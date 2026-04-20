@@ -1,8 +1,7 @@
 from agno.team import Team
 from agno.tools.mcp import MCPTools
-from .agents import make_coder, make_reviewer
+from .agents import make_coder, make_reviewer, get_model
 from .memory import memory_search, memory_store
-from .tool_fix import OllamaToolFix
 from config.config import config
 
 
@@ -11,7 +10,7 @@ def build_swarm() -> Team:
     return Team(
         name="AgnoHive",
         mode="coordinate",
-        model=OllamaToolFix(id=config.leader_model, host=config.ollama_host),
+        model=get_model(config.leader_model, config.ollama_host),
         members=[make_coder(mcp), make_reviewer(mcp)],
         tools=[mcp, memory_search, memory_store],
         instructions=[
