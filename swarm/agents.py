@@ -1,5 +1,4 @@
 from agno.agent import Agent
-from agno.models.ollama import Ollama
 from agno.tools.mcp import MCPTools
 from .memory import memory_search, memory_store
 from .tool_fix import OllamaToolFix
@@ -7,11 +6,9 @@ from config.config import config
 
 
 def get_model(model_id: str, host: str):
-    """Use OllamaToolFix only for qwen2.5 family (outputs JSON in content).
-    All other models use native tool_calls support."""
-    if "qwen" in model_id.lower():
-        return OllamaToolFix(id=model_id, host=host)
-    return Ollama(id=model_id, host=host)
+    """Always use OllamaToolFix — it safely handles both native tool_calls and
+    JSON-in-content tool call patterns (llama3.3, qwen2.5, mistral, gemma3, etc.)."""
+    return OllamaToolFix(id=model_id, host=host)
 
 
 _BASE_PREAMBLE = [

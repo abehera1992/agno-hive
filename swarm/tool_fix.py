@@ -1,14 +1,10 @@
-"""OllamaToolFix — handles qwen2.5-coder's non-standard tool call output.
+"""OllamaToolFix — handles non-standard tool call output from Ollama models.
 
-qwen2.5-coder emits tool calls as raw JSON in the `content` field rather than
-in Ollama's `tool_calls` API field. This subclass overrides _parse_provider_response
-and _parse_provider_response_delta to intercept that content and convert it to
-proper tool_calls before Agno processes the response.
-
-Handled formats:
-  1. <tool_call>{"name": ..., "arguments": ...}</tool_call> blocks
-  2. Two or more bare JSON objects concatenated with whitespace
-  3. A single bare JSON object as the entire content
+Supported formats:
+  1. <tool_call>{"name": ..., "arguments": ...}</tool_call> (qwen2.5)
+  2. <|python_tag|>{"type": "function", "name": ..., "parameters": ...} (llama3.3)
+  3. {"name": ..., "arguments": ...} bare JSON (qwen2.5 non-streaming)
+  4. Multiple bare JSON objects concatenated with whitespace
 """
 import json
 import re
@@ -33,7 +29,26 @@ class OllamaToolFix(Ollama):
                     pass
             return calls
 
-        # Format 2 / 3: bare JSON objects
+        # Format 2: <|python_tag|> prefix (llama3.3)
+        python_tag = "<|python_tag|>"
+        if python_tag in content:
+            parts = content.split(python_tag)
+            for part in parts:
+                part = part.strip()
+                if not part:
+                    continue
+                # Strip any trailing eot-like tags
+                part = re.sub(r"<\|[^|]+\|>.*$", "", part).strip()
+                if not part:
+                    continue
+                try:
+                    obj = json.loads(part)
+                    calls.append(obj)
+                except json.JSONDecodeError:
+                    pass
+            return calls
+
+        # Format 3 / 4: bare JSON objects
         stripped = content.strip()
         if not stripped.startswith("{"):
             return calls
@@ -58,7 +73,12 @@ class OllamaToolFix(Ollama):
         result = []
         for call in parsed:
             name = call.get("name") or call.get("function", {}).get("name")
-            args = call.get("arguments") or call.get("function", {}).get("arguments", {})
+            # Support "arguments" (qwen2.5), "parameters" (llama3.3), or nested "function.arguments"
+            args = (
+                call.get("arguments")
+                or call.get("parameters")
+                or call.get("function", {}).get("arguments", {})
+            )
             if name:
                 result.append({
                     "type": "function",

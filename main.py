@@ -1,35 +1,30 @@
 """AgnoHive entry point.
-
 Usage:
-  python main.py "describe the seller verification flow"   # single task
-  python main.py                                           # interactive loop
+  python3 main.py "your task here"   # single task
+  python3 main.py                    # interactive loop
 """
+import asyncio
 import sys
-
-from config.config import config
-from swarm.team import build_swarm
+from swarm.team import run_task_async
 
 
-def run(task: str) -> None:
-    swarm = build_swarm()
-    swarm.run(task, stream=config.stream)
-
-
-def interactive() -> None:
-    print("AgnoHive — type 'exit' to quit.")
-    swarm = build_swarm()
-    while True:
-        try:
-            task = input("\n> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if task.lower() in ("exit", "quit", ""):
-            break
-        swarm.run(task, stream=config.stream)
+async def main() -> None:
+    if len(sys.argv) > 1:
+        task = " ".join(sys.argv[1:])
+        result = await run_task_async(task)
+        print(result)
+    else:
+        print("AgnoHive - type 'exit' to quit.")
+        while True:
+            try:
+                task = input("\n> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if task.lower() in ("exit", "quit", ""):
+                break
+            result = await run_task_async(task)
+            print(result)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        run(" ".join(sys.argv[1:]))
-    else:
-        interactive()
+    asyncio.run(main())
