@@ -98,8 +98,10 @@ class OllamaToolFix(Ollama):
         if model_response.content:
             parsed = self._parse_tool_calls_from_content(model_response.content)
             if parsed:
-                model_response.tool_calls = self._to_tool_calls(parsed)
-                model_response.content = ""
+                tool_calls = self._to_tool_calls(parsed)
+                if tool_calls:  # only strip content if valid named tool calls found
+                    model_response.tool_calls = tool_calls
+                    model_response.content = ""
 
         return model_response
 
@@ -112,7 +114,9 @@ class OllamaToolFix(Ollama):
         if model_response.content:
             parsed = self._parse_tool_calls_from_content(model_response.content)
             if parsed:
-                model_response.tool_calls = self._to_tool_calls(parsed)
-                model_response.content = ""
+                tool_calls = self._to_tool_calls(parsed)
+                if tool_calls:  # only strip content if valid named tool calls found
+                    model_response.tool_calls = tool_calls
+                    model_response.content = ""
 
         return model_response
