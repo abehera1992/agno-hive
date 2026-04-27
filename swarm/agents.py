@@ -1,31 +1,37 @@
 from agno.agent import Agent
 from agno.tools.mcp import MCPTools
-from .memory import memory_search, memory_store
 from .tool_fix import OllamaToolFix
 from config.config import config
 
 
 def get_model(model_id: str, host: str):
-    """Always use OllamaToolFix — it safely handles both native tool_calls and
-    JSON-in-content tool call patterns (llama3.3, qwen2.5, mistral, gemma3, etc.)."""
+    """OllamaToolFix handles all Ollama tool call formats
+    (native tool_calls, <tool_call> tags, <|python_tag|>, bare JSON)."""
     return OllamaToolFix(id=model_id, host=host)
 
 
 _BASE_PREAMBLE = [
-    "When working on a task:",
-    "  1. Call get_project_context() to load full project context if not already loaded.",
-    "  2. Call memory_search() with relevant keywords to recall prior findings.",
-    "  3. Call search_knowledge_graph() to understand code structure.",
-    "After completing the task:",
-    "  4. Call memory_store() with a descriptive key and any non-obvious insight.",
+    "If memory_search is available via MCP, call it with relevant keywords before starting.",
+    "If memory_store is available via MCP, call it with a descriptive key after completing.",
 ]
+
+
+def make_agent_from_spec(spec, mcp: MCPTools) -> Agent:
+    """Build an Agent from a dynamic spec (AgentSpec or any duck-typed object)."""
+    return Agent(
+        name=spec.name,
+        model=get_model(spec.model, config.ollama_host),
+        tools=[mcp],
+        instructions=spec.instructions,
+        role=spec.role,
+    )
 
 
 def make_coder(mcp: MCPTools) -> Agent:
     return Agent(
         name="Coder",
         model=get_model(config.coder_model, config.ollama_host),
-        tools=[mcp, memory_search, memory_store],
+        tools=[mcp],
         instructions=[
             *_BASE_PREAMBLE,
             "You are the implementation specialist. Write clean, idiomatic code.",
@@ -40,7 +46,7 @@ def make_reviewer(mcp: MCPTools) -> Agent:
     return Agent(
         name="Reviewer",
         model=get_model(config.reviewer_model, config.ollama_host),
-        tools=[mcp, memory_search],
+        tools=[mcp],
         instructions=[
             *_BASE_PREAMBLE,
             "You are the code reviewer. Check for correctness, security, and consistency.",

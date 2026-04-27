@@ -21,9 +21,8 @@ class Config:
     # Pattern discovery glob — relative to the connected project root
     patterns_glob: str = os.getenv("PATTERNS_GLOB", "patterns/**/*.md")
 
-    # Optional: PostgreSQL for shared conscience (claude_flow schema)
-    db_url: str | None = os.getenv("DB_URL", None)
-    memory_namespace: str = os.getenv("MEMORY_NAMESPACE", "agno-hive")
+    # API server
+    api_port: int = int(os.getenv("AGNO_PORT", "9001"))
 
     # Swarm behaviour
     stream: bool = os.getenv("STREAM", "false").lower() == "true"

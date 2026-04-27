@@ -16,12 +16,6 @@ def test_defaults_have_no_hardcoded_ips():
     assert cfg.mcp_url == ""
 
 
-def test_db_url_defaults_to_none():
-    mod = _reload_config()
-    cfg = mod.Config()
-    assert cfg.db_url is None
-
-
 def test_patterns_glob_default():
     mod = _reload_config()
     cfg = mod.Config()
@@ -33,13 +27,6 @@ def test_patterns_glob_from_env(monkeypatch):
     mod = _reload_config()
     cfg = mod.Config()
     assert cfg.patterns_glob == "docs/patterns/**/*.md"
-
-
-def test_db_url_from_env(monkeypatch):
-    monkeypatch.setenv("DB_URL", "postgresql://user:pass@host/db")
-    mod = _reload_config()
-    cfg = mod.Config()
-    assert cfg.db_url == "postgresql://user:pass@host/db"
 
 
 def test_stream_defaults_false():
