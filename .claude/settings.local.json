@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_config.py -v)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(python -m pytest tests/ -v)",
+      "Bash(python -c \"from config.config import config; print\\('✓ Config imported successfully'\\); print\\(f'  ollama_host: \\\\\"{config.ollama_host}\\\\\"'\\); print\\(f'  mcp_url: \\\\\"{config.mcp_url}\\\\\"'\\); print\\(f'  db_url: {config.db_url}'\\); print\\(f'  patterns_glob: \\\\\"{config.patterns_glob}\\\\\"'\\); print\\(f'  stream: {config.stream}'\\); print\\(f'  max_iterations: {config.max_iterations}'\\)\")",
+      "Bash(python -c \"from config.config import config; print\\('Config imported successfully'\\); print\\('  ollama_host:', repr\\(config.ollama_host\\)\\); print\\('  mcp_url:', repr\\(config.mcp_url\\)\\); print\\('  db_url:', repr\\(config.db_url\\)\\); print\\('  patterns_glob:', repr\\(config.patterns_glob\\)\\); print\\('  stream:', config.stream\\); print\\('  max_iterations:', config.max_iterations\\)\")",
+      "Bash(git *)",
+      "Bash(python -m pytest tests/test_memory.py tests/test_bootstrap.py -v)"
+    ]
+  }
+}
