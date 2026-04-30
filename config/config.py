@@ -31,6 +31,14 @@ class Config:
     qdrant_url: str = os.getenv("QDRANT_URL", "http://localhost:6333")
     postgres_uri: str = os.getenv("POSTGRES_URI", "")
 
+    # LightRAG MCP server
+    lightrag_mcp_port: int = int(os.getenv("LIGHTRAG_MCP_PORT", "9002"))
+    lightrag_mcp_url: str = os.getenv("LIGHTRAG_MCP_URL", "http://localhost:9002/sse")
+    lightrag_llm_model: str = os.getenv("LIGHTRAG_LLM_MODEL", "mistral-small3.1:24b")
+    lightrag_embed_model: str = os.getenv("LIGHTRAG_EMBED_MODEL", "nomic-embed-text")
+    lightrag_embed_dim: int = int(os.getenv("LIGHTRAG_EMBED_DIM", "768"))
+    lightrag_working_dir: str = os.getenv("LIGHTRAG_WORKING_DIR", os.path.expanduser("~/.agno-hive/lightrag"))
+
     # Observability — OTLP endpoint for any OTel-compatible backend
     # e.g. existing SigNoz: http://<ekam-host>:4318
     otlp_endpoint: str = os.getenv("OTLP_ENDPOINT", "")

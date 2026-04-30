@@ -33,5 +33,10 @@ if __name__ == "__main__":
         from config.config import config
         print(f"[agno-hive] starting on 0.0.0.0:{config.api_port}")
         uvicorn.run(app, host="0.0.0.0", port=config.api_port)
+    elif "--serve-lightrag" in sys.argv:
+        from config.config import config
+        from lightrag_mcp.server import mcp
+        print(f"[agno-hive] lightrag-mcp starting on 0.0.0.0:{config.lightrag_mcp_port}")
+        mcp.run(transport="sse", host="0.0.0.0", port=config.lightrag_mcp_port)
     else:
         asyncio.run(_interactive())

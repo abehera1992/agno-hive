@@ -224,12 +224,57 @@ pytest tests/ -v
 
 Create `teams/<name>.yaml` with the format above. It's immediately available via `GET /teams` and `POST /run` with `"team": "<name>"` — no code changes needed.
 
-## LightRAG Integration (Phase 3 — Planned)
+## LightRAG MCP Server (Phase 3)
 
-LightRAG will be deployed as a separate FastMCP server on ZGX, using:
-- **Vector store:** `QdrantVectorDBStorage` → Qdrant at `localhost:6333`
-- **Graph store:** `AGEStorage` → PostgreSQL + AGE at `localhost:5432`, graph name `agno`
-- **Retrieval modes:** `low` (entity/file-specific), `high` (thematic/cross-module), `hybrid` (default)
-- **Constraint:** Requires 32K+ context window model for indexing; do not use reasoning models for extraction
+A standalone FastMCP server (`lightrag_mcp/`) running on ZGX. Agents call it via two MCP tools:
 
-Agents will call it via MCP tools: `lightrag_insert(text, project_id)`, `lightrag_query(query, mode, project_id)`.
+| Tool | Args | Purpose |
+|---|---|---|
+| `lightrag_insert` | `text, project_id` | Index text — LLM extracts entities/relations → Qdrant + AGE |
+| `lightrag_query` | `query, project_id, mode` | Retrieve context using `local`, `global`, or `hybrid` mode |
+
+**Retrieval modes:**
+- `local` — entity-centric: vector search over entity index → 1-hop graph traversal. Best for specific file/symbol questions.
+- `global` — relationship-centric: vector search over relationship summaries → edge centrality ranking. Best for cross-module/thematic questions.
+- `hybrid` — runs both and merges (default, recommended).
+
+**Storage backends:**
+- Vector: `QdrantVectorDBStorage` → Qdrant at `QDRANT_URL`, one collection per project (`project_{project_id}`)
+- Graph: `PGGraphStorage` → PostgreSQL + AGE at `POSTGRES_URI`, shared `agno` graph
+
+**Project isolation:** Qdrant collections are fully isolated per project. The AGE graph is shared with `project_id` as node metadata (full graph-level isolation planned for Phase 4).
+
+### Running the LightRAG MCP Server
+
+```bash
+# Prerequisites — pull the embedding model in Ollama first
+ollama pull nomic-embed-text
+
+# Start the server (SSE on port 9002)
+python main.py --serve-lightrag
+
+# Or directly
+python -m lightrag_mcp.server
+```
+
+### LightRAG MCP Config
+
+| Variable | Default | Description |
+|---|---|---|
+| `LIGHTRAG_MCP_PORT` | `9002` | SSE server port |
+| `LIGHTRAG_MCP_URL` | `http://localhost:9002/sse` | URL agents use to connect |
+| `LIGHTRAG_LLM_MODEL` | `mistral-small3.1:24b` | Model for entity/relation extraction during insert |
+| `LIGHTRAG_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model (must be pulled) |
+| `LIGHTRAG_EMBED_DIM` | `768` | Must match the embed model's output dimension |
+| `LIGHTRAG_WORKING_DIR` | `~/.agno-hive/lightrag` | Base dir for per-project file-based KV storage |
+
+**Constraint:** LightRAG requires a 32K+ context window model for entity extraction during insert. Do not use reasoning/chain-of-thought models (e.g. DeepSeek R1) for `LIGHTRAG_LLM_MODEL` — they slow indexing dramatically.
+
+### File Structure
+
+```
+lightrag_mcp/
+  __init__.py
+  server.py    # FastMCP app, tool definitions, SSE entry point
+  rag.py       # LightRAG instance factory and per-project cache
+```
