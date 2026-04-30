@@ -167,6 +167,32 @@ docker compose -f docker/docker-compose.zgx.yml down -v    # stop + delete volum
 
 **Note:** `pgdata` volume must be mounted at `/var/lib/postgresql` (not `/var/lib/postgresql/data`) due to PostgreSQL 18+ directory layout change in the `apache/age:latest` image.
 
+### Checking Container Status (via SSH or ZGX terminal)
+
+```bash
+# Quick status — just agno containers
+docker ps --filter "name=agno-"
+
+# All running containers
+docker ps
+
+# Check logs if something looks wrong
+docker logs agno-qdrant --tail 20
+docker logs agno-postgres-age --tail 20
+
+# Verify Qdrant health
+curl http://localhost:6333/healthz
+
+# Verify AGE graph exists in Postgres
+docker exec agno-postgres-age psql -U agno -d agno_graph -c "SELECT * FROM ag_catalog.ag_graph;"
+
+# Restart the stack
+docker compose -f ~/agno-hive/docker/docker-compose.zgx.yml restart
+
+# Stop the stack
+docker compose -f ~/agno-hive/docker/docker-compose.zgx.yml down
+```
+
 ## Observability
 
 AGNOHive will use the OpenTelemetry Python SDK (`opentelemetry-sdk`, `opentelemetry-exporter-otlp`) with a configurable `OTLP_ENDPOINT`. Set this to the SigNoz OTLP HTTP endpoint on the Ekam host:
