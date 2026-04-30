@@ -1,0 +1,35 @@
+# AGNOHive ZGX Infrastructure Stack
+# Qdrant (vector memory) + PostgreSQL/AGE (graph reasoning)
+# Ollama runs natively on ZGX for GPU access — not managed here.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.zgx.yml up -d
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: agno-qdrant
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  postgres-age:
+    image: apache/age:latest
+    container_name: agno-postgres-age
+    environment:
+      POSTGRES_USER: agno
+      POSTGRES_PASSWORD: agno
+      POSTGRES_DB: agno_graph
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
+  pgdata:

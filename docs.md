@@ -1,0 +1,209 @@
+# AGNOHive — Technical Reference
+
+## Project Structure
+
+```
+agno-hive/
+├── main.py                  # Entry point: CLI, interactive loop, --serve flag
+├── config/
+│   └── config.py            # All config via env vars, dataclass, loaded from .env
+├── swarm/
+│   ├── agents.py            # Agent factory functions (make_coder, make_reviewer, make_agent_from_spec)
+│   ├── team.py              # run_task_async — builds and runs the Team
+│   ├── bootstrap.py         # Pre-team MCP session to fetch project patterns
+│   ├── ollama.py            # Ollama model list/pull via httpx
+│   └── tool_fix.py          # OllamaToolFix: normalises all Ollama tool-call formats
+├── api/
+│   ├── server.py            # FastAPI app: /health, /teams, /run
+│   └── models.py            # Pydantic models: AgentSpec, RunRequest, RunResponse
+├── teams/
+│   └── coding.yaml          # Default Coder + Reviewer team spec
+├── docker/
+│   ├── docker-compose.zgx.yml   # ZGX infra stack (Qdrant + PostgreSQL/AGE)
+│   └── init/
+│       └── 01_age.sql           # Runs once on first postgres-age start; creates AGE extension + agno graph
+├── tests/
+│   ├── conftest.py
+│   ├── test_bootstrap.py
+│   └── test_config.py
+├── .env.example             # All env vars with descriptions
+├── requirements.txt
+├── CLAUDE.md                # High-level project context for Claude
+└── docs.md                  # This file
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLLAMA_HOST` | `` | Ollama server URL, e.g. `http://<zgx-ip>:11434` |
+| `LEADER_MODEL` | `qwen3:30b-a3b` | Coordinator agent model |
+| `CODER_MODEL` | `mistral-small3.1:24b` | Coder agent model |
+| `REVIEWER_MODEL` | `gemma3:27b` | Reviewer agent model |
+| `PLANNER_MODEL` | `deepseek-r1` | Planner agent model (Phase 2) |
+| `RESEARCHER_MODEL` | `mixtral:8x7b` | Researcher agent model (Phase 2) |
+| `EXECUTOR_MODEL` | `llama3.1:8b` | Executor agent model (Phase 2) |
+| `ROUTER_MODEL` | `llama3.1:8b` | Context Router agent model (Phase 2) |
+| `MCP_URL` | `` | Client project MCP server SSE endpoint, e.g. `http://<host>:9000/sse` |
+| `PATTERNS_GLOB` | `patterns/**/*.md` | Glob for bootstrap pattern files on the MCP server |
+| `QDRANT_URL` | `http://localhost:6333` | Qdrant REST API (ZGX Docker) |
+| `POSTGRES_URI` | `` | PostgreSQL connection string, e.g. `postgresql://agno:agno@localhost:5432/agno_graph` |
+| `OTLP_ENDPOINT` | `` | OTel exporter endpoint, e.g. `http://<ekam-host>:4318` |
+| `AGNO_PORT` | `9001` | FastAPI server port |
+| `STREAM` | `false` | Enable streaming output |
+| `MAX_ITERATIONS` | `5` | Max coordinator iterations per task |
+
+## API Reference
+
+### `GET /health`
+Returns server status and configured MCP URL.
+```json
+{ "status": "ok", "mcp_url": "http://..." }
+```
+
+### `GET /teams`
+Lists all available team specs from `teams/*.yaml`.
+```json
+{
+  "teams": [
+    { "name": "coding", "description": "...", "agents": ["Coder", "Reviewer"] }
+  ]
+}
+```
+
+### `POST /run`
+Runs a task. Returns the result with metadata.
+
+**Request:**
+```json
+{
+  "task": "Refactor the auth module to use JWT",
+  "team": "coding",           // optional: named team from teams/*.yaml
+  "agents": [...],            // optional: inline AgentSpec list (overrides team)
+  "mcp_url": "http://..."     // optional: override MCP_URL for this request
+}
+```
+
+**Response:**
+```json
+{
+  "result": "...",
+  "team": "coding",
+  "agents_used": ["Coder", "Reviewer"],
+  "models_pulled": [],
+  "duration_seconds": 12.4
+}
+```
+
+**Resolution order for team:** `agents` inline > `team` named > default `coding` team.
+
+## Team YAML Format
+
+Files in `teams/*.yaml` define reusable agent configurations.
+
+```yaml
+name: coding
+description: General-purpose coding assistant.
+coordinator_model: qwen3:30b-a3b   # optional, falls back to LEADER_MODEL
+
+agents:
+  - name: Coder
+    model: mistral-small3.1:24b
+    role: Senior software engineer who implements features and fixes bugs.
+    instructions:
+      - If memory_search is available via MCP, call it with relevant keywords before starting.
+      - Write clean, idiomatic code.
+
+  - name: Reviewer
+    model: gemma3:27b
+    role: Senior engineer who reviews code for correctness and security.
+    instructions:
+      - Be concise — flag real problems only.
+```
+
+## How run_task_async Works
+
+```
+run_task_async(task, agent_specs, coordinator_model, mcp_url)
+  1. bootstrap() — opens raw MCP session, reads patterns_glob files → project_context string
+  2. MCPTools(url, transport="sse") — opens persistent MCP connection for agents
+  3. Build team members (from agent_specs or default Coder+Reviewer)
+  4. Build Team (coordinator model + members + MCP tools + instructions + project_context)
+  5. team.arun(task) → returns result
+```
+
+Bootstrap is a separate MCP session that closes before the Team opens its own connection. This avoids session conflicts.
+
+## How Bootstrap Works
+
+`swarm/bootstrap.py` opens a raw `mcp.ClientSession` (not via Agno), calls `find_files(patterns_glob)` to discover pattern files, then reads each with `get_file_content()`. Falls back to `get_project_context()` if pattern files aren't found. Returns a combined string injected into the coordinator's instructions.
+
+## How OllamaToolFix Works
+
+`swarm/tool_fix.py` wraps the Ollama model and normalises tool calls across four formats that different Ollama models emit:
+1. Native OpenAI-compatible `tool_calls` array
+2. `<tool_call>...</tool_call>` XML tags in content
+3. `` <|python_tag|> `` delimited JSON
+4. Bare JSON object in content
+
+All formats are parsed and converted to the standard format before passing to Agno's agent loop.
+
+## ZGX Infrastructure
+
+Managed via `docker/docker-compose.zgx.yml`. Run from the repo root on ZGX:
+
+```bash
+docker compose -f docker/docker-compose.zgx.yml up -d
+docker compose -f docker/docker-compose.zgx.yml down       # stop
+docker compose -f docker/docker-compose.zgx.yml down -v    # stop + delete volumes
+```
+
+| Container | Image | Ports | Volume |
+|---|---|---|---|
+| `agno-qdrant` | `qdrant/qdrant:latest` | `6333` (REST), `6334` (gRPC) | `qdrant_data` |
+| `agno-postgres-age` | `apache/age:latest` | `5432` | `pgdata` (mounted at `/var/lib/postgresql`) |
+
+`docker/init/01_age.sql` runs once on first start, loads the AGE extension, and creates the `agno` graph.
+
+**Note:** `pgdata` volume must be mounted at `/var/lib/postgresql` (not `/var/lib/postgresql/data`) due to PostgreSQL 18+ directory layout change in the `apache/age:latest` image.
+
+## Observability
+
+AGNOHive will use the OpenTelemetry Python SDK (`opentelemetry-sdk`, `opentelemetry-exporter-otlp`) with a configurable `OTLP_ENDPOINT`. Set this to the SigNoz OTLP HTTP endpoint on the Ekam host:
+
+```
+OTLP_ENDPOINT=http://<ekam-host-ip>:4318
+```
+
+SigNoz runs in Docker on the Ekam host (separate `signoz-network` from `ekam-network`). ZGX reaches it via the host machine's exposed port — Docker network isolation is irrelevant for external machine access. Verify with:
+
+```bash
+curl http://<ekam-host-ip>:4318/v1/traces -d '{}' -H 'Content-Type: application/json'
+# Expect 400 (bad payload), not connection refused
+```
+
+## Running Tests
+
+```bash
+pytest tests/ -v
+```
+
+## Adding a New Agent (Quick Reference)
+
+1. Add a `make_<agent>()` factory function in `swarm/agents.py` following the `make_coder` pattern
+2. Add the model env var to `config/config.py` and `.env.example`
+3. Reference the agent in a team YAML or wire it into `run_task_async` in `swarm/team.py`
+
+## Adding a New Team
+
+Create `teams/<name>.yaml` with the format above. It's immediately available via `GET /teams` and `POST /run` with `"team": "<name>"` — no code changes needed.
+
+## LightRAG Integration (Phase 3 — Planned)
+
+LightRAG will be deployed as a separate FastMCP server on ZGX, using:
+- **Vector store:** `QdrantVectorDBStorage` → Qdrant at `localhost:6333`
+- **Graph store:** `AGEStorage` → PostgreSQL + AGE at `localhost:5432`, graph name `agno`
+- **Retrieval modes:** `low` (entity/file-specific), `high` (thematic/cross-module), `hybrid` (default)
+- **Constraint:** Requires 32K+ context window model for indexing; do not use reasoning models for extraction
+
+Agents will call it via MCP tools: `lightrag_insert(text, project_id)`, `lightrag_query(query, mode, project_id)`.
