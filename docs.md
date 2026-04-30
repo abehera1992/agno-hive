@@ -248,7 +248,7 @@ A standalone FastMCP server (`lightrag_mcp/`) running on ZGX. Agents call it via
 
 ```bash
 # Prerequisites — pull the embedding model in Ollama first
-ollama pull nomic-embed-text
+ollama pull qwen3-embedding:0.6b
 
 # Start the server (SSE on port 9002)
 python main.py --serve-lightrag
@@ -264,8 +264,8 @@ python -m lightrag_mcp.server
 | `LIGHTRAG_MCP_PORT` | `9002` | SSE server port |
 | `LIGHTRAG_MCP_URL` | `http://localhost:9002/sse` | URL agents use to connect |
 | `LIGHTRAG_LLM_MODEL` | `mistral-small3.1:24b` | Model for entity/relation extraction during insert |
-| `LIGHTRAG_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model (must be pulled) |
-| `LIGHTRAG_EMBED_DIM` | `768` | Must match the embed model's output dimension |
+| `LIGHTRAG_EMBED_MODEL` | `qwen3-embedding:0.6b` | Ollama embedding model (must be pulled) |
+| `LIGHTRAG_EMBED_DIM` | `1024` | Must match the embed model's output dimension |
 | `LIGHTRAG_WORKING_DIR` | `~/.agno-hive/lightrag` | Base dir for per-project file-based KV storage |
 
 **Constraint:** LightRAG requires a 32K+ context window model for entity extraction during insert. Do not use reasoning/chain-of-thought models (e.g. DeepSeek R1) for `LIGHTRAG_LLM_MODEL` — they slow indexing dramatically.
