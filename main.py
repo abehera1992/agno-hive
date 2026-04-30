@@ -1,8 +1,11 @@
 """AgnoHive entry point.
 Usage:
-  python main.py "your task here"   # single task
-  python main.py                    # interactive loop
-  python main.py --serve            # start FastAPI server on AGNO_PORT (default 9001)
+  python main.py "your task here"                            # single task
+  python main.py                                             # interactive loop
+  python main.py --serve                                     # FastAPI server on AGNO_PORT (default 9001)
+  python main.py --serve-lightrag                            # LightRAG MCP server on LIGHTRAG_MCP_PORT (default 9002)
+  python main.py --index --path /repo --project-id <id>     # index a repo into LightRAG
+  python main.py --index --path /repo --project-id <id> --force  # force full reindex
 """
 import asyncio
 import sys
@@ -38,5 +41,9 @@ if __name__ == "__main__":
         from lightrag_mcp.server import mcp
         print(f"[agno-hive] lightrag-mcp starting on 0.0.0.0:{config.lightrag_mcp_port}")
         mcp.run(transport="sse", host="0.0.0.0", port=config.lightrag_mcp_port)
+    elif "--index" in sys.argv:
+        sys.argv.remove("--index")
+        from indexer.cli import main as index_main
+        index_main()
     else:
         asyncio.run(_interactive())

@@ -193,6 +193,62 @@ docker compose -f ~/agno-hive/docker/docker-compose.zgx.yml restart
 docker compose -f ~/agno-hive/docker/docker-compose.zgx.yml down
 ```
 
+## Automated Code Indexer (Phase 4)
+
+Walks a repository, chunks source files, and inserts them into LightRAG. Runs on ZGX where LightRAG and Qdrant/PostgreSQL are available. No additional dependencies — Python files are parsed with the built-in `ast` module; all other types use fixed-size text chunking.
+
+### Usage
+
+```bash
+# First run — indexes everything
+python main.py --index --path /path/to/repo --project-id ekam
+
+# Subsequent runs — only changed/new files are reindexed
+python main.py --index --path /path/to/repo --project-id ekam
+
+# Force full reindex (ignores cached state)
+python main.py --index --path /path/to/repo --project-id ekam --force
+
+# Or run directly as a module
+python -m indexer.cli --path /path/to/repo --project-id ekam
+```
+
+### How It Works
+
+1. Walks all files, skipping `.git`, `__pycache__`, `node_modules`, binaries, etc.
+2. Computes SHA-256 hash of each file
+3. Compares against cached state in `~/.agno-hive/index-state/{project_id}.json`
+4. Only processes changed or new files (incremental by default)
+5. Python files: `ast` module extracts module docstrings, functions, and classes as individual chunks
+6. All other files: split into 4000-char chunks with file/type headers
+7. Each chunk inserted via `rag.ainsert()` — LightRAG extracts entities/relations into Qdrant + AGE
+8. Saves updated state after a successful run
+
+### Chunk Format (Python)
+
+```
+File: src/models/user.py
+Type: class
+Name: User
+Docstring: ORM model for authenticated users.
+
+class User(Base):
+    id = Column(Integer, primary_key=True)
+    email = Column(String, unique=True)
+```
+
+### File Structure
+
+```
+indexer/
+  __init__.py
+  cli.py       # Entry point, orchestration, argparse
+  parser.py    # Python AST chunker + generic text chunker
+  tracker.py   # SHA-256 hash state (incremental indexing)
+```
+
+State files: `~/.agno-hive/index-state/{project_id}.json` — delete to force full reindex.
+
 ## Observability
 
 AGNOHive will use the OpenTelemetry Python SDK (`opentelemetry-sdk`, `opentelemetry-exporter-otlp`) with a configurable `OTLP_ENDPOINT`. Set this to the SigNoz OTLP HTTP endpoint on the Ekam host:
