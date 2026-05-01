@@ -27,7 +27,7 @@ Each `hive` invocation is a stateless `POST /run` — the coordinator has no mem
 
 - Streaming history (server-sent events, websockets) — out of scope
 - Session sharing between users — single-user tool
-- History summarisation — sliding window of last 10 turns is sufficient
+- Full history summarisation on every turn — compaction only triggers at a message threshold
 - Client-side history caching — server is the single source of truth
 
 ---
@@ -40,13 +40,15 @@ Two new tables in the existing AGNOHive PostgreSQL database. Auto-created on fir
 
 ```sql
 CREATE TABLE IF NOT EXISTS chat_sessions (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    project_id  TEXT        NOT NULL,
-    title       TEXT        NOT NULL,        -- first 80 chars of first user message
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at  TIMESTAMPTZ,                 -- NULL when persist = true
-    persist     BOOLEAN     NOT NULL DEFAULT FALSE
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id      TEXT        NOT NULL,
+    title           TEXT        NOT NULL,        -- first 80 chars of first user message
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ,                 -- NULL when persist = true
+    persist         BOOLEAN     NOT NULL DEFAULT FALSE,
+    summary         TEXT,                        -- compacted summary of older messages
+    summary_through INT         NOT NULL DEFAULT 0  -- message id up to which summary covers
 );
 
 CREATE INDEX IF NOT EXISTS chat_sessions_project_idx
@@ -90,7 +92,9 @@ Public interface:
 |---|---|
 | `create_session(project_id, title, persist) -> str` | Create session, return UUID string |
 | `append_message(session_id, role, content)` | Add one turn to session |
-| `get_history(session_id, limit=10) -> list[dict]` | Return last N turns as `[{role, content}]` |
+| `get_history(session_id, limit=10) -> list[dict]` | Return last N verbatim messages as `[{role, content}]` |
+| `get_context(session_id) -> tuple[str, list[dict]]` | Return `(summary_or_empty, recent_messages)` for injection |
+| `compact_session(session_id)` | Summarise older messages via `llama3.1:8b`, store in `summary` column |
 | `list_sessions(project_id, limit=20) -> list[dict]` | Return session summaries |
 | `delete_session(session_id)` | Hard delete (works on persisted sessions) |
 | `persist_session(session_id)` | Set persist=true, expires_at=NULL |
@@ -115,12 +119,13 @@ session_id: str   # always returned — new or existing
 
 **Request flow:**
 
-1. If `session_id` provided → load last 10 turns via `get_history()`
+1. If `session_id` provided → load context via `get_context()` (summary + last 6 verbatim messages)
 2. If no `session_id` → call `create_session()` to get a new UUID
-3. Inject history into coordinator instructions (see Context Injection below)
+3. Inject context into coordinator instructions (see Context Injection below)
 4. Run the task
 5. `append_message(session_id, "user", task)` + `append_message(session_id, "assistant", result)`
-6. Return `session_id` in response
+6. If total message count crosses compaction threshold → trigger `compact_session()` asynchronously (non-blocking)
+7. Return `session_id` in response
 
 ### New REST Endpoints
 
@@ -133,19 +138,38 @@ session_id: str   # always returned — new or existing
 
 ### Context Injection Format
 
-Injected into the coordinator's `instructions` list after the existing project context and failure context blocks:
+Injected into the coordinator's `instructions` list after the existing project context and failure context blocks. Two-layer format — compacted summary (if exists) followed by verbatim recent messages:
 
 ```
-── Conversation history (last 10 turns) ─────────────────────
+── Session summary (turns 1–20) ──────────────────────────────
+The user is building session persistence for the hive CLI.
+Key decisions: PostgreSQL server-side storage, 30-day TTL,
+persist flag for permanent sessions, sliding window context.
+──────────────────────────────────────────────────────────────
+── Recent messages (last 6) ──────────────────────────────────
 [user] add a docstring to write_file in mcp-server/tools/write.py
 [assistant] The docstring has been updated. Here's what changed: ...
 
 [user] now add type hints to the same function
 [assistant] Type hints added. The signature is now: ...
-─────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────────
 ```
 
-History window: last 10 **messages** total (ordered oldest-first for injection), configurable via `AGNO_SESSION_WINDOW` env var (default: `10`). A value of 10 means 5 user + 5 assistant messages in a balanced session.
+If no compaction has occurred yet (session is short), only the recent messages block is injected — no summary header.
+
+**Verbatim window:** last 6 messages (configurable via `AGNO_SESSION_WINDOW`, default `6`).
+
+### Compaction
+
+Compaction triggers when total message count exceeds `AGNO_COMPACT_THRESHOLD` (default: `20`) and the existing summary does not yet cover all messages before the verbatim window.
+
+**Compaction flow:**
+1. Load all messages older than the verbatim window
+2. Send to `llama3.1:8b` (already in the engineering team roster — no new model pull) with a system prompt: `"Summarise this conversation history concisely, preserving key decisions, file names, and outcomes. Be factual and brief."`
+3. Store the summary in `chat_sessions.summary` and update `summary_through` to the last message ID covered
+4. Future runs inject this summary + the fresh verbatim window
+
+Compaction runs as a fire-and-forget `asyncio.create_task` after the response is returned — it never blocks the current turn. If it fails, the next turn retries.
 
 ---
 
@@ -204,13 +228,30 @@ Only updated by REPL mode. One-shot mode never touches this file.
   resume later: hive --session a3f7c2d1-8b3e-4f2a-9c1d-...
 ```
 
+### Result Footer
+
+Every response (both REPL and one-shot) prints an informative footer line:
+
+**REPL (ongoing session):**
+```
+── Coder, Reviewer · 42.3s  ·  session a3f7c2d1  ·  turn 4  ·  6 msgs in context  ·  expires 2026-05-31
+```
+
+**REPL (persisted session):**
+```
+── Coder, Reviewer · 42.3s  ·  session a3f7c2d1  ·  turn 4  ·  summary + 6 msgs  ·  [persistent]
+```
+
+**One-shot:**
+```
+── Coder, Reviewer · 42.3s  ·  session a3f7c2d1  ·  expires 2026-05-31  ·  resume: hive --session a3f7c2d1
+```
+
+Fields shown: agents used · duration · session ID (short 8-char prefix) · turn number (REPL only) · context window used · expiry or persistent badge. All rendered in dim colour.
+
 ### One-Shot Mode
 
-`hive "task"` always creates a new ephemeral session. Does NOT update `~/.agno_last_session`. Prints session ID at the bottom in dim text so the user can resume manually if they want to follow up.
-
-```
-  ── Coder, Reviewer · 42.3s · session: a3f7c2d1
-```
+`hive "task"` always creates a new ephemeral session. Does NOT update `~/.agno_last_session`. The footer includes the session ID and a ready-to-paste resume command so the user can continue in REPL mode if they want to follow up.
 
 ---
 
@@ -219,7 +260,8 @@ Only updated by REPL mode. One-shot mode never touches this file.
 | Env var | Default | Description |
 |---|---|---|
 | `SESSION_TTL_DAYS` | `30` | Days before an unpersisted session expires |
-| `AGNO_SESSION_WINDOW` | `10` | Max turns of history injected per request |
+| `AGNO_SESSION_WINDOW` | `6` | Verbatim messages injected per request |
+| `AGNO_COMPACT_THRESHOLD` | `20` | Total messages before compaction triggers |
 | `SESSION_CLEANUP_INTERVAL` | `3600` | Seconds between TTL cleanup sweeps |
 
 All added to `config/config.py` and `.env.example`.
@@ -239,13 +281,13 @@ All added to `config/config.py` and `.env.example`.
 
 | File | Change |
 |---|---|
-| `swarm/sessions.py` | New — all session CRUD + TTL cleanup |
-| `swarm/team.py` | Inject history into coordinator instructions |
+| `swarm/sessions.py` | New — session CRUD, compaction, TTL cleanup |
+| `swarm/team.py` | Inject `get_context()` result into coordinator instructions |
 | `api/models.py` | Add `session_id`, `persist` to `RunRequest`; `session_id` to `RunResponse`; new session models |
 | `api/server.py` | New session endpoints + startup cleanup task |
-| `config/config.py` | Add `session_ttl_days`, `session_window`, `session_cleanup_interval` |
+| `config/config.py` | Add `session_ttl_days`, `session_window`, `compact_threshold`, `session_cleanup_interval` |
 | `.env.example` | Document new env vars |
-| `cli/hive` | Session flags, REPL slash commands, local state file, banner |
+| `cli/hive` | Session flags, REPL slash commands, local state file, informative footer, banner |
 
 ---
 
@@ -255,3 +297,5 @@ All added to `config/config.py` and `.env.example`.
 - Session export to JSON
 - Cross-project session search
 - Session tagging / labelling
+- Manual compaction trigger (`/compact` REPL command)
+- Compaction model override (currently hardcoded to `llama3.1:8b`)
