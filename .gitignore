@@ -8,6 +8,8 @@ dist/
 build/
 .DS_Store
 docs/
+!docs/superpowers/
+!docs/superpowers/**
 .claude/
 CLAUDE.md
 docs.md
