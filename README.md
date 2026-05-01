@@ -1,156 +1,302 @@
-# agno-hive
+# AGNOHive
 
-Stateless agentic swarm for codebase-aware AI tasks. Runs on a dedicated workstation (ZGX) and connects to any project via its MCP server — no code changes needed per project, only `.env`.
+A generic, model-agnostic agentic swarm built on [Agno](https://github.com/agno-agi/agno). Runs on a dedicated ZGX workstation, connects to any project via its MCP server, and coordinates a full engineering team of local Ollama-backed agents — no cloud API calls.
 
-## How it works
+## How It Works
 
 ```
-Client app  ──task──►  agno-hive (ZGX)  ──MCP──►  Project MCP server (client machine)
-                            │                              │
-                       Coordinator                  find_files
-                       Coder                        get_file_content
-                       Reviewer                     search_files
-                                                    memory_store / memory_search
-                                                    run_command
-                                                    … any tool the project exposes
+Client project  ──task──►  AGNOHive (ZGX)
+                               │
+                    ┌──────────▼──────────────┐
+                    │  Coordinator (qwen3:30b) │
+                    │  ├─ ContextRouter        │  ──MCP──►  Project MCP server
+                    │  ├─ Researcher           │            find_files
+                    │  ├─ Planner              │            get_file_content
+                    │  ├─ Coder               │            search_files
+                    │  ├─ Executor             │            run_command
+                    │  └─ Reviewer             │            memory_store / memory_search
+                    └─────────────────────────┘
+                               │
+                    ┌──────────▼──────────────┐
+                    │  ZGX Storage             │
+                    │  ├─ Qdrant  (vectors)    │
+                    │  └─ PostgreSQL/AGE (graph)│
+                    └─────────────────────────┘
 ```
 
-1. On startup, agno-hive bootstraps project context by fetching pattern files from the MCP server.
-2. The coordinator routes the task to the appropriate tool path (pattern lookup, architecture query, or implementation).
-3. Coder and Reviewer agents are delegated to as needed, all operating through the project's MCP tools.
-4. Session memory and persistence are owned by the client's MCP server — agno-hive is fully stateless.
+1. Bootstrap: fetches project patterns from the MCP server to inject into the coordinator
+2. Failure context from past runs is loaded and injected before every task
+3. The coordinator routes to the right agents based on task type
+4. After each run, successes go to LightRAG (vector memory) and failures go to PostgreSQL (failure log)
+5. OTel traces flow to your existing SigNoz instance
 
 ---
 
-## Requirements
+## Prerequisites
 
-- Python 3.11+
-- [Ollama](https://ollama.com) running on the ZGX workstation with the models pulled (see model stack below)
-- A project MCP server exposing file and optional memory tools (running on the client machine, reachable from ZGX over Tailscale or local network)
+### ZGX Workstation
+- Ubuntu / Linux with Python 3.12+
+- [Miniforge](https://github.com/conda-forge/miniforge) or standard venv
+- Ollama running natively (for GPU access)
+- Docker + Docker Compose (for Qdrant and PostgreSQL/AGE)
+- Tailscale or network access to the client project machine
+
+### Ollama Models (pull before first run)
+```bash
+ollama pull qwen3:30b-a3b          # Coordinator
+ollama pull mistral-small3.1:24b   # Coder + LightRAG entity extraction
+ollama pull gemma3:27b             # Reviewer
+ollama pull deepseek-r1            # Planner
+ollama pull mixtral:8x7b           # Researcher
+ollama pull llama3.1:8b            # Executor + ContextRouter
+ollama pull qwen3-embedding:0.6b   # LightRAG embeddings
+```
+
+### Client Project
+- A FastMCP server exposing file/search/run tools over Streamable HTTP (e.g. at `http://<host>:9000/mcp`)
+- Reachable from ZGX over Tailscale or local network
 
 ---
 
-## Installation
+## Installation (on ZGX)
 
 ```bash
-git clone <repo-url> agno-hive
-cd agno-hive
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+git clone <repo-url> ~/agno-hive
+cd ~/agno-hive
 pip install -r requirements.txt
+```
+
+---
+
+## Infrastructure Setup (ZGX)
+
+Start Qdrant and PostgreSQL/AGE via Docker:
+
+```bash
+docker compose -f docker/docker-compose.zgx.yml up -d
+
+# Verify both are healthy
+docker ps --filter "name=agno-"
+curl http://localhost:6333/healthz
+docker exec agno-postgres-age psql -U agno -d agno_graph -c "SELECT * FROM ag_catalog.ag_graph;"
 ```
 
 ---
 
 ## Configuration
 
-Copy the example env file and fill in your values:
+Copy the example and fill in your values:
 
 ```bash
 cp .env.example .env
 ```
 
-`.env` reference:
+Minimum required `.env` on ZGX:
 
 ```env
-# Ollama inference server (ZGX)
+# Ollama (running natively on ZGX)
 OLLAMA_HOST=http://<zgx-ip>:11434
 
-# Models — defaults shown, override to swap models
-LEADER_MODEL=qwen3:30b-a3b
-CODER_MODEL=mistral-small3.1:24b
-REVIEWER_MODEL=gemma3:27b
+# Client project MCP server (Streamable HTTP)
+MCP_URL=http://<project-host>:9000/mcp
 
-# MCP server of the project you want to work on
-MCP_URL=http://<project-machine-ip>:9000/sse
+# Storage (Docker on ZGX)
+QDRANT_URL=http://localhost:6333
+POSTGRES_URI=postgresql://agno:agno@localhost:5432/agno_graph
 
-# Pattern file discovery glob — relative to the project root on the MCP server
-# Default is patterns/**/*.md — only set this if your project uses a different layout
-PATTERNS_GLOB=patterns/**/*.md
+# PostgreSQL individual vars (required by LightRAG)
+POSTGRES_USER=agno
+POSTGRES_PASSWORD=agno
+POSTGRES_DATABASE=agno_graph
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
 
-# Swarm behaviour
-STREAM=false
-MAX_ITERATIONS=5
-```
+# LightRAG MCP
+LIGHTRAG_MCP_PORT=9002
+LIGHTRAG_MCP_URL=http://localhost:9002/sse
+LIGHTRAG_LLM_MODEL=mistral-small3.1:24b
+LIGHTRAG_EMBED_MODEL=qwen3-embedding:0.6b
+LIGHTRAG_EMBED_DIM=1024
 
-### Pull the Ollama models (ZGX)
-
-```bash
-ollama pull qwen3:30b-a3b
-ollama pull mistral-small3.1:24b
-ollama pull gemma3:27b
+# Observability → SigNoz (optional, omit to disable)
+OTEL_EXPORTER_OTLP_ENDPOINT=http://<signoz-host>:4317
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+OTEL_RESOURCE_ATTRIBUTES=service.name=agno-hive,deployment.environment=dev
 ```
 
 ---
 
-## Usage
+## Running AGNOHive
 
-**Single task:**
-
+### 1. Start the LightRAG MCP Server (optional but recommended)
 ```bash
-python main.py "How do we handle async database queries in this project?"
+python main.py --serve-lightrag
+# → FastMCP SSE server on port 9002
 ```
 
-**Interactive loop:**
+### 2. Start the AGNOHive API Server
+```bash
+python main.py --serve
+# → FastAPI on port 9001
+```
 
+### 3. Single task (CLI)
+```bash
+python main.py "How does authentication work in this project?"
+```
+
+### 4. Interactive loop
 ```bash
 python main.py
-# AgnoHive - type 'exit' to quit.
 # > your task here
+# > exit
+```
+
+### 5. Index a codebase into LightRAG
+```bash
+# First run — indexes everything
+python main.py --index --path /path/to/repo --project-id myproject
+
+# Subsequent runs — only changed files
+python main.py --index --path /path/to/repo --project-id myproject
+
+# Force full reindex
+python main.py --index --path /path/to/repo --project-id myproject --force
 ```
 
 ---
 
-## Model stack
+## API Usage
 
-| Role | Model | Notes |
-|---|---|---|
-| Coordinator | `qwen3:30b-a3b` | MoE, 30B params / 3B active — fast tool routing |
-| Coder | `mistral-small3.1:24b` | Implementation specialist |
-| Reviewer | `gemma3:27b` | Code review and correctness |
+### Health check
+```bash
+curl http://localhost:9001/health
+# {"status": "ok", "mcp_url": "http://..."}
+```
 
-## Tool routing
+### List teams
+```bash
+curl http://localhost:9001/teams
+```
 
-The coordinator picks the fastest path based on query type:
+### Run a task
+```bash
+curl -X POST http://localhost:9001/run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task": "What files exist in the project root?",
+    "project_id": "myproject",
+    "team": "engineering"
+  }'
+```
 
-| Query type | Tool path | Latency |
-|---|---|---|
-| Code pattern / convention | `find_files` → `search_files` → `get_file_content` | ~26s |
-| Architecture / feature | `get_context_section(topic)` | ~19s |
-| Implementation task | context section + file reads → Coder → Reviewer | varies |
+**Request fields:**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `task` | string | required | The task or question |
+| `project_id` | string | `"default"` | Namespace for memory and failure tracking |
+| `team` | string | `"engineering"` | Team spec from `teams/*.yaml` |
+| `agents` | array | — | Inline agent specs (overrides team) |
+| `mcp_url` | string | — | Override `MCP_URL` for this request |
+
+**Response:**
+
+```json
+{
+  "result": "...",
+  "team": "engineering",
+  "agents_used": ["ContextRouter", "Researcher", "Planner", "Coder", "Executor", "Reviewer"],
+  "models_pulled": [],
+  "duration_seconds": 30.7
+}
+```
 
 ---
 
-## Project patterns
+## Agent Roster
 
-Pattern files live in the **target project**, not in this repo. agno-hive discovers
-them at startup by calling `find_files(PATTERNS_GLOB)` on the connected MCP server
-and reading each file via `get_file_content()`.
+| Agent | Model | Role |
+|---|---|---|
+| Coordinator | `qwen3:30b-a3b` | Routes tasks, synthesises results |
+| ContextRouter | `llama3.1:8b` | Picks the right memory/search backend |
+| Researcher | `mixtral:8x7b` | Reads and summarises the codebase |
+| Planner | `deepseek-r1` | Breaks tasks into ordered steps |
+| Coder | `mistral-small3.1:24b` | Implements features and fixes |
+| Executor | `llama3.1:8b` | Runs commands and validates results |
+| Reviewer | `gemma3:27b` | Reviews code for correctness and security |
 
-Store patterns in your project under `patterns/*.md` (or set `PATTERNS_GLOB` to match
-your layout). The loaded content is injected into the coordinator's instructions before
-the first task runs.
+---
 
-### MCP tools agno-hive expects
+## Teams
 
-agno-hive works with any subset of these — missing tools are handled gracefully:
+Teams are defined in `teams/*.yaml`. The default team is `engineering` (all 6 agents). Create a new team by adding a YAML file — no code changes needed.
+
+```yaml
+name: my-team
+description: Custom team.
+coordinator_model: qwen3:30b-a3b
+agents:
+  - name: Coder
+    model: mistral-small3.1:24b
+    role: Senior engineer.
+    instructions:
+      - Write clean, idiomatic code.
+```
+
+---
+
+## MCP Tools AGNOHive Expects
+
+Works with any subset — missing tools are handled gracefully:
 
 | Tool | Purpose | Required |
 |---|---|---|
 | `find_files(pattern)` | Discover files by glob | Recommended |
 | `get_file_content(path)` | Read a file | Recommended |
-| `search_files(pattern, glob)` | Grep across codebase | Recommended |
-| `get_context_section(topic)` | Targeted DOCS section | Recommended |
-| `get_project_context()` | Full project overview (fallback) | Optional |
-| `write_file(path, content)` | Create or overwrite a file | Optional |
-| `apply_diff(path, diff)` | Surgical edits | Optional |
-| `run_command(cmd)` | Run tests / linters / build | Optional |
-| `memory_store(key, value)` | Persist a finding (session owned by client) | Optional |
+| `search_files(pattern, glob)` | Search across codebase | Recommended |
+| `run_command(cmd)` | Run tests / linters | Optional |
+| `memory_store(key, value)` | Persist a finding | Optional |
 | `memory_search(query)` | Recall prior findings | Optional |
+| `get_context_section(topic)` | Targeted docs section | Optional |
+| `get_project_context()` | Full project overview | Optional |
+
+> **Transport:** AGNOHive connects via **Streamable HTTP** (the current MCP standard). Your MCP server must expose a `/mcp` endpoint, not `/sse`.
 
 ---
 
-## Running tests
+## Git Workflow
+
+All file changes are made on Windows, committed, pushed to remote, then pulled on ZGX:
+
+```bash
+# On ZGX — pick up latest changes
+git -C ~/agno-hive pull
+```
+
+**Never edit files directly on ZGX.**
+
+---
+
+## What's Built
+
+| Component | Status |
+|---|---|
+| Engineering team (6 agents) | Done |
+| Dynamic YAML team specs | Done |
+| FastAPI server + `/run` endpoint | Done |
+| Bootstrap project context from MCP | Done |
+| OllamaToolFix (all tool-call formats) | Done |
+| ZGX infra — Qdrant + PostgreSQL/AGE (Docker) | Done |
+| LightRAG MCP server (Qdrant + AGE backends) | Done |
+| Automated code indexer (AST + incremental) | Done |
+| Self-improving loop (success → LightRAG, failure → Postgres) | Done |
+| OTel instrumentation → SigNoz | Done |
+| Cost-aware model routing | Planned |
+
+---
+
+## Running Tests
 
 ```bash
 pytest tests/ -v

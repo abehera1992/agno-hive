@@ -4,20 +4,31 @@
 
 ```
 agno-hive/
-├── main.py                  # Entry point: CLI, interactive loop, --serve flag
+├── main.py                  # Entry point: CLI, interactive loop, --serve, --serve-lightrag, --index
 ├── config/
 │   └── config.py            # All config via env vars, dataclass, loaded from .env
 ├── swarm/
-│   ├── agents.py            # Agent factory functions (make_coder, make_reviewer, make_agent_from_spec)
+│   ├── agents.py            # Agent factory functions (all 6 agents + make_agent_from_spec)
 │   ├── team.py              # run_task_async — builds and runs the Team
-│   ├── bootstrap.py         # Pre-team MCP session to fetch project patterns
+│   ├── bootstrap.py         # Pre-team MCP session via Streamable HTTP to fetch project patterns
+│   ├── feedback.py          # Self-improving loop: record_success, record_failure, load_failure_context
 │   ├── ollama.py            # Ollama model list/pull via httpx
 │   └── tool_fix.py          # OllamaToolFix: normalises all Ollama tool-call formats
 ├── api/
 │   ├── server.py            # FastAPI app: /health, /teams, /run
 │   └── models.py            # Pydantic models: AgentSpec, RunRequest, RunResponse
 ├── teams/
-│   └── coding.yaml          # Default Coder + Reviewer team spec
+│   └── engineering.yaml     # Full 6-agent engineering team spec
+├── lightrag_mcp/
+│   ├── server.py            # FastMCP SSE server: lightrag_insert, lightrag_query tools
+│   └── rag.py               # LightRAG instance factory (per-project cache, Qdrant + AGE backends)
+├── indexer/
+│   ├── cli.py               # Code indexer entry point and orchestration
+│   ├── parser.py            # Python AST chunker + generic text chunker
+│   └── tracker.py           # SHA-256 hash state for incremental indexing
+├── observability/
+│   ├── setup.py             # setup_telemetry() singleton — reads standard OTEL_* env vars
+│   └── metrics.py           # task_duration histogram + task_counter
 ├── docker/
 │   ├── docker-compose.zgx.yml   # ZGX infra stack (Qdrant + PostgreSQL/AGE)
 │   └── init/
@@ -44,11 +55,19 @@ agno-hive/
 | `RESEARCHER_MODEL` | `mixtral:8x7b` | Researcher agent model (Phase 2) |
 | `EXECUTOR_MODEL` | `llama3.1:8b` | Executor agent model (Phase 2) |
 | `ROUTER_MODEL` | `llama3.1:8b` | Context Router agent model (Phase 2) |
-| `MCP_URL` | `` | Client project MCP server SSE endpoint, e.g. `http://<host>:9000/sse` |
+| `MCP_URL` | `` | Client project MCP server endpoint (Streamable HTTP), e.g. `http://<host>:9000/mcp` |
 | `PATTERNS_GLOB` | `patterns/**/*.md` | Glob for bootstrap pattern files on the MCP server |
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant REST API (ZGX Docker) |
 | `POSTGRES_URI` | `` | PostgreSQL connection string, e.g. `postgresql://agno:agno@localhost:5432/agno_graph` |
-| `OTLP_ENDPOINT` | `` | OTel exporter endpoint, e.g. `http://<ekam-host>:4318` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `` | OTel collector endpoint, e.g. `http://<signoz-host>:4317` |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` | Transport: `grpc` (port 4317) or `http/protobuf` (port 4318) |
+| `OTEL_RESOURCE_ATTRIBUTES` | `` | e.g. `service.name=agno-hive,deployment.environment=dev` |
+| `OTEL_SDK_DISABLED` | `false` | Set to `true` to disable telemetry entirely |
+| `POSTGRES_USER` | `` | PostgreSQL user (required by LightRAG separately from `POSTGRES_URI`) |
+| `POSTGRES_PASSWORD` | `` | PostgreSQL password |
+| `POSTGRES_DATABASE` | `` | PostgreSQL database name |
+| `POSTGRES_HOST` | `localhost` | PostgreSQL host |
+| `POSTGRES_PORT` | `5432` | PostgreSQL port |
 | `AGNO_PORT` | `9001` | FastAPI server port |
 | `STREAM` | `false` | Enable streaming output |
 | `MAX_ITERATIONS` | `5` | Max coordinator iterations per task |
@@ -124,19 +143,25 @@ agents:
 ## How run_task_async Works
 
 ```
-run_task_async(task, agent_specs, coordinator_model, mcp_url)
-  1. bootstrap() — opens raw MCP session, reads patterns_glob files → project_context string
-  2. MCPTools(url, transport="sse") — opens persistent MCP connection for agents
-  3. Build team members (from agent_specs or default Coder+Reviewer)
-  4. Build Team (coordinator model + members + MCP tools + instructions + project_context)
-  5. team.arun(task) → returns result
+run_task_async(task, agent_specs, coordinator_model, mcp_url, project_id)
+  1. [parallel] bootstrap() — Streamable HTTP MCP session, reads patterns_glob → project_context
+  1. [parallel] load_failure_context(project_id) — queries PostgreSQL failure_log → failure_context
+  2. MCPTools(url, transport="streamable-http") — opens persistent MCP connection for agents
+  3. Build team members (from agent_specs or default engineering team)
+  4. Build Team (coordinator + members + MCP tools + instructions + project_context + failure_context)
+  5. team.arun(task)
+     ├── success → record_success() → LightRAG insert
+     └── failure → record_failure() → PostgreSQL failure_log
+  6. return result
 ```
 
-Bootstrap is a separate MCP session that closes before the Team opens its own connection. This avoids session conflicts.
+Bootstrap and failure context loading run in parallel (`asyncio.gather`) — no latency penalty.
 
 ## How Bootstrap Works
 
-`swarm/bootstrap.py` opens a raw `mcp.ClientSession` (not via Agno), calls `find_files(patterns_glob)` to discover pattern files, then reads each with `get_file_content()`. Falls back to `get_project_context()` if pattern files aren't found. Returns a combined string injected into the coordinator's instructions.
+`swarm/bootstrap.py` opens a raw `mcp.ClientSession` via **Streamable HTTP** (`streamablehttp_client`), calls `find_files(patterns_glob)` to discover pattern files, then reads each with `get_file_content()`. Falls back to `get_project_context()` if pattern files aren't found. Returns a combined string injected into the coordinator's instructions.
+
+> **Transport note:** AGNOHive uses Streamable HTTP (the current MCP standard) for all MCP connections. Your MCP server must expose a `/mcp` endpoint. The deprecated `/sse` endpoint will return `400 Bad Request`.
 
 ## How OllamaToolFix Works
 
