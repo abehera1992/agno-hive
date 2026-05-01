@@ -50,5 +50,11 @@ class Config:
     stream: bool = os.getenv("STREAM", "false").lower() == "true"
     max_iterations: int = int(os.getenv("MAX_ITERATIONS", "5"))
 
+    # Session persistence
+    session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))
+    session_window: int = int(os.getenv("AGNO_SESSION_WINDOW", "6"))
+    compact_threshold: int = int(os.getenv("AGNO_COMPACT_THRESHOLD", "20"))
+    session_cleanup_interval: int = int(os.getenv("SESSION_CLEANUP_INTERVAL", "3600"))
+
 
 config = Config()
