@@ -166,6 +166,66 @@ python main.py --index --path /path/to/repo --project-id myproject --force
 
 ---
 
+## CLI Client (`hive`)
+
+AGNOHive ships a zero-dependency CLI client (`cli/hive`) that lets you use the swarm from any terminal that can reach ZGX — the same feel as an AI coding assistant in your project directory.
+
+### Installation
+
+```bash
+# Copy to your PATH
+mkdir -p ~/.local/bin
+cp /path/to/agno-hive/cli/hive ~/.local/bin/hive
+chmod +x ~/.local/bin/hive
+
+# Or fetch directly from the repo
+curl -o ~/.local/bin/hive https://raw.githubusercontent.com/<your-repo>/agno-hive/main/cli/hive
+chmod +x ~/.local/bin/hive
+
+# Ensure ~/.local/bin is in PATH (add to ~/.bashrc or ~/.zshrc)
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+### Configuration
+
+```bash
+# Add to ~/.bashrc or ~/.zshrc
+export AGNO_HOST=http://<zgx-ip>:9001    # AGNOHive server address
+export AGNO_PROJECT=myproject             # override project auto-detection
+export AGNO_TEAM=engineering              # team to use (default: engineering)
+```
+
+`AGNO_PROJECT` is auto-detected from `git remote get-url origin` if not set — so running `hive` inside a git repo will automatically use that repo's name as the project id.
+
+### Usage
+
+```bash
+# Single task
+hive "how does authentication work in this project?"
+
+# Interactive REPL
+hive
+> what models are in the User table?
+> write a test for the login endpoint
+> exit
+
+# Explicit project and team
+hive --project myapp --team engineering "fix the rate limiting bug"
+
+# Connect to a different AGNOHive instance
+hive --host http://other-host:9001 "explain the auth flow"
+```
+
+### Features
+
+- **Auto-detects project** from `git remote get-url origin` in your current directory
+- **Readline history** — arrow keys, Ctrl+R search, persisted in `~/.agno_history`
+- **Shows agents + duration** after every response
+- **Health check** on startup — warns if ZGX is unreachable before you type anything
+- **Zero dependencies** — pure Python 3 stdlib, works on any machine with Python installed
+
+---
+
 ## API Usage
 
 ### Health check
