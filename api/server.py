@@ -60,8 +60,8 @@ async def run(request: RunRequest):
         agent_specs, coordinator_model = _load_team(request.team)
         team_name = request.team
     else:
-        agent_specs, coordinator_model = _load_team("coding")
-        team_name = "coding"
+        agent_specs, coordinator_model = _load_team("engineering")
+        team_name = "engineering"
 
     # Pull any missing Ollama models before building the team
     all_models = list({coordinator_model} | {a.model for a in agent_specs})
