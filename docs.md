@@ -193,6 +193,66 @@ docker compose -f ~/agno-hive/docker/docker-compose.zgx.yml restart
 docker compose -f ~/agno-hive/docker/docker-compose.zgx.yml down
 ```
 
+## Self-Improving Loop (Phase 5)
+
+Every task run feeds back into memory so the coordinator learns from past outcomes.
+
+### Flow
+
+```
+run_task_async(task, project_id)
+  ├── load_failure_context(project_id)   → recent failures injected into coordinator instructions
+  ├── bootstrap()                        → project patterns from MCP
+  ├── team.arun(task)
+  │     ├── success → record_success()  → LightRAG insert (agents can query via memory_search)
+  │     └── failure → record_failure()  → PostgreSQL failure_log table
+  └── return result
+```
+
+### Success Path
+
+Outcome stored in LightRAG via `rag.ainsert()` — tagged with project_id and task description. Agents retrieve past successes via `memory_search` MCP tool in subsequent runs.
+
+### Failure Path
+
+Failures written to a `failure_log` PostgreSQL table (auto-created on first use):
+
+| Column | Type | Description |
+|---|---|---|
+| `project_id` | TEXT | Project namespace |
+| `task` | TEXT | Task description (truncated to 300 chars) |
+| `error_type` | TEXT | Exception class name |
+| `error_message` | TEXT | Error message (truncated to 500 chars) |
+| `agent` | TEXT | Agent that failed |
+| `created_at` | TIMESTAMPTZ | Timestamp |
+
+### Context Injection
+
+Before every `team.arun()`, the 3 most recent failures for the project are loaded and appended to the coordinator's instructions:
+
+```
+── Past failures — avoid repeating these mistakes ──────────
+  Task:  refactor the auth module
+  Error: RuntimeError: get_file_content returned empty for src/auth.py
+
+  Task:  add rate limiting to /api/login
+  Error: TimeoutError: MCP connection timed out after 60s
+```
+
+### API Change
+
+`POST /run` now accepts `project_id` (default: `"default"`):
+
+```json
+{ "task": "...", "project_id": "ekam", "team": "engineering" }
+```
+
+### Files
+
+```
+swarm/feedback.py   # record_success, record_failure, load_failure_context, _ensure_table
+```
+
 ## Automated Code Indexer (Phase 4)
 
 Walks a repository, chunks source files, and inserts them into LightRAG. Runs on ZGX where LightRAG and Qdrant/PostgreSQL are available. No additional dependencies — Python files are parsed with the built-in `ast` module; all other types use fixed-size text chunking.

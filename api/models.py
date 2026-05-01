@@ -10,9 +10,10 @@ class AgentSpec(BaseModel):
 
 class RunRequest(BaseModel):
     task: str
-    team: str | None = None          # named team from registry (teams/*.yaml)
-    agents: list[AgentSpec] | None = None  # inline spec — overrides registry
-    mcp_url: str | None = None       # override default MCP_URL for this request
+    project_id: str = "default"             # namespace for memory and feedback loop
+    team: str | None = None                 # named team from registry (teams/*.yaml)
+    agents: list[AgentSpec] | None = None   # inline spec — overrides registry
+    mcp_url: str | None = None              # override default MCP_URL for this request
 
 
 class RunResponse(BaseModel):

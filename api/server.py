@@ -74,6 +74,7 @@ async def run(request: RunRequest):
         agent_specs=agent_specs,
         coordinator_model=coordinator_model,
         mcp_url=mcp_url,
+        project_id=request.project_id,
     )
 
     return RunResponse(

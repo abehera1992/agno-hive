@@ -1,7 +1,10 @@
+import asyncio
+
 from agno.team import Team
 from agno.tools.mcp import MCPTools
 from .agents import make_coder, make_reviewer, make_agent_from_spec, get_model
 from .bootstrap import bootstrap
+from .feedback import record_success, record_failure, load_failure_context
 from config.config import config
 
 _MCP_TIMEOUT = 60
@@ -38,16 +41,22 @@ async def run_task_async(
     agent_specs: list | None = None,
     coordinator_model: str | None = None,
     mcp_url: str | None = None,
+    project_id: str = "default",
 ) -> str:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer."""
     effective_mcp_url = mcp_url or config.mcp_url
     effective_coordinator = coordinator_model or config.leader_model
 
-    project_context = await bootstrap(effective_mcp_url, _MCP_TIMEOUT, config.patterns_glob)
+    project_context, failure_context = await asyncio.gather(
+        bootstrap(effective_mcp_url, _MCP_TIMEOUT, config.patterns_glob),
+        load_failure_context(project_id),
+    )
 
     instructions = list(_COORDINATOR_INSTRUCTIONS)
     if project_context:
         instructions += ["", "── Project rules (loaded from MCP) ──────────────────", project_context]
+    if failure_context:
+        instructions += ["", failure_context]
 
     async with MCPTools(url=effective_mcp_url, transport="sse", timeout_seconds=_MCP_TIMEOUT) as mcp:
         if agent_specs:
@@ -65,5 +74,12 @@ async def run_task_async(
             show_members_responses=True,
             max_iterations=config.max_iterations,
         )
-        result = await team.arun(task)
-        return result.content if hasattr(result, "content") else str(result)
+
+        try:
+            result = await team.arun(task)
+            content = result.content if hasattr(result, "content") else str(result)
+            await record_success(task, content, project_id)
+            return content
+        except Exception as exc:
+            await record_failure(task, str(exc), project_id)
+            raise
