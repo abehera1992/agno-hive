@@ -22,3 +22,8 @@ class RunResponse(BaseModel):
     agents_used: list[str]
     models_pulled: list[str]
     duration_seconds: float
+
+
+class PlanResponse(BaseModel):
+    plan: str
+    duration_seconds: float

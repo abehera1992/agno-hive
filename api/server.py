@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 from fastapi import FastAPI, HTTPException
 
-from api.models import AgentSpec, RunRequest, RunResponse
+from api.models import AgentSpec, RunRequest, RunResponse, PlanResponse
 from swarm.ollama import ensure_models
 from swarm.team import run_task_async
 from config.config import config
@@ -92,5 +92,30 @@ async def run(request: RunRequest):
         team=team_name,
         agents_used=[a.name for a in agent_specs],
         models_pulled=models_pulled,
+        duration_seconds=round(time.perf_counter() - start, 2),
+    )
+
+
+@app.post("/plan", response_model=PlanResponse)
+async def plan(request: RunRequest):
+    """Run the planning team only — returns a step-by-step plan without executing.
+    Used by the hive CLI --review flag for human-in-the-loop approval before execution.
+    """
+    start = time.perf_counter()
+    agent_specs, coordinator_model = _load_team("planning")
+    mcp_url = request.mcp_url or config.mcp_url
+
+    all_models = list({coordinator_model} | {a.model for a in agent_specs})
+    await ensure_models(all_models, config.ollama_host)
+
+    plan_text = await run_task_async(
+        task=request.task,
+        agent_specs=agent_specs,
+        coordinator_model=coordinator_model,
+        mcp_url=mcp_url,
+        project_id=request.project_id,
+    )
+    return PlanResponse(
+        plan=plan_text,
         duration_seconds=round(time.perf_counter() - start, 2),
     )

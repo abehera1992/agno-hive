@@ -6,14 +6,15 @@ Installation (on any machine that can reach ZGX):
     chmod +x ~/.local/bin/hive
 
 Environment vars (add to ~/.bashrc or ~/.zshrc):
-    export AGNO_HOST=http://100.96.86.82:9001   # ZGX address (default)
-    export AGNO_PROJECT=ekam                     # override project auto-detect
-    export AGNO_TEAM=engineering                 # team to use (default)
+    export AGNO_HOST=http://<zgx-ip>:9001   # AGNOHive server address
+    export AGNO_PROJECT=myproject            # override project auto-detect
+    export AGNO_TEAM=engineering             # team to use (default)
 
 Usage:
-    hive "how does authentication work?"         # single task
-    hive                                         # interactive REPL
-    hive --project myapp "fix the login bug"     # explicit project
+    hive "how does authentication work?"          # single task
+    hive                                          # interactive REPL
+    hive --review "add rate limiting to /login"   # plan first, confirm before running
+    hive --project myapp "fix the login bug"      # explicit project
 """
 import json
 import os
@@ -94,20 +95,8 @@ def run_task(task: str, project_id: str) -> None:
             "team":       AGNO_TEAM,
         })
         if _COLOUR:
-            print(" " * 20, end="\r")   # clear "thinking..."
-        result   = data.get("result", "")
-        agents   = ", ".join(data.get("agents_used", []))
-        duration = data.get("duration_seconds", 0)
-        pulled   = data.get("models_pulled", [])
-
-        print()
-        print(result)
-        print()
-        footer = f"── {agents} · {duration:.1f}s"
-        if pulled:
-            footer += f" · pulled: {', '.join(pulled)}"
-        print(dim(footer))
-        print()
+            print(" " * 20, end="\r")
+        _print_result(data)
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
         try:
@@ -122,9 +111,85 @@ def run_task(task: str, project_id: str) -> None:
         print(red(f"  error: {e}"))
 
 
+def review_task(task: str, project_id: str) -> None:
+    """HITL flow — plan first, ask for approval, then execute."""
+    # ── Step 1: Plan ──────────────────────────────────────────────────────────
+    print(f"\n{bold('Planning...')} {dim('(ContextRouter → Researcher → Planner)')}\n")
+    try:
+        data = call_api("/plan", {
+            "task":       task,
+            "project_id": project_id,
+        })
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        try:
+            msg = json.loads(body).get("detail", body)
+        except Exception:
+            msg = body
+        print(red(f"  plan failed {e.code}: {msg}"))
+        return
+    except Exception as e:
+        print(red(f"  plan error: {e}"))
+        return
+
+    plan     = data.get("plan", "")
+    duration = data.get("duration_seconds", 0)
+
+    # ── Step 2: Show the plan ─────────────────────────────────────────────────
+    print(f"{bold('─' * 60)}")
+    print(f"{bold('Proposed Plan')}")
+    print(f"{bold('─' * 60)}\n")
+    print(plan)
+    print(f"\n{dim(f'── planned in {duration:.1f}s')}\n")
+    print(f"{bold('─' * 60)}\n")
+
+    # ── Step 3: Confirm ───────────────────────────────────────────────────────
+    try:
+        answer = input(f"{bold('Proceed with this plan?')} {dim('[Y/n]')} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n{yellow('  aborted.')}")
+        return
+
+    if answer in ("n", "no"):
+        print(f"{yellow('  plan rejected — nothing was executed.')}")
+        return
+
+    # ── Step 4: Execute ───────────────────────────────────────────────────────
+    print(f"\n{bold('Executing...')} {dim('(full engineering team)')}\n")
+    if _COLOUR:
+        print(dim("  thinking..."), end="\r", flush=True)
+    try:
+        result_data = call_api("/run", {
+            "task":       task,
+            "project_id": project_id,
+            "team":       AGNO_TEAM,
+        })
+        if _COLOUR:
+            print(" " * 20, end="\r")
+        _print_result(result_data)
+    except Exception as e:
+        print(red(f"  execution error: {e}"))
+
+
+def _print_result(data: dict) -> None:
+    result   = data.get("result", "")
+    agents   = ", ".join(data.get("agents_used", []))
+    duration = data.get("duration_seconds", 0)
+    pulled   = data.get("models_pulled", [])
+
+    print()
+    print(result)
+    print()
+    footer = f"── {agents} · {duration:.1f}s"
+    if pulled:
+        footer += f" · pulled: {', '.join(pulled)}"
+    print(dim(footer))
+    print()
+
+
 # ── Interactive REPL ──────────────────────────────────────────────────────────
 
-def repl(project_id: str) -> None:
+def repl(project_id: str, review: bool = False) -> None:
     history = Path.home() / ".agno_history"
     try:
         readline.read_history_file(history)
@@ -132,14 +197,17 @@ def repl(project_id: str) -> None:
         pass
     readline.set_history_length(500)
 
+    mode_label = cyan("review") if review else cyan(AGNO_TEAM)
     print(
         f"{bold('AGNOHive')}  "
         f"project {cyan(project_id)}  "
-        f"team {cyan(AGNO_TEAM)}  "
+        f"mode {mode_label}  "
         f"{dim(AGNO_HOST)}"
     )
     if not health_check():
         print(yellow("  warning: AGNOHive is not reachable — tasks will fail"))
+    if review:
+        print(dim("  review mode: plan will be shown before every task executes"))
     print(dim("  type 'exit' or Ctrl+C to quit\n"))
 
     try:
@@ -155,9 +223,16 @@ def repl(project_id: str) -> None:
                 break
             if task.lower() in ("help", "?"):
                 print(dim("  send any task or question to AGNOHive"))
-                print(dim(f"  project: {project_id} · team: {AGNO_TEAM}"))
+                print(dim(f"  project: {project_id} · mode: {'review' if review else AGNO_TEAM}"))
+                print(dim("  prefix task with '!' to skip review for a single task"))
                 continue
-            run_task(task, project_id)
+            # Allow per-task review bypass with '!' prefix
+            if task.startswith("!") and review:
+                run_task(task[1:].strip(), project_id)
+            elif review:
+                review_task(task, project_id)
+            else:
+                run_task(task, project_id)
     except KeyboardInterrupt:
         print()
     finally:
@@ -174,10 +249,12 @@ def main() -> None:
         description="AGNOHive CLI — run the agent swarm from your terminal",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("task",    nargs="*",  help="task to run (omit for interactive mode)")
-    parser.add_argument("--project", "-p",     help="project id (default: auto-detect from git)")
-    parser.add_argument("--team",    "-t",     help=f"team to use (default: {AGNO_TEAM})")
-    parser.add_argument("--host",    "-H",     help=f"AGNOHive host (default: {AGNO_HOST})")
+    parser.add_argument("task",              nargs="*", help="task to run (omit for interactive mode)")
+    parser.add_argument("--project",  "-p",            help="project id (default: auto-detect from git)")
+    parser.add_argument("--team",     "-t",            help=f"team to use (default: {AGNO_TEAM})")
+    parser.add_argument("--host",     "-H",            help=f"AGNOHive host (default: {AGNO_HOST})")
+    parser.add_argument("--review",   "-r",            action="store_true",
+                        help="HITL mode: show plan and ask for approval before executing")
 
     args = parser.parse_args()
 
@@ -190,9 +267,13 @@ def main() -> None:
     project_id = args.project or detect_project()
 
     if args.task:
-        run_task(" ".join(args.task), project_id)
+        task = " ".join(args.task)
+        if args.review:
+            review_task(task, project_id)
+        else:
+            run_task(task, project_id)
     else:
-        repl(project_id)
+        repl(project_id, review=args.review)
 
 
 if __name__ == "__main__":
