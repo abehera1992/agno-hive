@@ -9,8 +9,18 @@ from api.models import AgentSpec, RunRequest, RunResponse
 from swarm.ollama import ensure_models
 from swarm.team import run_task_async
 from config.config import config
+from observability.setup import setup_telemetry
+
+setup_telemetry()
 
 app = FastAPI(title="AgnoHive", version="1.0.0")
+
+# Auto-instrument FastAPI — adds spans for every HTTP request
+try:
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    FastAPIInstrumentor.instrument_app(app)
+except ImportError:
+    pass
 
 _TEAMS_DIR = Path(__file__).parent.parent / "teams"
 

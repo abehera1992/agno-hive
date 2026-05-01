@@ -1,11 +1,15 @@
 import asyncio
+import time
 
+from opentelemetry import trace
 from agno.team import Team
 from agno.tools.mcp import MCPTools
 from .agents import make_coder, make_reviewer, make_agent_from_spec, get_model
 from .bootstrap import bootstrap
 from .feedback import record_success, record_failure, load_failure_context
 from config.config import config
+
+_tracer = trace.get_tracer("agno-hive.team")
 
 _MCP_TIMEOUT = 60
 
@@ -75,11 +79,32 @@ async def run_task_async(
             max_iterations=config.max_iterations,
         )
 
-        try:
-            result = await team.arun(task)
-            content = result.content if hasattr(result, "content") else str(result)
-            await record_success(task, content, project_id)
-            return content
-        except Exception as exc:
-            await record_failure(task, str(exc), project_id)
-            raise
+        span_attrs = {
+            "project_id": project_id,
+            "coordinator_model": effective_coordinator,
+            "agent_count": len(members),
+            "task": task[:120],
+        }
+
+        with _tracer.start_as_current_span("agno.task", attributes=span_attrs) as span:
+            from observability.metrics import task_duration, task_counter
+            t0 = time.perf_counter()
+            try:
+                with _tracer.start_as_current_span("agno.team.run"):
+                    result = await team.arun(task)
+                content = result.content if hasattr(result, "content") else str(result)
+                span.set_status(trace.StatusCode.OK)
+                task_counter.add(1, {"project_id": project_id, "outcome": "success"})
+                await record_success(task, content, project_id)
+                return content
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(trace.StatusCode.ERROR, str(exc))
+                task_counter.add(1, {"project_id": project_id, "outcome": "failure"})
+                await record_failure(task, str(exc), project_id)
+                raise
+            finally:
+                task_duration.record(
+                    time.perf_counter() - t0,
+                    {"project_id": project_id},
+                )

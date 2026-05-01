@@ -309,6 +309,50 @@ indexer/
 
 State files: `~/.agno-hive/index-state/{project_id}.json` — delete to force full reindex.
 
+## OTel Instrumentation (Phase 6)
+
+AGNOHive uses the OpenTelemetry Python SDK with a configurable `OTLP_ENDPOINT`. If the env var is empty, telemetry is completely disabled — zero overhead, no errors.
+
+### File Structure
+
+```
+observability/
+  __init__.py
+  setup.py     # setup_telemetry() singleton — call once at process startup
+  metrics.py   # task_duration (histogram) and task_counter (counter) instruments
+```
+
+### What Gets Traced
+
+| Span | Attributes |
+|---|---|
+| `agno.task` (root) | `project_id`, `coordinator_model`, `agent_count`, `task` (first 120 chars) |
+| `agno.team.run` (child) | — |
+| HTTP requests | Auto-instrumented via `FastAPIInstrumentor` |
+
+Failures set `ERROR` status on the span and call `span.record_exception()`.
+
+### What Gets Measured
+
+| Metric | Type | Labels |
+|---|---|---|
+| `agno.task.duration` | Histogram (seconds) | `project_id` |
+| `agno.task.count` | Counter | `project_id`, `outcome` (success/failure) |
+
+### Enabling Telemetry
+
+Set `OTLP_ENDPOINT` in `.env` and restart:
+
+```bash
+# SigNoz self-hosted on Ekam host
+OTLP_ENDPOINT=http://<ekam-host-ip>:4318
+
+# Any other OTel-compatible backend
+OTLP_ENDPOINT=http://localhost:4317
+```
+
+`setup_telemetry()` is called at startup in both `--serve` (FastAPI) and CLI/interactive modes. Metrics are exported every 60 seconds.
+
 ## Observability
 
 AGNOHive will use the OpenTelemetry Python SDK (`opentelemetry-sdk`, `opentelemetry-exporter-otlp`) with a configurable `OTLP_ENDPOINT`. Set this to the SigNoz OTLP HTTP endpoint on the Ekam host:

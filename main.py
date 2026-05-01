@@ -10,6 +10,7 @@ Usage:
 import asyncio
 import sys
 from swarm.team import run_task_async
+from observability.setup import setup_telemetry
 
 
 async def _interactive() -> None:
@@ -30,6 +31,7 @@ async def _interactive() -> None:
 
 
 if __name__ == "__main__":
+    setup_telemetry()
     if "--serve" in sys.argv:
         import uvicorn
         from api.server import app
