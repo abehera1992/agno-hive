@@ -62,7 +62,7 @@ async def run_task_async(
     if failure_context:
         instructions += ["", failure_context]
 
-    async with MCPTools(url=effective_mcp_url, transport="sse", timeout_seconds=_MCP_TIMEOUT) as mcp:
+    async with MCPTools(url=effective_mcp_url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT) as mcp:
         if agent_specs:
             members = [make_agent_from_spec(spec, mcp) for spec in agent_specs]
         else:

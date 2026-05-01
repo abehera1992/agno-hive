@@ -22,11 +22,13 @@ async def pull_model(model: str, ollama_host: str) -> None:
 async def ensure_models(models: list[str], ollama_host: str) -> list[str]:
     """Pull any models not already in Ollama. Returns list of models that were pulled."""
     available = await list_models(ollama_host)
+    # Match both exact tags (deepseek-r1:latest) and tagless names (deepseek-r1)
+    available_exact = set(available)
     available_bases = {m.split(":")[0] for m in available}
     pulled = []
     for model in models:
         base = model.split(":")[0]
-        if model not in available and base not in available_bases:
+        if model not in available_exact and base not in available_bases:
             await pull_model(model, ollama_host)
             pulled.append(model)
     return pulled

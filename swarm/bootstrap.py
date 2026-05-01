@@ -4,7 +4,7 @@ Opens a raw MCP client session, fetches project patterns via file tools,
 and returns the combined context string.
 """
 from mcp import ClientSession
-from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
 
 
 async def bootstrap(
@@ -17,7 +17,7 @@ async def bootstrap(
     Falls back to "" if the MCP server is unreachable.
     """
     try:
-        async with sse_client(mcp_url) as (read, write):
+        async with streamablehttp_client(mcp_url) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 return await _load_from_session(session, patterns_glob)
