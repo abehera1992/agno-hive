@@ -209,6 +209,17 @@ hive
 > write a test for the login endpoint
 > exit
 
+# Human-in-the-loop review mode — shows plan before executing
+hive --review "add rate limiting to the login endpoint"
+
+# Review mode REPL — every task shows a plan and asks for approval
+hive --review
+> refactor the User model to use UUIDs
+# → plan shown, Proceed? [Y/n] prompt appears before agents execute
+
+# Skip review for one task in a review REPL (prefix with !)
+> ! what files are in the auth module?
+
 # Explicit project and team
 hive --project myapp --team engineering "fix the rate limiting bug"
 
@@ -222,6 +233,7 @@ hive --host http://other-host:9001 "explain the auth flow"
 - **Readline history** — arrow keys, Ctrl+R search, persisted in `~/.agno_history`
 - **Shows agents + duration** after every response
 - **Health check** on startup — warns if ZGX is unreachable before you type anything
+- **HITL review mode** (`--review`) — plan shown before every task executes, requires your approval
 - **Zero dependencies** — pure Python 3 stdlib, works on any machine with Python installed
 
 ---
@@ -272,6 +284,28 @@ curl -X POST http://localhost:9001/run \
 }
 ```
 
+### Get a plan only (HITL)
+
+Returns a step-by-step plan from the planning team without executing. Used by `hive --review`.
+
+```bash
+curl -X POST http://localhost:9001/plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task": "Add rate limiting to the login endpoint",
+    "project_id": "myproject"
+  }'
+```
+
+**Response:**
+
+```json
+{
+  "plan": "1. Researcher: read API/auth-service/routes.py ...\n2. Coder: implement ...",
+  "duration_seconds": 18.2
+}
+```
+
 ---
 
 ## Agent Roster
@@ -290,7 +324,14 @@ curl -X POST http://localhost:9001/run \
 
 ## Teams
 
-Teams are defined in `teams/*.yaml`. The default team is `engineering` (all 6 agents). Create a new team by adding a YAML file — no code changes needed.
+Teams are defined in `teams/*.yaml`. Two built-in teams ship with AGNOHive:
+
+| Team | Agents | Used for |
+|---|---|---|
+| `engineering` | All 6 (default) | Full implementation tasks |
+| `planning` | ContextRouter + Researcher + Planner | HITL plan review via `POST /plan` |
+
+Create a new team by adding a YAML file — no code changes needed.
 
 ```yaml
 name: my-team
@@ -303,6 +344,80 @@ agents:
     instructions:
       - Write clean, idiomatic code.
 ```
+
+---
+
+## Global Memory (Cross-Project Knowledge)
+
+AGNOHive maintains two memory namespaces in LightRAG/Qdrant:
+
+| Namespace | Scope | Use case |
+|---|---|---|
+| `project_{id}` | Per-project | Code-specific knowledge, file patterns, project conventions |
+| `global` | Shared across all projects | Architectural patterns, debugging approaches, reusable solutions |
+
+Every `lightrag_query` call automatically searches **both** namespaces and merges the results — agents get project-specific and cross-project context in one call.
+
+Agents store cross-project insights via the `lightrag_insert_global` MCP tool:
+```
+lightrag_insert_global("Always use UUIDs for primary keys in FastAPI services — avoids int enumeration attacks.")
+```
+
+The ContextRouter knows when to query global memory:
+- Project-specific questions → `lightrag_query(query, project_id, mode='local')`
+- Cross-project patterns → `lightrag_query(query, 'global', mode='hybrid')`
+
+---
+
+## Human-in-the-Loop (HITL) Plan Review
+
+Before AGNOHive executes any implementation task, you can require a plan approval step. The planning team (ContextRouter + Researcher + Planner) produces a step-by-step plan — you review it and approve or reject before the full engineering team runs.
+
+### Via CLI
+
+```bash
+# Single task with review
+hive --review "add rate limiting to the login endpoint"
+
+# Review mode REPL — every task requires approval
+hive --review
+
+# Skip review for one task in a review session
+> ! what is in the auth module?  # the ! prefix bypasses review
+```
+
+### Via API
+
+```bash
+# Step 1: Get the plan
+curl -X POST http://localhost:9001/plan \
+  -H "Content-Type: application/json" \
+  -d '{"task": "Add rate limiting", "project_id": "myproject"}'
+
+# Step 2: Review the plan, then execute if approved
+curl -X POST http://localhost:9001/run \
+  -H "Content-Type: application/json" \
+  -d '{"task": "Add rate limiting", "project_id": "myproject"}'
+```
+
+---
+
+## VSCode Code Diff Before Edits (Client MCP)
+
+If your client project MCP server supports it, AGNOHive can show a VSCode diff of every proposed file change **before applying it** — giving you final say on every edit.
+
+Enable on the client MCP server side with `WRITE_REVIEW=true` in the server's environment. When an agent calls `write_file()` or `apply_diff()` on an existing file:
+
+1. A `.hive_proposed` temp file is created with the proposed content
+2. VSCode opens a diff automatically (original ← → proposed)
+3. The agent receives `review_pending: path/to/file` and waits
+4. You review the diff in VSCode, then tell the agent to proceed:
+   - **Apply:** ask the agent to call `confirm_write('path/to/file')`
+   - **Reject:** ask the agent to call `reject_write('path/to/file')`
+
+The agent's instructions prevent it from auto-confirming — it always waits for your explicit approval.
+
+> This feature requires `confirm_write` and `reject_write` tools to be registered in your client project's MCP server. See `tools/write.py` in your MCP server for the implementation.
 
 ---
 
@@ -352,6 +467,9 @@ git -C ~/agno-hive pull
 | Automated code indexer (AST + incremental) | Done |
 | Self-improving loop (success → LightRAG, failure → Postgres) | Done |
 | OTel instrumentation → SigNoz | Done |
+| Global memory (cross-project shared namespace) | Done |
+| HITL plan review (`POST /plan` + `hive --review`) | Done |
+| VSCode diff before edits (client MCP integration) | Done |
 | Cost-aware model routing | Planned |
 
 ---
