@@ -46,14 +46,28 @@ async def run_task_async(
     coordinator_model: str | None = None,
     mcp_url: str | None = None,
     project_id: str = "default",
+    session_id: str | None = None,
 ) -> str:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer."""
     effective_mcp_url = mcp_url or config.mcp_url
     effective_coordinator = coordinator_model or config.leader_model
 
-    project_context, failure_context = await asyncio.gather(
-        bootstrap(effective_mcp_url, _MCP_TIMEOUT, config.patterns_glob),
-        load_failure_context(project_id),
+    from swarm.sessions import get_context as get_session_context
+
+    async def _load_session_context():
+        if session_id:
+            try:
+                return await get_session_context(session_id)
+            except Exception as exc:
+                print(f"[team] session context warning: {exc}")
+        return "", []
+
+    project_context, failure_context, (session_summary, session_messages) = (
+        await asyncio.gather(
+            bootstrap(effective_mcp_url, _MCP_TIMEOUT, config.patterns_glob),
+            load_failure_context(project_id),
+            _load_session_context(),
+        )
     )
 
     instructions = list(_COORDINATOR_INSTRUCTIONS)
@@ -61,6 +75,19 @@ async def run_task_async(
         instructions += ["", "── Project rules (loaded from MCP) ──────────────────", project_context]
     if failure_context:
         instructions += ["", failure_context]
+    if session_summary:
+        instructions += [
+            "",
+            "── Session summary (older turns) ─────────────────────────────────",
+            session_summary,
+            "──────────────────────────────────────────────────────────────────",
+        ]
+    if session_messages:
+        lines = ["── Recent messages ───────────────────────────────────────────────"]
+        for msg in session_messages:
+            lines.append(f"[{msg['role']}] {msg['content'][:800]}")
+        lines.append("──────────────────────────────────────────────────────────────────")
+        instructions += [""] + lines
 
     async with MCPTools(url=effective_mcp_url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT) as mcp:
         if agent_specs:
