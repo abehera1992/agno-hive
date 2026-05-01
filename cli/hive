@@ -11,10 +11,13 @@ Environment vars (add to ~/.bashrc or ~/.zshrc):
     export AGNO_TEAM=engineering             # team to use (default)
 
 Usage:
-    hive "how does authentication work?"          # single task
-    hive                                          # interactive REPL
-    hive --review "add rate limiting to /login"   # plan first, confirm before running
-    hive --project myapp "fix the login bug"      # explicit project
+    hive "task"                              # one-shot (new session each time)
+    hive                                     # REPL (auto-resumes last session)
+    hive --session <id>                      # resume a specific session
+    hive --persist "task"                    # permanent session
+    hive --list-sessions                     # list recent sessions and exit
+    hive --review "task"                     # plan -> approve -> execute
+    hive --project myapp "fix the bug"       # explicit project
 """
 import json
 import os
@@ -24,12 +27,15 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlencode
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 AGNO_HOST    = os.getenv("AGNO_HOST",    "http://100.96.86.82:9001")
 AGNO_PROJECT = os.getenv("AGNO_PROJECT", "")
 AGNO_TEAM    = os.getenv("AGNO_TEAM",    "engineering")
+
+_LAST_SESSION_FILE = Path.home() / ".agno_last_session"
 
 # ── ANSI colours (disabled if not a TTY) ──────────────────────────────────────
 
@@ -65,6 +71,28 @@ def detect_project() -> str:
     return Path.cwd().name
 
 
+def load_last_session(project_id: str) -> str | None:
+    """Return last session ID for this project from ~/.agno_last_session."""
+    try:
+        data = json.loads(_LAST_SESSION_FILE.read_text())
+        if data.get("project_id") == project_id:
+            return data.get("session_id")
+    except Exception:
+        pass
+    return None
+
+
+def save_last_session(session_id: str, project_id: str) -> None:
+    """Write last session ID to ~/.agno_last_session."""
+    try:
+        _LAST_SESSION_FILE.write_text(
+            json.dumps({"session_id": session_id, "project_id": project_id})
+        )
+    except Exception:
+        pass
+
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
+
 def call_api(endpoint: str, payload: dict, timeout: int = 300) -> dict:
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
@@ -77,6 +105,26 @@ def call_api(endpoint: str, payload: dict, timeout: int = 300) -> dict:
         return json.loads(resp.read())
 
 
+def call_get(endpoint: str, params: dict | None = None, timeout: int = 30) -> dict:
+    url = f"{AGNO_HOST}{endpoint}"
+    if params:
+        url += "?" + urlencode(params)
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def call_delete(endpoint: str, timeout: int = 30) -> dict:
+    req = urllib.request.Request(f"{AGNO_HOST}{endpoint}", method="DELETE")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def call_patch(endpoint: str, timeout: int = 30) -> dict:
+    req = urllib.request.Request(f"{AGNO_HOST}{endpoint}", method="PATCH")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
 def health_check() -> bool:
     try:
         with urllib.request.urlopen(f"{AGNO_HOST}/health", timeout=5) as r:
@@ -84,8 +132,70 @@ def health_check() -> bool:
     except Exception:
         return False
 
+# ── Result display ────────────────────────────────────────────────────────────
 
-def run_task(task: str, project_id: str) -> None:
+def _format_expiry(expires_at: str | None, persist: bool) -> str:
+    if persist:
+        return "[persistent]"
+    if not expires_at:
+        return ""
+    try:
+        from datetime import datetime
+        exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        return f"expires {exp.strftime('%Y-%m-%d')}"
+    except Exception:
+        return ""
+
+
+def _print_result(data: dict, show_resume: bool = False) -> None:
+    result   = data.get("result", "")
+    agents   = ", ".join(data.get("agents_used", []))
+    duration = data.get("duration_seconds", 0)
+    pulled   = data.get("models_pulled", [])
+    session  = data.get("session", {})
+
+    session_id   = session.get("session_id", "")
+    turn         = session.get("turn", 0)
+    context_size = session.get("context_size", 0)
+    compacted    = session.get("compacted", False)
+    persist      = session.get("persist", False)
+    expires_at   = session.get("expires_at")
+
+    print()
+    print(result)
+    print()
+
+    sid_short   = session_id[:8] if session_id else ""
+    context_str = f"summary + {context_size} msgs" if compacted else f"{context_size} msgs in context"
+    expiry_str  = _format_expiry(expires_at, persist)
+
+    parts = [f"── {agents} · {duration:.1f}s"]
+    if sid_short:
+        parts.append(f"session {sid_short}")
+    if turn:
+        parts.append(f"turn {turn}")
+    if session_id:
+        parts.append(context_str)
+    if expiry_str:
+        parts.append(expiry_str)
+    if pulled:
+        parts.append(f"pulled: {', '.join(pulled)}")
+
+    print(dim("  ·  ".join(parts)))
+    if show_resume and session_id:
+        print(dim(f"  resume: hive --session {session_id}"))
+    print()
+
+# ── Task runners ──────────────────────────────────────────────────────────────
+
+def run_task(
+    task: str,
+    project_id: str,
+    session_id: str | None = None,
+    persist: bool = False,
+    show_resume: bool = False,
+) -> str | None:
+    """Run a task; return the session_id from the response, or None on error."""
     if _COLOUR:
         print(dim("  thinking..."), end="\r", flush=True)
     try:
@@ -93,10 +203,13 @@ def run_task(task: str, project_id: str) -> None:
             "task":       task,
             "project_id": project_id,
             "team":       AGNO_TEAM,
+            "session_id": session_id,
+            "persist":    persist,
         })
         if _COLOUR:
             print(" " * 20, end="\r")
-        _print_result(data)
+        _print_result(data, show_resume=show_resume)
+        return data.get("session", {}).get("session_id")
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
         try:
@@ -109,17 +222,19 @@ def run_task(task: str, project_id: str) -> None:
         print(dim(f"  is AGNOHive running at {AGNO_HOST}?"))
     except Exception as e:
         print(red(f"  error: {e}"))
+    return None
 
 
-def review_task(task: str, project_id: str) -> None:
-    """HITL flow — plan first, ask for approval, then execute."""
-    # ── Step 1: Plan ──────────────────────────────────────────────────────────
-    print(f"\n{bold('Planning...')} {dim('(ContextRouter → Researcher → Planner)')}\n")
+def review_task(
+    task: str,
+    project_id: str,
+    session_id: str | None = None,
+    persist: bool = False,
+) -> str | None:
+    """HITL flow — plan -> approve -> execute. Returns session_id or None."""
+    print(f"\n{bold('Planning...')} {dim('(ContextRouter -> Researcher -> Planner)')}\n")
     try:
-        data = call_api("/plan", {
-            "task":       task,
-            "project_id": project_id,
-        })
+        data = call_api("/plan", {"task": task, "project_id": project_id})
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
         try:
@@ -127,15 +242,14 @@ def review_task(task: str, project_id: str) -> None:
         except Exception:
             msg = body
         print(red(f"  plan failed {e.code}: {msg}"))
-        return
+        return None
     except Exception as e:
         print(red(f"  plan error: {e}"))
-        return
+        return None
 
     plan     = data.get("plan", "")
     duration = data.get("duration_seconds", 0)
 
-    # ── Step 2: Show the plan ─────────────────────────────────────────────────
     print(f"{bold('─' * 60)}")
     print(f"{bold('Proposed Plan')}")
     print(f"{bold('─' * 60)}\n")
@@ -143,72 +257,170 @@ def review_task(task: str, project_id: str) -> None:
     print(f"\n{dim(f'── planned in {duration:.1f}s')}\n")
     print(f"{bold('─' * 60)}\n")
 
-    # ── Step 3: Confirm ───────────────────────────────────────────────────────
     try:
         answer = input(f"{bold('Proceed with this plan?')} {dim('[Y/n]')} ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         print(f"\n{yellow('  aborted.')}")
-        return
+        return None
 
     if answer in ("n", "no"):
         print(f"{yellow('  plan rejected — nothing was executed.')}")
-        return
+        return None
 
-    # ── Step 4: Execute ───────────────────────────────────────────────────────
     print(f"\n{bold('Executing...')} {dim('(full engineering team)')}\n")
-    if _COLOUR:
-        print(dim("  thinking..."), end="\r", flush=True)
+    return run_task(task, project_id, session_id=session_id, persist=persist)
+
+# ── REPL slash commands ───────────────────────────────────────────────────────
+
+def _cmd_sessions(project_id: str) -> None:
     try:
-        result_data = call_api("/run", {
-            "task":       task,
-            "project_id": project_id,
-            "team":       AGNO_TEAM,
-        })
-        if _COLOUR:
-            print(" " * 20, end="\r")
-        _print_result(result_data)
+        data = call_get("/sessions", {"project_id": project_id, "limit": "20"})
+        sessions = data.get("sessions", [])
+        if not sessions:
+            print(dim("  no sessions found for this project"))
+            return
+        print()
+        for s in sessions:
+            sid_short     = s["id"][:8]
+            title         = s["title"][:52]
+            count         = s.get("message_count", 0)
+            persist_badge = " [persistent]" if s["persist"] else ""
+            expires_str   = (
+                f"  expires {s['expires_at'][:10]}"
+                if s.get("expires_at") and not s["persist"]
+                else ""
+            )
+            print(
+                f"  {cyan(sid_short)}  {title}"
+                f"{dim(persist_badge)}"
+                f"  {dim(f'{count} msgs{expires_str}')}"
+            )
+        print()
     except Exception as e:
-        print(red(f"  execution error: {e}"))
+        print(red(f"  error listing sessions: {e}"))
 
 
-def _print_result(data: dict) -> None:
-    result   = data.get("result", "")
-    agents   = ", ".join(data.get("agents_used", []))
-    duration = data.get("duration_seconds", 0)
-    pulled   = data.get("models_pulled", [])
+def _cmd_history(session_id: str | None) -> None:
+    if not session_id:
+        print(yellow("  no active session"))
+        return
+    try:
+        data = call_get(f"/sessions/{session_id}")
+        summary  = data.get("summary")
+        messages = data.get("messages", [])
+        if summary:
+            print(f"\n{dim('── summary ──────────────────────────────────────')}")
+            print(dim(summary))
+        print(f"\n{dim('── messages ─────────────────────────────────────')}")
+        for m in messages:
+            role_str = bold(f"[{m['role']}]")
+            print(f"{role_str} {m['content'][:300]}")
+        print()
+    except Exception as e:
+        print(red(f"  error fetching history: {e}"))
 
-    print()
-    print(result)
-    print()
-    footer = f"── {agents} · {duration:.1f}s"
-    if pulled:
-        footer += f" · pulled: {', '.join(pulled)}"
-    print(dim(footer))
-    print()
 
+def _cmd_persist_current(session_id: str | None) -> None:
+    if not session_id:
+        print(yellow("  no active session"))
+        return
+    try:
+        call_patch(f"/sessions/{session_id}/persist")
+        print(green(f"  session {session_id[:8]} marked as persistent — it will never auto-delete"))
+    except Exception as e:
+        print(red(f"  error: {e}"))
+
+
+def _cmd_delete(args: str) -> None:
+    sid = args.strip()
+    if not sid:
+        print(yellow("  usage: /delete <session-id>"))
+        return
+    try:
+        call_delete(f"/sessions/{sid}")
+        print(green(f"  session {sid[:8]} deleted"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print(yellow(f"  session {sid[:8]} not found"))
+        else:
+            print(red(f"  error {e.code}: {e.read().decode()}"))
+    except Exception as e:
+        print(red(f"  error: {e}"))
+
+
+def _cmd_list_sessions_oneshot(project_id: str) -> None:
+    """Tabular listing for --list-sessions flag."""
+    try:
+        data = call_get("/sessions", {"project_id": project_id, "limit": "20"})
+        sessions = data.get("sessions", [])
+        if not sessions:
+            print("No sessions found.")
+            return
+        header = f"{'ID':<10}  {'Title':<52}  {'Msgs':>4}  Status"
+        print(f"\n{header}")
+        print("─" * len(header))
+        for s in sessions:
+            sid_short = s["id"][:8]
+            title     = s["title"][:52]
+            count     = s.get("message_count", 0)
+            if s["persist"]:
+                status = "persistent"
+            elif s.get("expires_at"):
+                status = f"expires {s['expires_at'][:10]}"
+            else:
+                status = "—"
+            print(f"{sid_short:<10}  {title:<52}  {count:>4}  {status}")
+        print()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 # ── Interactive REPL ──────────────────────────────────────────────────────────
 
-def repl(project_id: str, review: bool = False) -> None:
-    history = Path.home() / ".agno_history"
+def repl(
+    project_id: str,
+    review: bool = False,
+    initial_session_id: str | None = None,
+    persist: bool = False,
+) -> None:
+    history_file = Path.home() / ".agno_history"
     try:
-        readline.read_history_file(history)
+        readline.read_history_file(history_file)
     except FileNotFoundError:
         pass
     readline.set_history_length(500)
 
+    # Resolve starting session
+    session_id: str | None = initial_session_id
+    is_explicit = initial_session_id is not None
+    if session_id is None:
+        session_id = load_last_session(project_id)
+        is_resumed = session_id is not None
+    else:
+        is_resumed = True
+
+    # Banner
     mode_label = cyan("review") if review else cyan(AGNO_TEAM)
     print(
-        f"{bold('AGNOHive')}  "
+        f"\n{bold('AGNOHive')}  "
         f"project {cyan(project_id)}  "
         f"mode {mode_label}  "
         f"{dim(AGNO_HOST)}"
     )
     if not health_check():
         print(yellow("  warning: AGNOHive is not reachable — tasks will fail"))
+
+    if session_id and is_resumed and not is_explicit:
+        print(dim(f"  resuming session {session_id[:8]}  (last used this project)"))
+    elif session_id and is_explicit:
+        print(dim(f"  session {session_id[:8]}"))
+    else:
+        print(dim("  new session will be created on first prompt"))
+
     if review:
-        print(dim("  review mode: plan will be shown before every task executes"))
-    print(dim("  type 'exit' or Ctrl+C to quit\n"))
+        print(dim("  review mode: plan shown before every task  ·  prefix with ! to skip"))
+
+    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /exit\n"))
 
     try:
         while True:
@@ -217,27 +429,59 @@ def repl(project_id: str, review: bool = False) -> None:
             except EOFError:
                 print()
                 break
+
             if not task:
                 continue
-            if task.lower() in ("exit", "quit", "q", ":q"):
-                break
-            if task.lower() in ("help", "?"):
-                print(dim("  send any task or question to AGNOHive"))
-                print(dim(f"  project: {project_id} · mode: {'review' if review else AGNO_TEAM}"))
-                print(dim("  prefix task with '!' to skip review for a single task"))
+
+            # ── Slash commands ─────────────────────────────────────────────
+            if task.startswith("/"):
+                parts = task.split(None, 1)
+                cmd   = parts[0].lower()
+                args  = parts[1] if len(parts) > 1 else ""
+
+                if cmd == "/exit":
+                    break
+                elif cmd == "/new":
+                    session_id = None
+                    print(dim("  started new session (will be created on next prompt)"))
+                elif cmd == "/sessions":
+                    _cmd_sessions(project_id)
+                elif cmd == "/history":
+                    _cmd_history(session_id)
+                elif cmd == "/persist":
+                    _cmd_persist_current(session_id)
+                elif cmd == "/delete":
+                    _cmd_delete(args)
+                else:
+                    print(dim(f"  unknown command: {cmd}  ·  /new /sessions /history /persist /delete /exit"))
                 continue
-            # Allow per-task review bypass with '!' prefix
-            if task.startswith("!") and review:
-                run_task(task[1:].strip(), project_id)
-            elif review:
-                review_task(task, project_id)
+
+            # ── Run task ───────────────────────────────────────────────────
+            skip_review = task.startswith("!") and review
+            clean_task  = task[1:].strip() if skip_review else task
+
+            if skip_review or not review:
+                returned_id = run_task(
+                    clean_task, project_id,
+                    session_id=session_id, persist=persist,
+                )
             else:
-                run_task(task, project_id)
+                returned_id = review_task(
+                    clean_task, project_id,
+                    session_id=session_id, persist=persist,
+                )
+
+            if returned_id:
+                session_id = returned_id
+
     except KeyboardInterrupt:
         print()
     finally:
-        readline.write_history_file(history)
-
+        readline.write_history_file(history_file)
+        if session_id:
+            save_last_session(session_id, project_id)
+            print(f"\n{dim('  session saved:  ' + session_id)}")
+            print(dim(f"  resume later:   hive --session {session_id}"))
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -249,12 +493,17 @@ def main() -> None:
         description="AGNOHive CLI — run the agent swarm from your terminal",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("task",              nargs="*", help="task to run (omit for interactive mode)")
-    parser.add_argument("--project",  "-p",            help="project id (default: auto-detect from git)")
-    parser.add_argument("--team",     "-t",            help=f"team to use (default: {AGNO_TEAM})")
-    parser.add_argument("--host",     "-H",            help=f"AGNOHive host (default: {AGNO_HOST})")
-    parser.add_argument("--review",   "-r",            action="store_true",
-                        help="HITL mode: show plan and ask for approval before executing")
+    parser.add_argument("task",                 nargs="*", help="task to run (omit for REPL)")
+    parser.add_argument("--project",  "-p",               help="project id (default: auto-detect)")
+    parser.add_argument("--team",     "-t",               help=f"team (default: {AGNO_TEAM})")
+    parser.add_argument("--host",     "-H",               help=f"AGNOHive host (default: {AGNO_HOST})")
+    parser.add_argument("--review",   "-r",  action="store_true",
+                        help="show plan and ask for approval before executing")
+    parser.add_argument("--session",  "-s",               help="resume a specific session by ID")
+    parser.add_argument("--persist",          action="store_true",
+                        help="mark session as permanent (never auto-deleted)")
+    parser.add_argument("--list-sessions",    action="store_true",
+                        help="list recent sessions for this project and exit")
 
     args = parser.parse_args()
 
@@ -266,14 +515,27 @@ def main() -> None:
 
     project_id = args.project or detect_project()
 
+    if args.list_sessions:
+        _cmd_list_sessions_oneshot(project_id)
+        return
+
     if args.task:
         task = " ".join(args.task)
         if args.review:
-            review_task(task, project_id)
+            review_task(task, project_id, session_id=args.session, persist=args.persist)
         else:
-            run_task(task, project_id)
+            run_task(
+                task, project_id,
+                session_id=args.session, persist=args.persist,
+                show_resume=True,
+            )
     else:
-        repl(project_id, review=args.review)
+        repl(
+            project_id,
+            review=args.review,
+            initial_session_id=args.session,
+            persist=args.persist,
+        )
 
 
 if __name__ == "__main__":
