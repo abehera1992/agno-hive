@@ -48,6 +48,19 @@ def _load_team(name: str) -> tuple[list[AgentSpec], str]:
     return agents, coordinator
 
 
+@app.on_event("startup")
+async def _start_cleanup_loop():
+    asyncio.create_task(_session_cleanup_loop())
+
+
+async def _session_cleanup_loop():
+    while True:
+        await asyncio.sleep(config.session_cleanup_interval)
+        count = await _cleanup_expired()
+        if count:
+            print(f"[sessions] cleaned up {count} expired session(s)")
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "mcp_url": config.mcp_url}
@@ -173,3 +186,77 @@ async def plan(request: RunRequest):
         plan=plan_text,
         duration_seconds=round(time.perf_counter() - start, 2),
     )
+
+
+@app.get("/sessions")
+async def list_sessions_endpoint(project_id: str = "default", limit: int = 20):
+    from api.models import SessionListItem
+    sessions = await _list_sessions(project_id, limit=limit)
+    return {
+        "sessions": [
+            SessionListItem(
+                id=s["id"],
+                title=s["title"],
+                created_at=s["created_at"],
+                updated_at=s["updated_at"],
+                expires_at=s.get("expires_at"),
+                persist=s["persist"],
+                message_count=s["message_count"],
+            )
+            for s in sessions
+        ]
+    }
+
+
+@app.get("/sessions/{session_id}")
+async def get_session_endpoint(session_id: str):
+    from api.models import SessionDetail, SessionMessage
+    import psycopg
+    from config.config import config as _config
+
+    session = await get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+
+    try:
+        async with await psycopg.AsyncConnection.connect(_config.postgres_uri) as conn:
+            rows = await conn.execute(
+                "SELECT role, content, created_at FROM session_messages"
+                " WHERE session_id = %s ORDER BY created_at ASC",
+                (session_id,),
+            )
+            messages = [
+                SessionMessage(role=r[0], content=r[1], created_at=r[2])
+                for r in await rows.fetchall()
+            ]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return SessionDetail(
+        id=session["id"],
+        project_id=session["project_id"],
+        title=session["title"],
+        created_at=session["created_at"],
+        updated_at=session["updated_at"],
+        expires_at=session.get("expires_at"),
+        persist=session["persist"],
+        summary=session.get("summary"),
+        message_count=session["message_count"],
+        messages=messages,
+    )
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session_endpoint(session_id: str):
+    deleted = await _delete_session(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"deleted": session_id}
+
+
+@app.patch("/sessions/{session_id}/persist")
+async def persist_session_endpoint(session_id: str):
+    updated = await _persist_session(session_id)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"persisted": session_id}
