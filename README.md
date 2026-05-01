@@ -168,7 +168,7 @@ python main.py --index --path /path/to/repo --project-id myproject --force
 
 ## CLI Client (`hive`)
 
-AGNOHive ships a zero-dependency CLI client (`cli/hive`) that lets you use the swarm from any terminal that can reach ZGX — the same feel as an AI coding assistant in your project directory.
+AGNOHive ships a zero-dependency CLI client (`cli/hive`) that lets you use the swarm from any terminal that can reach ZGX — the same feel as an AI coding assistant in your project directory. Every run is backed by a **persistent chat session** stored server-side in PostgreSQL, so follow-up prompts always have full conversation context.
 
 ### Installation
 
@@ -197,41 +197,185 @@ export AGNO_TEAM=engineering              # team to use (default: engineering)
 
 `AGNO_PROJECT` is auto-detected from `git remote get-url origin` if not set — so running `hive` inside a git repo will automatically use that repo's name as the project id.
 
-### Usage
+---
+
+### Command Glossary
+
+#### One-Shot Commands
+
+Run a single task and exit. Each one-shot always creates a **new** session. The session ID is printed in the footer so you can resume later.
+
+| Command | Description |
+|---|---|
+| `hive "task"` | Run a single task |
+| `hive --review "task"` | Show plan, ask for approval, then execute |
+| `hive --session <id> "task"` | Run a task in an existing session |
+| `hive --persist "task"` | Run a task in a new permanent session (never auto-deleted) |
+| `hive --list-sessions` | Print recent sessions for this project and exit |
+| `hive --project <name> "task"` | Override project auto-detection |
+| `hive --team <name> "task"` | Use a specific team (default: `engineering`) |
+| `hive --host <url> "task"` | Connect to a different AGNOHive instance |
+
+#### Interactive REPL
 
 ```bash
-# Single task
+hive          # start REPL — auto-resumes last session for this project
+hive -r       # start REPL in review mode (plan shown before every task)
+hive --session <id>   # start REPL resuming a specific session
+hive --persist        # start REPL with a permanent session
+```
+
+#### REPL Slash Commands
+
+| Command | Description |
+|---|---|
+| `/new` | Start a fresh session (next prompt creates it) |
+| `/sessions` | List recent sessions for this project |
+| `/history` | Print all messages in the current session |
+| `/persist` | Mark the current session as permanent |
+| `/delete <id>` | Delete a session by ID |
+| `/exit` | Save session ID to `~/.agno_last_session` and quit |
+| `! task` | Run a single task without review (review REPL only) |
+
+---
+
+### Usage Examples
+
+#### Basic tasks
+
+```bash
+# Ask a question about the codebase
 hive "how does authentication work in this project?"
 
-# Interactive REPL
-hive
-> what models are in the User table?
-> write a test for the login endpoint
-> exit
+# Ask about a specific file
+hive "what does the write_file function in mcp-server/tools/write.py do?"
 
-# Human-in-the-loop review mode — shows plan before executing
+# Request a code change
+hive "add input validation to the POST /sellers endpoint"
+```
+
+#### Sessions — resuming context
+
+```bash
+# First task — creates a new session and prints the session ID
+hive "explain the seller registration flow"
+
+# Output footer example:
+# ── ContextRouter, Researcher · 38.2s  ·  session a3f7c2d1  ·  turn 1  ·  0 msgs in context  ·  expires 2026-05-31
+#   resume: hive --session a3f7c2d1-8b3e-4f2a-9c1d-000000000000
+
+# Resume and follow up — agents remember the previous exchange
+hive --session a3f7c2d1-8b3e-4f2a-9c1d-000000000000 "now add unit tests for that flow"
+```
+
+#### REPL with session continuity
+
+```bash
+# Enter REPL — auto-resumes last session for this project
+hive
+
+# Banner shows which session is active:
+# AGNOHive  project EkamApp  mode engineering  http://100.96.86.82:9001
+#   resuming session a3f7c2d1  (last used this project)
+#   /new  /sessions  /history  /persist  /delete <id>  /exit
+
+> explain the write_file function
+> now add type hints to it
+> what other functions are in the same file?
+> /history           # review everything said so far
+> /exit              # saves session, prints resume command
+```
+
+#### Persistent sessions
+
+```bash
+# Create a session that never expires
+hive --persist "start working on the seller documents feature"
+
+# Or mark an existing REPL session as permanent
+hive
+> /persist           # marks current session as permanent
+> /sessions          # shows [persistent] badge next to it
+```
+
+#### Plan review (HITL)
+
+```bash
+# See the plan before anything runs
 hive --review "add rate limiting to the login endpoint"
 
-# Review mode REPL — every task shows a plan and asks for approval
+# Review REPL — every task shows a plan and asks approval
 hive --review
 > refactor the User model to use UUIDs
-# → plan shown, Proceed? [Y/n] prompt appears before agents execute
+# → plan is shown, then Proceed? [Y/n]
 
-# Skip review for one task in a review REPL (prefix with !)
+# Skip review for a quick question inside a review REPL
 > ! what files are in the auth module?
-
-# Explicit project and team
-hive --project myapp --team engineering "fix the rate limiting bug"
-
-# Connect to a different AGNOHive instance
-hive --host http://other-host:9001 "explain the auth flow"
 ```
+
+#### Session management
+
+```bash
+# List all sessions for this project
+hive --list-sessions
+
+# Output:
+# ID          Title                                                 Msgs  Status
+# ──────────────────────────────────────────────────────────────────────────────
+# a3f7c2d1    explain the seller registration flow                     4  expires 2026-05-31
+# b8e1f902    add rate limiting to the login endpoint                  2  persistent
+
+# Delete a session
+hive
+> /delete a3f7c2d1-8b3e-4f2a-9c1d-000000000000
+
+# Resume a specific session by ID
+hive --session a3f7c2d1-8b3e-4f2a-9c1d-000000000000
+```
+
+#### Footer explained
+
+Every response prints an informative footer:
+
+```
+── Coder, Reviewer · 42.3s  ·  session a3f7c2d1  ·  turn 3  ·  4 msgs in context  ·  expires 2026-05-31
+```
+
+| Field | Meaning |
+|---|---|
+| `Coder, Reviewer` | Agents that ran |
+| `42.3s` | Total wall time |
+| `session a3f7c2d1` | First 8 chars of session UUID |
+| `turn 3` | Number of prompt/response pairs in this session |
+| `4 msgs in context` | Verbatim messages injected into the coordinator |
+| `summary + N msgs` | Older turns were compacted — summary + recent messages injected |
+| `expires 2026-05-31` | TTL expiry date |
+| `[persistent]` | Session will never auto-delete |
+
+---
+
+### Session Behaviour
+
+| Mode | New session? | Saves to `~/.agno_last_session`? |
+|---|---|---|
+| `hive "task"` (one-shot) | Always | No |
+| `hive` (REPL) | Only if no prior session for this project | Yes, on `/exit` |
+| `hive --session <id>` | No — resumes specified session | Yes (REPL), No (one-shot) |
+| `hive --persist` | Yes, permanent | Yes (REPL) |
+| `/new` in REPL | Yes | On next `/exit` |
+
+Sessions expire after **30 days** unless marked persistent. Expired sessions are cleaned up automatically by the server every hour.
+
+---
 
 ### Features
 
+- **Persistent sessions** — full conversation history stored in PostgreSQL on ZGX, resumable by session ID
+- **Auto-resume** — REPL auto-resumes the last session for the current project
+- **Compaction** — sessions longer than 20 messages are automatically summarised by `llama3.1:8b` so context never bloats
 - **Auto-detects project** from `git remote get-url origin` in your current directory
 - **Readline history** — arrow keys, Ctrl+R search, persisted in `~/.agno_history`
-- **Shows agents + duration** after every response
+- **Informative footer** — shows agents, duration, session ID, turn count, context window, expiry
 - **Health check** on startup — warns if ZGX is unreachable before you type anything
 - **HITL review mode** (`--review`) — plan shown before every task executes, requires your approval
 - **Zero dependencies** — pure Python 3 stdlib, works on any machine with Python installed
@@ -271,6 +415,8 @@ curl -X POST http://localhost:9001/run \
 | `team` | string | `"engineering"` | Team spec from `teams/*.yaml` |
 | `agents` | array | — | Inline agent specs (overrides team) |
 | `mcp_url` | string | — | Override `MCP_URL` for this request |
+| `session_id` | string | — | Resume an existing session |
+| `persist` | bool | `false` | Mark new session as permanent |
 
 **Response:**
 
@@ -280,8 +426,32 @@ curl -X POST http://localhost:9001/run \
   "team": "engineering",
   "agents_used": ["ContextRouter", "Researcher", "Planner", "Coder", "Executor", "Reviewer"],
   "models_pulled": [],
-  "duration_seconds": 30.7
+  "duration_seconds": 30.7,
+  "session": {
+    "session_id": "a3f7c2d1-8b3e-4f2a-9c1d-...",
+    "turn": 1,
+    "context_size": 0,
+    "compacted": false,
+    "persist": false,
+    "expires_at": "2026-05-31T14:45:00+00:00"
+  }
 }
+```
+
+### Session endpoints
+
+```bash
+# List sessions for a project
+curl "http://localhost:9001/sessions?project_id=myproject"
+
+# Get full session with all messages
+curl "http://localhost:9001/sessions/<session-id>"
+
+# Delete a session
+curl -X DELETE "http://localhost:9001/sessions/<session-id>"
+
+# Mark a session as permanent
+curl -X PATCH "http://localhost:9001/sessions/<session-id>/persist"
 ```
 
 ### Get a plan only (HITL)
@@ -470,6 +640,7 @@ git -C ~/agno-hive pull
 | Global memory (cross-project shared namespace) | Done |
 | HITL plan review (`POST /plan` + `hive --review`) | Done |
 | VSCode diff before edits (client MCP integration) | Done |
+| Persistent chat sessions (PostgreSQL, TTL, compaction) | Done |
 | Cost-aware model routing | Planned |
 
 ---
