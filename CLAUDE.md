@@ -6,12 +6,15 @@ A generic, model-agnostic agentic swarm built on [Agno](https://github.com/agno-
 
 ## Architecture in One Sentence
 
-**Client MCP Server** (stateless, exposes project tools) → **AGNOHive on ZGX** (coordinator + 6 agents) → **ZGX Storage** (Qdrant for vector memory, PostgreSQL/AGE for graph reasoning) → **SigNoz** (OTel traces via gRPC).
+**Client project** → **hive-mcp** (host actions: files, shell, Docker, git) + **project MCP** (context: code search, memory) → **AGNOHive on ZGX** (coordinator + 6 agents) → **ZGX Storage** (Qdrant + PostgreSQL/AGE) → **SigNoz** (OTel traces).
 
 ## Key Design Decisions
 
-- **Agents never touch files directly** — everything goes through MCP tools (`get_file_content`, `find_files`, `search_files`, `run_command`)
-- **Streamable HTTP transport** — AGNOHive connects to MCP servers via Streamable HTTP (`/mcp` endpoint), not the deprecated SSE transport
+- **Dual-MCP architecture** — two MCP connections per run: `mcp_url` (primary, project context) and `mcp_urls` (secondary list, host actions via hive-mcp); agents choose the right one per operation
+- **hive-mcp is project-agnostic** — Docker image on GHCR, runs on any client machine; provides raw filesystem, shell, Docker, git, and `index_project` bootstrap
+- **Tailscale as mandatory transport** — stable IPs, WireGuard security, no NAT issues; hive CLI auto-detects Tailscale IP for both MCP URLs
+- **Agents never touch files directly** — everything goes through MCP tools (`get_file_content`, `find_files`, `search_files`, `run_command` for reads; `apply_diff`, `write_file` for writes via hive-mcp)
+- **Streamable HTTP transport** — AGNOHive connects to all MCP servers via Streamable HTTP (`/mcp` endpoint); the deprecated SSE (`/sse`) endpoint is not used
 - **Teams are YAML-configurable** — no code changes needed to define a new agent lineup (`teams/*.yaml`)
 - **Models are swappable via env vars** — all model names are config-driven, no hardcoded values
 - **Bootstrap runs before team construction** — fetches project patterns from MCP server to inject context into coordinator
@@ -19,10 +22,11 @@ A generic, model-agnostic agentic swarm built on [Agno](https://github.com/agno-
 - **Self-improving loop** — successes stored in LightRAG (queryable via `memory_search`), failures stored in PostgreSQL and injected into the next run's coordinator instructions
 - **Global memory** — `lightrag_query` merges per-project + shared `global` namespace; `lightrag_insert_global` stores cross-project insights
 - **HITL plan review** — `POST /plan` runs planning team only; `hive --review` shows plan and requires approval before execution
-- **VSCode diff review** — client MCP servers enable `WRITE_REVIEW=true` to stage every file write as a `.hive_proposed` file; VS Code opens a diff tab automatically; the hive CLI shows an arrow-key selector (confirm / reject / skip); confirm/reject are local file operations in the CLI — agents cannot confirm or reject (those tools are not exposed)
+- **VSCode diff review** — hive-mcp enables `WRITE_REVIEW=true` to stage every file write as a `.hive_proposed` file; hive CLI shows inline terminal diff + arrow-key selector (confirm / reject / skip); confirm/reject are local file operations in the CLI — agents cannot confirm or reject (those tools are not exposed)
 - **run_command write guard** — when `WRITE_REVIEW=true`, `run_command` blocks any command that writes to files (`>`, `>>`, `sed -i`, `tee`, etc.); agents are forced to use `apply_diff` or `write_file` for all file changes
 - **apply_diff always surgical** — agents must use `apply_diff` (not `write_file`) for existing files; to append, include the anchor line in both `old_string` and `new_string`
 - **Persistent chat sessions** — every `POST /run` creates or resumes a session in PostgreSQL; last 6 messages injected into coordinator; sessions older than 20 messages are compacted by `llama3.1:8b`; 30-day TTL with optional `persist` flag for permanent sessions
+- **hive bootstrap** — `hive --bootstrap` calls `index_project` on hive-mcp, which chunks the project with AST (Python) or text windows (other files) and inserts into LightRAG via Streamable HTTP
 
 ## Infrastructure (ZGX)
 
@@ -31,8 +35,16 @@ A generic, model-agnostic agentic swarm built on [Agno](https://github.com/agno-
 | Ollama | Local LLM inference (native, not Docker) | `OLLAMA_HOST` |
 | Qdrant | Vector memory for LightRAG + project memory | `localhost:6333` |
 | PostgreSQL + AGE | Graph reasoning (LightRAG) + failure log + chat sessions | `localhost:5432` |
+| LightRAG MCP | Streamable HTTP MCP server, port 9002 | `http://localhost:9002/mcp` |
 
 ZGX infra is managed via `docker/docker-compose.zgx.yml`. Ollama runs natively for GPU access.
+
+## Client Machine
+
+| Component | Purpose | Port |
+|---|---|---|
+| hive-mcp | Docker container, host actions MCP | 9000 (project) or 9003 (when project MCP also on 9000) |
+| project MCP | App-specific context tools | 9000 (typical) |
 
 ## Agent Roster (all implemented)
 
@@ -54,10 +66,10 @@ ZGX infra is managed via `docker/docker-compose.zgx.yml`. Ollama runs natively f
 # FastAPI server (default port 9001)
 python main.py --serve
 
-# LightRAG MCP server (default port 9002)
+# LightRAG MCP server (default port 9002, Streamable HTTP)
 python main.py --serve-lightrag
 
-# Code indexer
+# Code indexer (runs on ZGX where LightRAG is available)
 python main.py --index --path /path/to/repo --project-id myproject
 
 # Single task
@@ -68,6 +80,43 @@ python main.py
 ```
 
 API endpoints: `GET /health`, `GET /teams`, `POST /run`, `POST /plan`, `GET /sessions`, `GET /sessions/{id}`, `DELETE /sessions/{id}`, `PATCH /sessions/{id}/persist`
+
+## POST /run Request Shape
+
+```json
+{
+  "task": "...",
+  "project_id": "EkamApp",
+  "team": "engineering",
+  "mcp_url": "http://<tailscale-ip>:9000/mcp",
+  "mcp_urls": ["http://<tailscale-ip>:9003/mcp"],
+  "session_id": "optional-uuid",
+  "persist": false
+}
+```
+
+`mcp_url` = primary (project context). `mcp_urls` = additional MCPs (e.g. hive-mcp for host actions). All are opened simultaneously via `AsyncExitStack`.
+
+## hive CLI Key Flags
+
+```bash
+hive "task"                     # one-shot
+hive                            # REPL (auto-resumes last session)
+hive --review "task"            # HITL: plan → approve → execute
+hive -r                         # review REPL
+hive --bootstrap                # index project into LightRAG via hive-mcp
+hive --bootstrap --force        # full reindex
+hive --lightrag-url <url>       # LightRAG MCP URL for bootstrap
+hive --mcp-status               # show both MCP connection statuses
+hive --mcp-url <url>            # override project MCP URL
+hive --mcp-port <port>          # Tailscale auto-detect port for project MCP
+hive --list-sessions            # list sessions and exit
+hive --delete-all-sessions      # delete all sessions for this project
+hive confirm [path]             # apply pending .hive_proposed file
+hive reject [path]              # discard pending .hive_proposed file
+```
+
+REPL slash commands: `/new`, `/sessions`, `/history`, `/persist`, `/delete <id>`, `/delete-all`, `/diff`, `/confirm [path]`, `/reject [path]`, `/cleanup`, `/mcp`, `/exit`
 
 ## Git Workflow
 
@@ -89,12 +138,16 @@ git -C ~/agno-hive pull
 | OllamaToolFix (all tool-call formats) | Done |
 | ZGX infra — Qdrant + PostgreSQL/AGE | Done (Phase 1) |
 | Expanded agent roster | Done (Phase 2) |
-| LightRAG MCP server | Done (Phase 3) |
+| LightRAG MCP server (Streamable HTTP) | Done (Phase 3) |
 | Automated code indexer | Done (Phase 4) |
 | Self-improving loop | Done (Phase 5) |
 | OTel instrumentation → SigNoz | Done (Phase 6) |
 | Global memory (cross-project namespace) | Done |
 | HITL plan review (`POST /plan` + `hive --review`) | Done |
-| VSCode diff before edits (client MCP) | Done |
+| VSCode diff + CLI arrow-key review | Done |
 | Persistent chat sessions (PostgreSQL, TTL, compaction) | Done |
+| hive-mcp (generic Docker host-action MCP, GHCR image) | Done |
+| Dual-MCP architecture (project context + host actions) | Done |
+| Tailscale auto-detection for MCP URLs | Done |
+| `hive bootstrap` / `index_project` (LightRAG via hive-mcp) | Done |
 | Cost-aware model routing | Planned (Phase 7) |

@@ -1,34 +1,37 @@
 # AGNOHive
 
-A generic, model-agnostic agentic swarm built on [Agno](https://github.com/agno-agi/agno). Runs on a dedicated ZGX workstation, connects to any project via its MCP server, and coordinates a full engineering team of local Ollama-backed agents — no cloud API calls.
+A generic, model-agnostic agentic swarm built on [Agno](https://github.com/agno-agi/agno). Runs on a dedicated ZGX workstation, connects to any project via MCP, and coordinates a full engineering team of local Ollama-backed agents — no cloud API calls.
 
 ## How It Works
 
 ```
-Client project  ──task──►  AGNOHive (ZGX)
-                               │
-                    ┌──────────▼──────────────┐
-                    │  Coordinator (qwen3:30b) │
-                    │  ├─ ContextRouter        │  ──MCP──►  Project MCP server
-                    │  ├─ Researcher           │            find_files
-                    │  ├─ Planner              │            get_file_content
-                    │  ├─ Coder               │            search_files
-                    │  ├─ Executor             │            run_command
-                    │  └─ Reviewer             │            memory_store / memory_search
-                    └─────────────────────────┘
-                               │
-                    ┌──────────▼──────────────┐
-                    │  ZGX Storage             │
-                    │  ├─ Qdrant  (vectors)    │
-                    │  └─ PostgreSQL/AGE (graph)│
-                    └─────────────────────────┘
+Client machine                           ZGX (AGNOHive)
+──────────────                           ──────────────────────────────────────
+hive-mcp  ◄─────────────────────────────  ContextRouter
+  apply_diff                              Researcher
+  write_file                              Planner
+  run_shell                               Coder          ──► Qdrant (vectors)
+  run_docker                              Executor       ──► PostgreSQL/AGE (graph)
+  git_*                                   Reviewer       ──► SigNoz (OTel)
+  index_project                         ──────────────────────────────────────
+                                           Coordinator (qwen3:30b)
+project MCP  ◄───────────────────────────  orchestrates all agents
+  get_file_content
+  find_files
+  search_files
+  memory_search
+  (app-specific tools)
 ```
 
-1. Bootstrap: fetches project patterns from the MCP server to inject into the coordinator
-2. Failure context from past runs is loaded and injected before every task
-3. The coordinator routes to the right agents based on task type
+**Two MCP connections per run** (dual-MCP):
+- **Project MCP** — project-specific context: read code, search memory, app workflows
+- **hive-mcp** — host-level actions: file writes, shell, Docker, git, semantic bootstrap
+
+1. Bootstrap fetches project patterns from the project MCP before the team starts
+2. Failure context from past runs is injected into the coordinator's instructions
+3. The coordinator routes operations to the right MCP — agents pick context tools from the project MCP and action tools from hive-mcp
 4. After each run, successes go to LightRAG (vector memory) and failures go to PostgreSQL (failure log)
-5. OTel traces flow to your existing SigNoz instance
+5. OTel traces flow to SigNoz
 
 ---
 
@@ -36,10 +39,10 @@ Client project  ──task──►  AGNOHive (ZGX)
 
 ### ZGX Workstation
 - Ubuntu / Linux with Python 3.12+
-- [Miniforge](https://github.com/conda-forge/miniforge) or standard venv
+- Miniforge or standard venv
 - Ollama running natively (for GPU access)
 - Docker + Docker Compose (for Qdrant and PostgreSQL/AGE)
-- Tailscale or network access to the client project machine
+- Tailscale
 
 ### Ollama Models (pull before first run)
 ```bash
@@ -52,9 +55,10 @@ ollama pull llama3.1:8b            # Executor + ContextRouter
 ollama pull qwen3-embedding:0.6b   # LightRAG embeddings
 ```
 
-### Client Project
-- A FastMCP server exposing file/search/run tools over Streamable HTTP (e.g. at `http://<host>:9000/mcp`)
-- Reachable from ZGX over Tailscale or local network
+### Client Machine
+- Docker (for hive-mcp)
+- **Tailscale** — mandatory; ZGX and client machines must be on the same Tailscale network
+- Python 3.8+ (for the `hive` CLI — stdlib only, no pip install needed)
 
 ---
 
@@ -75,11 +79,32 @@ Start Qdrant and PostgreSQL/AGE via Docker:
 ```bash
 docker compose -f docker/docker-compose.zgx.yml up -d
 
-# Verify both are healthy
+# Verify
 docker ps --filter "name=agno-"
 curl http://localhost:6333/healthz
 docker exec agno-postgres-age psql -U agno -d agno_graph -c "SELECT * FROM ag_catalog.ag_graph;"
 ```
+
+---
+
+## Client Setup: hive-mcp
+
+hive-mcp is a Docker container that runs on your local machine and gives AGNOHive host-level access via Tailscale.
+
+```bash
+# Copy the compose file into your project directory
+cp /path/to/agno-hive/hive-mcp/docker-compose.hive.yml .
+
+# Pull and start
+docker compose -f docker-compose.hive.yml up -d
+
+# Verify
+docker ps --filter "name=hive-mcp"
+```
+
+ZGX reaches it via your Tailscale IP: `http://<your-tailscale-ip>:9000/mcp`
+
+The `hive` CLI auto-detects your Tailscale IP — no manual URL configuration needed.
 
 ---
 
@@ -97,7 +122,7 @@ Minimum required `.env` on ZGX:
 # Ollama (running natively on ZGX)
 OLLAMA_HOST=http://<zgx-ip>:11434
 
-# Client project MCP server (Streamable HTTP)
+# Client project MCP server (Streamable HTTP, /mcp endpoint)
 MCP_URL=http://<project-host>:9000/mcp
 
 # Storage (Docker on ZGX)
@@ -111,9 +136,9 @@ POSTGRES_DATABASE=agno_graph
 POSTGRES_HOST=localhost
 POSTGRES_PORT=5432
 
-# LightRAG MCP
+# LightRAG MCP (Streamable HTTP, port 9002)
 LIGHTRAG_MCP_PORT=9002
-LIGHTRAG_MCP_URL=http://localhost:9002/sse
+LIGHTRAG_MCP_URL=http://localhost:9002/mcp
 LIGHTRAG_LLM_MODEL=mistral-small3.1:24b
 LIGHTRAG_EMBED_MODEL=qwen3-embedding:0.6b
 LIGHTRAG_EMBED_DIM=1024
@@ -128,39 +153,36 @@ OTEL_RESOURCE_ATTRIBUTES=service.name=agno-hive,deployment.environment=dev
 
 ## Running AGNOHive
 
-### 1. Start the LightRAG MCP Server (optional but recommended)
+### 1. Start the LightRAG MCP Server (ZGX)
 ```bash
 python main.py --serve-lightrag
-# → FastMCP SSE server on port 9002
+# → Streamable HTTP on 0.0.0.0:9002  (/mcp endpoint)
 ```
 
-### 2. Start the AGNOHive API Server
+### 2. Start the AGNOHive API Server (ZGX)
 ```bash
 python main.py --serve
-# → FastAPI on port 9001
+# → FastAPI on 0.0.0.0:9001
 ```
 
-### 3. Single task (CLI)
+### 3. Start hive-mcp (client machine)
+```bash
+docker compose -f docker-compose.hive.yml up -d
+```
+
+### 4. Single task (CLI)
 ```bash
 python main.py "How does authentication work in this project?"
 ```
 
-### 4. Interactive loop
+### 5. Interactive loop
 ```bash
 python main.py
-# > your task here
-# > exit
 ```
 
-### 5. Index a codebase into LightRAG
+### 6. Index a codebase into LightRAG (ZGX-side)
 ```bash
-# First run — indexes everything
 python main.py --index --path /path/to/repo --project-id myproject
-
-# Subsequent runs — only changed files
-python main.py --index --path /path/to/repo --project-id myproject
-
-# Force full reindex
 python main.py --index --path /path/to/repo --project-id myproject --force
 ```
 
@@ -168,34 +190,34 @@ python main.py --index --path /path/to/repo --project-id myproject --force
 
 ## CLI Client (`hive`)
 
-AGNOHive ships a zero-dependency CLI client (`cli/hive`) that lets you use the swarm from any terminal that can reach ZGX — the same feel as an AI coding assistant in your project directory. Every run is backed by a **persistent chat session** stored server-side in PostgreSQL, so follow-up prompts always have full conversation context.
+AGNOHive ships a zero-dependency CLI client (`cli/hive`) that lets you use the swarm from any terminal. Every run is backed by a **persistent chat session** stored server-side in PostgreSQL. The CLI auto-detects your Tailscale IP to connect to both your project MCP and hive-mcp.
 
 ### Installation
 
 ```bash
 # Copy to your PATH
-mkdir -p ~/.local/bin
 cp /path/to/agno-hive/cli/hive ~/.local/bin/hive
-chmod +x ~/.local/bin/hive
-
-# Or fetch directly from the repo
-curl -o ~/.local/bin/hive https://raw.githubusercontent.com/<your-repo>/agno-hive/main/cli/hive
-chmod +x ~/.local/bin/hive
-
-# Ensure ~/.local/bin is in PATH (add to ~/.bashrc or ~/.zshrc)
-export PATH="$HOME/.local/bin:$PATH"
+chmod +x ~/.local/bin/hive          # Linux/Mac
 ```
+
+On Windows, the `hive` file is a Python script — either add it to your PATH or run it with `python cli/hive`.
 
 ### Configuration
 
 ```bash
-# Add to ~/.bashrc or ~/.zshrc
-export AGNO_HOST=http://<zgx-ip>:9001    # AGNOHive server address
-export AGNO_PROJECT=myproject             # override project auto-detection
-export AGNO_TEAM=engineering              # team to use (default: engineering)
+# Add to ~/.bashrc / ~/.zshrc / PowerShell profile
+export AGNO_HOST=http://<zgx-tailscale-ip>:9001   # AGNOHive server
+export AGNO_PROJECT=myproject                       # optional — auto-detected from git remote
+export AGNO_TEAM=engineering                        # optional — default team
+export AGNO_MCP_URL=http://<ip>:9000/mcp           # optional — project MCP (auto-detected via Tailscale)
+export AGNO_MCP_PORT=9000                           # optional — port for Tailscale auto-detection
+export AGNO_SYSTEM_MCP_URL=http://<ip>:9003/mcp    # optional — hive-mcp (auto-detected via Tailscale)
+export AGNO_SYSTEM_MCP_PORT=9003                    # optional — hive-mcp port for auto-detection
 ```
 
-`AGNO_PROJECT` is auto-detected from `git remote get-url origin` if not set — so running `hive` inside a git repo will automatically use that repo's name as the project id.
+`AGNO_PROJECT` is auto-detected from `git remote get-url origin` — running `hive` inside a git repo uses that repo's name as the project id.
+
+MCP URLs are auto-detected via `tailscale ip -4` — no manual configuration needed if Tailscale is installed.
 
 ---
 
@@ -203,39 +225,54 @@ export AGNO_TEAM=engineering              # team to use (default: engineering)
 
 #### One-Shot Commands
 
-Run a single task and exit. Each one-shot always creates a **new** session. The session ID is printed in the footer so you can resume later.
-
 | Command | Description |
 |---|---|
-| `hive "task"` | Run a single task |
+| `hive "task"` | Run a single task (new session each time) |
 | `hive --review "task"` | Show plan, ask for approval, then execute |
-| `hive --session <id> "task"` | Run a task in an existing session |
-| `hive --persist "task"` | Run a task in a new permanent session (never auto-deleted) |
-| `hive --list-sessions` | Print recent sessions for this project and exit |
+| `hive -r "task"` | Alias for `--review` |
+| `hive --session <id> "task"` | Run in an existing session |
+| `hive --persist "task"` | Run in a new permanent session |
 | `hive --project <name> "task"` | Override project auto-detection |
 | `hive --team <name> "task"` | Use a specific team (default: `engineering`) |
 | `hive --host <url> "task"` | Connect to a different AGNOHive instance |
+| `hive --mcp-url <url> "task"` | Override project MCP URL |
+| `hive --mcp-port <port> "task"` | Override Tailscale auto-detect port for project MCP |
+| `hive --list-sessions` | Print recent sessions for this project and exit |
+| `hive --delete-all-sessions` | Delete all sessions for this project (prompts for confirmation) |
+| `hive --mcp-status` | Show connection status of both MCPs and exit |
+| `hive --bootstrap` | Index this project into LightRAG for semantic search |
+| `hive --bootstrap --lightrag-url <url>` | Specify LightRAG MCP URL (default: auto-derived from ZGX host) |
+| `hive --bootstrap --glob "**/*.py"` | Index only matching files |
+| `hive --bootstrap --force` | Re-index all files, ignore cached checksums |
+| `hive confirm [path]` | Apply a pending `.hive_proposed` file |
+| `hive reject [path]` | Discard a pending `.hive_proposed` file |
 
 #### Interactive REPL
 
 ```bash
-hive          # start REPL — auto-resumes last session for this project
-hive -r       # start REPL in review mode (plan shown before every task)
-hive --session <id>   # start REPL resuming a specific session
-hive --persist        # start REPL with a permanent session
+hive                      # start REPL — auto-resumes last session for this project
+hive -r                   # start REPL in review mode (plan shown before every task)
+hive --session <id>       # start REPL resuming a specific session
+hive --persist            # start REPL with a permanent session
 ```
 
 #### REPL Slash Commands
 
 | Command | Description |
 |---|---|
-| `/new` | Start a fresh session (next prompt creates it) |
+| `/new` | Start a fresh session (created on next prompt) |
 | `/sessions` | List recent sessions for this project |
 | `/history` | Print all messages in the current session |
 | `/persist` | Mark the current session as permanent |
 | `/delete <id>` | Delete a session by ID |
-| `/exit` | Save session ID to `~/.agno_last_session` and quit |
-| `! task` | Run a single task without review (review REPL only) |
+| `/delete-all` | Delete all sessions for this project (prompts) |
+| `/diff` | Open VS Code diff for all pending `.hive_proposed` files |
+| `/confirm [path]` | Apply pending proposed file (auto-detects if only one pending) |
+| `/reject [path]` | Discard pending proposed file |
+| `/cleanup` | List and delete all stale `.hive_proposed` files with confirmation |
+| `/mcp` | Show connection status of both MCPs |
+| `/exit` | Save session to `~/.agno_last_session` and quit |
+| `! task` | Run one task without review (review REPL only) |
 
 ---
 
@@ -244,111 +281,151 @@ hive --persist        # start REPL with a permanent session
 #### Basic tasks
 
 ```bash
-# Ask a question about the codebase
 hive "how does authentication work in this project?"
-
-# Ask about a specific file
-hive "what does the write_file function in mcp-server/tools/write.py do?"
-
-# Request a code change
 hive "add input validation to the POST /sellers endpoint"
+hive "what files are in the auth module?"
 ```
 
 #### Sessions — resuming context
 
 ```bash
-# First task — creates a new session and prints the session ID
+# First task — creates a new session, prints the ID in the footer
 hive "explain the seller registration flow"
-
-# Output footer example:
-# ── ContextRouter, Researcher · 38.2s  ·  session a3f7c2d1  ·  turn 1  ·  0 msgs in context  ·  expires 2026-05-31
+# ── 38.2s  ·  session a3f7c2d1  ·  turn 1  ·  0 msgs in context  ·  expires 2026-05-31
 #   resume: hive --session a3f7c2d1-8b3e-4f2a-9c1d-000000000000
 
-# Resume and follow up — agents remember the previous exchange
+# Resume — agents remember the previous exchange
 hive --session a3f7c2d1-8b3e-4f2a-9c1d-000000000000 "now add unit tests for that flow"
 ```
 
-#### REPL with session continuity
+#### REPL
 
 ```bash
-# Enter REPL — auto-resumes last session for this project
 hive
-
-# Banner shows which session is active:
 # AGNOHive  project EkamApp  mode engineering  http://100.96.86.82:9001
+#   project:   http://100.87.159.1:9000/mcp   + 12ms
+#   hive-mcp:  http://100.87.159.1:9003/mcp   + 8ms
 #   resuming session a3f7c2d1  (last used this project)
-#   /new  /sessions  /history  /persist  /delete <id>  /exit
+#   /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff  /cleanup  /mcp  /confirm  /reject  /exit  ·  ESC to interrupt
 
 > explain the write_file function
 > now add type hints to it
-> what other functions are in the same file?
-> /history           # review everything said so far
-> /exit              # saves session, prints resume command
-```
-
-#### Persistent sessions
-
-```bash
-# Create a session that never expires
-hive --persist "start working on the seller documents feature"
-
-# Or mark an existing REPL session as permanent
-hive
-> /persist           # marks current session as permanent
-> /sessions          # shows [persistent] badge next to it
+> /history
+> /exit
 ```
 
 #### Plan review (HITL)
 
 ```bash
-# See the plan before anything runs
 hive --review "add rate limiting to the login endpoint"
+# Planning... (ContextRouter -> Researcher -> Planner)
+# ────────────────────────────────────────────────────
+# Proposed Plan
+# ────────────────────────────────────────────────────
+# 1. Researcher: read src/api/auth.py ...
+# 2. Coder: implement rate limiting using Redis ...
+# ── planned in 18.2s
+# Proceed with this plan? [Y/n]
 
-# Review REPL — every task shows a plan and asks approval
-hive --review
-> refactor the User model to use UUIDs
-# → plan is shown, then Proceed? [Y/n]
+hive -r              # review REPL — every task asks approval
+> ! what files are in the auth module?   # skip review for this one
+```
 
-# Skip review for a quick question inside a review REPL
-> ! what files are in the auth module?
+#### Write review (WRITE_REVIEW mode)
+
+When hive-mcp has `WRITE_REVIEW=true`, every file write is staged for your approval:
+
+```bash
+# Agent creates/edits a file → hive-mcp writes path.hive_proposed
+# hive CLI auto-detects the pending file and shows:
+
+  review pending  src/api/auth.py
+  diff open in VS Code ↑        ← or inline terminal diff if IPC unavailable
+
+  ❯ confirm  — apply this change
+    reject   — discard
+    skip     — decide later
+
+# Arrow keys ↑/↓ to choose, Enter to confirm
+```
+
+REPL commands for managing proposed files:
+
+```bash
+> /diff              # open VS Code diff for all pending files
+> /confirm           # apply (auto-selects if only one pending)
+> /confirm src/api/auth.py   # explicit path
+> /reject src/api/auth.py
+> /cleanup           # list and delete all stale .hive_proposed files
+```
+
+Or without slash:
+
+```bash
+> confirm            # same as /confirm
+> reject src/api/auth.py
+```
+
+#### Bootstrap — index project into LightRAG
+
+```bash
+# First time — index everything (runs inside hive-mcp container)
+hive --bootstrap --lightrag-url http://<zgx-tailscale-ip>:9002/mcp
+
+# Incremental — only changed files
+hive --bootstrap
+
+# Force full reindex
+hive --bootstrap --force
+
+# Index only Python files
+hive --bootstrap --glob "**/*.py"
+```
+
+After bootstrap, agents can query the project knowledge graph:
+```
+memory_search("seller registration flow")
+lightrag_query("how does the auth middleware work", "EkamApp", mode="hybrid")
+```
+
+#### MCP status
+
+```bash
+hive --mcp-status
+#   project MCP           +  12ms  http://100.87.159.1:9000/mcp
+#     source: Tailscale auto-detect (port 9000)
+#
+#   hive-mcp (system)     +  8ms   http://100.87.159.1:9003/mcp
+#     source: Tailscale auto-detect (port 9003)
 ```
 
 #### Session management
 
 ```bash
-# List all sessions for this project
 hive --list-sessions
-
-# Output:
 # ID          Title                                                 Msgs  Status
 # ──────────────────────────────────────────────────────────────────────────────
 # a3f7c2d1    explain the seller registration flow                     4  expires 2026-05-31
 # b8e1f902    add rate limiting to the login endpoint                  2  persistent
 
-# Delete a session
-hive
-> /delete a3f7c2d1-8b3e-4f2a-9c1d-000000000000
-
-# Resume a specific session by ID
-hive --session a3f7c2d1-8b3e-4f2a-9c1d-000000000000
+hive --delete-all-sessions    # prompts for confirmation
 ```
 
-#### Footer explained
+---
 
-Every response prints an informative footer:
+### Footer Explained
 
 ```
-── Coder, Reviewer · 42.3s  ·  session a3f7c2d1  ·  turn 3  ·  4 msgs in context  ·  expires 2026-05-31
+── 42.3s  ·  session a3f7c2d1  ·  turn 3  ·  4 msgs in context  ·  expires 2026-05-31
 ```
 
 | Field | Meaning |
 |---|---|
-| `Coder, Reviewer` | Agents that ran |
 | `42.3s` | Total wall time |
 | `session a3f7c2d1` | First 8 chars of session UUID |
-| `turn 3` | Number of prompt/response pairs in this session |
+| `turn 3` | Prompt/response pairs in this session |
 | `4 msgs in context` | Verbatim messages injected into the coordinator |
-| `summary + N msgs` | Older turns were compacted — summary + recent messages injected |
+| `summary + N msgs` | Older turns compacted — summary + recent messages injected |
 | `expires 2026-05-31` | TTL expiry date |
 | `[persistent]` | Session will never auto-delete |
 
@@ -364,20 +441,23 @@ Every response prints an informative footer:
 | `hive --persist` | Yes, permanent | Yes (REPL) |
 | `/new` in REPL | Yes | On next `/exit` |
 
-Sessions expire after **30 days** unless marked persistent. Expired sessions are cleaned up automatically by the server every hour.
+Sessions expire after **30 days** unless marked persistent.
 
 ---
 
 ### Features
 
-- **Persistent sessions** — full conversation history stored in PostgreSQL on ZGX, resumable by session ID
-- **Auto-resume** — REPL auto-resumes the last session for the current project
-- **Compaction** — sessions longer than 20 messages are automatically summarised by `llama3.1:8b` so context never bloats
-- **Auto-detects project** from `git remote get-url origin` in your current directory
+- **Dual-MCP** — project MCP for context + hive-mcp for host actions; all tools available to all agents
+- **Tailscale auto-detection** — no manual URL config; CLI discovers both MCPs via `tailscale ip -4`
+- **Persistent sessions** — full conversation history in PostgreSQL, resumable by ID
+- **Auto-resume** — REPL auto-resumes last session for the current project
+- **Compaction** — sessions longer than 20 messages are summarised automatically by `llama3.1:8b`
+- **HITL review mode** (`--review`) — plan shown before every task, requires your approval
+- **Write review** — every file write staged as `.hive_proposed`; arrow-key selector in CLI; VS Code diff via IPC if available
+- **Semantic bootstrap** (`--bootstrap`) — index project into LightRAG for knowledge graph queries
+- **MCP status** (`--mcp-status`) — connectivity check for both MCPs with latency
 - **Readline history** — arrow keys, Ctrl+R search, persisted in `~/.agno_history`
-- **Informative footer** — shows agents, duration, session ID, turn count, context window, expiry
-- **Health check** on startup — warns if ZGX is unreachable before you type anything
-- **HITL review mode** (`--review`) — plan shown before every task executes, requires your approval
+- **Auto-detects project** from `git remote get-url origin`
 - **Zero dependencies** — pure Python 3 stdlib, works on any machine with Python installed
 
 ---
@@ -390,90 +470,32 @@ curl http://localhost:9001/health
 # {"status": "ok", "mcp_url": "http://..."}
 ```
 
-### List teams
-```bash
-curl http://localhost:9001/teams
-```
-
 ### Run a task
 ```bash
 curl -X POST http://localhost:9001/run \
   -H "Content-Type: application/json" \
   -d '{
     "task": "What files exist in the project root?",
-    "project_id": "myproject",
-    "team": "engineering"
+    "project_id": "EkamApp",
+    "team": "engineering",
+    "mcp_url": "http://<tailscale-ip>:9000/mcp",
+    "mcp_urls": ["http://<tailscale-ip>:9003/mcp"]
   }'
-```
-
-**Request fields:**
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `task` | string | required | The task or question |
-| `project_id` | string | `"default"` | Namespace for memory and failure tracking |
-| `team` | string | `"engineering"` | Team spec from `teams/*.yaml` |
-| `agents` | array | — | Inline agent specs (overrides team) |
-| `mcp_url` | string | — | Override `MCP_URL` for this request |
-| `session_id` | string | — | Resume an existing session |
-| `persist` | bool | `false` | Mark new session as permanent |
-
-**Response:**
-
-```json
-{
-  "result": "...",
-  "team": "engineering",
-  "agents_used": ["ContextRouter", "Researcher", "Planner", "Coder", "Executor", "Reviewer"],
-  "models_pulled": [],
-  "duration_seconds": 30.7,
-  "session": {
-    "session_id": "a3f7c2d1-8b3e-4f2a-9c1d-...",
-    "turn": 1,
-    "context_size": 0,
-    "compacted": false,
-    "persist": false,
-    "expires_at": "2026-05-31T14:45:00+00:00"
-  }
-}
-```
-
-### Session endpoints
-
-```bash
-# List sessions for a project
-curl "http://localhost:9001/sessions?project_id=myproject"
-
-# Get full session with all messages
-curl "http://localhost:9001/sessions/<session-id>"
-
-# Delete a session
-curl -X DELETE "http://localhost:9001/sessions/<session-id>"
-
-# Mark a session as permanent
-curl -X PATCH "http://localhost:9001/sessions/<session-id>/persist"
 ```
 
 ### Get a plan only (HITL)
-
-Returns a step-by-step plan from the planning team without executing. Used by `hive --review`.
-
 ```bash
 curl -X POST http://localhost:9001/plan \
   -H "Content-Type: application/json" \
-  -d '{
-    "task": "Add rate limiting to the login endpoint",
-    "project_id": "myproject"
-  }'
+  -d '{"task": "Add rate limiting to login", "project_id": "EkamApp"}'
 ```
 
-**Response:**
-
-```json
-{
-  "plan": "1. Researcher: read API/auth-service/routes.py ...\n2. Coder: implement ...",
-  "duration_seconds": 18.2
-}
+### Session endpoints
+```bash
+curl "http://localhost:9001/sessions?project_id=EkamApp"
+curl "http://localhost:9001/sessions/<id>"
+curl -X DELETE "http://localhost:9001/sessions/<id>"
+curl -X PATCH "http://localhost:9001/sessions/<id>/persist"
 ```
 
 ---
@@ -494,129 +516,60 @@ curl -X POST http://localhost:9001/plan \
 
 ## Teams
 
-Teams are defined in `teams/*.yaml`. Two built-in teams ship with AGNOHive:
-
 | Team | Agents | Used for |
 |---|---|---|
 | `engineering` | All 6 (default) | Full implementation tasks |
 | `planning` | ContextRouter + Researcher + Planner | HITL plan review via `POST /plan` |
 
-Create a new team by adding a YAML file — no code changes needed.
-
-```yaml
-name: my-team
-description: Custom team.
-coordinator_model: qwen3:30b-a3b
-agents:
-  - name: Coder
-    model: mistral-small3.1:24b
-    role: Senior engineer.
-    instructions:
-      - Write clean, idiomatic code.
-```
+Create a new team by adding a YAML file in `teams/` — no code changes needed.
 
 ---
 
-## Global Memory (Cross-Project Knowledge)
+## MCP Tools
 
-AGNOHive maintains two memory namespaces in LightRAG/Qdrant:
-
-| Namespace | Scope | Use case |
-|---|---|---|
-| `project_{id}` | Per-project | Code-specific knowledge, file patterns, project conventions |
-| `global` | Shared across all projects | Architectural patterns, debugging approaches, reusable solutions |
-
-Every `lightrag_query` call automatically searches **both** namespaces and merges the results — agents get project-specific and cross-project context in one call.
-
-Agents store cross-project insights via the `lightrag_insert_global` MCP tool:
-```
-lightrag_insert_global("Always use UUIDs for primary keys in FastAPI services — avoids int enumeration attacks.")
-```
-
-The ContextRouter knows when to query global memory:
-- Project-specific questions → `lightrag_query(query, project_id, mode='local')`
-- Cross-project patterns → `lightrag_query(query, 'global', mode='hybrid')`
-
----
-
-## Human-in-the-Loop (HITL) Plan Review
-
-Before AGNOHive executes any implementation task, you can require a plan approval step. The planning team (ContextRouter + Researcher + Planner) produces a step-by-step plan — you review it and approve or reject before the full engineering team runs.
-
-### Via CLI
-
-```bash
-# Single task with review
-hive --review "add rate limiting to the login endpoint"
-
-# Review mode REPL — every task requires approval
-hive --review
-
-# Skip review for one task in a review session
-> ! what is in the auth module?  # the ! prefix bypasses review
-```
-
-### Via API
-
-```bash
-# Step 1: Get the plan
-curl -X POST http://localhost:9001/plan \
-  -H "Content-Type: application/json" \
-  -d '{"task": "Add rate limiting", "project_id": "myproject"}'
-
-# Step 2: Review the plan, then execute if approved
-curl -X POST http://localhost:9001/run \
-  -H "Content-Type: application/json" \
-  -d '{"task": "Add rate limiting", "project_id": "myproject"}'
-```
-
----
-
-## VSCode Code Diff Before Edits (Client MCP)
-
-If your client project MCP server supports it, AGNOHive can show a VSCode diff of every proposed file change **before applying it** — giving you final say on every edit.
-
-Enable on the client MCP server side with `WRITE_REVIEW=true` in the server's environment. When an agent calls `write_file()` or `apply_diff()` on an existing file:
-
-1. A `.hive_proposed` temp file is created with the proposed content
-2. VSCode opens a diff automatically (original ← → proposed)
-3. The agent receives `review_pending: path/to/file` and waits
-4. You review the diff in VSCode, then tell the agent to proceed:
-   - **Apply:** ask the agent to call `confirm_write('path/to/file')`
-   - **Reject:** ask the agent to call `reject_write('path/to/file')`
-
-The agent's instructions prevent it from auto-confirming — it always waits for your explicit approval.
-
-> This feature requires `confirm_write` and `reject_write` tools to be registered in your client project's MCP server. See `tools/write.py` in your MCP server for the implementation.
-
----
-
-## MCP Tools AGNOHive Expects
-
-Works with any subset — missing tools are handled gracefully:
+### Project MCP (context — app-specific)
 
 | Tool | Purpose | Required |
 |---|---|---|
 | `find_files(pattern)` | Discover files by glob | Recommended |
 | `get_file_content(path)` | Read a file | Recommended |
 | `search_files(pattern, glob)` | Search across codebase | Recommended |
-| `run_command(cmd)` | Run tests / linters | Optional |
-| `memory_store(key, value)` | Persist a finding | Optional |
-| `memory_search(query)` | Recall prior findings | Optional |
-| `get_context_section(topic)` | Targeted docs section | Optional |
 | `get_project_context()` | Full project overview | Optional |
+| `run_command(cmd)` | Run tests / linters (read-only) | Optional |
+| `memory_search(query)` | Recall prior findings | Optional |
 
-> **Transport:** AGNOHive connects via **Streamable HTTP** (the current MCP standard). Your MCP server must expose a `/mcp` endpoint, not `/sse`.
+### hive-mcp (host actions — generic)
+
+| Tool | Purpose |
+|---|---|
+| `apply_diff(path, old_string, new_string)` | Surgical file edit (WRITE_REVIEW-aware) |
+| `write_file(path, content)` | Create a new file (WRITE_REVIEW-aware) |
+| `run_shell(cmd)` | Run any shell command |
+| `run_docker(cmd)` | Docker / docker compose commands |
+| `git_status/log/diff/blame` | Git operations |
+| `index_project(project_id, lightrag_url, ...)` | Semantic bootstrap into LightRAG |
+
+> **Transport:** All MCP servers must use **Streamable HTTP** (`/mcp` endpoint). The deprecated `/sse` transport is not used.
+
+---
+
+## Global Memory
+
+| Namespace | Scope |
+|---|---|
+| `project_{id}` | Per-project code knowledge |
+| `global` | Shared across all projects |
+
+Every `lightrag_query` searches both namespaces and merges results automatically.
 
 ---
 
 ## Git Workflow
 
-All file changes are made on Windows, committed, pushed to remote, then pulled on ZGX:
+All file changes are made on Windows, committed, pushed, then pulled on ZGX:
 
 ```bash
-# On ZGX — pick up latest changes
-git -C ~/agno-hive pull
+git -C ~/agno-hive pull   # on ZGX
 ```
 
 **Never edit files directly on ZGX.**
@@ -633,14 +586,18 @@ git -C ~/agno-hive pull
 | Bootstrap project context from MCP | Done |
 | OllamaToolFix (all tool-call formats) | Done |
 | ZGX infra — Qdrant + PostgreSQL/AGE (Docker) | Done |
-| LightRAG MCP server (Qdrant + AGE backends) | Done |
+| LightRAG MCP server (Streamable HTTP) | Done |
 | Automated code indexer (AST + incremental) | Done |
 | Self-improving loop (success → LightRAG, failure → Postgres) | Done |
 | OTel instrumentation → SigNoz | Done |
 | Global memory (cross-project shared namespace) | Done |
 | HITL plan review (`POST /plan` + `hive --review`) | Done |
-| VSCode diff before edits (client MCP integration) | Done |
+| VSCode diff + CLI arrow-key review (WRITE_REVIEW) | Done |
 | Persistent chat sessions (PostgreSQL, TTL, compaction) | Done |
+| hive-mcp (generic Docker host-action MCP, GHCR image) | Done |
+| Dual-MCP architecture (project context + hive-mcp host actions) | Done |
+| Tailscale auto-detection for MCP URLs | Done |
+| `hive bootstrap` / `index_project` (LightRAG via hive-mcp) | Done |
 | Cost-aware model routing | Planned |
 
 ---

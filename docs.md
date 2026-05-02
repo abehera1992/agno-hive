@@ -8,8 +8,8 @@ agno-hive/
 ├── config/
 │   └── config.py            # All config via env vars, dataclass, loaded from .env
 ├── swarm/
-│   ├── agents.py            # Agent factory functions (all 6 agents + make_agent_from_spec)
-│   ├── team.py              # run_task_async — builds and runs the Team
+│   ├── agents.py            # Agent factory functions — all accept *mcps: MCPTools
+│   ├── team.py              # run_task_async — dual-MCP via AsyncExitStack
 │   ├── bootstrap.py         # Pre-team MCP session via Streamable HTTP to fetch project patterns
 │   ├── feedback.py          # Self-improving loop: record_success, record_failure, load_failure_context
 │   ├── sessions.py          # Chat session persistence: CRUD, TTL cleanup, compaction
@@ -19,12 +19,13 @@ agno-hive/
 │   ├── server.py            # FastAPI app: /health, /teams, /run, /plan, /sessions
 │   └── models.py            # Pydantic models: AgentSpec, RunRequest, RunResponse, SessionMeta, SessionDetail
 ├── teams/
-│   └── engineering.yaml     # Full 6-agent engineering team spec
+│   ├── engineering.yaml     # Full 6-agent engineering team spec
+│   └── planning.yaml        # HITL planning team (ContextRouter + Researcher + Planner)
 ├── lightrag_mcp/
-│   ├── server.py            # FastMCP SSE server: lightrag_insert, lightrag_query tools
+│   ├── server.py            # FastMCP Streamable HTTP server: lightrag_insert, lightrag_query tools
 │   └── rag.py               # LightRAG instance factory (per-project cache, Qdrant + AGE backends)
 ├── indexer/
-│   ├── cli.py               # Code indexer entry point and orchestration
+│   ├── cli.py               # Code indexer entry point (ZGX-side, direct LightRAG insert)
 │   ├── parser.py            # Python AST chunker + generic text chunker
 │   └── tracker.py           # SHA-256 hash state for incremental indexing
 ├── observability/
@@ -34,6 +35,21 @@ agno-hive/
 │   ├── docker-compose.zgx.yml   # ZGX infra stack (Qdrant + PostgreSQL/AGE)
 │   └── init/
 │       └── 01_age.sql           # Runs once on first postgres-age start; creates AGE extension + agno graph
+├── hive-mcp/                # Generic client-side Docker MCP server (see hive-mcp/README.md)
+│   ├── main.py              # FastMCP Streamable HTTP server entry point
+│   ├── config.py            # PROJECT_ROOT, MCP_HOST, MCP_PORT, WRITE_REVIEW
+│   ├── Dockerfile
+│   ├── docker-compose.hive.yml  # Drop into any project and run
+│   ├── requirements.txt
+│   ├── .env.example
+│   └── tools/
+│       ├── context.py       # get_project_context, get_file_content, find_files, search_files, list_directory
+│       ├── files.py         # write_file, apply_diff, run_command (WRITE_REVIEW-aware)
+│       ├── shell.py         # run_shell, run_docker, get_env_info, check_port, list_processes
+│       ├── git.py           # git_status, git_log, git_diff, git_log_file, git_blame
+│       └── index.py         # index_project — walks project, chunks, inserts into LightRAG via MCP
+├── cli/
+│   └── hive                 # Zero-dependency CLI client (pure Python stdlib)
 ├── tests/
 │   ├── conftest.py
 │   ├── test_bootstrap.py
@@ -52,11 +68,11 @@ agno-hive/
 | `LEADER_MODEL` | `qwen3:30b-a3b` | Coordinator agent model |
 | `CODER_MODEL` | `mistral-small3.1:24b` | Coder agent model |
 | `REVIEWER_MODEL` | `gemma3:27b` | Reviewer agent model |
-| `PLANNER_MODEL` | `deepseek-r1` | Planner agent model (Phase 2) |
-| `RESEARCHER_MODEL` | `mixtral:8x7b` | Researcher agent model (Phase 2) |
-| `EXECUTOR_MODEL` | `llama3.1:8b` | Executor agent model (Phase 2) |
-| `ROUTER_MODEL` | `llama3.1:8b` | Context Router agent model (Phase 2) |
-| `MCP_URL` | `` | Client project MCP server endpoint (Streamable HTTP), e.g. `http://<host>:9000/mcp` |
+| `PLANNER_MODEL` | `deepseek-r1` | Planner agent model |
+| `RESEARCHER_MODEL` | `mixtral:8x7b` | Researcher agent model |
+| `EXECUTOR_MODEL` | `llama3.1:8b` | Executor agent model |
+| `ROUTER_MODEL` | `llama3.1:8b` | Context Router agent model |
+| `MCP_URL` | `` | Primary MCP server (project context), e.g. `http://<host>:9000/mcp` |
 | `PATTERNS_GLOB` | `patterns/**/*.md` | Glob for bootstrap pattern files on the MCP server |
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant REST API (ZGX Docker) |
 | `POSTGRES_URI` | `` | PostgreSQL connection string, e.g. `postgresql://agno:agno@localhost:5432/agno_graph` |
@@ -90,36 +106,78 @@ Lists all available team specs from `teams/*.yaml`.
 ```json
 {
   "teams": [
-    { "name": "coding", "description": "...", "agents": ["Coder", "Reviewer"] }
+    { "name": "engineering", "description": "...", "agents": ["ContextRouter", "Researcher", ...] }
   ]
 }
 ```
 
 ### `POST /run`
-Runs a task. Returns the result with metadata.
+Runs a task. Returns the result with session metadata.
 
 **Request:**
 ```json
 {
   "task": "Refactor the auth module to use JWT",
-  "team": "coding",           // optional: named team from teams/*.yaml
-  "agents": [...],            // optional: inline AgentSpec list (overrides team)
-  "mcp_url": "http://..."     // optional: override MCP_URL for this request
+  "project_id": "EkamApp",
+  "team": "engineering",
+  "agents": [...],
+  "mcp_url": "http://<tailscale-ip>:9000/mcp",
+  "mcp_urls": ["http://<tailscale-ip>:9003/mcp"],
+  "session_id": "optional-uuid",
+  "persist": false
 }
 ```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `task` | string | required | The task or question |
+| `project_id` | string | `"default"` | Namespace for memory and failure tracking |
+| `team` | string | `"engineering"` | Team spec from `teams/*.yaml` |
+| `agents` | array | — | Inline agent specs (overrides team) |
+| `mcp_url` | string | — | Primary MCP (project context); overrides `MCP_URL` env var |
+| `mcp_urls` | list[string] | — | Additional MCPs (e.g. hive-mcp for host actions) |
+| `session_id` | string | — | Resume an existing session |
+| `persist` | bool | `false` | Mark new session as permanent |
+
+**Resolution order for team:** `agents` inline > `team` named > default `engineering` team.
 
 **Response:**
 ```json
 {
   "result": "...",
-  "team": "coding",
-  "agents_used": ["Coder", "Reviewer"],
+  "team": "engineering",
+  "agents_used": ["ContextRouter", "Researcher", "Planner", "Coder", "Executor", "Reviewer"],
   "models_pulled": [],
-  "duration_seconds": 12.4
+  "duration_seconds": 30.7,
+  "session": {
+    "session_id": "a3f7c2d1-8b3e-4f2a-9c1d-...",
+    "turn": 1,
+    "context_size": 0,
+    "compacted": false,
+    "persist": false,
+    "expires_at": "2026-05-31T14:45:00+00:00"
+  }
 }
 ```
 
-**Resolution order for team:** `agents` inline > `team` named > default `coding` team.
+### `POST /plan`
+Runs the planning team (ContextRouter + Researcher + Planner) and returns a step-by-step plan without executing. Used by `hive --review`.
+
+**Request:** same shape as `/run`
+
+**Response:**
+```json
+{ "plan": "1. Researcher: ...\n2. Coder: ...", "duration_seconds": 18.2 }
+```
+
+### Session endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/sessions?project_id=X&limit=20` | List sessions for a project |
+| `GET` | `/sessions/{id}` | Full session with all messages and summary |
+| `DELETE` | `/sessions/{id}` | Hard delete (including persisted sessions) |
+| `PATCH` | `/sessions/{id}/persist` | Mark session as permanent |
 
 ## Team YAML Format
 
@@ -148,16 +206,22 @@ agents:
 ## How run_task_async Works
 
 ```
-run_task_async(task, agent_specs, coordinator_model, mcp_url, project_id)
-  1. [parallel] bootstrap() — Streamable HTTP MCP session, reads patterns_glob → project_context
-  1. [parallel] load_failure_context(project_id) — queries PostgreSQL failure_log → failure_context
-  2. MCPTools(url, transport="streamable-http") — opens persistent MCP connection for agents
-  3. Build team members (from agent_specs or default engineering team)
-  4. Build Team (coordinator + members + MCP tools + instructions + project_context + failure_context)
-  5. team.arun(task)
-     ├── success → record_success() → LightRAG insert
-     └── failure → record_failure() → PostgreSQL failure_log
-  6. return result
+run_task_async(task, agent_specs, coordinator_model, mcp_url, mcp_urls, project_id)
+  1. [parallel] bootstrap()            — Streamable HTTP MCP session → project_context
+  1. [parallel] load_failure_context() — PostgreSQL failure_log → failure_context
+  2. AsyncExitStack opens ALL MCP connections simultaneously:
+       - mcp_list[0] = MCPTools(mcp_url)            # primary: project context
+       - mcp_list[1] = MCPTools(mcp_urls[0])        # secondary: hive-mcp host actions
+       - ...
+  3. Build team members — each factory accepts *mcp_list: make_coder(*mcp_list)
+  4. Build Team (coordinator + members + all MCP tools + instructions + context)
+  5. Coordinator instructions include routing rules:
+       "PROJECT MCP: reading context, memory_search, knowledge graph"
+       "hive-mcp: apply_diff, write_file, run_shell, run_docker, git_*"
+  6. team.arun(task)
+       ├── success → record_success() → LightRAG insert
+       └── failure → record_failure() → PostgreSQL failure_log
+  7. return result
 ```
 
 Bootstrap and failure context loading run in parallel (`asyncio.gather`) — no latency penalty.
@@ -166,7 +230,7 @@ Bootstrap and failure context loading run in parallel (`asyncio.gather`) — no 
 
 `swarm/bootstrap.py` opens a raw `mcp.ClientSession` via **Streamable HTTP** (`streamablehttp_client`), calls `find_files(patterns_glob)` to discover pattern files, then reads each with `get_file_content()`. Falls back to `get_project_context()` if pattern files aren't found. Returns a combined string injected into the coordinator's instructions.
 
-> **Transport note:** AGNOHive uses Streamable HTTP (the current MCP standard) for all MCP connections. Your MCP server must expose a `/mcp` endpoint. The deprecated `/sse` endpoint will return `400 Bad Request`.
+> **Transport note:** AGNOHive uses Streamable HTTP (the current MCP standard) for all MCP connections. Your MCP server must expose a `/mcp` endpoint. The deprecated `/sse` endpoint is not used.
 
 ## How OllamaToolFix Works
 
@@ -177,6 +241,26 @@ Bootstrap and failure context loading run in parallel (`asyncio.gather`) — no 
 4. Bare JSON object in content
 
 All formats are parsed and converted to the standard format before passing to Agno's agent loop.
+
+## Dual-MCP Architecture
+
+Every `run_task_async` call can receive multiple MCP URLs. All connections are opened simultaneously with `AsyncExitStack` before the team is built, then each agent factory receives all MCPs:
+
+```python
+async with AsyncExitStack() as stack:
+    mcp_list = []
+    for url in all_mcp_urls:
+        mcp = await stack.enter_async_context(
+            MCPTools(url=url, transport="streamable-http", timeout_seconds=120)
+        )
+        mcp_list.append(mcp)
+    members = [make_coder(*mcp_list), make_reviewer(*mcp_list), ...]
+    team = Team(tools=mcp_list, members=members, ...)
+```
+
+Coordinator routing instructions:
+- **Project MCP** — `get_file_content`, `find_files`, `search_files`, `memory_search`, `lightrag_query`, and any app-specific workflow tools
+- **hive-mcp** — `apply_diff`, `write_file`, `run_shell`, `run_docker`, `git_*`, `index_project`
 
 ## ZGX Infrastructure
 
@@ -197,37 +281,18 @@ docker compose -f docker/docker-compose.zgx.yml down -v    # stop + delete volum
 
 **Note:** `pgdata` volume must be mounted at `/var/lib/postgresql` (not `/var/lib/postgresql/data`) due to PostgreSQL 18+ directory layout change in the `apache/age:latest` image.
 
-### Checking Container Status (via SSH or ZGX terminal)
+### Checking Container Status
 
 ```bash
-# Quick status — just agno containers
 docker ps --filter "name=agno-"
-
-# All running containers
-docker ps
-
-# Check logs if something looks wrong
-docker logs agno-qdrant --tail 20
-docker logs agno-postgres-age --tail 20
-
-# Verify Qdrant health
 curl http://localhost:6333/healthz
-
-# Verify AGE graph exists in Postgres
 docker exec agno-postgres-age psql -U agno -d agno_graph -c "SELECT * FROM ag_catalog.ag_graph;"
-
-# Restart the stack
 docker compose -f ~/agno-hive/docker/docker-compose.zgx.yml restart
-
-# Stop the stack
-docker compose -f ~/agno-hive/docker/docker-compose.zgx.yml down
 ```
 
-## Self-Improving Loop (Phase 5)
+## Self-Improving Loop
 
 Every task run feeds back into memory so the coordinator learns from past outcomes.
-
-### Flow
 
 ```
 run_task_async(task, project_id)
@@ -239,13 +304,7 @@ run_task_async(task, project_id)
   └── return result
 ```
 
-### Success Path
-
-Outcome stored in LightRAG via `rag.ainsert()` — tagged with project_id and task description. Agents retrieve past successes via `memory_search` MCP tool in subsequent runs.
-
-### Failure Path
-
-Failures written to a `failure_log` PostgreSQL table (auto-created on first use):
+Failure log schema:
 
 | Column | Type | Description |
 |---|---|---|
@@ -256,63 +315,83 @@ Failures written to a `failure_log` PostgreSQL table (auto-created on first use)
 | `agent` | TEXT | Agent that failed |
 | `created_at` | TIMESTAMPTZ | Timestamp |
 
-### Context Injection
+The 3 most recent failures are loaded and appended to the coordinator's instructions before every run.
 
-Before every `team.arun()`, the 3 most recent failures for the project are loaded and appended to the coordinator's instructions:
+## hive-mcp (Client-Side Docker MCP)
 
-```
-── Past failures — avoid repeating these mistakes ──────────
-  Task:  refactor the auth module
-  Error: RuntimeError: get_file_content returned empty for src/auth.py
+`hive-mcp/` is a standalone FastMCP server that runs on the client machine as a Docker container. It gives AGNOHive host-level access independent of what project MCP is installed.
 
-  Task:  add rate limiting to /api/login
-  Error: TimeoutError: MCP connection timed out after 60s
-```
-
-### API Change
-
-`POST /run` now accepts `project_id` (default: `"default"`):
-
-```json
-{ "task": "...", "project_id": "ekam", "team": "engineering" }
-```
-
-### Files
+### Image
 
 ```
-swarm/feedback.py   # record_success, record_failure, load_failure_context, _ensure_table
+ghcr.io/abehera1992/hive-mcp:latest
 ```
 
-## Automated Code Indexer (Phase 4)
+Rebuilt automatically on every push to `main` that changes `hive-mcp/**`.
 
-Walks a repository, chunks source files, and inserts them into LightRAG. Runs on ZGX where LightRAG and Qdrant/PostgreSQL are available. No additional dependencies — Python files are parsed with the built-in `ast` module; all other types use fixed-size text chunking.
-
-### Usage
+### Running
 
 ```bash
-# First run — indexes everything
-python main.py --index --path /path/to/repo --project-id ekam
+# Using docker-compose (recommended — copy file into your project)
+docker compose -f docker-compose.hive.yml up -d
 
-# Subsequent runs — only changed/new files are reindexed
-python main.py --index --path /path/to/repo --project-id ekam
-
-# Force full reindex (ignores cached state)
-python main.py --index --path /path/to/repo --project-id ekam --force
-
-# Or run directly as a module
-python -m indexer.cli --path /path/to/repo --project-id ekam
+# Or docker run
+docker run -d --name hive-mcp --restart unless-stopped \
+  -p 9000:9000 \
+  -v "$(pwd):/project" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e PROJECT_ROOT=/project -e WRITE_REVIEW=true \
+  ghcr.io/abehera1992/hive-mcp:latest
 ```
 
-### How It Works
+### Config
 
-1. Walks all files, skipping `.git`, `__pycache__`, `node_modules`, binaries, etc.
-2. Computes SHA-256 hash of each file
-3. Compares against cached state in `~/.agno-hive/index-state/{project_id}.json`
-4. Only processes changed or new files (incremental by default)
-5. Python files: `ast` module extracts module docstrings, functions, and classes as individual chunks
-6. All other files: split into 4000-char chunks with file/type headers
-7. Each chunk inserted via `rag.ainsert()` — LightRAG extracts entities/relations into Qdrant + AGE
-8. Saves updated state after a successful run
+| Variable | Default | Description |
+|---|---|---|
+| `PROJECT_ROOT` | `/project` | Project path inside the container |
+| `MCP_HOST` | `0.0.0.0` | Bind address |
+| `MCP_PORT` | `9000` | Container port |
+| `WRITE_REVIEW` | `true` | Stage writes as `.hive_proposed` for human review |
+
+### Endpoint
+
+```
+http://<tailscale-ip>:<port>/mcp
+```
+
+The hive CLI auto-detects the Tailscale IP. Default port for hive-mcp is 9003 on the host when the project MCP already occupies 9000 (docker `-p 9003:9000`).
+
+### Tools exposed
+
+See `hive-mcp/README.md` for the full tool list.
+
+## Automated Code Indexer
+
+Two paths to index a project into LightRAG:
+
+### 1. ZGX-side (`python main.py --index`)
+
+Runs directly on ZGX, calls `rag.ainsert()` without going through MCP. Fastest option.
+
+```bash
+python main.py --index --path /path/to/repo --project-id ekam
+python main.py --index --path /path/to/repo --project-id ekam --force
+```
+
+State: `~/.agno-hive/index-state/{project_id}.json`
+
+### 2. Client-side (`hive --bootstrap` via hive-mcp)
+
+Runs inside the hive-mcp container on the client machine. Calls `lightrag_insert` on the LightRAG MCP server via Streamable HTTP.
+
+```bash
+hive --bootstrap                                    # auto-detects lightrag URL from ZGX host
+hive --bootstrap --lightrag-url http://<zgx>:9002/mcp
+hive --bootstrap --glob "**/*.py"                   # only Python files
+hive --bootstrap --force                            # reindex everything
+```
+
+State: `/tmp/hive-index/{project_id}.json` (inside container)
 
 ### Chunk Format (Python)
 
@@ -327,32 +406,7 @@ class User(Base):
     email = Column(String, unique=True)
 ```
 
-### File Structure
-
-```
-indexer/
-  __init__.py
-  cli.py       # Entry point, orchestration, argparse
-  parser.py    # Python AST chunker + generic text chunker
-  tracker.py   # SHA-256 hash state (incremental indexing)
-```
-
-State files: `~/.agno-hive/index-state/{project_id}.json` — delete to force full reindex.
-
-## OTel Instrumentation (Phase 6)
-
-AGNOHive uses the OpenTelemetry Python SDK with a configurable `OTLP_ENDPOINT`. If the env var is empty, telemetry is completely disabled — zero overhead, no errors.
-
-### File Structure
-
-```
-observability/
-  __init__.py
-  setup.py     # setup_telemetry() singleton — call once at process startup
-  metrics.py   # task_duration (histogram) and task_counter (counter) instruments
-```
-
-### What Gets Traced
+## OTel Instrumentation
 
 | Span | Attributes |
 |---|---|
@@ -360,43 +414,12 @@ observability/
 | `agno.team.run` (child) | — |
 | HTTP requests | Auto-instrumented via `FastAPIInstrumentor` |
 
-Failures set `ERROR` status on the span and call `span.record_exception()`.
-
-### What Gets Measured
-
 | Metric | Type | Labels |
 |---|---|---|
 | `agno.task.duration` | Histogram (seconds) | `project_id` |
 | `agno.task.count` | Counter | `project_id`, `outcome` (success/failure) |
 
-### Enabling Telemetry
-
-Set `OTLP_ENDPOINT` in `.env` and restart:
-
-```bash
-# SigNoz self-hosted on Ekam host
-OTLP_ENDPOINT=http://<ekam-host-ip>:4318
-
-# Any other OTel-compatible backend
-OTLP_ENDPOINT=http://localhost:4317
-```
-
-`setup_telemetry()` is called at startup in both `--serve` (FastAPI) and CLI/interactive modes. Metrics are exported every 60 seconds.
-
-## Observability
-
-AGNOHive will use the OpenTelemetry Python SDK (`opentelemetry-sdk`, `opentelemetry-exporter-otlp`) with a configurable `OTLP_ENDPOINT`. Set this to the SigNoz OTLP HTTP endpoint on the Ekam host:
-
-```
-OTLP_ENDPOINT=http://<ekam-host-ip>:4318
-```
-
-SigNoz runs in Docker on the Ekam host (separate `signoz-network` from `ekam-network`). ZGX reaches it via the host machine's exposed port — Docker network isolation is irrelevant for external machine access. Verify with:
-
-```bash
-curl http://<ekam-host-ip>:4318/v1/traces -d '{}' -H 'Content-Type: application/json'
-# Expect 400 (bad payload), not connection refused
-```
+Enable by setting `OTEL_EXPORTER_OTLP_ENDPOINT` in `.env`.
 
 ## Global Memory
 
@@ -407,20 +430,7 @@ LightRAG maintains two namespaces queried on every lookup:
 | `project_{id}` | `project_ekam`, etc. | Per-project code knowledge |
 | `global` | `project_global` | Cross-project patterns and lessons |
 
-### How It Works
-
-`lightrag_query` runs both namespace queries in parallel (`asyncio.gather`) and merges results with labelled sections. An empty namespace returns no output and is omitted from the merge.
-
-```python
-# lightrag_mcp/server.py
-project_result, global_result = await asyncio.gather(
-    project_rag.aquery(query, param=param),
-    global_rag.aquery(query, param=param),
-    return_exceptions=True,
-)
-```
-
-### Tools
+`lightrag_query` runs both in parallel (`asyncio.gather`) and merges results. An empty namespace is omitted from the merge.
 
 | Tool | Purpose |
 |---|---|
@@ -428,19 +438,14 @@ project_result, global_result = await asyncio.gather(
 | `lightrag_insert_global(text)` | Index into shared global namespace |
 | `lightrag_query(query, project_id, mode)` | Query both namespaces, merged |
 
-### ContextRouter Routing Rules
-
+ContextRouter routing:
 ```
-Specific file/symbol questions   → lightrag_query(query, project_id, mode='local')
-Cross-module/thematic context    → lightrag_query(query, project_id, mode='global')
-Cross-project patterns/lessons   → lightrag_query(query, 'global', mode='hybrid')
+Specific file/symbol        → lightrag_query(query, project_id, mode='local')
+Cross-module/thematic       → lightrag_query(query, project_id, mode='global')
+Cross-project patterns      → lightrag_query(query, 'global', mode='hybrid')
 ```
-
----
 
 ## Human-in-the-Loop (HITL) Plan Review
-
-### Architecture
 
 ```
 hive --review "task"
@@ -452,34 +457,11 @@ hive --review "task"
   │   └─ N → abort, nothing executed
 ```
 
-### Planning Team
-
-`teams/planning.yaml` — ContextRouter + Researcher + Planner only. Produces a numbered step list naming responsible agent, files to touch, and risks. Does **not** implement anything.
-
-### API Endpoints
-
-`POST /plan` — same request body as `/run`, returns:
-```json
-{ "plan": "1. Researcher: ...\n2. Coder: ...", "duration_seconds": 18.2 }
-```
-
-### CLI Flags
-
-```bash
-hive --review "task"   # single task with approval gate
-hive -r                # review mode REPL
-> ! task               # skip review for one task in review REPL
-```
-
----
+`teams/planning.yaml` — produces a numbered step list naming responsible agent, files to touch, and risks. Does not implement anything.
 
 ## Persistent Chat Sessions
 
-Every `POST /run` call creates or resumes a session in PostgreSQL. The coordinator receives the last N messages (verbatim window) plus a compacted summary of older turns so follow-up prompts always have full context.
-
 ### Database Schema
-
-Two tables auto-created on first server start (same pattern as `failure_log`):
 
 ```sql
 chat_sessions
@@ -491,7 +473,7 @@ chat_sessions
   expires_at      TIMESTAMPTZ            -- NULL when persist = TRUE
   persist         BOOLEAN DEFAULT FALSE
   summary         TEXT                   -- compacted summary of older messages
-  summary_through INT DEFAULT 0          -- message id up to which summary covers
+  summary_through INT DEFAULT 0
 
 session_messages
   id          SERIAL PRIMARY KEY
@@ -501,39 +483,9 @@ session_messages
   created_at  TIMESTAMPTZ
 ```
 
-### Context Injection
-
-Injected into the coordinator's instructions after project context and failure context:
-
-```
-── Session summary (older turns) ──────────────────────────────────
-The user is adding seller documents. Key decisions: use UUID primary
-keys, POST /sellers/{id}/documents, return 201 on success.
-───────────────────────────────────────────────────────────────────
-── Recent messages ─────────────────────────────────────────────────
-[user] add the POST endpoint for seller documents
-[assistant] Done. Added POST /sellers/{seller_id}/documents to...
-───────────────────────────────────────────────────────────────────
-```
-
 ### Compaction
 
-When total message count exceeds `AGNO_COMPACT_THRESHOLD` (default: 20), a fire-and-forget `asyncio.create_task` calls `llama3.1:8b` via Ollama to summarise the older messages outside the verbatim window. The summary is stored in `chat_sessions.summary` and used on all subsequent runs.
-
-### TTL and Persistence
-
-- Non-persisted sessions expire after `SESSION_TTL_DAYS` (default: 30 days)
-- Server runs `DELETE WHERE expires_at < NOW() AND persist = FALSE` every `SESSION_CLEANUP_INTERVAL` seconds (default: 3600)
-- Persisted sessions are only deleted via `DELETE /sessions/{id}`
-
-### Session API Endpoints
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/sessions?project_id=X&limit=20` | List sessions for a project |
-| `GET` | `/sessions/{id}` | Full session with all messages and summary |
-| `DELETE` | `/sessions/{id}` | Hard delete (including persisted sessions) |
-| `PATCH` | `/sessions/{id}/persist` | Mark session as permanent |
+When total message count exceeds `AGNO_COMPACT_THRESHOLD` (default: 20), a fire-and-forget `asyncio.create_task` calls `llama3.1:8b` to summarise older messages. The summary is stored in `chat_sessions.summary`.
 
 ### `swarm/sessions.py` Public Interface
 
@@ -552,34 +504,25 @@ When total message count exceeds `AGNO_COMPACT_THRESHOLD` (default: 20), a fire-
 
 All functions fail silently — a PostgreSQL outage never blocks task runs.
 
-### CLI Session State
+## VSCode Diff Review (WRITE_REVIEW)
 
-The CLI stores the last active session in `~/.agno_last_session`:
-
-```json
-{"session_id": "a3f7c2d1-...", "project_id": "EkamApp"}
-```
-
-REPL mode reads this on start and auto-resumes if the project matches. One-shot mode never writes this file.
-
----
-
-## VSCode Diff Review (Client MCP Integration)
-
-Enabled via `WRITE_REVIEW=true` on the client MCP server. Intercepts **all** `write_file()` and `apply_diff()` calls — both edits to existing files and creation of new files.
+Enabled via `WRITE_REVIEW=true` on hive-mcp.
 
 ### Flow
 
 ```
-agent calls apply_diff(path, old_string, new_string)   ← always use this for edits
-  ├─ WRITE_REVIEW=false (default) → applies immediately, returns "applied: path"
+agent calls apply_diff(path, old_string, new_string)
+  ├─ WRITE_REVIEW=false → applies immediately → "applied: path"
   └─ WRITE_REVIEW=true
        ├─ writes proposed content to path + ".hive_proposed"
        └─ returns "review_pending: path — user will confirm/reject via CLI"
               ↓
-       hive CLI detects new .hive_proposed file
+       hive CLI detects new .hive_proposed files
               ↓
-       VS Code opens diff tab in current window (code --diff original proposed)
+       VS Code IPC: opens diff tab in existing window (no new window)
+       — or —
+       inline terminal diff shown if IPC unavailable
+              ↓
        CLI shows arrow-key selector:
          ❯ confirm  — apply this change
            reject   — discard
@@ -588,27 +531,20 @@ agent calls apply_diff(path, old_string, new_string)   ← always use this for e
        user presses ↑/↓ then Enter
               ↓
        CLI applies or deletes .hive_proposed directly on local filesystem
-       (no agent involvement — agents cannot confirm or reject)
+       (agents have no involvement — confirm_write/reject_write are not MCP tools)
 ```
 
-### Why agents cannot confirm/reject
+### VS Code IPC
 
-`confirm_write` and `reject_write` are **not registered as MCP tools**. They are not visible to agents. This prevents models from auto-confirming despite instructions. The hive CLI applies or discards proposed files directly using local file I/O.
+When the terminal was opened by VS Code, `VSCODE_IPC_HOOK_CLI` is set. The CLI writes a JSON open/diff command directly to the VS Code named pipe socket — zero new process, zero extra window. Falls back to enumerating `\\.\pipe\vscode-ipc-*-sock` pipes. If no IPC socket is found, inline terminal diff is shown instead.
 
 ### run_command write guard
 
-When `WRITE_REVIEW=true`, `run_command` **blocks** any shell command that writes to files. Blocked patterns: `>`, `>>`, `sed -i`, `perl -i`, `tee`, `truncate`, `dd of=`. The tool returns:
-
-```
-blocked: run_command cannot write files when WRITE_REVIEW is enabled.
-Use apply_diff() to edit an existing file or write_file() to create a new one.
-```
-
-This prevents agents from bypassing the review flow via shell redirection.
+When `WRITE_REVIEW=true`, `run_command` blocks any shell command that writes to files. Blocked patterns: `>`, `>>`, `sed -i`, `perl -i`, `tee`, `truncate`, `dd of=`.
 
 ### apply_diff: edit vs. append
 
-`apply_diff` makes a **surgical replacement** — it finds `old_string` (must appear exactly once) and replaces it with `new_string`.
+`apply_diff` makes a surgical replacement — `old_string` must appear exactly once.
 
 **To replace a line:**
 ```
@@ -616,36 +552,39 @@ old_string = "old content"
 new_string = "new content"
 ```
 
-**To append after a line** (do NOT omit the anchor):
+**To append after a line** (include the anchor in both):
 ```
 old_string = "last_existing_line"
 new_string = "last_existing_line\nnew_appended_line"
 ```
 
-Omitting the anchor from `new_string` replaces the line instead of appending — a common agent mistake.
+Omitting the anchor from `new_string` replaces the line instead of appending.
 
-### hive CLI review commands
+## LightRAG MCP Server
 
-| Command | Description |
-|---|---|
-| `/diff` | Open VS Code diff for all pending `.hive_proposed` files |
-| `/confirm [path]` | Apply pending proposed file (auto-detects if only one pending) |
-| `/reject [path]` | Discard pending proposed file |
-| `/cleanup` | List and delete all stale `.hive_proposed` files with confirmation |
-
-Multiple pending files are handled one at a time in sequence. For each file, VS Code opens the diff tab and the CLI shows the selector before moving to the next.
-
-### Enabling
-
-Add to your client MCP server's environment:
+Standalone FastMCP server (`lightrag_mcp/`) running on ZGX over **Streamable HTTP**.
 
 ```bash
-WRITE_REVIEW=true
+# Start (port 9002)
+python main.py --serve-lightrag
+
+# Endpoint
+http://<zgx-tailscale-ip>:9002/mcp
 ```
 
-No code changes needed. `write_file` and `apply_diff` check this env var on every call. New files (that don't exist yet) are also staged for review — VS Code opens just the proposed file for preview.
+| Variable | Default | Description |
+|---|---|---|
+| `LIGHTRAG_MCP_PORT` | `9002` | Server port |
+| `LIGHTRAG_MCP_URL` | `http://localhost:9002/mcp` | URL agents use to connect |
+| `LIGHTRAG_MCP_HOST` | `0.0.0.0` | Bind address (passed to FastMCP constructor) |
+| `LIGHTRAG_LLM_MODEL` | `mistral-small3.1:24b` | Entity/relation extraction model during insert |
+| `LIGHTRAG_EMBED_MODEL` | `qwen3-embedding:0.6b` | Ollama embedding model (must be pulled first) |
+| `LIGHTRAG_EMBED_DIM` | `1024` | Must match embed model output dimension |
+| `LIGHTRAG_WORKING_DIR` | `~/.agno-hive/lightrag` | Base dir for per-project file-based KV storage |
 
----
+**Constraint:** LightRAG requires a 32K+ context window model for entity extraction. Do not use reasoning/chain-of-thought models (e.g. DeepSeek R1) for `LIGHTRAG_LLM_MODEL`.
+
+**Note on host/port:** The `mcp` package's `FastMCP.run()` does not accept `host`/`port` arguments — they are passed to the `FastMCP(name, host=..., port=...)` constructor. `LIGHTRAG_MCP_HOST` and `LIGHTRAG_MCP_PORT` are read at module import time and passed to the constructor.
 
 ## Running Tests
 
@@ -653,67 +592,12 @@ No code changes needed. `write_file` and `apply_diff` check this env var on ever
 pytest tests/ -v
 ```
 
-## Adding a New Agent (Quick Reference)
+## Adding a New Agent
 
-1. Add a `make_<agent>()` factory function in `swarm/agents.py` following the `make_coder` pattern
+1. Add a `make_<agent>(*mcps: MCPTools)` factory in `swarm/agents.py` following the `make_coder` pattern
 2. Add the model env var to `config/config.py` and `.env.example`
 3. Reference the agent in a team YAML or wire it into `run_task_async` in `swarm/team.py`
 
 ## Adding a New Team
 
 Create `teams/<name>.yaml` with the format above. It's immediately available via `GET /teams` and `POST /run` with `"team": "<name>"` — no code changes needed.
-
-## LightRAG MCP Server (Phase 3)
-
-A standalone FastMCP server (`lightrag_mcp/`) running on ZGX. Agents call it via two MCP tools:
-
-| Tool | Args | Purpose |
-|---|---|---|
-| `lightrag_insert` | `text, project_id` | Index text — LLM extracts entities/relations → Qdrant + AGE |
-| `lightrag_query` | `query, project_id, mode` | Retrieve context using `local`, `global`, or `hybrid` mode |
-
-**Retrieval modes:**
-- `local` — entity-centric: vector search over entity index → 1-hop graph traversal. Best for specific file/symbol questions.
-- `global` — relationship-centric: vector search over relationship summaries → edge centrality ranking. Best for cross-module/thematic questions.
-- `hybrid` — runs both and merges (default, recommended).
-
-**Storage backends:**
-- Vector: `QdrantVectorDBStorage` → Qdrant at `QDRANT_URL`, one collection per project (`project_{project_id}`)
-- Graph: `PGGraphStorage` → PostgreSQL + AGE at `POSTGRES_URI`, shared `agno` graph
-
-**Project isolation:** Qdrant collections are fully isolated per project. The AGE graph is shared with `project_id` as node metadata (full graph-level isolation planned for Phase 4).
-
-### Running the LightRAG MCP Server
-
-```bash
-# Prerequisites — pull the embedding model in Ollama first
-ollama pull qwen3-embedding:0.6b
-
-# Start the server (SSE on port 9002)
-python main.py --serve-lightrag
-
-# Or directly
-python -m lightrag_mcp.server
-```
-
-### LightRAG MCP Config
-
-| Variable | Default | Description |
-|---|---|---|
-| `LIGHTRAG_MCP_PORT` | `9002` | SSE server port |
-| `LIGHTRAG_MCP_URL` | `http://localhost:9002/sse` | URL agents use to connect |
-| `LIGHTRAG_LLM_MODEL` | `mistral-small3.1:24b` | Model for entity/relation extraction during insert |
-| `LIGHTRAG_EMBED_MODEL` | `qwen3-embedding:0.6b` | Ollama embedding model (must be pulled) |
-| `LIGHTRAG_EMBED_DIM` | `1024` | Must match the embed model's output dimension |
-| `LIGHTRAG_WORKING_DIR` | `~/.agno-hive/lightrag` | Base dir for per-project file-based KV storage |
-
-**Constraint:** LightRAG requires a 32K+ context window model for entity extraction during insert. Do not use reasoning/chain-of-thought models (e.g. DeepSeek R1) for `LIGHTRAG_LLM_MODEL` — they slow indexing dramatically.
-
-### File Structure
-
-```
-lightrag_mcp/
-  __init__.py
-  server.py    # FastMCP app, tool definitions, SSE entry point
-  rag.py       # LightRAG instance factory and per-project cache
-```
