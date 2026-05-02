@@ -245,13 +245,6 @@ def _format_expiry(expires_at: str | None, persist: bool) -> str:
 
 def _print_result(data: dict, show_resume: bool = False) -> None:
     result   = data.get("result", "")
-
-    # Auto-open VSCode diff if agent returned review_pending
-    for line in result.splitlines():
-        if line.startswith("review_pending:"):
-            rel = line.split(":", 1)[1].strip().split()[0]  # grab path before any spaces
-            _open_vscode_diff(rel)
-            break
     agents   = ", ".join(data.get("agents_used", []))
     duration = data.get("duration_seconds", 0)
     pulled   = data.get("models_pulled", [])
@@ -307,6 +300,9 @@ def run_task(
     show_resume: bool = False,
 ) -> str | None:
     """Run a task; return the session_id from the response, or None on error."""
+    # Snapshot existing .hive_proposed files before the run
+    before = set(Path.cwd().rglob(f"*{_PROPOSED_SUFFIX}"))
+
     has_esc = _start_escape_watcher()
     esc_hint = dim("  ESC to interrupt") if has_esc else dim("  Ctrl+C to interrupt")
     if _COLOUR:
@@ -343,6 +339,13 @@ def run_task(
         return None
 
     _print_result(data, show_resume=show_resume)
+
+    # Open VS Code diff for any .hive_proposed files created during this run
+    after = set(Path.cwd().rglob(f"*{_PROPOSED_SUFFIX}"))
+    for p in after - before:
+        original = p.with_name(p.name[: -len(_PROPOSED_SUFFIX)])
+        _open_vscode_diff(str(original.relative_to(Path.cwd())).replace("\\", "/"))
+
     return data.get("session", {}).get("session_id")
 
 
