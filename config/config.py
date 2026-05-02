@@ -33,7 +33,7 @@ class Config:
 
     # LightRAG MCP server
     lightrag_mcp_port: int = int(os.getenv("LIGHTRAG_MCP_PORT", "9002"))
-    lightrag_mcp_url: str = os.getenv("LIGHTRAG_MCP_URL", "http://localhost:9002/sse")
+    lightrag_mcp_url: str = os.getenv("LIGHTRAG_MCP_URL", "http://localhost:9002/mcp")
     lightrag_llm_model: str = os.getenv("LIGHTRAG_LLM_MODEL", "mistral-small3.1:24b")
     lightrag_embed_model: str = os.getenv("LIGHTRAG_EMBED_MODEL", "qwen3-embedding:0.6b")
     lightrag_embed_dim: int = int(os.getenv("LIGHTRAG_EMBED_DIM", "1024"))

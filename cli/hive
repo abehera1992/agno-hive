@@ -981,6 +981,45 @@ def _cmd_delete_all_sessions(project_id: str) -> None:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+def _cmd_bootstrap(
+    project_id: str,
+    lightrag_url: str,
+    glob_filter: str,
+    force: bool,
+) -> None:
+    """Call index_project on hive-mcp to bootstrap the project knowledge graph."""
+    if not AGNO_SYSTEM_MCP_URL:
+        print(red("  hive-mcp not reachable — start it first:"))
+        print(dim("  docker compose -f docker-compose.hive.yml up -d"))
+        return
+
+    print(f"\n  {bold('Bootstrapping')} project {cyan(project_id)}")
+    print(dim(f"  hive-mcp:    {AGNO_SYSTEM_MCP_URL}"))
+    print(dim(f"  lightrag:    {lightrag_url}"))
+    print(dim(f"  glob:        {glob_filter}"))
+    print(dim(f"  force:       {force}"))
+    print()
+
+    payload = {
+        "task": (
+            f"Call the index_project tool with these exact arguments: "
+            f"project_id='{project_id}', "
+            f"lightrag_url='{lightrag_url}', "
+            f"glob_filter='{glob_filter}', "
+            f"force={'true' if force else 'false'}. "
+            f"Return the full output from the tool."
+        ),
+        "project_id": project_id,
+        "mcp_urls": [AGNO_SYSTEM_MCP_URL],
+    }
+
+    data, err = _run_in_thread(call_api, "/run", payload, 600)
+    if err:
+        print(red(f"  bootstrap failed: {err}"))
+        return
+    print(data.get("result", "(no output)"))
+
+
 def _cmd_mcp_status() -> None:
     """Show status of both the project MCP and the system (hive-mcp) MCP."""
     def _show(label: str, url: str | None, src: str, setup_hint: str) -> None:
@@ -1216,6 +1255,14 @@ def main() -> None:
                         help=f"hive-mcp port for Tailscale auto-detection (default: {AGNO_MCP_PORT})")
     parser.add_argument("--mcp-status",        action="store_true",
                         help="show hive-mcp connection status and exit")
+    parser.add_argument("--bootstrap",         action="store_true",
+                        help="index this project into LightRAG for semantic search and exit")
+    parser.add_argument("--lightrag-url",      metavar="URL",
+                        help="LightRAG MCP URL for bootstrap (default: auto-detect from ZGX)")
+    parser.add_argument("--glob",              metavar="PATTERN", default="**/*",
+                        help="glob filter for bootstrap indexing (default: **/*)")
+    parser.add_argument("--force",             action="store_true",
+                        help="re-index all files even if unchanged (use with --bootstrap)")
 
     args = parser.parse_args()
 
@@ -1244,6 +1291,20 @@ def main() -> None:
 
     if args.mcp_status:
         _cmd_mcp_status()
+        return
+
+    if args.bootstrap:
+        lightrag_url = (
+            args.lightrag_url
+            or os.getenv("LIGHTRAG_MCP_URL")
+            or f"http://{AGNO_HOST.split('//')[1].split(':')[0]}:9002/mcp"
+        )
+        _cmd_bootstrap(
+            project_id=project_id,
+            lightrag_url=lightrag_url,
+            glob_filter=args.glob,
+            force=args.force,
+        )
         return
 
     if args.list_sessions:

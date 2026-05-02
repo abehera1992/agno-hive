@@ -1,4 +1,4 @@
-"""LightRAG MCP server — exposes lightrag_insert and lightrag_query as MCP tools over SSE."""
+"""LightRAG MCP server — exposes lightrag_insert and lightrag_query as MCP tools over Streamable HTTP."""
 import asyncio
 import os
 from dotenv import load_dotenv
@@ -94,4 +94,5 @@ async def lightrag_query(query: str, project_id: str, mode: str = "hybrid") -> s
 
 if __name__ == "__main__":
     port = int(os.getenv("LIGHTRAG_MCP_PORT", "9002"))
-    mcp.run(transport="sse", host="0.0.0.0", port=port)
+    host = os.getenv("LIGHTRAG_MCP_HOST", "0.0.0.0")
+    mcp.run(transport="streamable-http", host=host, port=port)

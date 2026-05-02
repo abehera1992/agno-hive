@@ -31,6 +31,7 @@ from tools.context import (
 from tools.files import write_file, apply_diff, run_command
 from tools.shell import run_shell, run_docker, get_env_info, check_port, list_processes
 from tools.git import git_status, git_log, git_diff, git_log_file, git_blame
+from tools.index import index_project
 
 _instructions = (
     "You are connected to a project via hive-mcp. "
@@ -77,6 +78,9 @@ mcp.tool()(git_log)
 mcp.tool()(git_diff)
 mcp.tool()(git_log_file)
 mcp.tool()(git_blame)
+
+# ── Semantic indexing (bootstrap) ─────────────────────────────────────────────
+mcp.tool()(index_project)
 
 
 if __name__ == "__main__":
