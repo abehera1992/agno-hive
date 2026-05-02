@@ -160,6 +160,14 @@ async def run_task_async(
                 with _tracer.start_as_current_span("agno.team.run"):
                     result = await team.arun(task)
                 content = result.content if hasattr(result, "content") else str(result)
+                # Fallback: if content is empty, pull from the last message in the run
+                if not content and hasattr(result, "messages") and result.messages:
+                    for msg in reversed(result.messages):
+                        msg_content = getattr(msg, "content", None)
+                        if msg_content and isinstance(msg_content, str):
+                            content = msg_content
+                            break
+                content = content or "(no response)"
                 tokens = _extract_tokens(result)
                 span.set_status(trace.StatusCode.OK)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
