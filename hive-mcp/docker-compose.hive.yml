@@ -1,0 +1,45 @@
+# hive-mcp — drop this file into any project and run:
+#   docker compose -f docker-compose.hive.yml up -d
+#
+# Prerequisites:
+#   - Docker installed
+#   - Tailscale installed on this machine (ZGX reaches it via Tailscale IP)
+#
+# Environment variables (set in shell or .env):
+#   PROJECT_PATH   path to your project (default: current directory)
+#   HIVE_MCP_PORT  host port to expose (default: 9000)
+#   WRITE_REVIEW   true = stage all writes for human review (default: true)
+
+services:
+  hive-mcp:
+    image: ghcr.io/abehera1992/hive-mcp:latest
+    container_name: hive-mcp
+    restart: unless-stopped
+    ports:
+      - "${HIVE_MCP_PORT:-9000}:9000"
+    volumes:
+      # Project files — bind-mount your project directory
+      - ${PROJECT_PATH:-.}:/project
+
+      # Host Docker socket — gives the agent docker CLI access to the host daemon
+      # Linux / Mac (Docker Desktop):
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Windows Docker Desktop (uncomment if the above doesn't work):
+      # - //./pipe/docker_engine://./pipe/docker_engine
+
+      # Git identity (read-only)
+      - ${HOME}/.gitconfig:/root/.gitconfig:ro
+
+      # SSH keys for git (read-only)
+      - ${HOME}/.ssh:/root/.ssh:ro
+
+    environment:
+      - PROJECT_ROOT=/project
+      - MCP_PORT=9000
+      - WRITE_REVIEW=${WRITE_REVIEW:-true}
+
+    # Use host network so the container shares the host's Tailscale interface.
+    # ZGX connects to http://<your-tailscale-ip>:9000/mcp
+    # Note: network_mode: host is Linux only.
+    # On Mac/Windows Docker Desktop, remove this line — port publishing is enough.
+    # network_mode: host
