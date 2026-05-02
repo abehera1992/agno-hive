@@ -57,6 +57,54 @@ red    = lambda t: _c("31",   t)
 green  = lambda t: _c("32",   t)
 yellow = lambda t: _c("33",   t)
 
+# ── VSCode diff watcher ───────────────────────────────────────────────────────
+
+_PROPOSED_SUFFIX = ".hive_proposed"
+_VSCODE_CANDIDATES = [
+    "code",                                           # in PATH
+    r"C:\Program Files\Microsoft VS Code\bin\code.cmd",
+    r"C:\Program Files (x86)\Microsoft VS Code\bin\code.cmd",
+]
+
+def _find_vscode() -> str | None:
+    for candidate in _VSCODE_CANDIDATES:
+        try:
+            subprocess.run(
+                [candidate, "--version"],
+                capture_output=True, timeout=3,
+            )
+            return candidate
+        except Exception:
+            continue
+    return None
+
+def _start_diff_watcher(project_root: Path) -> None:
+    """Background thread: open a VSCode diff whenever a .hive_proposed file appears."""
+    vscode = _find_vscode()
+    known: set[Path] = set()
+
+    def _watch():
+        while True:
+            try:
+                for p in project_root.rglob(f"*{_PROPOSED_SUFFIX}"):
+                    if p not in known:
+                        known.add(p)
+                        original = p.with_name(p.name[: -len(_PROPOSED_SUFFIX)])
+                        if vscode and original.exists():
+                            subprocess.Popen(
+                                [vscode, "--diff", str(original), str(p)],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                # Prune removed files from known set
+                known.intersection_update(p for p in known if p.exists())
+            except Exception:
+                pass
+            time.sleep(1)
+
+    threading.Thread(target=_watch, daemon=True).start()
+
+
 # ── ESC interrupt ─────────────────────────────────────────────────────────────
 
 _cancel_event = threading.Event()
@@ -347,6 +395,50 @@ def review_task(
 
 # ── REPL slash commands ───────────────────────────────────────────────────────
 
+def _find_pending_diffs() -> list[Path]:
+    """Return all .hive_proposed files under cwd."""
+    return list(Path.cwd().rglob(f"*{_PROPOSED_SUFFIX}"))
+
+
+def _cmd_diff() -> None:
+    """Open VSCode diffs for all pending .hive_proposed files."""
+    pending = _find_pending_diffs()
+    if not pending:
+        print(dim("  no pending diffs"))
+        return
+    vscode = _find_vscode()
+    for p in pending:
+        original = p.with_name(p.name[: -len(_PROPOSED_SUFFIX)])
+        rel = p.relative_to(Path.cwd())
+        print(dim(f"  pending: {original.relative_to(Path.cwd())}"))
+        if vscode and original.exists():
+            subprocess.Popen(
+                [vscode, "--diff", str(original), str(p)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        elif not vscode:
+            print(yellow("  VSCode not found — diff file at:"), str(p))
+
+
+def _resolve_pending_path(args: str) -> str | None:
+    """Return a file path for confirm/reject.
+    If args is given, use it. Otherwise auto-detect from .hive_proposed files."""
+    if args.strip():
+        return args.strip()
+    pending = _find_pending_diffs()
+    if len(pending) == 1:
+        original = pending[0].with_name(pending[0].name[: -len(_PROPOSED_SUFFIX)])
+        return str(original.relative_to(Path.cwd())).replace("\\", "/")
+    if len(pending) > 1:
+        print(yellow("  multiple pending diffs — specify path:"))
+        for p in pending:
+            original = p.with_name(p.name[: -len(_PROPOSED_SUFFIX)])
+            print(dim(f"    {original.relative_to(Path.cwd())}"))
+        return None
+    print(yellow("  no pending diff found"))
+    return None
+
+
 def _cmd_sessions(project_id: str) -> None:
     try:
         data = call_get("/sessions", {"project_id": project_id, "limit": "20"})
@@ -458,6 +550,8 @@ def repl(
     initial_session_id: str | None = None,
     persist: bool = False,
 ) -> None:
+    _start_diff_watcher(Path.cwd())  # auto-open VSCode diffs for .hive_proposed files
+
     history_file = Path.home() / ".agno_history"
     if _READLINE:
         try:
@@ -496,7 +590,7 @@ def repl(
     if review:
         print(dim("  review mode: plan shown before every task  ·  prefix with ! to skip"))
 
-    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /exit  ·  ESC to interrupt\n"))
+    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /diff  /exit  ·  ESC to interrupt\n"))
 
     try:
         while True:
@@ -528,8 +622,28 @@ def repl(
                     _cmd_persist_current(session_id)
                 elif cmd == "/delete":
                     _cmd_delete(args)
+                elif cmd == "/diff":
+                    _cmd_diff()
+                elif cmd in ("/confirm", "/reject"):
+                    bare = cmd[1:]  # "confirm" or "reject"
+                    path = _resolve_pending_path(args)
+                    if path:
+                        run_task(f"{bare} {path}", project_id, session_id=session_id)
                 else:
-                    print(dim(f"  unknown command: {cmd}  ·  /new /sessions /history /persist /delete /exit"))
+                    print(dim(f"  unknown command: {cmd}  ·  /new /sessions /history /persist /delete /diff /confirm /reject /exit"))
+                continue
+
+            # ── Bare confirm / reject (no slash) ───────────────────────────
+            lower = task.lower()
+            if lower == "confirm" or lower.startswith("confirm "):
+                path = _resolve_pending_path(task[7:].strip())
+                if path:
+                    run_task(f"confirm {path}", project_id, session_id=session_id)
+                continue
+            if lower == "reject" or lower.startswith("reject "):
+                path = _resolve_pending_path(task[6:].strip())
+                if path:
+                    run_task(f"reject {path}", project_id, session_id=session_id)
                 continue
 
             # ── Run task ───────────────────────────────────────────────────
