@@ -102,6 +102,68 @@ def _open_vscode_diff(relative_path: str) -> None:
         )
 
 
+def _getch() -> str:
+    """Read a single character without waiting for Enter. Returns '' on failure."""
+    try:
+        import msvcrt
+        ch = msvcrt.getch()
+        if ch in (b'\r', b'\n', b'\x00', b'\xe0'):
+            return '\n'
+        try:
+            return ch.decode('utf-8', errors='replace')
+        except Exception:
+            return ''
+    except ImportError:
+        pass
+    try:
+        import tty, termios
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        return ch or '\n'
+    except Exception:
+        try:
+            line = input().strip()
+            return line[0].lower() if line else '\n'
+        except Exception:
+            return '\n'
+
+
+def _prompt_confirm_reject(
+    rel: str,
+    original_name: str,
+    project_id: str,
+    session_id: str | None,
+    persist: bool,
+) -> None:
+    """Interactive [C]/[R]/[↵] prompt shown after a review_pending file is detected."""
+    label = original_name if len(original_name) <= 42 else original_name[:41] + "…"
+    print()
+    print(f"  {bold('review pending')}  {dim('·')}  {cyan(label)}")
+    print(f"  {cyan('[C]')} confirm    {red('[R]')} reject    {dim('[↵] skip')}")
+    print(dim("  › "), end="", flush=True)
+
+    key = _getch().lower()
+    if key not in ('\n', '\r', '', ' '):
+        print(key.upper())
+    else:
+        print()
+
+    if key == 'c':
+        print(dim(f"  applying {label}..."))
+        run_task(f"confirm {rel}", project_id, session_id=session_id, persist=persist)
+    elif key == 'r':
+        print(dim(f"  discarding {label}..."))
+        run_task(f"reject {rel}", project_id, session_id=session_id, persist=persist)
+    else:
+        print(dim("  skipped — /confirm or /reject when ready"))
+    print()
+
+
 # ── ESC interrupt ─────────────────────────────────────────────────────────────
 
 _cancel_event = threading.Event()
@@ -347,11 +409,7 @@ def run_task(
         original = p.with_name(p.name[: -len(_PROPOSED_SUFFIX)])
         rel = str(original.relative_to(Path.cwd())).replace("\\", "/")
         _open_vscode_diff(rel)
-        print(bold("  ┌─ Review pending ──────────────────┐"))
-        print(bold("  │") + cyan("  confirm") + dim(f"  →  apply {original.name} ") + bold("│"))
-        print(bold("  │") + red("  reject ") + dim(f"  →  discard          ") + bold("│"))
-        print(bold("  └───────────────────────────────────┘"))
-        print()
+        _prompt_confirm_reject(rel, original.name, project_id, session_id or "", persist)
 
     return data.get("session", {}).get("session_id")
 
