@@ -37,6 +37,15 @@ _COORDINATOR_INSTRUCTIONS = [
     "── General rules ──────────────────────────────────────────────",
     "  - Base answers on file contents, not assumptions",
     "  - Synthesise member outputs into one coherent response",
+    "",
+    "── File write review (CRITICAL) ───────────────────────────────",
+    "  - If write_file() or apply_diff() returns 'review_pending',",
+    "    the proposed change is waiting for human approval.",
+    "  - NEVER call confirm_write() automatically.",
+    "  - STOP and tell the human what was proposed, show the diff,",
+    "    and wait for them to explicitly say 'confirm' or 'reject'.",
+    "  - Only call confirm_write() when the human says confirm.",
+    "  - Only call reject_write() when the human says reject.",
 ]
 
 
