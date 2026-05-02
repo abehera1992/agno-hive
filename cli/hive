@@ -170,31 +170,32 @@ def _vscode_ipc_open(file_uris: list[str], diff_mode: bool = False) -> bool:
         return False
 
 
-def _open_vscode_for_proposed(proposed: Path) -> None:
-    """Open VS Code diff (existing file) or file view (new file) in the current window.
+def _open_vscode_for_proposed(proposed: Path) -> bool:
+    """Open VS Code diff (or file preview for new files) in the current window.
+
+    Returns True if the VS Code IPC path was used (no new window).
+    Returns False if the code CLI fallback was used (may briefly show a window)
+    or if VS Code was not found at all.
 
     Strategy:
-    1. If VSCODE_IPC_HOOK_CLI is set (running from VS Code terminal) → write
-       directly to the IPC socket.  Zero new process, zero extra window.
-    2. Otherwise fall back to the code CLI with -r + CREATE_NO_WINDOW.
+    1. Try the VS Code IPC socket — zero new process, zero extra window.
+    2. Fall back to the code CLI with -r + CREATE_NO_WINDOW.
     """
     original = proposed.with_name(proposed.name[: -len(_PROPOSED_SUFFIX)])
     is_new   = not original.exists()
 
-    # ── Fast path: IPC (no new process) ──────────────────────────────────────
+    # ── Fast path: IPC (no new process, no window) ────────────────────────────
     if is_new:
         if _vscode_ipc_open([proposed.as_uri()]):
-            return
+            return True
     else:
         if _vscode_ipc_open([original.as_uri(), proposed.as_uri()], diff_mode=True):
-            return
+            return True
 
     # ── Fallback: code CLI ────────────────────────────────────────────────────
     vscode = _find_vscode()
     if not vscode:
-        return
-    # CREATE_NO_WINDOW suppresses the cmd.exe wrapper window on Windows.
-    # -r routes the diff into the already-open VS Code window.
+        return False
     _no_win = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
     if is_new:
         subprocess.Popen(
@@ -206,6 +207,7 @@ def _open_vscode_for_proposed(proposed: Path) -> None:
             [vscode, "-r", "--diff", str(original), str(proposed)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_no_win,
         )
+    return False
 
 
 def _confirm_locally(proposed: Path) -> bool:
@@ -327,8 +329,36 @@ def _arrow_select(options: list[str], hints: list[str] | None = None) -> int:
             return 0
 
 
+def _show_inline_diff(original: Path, proposed: Path) -> None:
+    """Print a coloured unified diff between original and proposed."""
+    try:
+        a = original.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        b = proposed.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        chunks = list(difflib.unified_diff(a, b, n=3))
+        if not chunks:
+            print(dim("  (no differences)"))
+            return
+        for line in chunks[2:]:        # skip --- / +++ header
+            s = line.rstrip("\n")
+            if s.startswith("+"):
+                print(green("  " + s))
+            elif s.startswith("-"):
+                print(red("  " + s))
+            elif s.startswith("@@"):
+                print(cyan("  " + s))
+            else:
+                print(dim("  " + s))
+    except Exception as exc:
+        print(dim(f"  (diff unavailable: {exc})"))
+
+
 def _prompt_confirm_reject(proposed: Path) -> None:
-    """Open VS Code diff and show arrow-key selector for a review_pending file."""
+    """Show diff and arrow-key selector for a review_pending file.
+
+    If VS Code IPC is available: opens diff tab in existing window, no new window.
+    Otherwise: shows the diff inline in the terminal (like Claude Code CLI does),
+    so the user can review without a distracting VS Code window flash.
+    """
     original = proposed.with_name(proposed.name[: -len(_PROPOSED_SUFFIX)])
     is_new = not original.exists()
     try:
@@ -336,10 +366,20 @@ def _prompt_confirm_reject(proposed: Path) -> None:
     except ValueError:
         rel = original.name
 
-    _open_vscode_for_proposed(proposed)
+    ipc_ok = _open_vscode_for_proposed(proposed)
+
+    # When IPC isn't available, show the diff inline so the user can review
+    # without having to deal with a new VS Code window popping up.
+    if not ipc_ok and not is_new:
+        sep = dim("  " + "─" * 54)
+        print(f"\n{sep}")
+        _show_inline_diff(original, proposed)
+        print(sep)
 
     label = "new file" if is_new else "review pending"
     print(f"\n  {bold(label)}  {cyan(rel)}")
+    if ipc_ok:
+        print(dim("  diff open in VS Code ↑"))
 
     if is_new:
         opts  = ["create", "reject", "skip"]
