@@ -133,15 +133,35 @@ def _getch() -> str:
             return '\n'
 
 
-def _prompt_confirm_reject(
-    rel: str,
-    original_name: str,
-    project_id: str,
-    session_id: str | None,
-    persist: bool,
-) -> None:
-    """Interactive [C]/[R]/[↵] prompt shown after a review_pending file is detected."""
-    label = original_name if len(original_name) <= 42 else original_name[:41] + "…"
+def _confirm_locally(proposed: Path) -> bool:
+    """Apply a .hive_proposed file directly on the local filesystem."""
+    original = proposed.with_name(proposed.name[: -len(_PROPOSED_SUFFIX)])
+    try:
+        original.write_bytes(proposed.read_bytes())
+        proposed.unlink()
+        print(green(f"  applied: {original.name}"))
+        return True
+    except Exception as e:
+        print(red(f"  confirm failed: {e}"))
+        return False
+
+
+def _reject_locally(proposed: Path) -> bool:
+    """Delete a .hive_proposed file without applying it."""
+    original = proposed.with_name(proposed.name[: -len(_PROPOSED_SUFFIX)])
+    try:
+        proposed.unlink()
+        print(yellow(f"  rejected: {original.name} — no changes applied"))
+        return True
+    except Exception as e:
+        print(red(f"  reject failed: {e}"))
+        return False
+
+
+def _prompt_confirm_reject(proposed: Path) -> None:
+    """Interactive [C]/[R]/[↵] prompt for a review_pending file."""
+    original = proposed.with_name(proposed.name[: -len(_PROPOSED_SUFFIX)])
+    label = original.name if len(original.name) <= 42 else original.name[:41] + "…"
     print()
     print(f"  {bold('review pending')}  {dim('·')}  {cyan(label)}")
     print(f"  {cyan('[C]')} confirm    {red('[R]')} reject    {dim('[↵] skip')}")
@@ -154,11 +174,9 @@ def _prompt_confirm_reject(
         print()
 
     if key == 'c':
-        print(dim(f"  applying {label}..."))
-        run_task(f"confirm {rel}", project_id, session_id=session_id, persist=persist)
+        _confirm_locally(proposed)
     elif key == 'r':
-        print(dim(f"  discarding {label}..."))
-        run_task(f"reject {rel}", project_id, session_id=session_id, persist=persist)
+        _reject_locally(proposed)
     else:
         print(dim("  skipped — /confirm or /reject when ready"))
     print()
@@ -409,7 +427,7 @@ def run_task(
         original = p.with_name(p.name[: -len(_PROPOSED_SUFFIX)])
         rel = str(original.relative_to(Path.cwd())).replace("\\", "/")
         _open_vscode_diff(rel)
-        _prompt_confirm_reject(rel, original.name, project_id, session_id or "", persist)
+        _prompt_confirm_reject(p)
 
     return data.get("session", {}).get("session_id")
 
@@ -492,20 +510,24 @@ def _cmd_diff() -> None:
             print(yellow("  VSCode not found — diff file at:"), str(p))
 
 
-def _resolve_pending_path(args: str) -> str | None:
-    """Return a file path for confirm/reject.
-    If args is given, use it. Otherwise auto-detect from .hive_proposed files."""
-    if args.strip():
-        return args.strip()
-    pending = _find_pending_diffs()
+def _resolve_proposed(arg: str, pending: list[Path]) -> Path | None:
+    """Resolve a .hive_proposed Path from an optional path arg and a list of pending files."""
+    if arg:
+        rel = arg.replace("\\", "/")
+        name = Path(rel).name
+        matches = [p for p in pending
+                   if str(p.with_name(p.name[:-len(_PROPOSED_SUFFIX)]).relative_to(Path.cwd())).replace("\\", "/") == rel
+                   or p.with_name(p.name[:-len(_PROPOSED_SUFFIX)]).name == name]
+        if matches:
+            return matches[0]
+        print(yellow(f"  no pending diff for {arg}"))
+        return None
     if len(pending) == 1:
-        original = pending[0].with_name(pending[0].name[: -len(_PROPOSED_SUFFIX)])
-        return str(original.relative_to(Path.cwd())).replace("\\", "/")
+        return pending[0]
     if len(pending) > 1:
         print(yellow("  multiple pending diffs — specify path:"))
         for p in pending:
-            original = p.with_name(p.name[: -len(_PROPOSED_SUFFIX)])
-            print(dim(f"    {original.relative_to(Path.cwd())}"))
+            print(dim(f"    {p.with_name(p.name[:-len(_PROPOSED_SUFFIX)]).relative_to(Path.cwd())}"))
         return None
     print(yellow("  no pending diff found"))
     return None
@@ -743,10 +765,27 @@ def repl(
                 elif cmd == "/delete-all":
                     _cmd_delete_all_sessions(project_id)
                 elif cmd in ("/confirm", "/reject"):
-                    bare = cmd[1:]  # "confirm" or "reject"
-                    path = _resolve_pending_path(args)
-                    if path:
-                        run_task(f"{bare} {path}", project_id, session_id=session_id)
+                    pending = _find_pending_diffs()
+                    if args.strip():
+                        rel = args.strip().replace("\\", "/")
+                        candidates = [p for p in pending
+                                      if p.with_name(p.name[:-len(_PROPOSED_SUFFIX)]).name == Path(rel).name
+                                      or str(p.with_name(p.name[:-len(_PROPOSED_SUFFIX)]).relative_to(Path.cwd())).replace("\\", "/") == rel]
+                        proposed = candidates[0] if candidates else None
+                        if not proposed:
+                            print(yellow(f"  no pending diff for {rel}"))
+                    elif len(pending) == 1:
+                        proposed = pending[0]
+                    elif len(pending) > 1:
+                        print(yellow("  multiple pending diffs — specify path:"))
+                        for p in pending:
+                            print(dim(f"    {p.with_name(p.name[:-len(_PROPOSED_SUFFIX)]).relative_to(Path.cwd())}"))
+                        proposed = None
+                    else:
+                        print(yellow("  no pending diff found"))
+                        proposed = None
+                    if proposed:
+                        _confirm_locally(proposed) if cmd == "/confirm" else _reject_locally(proposed)
                 else:
                     print(dim(f"  unknown command: {cmd}  ·  /new /sessions /history /persist /delete /diff /confirm /reject /exit"))
                 continue
@@ -754,14 +793,18 @@ def repl(
             # ── Bare confirm / reject (no slash) ───────────────────────────
             lower = task.lower()
             if lower == "confirm" or lower.startswith("confirm "):
-                path = _resolve_pending_path(task[7:].strip())
-                if path:
-                    run_task(f"confirm {path}", project_id, session_id=session_id)
+                arg = task[7:].strip()
+                pending = _find_pending_diffs()
+                proposed = _resolve_proposed(arg, pending)
+                if proposed:
+                    _confirm_locally(proposed)
                 continue
             if lower == "reject" or lower.startswith("reject "):
-                path = _resolve_pending_path(task[6:].strip())
-                if path:
-                    run_task(f"reject {path}", project_id, session_id=session_id)
+                arg = task[6:].strip()
+                pending = _find_pending_diffs()
+                proposed = _resolve_proposed(arg, pending)
+                if proposed:
+                    _reject_locally(proposed)
                 continue
 
             # ── Run task ───────────────────────────────────────────────────
@@ -839,9 +882,10 @@ def main() -> None:
     if args.task and args.task[0].lower() in ("confirm", "reject"):
         verb = args.task[0].lower()
         arg_path = " ".join(args.task[1:])
-        path = _resolve_pending_path(arg_path)
-        if path:
-            run_task(f"{verb} {path}", project_id, session_id=args.session)
+        pending = _find_pending_diffs()
+        proposed = _resolve_proposed(arg_path, pending)
+        if proposed:
+            _confirm_locally(proposed) if verb == "confirm" else _reject_locally(proposed)
         return
 
     if args.task:
