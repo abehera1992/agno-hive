@@ -525,7 +525,7 @@ def _cmd_delete(args: str) -> None:
 def _cmd_list_sessions_oneshot(project_id: str) -> None:
     """Tabular listing for --list-sessions flag."""
     try:
-        data = call_get("/sessions", {"project_id": project_id, "limit": "20"})
+        data = call_get("/sessions", {"project_id": project_id, "limit": "100"})
         sessions = data.get("sessions", [])
         if not sessions:
             print("No sessions found.")
@@ -544,6 +544,52 @@ def _cmd_list_sessions_oneshot(project_id: str) -> None:
             else:
                 status = "—"
             print(f"{sid_short:<10}  {title:<52}  {count:>4}  {status}")
+        print(f"\n{len(sessions)} session(s)")
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+
+
+def _cmd_delete_all_sessions(project_id: str) -> None:
+    """Delete all sessions for this project (prompts for confirmation)."""
+    try:
+        data = call_get("/sessions", {"project_id": project_id, "limit": "100"})
+        sessions = data.get("sessions", [])
+        if not sessions:
+            print("No sessions found.")
+            return
+
+        persistent = [s for s in sessions if s["persist"]]
+        ephemeral  = [s for s in sessions if not s["persist"]]
+
+        print(f"\n  {len(sessions)} session(s) found — {len(ephemeral)} ephemeral, {len(persistent)} persistent")
+        if persistent:
+            print(yellow(f"  note: {len(persistent)} persistent session(s) will also be deleted"))
+        try:
+            answer = input(bold(f"  Delete all {len(sessions)} sessions for project '{project_id}'? [y/N] ")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n{yellow('  aborted.')}")
+            return
+        if answer not in ("y", "yes"):
+            print(yellow("  aborted — nothing deleted."))
+            return
+
+        deleted = 0
+        failed  = 0
+        for s in sessions:
+            try:
+                call_delete(f"/sessions/{s['id']}")
+                deleted += 1
+            except Exception:
+                failed += 1
+
+        print(green(f"  deleted {deleted} session(s)") + (red(f"  ({failed} failed)") if failed else ""))
+        # Clear local last-session file if it pointed to this project
+        try:
+            local = json.loads(_LAST_SESSION_FILE.read_text())
+            if local.get("project_id") == project_id:
+                _LAST_SESSION_FILE.unlink()
+        except Exception:
+            pass
         print()
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -595,7 +641,7 @@ def repl(
     if review:
         print(dim("  review mode: plan shown before every task  ·  prefix with ! to skip"))
 
-    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /diff  /exit  ·  ESC to interrupt\n"))
+    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff  /exit  ·  ESC to interrupt\n"))
 
     try:
         while True:
@@ -629,6 +675,8 @@ def repl(
                     _cmd_delete(args)
                 elif cmd == "/diff":
                     _cmd_diff()
+                elif cmd == "/delete-all":
+                    _cmd_delete_all_sessions(project_id)
                 elif cmd in ("/confirm", "/reject"):
                     bare = cmd[1:]  # "confirm" or "reject"
                     path = _resolve_pending_path(args)
@@ -702,6 +750,8 @@ def main() -> None:
                         help="mark session as permanent (never auto-deleted)")
     parser.add_argument("--list-sessions",    action="store_true",
                         help="list recent sessions for this project and exit")
+    parser.add_argument("--delete-all-sessions", action="store_true",
+                        help="delete all sessions for this project (prompts for confirmation)")
 
     args = parser.parse_args()
 
@@ -714,6 +764,10 @@ def main() -> None:
 
     if args.list_sessions:
         _cmd_list_sessions_oneshot(project_id)
+        return
+
+    if args.delete_all_sessions:
+        _cmd_delete_all_sessions(project_id)
         return
 
     # Handle bare: hive confirm [path]  /  hive reject [path]
