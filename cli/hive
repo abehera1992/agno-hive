@@ -96,7 +96,7 @@ def _open_vscode_diff(relative_path: str) -> None:
     proposed = original.with_name(original.name + _PROPOSED_SUFFIX)
     if original.exists() and proposed.exists():
         subprocess.Popen(
-            [vscode, "--diff", str(original), str(proposed)],
+            [vscode, "--reuse-window", "--diff", str(original), str(proposed)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -420,7 +420,7 @@ def _cmd_diff() -> None:
         print(dim(f"  pending: {original.relative_to(Path.cwd())}"))
         if vscode and original.exists():
             subprocess.Popen(
-                [vscode, "--diff", str(original), str(p)],
+                [vscode, "--reuse-window", "--diff", str(original), str(p)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         elif not vscode:
