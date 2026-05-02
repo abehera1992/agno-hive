@@ -21,7 +21,11 @@ Usage:
 """
 import json
 import os
-import readline
+try:
+    import readline
+    _READLINE = True
+except ImportError:
+    _READLINE = False  # Windows — history not persisted between sessions
 import subprocess
 import sys
 import urllib.error
@@ -392,11 +396,12 @@ def repl(
     persist: bool = False,
 ) -> None:
     history_file = Path.home() / ".agno_history"
-    try:
-        readline.read_history_file(history_file)
-    except FileNotFoundError:
-        pass
-    readline.set_history_length(500)
+    if _READLINE:
+        try:
+            readline.read_history_file(history_file)
+        except FileNotFoundError:
+            pass
+        readline.set_history_length(500)
 
     # Resolve starting session
     session_id: str | None = initial_session_id
@@ -485,7 +490,8 @@ def repl(
     except KeyboardInterrupt:
         print()
     finally:
-        readline.write_history_file(history_file)
+        if _READLINE:
+            readline.write_history_file(history_file)
         if session_id:
             save_last_session(session_id, project_id)
             print(f"\n{dim('  session saved:  ' + session_id)}")
