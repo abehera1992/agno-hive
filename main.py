@@ -42,7 +42,7 @@ if __name__ == "__main__":
         from config.config import config
         from lightrag_mcp.server import mcp
         print(f"[agno-hive] lightrag-mcp starting on 0.0.0.0:{config.lightrag_mcp_port}")
-        mcp.run(transport="streamable-http", host="0.0.0.0", port=config.lightrag_mcp_port)
+        mcp.run(transport="streamable-http")
     elif "--index" in sys.argv:
         sys.argv.remove("--index")
         from indexer.cli import main as index_main

@@ -10,7 +10,9 @@ from lightrag import QueryParam
 
 from .rag import get_rag
 
-mcp = FastMCP("lightrag")
+_mcp_host = os.getenv("LIGHTRAG_MCP_HOST", "0.0.0.0")
+_mcp_port = int(os.getenv("LIGHTRAG_MCP_PORT", "9002"))
+mcp = FastMCP("lightrag", host=_mcp_host, port=_mcp_port)
 
 _GLOBAL = "global"  # cross-project shared namespace
 
@@ -93,6 +95,4 @@ async def lightrag_query(query: str, project_id: str, mode: str = "hybrid") -> s
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("LIGHTRAG_MCP_PORT", "9002"))
-    host = os.getenv("LIGHTRAG_MCP_HOST", "0.0.0.0")
-    mcp.run(transport="streamable-http", host=host, port=port)
+    mcp.run(transport="streamable-http")
