@@ -39,6 +39,15 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlencode
 
+# Force UTF-8 output on Windows — cp1252 can't encode box-drawing chars or
+# Unicode content that agent responses may contain.
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass  # Python < 3.7 fallback
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 AGNO_HOST     = os.getenv("AGNO_HOST",     "http://100.96.86.82:9001")
@@ -962,7 +971,7 @@ def _cmd_mcp_status() -> None:
         return
 
     reachable, ms = check_mcp_reachable(url)
-    status = green(f"✓  reachable  ({ms:.0f} ms)") if reachable else red("✗  unreachable")
+    status = green(f"+  reachable  ({ms:.0f} ms)") if reachable else red("!  unreachable")
     src    = "env var" if os.getenv("AGNO_MCP_URL") else "Tailscale auto-detect"
     print(f"\n  {bold('hive-mcp')}")
     print(f"  url     {cyan(url)}")
@@ -1012,7 +1021,7 @@ def repl(
     # MCP status line
     if AGNO_MCP_URL:
         reachable, ms = check_mcp_reachable(AGNO_MCP_URL)
-        mcp_indicator = green(f"✓ {ms:.0f}ms") if reachable else red("✗ unreachable")
+        mcp_indicator = green(f"+ {ms:.0f}ms") if reachable else red("! unreachable")
         print(dim(f"  mcp  {AGNO_MCP_URL}  ") + mcp_indicator)
     else:
         print(dim("  mcp  ") + yellow("not configured") + dim("  — /mcp for setup help"))
