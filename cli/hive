@@ -66,44 +66,40 @@ _VSCODE_CANDIDATES = [
     r"C:\Program Files (x86)\Microsoft VS Code\bin\code.cmd",
 ]
 
+_vscode_exe: str | None = None  # cached on first use
+
 def _find_vscode() -> str | None:
+    global _vscode_exe
+    if _vscode_exe is not None:
+        return _vscode_exe or None
     for candidate in _VSCODE_CANDIDATES:
         try:
-            subprocess.run(
+            r = subprocess.run(
                 [candidate, "--version"],
                 capture_output=True, timeout=3,
             )
-            return candidate
+            if r.returncode == 0:
+                _vscode_exe = candidate
+                return candidate
         except Exception:
             continue
+    _vscode_exe = ""  # mark as not found
     return None
 
-def _start_diff_watcher(project_root: Path) -> None:
-    """Background thread: open a VSCode diff whenever a NEW .hive_proposed file appears."""
+
+def _open_vscode_diff(relative_path: str) -> None:
+    """Open VS Code diff for a review_pending file. Called immediately after agent responds."""
     vscode = _find_vscode()
-    # Seed with files already on disk so stale proposals don't open on start
-    known: set[Path] = set(project_root.rglob(f"*{_PROPOSED_SUFFIX}"))
-
-    def _watch():
-        while True:
-            try:
-                for p in project_root.rglob(f"*{_PROPOSED_SUFFIX}"):
-                    if p not in known:
-                        known.add(p)
-                        original = p.with_name(p.name[: -len(_PROPOSED_SUFFIX)])
-                        if vscode and original.exists():
-                            subprocess.Popen(
-                                [vscode, "--diff", str(original), str(p)],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                            )
-                # Prune removed files so they can re-trigger if recreated
-                known.intersection_update(p for p in known if p.exists())
-            except Exception:
-                pass
-            time.sleep(1)
-
-    threading.Thread(target=_watch, daemon=True).start()
+    if not vscode:
+        return
+    original = Path.cwd() / relative_path
+    proposed = original.with_name(original.name + _PROPOSED_SUFFIX)
+    if original.exists() and proposed.exists():
+        subprocess.Popen(
+            [vscode, "--diff", str(original), str(proposed)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
 # ── ESC interrupt ─────────────────────────────────────────────────────────────
@@ -249,6 +245,13 @@ def _format_expiry(expires_at: str | None, persist: bool) -> str:
 
 def _print_result(data: dict, show_resume: bool = False) -> None:
     result   = data.get("result", "")
+
+    # Auto-open VSCode diff if agent returned review_pending
+    for line in result.splitlines():
+        if line.startswith("review_pending:"):
+            rel = line.split(":", 1)[1].strip().split()[0]  # grab path before any spaces
+            _open_vscode_diff(rel)
+            break
     agents   = ", ".join(data.get("agents_used", []))
     duration = data.get("duration_seconds", 0)
     pulled   = data.get("models_pulled", [])
@@ -551,8 +554,6 @@ def repl(
     initial_session_id: str | None = None,
     persist: bool = False,
 ) -> None:
-    _start_diff_watcher(Path.cwd())  # auto-open VSCode diffs for .hive_proposed files
-
     history_file = Path.home() / ".agno_history"
     if _READLINE:
         try:
