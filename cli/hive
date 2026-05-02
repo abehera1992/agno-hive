@@ -28,6 +28,8 @@ except ImportError:
     _READLINE = False  # Windows — history not persisted between sessions
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -54,6 +56,51 @@ cyan   = lambda t: _c("36",   t)
 red    = lambda t: _c("31",   t)
 green  = lambda t: _c("32",   t)
 yellow = lambda t: _c("33",   t)
+
+# ── ESC interrupt ─────────────────────────────────────────────────────────────
+
+_cancel_event = threading.Event()
+
+def _start_escape_watcher() -> bool:
+    """Start a daemon thread that sets _cancel_event when ESC is pressed.
+    Returns True on Windows (msvcrt available), False otherwise."""
+    _cancel_event.clear()
+    try:
+        import msvcrt
+        def _watch():
+            while not _cancel_event.is_set():
+                if msvcrt.kbhit():
+                    if msvcrt.getch() == b'\x1b':
+                        _cancel_event.set()
+                        return
+                time.sleep(0.05)
+        threading.Thread(target=_watch, daemon=True).start()
+        return True
+    except ImportError:
+        return False  # Unix — use Ctrl+C instead
+
+
+def _run_in_thread(fn, *args, **kwargs):
+    """Run fn(*args, **kwargs) in a thread; return (result, error).
+    Polls _cancel_event — returns (None, 'interrupted') if ESC pressed."""
+    result_box: list = [None]
+    error_box:  list = [None]
+
+    def _target():
+        try:
+            result_box[0] = fn(*args, **kwargs)
+        except Exception as exc:
+            error_box[0] = exc
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    while t.is_alive():
+        if _cancel_event.is_set():
+            return None, "interrupted"
+        time.sleep(0.1)
+    _cancel_event.set()  # stop watcher
+    return result_box[0], error_box[0]
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -208,33 +255,43 @@ def run_task(
     show_resume: bool = False,
 ) -> str | None:
     """Run a task; return the session_id from the response, or None on error."""
+    has_esc = _start_escape_watcher()
+    esc_hint = dim("  ESC to interrupt") if has_esc else dim("  Ctrl+C to interrupt")
     if _COLOUR:
-        print(dim("  thinking..."), end="\r", flush=True)
-    try:
-        data = call_api("/run", {
-            "task":       task,
-            "project_id": project_id,
-            "team":       AGNO_TEAM,
-            "session_id": session_id,
-            "persist":    persist,
-        })
-        if _COLOUR:
-            print(" " * 20, end="\r")
-        _print_result(data, show_resume=show_resume)
-        return data.get("session", {}).get("session_id")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
+        print(f"{dim('  thinking...')}  {esc_hint}", end="\r", flush=True)
+
+    data, err = _run_in_thread(call_api, "/run", {
+        "task":       task,
+        "project_id": project_id,
+        "team":       AGNO_TEAM,
+        "session_id": session_id,
+        "persist":    persist,
+    })
+
+    if _COLOUR:
+        print(" " * 50, end="\r")
+
+    if err == "interrupted":
+        print(yellow("  interrupted"))
+        return None
+    if isinstance(err, urllib.error.HTTPError):
+        body = err.read().decode(errors="replace")
         try:
             msg = json.loads(body).get("detail", body)
         except Exception:
             msg = body
-        print(red(f"  server error {e.code}: {msg}"))
-    except urllib.error.URLError as e:
-        print(red(f"  connection error: {e.reason}"))
+        print(red(f"  server error {err.code}: {msg}"))
+        return None
+    if isinstance(err, urllib.error.URLError):
+        print(red(f"  connection error: {err.reason}"))
         print(dim(f"  is AGNOHive running at {AGNO_HOST}?"))
-    except Exception as e:
-        print(red(f"  error: {e}"))
-    return None
+        return None
+    if err:
+        print(red(f"  error: {err}"))
+        return None
+
+    _print_result(data, show_resume=show_resume)
+    return data.get("session", {}).get("session_id")
 
 
 def review_task(
@@ -244,19 +301,25 @@ def review_task(
     persist: bool = False,
 ) -> str | None:
     """HITL flow — plan -> approve -> execute. Returns session_id or None."""
-    print(f"\n{bold('Planning...')} {dim('(ContextRouter -> Researcher -> Planner)')}\n")
-    try:
-        data = call_api("/plan", {"task": task, "project_id": project_id})
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
+    has_esc = _start_escape_watcher()
+    esc_hint = dim("  ESC to interrupt") if has_esc else dim("  Ctrl+C to interrupt")
+    print(f"\n{bold('Planning...')} {dim('(ContextRouter -> Researcher -> Planner)')}  {esc_hint}\n")
+
+    data, err = _run_in_thread(call_api, "/plan", {"task": task, "project_id": project_id})
+
+    if err == "interrupted":
+        print(yellow("  interrupted"))
+        return None
+    if isinstance(err, urllib.error.HTTPError):
+        body = err.read().decode(errors="replace")
         try:
             msg = json.loads(body).get("detail", body)
         except Exception:
             msg = body
-        print(red(f"  plan failed {e.code}: {msg}"))
+        print(red(f"  plan failed {err.code}: {msg}"))
         return None
-    except Exception as e:
-        print(red(f"  plan error: {e}"))
+    if err:
+        print(red(f"  plan error: {err}"))
         return None
 
     plan     = data.get("plan", "")
@@ -433,7 +496,7 @@ def repl(
     if review:
         print(dim("  review mode: plan shown before every task  ·  prefix with ! to skip"))
 
-    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /exit\n"))
+    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /exit  ·  ESC to interrupt\n"))
 
     try:
         while True:
