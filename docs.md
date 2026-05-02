@@ -564,45 +564,86 @@ REPL mode reads this on start and auto-resumes if the project matches. One-shot 
 
 ---
 
-## VSCode Code Diff (Client MCP Integration)
+## VSCode Diff Review (Client MCP Integration)
 
-Enabled via `WRITE_REVIEW=true` on the client MCP server. Intercepts `write_file()` and `apply_diff()` calls on existing files.
+Enabled via `WRITE_REVIEW=true` on the client MCP server. Intercepts **all** `write_file()` and `apply_diff()` calls — both edits to existing files and creation of new files.
 
 ### Flow
 
 ```
-agent calls write_file(path, content)
-  ├─ WRITE_REVIEW=false (default) → writes immediately, returns "written: path"
-  └─ WRITE_REVIEW=true + file exists
+agent calls apply_diff(path, old_string, new_string)   ← always use this for edits
+  ├─ WRITE_REVIEW=false (default) → applies immediately, returns "applied: path"
+  └─ WRITE_REVIEW=true
        ├─ writes proposed content to path + ".hive_proposed"
-       ├─ opens: code --diff <original> <proposed>   (non-blocking)
-       └─ returns "review_pending: path — diff opened in VSCode"
+       └─ returns "review_pending: path — user will confirm/reject via CLI"
               ↓
-       user reviews diff in VSCode
+       hive CLI detects new .hive_proposed file
               ↓
-       user tells agent: confirm or reject
+       VS Code opens diff tab in current window (code --diff original proposed)
+       CLI shows arrow-key selector:
+         ❯ confirm  — apply this change
+           reject   — discard
+           skip     — decide later
               ↓
-       agent calls confirm_write(path) → copies .hive_proposed → original
-       OR     reject_write(path)  → deletes .hive_proposed
+       user presses ↑/↓ then Enter
+              ↓
+       CLI applies or deletes .hive_proposed directly on local filesystem
+       (no agent involvement — agents cannot confirm or reject)
 ```
 
-### New Tools (Client MCP)
+### Why agents cannot confirm/reject
 
-| Tool | Args | Purpose |
-|---|---|---|
-| `confirm_write(relative_path)` | path | Apply the pending `.hive_proposed` file |
-| `reject_write(relative_path)` | path | Delete the pending `.hive_proposed` file |
+`confirm_write` and `reject_write` are **not registered as MCP tools**. They are not visible to agents. This prevents models from auto-confirming despite instructions. The hive CLI applies or discards proposed files directly using local file I/O.
 
-Agent instructions are updated to **never auto-confirm** — it always waits for the user to explicitly say "confirm" or "reject" after reviewing the VSCode diff.
+### run_command write guard
+
+When `WRITE_REVIEW=true`, `run_command` **blocks** any shell command that writes to files. Blocked patterns: `>`, `>>`, `sed -i`, `perl -i`, `tee`, `truncate`, `dd of=`. The tool returns:
+
+```
+blocked: run_command cannot write files when WRITE_REVIEW is enabled.
+Use apply_diff() to edit an existing file or write_file() to create a new one.
+```
+
+This prevents agents from bypassing the review flow via shell redirection.
+
+### apply_diff: edit vs. append
+
+`apply_diff` makes a **surgical replacement** — it finds `old_string` (must appear exactly once) and replaces it with `new_string`.
+
+**To replace a line:**
+```
+old_string = "old content"
+new_string = "new content"
+```
+
+**To append after a line** (do NOT omit the anchor):
+```
+old_string = "last_existing_line"
+new_string = "last_existing_line\nnew_appended_line"
+```
+
+Omitting the anchor from `new_string` replaces the line instead of appending — a common agent mistake.
+
+### hive CLI review commands
+
+| Command | Description |
+|---|---|
+| `/diff` | Open VS Code diff for all pending `.hive_proposed` files |
+| `/confirm [path]` | Apply pending proposed file (auto-detects if only one pending) |
+| `/reject [path]` | Discard pending proposed file |
+| `/cleanup` | List and delete all stale `.hive_proposed` files with confirmation |
+
+Multiple pending files are handled one at a time in sequence. For each file, VS Code opens the diff tab and the CLI shows the selector before moving to the next.
 
 ### Enabling
 
 Add to your client MCP server's environment:
+
 ```bash
 WRITE_REVIEW=true
 ```
 
-No code changes needed — `write_file` and `apply_diff` check this env var on every call.
+No code changes needed. `write_file` and `apply_diff` check this env var on every call. New files (that don't exist yet) are also staged for review — VS Code opens just the proposed file for preview.
 
 ---
 

@@ -19,7 +19,9 @@ A generic, model-agnostic agentic swarm built on [Agno](https://github.com/agno-
 - **Self-improving loop** — successes stored in LightRAG (queryable via `memory_search`), failures stored in PostgreSQL and injected into the next run's coordinator instructions
 - **Global memory** — `lightrag_query` merges per-project + shared `global` namespace; `lightrag_insert_global` stores cross-project insights
 - **HITL plan review** — `POST /plan` runs planning team only; `hive --review` shows plan and requires approval before execution
-- **VSCode diff** — client MCP servers can enable `WRITE_REVIEW=true` to open VSCode diffs before applying any file write; agents wait for explicit `confirm_write` / `reject_write`
+- **VSCode diff review** — client MCP servers enable `WRITE_REVIEW=true` to stage every file write as a `.hive_proposed` file; VS Code opens a diff tab automatically; the hive CLI shows an arrow-key selector (confirm / reject / skip); confirm/reject are local file operations in the CLI — agents cannot confirm or reject (those tools are not exposed)
+- **run_command write guard** — when `WRITE_REVIEW=true`, `run_command` blocks any command that writes to files (`>`, `>>`, `sed -i`, `tee`, etc.); agents are forced to use `apply_diff` or `write_file` for all file changes
+- **apply_diff always surgical** — agents must use `apply_diff` (not `write_file`) for existing files; to append, include the anchor line in both `old_string` and `new_string`
 - **Persistent chat sessions** — every `POST /run` creates or resumes a session in PostgreSQL; last 6 messages injected into coordinator; sessions older than 20 messages are compacted by `llama3.1:8b`; 30-day TTL with optional `persist` flag for permanent sessions
 
 ## Infrastructure (ZGX)
