@@ -9,6 +9,8 @@ Environment vars (add to ~/.bashrc or ~/.zshrc):
     export AGNO_HOST=http://<zgx-ip>:9001   # AGNOHive server address
     export AGNO_PROJECT=myproject            # override project auto-detect
     export AGNO_TEAM=engineering             # team to use (default)
+    export AGNO_MCP_URL=http://<ip>:9000/mcp # hive-mcp URL (auto-detected via Tailscale if unset)
+    export AGNO_MCP_PORT=9000               # port for Tailscale auto-detection (default 9000)
 
 Usage:
     hive "task"                              # one-shot (new session each time)
@@ -18,6 +20,7 @@ Usage:
     hive --list-sessions                     # list recent sessions and exit
     hive --review "task"                     # plan -> approve -> execute
     hive --project myapp "fix the bug"       # explicit project
+    hive --mcp-status                        # show hive-mcp connection status and exit
 """
 import difflib
 import json
@@ -38,9 +41,11 @@ from urllib.parse import urlencode
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-AGNO_HOST    = os.getenv("AGNO_HOST",    "http://100.96.86.82:9001")
-AGNO_PROJECT = os.getenv("AGNO_PROJECT", "")
-AGNO_TEAM    = os.getenv("AGNO_TEAM",    "engineering")
+AGNO_HOST     = os.getenv("AGNO_HOST",     "http://100.96.86.82:9001")
+AGNO_PROJECT  = os.getenv("AGNO_PROJECT",  "")
+AGNO_TEAM     = os.getenv("AGNO_TEAM",     "engineering")
+AGNO_MCP_URL  = os.getenv("AGNO_MCP_URL",  "")   # populated at startup if blank
+AGNO_MCP_PORT = os.getenv("AGNO_MCP_PORT", "9000")
 
 _LAST_SESSION_FILE = Path.home() / ".agno_last_session"
 
@@ -463,6 +468,37 @@ def save_last_session(session_id: str, project_id: str) -> None:
     except Exception:
         pass
 
+
+def detect_mcp_url() -> str | None:
+    """Try to discover the hive-mcp URL via Tailscale IP auto-detection.
+    Returns a URL string on success, None if Tailscale is not available."""
+    try:
+        r = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True, text=True, timeout=3,
+        )
+        ip = r.stdout.strip()
+        if ip:
+            return f"http://{ip}:{AGNO_MCP_PORT}/mcp"
+    except Exception:
+        pass
+    return None
+
+
+def check_mcp_reachable(url: str) -> tuple[bool, float]:
+    """TCP-probe hive-mcp. Returns (reachable, latency_ms)."""
+    import socket, time
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 9000
+    t0 = time.perf_counter()
+    try:
+        with socket.create_connection((host, port), timeout=3):
+            return True, (time.perf_counter() - t0) * 1000
+    except Exception:
+        return False, 0.0
+
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 def call_api(endpoint: str, payload: dict, timeout: int = 300) -> dict:
@@ -584,13 +620,17 @@ def run_task(
     if _COLOUR:
         print(f"{dim('  thinking...')}  {esc_hint}", end="\r", flush=True)
 
-    data, err = _run_in_thread(call_api, "/run", {
+    payload = {
         "task":       task,
         "project_id": project_id,
         "team":       AGNO_TEAM,
         "session_id": session_id,
         "persist":    persist,
-    })
+    }
+    if AGNO_MCP_URL:
+        payload["mcp_url"] = AGNO_MCP_URL
+
+    data, err = _run_in_thread(call_api, "/run", payload)
 
     if _COLOUR:
         print(" " * 50, end="\r")
@@ -636,7 +676,11 @@ def review_task(
     esc_hint = dim("  ESC to interrupt") if has_esc else dim("  Ctrl+C to interrupt")
     print(f"\n{bold('Planning...')} {dim('(ContextRouter -> Researcher -> Planner)')}  {esc_hint}\n")
 
-    data, err = _run_in_thread(call_api, "/plan", {"task": task, "project_id": project_id})
+    plan_payload = {"task": task, "project_id": project_id}
+    if AGNO_MCP_URL:
+        plan_payload["mcp_url"] = AGNO_MCP_URL
+
+    data, err = _run_in_thread(call_api, "/plan", plan_payload)
 
     if err == "interrupted":
         print(yellow("  interrupted"))
@@ -906,6 +950,29 @@ def _cmd_delete_all_sessions(project_id: str) -> None:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+def _cmd_mcp_status() -> None:
+    """Show hive-mcp connection status."""
+    url = AGNO_MCP_URL
+    if not url:
+        print(f"\n  {bold('hive-mcp')}  {yellow('not configured')}")
+        print(dim("  Auto-detection via Tailscale found nothing."))
+        print(dim("  → install Tailscale, or set AGNO_MCP_URL explicitly"))
+        print(dim("  → start hive-mcp: docker compose -f docker-compose.hive.yml up -d"))
+        print()
+        return
+
+    reachable, ms = check_mcp_reachable(url)
+    status = green(f"✓  reachable  ({ms:.0f} ms)") if reachable else red("✗  unreachable")
+    src    = "env var" if os.getenv("AGNO_MCP_URL") else "Tailscale auto-detect"
+    print(f"\n  {bold('hive-mcp')}")
+    print(f"  url     {cyan(url)}")
+    print(f"  source  {dim(src)}")
+    print(f"  status  {status}")
+    if not reachable:
+        print(dim("  → docker compose -f docker-compose.hive.yml up -d"))
+    print()
+
+
 # ── Interactive REPL ──────────────────────────────────────────────────────────
 
 def repl(
@@ -942,6 +1009,14 @@ def repl(
     if not health_check():
         print(yellow("  warning: AGNOHive is not reachable — tasks will fail"))
 
+    # MCP status line
+    if AGNO_MCP_URL:
+        reachable, ms = check_mcp_reachable(AGNO_MCP_URL)
+        mcp_indicator = green(f"✓ {ms:.0f}ms") if reachable else red("✗ unreachable")
+        print(dim(f"  mcp  {AGNO_MCP_URL}  ") + mcp_indicator)
+    else:
+        print(dim("  mcp  ") + yellow("not configured") + dim("  — /mcp for setup help"))
+
     if session_id and is_resumed and not is_explicit:
         print(dim(f"  resuming session {session_id[:8]}  (last used this project)"))
     elif session_id and is_explicit:
@@ -952,7 +1027,7 @@ def repl(
     if review:
         print(dim("  review mode: plan shown before every task  ·  prefix with ! to skip"))
 
-    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff  /cleanup  /exit  ·  ESC to interrupt\n"))
+    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff  /cleanup  /mcp  /exit  ·  ESC to interrupt\n"))
 
     try:
         while True:
@@ -988,6 +1063,8 @@ def repl(
                     _cmd_diff()
                 elif cmd == "/cleanup":
                     _cmd_cleanup()
+                elif cmd == "/mcp":
+                    _cmd_mcp_status()
                 elif cmd == "/delete-all":
                     _cmd_delete_all_sessions(project_id)
                 elif cmd in ("/confirm", "/reject"):
@@ -1013,7 +1090,7 @@ def repl(
                     if proposed:
                         _confirm_locally(proposed) if cmd == "/confirm" else _reject_locally(proposed)
                 else:
-                    print(dim(f"  unknown command: {cmd}  ·  /new /sessions /history /persist /delete /diff /cleanup /confirm /reject /exit"))
+                    print(dim(f"  unknown command: {cmd}  ·  /new /sessions /history /persist /delete /diff /cleanup /mcp /confirm /reject /exit"))
                 continue
 
             # ── Bare confirm / reject (no slash) ───────────────────────────
@@ -1071,7 +1148,7 @@ def main() -> None:
         description="AGNOHive CLI — run the agent swarm from your terminal",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    global AGNO_HOST, AGNO_TEAM
+    global AGNO_HOST, AGNO_TEAM, AGNO_MCP_URL
 
     parser.add_argument("task",                 nargs="*", help="task to run (omit for REPL)")
     parser.add_argument("--project",  "-p",               help="project id (default: auto-detect)")
@@ -1086,6 +1163,12 @@ def main() -> None:
                         help="list recent sessions for this project and exit")
     parser.add_argument("--delete-all-sessions", action="store_true",
                         help="delete all sessions for this project (prompts for confirmation)")
+    parser.add_argument("--mcp-url",           metavar="URL",
+                        help="hive-mcp URL (overrides AGNO_MCP_URL and auto-detection)")
+    parser.add_argument("--mcp-port",          metavar="PORT", default=None,
+                        help=f"hive-mcp port for Tailscale auto-detection (default: {AGNO_MCP_PORT})")
+    parser.add_argument("--mcp-status",        action="store_true",
+                        help="show hive-mcp connection status and exit")
 
     args = parser.parse_args()
 
@@ -1094,7 +1177,24 @@ def main() -> None:
     if args.team:
         AGNO_TEAM = args.team
 
+    # Resolve MCP URL: flag > env var > Tailscale auto-detect
+    if args.mcp_url:
+        AGNO_MCP_URL = args.mcp_url
+    elif not AGNO_MCP_URL:
+        if args.mcp_port:
+            # Use custom port for auto-detection
+            import importlib, sys as _sys
+            _mod = _sys.modules[__name__]
+            _mod.AGNO_MCP_PORT = args.mcp_port
+        detected = detect_mcp_url()
+        if detected:
+            AGNO_MCP_URL = detected
+
     project_id = args.project or detect_project()
+
+    if args.mcp_status:
+        _cmd_mcp_status()
+        return
 
     if args.list_sessions:
         _cmd_list_sessions_oneshot(project_id)
