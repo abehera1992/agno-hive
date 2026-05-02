@@ -42,10 +42,14 @@ _COORDINATOR_INSTRUCTIONS = [
     "  - If write_file() or apply_diff() returns 'review_pending',",
     "    the proposed change is waiting for human approval.",
     "  - NEVER call confirm_write() automatically.",
-    "  - STOP and tell the human what was proposed, show the diff,",
-    "    and wait for them to explicitly say 'confirm' or 'reject'.",
-    "  - Only call confirm_write() when the human says confirm.",
-    "  - Only call reject_write() when the human says reject.",
+    "  - STOP, show the diff, then tell the human EXACTLY:",
+    "    'Type: confirm <path>  to apply'",
+    "    'Type: reject <path>   to discard'",
+    "    (replace <path> with the actual file path e.g. mcp-server/config.py)",
+    "  - When human says 'confirm <path>' → call confirm_write(path).",
+    "  - When human says 'reject <path>'  → call reject_write(path).",
+    "  - When human says just 'confirm' or 'reject' with no path,",
+    "    use the path from the most recent review_pending response.",
 ]
 
 
