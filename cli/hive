@@ -96,18 +96,20 @@ def _open_vscode_for_proposed(proposed: Path) -> None:
     if not vscode:
         return
     original = proposed.with_name(proposed.name[: -len(_PROPOSED_SUFFIX)])
-    # CREATE_NO_WINDOW prevents the batch-script launcher (code.cmd) from flashing
-    # a console/VS Code window on Windows before the IPC handoff to the existing instance.
+    # -r/--reuse-window: open diff as a tab in the current VS Code window.
+    # CREATE_NO_WINDOW (0x08000000): code is code.cmd on Windows — without this flag
+    # Windows spawns a temporary cmd.exe window to run that batch script, which is
+    # the extra window that flashes up. Both flags are required together.
     _no_win = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
     if original.exists():
         subprocess.Popen(
-            [vscode, "--diff", str(original), str(proposed)],
+            [vscode, "-r", "--diff", str(original), str(proposed)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             **_no_win,
         )
     else:
         subprocess.Popen(
-            [vscode, str(proposed)],
+            [vscode, "-r", str(proposed)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             **_no_win,
         )
