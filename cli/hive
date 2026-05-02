@@ -716,6 +716,15 @@ def main() -> None:
         _cmd_list_sessions_oneshot(project_id)
         return
 
+    # Handle bare: hive confirm [path]  /  hive reject [path]
+    if args.task and args.task[0].lower() in ("confirm", "reject"):
+        verb = args.task[0].lower()
+        arg_path = " ".join(args.task[1:])
+        path = _resolve_pending_path(arg_path)
+        if path:
+            run_task(f"{verb} {path}", project_id, session_id=args.session)
+        return
+
     if args.task:
         task = " ".join(args.task)
         if args.review:
