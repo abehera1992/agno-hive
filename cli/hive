@@ -501,6 +501,8 @@ def main() -> None:
         description="AGNOHive CLI — run the agent swarm from your terminal",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    global AGNO_HOST, AGNO_TEAM
+
     parser.add_argument("task",                 nargs="*", help="task to run (omit for REPL)")
     parser.add_argument("--project",  "-p",               help="project id (default: auto-detect)")
     parser.add_argument("--team",     "-t",               help=f"team (default: {AGNO_TEAM})")
@@ -515,7 +517,6 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    global AGNO_HOST, AGNO_TEAM
     if args.host:
         AGNO_HOST = args.host
     if args.team:
