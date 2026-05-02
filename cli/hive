@@ -79,9 +79,10 @@ def _find_vscode() -> str | None:
     return None
 
 def _start_diff_watcher(project_root: Path) -> None:
-    """Background thread: open a VSCode diff whenever a .hive_proposed file appears."""
+    """Background thread: open a VSCode diff whenever a NEW .hive_proposed file appears."""
     vscode = _find_vscode()
-    known: set[Path] = set()
+    # Seed with files already on disk so stale proposals don't open on start
+    known: set[Path] = set(project_root.rglob(f"*{_PROPOSED_SUFFIX}"))
 
     def _watch():
         while True:
@@ -96,7 +97,7 @@ def _start_diff_watcher(project_root: Path) -> None:
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL,
                             )
-                # Prune removed files from known set
+                # Prune removed files so they can re-trigger if recreated
                 known.intersection_update(p for p in known if p.exists())
             except Exception:
                 pass
