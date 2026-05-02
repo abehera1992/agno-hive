@@ -175,7 +175,7 @@ def _print_result(data: dict, show_resume: bool = False) -> None:
     def _fmt_tokens(n: int) -> str:
         return f"{n/1000:.1f}k" if n >= 1000 else str(n)
 
-    parts = [f"── {agents} · {duration:.1f}s"]
+    parts = [f"── {duration:.1f}s"]
     if sid_short:
         parts.append(f"session {sid_short}")
     if turn:
