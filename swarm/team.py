@@ -34,6 +34,12 @@ _COORDINATOR_INSTRUCTIONS = [
     "  3. Delegate writing to Coder, review to Reviewer",
     "  4. memory_store() any non-obvious insight after completing (if available)",
     "",
+    "── Editing files (CRITICAL) ────────────────────────────────────",
+    "  - For existing files: ALWAYS use apply_diff(), NEVER write_file().",
+    "    apply_diff makes surgical line-level changes; write_file rewrites the whole file.",
+    "  - Only use write_file() when creating a brand-new file that does not exist yet.",
+    "  - Read the file first (get_file_content) to get the exact old_string to replace.",
+    "",
     "── General rules ──────────────────────────────────────────────",
     "  - Base answers on file contents, not assumptions",
     "  - Synthesise member outputs into one coherent response",
@@ -43,8 +49,8 @@ _COORDINATOR_INSTRUCTIONS = [
     "    the proposed change is staged for human review.",
     "  - STOP immediately — do NOT call any other tool.",
     "  - confirm_write and reject_write do NOT exist — you cannot approve writes.",
-    "  - Tell the human: 'review_pending: <path> — press C in the CLI to apply or R to reject'",
-    "  - The human uses their CLI to apply or reject — your job ends at 'review_pending'.",
+    "  - Tell the human: 'review_pending: <path>' and wait.",
+    "  - The human selects confirm/reject in their CLI — your job ends at 'review_pending'.",
 ]
 
 

@@ -19,6 +19,7 @@ Usage:
     hive --review "task"                     # plan -> approve -> execute
     hive --project myapp "fix the bug"       # explicit project
 """
+import difflib
 import json
 import os
 try:
@@ -158,26 +159,60 @@ def _reject_locally(proposed: Path) -> bool:
         return False
 
 
+def _show_inline_diff(original: Path, proposed: Path) -> None:
+    """Print a coloured unified diff of original vs proposed."""
+    try:
+        a = original.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        b = proposed.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        chunks = list(difflib.unified_diff(a, b, n=3))
+        if not chunks:
+            print(dim("  (no differences)"))
+            return
+        for line in chunks[2:]:       # skip --- / +++ header
+            s = line.rstrip("\n")
+            if s.startswith("+"):
+                print(green("  " + s))
+            elif s.startswith("-"):
+                print(red("  " + s))
+            elif s.startswith("@@"):
+                print(cyan("  " + s))
+            else:
+                print(dim("  " + s))
+    except Exception as exc:
+        print(dim(f"  (diff unavailable: {exc})"))
+
+
 def _prompt_confirm_reject(proposed: Path) -> None:
-    """Interactive [C]/[R]/[↵] prompt for a review_pending file."""
+    """Show inline diff and numbered selector for a review_pending file."""
     original = proposed.with_name(proposed.name[: -len(_PROPOSED_SUFFIX)])
-    label = original.name if len(original.name) <= 42 else original.name[:41] + "…"
+    try:
+        rel = str(original.relative_to(Path.cwd())).replace("\\", "/")
+    except ValueError:
+        rel = original.name
+
+    sep = dim("  " + "─" * 54)
     print()
-    print(f"  {bold('review pending')}  {dim('·')}  {cyan(label)}")
-    print(f"  {cyan('[C]')} confirm    {red('[R]')} reject    {dim('[↵] skip')}")
+    print(sep)
+    print(f"  {bold('review pending')}  {cyan(rel)}")
+    print(sep)
+    _show_inline_diff(original, proposed)
+    print(sep)
+    print()
+    print(f"  {green('1')}  confirm   {dim('apply these changes')}")
+    print(f"  {red('2')}  reject    {dim('discard')}")
+    print(f"  {dim('3')}  skip      {dim('decide later')}")
+    print()
     print(dim("  › "), end="", flush=True)
 
-    key = _getch().lower()
-    if key not in ('\n', '\r', '', ' '):
-        print(key.upper())
-    else:
-        print()
-
-    if key == 'c':
+    key = _getch().strip().lower()
+    if key in ("1", "c", "y"):
+        print("1")
         _confirm_locally(proposed)
-    elif key == 'r':
+    elif key in ("2", "r", "n"):
+        print("2")
         _reject_locally(proposed)
     else:
+        print("3" if key == "3" else "")
         print(dim("  skipped — /confirm or /reject when ready"))
     print()
 
@@ -424,9 +459,6 @@ def run_task(
     after = set(Path.cwd().rglob(f"*{_PROPOSED_SUFFIX}"))
     new_proposed = after - before
     for p in new_proposed:
-        original = p.with_name(p.name[: -len(_PROPOSED_SUFFIX)])
-        rel = str(original.relative_to(Path.cwd())).replace("\\", "/")
-        _open_vscode_diff(rel)
         _prompt_confirm_reject(p)
 
     return data.get("session", {}).get("session_id")
