@@ -347,11 +347,10 @@ def run_task(
         original = p.with_name(p.name[: -len(_PROPOSED_SUFFIX)])
         rel = str(original.relative_to(Path.cwd())).replace("\\", "/")
         _open_vscode_diff(rel)
-        # Print a clear action prompt so user knows what to type
-        print(bold("  ┌─ Review pending ─────────────────────────────────────────┐"))
-        print(bold(f"  │") + f"  confirm {rel:<48}" + bold("│"))
-        print(bold(f"  │") + f"  reject  {rel:<48}" + bold("│"))
-        print(bold("  └──────────────────────────────────────────────────────────┘"))
+        print(bold("  ┌─ Review pending ──────────────────┐"))
+        print(bold("  │") + cyan("  confirm") + dim(f"  →  apply {original.name} ") + bold("│"))
+        print(bold("  │") + red("  reject ") + dim(f"  →  discard          ") + bold("│"))
+        print(bold("  └───────────────────────────────────┘"))
         print()
 
     return data.get("session", {}).get("session_id")
