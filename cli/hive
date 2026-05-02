@@ -91,26 +91,27 @@ def _find_vscode() -> str | None:
 
 
 def _vscode_ipc_open(file_uris: list[str], diff_mode: bool = False) -> bool:
-    """Send an open/diff command directly to the running VS Code instance via its IPC socket.
+    """Send an open/diff command directly to the running VS Code instance via IPC.
 
-    VS Code sets VSCODE_IPC_HOOK_CLI in every terminal it spawns.  When that
-    variable is present we can write a null-terminated JSON message straight to
-    the socket — no new Code.exe process, no extra window, instant response.
+    VS Code sets VSCODE_IPC_HOOK_CLI in every integrated terminal it spawns.
+    The CLI server at that socket reads plain JSON until the connection closes
+    (EOF), then processes the command — no null terminator, no framing.
 
-    Protocol: send  JSON + '\\0'  over a Unix socket (Mac/Linux) or Windows
-    named pipe, then optionally read the '\\0'-terminated JSON reply.
+    Sending via IPC means zero new Code.exe process and zero extra window.
+    Falls back silently to the code CLI if the socket is unavailable.
     """
     ipc = os.environ.get("VSCODE_IPC_HOOK_CLI")
     if not ipc:
         return False
     try:
+        # No null terminator — VS Code CLI server reads until EOF, then JSON-parses
         payload = json.dumps({
             "type": "open",
             "fileURIs": file_uris,
             "folderURIs": [],
             "diffMode": diff_mode,
             "forceReuseWindow": True,
-        }).encode("utf-8") + b"\0"
+        }).encode("utf-8")
 
         if sys.platform == "win32":
             import ctypes
@@ -118,15 +119,25 @@ def _vscode_ipc_open(file_uris: list[str], diff_mode: bool = False) -> bool:
             h = ctypes.windll.kernel32.CreateFileW(
                 ipc, 0xC0000000, 0, None, 3, 0, None   # GENERIC_RW, OPEN_EXISTING
             )
-            n = _wt.DWORD(0)
-            ctypes.windll.kernel32.WriteFile(h, payload, len(payload), ctypes.byref(n), None)
-            ctypes.windll.kernel32.CloseHandle(h)
-            return n.value > 0
+            # INVALID_HANDLE_VALUE is -1 as a signed pointer
+            if ctypes.cast(h, ctypes.c_ssize_t).value == -1:
+                return False
+            try:
+                n = _wt.DWORD(0)
+                ok = ctypes.windll.kernel32.WriteFile(
+                    h, payload, len(payload), ctypes.byref(n), None
+                )
+                ctypes.windll.kernel32.FlushFileBuffers(h)  # ensure bytes reach VS Code
+            finally:
+                ctypes.windll.kernel32.CloseHandle(h)       # close = EOF signal
+            return bool(ok) and n.value > 0
         else:
             import socket as _sock
             with _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM) as s:
                 s.connect(ipc)
                 s.sendall(payload)
+                s.shutdown(_sock.SHUT_WR)   # signal EOF so VS Code parses the message
+                s.recv(4096)                # wait for VS Code's JSON response
             return True
     except Exception:
         return False
