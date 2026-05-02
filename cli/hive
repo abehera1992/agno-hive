@@ -96,7 +96,7 @@ def _open_vscode_diff(relative_path: str) -> None:
     proposed = original.with_name(original.name + _PROPOSED_SUFFIX)
     if original.exists() and proposed.exists():
         subprocess.Popen(
-            [vscode, "--reuse-window", "--diff", str(original), str(proposed)],
+            [vscode, "-r", "--diff", str(original), str(proposed)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -342,9 +342,17 @@ def run_task(
 
     # Open VS Code diff for any .hive_proposed files created during this run
     after = set(Path.cwd().rglob(f"*{_PROPOSED_SUFFIX}"))
-    for p in after - before:
+    new_proposed = after - before
+    for p in new_proposed:
         original = p.with_name(p.name[: -len(_PROPOSED_SUFFIX)])
-        _open_vscode_diff(str(original.relative_to(Path.cwd())).replace("\\", "/"))
+        rel = str(original.relative_to(Path.cwd())).replace("\\", "/")
+        _open_vscode_diff(rel)
+        # Print a clear action prompt so user knows what to type
+        print(bold("  ┌─ Review pending ─────────────────────────────────────────┐"))
+        print(bold(f"  │") + f"  confirm {rel:<48}" + bold("│"))
+        print(bold(f"  │") + f"  reject  {rel:<48}" + bold("│"))
+        print(bold("  └──────────────────────────────────────────────────────────┘"))
+        print()
 
     return data.get("session", {}).get("session_id")
 
@@ -420,7 +428,7 @@ def _cmd_diff() -> None:
         print(dim(f"  pending: {original.relative_to(Path.cwd())}"))
         if vscode and original.exists():
             subprocess.Popen(
-                [vscode, "--reuse-window", "--diff", str(original), str(p)],
+                [vscode, "-r", "--diff", str(original), str(p)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         elif not vscode:
