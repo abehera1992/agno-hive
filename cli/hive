@@ -90,21 +90,49 @@ def _find_vscode() -> str | None:
     return None
 
 
+def _find_vscode_cli_ipc() -> str | None:
+    """Locate VS Code's CLI IPC socket.
+
+    VS Code sets VSCODE_IPC_HOOK_CLI in terminals it spawns, but some
+    configurations don't inject it.  As a fallback we enumerate named pipes
+    (Windows) or /tmp sockets (Unix) to find the vscode-ipc-*-sock socket
+    that VS Code always creates regardless of env-var injection.
+    """
+    ipc = os.environ.get("VSCODE_IPC_HOOK_CLI")
+    if ipc:
+        return ipc
+
+    if sys.platform == "win32":
+        try:
+            pipes = os.listdir("\\\\.\\pipe\\")
+            for pipe in pipes:
+                if pipe.startswith("vscode-ipc-") and pipe.endswith("-sock"):
+                    return f"\\\\.\\pipe\\{pipe}"
+        except Exception:
+            pass
+    else:
+        try:
+            import glob as _glob
+            sockets = _glob.glob("/tmp/vscode-ipc-*.sock")
+            if sockets:
+                return max(sockets, key=lambda p: os.path.getmtime(p))
+        except Exception:
+            pass
+
+    return None
+
+
 def _vscode_ipc_open(file_uris: list[str], diff_mode: bool = False) -> bool:
     """Send an open/diff command directly to the running VS Code instance via IPC.
 
-    VS Code sets VSCODE_IPC_HOOK_CLI in every integrated terminal it spawns.
-    The CLI server at that socket reads plain JSON until the connection closes
-    (EOF), then processes the command — no null terminator, no framing.
-
-    Sending via IPC means zero new Code.exe process and zero extra window.
-    Falls back silently to the code CLI if the socket is unavailable.
+    The VS Code CLI server reads plain JSON until EOF, then processes the command.
+    Using IPC means zero new Code.exe process and zero extra window.
+    Falls back silently to the code CLI if no socket is found.
     """
-    ipc = os.environ.get("VSCODE_IPC_HOOK_CLI")
+    ipc = _find_vscode_cli_ipc()
     if not ipc:
         return False
     try:
-        # No null terminator — VS Code CLI server reads until EOF, then JSON-parses
         payload = json.dumps({
             "type": "open",
             "fileURIs": file_uris,
@@ -117,9 +145,8 @@ def _vscode_ipc_open(file_uris: list[str], diff_mode: bool = False) -> bool:
             import ctypes
             import ctypes.wintypes as _wt
             h = ctypes.windll.kernel32.CreateFileW(
-                ipc, 0xC0000000, 0, None, 3, 0, None   # GENERIC_RW, OPEN_EXISTING
+                ipc, 0xC0000000, 0, None, 3, 0, None
             )
-            # INVALID_HANDLE_VALUE is -1 as a signed pointer
             if ctypes.cast(h, ctypes.c_ssize_t).value == -1:
                 return False
             try:
@@ -127,17 +154,17 @@ def _vscode_ipc_open(file_uris: list[str], diff_mode: bool = False) -> bool:
                 ok = ctypes.windll.kernel32.WriteFile(
                     h, payload, len(payload), ctypes.byref(n), None
                 )
-                ctypes.windll.kernel32.FlushFileBuffers(h)  # ensure bytes reach VS Code
+                ctypes.windll.kernel32.FlushFileBuffers(h)
             finally:
-                ctypes.windll.kernel32.CloseHandle(h)       # close = EOF signal
+                ctypes.windll.kernel32.CloseHandle(h)
             return bool(ok) and n.value > 0
         else:
             import socket as _sock
             with _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM) as s:
                 s.connect(ipc)
                 s.sendall(payload)
-                s.shutdown(_sock.SHUT_WR)   # signal EOF so VS Code parses the message
-                s.recv(4096)                # wait for VS Code's JSON response
+                s.shutdown(_sock.SHUT_WR)
+                s.recv(4096)
             return True
     except Exception:
         return False
