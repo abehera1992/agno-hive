@@ -16,22 +16,22 @@ _BASE_PREAMBLE = [
 ]
 
 
-def make_agent_from_spec(spec, mcp: MCPTools) -> Agent:
-    """Build an Agent from a dynamic spec (AgentSpec or any duck-typed object)."""
+def make_agent_from_spec(spec, *mcps: MCPTools) -> Agent:
+    """Build an Agent from a dynamic spec. Accepts one or more MCPTools instances."""
     return Agent(
         name=spec.name,
         model=get_model(spec.model, config.ollama_host),
-        tools=[mcp],
+        tools=list(mcps),
         instructions=spec.instructions,
         role=spec.role,
     )
 
 
-def make_coder(mcp: MCPTools) -> Agent:
+def make_coder(*mcps: MCPTools) -> Agent:
     return Agent(
         name="Coder",
         model=get_model(config.coder_model, config.ollama_host),
-        tools=[mcp],
+        tools=list(mcps),
         instructions=[
             *_BASE_PREAMBLE,
             "You are the implementation specialist. Write clean, idiomatic code.",
@@ -42,11 +42,11 @@ def make_coder(mcp: MCPTools) -> Agent:
     )
 
 
-def make_reviewer(mcp: MCPTools) -> Agent:
+def make_reviewer(*mcps: MCPTools) -> Agent:
     return Agent(
         name="Reviewer",
         model=get_model(config.reviewer_model, config.ollama_host),
-        tools=[mcp],
+        tools=list(mcps),
         instructions=[
             *_BASE_PREAMBLE,
             "You are the code reviewer. Check for correctness, security, and consistency.",
@@ -57,11 +57,11 @@ def make_reviewer(mcp: MCPTools) -> Agent:
     )
 
 
-def make_planner(mcp: MCPTools) -> Agent:
+def make_planner(*mcps: MCPTools) -> Agent:
     return Agent(
         name="Planner",
         model=get_model(config.planner_model, config.ollama_host),
-        tools=[mcp],
+        tools=list(mcps),
         instructions=[
             *_BASE_PREAMBLE,
             "You are the planning specialist. Break complex tasks into clear, ordered steps.",
@@ -74,11 +74,11 @@ def make_planner(mcp: MCPTools) -> Agent:
     )
 
 
-def make_researcher(mcp: MCPTools) -> Agent:
+def make_researcher(*mcps: MCPTools) -> Agent:
     return Agent(
         name="Researcher",
         model=get_model(config.researcher_model, config.ollama_host),
-        tools=[mcp],
+        tools=list(mcps),
         instructions=[
             *_BASE_PREAMBLE,
             "You are the research specialist. Understand the existing codebase before anyone writes code.",
@@ -91,15 +91,15 @@ def make_researcher(mcp: MCPTools) -> Agent:
     )
 
 
-def make_executor(mcp: MCPTools) -> Agent:
+def make_executor(*mcps: MCPTools) -> Agent:
     return Agent(
         name="Executor",
         model=get_model(config.executor_model, config.ollama_host),
-        tools=[mcp],
+        tools=list(mcps),
         instructions=[
             *_BASE_PREAMBLE,
             "You are the execution specialist. Run commands and validate results.",
-            "Use run_command() to execute tests, linters, or build steps.",
+            "Use run_shell() or run_command() to execute tests, linters, or build steps.",
             "Report stdout, stderr, and exit code verbatim — do not paraphrase errors.",
             "If a command fails, report the exact error and stop. Do not attempt fixes yourself.",
         ],
@@ -107,11 +107,11 @@ def make_executor(mcp: MCPTools) -> Agent:
     )
 
 
-def make_context_router(mcp: MCPTools) -> Agent:
+def make_context_router(*mcps: MCPTools) -> Agent:
     return Agent(
         name="ContextRouter",
         model=get_model(config.router_model, config.ollama_host),
-        tools=[mcp],
+        tools=list(mcps),
         instructions=[
             "You are a lightweight routing agent. Decide the fastest way to retrieve context for a query.",
             "Routing rules (pick ONE):",

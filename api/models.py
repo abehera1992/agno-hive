@@ -15,9 +15,10 @@ class RunRequest(BaseModel):
     project_id: str = "default"
     team: str | None = None
     agents: list[AgentSpec] | None = None
-    mcp_url: str | None = None
-    session_id: str | None = None   # resume existing session
-    persist: bool = False            # mark new session as permanent
+    mcp_url: str | None = None            # primary MCP — project context + app-specific tools
+    mcp_urls: list[str] | None = None     # secondary MCPs — e.g. hive-mcp for host actions
+    session_id: str | None = None         # resume existing session
+    persist: bool = False                 # mark new session as permanent
 
 
 class SessionMeta(BaseModel):

@@ -1,5 +1,6 @@
 import asyncio
 import time
+from contextlib import AsyncExitStack
 
 from opentelemetry import trace
 from agno.team import Team
@@ -34,6 +35,15 @@ _COORDINATOR_INSTRUCTIONS = [
     "  3. Delegate writing to Coder, review to Reviewer",
     "  4. memory_store() any non-obvious insight after completing (if available)",
     "",
+    "── Multi-MCP tool selection ─────────────────────────────────────",
+    "  When multiple MCP servers are connected, use the right one for each job:",
+    "  - PROJECT MCP (e.g. get_project_context, memory_search, search_knowledge_graph,",
+    "    get_file_content, find_files): reading context, understanding the project,",
+    "    app-specific workflows.",
+    "  - hive-mcp (e.g. apply_diff, write_file, run_shell, run_docker, git_status):",
+    "    writing files, running commands, Docker operations, all host-level actions.",
+    "  If only one MCP is connected, use it for everything.",
+    "",
     "── Editing files (CRITICAL) ────────────────────────────────────",
     "  - For existing files: ALWAYS use apply_diff(), NEVER write_file().",
     "    apply_diff makes surgical line-level changes; write_file rewrites the whole file.",
@@ -50,6 +60,7 @@ _COORDINATOR_INSTRUCTIONS = [
     "  - NEVER use run_command to modify files — no >, >>, sed -i, tee, perl -i.",
     "  - 'add a line', 'update a comment', 'change X to Y' → use apply_diff().",
     "  - Attempting to write via run_command will be BLOCKED by the server.",
+    "  - For full shell access (npm install, docker compose, etc.) use run_shell().",
     "",
     "── General rules ──────────────────────────────────────────────",
     "  - Base answers on file contents, not assumptions",
@@ -97,6 +108,7 @@ async def run_task_async(
     agent_specs: list | None = None,
     coordinator_model: str | None = None,
     mcp_url: str | None = None,
+    mcp_urls: list[str] | None = None,   # secondary MCPs (e.g. hive-mcp for host actions)
     project_id: str = "default",
     session_id: str | None = None,
 ) -> str:
@@ -141,18 +153,28 @@ async def run_task_async(
         lines.append("──────────────────────────────────────────────────────────────────")
         instructions += [""] + lines
 
-    async with MCPTools(url=effective_mcp_url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT) as mcp:
+    # Collect all MCP URLs: primary (project context) + secondary (host actions)
+    all_mcp_urls = [u for u in [effective_mcp_url] + (mcp_urls or []) if u]
+
+    async with AsyncExitStack() as stack:
+        mcp_list = []
+        for url in all_mcp_urls:
+            mcp = await stack.enter_async_context(
+                MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT)
+            )
+            mcp_list.append(mcp)
+
         if agent_specs:
-            members = [make_agent_from_spec(spec, mcp) for spec in agent_specs]
+            members = [make_agent_from_spec(spec, *mcp_list) for spec in agent_specs]
         else:
-            members = [make_coder(mcp), make_reviewer(mcp)]
+            members = [make_coder(*mcp_list), make_reviewer(*mcp_list)]
 
         team = Team(
             name="AgnoHive",
             mode="coordinate",
             model=get_model(effective_coordinator, config.ollama_host),
             members=members,
-            tools=[mcp],
+            tools=mcp_list,
             instructions=instructions,
             show_members_responses=True,
             max_iterations=config.max_iterations,

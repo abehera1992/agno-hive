@@ -123,6 +123,7 @@ async def run(request: RunRequest):
         agent_specs=agent_specs,
         coordinator_model=coordinator_model,
         mcp_url=mcp_url,
+        mcp_urls=request.mcp_urls,
         project_id=request.project_id,
         session_id=session_id,
     )
@@ -183,6 +184,7 @@ async def plan(request: RunRequest):
         agent_specs=agent_specs,
         coordinator_model=coordinator_model,
         mcp_url=mcp_url,
+        mcp_urls=request.mcp_urls,
         project_id=request.project_id,
     )
     return PlanResponse(
