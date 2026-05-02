@@ -36,6 +36,9 @@ class RunResponse(BaseModel):
     models_pulled: list[str]
     duration_seconds: float
     session: SessionMeta
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
 
 
 class PlanResponse(BaseModel):

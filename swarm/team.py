@@ -40,6 +40,33 @@ _COORDINATOR_INSTRUCTIONS = [
 ]
 
 
+def _extract_tokens(result) -> dict:
+    """Pull input/output/total token counts from an Agno RunResponse metrics object."""
+    try:
+        m = getattr(result, "metrics", None)
+        if not m:
+            return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+        def _sum(val):
+            if isinstance(val, list):
+                return sum(v for v in val if isinstance(v, (int, float)))
+            return int(val) if val else 0
+
+        if isinstance(m, dict):
+            return {
+                "input_tokens":  _sum(m.get("input_tokens",  0)),
+                "output_tokens": _sum(m.get("output_tokens", 0)),
+                "total_tokens":  _sum(m.get("total_tokens",  0)),
+            }
+        return {
+            "input_tokens":  _sum(getattr(m, "input_tokens",  0)),
+            "output_tokens": _sum(getattr(m, "output_tokens", 0)),
+            "total_tokens":  _sum(getattr(m, "total_tokens",  0)),
+        }
+    except Exception:
+        return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
 async def run_task_async(
     task: str,
     agent_specs: list | None = None,
@@ -120,16 +147,17 @@ async def run_task_async(
                 with _tracer.start_as_current_span("agno.team.run"):
                     result = await team.arun(task)
                 content = result.content if hasattr(result, "content") else str(result)
+                tokens = _extract_tokens(result)
                 span.set_status(trace.StatusCode.OK)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
                 await record_success(task, content, project_id)
-                return content
+                return content, tokens
             except Exception as exc:
                 span.record_exception(exc)
                 span.set_status(trace.StatusCode.ERROR, str(exc))
                 task_counter.add(1, {"project_id": project_id, "outcome": "failure"})
                 await record_failure(task, str(exc), project_id)
-                raise
+                raise  # callers receive (content, tokens) on success; exception on failure
             finally:
                 task_duration.record(
                     time.perf_counter() - t0,

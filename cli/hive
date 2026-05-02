@@ -154,12 +154,15 @@ def _print_result(data: dict, show_resume: bool = False) -> None:
     pulled   = data.get("models_pulled", [])
     session  = data.get("session", {})
 
-    session_id   = session.get("session_id", "")
-    turn         = session.get("turn", 0)
-    context_size = session.get("context_size", 0)
-    compacted    = session.get("compacted", False)
-    persist      = session.get("persist", False)
-    expires_at   = session.get("expires_at")
+    session_id    = session.get("session_id", "")
+    turn          = session.get("turn", 0)
+    context_size  = session.get("context_size", 0)
+    compacted     = session.get("compacted", False)
+    persist       = session.get("persist", False)
+    expires_at    = session.get("expires_at")
+    total_tokens  = data.get("total_tokens", 0)
+    input_tokens  = data.get("input_tokens", 0)
+    output_tokens = data.get("output_tokens", 0)
 
     print()
     print(result)
@@ -168,6 +171,9 @@ def _print_result(data: dict, show_resume: bool = False) -> None:
     sid_short   = session_id[:8] if session_id else ""
     context_str = f"summary + {context_size} msgs" if compacted else f"{context_size} msgs in context"
     expiry_str  = _format_expiry(expires_at, persist)
+
+    def _fmt_tokens(n: int) -> str:
+        return f"{n/1000:.1f}k" if n >= 1000 else str(n)
 
     parts = [f"── {agents} · {duration:.1f}s"]
     if sid_short:
@@ -178,6 +184,8 @@ def _print_result(data: dict, show_resume: bool = False) -> None:
         parts.append(context_str)
     if expiry_str:
         parts.append(expiry_str)
+    if total_tokens:
+        parts.append(f"{_fmt_tokens(total_tokens)} tokens ({_fmt_tokens(input_tokens)} in / {_fmt_tokens(output_tokens)} out)")
     if pulled:
         parts.append(f"pulled: {', '.join(pulled)}")
 

@@ -118,7 +118,7 @@ async def run(request: RunRequest):
     session_before = await get_session(session_id)
     has_summary = bool(session_before and session_before.get("summary"))
 
-    result = await run_task_async(
+    result, tokens = await run_task_async(
         task=request.task,
         agent_specs=agent_specs,
         coordinator_model=coordinator_model,
@@ -160,6 +160,9 @@ async def run(request: RunRequest):
         models_pulled=models_pulled,
         duration_seconds=round(time.perf_counter() - start, 2),
         session=session_meta,
+        input_tokens=tokens.get("input_tokens", 0),
+        output_tokens=tokens.get("output_tokens", 0),
+        total_tokens=tokens.get("total_tokens", 0),
     )
 
 
@@ -175,7 +178,7 @@ async def plan(request: RunRequest):
     all_models = list({coordinator_model} | {a.model for a in agent_specs})
     await ensure_models(all_models, config.ollama_host)
 
-    plan_text = await run_task_async(
+    plan_text, _ = await run_task_async(
         task=request.task,
         agent_specs=agent_specs,
         coordinator_model=coordinator_model,
