@@ -21,11 +21,10 @@ services:
       # Project files — bind-mount your project directory
       - ${PROJECT_PATH:-.}:/project
 
-      # Host Docker socket — gives the agent docker CLI access to the host daemon
-      # Linux / Mac (Docker Desktop):
+      # Host Docker socket — gives the agent docker CLI access to the host daemon.
+      # Works on Linux, Mac, and Windows Docker Desktop (which proxies the socket
+      # at /var/run/docker.sock via its WSL2 backend).
       - /var/run/docker.sock:/var/run/docker.sock
-      # Windows Docker Desktop (uncomment if the above doesn't work):
-      # - //./pipe/docker_engine://./pipe/docker_engine
 
       # Git identity (read-only)
       - ${HOME}/.gitconfig:/root/.gitconfig:ro
