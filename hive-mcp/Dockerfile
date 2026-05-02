@@ -36,7 +36,7 @@ ENV PROJECT_ROOT=/project \
 
 EXPOSE 9000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:9000/health || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD python3 -c "import socket; s=socket.socket(); s.settimeout(3); s.connect(('localhost', int(__import__('os').getenv('MCP_PORT','9000')))); s.close()" || exit 1
 
 CMD ["python", "main.py"]
