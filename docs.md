@@ -273,12 +273,25 @@ Two hard rules added:
 - **COVERAGE** — stopping at the first interesting directory is a failure; every top-level directory must appear in the response; subdirectory listings are included where they exist
 - **SEARCH rule** — for "how does X work" questions, `search_files(X, '**/*')` runs first; files are read only after search identifies which ones are relevant
 
+### Result caps
+
+`find_files` and `search_files` have per-call result caps. Exceeding them causes the agent to see a partial picture:
+
+| Tool | Default cap | Behaviour when hit |
+|---|---|---|
+| `find_files` | 200 results | Stops — files beyond the cap are invisible |
+| `search_files` | 80 matches | Stops — further occurrences are invisible |
+
+`list_directory_tree()` has **no result cap** — it walks every directory recursively and returns the full skeleton. This is why agents prefer it for overview questions; `find_files('**/*')` is the fallback for MCP servers that don't expose `list_directory_tree`.
+
 ### Files changed
 
 ```
-swarm/team.py              # _COORDINATOR_INSTRUCTIONS — new scan-first block at top, expanded query routing
-teams/engineering.yaml     # ContextRouter — 3-tier routing, relaxed call limit for overview queries
+swarm/team.py              # _COORDINATOR_INSTRUCTIONS — scan-first block, list_directory_tree preferred for overview
+teams/engineering.yaml     # ContextRouter — 3-tier routing, list_directory_tree first for overview
                            # Researcher — SCAN-FIRST, COVERAGE, SEARCH rules
+EkamApp/mcp-server/tools/context.py  # list_directory_tree() added; find_files cap 50→200; search_files cap 40→80
+EkamApp/mcp-server/main.py           # list_directory_tree registered as MCP tool; server instructions updated
 ```
 
 ## How Bootstrap Works
