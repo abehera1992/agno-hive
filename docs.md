@@ -226,6 +226,61 @@ run_task_async(task, agent_specs, coordinator_model, mcp_url, mcp_urls, project_
 
 Bootstrap and failure context loading run in parallel (`asyncio.gather`) — no latency penalty.
 
+## Scan-First Prompt Engineering
+
+User prompts are almost always short and vague ("list the directories", "how does auth work"). Without explicit guidance, agents stop at the first plausible result — describing a directory by its name, or reading only the first service they find. The scan-first rules force discovery before inference.
+
+### Coordinator (`swarm/team.py` — `_COORDINATOR_INSTRUCTIONS`)
+
+A top-level block runs before all other routing logic:
+
+```
+Before answering any question about structure, features, or behaviour:
+  1. find_files('**/*')           — get the full file tree
+  2. search_files(keyword, '**/*') — find all occurrences of the topic
+  3. get_file_content(path)       — read specific files to verify details
+Never describe a directory or module from its name alone.
+Never stop at the first interesting result for overview questions.
+```
+
+Query-type routing then layers on top:
+
+| Query type | Tool sequence |
+|---|---|
+| Overview / structure | `find_files('**/*')` → read one entry file per directory → grounded summary of ALL dirs |
+| "How does X work" | `search_files(X, '**/*')` → `get_file_content()` on 2-3 most relevant files |
+| Code pattern / convention | `find_files('**/<ext>')` → `search_files(pattern)` → `get_file_content()` on 1-2 files |
+| Implementation task | `get_context_section()` → read one reference file → Coder → Reviewer |
+
+### ContextRouter (`teams/engineering.yaml`)
+
+Three tiers (replaces the old "one tool call, use memory_search if unsure"):
+
+| User prompt shape | Action |
+|---|---|
+| "list directories", "what does X do", "show me the structure" | `find_files('**/*')` — full tree, pass raw results to Researcher |
+| "how does X work", "what is the X flow" | `search_files(X, '**/*')` — all occurrences across the whole codebase |
+| Specific file or symbol | targeted `find_files()` or `search_files()` — one call |
+| Past task / lesson | `memory_search()` |
+
+Tool call limit: 1 for specific lookups, up to 3 for overview/structure queries.
+
+### Researcher (`teams/engineering.yaml`)
+
+Two hard rules added:
+
+- **SCAN-FIRST** — must call `find_files('**/*')` before answering any structure or overview question; must read at least one file (README, main.py, config.py, `__init__.py`) per directory to ground the answer — never describe from the directory name alone
+- **COVERAGE** — stopping at the first interesting directory is a failure; every top-level directory must appear in the response; subdirectory listings are included where they exist
+- **SEARCH rule** — for "how does X work" questions, `search_files(X, '**/*')` runs first; files are read only after search identifies which ones are relevant
+
+### Files changed
+
+```
+swarm/team.py              # _COORDINATOR_INSTRUCTIONS — new scan-first block at top, expanded query routing
+teams/engineering.yaml     # ContextRouter — 3-tier routing, relaxed call limit for overview queries
+                           # Researcher — SCAN-FIRST, COVERAGE, SEARCH rules
+```
+
 ## How Bootstrap Works
 
 `swarm/bootstrap.py` opens a raw `mcp.ClientSession` via **Streamable HTTP** (`streamablehttp_client`), calls `find_files(patterns_glob)` to discover pattern files, then reads each with `get_file_content()`. Falls back to `get_project_context()` if pattern files aren't found. Returns a combined string injected into the coordinator's instructions.

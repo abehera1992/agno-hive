@@ -27,6 +27,7 @@ A generic, model-agnostic agentic swarm built on [Agno](https://github.com/agno-
 - **apply_diff always surgical** — agents must use `apply_diff` (not `write_file`) for existing files; to append, include the anchor line in both `old_string` and `new_string`
 - **Persistent chat sessions** — every `POST /run` creates or resumes a session in PostgreSQL; last 6 messages injected into coordinator; sessions older than 20 messages are compacted by `llama3.1:8b`; 30-day TTL with optional `persist` flag for permanent sessions
 - **hive bootstrap** — `hive --bootstrap` calls `index_project` on hive-mcp, which chunks the project with AST (Python) or text windows (other files) and inserts into LightRAG via Streamable HTTP
+- **Scan-first prompt engineering** — agents are instructed to discover before inferring: for overview/structure prompts `find_files('**/*')` runs first; for "how does X work" prompts `search_files(X, '**/*')` runs first; the Researcher must cover every top-level directory and ground every claim in a real file read — stopping at the first interesting result is treated as a failure
 
 ## Infrastructure (ZGX)
 
