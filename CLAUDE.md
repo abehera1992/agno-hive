@@ -28,6 +28,66 @@ A generic, model-agnostic agentic swarm built on [Agno](https://github.com/agno-
 - **Persistent chat sessions** — every `POST /run` creates or resumes a session in PostgreSQL; last 6 messages injected into coordinator; sessions older than 20 messages are compacted by `llama3.1:8b`; 30-day TTL with optional `persist` flag for permanent sessions
 - **hive bootstrap** — `hive --bootstrap` calls `index_project` on hive-mcp, which chunks the project with AST (Python) or text windows (other files) and inserts into LightRAG via Streamable HTTP
 - **Scan-first prompt engineering** — agents are instructed to discover before inferring: for overview/structure prompts `find_files('**/*')` runs first; for "how does X work" prompts `search_files(X, '**/*')` runs first; the Researcher must cover every top-level directory and ground every claim in a real file read — stopping at the first interesting result is treated as a failure
+- **Project-agnostic agent instructions** — no hardcoded directory names, file names, or tool names anywhere in coordinator instructions, team YAMLs, or agent factory functions; all tool references use "if available" qualifiers; directory names are always derived at runtime via `list_directory_tree()` or `find_files()` rather than assumed; this ensures the same team specs work across any project connected via MCP
+
+## Agent Instruction Design Principles
+
+Rules for writing or modifying coordinator instructions (`swarm/team.py`), team specs (`teams/*.yaml`), and agent factories (`swarm/agents.py`). Apply these whenever enhancing prompt engineering.
+
+**1. Never hardcode paths or filenames**
+Instructions must not reference specific directory names (`API/`, `services/`), file names (`DOCS.md`, `main.py`), or file extensions as fixed values. Use patterns (`**/*.py`, `**/routes*`) or derive the target at runtime.
+
+```yaml
+# Bad — breaks on any other project
+"call list_directory('API/') to enumerate services"
+
+# Good — derives the directory from what the project actually exposes
+"derive the target directory from list_directory_tree() or find_files() first, then call list_directory(target)"
+```
+
+**2. Never hardcode tool names**
+Different project MCPs expose different tools. Always qualify with "if available" and instruct agents to discover what tools are actually connected.
+
+```yaml
+# Bad — assumes every project has this tool
+"call get_context_section(topic) for architecture context"
+
+# Good — degrades gracefully when the tool isn't present
+"if the project MCP exposes a documentation section tool, call it — do not assume the tool name"
+```
+
+**3. Scan before inferring**
+Agents must call file discovery tools before answering. Describing a module from its directory name alone is forbidden. The order is always: discover → search → read → answer.
+
+```
+list_directory_tree()           # full skeleton, no cap
+  → list_directory(target)      # enumerate one directory's children
+    → search_files(X, '**/*')   # find relevant files
+      → get_file_content(path)  # read to verify
+        → answer
+```
+
+**4. Enumerate fully before answering**
+For any task covering a directory (list APIs, list services, map routes), the agent must enumerate ALL subdirectories first, process each one, and only write the answer after the last one. Skipping a subdirectory because "enough results" were found from a previous one is a failure.
+
+**5. Tool call limits are query-type dependent**
+Not all queries need the same number of tool calls. The limit should reflect the query type:
+- Specific file/symbol lookup: 1 call
+- Feature/pattern questions: 2–3 calls (search → read)
+- Overview/enumeration questions: up to the number of subdirectories × 2
+
+Applying a single blanket limit (e.g. "one tool call maximum") breaks comprehensive tasks.
+
+**6. Routing degrades gracefully**
+ContextRouter routing rules must work whether or not optional backends (LightRAG, memory) are connected. Each routing tier should have a fallback:
+
+```yaml
+# Semantic questions
+→ lightrag_query() if available, else memory_search() if available, else search_files()
+```
+
+**7. Result caps must match the task scope**
+`find_files` and `search_files` have per-call caps. For large projects a cap of 50 means the agent sees only a fraction of the codebase. Current caps: `find_files` 200, `search_files` 80. Prefer `list_directory_tree()` (no cap) for structure questions. Raise caps before adding more instructions — hitting the cap silently is worse than a slower scan.
 
 ## Infrastructure (ZGX)
 
