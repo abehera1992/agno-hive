@@ -1,44 +1,60 @@
-# hive-mcp — drop this file into any project and run:
-#   docker compose -f docker-compose.hive.yml up -d
+# hive-mcp — generic host-action MCP server for AGNOHive.
+#
+# Usage:
+#   docker compose -f docker-compose.hive.yml up -d              # start with defaults
+#   docker compose -f docker-compose.hive.yml --profile agno up -d  # also start agno-hive instance
+#   docker compose -f docker-compose.hive.yml down
 #
 # Prerequisites:
 #   - Docker installed
-#   - Tailscale installed on this machine (ZGX reaches it via Tailscale IP)
+#   - Tailscale installed (ZGX reaches this machine via Tailscale IP)
 #
-# Environment variables (set in shell or .env):
-#   PROJECT_PATH   path to your project (default: current directory)
-#   HIVE_MCP_PORT  host port to expose (default: 9000)
-#   WRITE_REVIEW   true = stage all writes for human review (default: true)
+# Environment variables (set in shell or .env before running):
+#   PROJECT_PATH        Path to the primary project (default: current directory)
+#   HIVE_MCP_PORT       Host port for primary instance (default: 9003)
+#   WRITE_REVIEW        Stage all writes for human review (default: true)
+#   WEB_SEARCH_ENABLED  Enable web_search and web_fetch tools (default: false)
+#
+# Two-project setup (EkamApp + agno-hive):
+#   Run with --profile agno to also start hive-mcp-agno on port 9004.
+#   Set AGNO_HIVE_PATH to the agno-hive repo path.
 
 services:
+  # ── Primary instance — points at your main project ───────────────────────────
   hive-mcp:
     image: ghcr.io/abehera1992/hive-mcp:latest
     container_name: hive-mcp
     restart: unless-stopped
     ports:
-      - "${HIVE_MCP_PORT:-9000}:9000"
+      - "${HIVE_MCP_PORT:-9003}:9000"
     volumes:
-      # Project files — bind-mount your project directory
       - ${PROJECT_PATH:-.}:/project
-
-      # Host Docker socket — gives the agent docker CLI access to the host daemon.
-      # Works on Linux, Mac, and Windows Docker Desktop (which proxies the socket
-      # at /var/run/docker.sock via its WSL2 backend).
       - /var/run/docker.sock:/var/run/docker.sock
-
-      # Git identity (read-only)
       - ${HOME}/.gitconfig:/root/.gitconfig:ro
-
-      # SSH keys for git (read-only)
       - ${HOME}/.ssh:/root/.ssh:ro
-
     environment:
       - PROJECT_ROOT=/project
       - MCP_PORT=9000
       - WRITE_REVIEW=${WRITE_REVIEW:-true}
+      - WEB_SEARCH_ENABLED=${WEB_SEARCH_ENABLED:-false}
 
-    # Use host network so the container shares the host's Tailscale interface.
-    # ZGX connects to http://<your-tailscale-ip>:9000/mcp
-    # Note: network_mode: host is Linux only.
-    # On Mac/Windows Docker Desktop, remove this line — port publishing is enough.
-    # network_mode: host
+  # ── agno-hive instance — points at the agno-hive repo itself ─────────────────
+  # Start with: docker compose -f docker-compose.hive.yml --profile agno up -d
+  # Connects on port 9004. Set in hive terminal: Use-AgnoHive
+  hive-mcp-agno:
+    image: ghcr.io/abehera1992/hive-mcp:latest
+    container_name: hive-mcp-agno
+    restart: unless-stopped
+    profiles: ["agno"]
+    ports:
+      - "9004:9000"
+    volumes:
+      - ${AGNO_HIVE_PATH:-../agno-hive}:/project
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOME}/.gitconfig:/root/.gitconfig:ro
+      - ${HOME}/.ssh:/root/.ssh:ro
+    environment:
+      - PROJECT_ROOT=/project
+      - MCP_PORT=9000
+      - WRITE_REVIEW=${WRITE_REVIEW:-true}
+      - WEB_SEARCH_ENABLED=${WEB_SEARCH_ENABLED:-false}
