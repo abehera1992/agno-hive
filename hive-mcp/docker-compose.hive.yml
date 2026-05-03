@@ -30,8 +30,8 @@ services:
     volumes:
       - ${PROJECT_PATH:-.}:/project
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${HOME}/.gitconfig:/root/.gitconfig:ro
-      - ${HOME}/.ssh:/root/.ssh:ro
+      - ${USERPROFILE:-.}/.gitconfig:/root/.gitconfig:ro
+      - ${USERPROFILE:-.}/.ssh:/root/.ssh:ro
     environment:
       - PROJECT_ROOT=/project
       - MCP_PORT=9000
@@ -51,8 +51,8 @@ services:
     volumes:
       - ${AGNO_HIVE_PATH:-../agno-hive}:/project
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${HOME}/.gitconfig:/root/.gitconfig:ro
-      - ${HOME}/.ssh:/root/.ssh:ro
+      - ${USERPROFILE:-.}/.gitconfig:/root/.gitconfig:ro
+      - ${USERPROFILE:-.}/.ssh:/root/.ssh:ro
     environment:
       - PROJECT_ROOT=/project
       - MCP_PORT=9000
