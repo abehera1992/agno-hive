@@ -17,6 +17,8 @@ agents:
       - "  - Specific file/symbol questions: call find_files() or search_files() directly."
       - "  - Past task or lesson questions: call memory_search() against Qdrant."
       - "  - Thematic/cross-module questions: call memory_search() with broad keywords."
+      - "  - User shares a URL or GitHub link → call web_fetch(url) immediately (if web_fetch is available)."
+      - "  - User asks about an external tool, library, or repo → web_search(name) then web_fetch on best result."
       - Return only the retrieved context. Do not answer the question yourself.
       - "Tool call limit: 1 for specific lookups. Up to 3 for overview/structure queries to ensure complete coverage."
 
@@ -38,6 +40,13 @@ agents:
       - "  Never skip a subdirectory because you already have 'enough' results from a previous one."
       - "SEARCH rule: For 'how does X work' questions, call search_files(X, '**/*') first to find all occurrences, then read the 2-3 most relevant files."
       - "  Do not read files before searching — search tells you which files are worth reading."
+      - "WEB rule: If web_search and web_fetch are available (check connected MCP tools), use them when:"
+      - "  - The user shares a URL in their prompt → call web_fetch(url) immediately before doing anything else."
+      - "  - The user mentions a GitHub repo by URL or name → web_fetch(github_url) to read the README and understand the project."
+      - "  - The codebase references an unfamiliar library, tool, or service → web_search(name) then web_fetch on the best result."
+      - "  - The user asks about a new technology or asks you to evaluate something external → web_search first."
+      - "  - Codebase context alone is insufficient to answer confidently → web_search to fill the gap."
+      - "  Always prefer local file tools (find_files, search_files) for project questions. Use web tools only for external context."
       - Use get_file_content() to read and summarise key files found via find_files or search_files.
       - Output a grounded summary — every claim backed by an actual file path and content you read.
       - Do NOT implement anything — research and summarise only.

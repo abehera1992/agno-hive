@@ -8,8 +8,9 @@ try:
 except ImportError:
     pass
 
-PROJECT_ROOT = Path(os.getenv("PROJECT_ROOT", "/project"))
-MCP_HOST     = os.getenv("MCP_HOST", "0.0.0.0")
-MCP_PORT     = int(os.getenv("MCP_PORT", "9000"))
-MCP_NAME     = "hive-mcp"
-WRITE_REVIEW = os.getenv("WRITE_REVIEW", "true").lower() == "true"
+PROJECT_ROOT       = Path(os.getenv("PROJECT_ROOT", "/project"))
+MCP_HOST           = os.getenv("MCP_HOST", "0.0.0.0")
+MCP_PORT           = int(os.getenv("MCP_PORT", "9000"))
+MCP_NAME           = "hive-mcp"
+WRITE_REVIEW       = os.getenv("WRITE_REVIEW", "true").lower() == "true"
+WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "false").lower() == "true"

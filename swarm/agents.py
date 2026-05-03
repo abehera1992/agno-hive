@@ -121,6 +121,8 @@ def make_context_router(*mcps: MCPTools) -> Agent:
             "  - Specific file/symbol         → find_files() or search_files() with a targeted pattern",
             "  - Semantic/memory questions    → lightrag_query() if available, else memory_search()",
             "  - Cross-project patterns       → lightrag_query(query, 'global', mode='hybrid') if available",
+            "  - User shares a URL or GitHub link → web_fetch(url) immediately if available",
+            "  - External tool/library/repo   → web_search(name) then web_fetch on best result if available",
             "Return only the retrieved context. Do not answer the question yourself.",
             "Tool call limit: 1 for specific lookups, up to 3 for overview/structure queries.",
         ],
