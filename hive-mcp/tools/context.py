@@ -88,7 +88,7 @@ def get_file_content(relative_path: str) -> str:
         return f"Could not read {relative_path}: {e}"
 
 
-def find_files(glob_pattern: str, max_results: int = 60) -> str:
+def find_files(glob_pattern: str, max_results: int = 200) -> str:
     """
     Find files and directories by glob pattern. Returns paths relative to project root.
     Use this before get_file_content when you don't know the exact path.
@@ -121,7 +121,7 @@ def find_files(glob_pattern: str, max_results: int = 60) -> str:
     return header + "\n".join(matches)
 
 
-def search_files(pattern: str, glob_filter: str = "**/*", max_results: int = 40) -> str:
+def search_files(pattern: str, glob_filter: str = "**/*", max_results: int = 80) -> str:
     """
     Search file contents with a regex pattern. Returns matching lines with path and line number.
     Use this to find usages, verify conventions, or locate code before editing.
@@ -160,6 +160,42 @@ def search_files(pattern: str, glob_filter: str = "**/*", max_results: int = 40)
         return f"search_files failed: {e}"
 
     return "\n".join(results) if results else f"No matches for: {pattern}"
+
+
+def list_directory_tree(max_depth: int = 3) -> str:
+    """
+    Return the full directory tree of the project up to max_depth levels deep.
+    Shows directories only (no individual files) — no result cap.
+    Use this for any overview or structure question before drilling into specific directories.
+    Prefer this over find_files('**/*') for structure questions — no cap, always complete.
+
+    Args:
+        max_depth: How many levels deep to traverse (default 3)
+
+    Examples:
+        list_directory_tree()    → full project structure, 3 levels deep
+        list_directory_tree(2)   → top 2 levels only
+    """
+    lines = []
+
+    def _recurse(path: Path, depth: int) -> None:
+        if depth > max_depth:
+            return
+        try:
+            children = sorted(path.iterdir())
+        except PermissionError:
+            return
+        dirs = [c for c in children
+                if c.is_dir() and c.name not in _IGNORE_DIRS and not c.name.startswith(".")]
+        for d in dirs:
+            indent = "  " * (depth - 1)
+            lines.append(f"{indent}{d.name}/")
+            _recurse(d, depth + 1)
+
+    _recurse(PROJECT_ROOT, 1)
+    if not lines:
+        return "No directories found."
+    return f"Project directory tree (dirs only, {max_depth} levels deep):\n" + "\n".join(lines)
 
 
 def list_directory(relative_path: str = "") -> str:

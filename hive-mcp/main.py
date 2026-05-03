@@ -27,6 +27,7 @@ from tools.context import (
     find_files,
     search_files,
     list_directory,
+    list_directory_tree,
 )
 from tools.files import write_file, apply_diff, run_command
 from tools.shell import run_shell, run_docker, get_env_info, check_port, list_processes
@@ -60,6 +61,7 @@ mcp.tool()(get_file_content)
 mcp.tool()(find_files)
 mcp.tool()(search_files)
 mcp.tool()(list_directory)
+mcp.tool()(list_directory_tree)
 
 # ── File writing (WRITE_REVIEW-aware) + read-only shell ──────────────────────
 mcp.tool()(write_file)
