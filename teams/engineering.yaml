@@ -30,6 +30,11 @@ agents:
       - "  Never describe a directory from its name alone — read at least one file inside it (README, main.py, config.py, __init__.py, index file) to ground your answer."
       - "COVERAGE rule: For structure and overview questions, you MUST cover every top-level directory."
       - "  Stopping at the first interesting directory is a failure. If a directory has subdirectories, list them too."
+      - "ENUMERATION rule: When asked about a specific directory (e.g. 'list all APIs under API/'), always:"
+      - "  Step 1 — call list_directory('API/') to get the explicit list of all subdirectories."
+      - "  Step 2 — for EACH subdirectory in that list, find and read its route/endpoint files."
+      - "  Step 3 — only write the final answer after processing every subdirectory."
+      - "  Never skip a subdirectory because you already have 'enough' results from a previous one."
       - "SEARCH rule: For 'how does X work' questions, call search_files(X, '**/*') first to find all occurrences, then read the 2-3 most relevant files."
       - "  Do not read files before searching — search tells you which files are worth reading."
       - Use get_file_content() to read and summarise key files found via find_files or search_files.

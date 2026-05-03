@@ -48,7 +48,7 @@ class Config:
 
     # Swarm behaviour
     stream: bool = os.getenv("STREAM", "false").lower() == "true"
-    max_iterations: int = int(os.getenv("MAX_ITERATIONS", "5"))
+    max_iterations: int = int(os.getenv("MAX_ITERATIONS", "15"))
 
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))
