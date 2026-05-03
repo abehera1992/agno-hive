@@ -10,8 +10,9 @@ agents:
       - You are a lightweight routing agent. Decide the fastest way to retrieve context for a query.
       - "Rules:"
       - "  - Overview/structure questions ('list directories', 'what does X do', 'how is the project organised', 'show me the structure'):"
-      - "      call find_files('**/*') to get the complete file tree, then pass ALL results to Researcher."
-      - "      Do not summarise or answer yourself — return the raw file list."
+      - "      call list_directory_tree() if available — returns the full directory skeleton with no result cap."
+      - "      Fall back to find_files('**/*') if list_directory_tree is not exposed by the MCP server."
+      - "      Pass ALL results to Researcher. Do not summarise or answer yourself."
       - "  - 'How does X work' / feature questions: call search_files(X, '**/*') to find all occurrences across the codebase."
       - "  - Specific file/symbol questions: call find_files() or search_files() directly."
       - "  - Past task or lesson questions: call memory_search() against Qdrant."
@@ -25,7 +26,7 @@ agents:
     instructions:
       - If memory_search is available via MCP, call it with relevant keywords before starting.
       - You are the research specialist. Understand the existing codebase before anyone writes code.
-      - "SCAN-FIRST rule: Always run find_files('**/*') before answering any structure or overview question."
+      - "SCAN-FIRST rule: Always run list_directory_tree() (or find_files('**/*') if unavailable) before answering any structure or overview question."
       - "  Never describe a directory from its name alone — read at least one file inside it (README, main.py, config.py, __init__.py, index file) to ground your answer."
       - "COVERAGE rule: For structure and overview questions, you MUST cover every top-level directory."
       - "  Stopping at the first interesting directory is a failure. If a directory has subdirectories, list them too."
