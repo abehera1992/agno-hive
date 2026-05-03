@@ -420,6 +420,7 @@ docker run -d --name hive-mcp --restart unless-stopped \
 | `MCP_HOST` | `0.0.0.0` | Bind address |
 | `MCP_PORT` | `9000` | Container port |
 | `WRITE_REVIEW` | `true` | Stage writes as `.hive_proposed` for human review |
+| `WEB_SEARCH_ENABLED` | `false` | Enable `web_search` and `web_fetch` tools (uses client network) |
 
 ### Endpoint
 
@@ -432,6 +433,50 @@ The hive CLI auto-detects the Tailscale IP. Default port for hive-mcp is 9003 on
 ### Tools exposed
 
 See `hive-mcp/README.md` for the full tool list.
+
+## Web Search and Fetch
+
+`web_search` and `web_fetch` run inside the hive-mcp container and use the **client machine's network**. ZGX is not involved — no traffic goes through the inference server. Both tools are disabled by default and enabled with `WEB_SEARCH_ENABLED=true`.
+
+### Tools
+
+| Tool | Args | Purpose |
+|---|---|---|
+| `web_search` | `query, max_results=5` | DuckDuckGo full-text search — returns titles, URLs, snippets. No API key required. |
+| `web_fetch` | `url, max_chars=8000` | Fetch a URL and return clean readable text. GitHub repos return README + metadata via GitHub API. |
+
+### web_fetch URL handling
+
+| URL type | Behaviour |
+|---|---|
+| `github.com/owner/repo` | GitHub API — repo description, language, stars, topics, full README |
+| GitHub raw/blob file | Direct httpx fetch of file content |
+| Documentation sites, blogs | httpx + BeautifulSoup — strips nav/scripts/ads, returns `<main>` or `<article>` content |
+| Any other HTTP/HTTPS URL | httpx fetch + plain text extraction |
+
+### Agent routing rules
+
+Agents use web tools when (all conditional on `WEB_SEARCH_ENABLED`):
+- **URL in user prompt** → `web_fetch(url)` immediately, before any other tool
+- **GitHub repo mentioned** → `web_fetch(github_url)` for README + metadata
+- **Unfamiliar library / tool / technology** → `web_search(name)` → `web_fetch` on best result
+- **Codebase context insufficient** → `web_search` to fill the gap
+
+Local file tools (`find_files`, `search_files`, `get_file_content`) always take priority for project questions. Web tools are for external context only.
+
+### Dependencies added to hive-mcp
+
+```
+duckduckgo-search>=6.0.0   # DuckDuckGo search, no API key
+beautifulsoup4>=4.12.0     # HTML content extraction
+httpx>=0.27.0              # already present — used for web_fetch
+```
+
+### File
+
+```
+hive-mcp/tools/web.py   # web_search, web_fetch, _clean_html, _github_repo_summary
+```
 
 ## Automated Code Indexer
 

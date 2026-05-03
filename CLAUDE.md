@@ -27,6 +27,7 @@ A generic, model-agnostic agentic swarm built on [Agno](https://github.com/agno-
 - **apply_diff always surgical** — agents must use `apply_diff` (not `write_file`) for existing files; to append, include the anchor line in both `old_string` and `new_string`
 - **Persistent chat sessions** — every `POST /run` creates or resumes a session in PostgreSQL; last 6 messages injected into coordinator; sessions older than 20 messages are compacted by `llama3.1:8b`; 30-day TTL with optional `persist` flag for permanent sessions
 - **hive bootstrap** — `hive --bootstrap` calls `index_project` on hive-mcp, which chunks the project with AST (Python) or text windows (other files) and inserts into LightRAG via Streamable HTTP
+- **Web search + fetch via hive-mcp** — `web_search(query)` uses DuckDuckGo (no API key); `web_fetch(url)` fetches any URL with cleaned text extraction; GitHub repo URLs return README + metadata via GitHub API; gated by `WEB_SEARCH_ENABLED=true` on the hive-mcp container; agents auto-fetch URLs shared in prompts and search when asked about external tools/libraries
 - **Scan-first prompt engineering** — agents are instructed to discover before inferring: for overview/structure prompts `find_files('**/*')` runs first; for "how does X work" prompts `search_files(X, '**/*')` runs first; the Researcher must cover every top-level directory and ground every claim in a real file read — stopping at the first interesting result is treated as a failure
 - **Project-agnostic agent instructions** — no hardcoded directory names, file names, or tool names anywhere in coordinator instructions, team YAMLs, or agent factory functions; all tool references use "if available" qualifiers; directory names are always derived at runtime via `list_directory_tree()` or `find_files()` rather than assumed; this ensures the same team specs work across any project connected via MCP
 
@@ -211,4 +212,5 @@ git -C ~/agno-hive pull
 | Dual-MCP architecture (project context + host actions) | Done |
 | Tailscale auto-detection for MCP URLs | Done |
 | `hive bootstrap` / `index_project` (LightRAG via hive-mcp) | Done |
+| Web search + fetch (`web_search`, `web_fetch` via hive-mcp, `WEB_SEARCH_ENABLED`) | Done |
 | Cost-aware model routing | Planned (Phase 7) |

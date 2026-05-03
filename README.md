@@ -13,7 +13,8 @@ hive-mcp  ◄──────────────────────�
   run_shell                               Coder          ──► Qdrant (vectors)
   run_docker                              Executor       ──► PostgreSQL/AGE (graph)
   git_*                                   Reviewer       ──► SigNoz (OTel)
-  index_project                         ──────────────────────────────────────
+  index_project
+  web_search / web_fetch                ──────────────────────────────────────
                                            Coordinator (qwen3:30b)
 project MCP  ◄───────────────────────────  orchestrates all agents
   get_file_content
@@ -105,6 +106,26 @@ docker ps --filter "name=hive-mcp"
 ZGX reaches it via your Tailscale IP: `http://<your-tailscale-ip>:9000/mcp`
 
 The `hive` CLI auto-detects your Tailscale IP — no manual URL configuration needed.
+
+### Enabling web search
+
+Add `WEB_SEARCH_ENABLED=true` to the container to give agents access to `web_search` and `web_fetch`:
+
+```bash
+# docker run
+docker run -d --name hive-mcp ... -e WEB_SEARCH_ENABLED=true ghcr.io/abehera1992/hive-mcp:latest
+
+# docker compose — set in shell or .env before running
+WRITE_REVIEW=true WEB_SEARCH_ENABLED=true docker compose -f docker-compose.hive.yml up -d
+```
+
+When enabled, agents will:
+- **Auto-fetch any URL** the user shares in a prompt
+- **Read GitHub repos** (README + metadata) when a repo URL or name is mentioned
+- **Search DuckDuckGo** when asked about unfamiliar libraries, tools, or technologies
+- **Chain search → fetch** — find the best result, then read the full page for grounded answers
+
+Uses the client machine's network. No API key required.
 
 ---
 
@@ -548,6 +569,8 @@ Create a new team by adding a YAML file in `teams/` — no code changes needed.
 | `run_docker(cmd)` | Docker / docker compose commands |
 | `git_status/log/diff/blame` | Git operations |
 | `index_project(project_id, lightrag_url, ...)` | Semantic bootstrap into LightRAG |
+| `web_search(query, max_results)` | DuckDuckGo search — titles, URLs, snippets (requires `WEB_SEARCH_ENABLED=true`) |
+| `web_fetch(url, max_chars)` | Fetch a URL and return clean text; GitHub repos return README + metadata via API (requires `WEB_SEARCH_ENABLED=true`) |
 
 > **Transport:** All MCP servers must use **Streamable HTTP** (`/mcp` endpoint). The deprecated `/sse` transport is not used.
 
@@ -598,6 +621,7 @@ git -C ~/agno-hive pull   # on ZGX
 | Dual-MCP architecture (project context + hive-mcp host actions) | Done |
 | Tailscale auto-detection for MCP URLs | Done |
 | `hive bootstrap` / `index_project` (LightRAG via hive-mcp) | Done |
+| Web search + fetch (`web_search`, `web_fetch` via hive-mcp, `WEB_SEARCH_ENABLED`) | Done |
 | Cost-aware model routing | Planned |
 
 ---
