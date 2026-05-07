@@ -8,6 +8,8 @@ class AgentSpec(BaseModel):
     role: str
     model: str
     instructions: list[str]
+    description: str | None = None
+    tools: list[str] | None = None
 
 
 class RunRequest(BaseModel):

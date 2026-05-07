@@ -17,14 +17,34 @@ _BASE_PREAMBLE = [
 
 
 def make_agent_from_spec(spec, *mcps: MCPTools) -> Agent:
-    """Build an Agent from a dynamic spec. Accepts one or more MCPTools instances."""
+    """Build an Agent from a dynamic spec.
+
+    If spec.tools lists tool names, only those Function objects are passed to the
+    agent — everything else in the connected MCPs is hidden from the model.
+    Falls back to all MCPs when spec.tools is absent or none of the names match.
+    """
+    if spec.tools:
+        all_funcs: dict = {}
+        for mcp in mcps:
+            all_funcs.update(mcp.functions)
+        scoped = [all_funcs[t] for t in spec.tools if t in all_funcs]
+        agent_tools = scoped if scoped else list(mcps)
+    else:
+        agent_tools = list(mcps)
+
     return Agent(
         name=spec.name,
         model=get_model(spec.model, config.ollama_host),
-        tools=list(mcps),
+        tools=agent_tools,
         instructions=spec.instructions,
         role=spec.role,
+        description=spec.description,
+        markdown=True,
+        add_name_to_context=True,
     )
+
+
+_COMMON_AGENT_KWARGS = dict(markdown=True, add_name_to_context=True)
 
 
 def make_coder(*mcps: MCPTools) -> Agent:
@@ -32,13 +52,16 @@ def make_coder(*mcps: MCPTools) -> Agent:
         name="Coder",
         model=get_model(config.coder_model, config.ollama_host),
         tools=list(mcps),
+        description="Implementation specialist. Write clean, idiomatic code following existing patterns. Use apply_diff() for existing files, write_file() only for new ones.",
         instructions=[
             *_BASE_PREAMBLE,
-            "You are the implementation specialist. Write clean, idiomatic code.",
             "Always read relevant files via get_file_content() before modifying code.",
             "Follow patterns already established in the codebase.",
+            "File editing rules: use apply_diff() for ALL edits to existing files. Use write_file() ONLY for brand-new files.",
+            "If apply_diff() or write_file() returns 'review_pending', STOP immediately and report it.",
         ],
         role="Senior software engineer who implements features and fixes bugs.",
+        **_COMMON_AGENT_KWARGS,
     )
 
 
@@ -47,13 +70,15 @@ def make_reviewer(*mcps: MCPTools) -> Agent:
         name="Reviewer",
         model=get_model(config.reviewer_model, config.ollama_host),
         tools=list(mcps),
+        description="Code review specialist. Check correctness, security, and consistency. Flag real problems only — never style preferences.",
         instructions=[
             *_BASE_PREAMBLE,
-            "You are the code reviewer. Check for correctness, security, and consistency.",
+            "Check for correctness, security, and consistency.",
             "Be concise — flag real problems only, not style preferences.",
             "If the implementation looks correct, say so explicitly.",
         ],
         role="Senior engineer who reviews code for correctness and security.",
+        **_COMMON_AGENT_KWARGS,
     )
 
 
@@ -62,15 +87,17 @@ def make_planner(*mcps: MCPTools) -> Agent:
         name="Planner",
         model=get_model(config.planner_model, config.ollama_host),
         tools=list(mcps),
+        description="Task decomposition specialist. Break complex tasks into numbered steps naming the responsible agent, files to touch, and risks.",
         instructions=[
             *_BASE_PREAMBLE,
-            "You are the planning specialist. Break complex tasks into clear, ordered steps.",
+            "Break complex tasks into clear, ordered steps.",
             "Before planning, call memory_search() to check if similar tasks were solved before.",
             "Output a numbered step list. Each step must name the responsible agent (Researcher, Coder, Executor, Reviewer).",
             "Do NOT implement anything yourself — plan only.",
             "If the task is simple enough for a single agent, say so and recommend skipping the plan.",
         ],
         role="Senior engineer who decomposes tasks into actionable steps for the team.",
+        **_COMMON_AGENT_KWARGS,
     )
 
 
@@ -79,15 +106,17 @@ def make_researcher(*mcps: MCPTools) -> Agent:
         name="Researcher",
         model=get_model(config.researcher_model, config.ollama_host),
         tools=list(mcps),
+        description="Codebase investigation specialist. Read real files and ground every claim in file content — never describe from directory names alone.",
         instructions=[
             *_BASE_PREAMBLE,
-            "You are the research specialist. Understand the existing codebase before anyone writes code.",
+            "Understand the existing codebase before anyone writes code.",
             "Use find_files() and search_files() to locate relevant modules, patterns, and conventions.",
             "Use get_file_content() to read and summarise key files.",
             "Output a concise summary: what exists, what patterns are used, what the Coder needs to know.",
             "Do NOT implement anything — research and summarise only.",
         ],
         role="Senior engineer who investigates the codebase and surfaces relevant context.",
+        **_COMMON_AGENT_KWARGS,
     )
 
 
@@ -96,14 +125,16 @@ def make_executor(*mcps: MCPTools) -> Agent:
         name="Executor",
         model=get_model(config.executor_model, config.ollama_host),
         tools=list(mcps),
+        description="Execution and validation specialist. Run commands and report exact stdout/stderr — never paraphrase errors.",
         instructions=[
             *_BASE_PREAMBLE,
-            "You are the execution specialist. Run commands and validate results.",
+            "Run commands and validate results.",
             "Use run_shell() or run_command() to execute tests, linters, or build steps.",
             "Report stdout, stderr, and exit code verbatim — do not paraphrase errors.",
             "If a command fails, report the exact error and stop. Do not attempt fixes yourself.",
         ],
         role="Engineer who runs commands, executes tests, and reports results.",
+        **_COMMON_AGENT_KWARGS,
     )
 
 
@@ -112,8 +143,9 @@ def make_context_router(*mcps: MCPTools) -> Agent:
         name="ContextRouter",
         model=get_model(config.router_model, config.ollama_host),
         tools=list(mcps),
+        description="Lightweight query router. Pick the fastest retrieval path and return raw results — never interpret or answer yourself.",
         instructions=[
-            "You are a lightweight routing agent. Decide the fastest way to retrieve context for a query.",
+            "Decide the fastest way to retrieve context for a query.",
             "Always use tools that are actually available — check the connected MCP, do not assume tool names.",
             "Routing rules:",
             "  - Overview/structure questions → list_directory_tree() if available, else find_files('**/*')",
@@ -127,4 +159,5 @@ def make_context_router(*mcps: MCPTools) -> Agent:
             "Tool call limit: 1 for specific lookups, up to 3 for overview/structure queries.",
         ],
         role="Routing agent that retrieves the right context from the right backend.",
+        **_COMMON_AGENT_KWARGS,
     )

@@ -5,7 +5,18 @@ coordinator_model: qwen3:30b-a3b
 agents:
   - name: ContextRouter
     model: llama3.1:8b
+    description: Lightweight query router. Pick the fastest retrieval path and return raw results — never interpret or answer yourself.
     role: Routing agent that retrieves the right context from the right backend.
+    tools:
+      - list_directory_tree
+      - find_files
+      - search_files
+      - list_directory
+      - get_file_content
+      - memory_search
+      - lightrag_query
+      - web_search
+      - web_fetch
     instructions:
       - You are a lightweight routing agent. Decide the fastest way to retrieve context for a query.
       - Always use tools that are actually available — check the connected MCP, do not assume tool names.
@@ -14,12 +25,25 @@ agents:
       - "  - 'How does X work' questions  → search_files(X, '**/*') across the whole codebase"
       - "  - Specific file/symbol         → find_files() or search_files() with a targeted pattern"
       - "  - Semantic/memory questions    → lightrag_query() if available, else memory_search()"
+      - "  - User shares a URL or GitHub link → web_fetch(url) immediately if available"
+      - "  - External tool/library/repo   → web_search(name) then web_fetch on best result if available"
       - Return only the retrieved context. Do not answer the question yourself.
       - "Tool call limit: 1 for specific lookups, up to 3 for overview/structure queries."
 
   - name: Researcher
     model: mixtral:8x7b
+    description: Codebase investigation specialist. Read real files and ground every claim in file content — never describe from directory names alone.
     role: Senior engineer who investigates the codebase and surfaces relevant context.
+    tools:
+      - find_files
+      - search_files
+      - get_file_content
+      - list_directory
+      - list_directory_tree
+      - memory_search
+      - lightrag_query
+      - web_search
+      - web_fetch
     instructions:
       - If memory_search or lightrag_query is available via MCP, call it with relevant keywords before starting.
       - You are the research specialist. Understand the existing codebase before anyone plans.
@@ -33,13 +57,25 @@ agents:
       - "  Step 2 — for EACH subdirectory, find and read its relevant files."
       - "  Step 3 — only write the final answer after processing every subdirectory."
       - "SEARCH rule: For 'how does X work' questions, call search_files(X, '**/*') first, then read the 2-3 most relevant files."
+      - "WEB rule: If web_search and web_fetch are available, use them when:"
+      - "  - The user shares a URL in their prompt → call web_fetch(url) immediately before doing anything else."
+      - "  - The user mentions a GitHub repo by URL or name → web_fetch(github_url) to read the README."
+      - "  - The codebase references an unfamiliar library or service → web_search(name) then web_fetch on the best result."
+      - "  Always prefer local file tools for project questions. Use web tools only for external context."
       - Use get_file_content() to read key files found via find_files or search_files.
       - Output a grounded summary — every claim backed by an actual file path and content you read.
       - Do NOT implement anything — research and summarise only.
 
   - name: Planner
     model: deepseek-r1
+    description: Task decomposition specialist. Break complex tasks into numbered steps naming the responsible agent, files to touch, and risks.
     role: Senior engineer who decomposes tasks into actionable steps for the team.
+    tools:
+      - find_files
+      - search_files
+      - get_file_content
+      - memory_search
+      - lightrag_query
     instructions:
       - If lightrag_query or memory_search is available via MCP, call it to check if similar tasks were solved before.
       - You are the planning specialist. Break complex tasks into clear, ordered steps.
