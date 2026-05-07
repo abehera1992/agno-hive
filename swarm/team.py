@@ -174,6 +174,120 @@ def _extract_tokens(result) -> dict:
         return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
 
+async def run_task_stream(
+    task: str,
+    agent_specs: list | None = None,
+    coordinator_model: str | None = None,
+    mcp_url: str | None = None,
+    mcp_urls: list[str] | None = None,
+    project_id: str = "default",
+    session_id: str | None = None,
+):
+    """Same setup as run_task_async but yields text chunks as the coordinator generates them.
+
+    Yields:
+      str  — content chunks from the coordinator as they arrive
+      dict — final sentinel {"__done__": True, "content": str, "tokens": dict}
+    """
+    effective_mcp_url = mcp_url or config.mcp_url
+    effective_coordinator = coordinator_model or config.leader_model
+
+    from swarm.sessions import get_context as get_session_context
+
+    async def _load_session_context():
+        if session_id:
+            try:
+                return await get_session_context(session_id)
+            except Exception as exc:
+                print(f"[team] session context warning: {exc}")
+        return "", []
+
+    project_context, failure_context, (session_summary, session_messages) = (
+        await asyncio.gather(
+            bootstrap(effective_mcp_url, _MCP_TIMEOUT, config.patterns_glob),
+            load_failure_context(project_id),
+            _load_session_context(),
+        )
+    )
+
+    instructions = list(_COORDINATOR_INSTRUCTIONS)
+    if project_context:
+        instructions += ["", "── Project rules (loaded from MCP) ──────────────────", project_context]
+    if failure_context:
+        instructions += ["", failure_context]
+    if session_summary:
+        instructions += [
+            "", "── Session summary (older turns) ─────────────────────────────────",
+            session_summary, "──────────────────────────────────────────────────────────────────",
+        ]
+    if session_messages:
+        lines = ["── Recent messages ───────────────────────────────────────────────"]
+        for msg in session_messages:
+            lines.append(f"[{msg['role']}] {msg['content'][:800]}")
+        lines.append("──────────────────────────────────────────────────────────────────")
+        instructions += [""] + lines
+
+    all_mcp_urls = [u for u in [effective_mcp_url] + (mcp_urls or []) if u]
+
+    async with AsyncExitStack() as stack:
+        mcp_list = []
+        for url in all_mcp_urls:
+            mcp = await stack.enter_async_context(
+                MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT)
+            )
+            mcp_list.append(mcp)
+
+        if agent_specs:
+            members = [make_agent_from_spec(spec, *mcp_list) for spec in agent_specs]
+        else:
+            members = [make_coder(*mcp_list), make_reviewer(*mcp_list)]
+
+        team = Team(
+            name="AgnoHive",
+            mode="coordinate",
+            model=get_model(effective_coordinator, config.ollama_host),
+            members=members,
+            tools=mcp_list,
+            instructions=instructions,
+            show_members_responses=True,
+            share_member_interactions=True,
+            add_member_tools_to_context=True,
+            markdown=True,
+            max_iterations=config.max_iterations,
+        )
+
+        full_content: list[str] = []
+        last_event = None
+
+        with _tracer.start_as_current_span("agno.task.stream", attributes={
+            "project_id": project_id,
+            "coordinator_model": effective_coordinator,
+            "agent_count": len(members),
+            "task": task[:120],
+        }):
+            from observability.metrics import task_duration, task_counter
+            t0 = time.perf_counter()
+            try:
+                async for event in team.arun(task, stream=True):
+                    last_event = event
+                    event_type = getattr(event, "event", "")
+                    chunk = getattr(event, "content", None)
+                    if isinstance(chunk, str) and chunk and event_type == "TeamRunContent":
+                        full_content.append(chunk)
+                        yield chunk
+                combined = "".join(full_content) or "(no response)"
+                tokens = _extract_tokens(last_event)
+                task_counter.add(1, {"project_id": project_id, "outcome": "success"})
+                await record_success(task, combined, project_id)
+                yield {"__done__": True, "content": combined, "tokens": tokens}
+            except Exception as exc:
+                task_counter.add(1, {"project_id": project_id, "outcome": "failure"})
+                await record_failure(task, str(exc), project_id)
+                raise
+            finally:
+                task_duration.record(time.perf_counter() - t0, {"project_id": project_id})
+
+
 async def run_task_async(
     task: str,
     agent_specs: list | None = None,

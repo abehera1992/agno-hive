@@ -7,8 +7,9 @@ import yaml
 from fastapi import FastAPI, HTTPException
 
 from api.models import AgentSpec, RunRequest, RunResponse, PlanResponse, ScanRequest, ScanResponse
+from fastapi.responses import StreamingResponse
 from swarm.ollama import ensure_models
-from swarm.team import run_task_async
+from swarm.team import run_task_async, run_task_stream
 from config.config import config
 from observability.setup import setup_telemetry
 from swarm.sessions import (
@@ -191,6 +192,95 @@ async def plan(request: RunRequest):
         plan=plan_text,
         duration_seconds=round(time.perf_counter() - start, 2),
     )
+
+
+@app.post("/stream")
+async def stream_endpoint(request: RunRequest):
+    """Stream coordinator output as Server-Sent Events.
+
+    Events:
+      data: {"type": "chunk",  "content": "<text>"}
+      data: {"type": "done",   "session": {...}, "input_tokens": N, ...}
+      data: {"type": "error",  "content": "<message>"}
+
+    Keeps the HTTP connection alive the whole time — no 300s timeout risk.
+    """
+    import json as _json
+
+    if request.agents:
+        agent_specs = request.agents
+        coordinator_model = config.leader_model
+    elif request.team:
+        agent_specs, coordinator_model = _load_team(request.team)
+    else:
+        agent_specs, coordinator_model = _load_team("engineering")
+
+    mcp_url = request.mcp_url or config.mcp_url
+
+    session_id = request.session_id
+    if not session_id:
+        session_id = await create_session(
+            project_id=request.project_id,
+            title=request.task,
+            persist=request.persist,
+        )
+    elif request.persist:
+        await _persist_session(session_id)
+
+    _, prior_messages = await get_context(session_id)
+    context_size = len(prior_messages)
+    session_before = await get_session(session_id)
+    has_summary = bool(session_before and session_before.get("summary"))
+
+    async def generate():
+        try:
+            async for chunk in run_task_stream(
+                task=request.task,
+                agent_specs=agent_specs,
+                coordinator_model=coordinator_model,
+                mcp_url=mcp_url,
+                mcp_urls=request.mcp_urls,
+                project_id=request.project_id,
+                session_id=session_id,
+            ):
+                if isinstance(chunk, str):
+                    yield f"data: {_json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
+
+                elif isinstance(chunk, dict) and chunk.get("__done__"):
+                    await append_message(session_id, "user", request.task)
+                    await append_message(session_id, "assistant", chunk["content"])
+
+                    session_after = await get_session(session_id)
+                    msg_count = session_after["message_count"] if session_after else 0
+                    if msg_count >= config.compact_threshold:
+                        asyncio.create_task(compact_session(session_id))
+
+                    tokens = chunk.get("tokens", {})
+                    session_meta = {
+                        "session_id": session_id,
+                        "turn": msg_count // 2,
+                        "context_size": context_size,
+                        "compacted": has_summary,
+                        "persist": session_after["persist"] if session_after else request.persist,
+                        "expires_at": (
+                            session_after["expires_at"].isoformat()
+                            if session_after and session_after.get("expires_at")
+                            else None
+                        ),
+                    }
+                    done_event = {
+                        "type": "done",
+                        "session": session_meta,
+                        "input_tokens": tokens.get("input_tokens", 0),
+                        "output_tokens": tokens.get("output_tokens", 0),
+                        "total_tokens": tokens.get("total_tokens", 0),
+                    }
+                    yield f"data: {_json.dumps(done_event)}\n\n"
+
+        except Exception as exc:
+            yield f"data: {_json.dumps({'type': 'error', 'content': str(exc)})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 @app.post("/scan", response_model=ScanResponse)

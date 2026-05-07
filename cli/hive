@@ -629,6 +629,71 @@ def _print_result(data: dict, show_resume: bool = False) -> None:
         print(dim(f"  resume: hive --session {session_id}"))
     print()
 
+# ── Streaming HTTP ────────────────────────────────────────────────────────────
+
+def _stream_api(endpoint: str, payload: dict, timeout: int = 600):
+    """POST to endpoint and yield parsed SSE data dicts as they arrive.
+
+    Reads the chunked HTTP response line-by-line — no third-party dependencies,
+    pure urllib. Each 'data: {...}' line is parsed and yielded as a dict.
+    """
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"{AGNO_HOST}{endpoint}",
+        data=data,
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", errors="replace")
+            if line.startswith("data: "):
+                payload_str = line[6:].strip()
+                if payload_str:
+                    try:
+                        yield json.loads(payload_str)
+                    except json.JSONDecodeError:
+                        pass
+
+
+def _print_footer(data: dict, show_resume: bool = False) -> None:
+    """Print the session/token footer after a streamed run (content already printed)."""
+    session      = data.get("session", {})
+    session_id   = session.get("session_id", "")
+    turn         = session.get("turn", 0)
+    context_size = session.get("context_size", 0)
+    compacted    = session.get("compacted", False)
+    persist      = session.get("persist", False)
+    expires_at   = session.get("expires_at")
+    total_tokens  = data.get("total_tokens", 0)
+    input_tokens  = data.get("input_tokens", 0)
+    output_tokens = data.get("output_tokens", 0)
+
+    sid_short   = session_id[:8] if session_id else ""
+    context_str = f"summary + {context_size} msgs" if compacted else f"{context_size} msgs in context"
+    expiry_str  = _format_expiry(expires_at, persist)
+
+    def _fmt_tokens(n: int) -> str:
+        return f"{n/1000:.1f}k" if n >= 1000 else str(n)
+
+    parts = ["──"]
+    if sid_short:
+        parts.append(f"session {sid_short}")
+    if turn:
+        parts.append(f"turn {turn}")
+    if session_id:
+        parts.append(context_str)
+    if expiry_str:
+        parts.append(expiry_str)
+    if total_tokens:
+        parts.append(f"{_fmt_tokens(total_tokens)} tokens ({_fmt_tokens(input_tokens)} in / {_fmt_tokens(output_tokens)} out)")
+
+    print(dim("  ·  ".join(parts)))
+    if show_resume and session_id:
+        print(dim(f"  resume: hive --session {session_id}"))
+    print()
+
+
 # ── Task runners ──────────────────────────────────────────────────────────────
 
 def run_task(
@@ -638,14 +703,11 @@ def run_task(
     persist: bool = False,
     show_resume: bool = False,
 ) -> str | None:
-    """Run a task; return the session_id from the response, or None on error."""
-    # Snapshot existing .hive_proposed files before the run
+    """Run a task via streaming SSE; return session_id or None on error."""
     before = set(Path.cwd().rglob(f"*{_PROPOSED_SUFFIX}"))
 
     has_esc = _start_escape_watcher()
     esc_hint = dim("  ESC to interrupt") if has_esc else dim("  Ctrl+C to interrupt")
-    if _COLOUR:
-        print(f"{dim('  thinking...')}  {esc_hint}", end="\r", flush=True)
 
     payload = {
         "task":       task,
@@ -659,39 +721,70 @@ def run_task(
     if AGNO_SYSTEM_MCP_URL:
         payload["mcp_urls"] = [AGNO_SYSTEM_MCP_URL]
 
-    data, err = _run_in_thread(call_api, "/run", payload)
-
     if _COLOUR:
-        print(" " * 50, end="\r")
+        print(f"{dim('  thinking...')}  {esc_hint}", end="\r", flush=True)
 
-    if err == "interrupted":
-        print(yellow("  interrupted"))
-        return None
-    if isinstance(err, urllib.error.HTTPError):
-        body = err.read().decode(errors="replace")
+    done_data: dict = {}
+    first_chunk = True
+    returned_session_id: str | None = None
+
+    try:
+        for event in _stream_api("/stream", payload, timeout=600):
+            if _cancel_event.is_set():
+                print(f"\n{yellow('  interrupted')}")
+                _cancel_event.clear()
+                return None
+
+            etype = event.get("type")
+
+            if etype == "chunk":
+                chunk = event.get("content", "")
+                if chunk:
+                    if first_chunk:
+                        if _COLOUR:
+                            print(" " * 54, end="\r")  # clear "thinking..." line
+                        print()
+                        first_chunk = False
+                    print(chunk, end="", flush=True)
+
+            elif etype == "done":
+                done_data = event
+                returned_session_id = event.get("session", {}).get("session_id")
+                break
+
+            elif etype == "error":
+                print(f"\n{red('  error: ' + event.get('content', 'unknown'))}")
+                return None
+
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
         try:
             msg = json.loads(body).get("detail", body)
         except Exception:
             msg = body
-        print(red(f"  server error {err.code}: {msg}"))
+        print(red(f"\n  server error {e.code}: {msg}"))
         return None
-    if isinstance(err, urllib.error.URLError):
-        print(red(f"  connection error: {err.reason}"))
+    except urllib.error.URLError as e:
+        print(red(f"\n  connection error: {e.reason}"))
         print(dim(f"  is AGNOHive running at {AGNO_HOST}?"))
         return None
-    if err:
-        print(red(f"  error: {err}"))
+    except Exception as e:
+        print(red(f"\n  error: {e}"))
         return None
 
-    _print_result(data, show_resume=show_resume)
+    _cancel_event.set()  # stop ESC watcher
 
-    # Open VS Code diff for any .hive_proposed files created during this run
+    if not first_chunk:
+        print("\n")   # newline after streamed content
+
+    if done_data:
+        _print_footer(done_data, show_resume=show_resume)
+
     after = set(Path.cwd().rglob(f"*{_PROPOSED_SUFFIX}"))
-    new_proposed = after - before
-    for p in new_proposed:
+    for p in after - before:
         _prompt_confirm_reject(p)
 
-    return data.get("session", {}).get("session_id")
+    return returned_session_id
 
 
 def review_task(
