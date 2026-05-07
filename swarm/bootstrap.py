@@ -27,7 +27,32 @@ async def bootstrap(
 
 
 async def _load_from_session(session: ClientSession, patterns_glob: str) -> str:
-    return await _fetch_patterns(session, patterns_glob)
+    parts = []
+
+    # Priority 1: hive.md — pre-built project context snapshot written by scan_project_context.
+    # Injected first so the coordinator sees grounded project knowledge before anything else.
+    hive = await _fetch_hive_md(session)
+    if hive:
+        parts.append(hive)
+
+    # Priority 2: pattern files (patterns/**/*.md)
+    patterns = await _fetch_patterns(session, patterns_glob)
+    if patterns:
+        parts.append(patterns)
+
+    return "\n\n---\n\n".join(parts) if parts else ""
+
+
+async def _fetch_hive_md(session: ClientSession) -> str:
+    """Try to read hive.md from the project root via the MCP server."""
+    try:
+        result = await session.call_tool("get_file_content", {"path": "hive.md"})
+        content = _extract_text(result)
+        if content and "not found" not in content.lower()[:40]:
+            return content
+    except Exception:
+        pass
+    return ""
 
 
 async def _fetch_patterns(session: ClientSession, patterns_glob: str) -> str:

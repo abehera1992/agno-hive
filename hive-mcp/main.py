@@ -33,6 +33,7 @@ from tools.files import write_file, apply_diff, run_command
 from tools.shell import run_shell, run_docker, get_env_info, check_port, list_processes
 from tools.git import git_status, git_log, git_diff, git_log_file, git_blame
 from tools.index import index_project
+from tools.scan import scan_project_context
 from tools.web import web_search, web_fetch
 
 _instructions = (
@@ -84,6 +85,9 @@ mcp.tool()(git_blame)
 
 # ── Semantic indexing (bootstrap) ─────────────────────────────────────────────
 mcp.tool()(index_project)
+
+# ── Project context snapshot ──────────────────────────────────────────────────
+mcp.tool()(scan_project_context)
 
 # ── Web search + fetch (gated by WEB_SEARCH_ENABLED) ─────────────────────────
 mcp.tool()(web_search)

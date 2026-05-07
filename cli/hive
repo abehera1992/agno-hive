@@ -981,6 +981,47 @@ def _cmd_delete_all_sessions(project_id: str) -> None:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+def _cmd_scan(project_id: str, force: bool = False) -> None:
+    """Call scan_project_context on hive-mcp to generate or update hive.md."""
+    if not AGNO_SYSTEM_MCP_URL:
+        print(red("  hive-mcp not reachable — start it first:"))
+        print(dim("  docker compose -f docker-compose.hive.yml up -d"))
+        return
+
+    mode = "full rescan" if force else "incremental"
+    print(f"\n  {bold('Scanning')} project {cyan(project_id)}  {dim(f'({mode})')}")
+    print(dim(f"  hive-mcp: {AGNO_SYSTEM_MCP_URL}"))
+    print()
+
+    payload = {
+        "task": (
+            f"Call the scan_project_context tool with force={'true' if force else 'false'}. "
+            f"Return the exact output from the tool, nothing else."
+        ),
+        "project_id": project_id,
+        "mcp_urls": [AGNO_SYSTEM_MCP_URL],
+    }
+
+    data, err = _run_in_thread(call_api, "/run", payload, 300)
+    if err:
+        print(red(f"  scan failed: {err}"))
+        return
+    result = data.get("result", "(no output)")
+    print(f"  {green(result) if result.startswith(('written', 'updated', 'up to date')) else result}")
+    print()
+
+
+def _ensure_hive_context(project_id: str) -> None:
+    """Auto-scan on first use: if hive.md is missing and hive-mcp is available, create it."""
+    hive_md = Path.cwd() / "hive.md"
+    if hive_md.exists():
+        return
+    if not AGNO_SYSTEM_MCP_URL:
+        return  # No hive-mcp available — proceed without context file
+    print(dim("  hive.md not found — scanning project for context (first-time setup, ~15s)..."))
+    _cmd_scan(project_id, force=True)
+
+
 def _cmd_bootstrap(
     project_id: str,
     lightrag_url: str,
@@ -1262,7 +1303,9 @@ def main() -> None:
     parser.add_argument("--glob",              metavar="PATTERN", default="**/*",
                         help="glob filter for bootstrap indexing (default: **/*)")
     parser.add_argument("--force",             action="store_true",
-                        help="re-index all files even if unchanged (use with --bootstrap)")
+                        help="re-index all files even if unchanged (use with --bootstrap or --scan)")
+    parser.add_argument("--scan",              action="store_true",
+                        help="generate or update hive.md project context file and exit")
 
     args = parser.parse_args()
 
@@ -1291,6 +1334,10 @@ def main() -> None:
 
     if args.mcp_status:
         _cmd_mcp_status()
+        return
+
+    if args.scan:
+        _cmd_scan(project_id, force=args.force)
         return
 
     if args.bootstrap:
@@ -1324,6 +1371,9 @@ def main() -> None:
         if proposed:
             _confirm_locally(proposed) if verb == "confirm" else _reject_locally(proposed)
         return
+
+    # Auto-create hive.md if missing (first-time setup for any project)
+    _ensure_hive_context(project_id)
 
     if args.task:
         task = " ".join(args.task)
