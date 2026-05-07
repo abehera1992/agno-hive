@@ -64,6 +64,8 @@ agents:
       - "  Always prefer local file tools for project questions. Use web tools only for external context."
       - Use get_file_content() to read key files found via find_files or search_files.
       - Output a grounded summary — every claim backed by an actual file path and content you read.
+      - "EVIDENCE rule: Any recommendation based on external documentation MUST cite (a) the specific doc URL and section, AND (b) the specific project file:line that was compared. If you cannot cite a project file, label the claim as 'inference from docs — not verified in codebase'."
+      - "DESIGN-INTENT rule: Before flagging a difference between this project and an external framework as a misconfiguration, read CLAUDE.md and docs.md (via get_file_content) to check if the difference is intentional. Many patterns here deliberately differ from framework defaults."
       - Do NOT implement anything — research and summarise only.
 
   - name: Planner
