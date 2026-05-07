@@ -14,6 +14,7 @@ hive-mcp  ◄──────────────────────�
   run_docker                              Executor       ──► PostgreSQL/AGE (graph)
   git_*                                   Reviewer       ──► SigNoz (OTel)
   index_project
+  scan_project_context → hive.md
   web_search / web_fetch                ──────────────────────────────────────
                                            Coordinator (qwen3:30b)
 project MCP  ◄───────────────────────────  orchestrates all agents
@@ -28,9 +29,9 @@ project MCP  ◄─────────────────────�
 - **Project MCP** — project-specific context: read code, search memory, app workflows
 - **hive-mcp** — host-level actions: file writes, shell, Docker, git, semantic bootstrap
 
-1. Bootstrap fetches project patterns from the project MCP before the team starts
+1. Bootstrap reads `hive.md` first (pre-built project snapshot), then `patterns/**/*.md` — coordinator gets grounded context before the first tool call
 2. Failure context from past runs is injected into the coordinator's instructions
-3. The coordinator routes operations to the right MCP — agents pick context tools from the project MCP and action tools from hive-mcp
+3. The coordinator routes operations to the right MCP — member agents see only their scoped tool subset
 4. After each run, successes go to LightRAG (vector memory) and failures go to PostgreSQL (failure log)
 5. OTel traces flow to SigNoz
 
@@ -261,6 +262,8 @@ MCP URLs are auto-detected via `tailscale ip -4` — no manual configuration nee
 | `hive --list-sessions` | Print recent sessions for this project and exit |
 | `hive --delete-all-sessions` | Delete all sessions for this project (prompts for confirmation) |
 | `hive --mcp-status` | Show connection status of both MCPs and exit |
+| `hive --scan` | Generate or update `hive.md` project context file (incremental) |
+| `hive --scan --force` | Rebuild `hive.md` from scratch (full rescan) |
 | `hive --bootstrap` | Index this project into LightRAG for semantic search |
 | `hive --bootstrap --lightrag-url <url>` | Specify LightRAG MCP URL (default: auto-derived from ZGX host) |
 | `hive --bootstrap --glob "**/*.py"` | Index only matching files |
@@ -468,7 +471,10 @@ Sessions expire after **30 days** unless marked persistent.
 
 ### Features
 
-- **Dual-MCP** — project MCP for context + hive-mcp for host actions; all tools available to all agents
+- **hive.md context snapshot** (`--scan`) — one-time project scan writes a structured context file; auto-injected into every session bootstrap; incremental updates cover committed + staged + unstaged + untracked changes so agents always see the current project state
+- **Per-agent tool scoping** — each YAML agent only sees the MCP tools it needs (Reviewer can't call `apply_diff`, Executor can't call `find_files`); reduces tool-misuse with local Ollama models
+- **Grounding rules** — coordinator and Researcher are instructed to read project files before fetching external docs, cite file:line + doc URL for any comparison claim, and check CLAUDE.md before flagging a difference as a misconfiguration
+- **Dual-MCP** — project MCP for context + hive-mcp for host actions; coordinator sees all tools, member agents are scoped
 - **Tailscale auto-detection** — no manual URL config; CLI discovers both MCPs via `tailscale ip -4`
 - **Persistent sessions** — full conversation history in PostgreSQL, resumable by ID
 - **Auto-resume** — REPL auto-resumes last session for the current project
@@ -568,6 +574,7 @@ Create a new team by adding a YAML file in `teams/` — no code changes needed.
 | `run_shell(cmd)` | Run any shell command |
 | `run_docker(cmd)` | Docker / docker compose commands |
 | `git_status/log/diff/blame` | Git operations |
+| `scan_project_context(force)` | Generate/update `hive.md` — full scan or incremental via 4-layer git diff |
 | `index_project(project_id, lightrag_url, ...)` | Semantic bootstrap into LightRAG |
 | `web_search(query, max_results)` | DuckDuckGo search — titles, URLs, snippets (requires `WEB_SEARCH_ENABLED=true`) |
 | `web_fetch(url, max_chars)` | Fetch a URL and return clean text; GitHub repos return README + metadata via API (requires `WEB_SEARCH_ENABLED=true`) |
@@ -622,6 +629,9 @@ git -C ~/agno-hive pull   # on ZGX
 | Tailscale auto-detection for MCP URLs | Done |
 | `hive bootstrap` / `index_project` (LightRAG via hive-mcp) | Done |
 | Web search + fetch (`web_search`, `web_fetch` via hive-mcp, `WEB_SEARCH_ENABLED`) | Done |
+| Agno framework alignment (per-agent tool scoping, Team flags, agent descriptions) | Done |
+| hive.md project context snapshot (`--scan`, auto-inject via bootstrap) | Done |
+| External-docs grounding rules (EVIDENCE + DESIGN-INTENT, read code before docs) | Done |
 | Cost-aware model routing | Planned |
 
 ---

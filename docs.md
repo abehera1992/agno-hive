@@ -47,7 +47,8 @@ agno-hive/
 │       ├── files.py         # write_file, apply_diff, run_command (WRITE_REVIEW-aware)
 │       ├── shell.py         # run_shell, run_docker, get_env_info, check_port, list_processes
 │       ├── git.py           # git_status, git_log, git_diff, git_log_file, git_blame
-│       └── index.py         # index_project — walks project, chunks, inserts into LightRAG via MCP
+│       ├── index.py         # index_project — walks project, chunks, inserts into LightRAG via MCP
+│       └── scan.py          # scan_project_context — full/incremental project scan → hive.md
 ├── cli/
 │   └── hive                 # Zero-dependency CLI client (pure Python stdlib)
 ├── tests/
@@ -337,11 +338,13 @@ Tool call limit: 1 for specific lookups, up to 3 for overview/structure queries.
 
 ### Researcher (`teams/engineering.yaml`)
 
-Two hard rules added:
+Rules in effect:
 
 - **SCAN-FIRST** — must call `find_files('**/*')` before answering any structure or overview question; must read at least one file (README, main.py, config.py, `__init__.py`) per directory to ground the answer — never describe from the directory name alone
 - **COVERAGE** — stopping at the first interesting directory is a failure; every top-level directory must appear in the response; subdirectory listings are included where they exist
 - **SEARCH rule** — for "how does X work" questions, `search_files(X, '**/*')` runs first; files are read only after search identifies which ones are relevant
+- **EVIDENCE rule** — any recommendation from external documentation must cite the specific doc URL + section AND the specific project file:line that was compared; unverified claims are labelled "inference from docs — not verified in codebase"
+- **DESIGN-INTENT rule** — before flagging a difference between this project and a framework as a misconfiguration, read CLAUDE.md / docs.md to check if the difference is intentional design
 
 ### Result caps
 
@@ -358,19 +361,99 @@ Two hard rules added:
 
 ```
 swarm/team.py              # _COORDINATOR_INSTRUCTIONS — ACTION APPROVAL block, scan-first rules,
+                           # external-docs grounding rules (read code before docs, cite both sides),
                            # share_member_interactions, add_member_tools_to_context, markdown=True
 swarm/agents.py            # make_agent_from_spec — tool scoping via mcp.functions; description,
                            # markdown=True, add_name_to_context=True on all agents
+swarm/bootstrap.py         # reads hive.md first (priority context) before patterns glob
 api/models.py              # AgentSpec — description and tools fields added
-teams/engineering.yaml     # all agents: description + scoped tools list; Coder: apply_diff/review_pending rules
-teams/planning.yaml        # all agents: description + scoped tools list; Researcher: WEB rule added
+teams/engineering.yaml     # all agents: description + scoped tools list; Coder: apply_diff/review_pending rules;
+                           # Researcher: EVIDENCE + DESIGN-INTENT rules against external-doc hallucination
+teams/planning.yaml        # all agents: description + scoped tools list; Researcher: WEB rule +
+                           # EVIDENCE + DESIGN-INTENT rules
+hive-mcp/tools/scan.py     # new — scan_project_context(force) tool; full/incremental scan → hive.md
+hive-mcp/main.py           # register scan_project_context tool
+cli/hive                   # --scan / --scan --force flags; _ensure_hive_context auto-scan on startup
 ```
 
 ## How Bootstrap Works
 
-`swarm/bootstrap.py` opens a raw `mcp.ClientSession` via **Streamable HTTP** (`streamablehttp_client`), calls `find_files(patterns_glob)` to discover pattern files, then reads each with `get_file_content()`. Falls back to `get_project_context()` if pattern files aren't found. Returns a combined string injected into the coordinator's instructions.
+`swarm/bootstrap.py` opens a raw `mcp.ClientSession` via **Streamable HTTP** (`streamablehttp_client`) and builds the coordinator's context in priority order:
+
+1. **`hive.md`** — if present in the project root, read first via `get_file_content("hive.md")`. This pre-built snapshot (directory tree, root docs, per-directory summaries) is injected at the top of coordinator context, giving grounded project knowledge with zero extra MCP calls during the session.
+2. **Pattern files** — `find_files(patterns_glob)` discovers `patterns/**/*.md` files; each is read with `get_file_content()` and appended.
+3. **Fallback** — if neither `hive.md` nor pattern files are found, `get_project_context()` is called.
+
+The combined string is injected into the coordinator's instructions before every task run.
 
 > **Transport note:** AGNOHive uses Streamable HTTP (the current MCP standard) for all MCP connections. Your MCP server must expose a `/mcp` endpoint. The deprecated `/sse` endpoint is not used.
+
+## hive.md Project Context Snapshot
+
+`hive.md` is a structured markdown file written to the project root by `hive-mcp/tools/scan.py`. It gives the coordinator a grounded project overview at the start of every session — reducing repeated file reads and hallucination on structure and design questions.
+
+### Generating hive.md
+
+```bash
+hive --scan            # incremental — re-reads only files changed since last scan
+hive --scan --force    # full rescan from scratch
+```
+
+On first `hive` launch (REPL or one-shot), if `hive.md` is missing and hive-mcp is reachable, the CLI auto-triggers a full scan before starting.
+
+### Incremental update strategy
+
+`--scan` covers **four layers** of change to pick up all local modifications, not just committed ones:
+
+| Layer | Git command |
+|---|---|
+| Committed since last scan | `git diff --name-only <stored-hash>..HEAD` |
+| Staged (index) | `git diff --cached --name-only` |
+| Unstaged (working tree) | `git diff --name-only` |
+| Untracked new files | `git ls-files --others --exclude-standard` |
+
+The stored commit hash lives in the `hive.md` header comment (`<!-- hive-scan: commit=<hash> timestamp=<iso> -->`). If nothing changed across all four layers, `--scan` returns instantly ("up to date"). Otherwise the full file is rebuilt (fast — all file reads are capped).
+
+Falls back to a full scan if git is unavailable or `hive.md` doesn't exist yet.
+
+### hive.md structure
+
+```markdown
+<!-- hive-scan: commit=a2b95be timestamp=2026-05-07T16:00:00Z -->
+# Hive Project Context
+**Project:** agno-hive
+**Last scanned:** 2026-05-07 16:00 UTC (commit `a2b95be`)
+**Uncommitted changes:** swarm/team.py, teams/engineering.yaml
+
+## Project Structure
+<directory tree, depth 3>
+
+## CLAUDE.md
+<first 3000 chars>
+
+## README.md
+<first 1500 chars>
+
+## .env.example
+<full content>
+
+## Top-Level Directory Summaries
+### `swarm/`
+```python
+<key file content, 800 char cap>
+```
+...
+```
+
+### `hive-mcp/tools/scan.py` — `scan_project_context(force)`
+
+| Behaviour | Trigger |
+|---|---|
+| Full scan | `force=True` or `hive.md` missing |
+| Incremental | default — checks all four git change layers |
+| Up to date | nothing changed — returns immediately |
+
+Works for any project, not just agno-hive. Falls back gracefully when git is unavailable.
 
 ## How OllamaToolFix Works
 
