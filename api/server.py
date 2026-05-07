@@ -6,7 +6,7 @@ from pathlib import Path
 import yaml
 from fastapi import FastAPI, HTTPException
 
-from api.models import AgentSpec, RunRequest, RunResponse, PlanResponse
+from api.models import AgentSpec, RunRequest, RunResponse, PlanResponse, ScanRequest, ScanResponse
 from swarm.ollama import ensure_models
 from swarm.team import run_task_async
 from config.config import config
@@ -189,6 +189,50 @@ async def plan(request: RunRequest):
     )
     return PlanResponse(
         plan=plan_text,
+        duration_seconds=round(time.perf_counter() - start, 2),
+    )
+
+
+@app.post("/scan", response_model=ScanResponse)
+async def scan(request: ScanRequest):
+    """Call scan_project_context on hive-mcp directly — no coordinator model, no team overhead.
+
+    Uses a raw ClientSession (same pattern as bootstrap) so the scan can take as
+    long as it needs without hitting the MCPTools 60s cap. Timeout: 240s.
+    """
+    import asyncio
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    start = time.perf_counter()
+
+    def _extract(result) -> str:
+        if not result or not result.content:
+            return "(no output)"
+        return "\n".join(
+            item.text for item in result.content
+            if hasattr(item, "text") and item.text
+        ) or "(no output)"
+
+    async def _do_scan() -> str:
+        async with streamablehttp_client(request.mcp_url) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(
+                    "scan_project_context",
+                    {"force": request.force},
+                )
+                return _extract(result)
+
+    try:
+        output = await asyncio.wait_for(_do_scan(), timeout=240)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="scan_project_context timed out after 240s")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return ScanResponse(
+        result=output,
         duration_seconds=round(time.perf_counter() - start, 2),
     )
 

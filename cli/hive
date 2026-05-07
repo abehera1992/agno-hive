@@ -982,7 +982,11 @@ def _cmd_delete_all_sessions(project_id: str) -> None:
         sys.exit(1)
 
 def _cmd_scan(project_id: str, force: bool = False) -> None:
-    """Call scan_project_context on hive-mcp to generate or update hive.md."""
+    """Call scan_project_context on hive-mcp via the /scan endpoint.
+
+    Bypasses the coordinator LLM — uses a direct ClientSession to hive-mcp with a
+    240s timeout, which is enough even for Docker Windows volume scans.
+    """
     if not AGNO_SYSTEM_MCP_URL:
         print(red("  hive-mcp not reachable — start it first:"))
         print(dim("  docker compose -f docker-compose.hive.yml up -d"))
@@ -993,16 +997,8 @@ def _cmd_scan(project_id: str, force: bool = False) -> None:
     print(dim(f"  hive-mcp: {AGNO_SYSTEM_MCP_URL}"))
     print()
 
-    payload = {
-        "task": (
-            f"Call the scan_project_context tool with force={'true' if force else 'false'}. "
-            f"Return the exact output from the tool, nothing else."
-        ),
-        "project_id": project_id,
-        "mcp_urls": [AGNO_SYSTEM_MCP_URL],
-    }
-
-    data, err = _run_in_thread(call_api, "/run", payload, 300)
+    payload = {"mcp_url": AGNO_SYSTEM_MCP_URL, "force": force}
+    data, err = _run_in_thread(call_api, "/scan", payload, 270)
     if err:
         print(red(f"  scan failed: {err}"))
         return

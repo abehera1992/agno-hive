@@ -49,6 +49,16 @@ class PlanResponse(BaseModel):
     duration_seconds: float
 
 
+class ScanRequest(BaseModel):
+    mcp_url: str          # hive-mcp URL — the scan tool lives here
+    force: bool = False   # True = full rescan; False = incremental
+
+
+class ScanResponse(BaseModel):
+    result: str
+    duration_seconds: float
+
+
 # ── Session endpoint models ────────────────────────────────────────────────────
 
 class SessionListItem(BaseModel):
