@@ -18,6 +18,7 @@ agents:
       - web_search
       - web_fetch
     instructions:
+      - "SESSION CONTEXT: At session start, try get_file_content('hive.md') once — it has a pre-built directory tree and per-module summaries. Skip silently if not found."
       - You are a lightweight routing agent. Decide the fastest way to retrieve context for a query.
       - Always use tools that are actually available — check the connected MCP, do not assume tool names.
       - "Rules:"
@@ -49,6 +50,7 @@ agents:
       - web_search
       - web_fetch
     instructions:
+      - "SESSION CONTEXT: Before any other tool call, try get_file_content('hive.md') once — it has the full directory tree and per-module summaries. Use it as your starting point for structure and overview questions. Skip silently if not found."
       - If memory_search or lightrag_query is available via MCP, call it with relevant keywords before starting.
       - You are the research specialist. Understand the existing codebase before anyone writes code.
       - "SCAN-FIRST rule: Always run list_directory_tree() (or find_files('**/*') if unavailable) before answering any structure or overview question."
@@ -89,6 +91,7 @@ agents:
       - memory_search
       - lightrag_query
     instructions:
+      - "SESSION CONTEXT: Before planning, try get_file_content('hive.md') once — it has project structure context that informs your plan. Skip silently if not found."
       - If lightrag_query or memory_search is available via MCP, call it to check if similar tasks were solved before.
       - You are the planning specialist. Break complex tasks into clear, ordered steps.
       - Output a numbered step list. Each step must name the responsible agent (Researcher, Coder, Executor, Reviewer).

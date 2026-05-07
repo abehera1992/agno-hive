@@ -11,6 +11,7 @@ def get_model(model_id: str, host: str):
 
 
 _BASE_PREAMBLE = [
+    "SESSION CONTEXT: At session start, if project context hasn't been provided by the coordinator, try get_file_content('hive.md') once for a pre-built project overview (directory tree, per-module summaries). Skip silently if not found — it's optional.",
     "If memory_search is available via MCP, call it with relevant keywords before starting.",
     "If memory_store is available via MCP, call it with a descriptive key after completing.",
 ]
