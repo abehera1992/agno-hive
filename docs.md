@@ -191,17 +191,55 @@ coordinator_model: qwen3:30b-a3b   # optional, falls back to LEADER_MODEL
 agents:
   - name: Coder
     model: mistral-small3.1:24b
-    role: Senior software engineer who implements features and fixes bugs.
+    description: Implementation specialist. Write clean, idiomatic code.   # prepended to system message
+    role: Senior software engineer who implements features and fixes bugs.  # coordinator-visible label
+    tools:                          # scoped tool list — only these functions reach the model
+      - get_file_content
+      - find_files
+      - apply_diff
+      - write_file
+      - run_command
     instructions:
-      - If memory_search is available via MCP, call it with relevant keywords before starting.
-      - Write clean, idiomatic code.
+      - Always read relevant files via get_file_content() before modifying code.
+      - Use apply_diff() for existing files, write_file() only for new ones.
 
   - name: Reviewer
     model: gemma3:27b
+    description: Code review specialist. Flag real problems only.
     role: Senior engineer who reviews code for correctness and security.
+    tools:
+      - get_file_content
+      - find_files
+      - search_files
+      - git_diff
     instructions:
       - Be concise — flag real problems only.
 ```
+
+### Field reference
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | yes | Agent name — shown in team output and used for delegation |
+| `model` | yes | Ollama model ID |
+| `role` | yes | Short label the coordinator sees when picking which agent to delegate to |
+| `instructions` | yes | List of instruction strings appended to the agent's system message |
+| `description` | no | One-sentence description prepended to the agent's own system message |
+| `tools` | no | Allowlist of MCP tool names. Only matching `Function` objects from connected MCPs are passed to the model. If absent or no names match, all MCP tools are used as fallback. |
+
+### How tool scoping works
+
+When `tools:` is specified, `make_agent_from_spec` (`swarm/agents.py`) collects all `Function` objects from every connected `MCPTools` instance via `mcp.functions`, then filters to only the names in the list:
+
+```python
+all_funcs = {}
+for mcp in mcps:
+    all_funcs.update(mcp.functions)   # mcp.functions: OrderedDict[str, Function]
+scoped = [all_funcs[t] for t in spec.tools if t in all_funcs]
+agent_tools = scoped if scoped else list(mcps)   # fallback if none match
+```
+
+Individual `Function` objects are passed to `Agent(tools=...)` — Agno explicitly supports `List[Union[Toolkit, Callable, Function, Dict]]`. The MCP session stays open via the enclosing `AsyncExitStack`, so the Function callables remain valid for the duration of the run.
 
 ## How run_task_async Works
 
@@ -209,22 +247,31 @@ agents:
 run_task_async(task, agent_specs, coordinator_model, mcp_url, mcp_urls, project_id)
   1. [parallel] bootstrap()            — Streamable HTTP MCP session → project_context
   1. [parallel] load_failure_context() — PostgreSQL failure_log → failure_context
+  1. [parallel] get_session_context()  — PostgreSQL → (summary, recent_messages)
   2. AsyncExitStack opens ALL MCP connections simultaneously:
        - mcp_list[0] = MCPTools(mcp_url)            # primary: project context
        - mcp_list[1] = MCPTools(mcp_urls[0])        # secondary: hive-mcp host actions
        - ...
-  3. Build team members — each factory accepts *mcp_list: make_coder(*mcp_list)
+  3. Build team members from agent_specs:
+       - make_agent_from_spec(spec, *mcp_list) for each spec
+       - if spec.tools is set: filter mcp.functions to only those names (tool scoping)
+       - each agent also gets description, markdown=True, add_name_to_context=True
   4. Build Team (coordinator + members + all MCP tools + instructions + context)
-  5. Coordinator instructions include routing rules:
-       "PROJECT MCP: reading context, memory_search, knowledge graph"
-       "hive-mcp: apply_diff, write_file, run_shell, run_docker, git_*"
+       Team flags: share_member_interactions=True, add_member_tools_to_context=True,
+                   markdown=True, show_members_responses=True
+  5. Coordinator instructions include:
+       - ACTION APPROVAL block (go-ahead messages → always delegate to Coder, never conversational)
+       - scan-first routing rules
+       - multi-MCP tool selection ("PROJECT MCP vs hive-mcp")
+       - file edit rules (apply_diff for existing, write_file for new only)
+       - review_pending handling (STOP immediately, do not call any other tool)
   6. team.arun(task)
        ├── success → record_success() → LightRAG insert
        └── failure → record_failure() → PostgreSQL failure_log
   7. return result
 ```
 
-Bootstrap and failure context loading run in parallel (`asyncio.gather`) — no latency penalty.
+Bootstrap, failure context, and session context load in parallel (`asyncio.gather`) — no latency penalty.
 
 ## Scan-First Prompt Engineering
 
@@ -232,7 +279,30 @@ User prompts are almost always short and vague ("list the directories", "how doe
 
 ### Coordinator (`swarm/team.py` — `_COORDINATOR_INSTRUCTIONS`)
 
-A top-level block runs before all other routing logic:
+Two top-level blocks run before all routing logic:
+
+**1. Conversational turn detection — runs first**
+
+```
+ACTION APPROVAL — always a TASK, never conversational:
+  If the agent just described or proposed a change and the user says any of:
+  'go ahead', 'apply it', 'do it', 'update it', 'yes', 'ok', 'confirm', 'sure' → TASK.
+  → Delegate the write/implementation to the Coder immediately.
+  → Do NOT reply in plain prose. Delegate and act.
+
+CONVERSATIONAL — respond directly, NO tool calls:
+  - User shares an opinion, agrees, disagrees without requesting action
+  - Simple follow-up already answered by the prior response
+  - NOT an approval of a proposed change (see ACTION APPROVAL above)
+
+TASK — use tools as needed:
+  - New URL to fetch, new file to read, new codebase question
+  - Explicit action: 'add X', 'fix Y', 'list Z', 'search for W'
+```
+
+This prevents "go ahead" / "apply it" messages from being swallowed as no-op conversational replies, which was causing the `confirm/reject/skip` UI never to appear after a proposed file change.
+
+**2. Scan-first rule**
 
 ```
 Before answering any question about structure, features, or behaviour:
@@ -287,11 +357,13 @@ Two hard rules added:
 ### Files changed
 
 ```
-swarm/team.py              # _COORDINATOR_INSTRUCTIONS — scan-first block, list_directory_tree preferred for overview
-teams/engineering.yaml     # ContextRouter — 3-tier routing, list_directory_tree first for overview
-                           # Researcher — SCAN-FIRST, COVERAGE, SEARCH rules
-EkamApp/mcp-server/tools/context.py  # list_directory_tree() added; find_files cap 50→200; search_files cap 40→80
-EkamApp/mcp-server/main.py           # list_directory_tree registered as MCP tool; server instructions updated
+swarm/team.py              # _COORDINATOR_INSTRUCTIONS — ACTION APPROVAL block, scan-first rules,
+                           # share_member_interactions, add_member_tools_to_context, markdown=True
+swarm/agents.py            # make_agent_from_spec — tool scoping via mcp.functions; description,
+                           # markdown=True, add_name_to_context=True on all agents
+api/models.py              # AgentSpec — description and tools fields added
+teams/engineering.yaml     # all agents: description + scoped tools list; Coder: apply_diff/review_pending rules
+teams/planning.yaml        # all agents: description + scoped tools list; Researcher: WEB rule added
 ```
 
 ## How Bootstrap Works
@@ -312,7 +384,7 @@ All formats are parsed and converted to the standard format before passing to Ag
 
 ## Dual-MCP Architecture
 
-Every `run_task_async` call can receive multiple MCP URLs. All connections are opened simultaneously with `AsyncExitStack` before the team is built, then each agent factory receives all MCPs:
+Every `run_task_async` call can receive multiple MCP URLs. All connections are opened simultaneously with `AsyncExitStack` before the team is built. Each agent receives only its declared tools via scoping:
 
 ```python
 async with AsyncExitStack() as stack:
@@ -322,13 +394,26 @@ async with AsyncExitStack() as stack:
             MCPTools(url=url, transport="streamable-http", timeout_seconds=120)
         )
         mcp_list.append(mcp)
-    members = [make_coder(*mcp_list), make_reviewer(*mcp_list), ...]
-    team = Team(tools=mcp_list, members=members, ...)
+
+    # YAML-driven agents: tools scoped to spec.tools list
+    members = [make_agent_from_spec(spec, *mcp_list) for spec in agent_specs]
+
+    # Coordinator sees ALL tools from ALL MCPs (needs full visibility for routing)
+    team = Team(
+        tools=mcp_list,
+        members=members,
+        share_member_interactions=True,   # member responses visible to coordinator
+        add_member_tools_to_context=True, # coordinator knows each member's tool set
+        markdown=True,
+        ...
+    )
 ```
 
 Coordinator routing instructions:
 - **Project MCP** — `get_file_content`, `find_files`, `search_files`, `memory_search`, `lightrag_query`, and any app-specific workflow tools
 - **hive-mcp** — `apply_diff`, `write_file`, `run_shell`, `run_docker`, `git_*`, `index_project`
+
+The coordinator always receives all tools so it can route correctly. Member agents are scoped via their YAML `tools:` list so individual models see fewer options and are less likely to call the wrong tool.
 
 ## ZGX Infrastructure
 
@@ -707,9 +792,32 @@ pytest tests/ -v
 
 ## Adding a New Agent
 
-1. Add a `make_<agent>(*mcps: MCPTools)` factory in `swarm/agents.py` following the `make_coder` pattern
-2. Add the model env var to `config/config.py` and `.env.example`
-3. Reference the agent in a team YAML or wire it into `run_task_async` in `swarm/team.py`
+**Option A — YAML only (preferred for new teams):**
+
+Add the agent to a YAML file. No Python changes needed.
+
+```yaml
+- name: SecurityAuditor
+  model: gemma3:27b
+  description: Security review specialist. Identify vulnerabilities and misconfigurations.
+  role: Security engineer who audits code for vulnerabilities and misconfigurations.
+  tools:
+    - get_file_content
+    - find_files
+    - search_files
+    - git_diff
+  instructions:
+    - Focus on OWASP Top 10, injection, auth bypass, secrets in code.
+    - Flag real vulnerabilities only — not theoretical risks.
+```
+
+**Option B — hardcoded factory (for agents used as default fallback):**
+
+1. Add `make_<agent>(*mcps: MCPTools)` to `swarm/agents.py` following the `make_coder` pattern. Include `description`, `**_COMMON_AGENT_KWARGS`.
+2. Add the model env var to `config/config.py` and `.env.example`.
+3. Wire into the `else` branch in `run_task_async` (`swarm/team.py`) or reference in a YAML.
+
+**Tool scoping note:** The `tools:` list in YAML must use exact MCP tool names (e.g. `apply_diff`, not `edit_file`). Names that don't match any connected MCP are silently skipped. If no names match, the agent falls back to all tools.
 
 ## Adding a New Team
 
