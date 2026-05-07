@@ -804,7 +804,7 @@ def review_task(
     if AGNO_SYSTEM_MCP_URL:
         plan_payload["mcp_urls"] = [AGNO_SYSTEM_MCP_URL]
 
-    data, err = _run_in_thread(call_api, "/plan", plan_payload)
+    data, err = _run_in_thread(call_api, "/plan", plan_payload, 600)
 
     if err == "interrupted":
         print(yellow("  interrupted"))
@@ -1100,6 +1100,45 @@ def _cmd_scan(project_id: str, force: bool = False) -> None:
     print()
 
 
+def _cmd_plan(task: str, project_id: str) -> None:
+    """Run the planning team and show analysis — no execution, no approval prompt."""
+    has_esc = _start_escape_watcher()
+    esc_hint = dim("  ESC to interrupt") if has_esc else dim("  Ctrl+C to interrupt")
+    print(f"\n{bold('Planning...')} {dim('(ContextRouter → Researcher → Planner)')}  {esc_hint}\n")
+
+    payload = {"task": task, "project_id": project_id}
+    if AGNO_MCP_URL:
+        payload["mcp_url"] = AGNO_MCP_URL
+    if AGNO_SYSTEM_MCP_URL:
+        payload["mcp_urls"] = [AGNO_SYSTEM_MCP_URL]
+
+    data, err = _run_in_thread(call_api, "/plan", payload, 600)
+
+    _cancel_event.set()
+
+    if err == "interrupted":
+        print(yellow("  interrupted"))
+        return
+    if isinstance(err, urllib.error.HTTPError):
+        body = err.read().decode(errors="replace")
+        try:
+            msg = json.loads(body).get("detail", body)
+        except Exception:
+            msg = body
+        print(red(f"  plan failed {err.code}: {msg}"))
+        return
+    if err:
+        print(red(f"  plan error: {err}"))
+        return
+
+    plan     = data.get("plan", "")
+    duration = data.get("duration_seconds", 0)
+
+    print(f"{bold('─' * 60)}\n")
+    print(plan)
+    print(f"\n{dim(f'── {duration:.1f}s  ·  planning team  ·  use /review <task> to plan + execute')}\n")
+
+
 def _ensure_hive_context(project_id: str) -> None:
     """Auto-scan on first use: if hive.md is missing and hive-mcp is available, create it."""
     hive_md = Path.cwd() / "hive.md"
@@ -1243,7 +1282,7 @@ def repl(
     if review:
         print(dim("  review mode: plan shown before every task  ·  prefix with ! to skip"))
 
-    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff  /cleanup  /mcp  /exit  ·  ESC to interrupt\n"))
+    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff  /cleanup  /plan  /review  /mcp  /exit  ·  ESC to interrupt\n"))
 
     try:
         while True:
@@ -1283,6 +1322,18 @@ def repl(
                     _cmd_mcp_status()
                 elif cmd == "/delete-all":
                     _cmd_delete_all_sessions(project_id)
+                elif cmd == "/plan":
+                    if not args.strip():
+                        print(dim("  usage: /plan <question or topic to research>"))
+                    else:
+                        _cmd_plan(args.strip(), project_id)
+                elif cmd == "/review":
+                    if not args.strip():
+                        print(dim("  usage: /review <task to plan then execute>"))
+                    else:
+                        returned_id = review_task(args.strip(), project_id, session_id=session_id, persist=persist)
+                        if returned_id:
+                            session_id = returned_id
                 elif cmd in ("/confirm", "/reject"):
                     pending = _find_pending_diffs()
                     if args.strip():
@@ -1306,7 +1357,7 @@ def repl(
                     if proposed:
                         _confirm_locally(proposed) if cmd == "/confirm" else _reject_locally(proposed)
                 else:
-                    print(dim(f"  unknown command: {cmd}  ·  /new /sessions /history /persist /delete /diff /cleanup /mcp /confirm /reject /exit"))
+                    print(dim(f"  unknown command: {cmd}  ·  /new /sessions /history /persist /delete /diff /cleanup /plan /review /mcp /confirm /reject /exit"))
                 continue
 
             # ── Bare confirm / reject (no slash) ───────────────────────────

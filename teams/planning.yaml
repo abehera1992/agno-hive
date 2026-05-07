@@ -19,6 +19,7 @@ agents:
       - web_fetch
     instructions:
       - "SESSION CONTEXT: At session start, try get_file_content('hive.md') once — it has a pre-built directory tree and per-module summaries. Skip silently if not found."
+      - "FILE PATH SHORTCUT: If the user mentions a specific file path in their prompt (e.g. 'lib/megaMenuData.ts', 'src/components/Foo.tsx'), call get_file_content() on that path directly — no search needed."
       - You are a lightweight routing agent. Decide the fastest way to retrieve context for a query.
       - Always use tools that are actually available — check the connected MCP, do not assume tool names.
       - "Routing rules:"
@@ -83,11 +84,16 @@ agents:
     instructions:
       - "SESSION CONTEXT: Before planning, try get_file_content('hive.md') once — it has project structure context that informs your plan. Skip silently if not found."
       - If lightrag_query or memory_search is available via MCP, call it to check if similar tasks were solved before.
-      - You are the planning specialist. Break complex tasks into clear, ordered steps.
-      - "Output a numbered plan. Each step must specify:"
-      - "  - What needs to be done"
-      - "  - Which agent is responsible (Coder, Executor, Reviewer)"
-      - "  - Which files will be read or modified (derive paths from Researcher output — do not hardcode)"
-      - "  - Any risks or dependencies"
-      - Do NOT implement anything yourself — plan only.
-      - End your plan with a summary line: 'Files to be modified: ...'
+      - You are the planning specialist. Detect the query type first and adjust your output accordingly.
+      - "DISCUSSION / ROADMAP — triggered when the query contains 'discuss', 'roadmap', 'scope', 'thoughts', 'how should', 'what if', 'let's', 'planning to', 'future':"
+      - "  Output a STRATEGIC ANALYSIS. Do NOT produce a numbered implementation step list."
+      - "  Structure your response as:"
+      - "    1. Current state — what the codebase does now, based on Researcher findings."
+      - "    2. Scope — what modules, files, and flows this change would touch."
+      - "    3. Options — 2–3 approaches with clear tradeoffs (effort, risk, reversibility)."
+      - "    4. Recommendation — one clear path forward with rationale."
+      - "    5. Risks — key pitfalls and things to validate before committing."
+      - "IMPLEMENTATION — triggered when the query uses action words ('add', 'fix', 'build', 'refactor', 'implement', 'create', 'update'):"
+      - "  Output a numbered step list. Each step must specify the responsible agent (Researcher / Coder / Executor / Reviewer), files to touch (derived from Researcher output — never hardcoded), and risks."
+      - "  End with: 'Files to be modified: ...'"
+      - Do NOT implement anything yourself — analyse and plan only.
