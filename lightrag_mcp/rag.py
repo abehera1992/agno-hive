@@ -32,14 +32,14 @@ def _build(project_id: str) -> LightRAG:
     embed_dim = config.lightrag_embed_dim
 
     async def _llm(prompt, system_prompt=None, history_messages=None, **kwargs):
-        # LightRAG may pass model= internally; drop it so our explicit value wins
+        # ollama_model_complete reads model from global_config["llm_model_name"],
+        # not from a kwarg — passing model= here causes a duplicate-arg TypeError.
         kwargs.pop("model", None)
         return await ollama_model_complete(
             prompt,
             system_prompt=system_prompt,
             history_messages=history_messages or [],
             host=ollama_host,
-            model=llm_model,
             options={"num_ctx": 32768},
             **kwargs,
         )
@@ -49,6 +49,7 @@ def _build(project_id: str) -> LightRAG:
 
     return LightRAG(
         working_dir=working_dir,
+        llm_model_name=llm_model,   # sets global_config["llm_model_name"] used by ollama_model_complete
         llm_model_func=_llm,
         embedding_func=EmbeddingFunc(
             embedding_dim=embed_dim,
