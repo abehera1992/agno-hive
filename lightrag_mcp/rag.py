@@ -59,7 +59,7 @@ def _build(project_id: str) -> LightRAG:
         # Storage backends — all four must be set explicitly
         kv_storage="PGKVStorage",
         vector_storage="QdrantVectorDBStorage",
-        graph_storage="AGEStorage",
+        graph_storage="PGGraphStorage",
         doc_status_storage="PGDocStatusStorage",
         vector_db_storage_cls_kwargs={
             "collection_name": f"project_{project_id}",
