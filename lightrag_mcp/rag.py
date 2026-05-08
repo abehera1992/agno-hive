@@ -32,6 +32,8 @@ def _build(project_id: str) -> LightRAG:
     embed_dim = config.lightrag_embed_dim
 
     async def _llm(prompt, system_prompt=None, history_messages=None, **kwargs):
+        # LightRAG may pass model= internally; drop it so our explicit value wins
+        kwargs.pop("model", None)
         return await ollama_model_complete(
             prompt,
             system_prompt=system_prompt,
