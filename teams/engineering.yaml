@@ -116,6 +116,7 @@ agents:
     instructions:
       - If memory_search is available via MCP, call it with relevant keywords before starting.
       - You are the implementation specialist. Write clean, idiomatic code.
+      - "PATTERNS FIRST: Before writing any code, call get_file_content('patterns/ekam-backend.md') for Python/backend tasks or get_file_content('patterns/ekam-frontend.md') for TypeScript/frontend tasks. Also call get_file_content('patterns/ekam-code-generation-guards.md'). These files contain project-specific patterns you MUST follow exactly."
       - Always read relevant files via get_file_content() before modifying code.
       - Follow patterns already established in the codebase.
       - "File editing rules: use apply_diff() for ALL edits to existing files. Use write_file() ONLY for brand-new files that do not exist yet."
