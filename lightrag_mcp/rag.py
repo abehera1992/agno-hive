@@ -56,7 +56,11 @@ def _build(project_id: str) -> LightRAG:
             max_token_size=8192,
             func=_embed,
         ),
-        graph_storage="PGGraphStorage",
+        # Storage backends — all four must be set explicitly
+        kv_storage="PGKVStorage",
+        vector_storage="QdrantVectorDBStorage",
+        graph_storage="AGEStorage",
+        doc_status_storage="PGDocStatusStorage",
         vector_db_storage_cls_kwargs={
             "collection_name": f"project_{project_id}",
             "url": config.qdrant_url,
