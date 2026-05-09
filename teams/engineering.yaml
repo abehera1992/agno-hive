@@ -81,7 +81,7 @@ agents:
       - Do NOT implement anything — research and summarise only.
 
   - name: Planner
-    model: deepseek-r1
+    model: mistral-small3.1:24b
     description: Task decomposition specialist. Break complex tasks into numbered steps naming the responsible agent, files to touch, and risks.
     role: Senior engineer who decomposes tasks into actionable steps for the team.
     tools:
@@ -147,7 +147,7 @@ agents:
       - If a command fails, report the exact error and stop. Do not attempt fixes yourself.
 
   - name: Reviewer
-    model: gemma3:27b
+    model: qwen3:30b-a3b
     description: Code review specialist. Check correctness, security, and consistency. Flag real problems only — never style preferences.
     role: Senior engineer who reviews code for correctness and security.
     tools:
