@@ -12,7 +12,7 @@ from config.config import config
 
 _tracer = trace.get_tracer("agno-hive.team")
 
-_MCP_TIMEOUT = 60
+_MCP_TIMEOUT = 180  # lightrag_query needs ~90-120s for LLM synthesis
 
 _COORDINATOR_INSTRUCTIONS = [
     "── Conversational turn detection (read this first) ─────────────",
