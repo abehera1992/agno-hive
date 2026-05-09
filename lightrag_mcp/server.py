@@ -15,6 +15,16 @@ _mcp_port = int(os.getenv("LIGHTRAG_MCP_PORT", "9002"))
 mcp = FastMCP("lightrag", host=_mcp_host, port=_mcp_port)
 
 _GLOBAL = "global"  # cross-project shared namespace
+_initialized: set[str] = set()  # tracks which project RAGs have been initialized
+
+
+async def _get_ready_rag(project_id: str):
+    """Return a fully initialized LightRAG instance, calling initialize_storages() once per project."""
+    rag = get_rag(project_id)
+    if project_id not in _initialized:
+        await rag.initialize_storages()
+        _initialized.add(project_id)
+    return rag
 
 
 @mcp.tool()
@@ -26,7 +36,7 @@ async def lightrag_insert(text: str, project_id: str) -> str:
         project_id: Project namespace — keeps each project's data isolated.
     """
     try:
-        rag = get_rag(project_id)
+        rag = await _get_ready_rag(project_id)
         await rag.ainsert(text)
         return f"Indexed {len(text)} characters for project '{project_id}'."
     except Exception as exc:
@@ -45,7 +55,7 @@ async def lightrag_insert_global(text: str) -> str:
         text: The insight or pattern to store globally.
     """
     try:
-        rag = get_rag(_GLOBAL)
+        rag = await _get_ready_rag(_GLOBAL)
         await rag.ainsert(text)
         return f"Indexed {len(text)} characters into global memory."
     except Exception as exc:
@@ -72,8 +82,10 @@ async def lightrag_query(query: str, project_id: str, mode: str = "hybrid") -> s
     if mode not in ("local", "global", "hybrid", "naive", "mix"):
         return f"Invalid mode '{mode}'. Use: local, global, hybrid."
     try:
-        project_rag = get_rag(project_id)
-        global_rag  = get_rag(_GLOBAL)
+        project_rag, global_rag = await asyncio.gather(
+            _get_ready_rag(project_id),
+            _get_ready_rag(_GLOBAL),
+        )
         param = QueryParam(mode=mode)
 
         # Query both namespaces in parallel
