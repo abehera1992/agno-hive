@@ -48,16 +48,18 @@ project MCP  ◄─────────────────────�
 
 ### Ollama Models (pull before first run)
 ```bash
-ollama pull qwen3:30b-a3b          # Coordinator + Reviewer
+ollama pull qwen3:30b-a3b          # Coordinator
+ollama pull qwen3:8b               # ContextRouter
+ollama pull devstral:24b           # Researcher
 ollama pull mistral-small3.1:24b   # Planner + LightRAG entity extraction
-ollama pull mixtral:8x7b           # Researcher
-ollama pull llama3.1:8b            # Executor + ContextRouter
+ollama pull qwen2.5-coder:32b      # Coder + Reviewer
+ollama pull llama3.1:8b            # Executor
 ollama pull qwen3-embedding:0.6b   # LightRAG embeddings
 ```
 
-The Coder defaults to `kimi-k2.6:cloud` (cloud API — no pull required). To use a local model instead, set `CODER_MODEL=mistral-small3.1:24b` in `.env` and update `teams/engineering.yaml`.
+All agents run local Ollama models. Set any model via env var (e.g. `CODER_MODEL=qwen2.5-coder:32b`) or in `teams/engineering.yaml`.
 
-> **Note:** `deepseek-r1` and `gemma3:27b` are no longer used — both return HTTP 400 for tool calls in Ollama.
+> **Note:** `deepseek-r1`, `gemma3:27b`, and `mixtral:8x7b` are no longer used — all return HTTP 400 for tool calls in Ollama. `kimi-k2.6:cloud` replaced with local `qwen2.5-coder:32b`. `llama3.1:8b` (ContextRouter) replaced with `qwen3:8b`.
 
 ### Client Machine
 - Docker (for hive-mcp)
@@ -550,12 +552,12 @@ curl -X PATCH "http://localhost:9001/sessions/<id>/persist"
 | Agent | Model | Role |
 |---|---|---|
 | Coordinator | `qwen3:30b-a3b` | Routes tasks, synthesises results |
-| ContextRouter | `llama3.1:8b` | Picks the right memory/search backend |
-| Researcher | `mixtral:8x7b` | Reads and summarises the codebase |
+| ContextRouter | `qwen3:8b` | Picks the right memory/search backend |
+| Researcher | `devstral:24b` | Reads and summarises the codebase |
 | Planner | `mistral-small3.1:24b` | Breaks tasks into ordered steps |
-| Coder | `kimi-k2.6:cloud` | Implements features and fixes |
+| Coder | `qwen2.5-coder:32b` | Implements features and fixes |
 | Executor | `llama3.1:8b` | Runs commands and validates results |
-| Reviewer | `qwen3:30b-a3b` | Reviews code for correctness and security |
+| Reviewer | `qwen2.5-coder:32b` | Reviews code for correctness and security |
 
 All models are configurable via `.env` or `teams/*.yaml`. Models are swappable without code changes — the YAML spec drives which model each agent uses.
 
