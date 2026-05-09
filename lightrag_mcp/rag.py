@@ -55,6 +55,7 @@ def _build(project_id: str) -> LightRAG:
             embedding_dim=embed_dim,
             max_token_size=8192,
             func=_embed,
+            model_name=embed_model,   # required for Qdrant workspace namespacing
         ),
         # Storage backends — all four must be set explicitly
         kv_storage="PGKVStorage",
