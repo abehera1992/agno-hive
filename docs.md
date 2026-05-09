@@ -918,6 +918,60 @@ http://<zgx-tailscale-ip>:9002/mcp
 
 **Note on host/port:** The `mcp` package's `FastMCP.run()` does not accept `host`/`port` arguments — they are passed to the `FastMCP(name, host=..., port=...)` constructor. `LIGHTRAG_MCP_HOST` and `LIGHTRAG_MCP_PORT` are read at module import time and passed to the constructor.
 
+### Initialization requirement
+
+`lightrag_mcp/server.py` must call `initialize_storages()` on every LightRAG instance before calling `aquery()` or `ainsert()`. This is handled via `_get_ready_rag(project_id)` which calls `initialize_storages()` once per project and caches the result in `_initialized: set[str]`. Skipping this step causes `'NoneType' object has no attribute 'query'` errors on every tool call.
+
+### Legacy Qdrant collection workspace patching
+
+If Qdrant collections were created without `model_name` set on `EmbeddingFunc`, points are stored without a `workspace_id` payload field. LightRAG queries filter by `workspace_id="_"` for legacy collections, so all existing points must be patched:
+
+```bash
+for col in lightrag_vdb_entities lightrag_vdb_relationships lightrag_vdb_chunks; do
+  curl -s -X POST http://localhost:6333/collections/$col/points/payload \
+    -H 'Content-Type: application/json' \
+    -d '{"payload": {"workspace_id": "_"}, "filter": {}}'
+done
+```
+
+Run this once after initial index if queries return `[no results]` despite data being present in Qdrant.
+
+## Troubleshooting
+
+### Agent returns HTTP 400 for tool calls
+
+Some Ollama models do not support tool/function calling. Confirmed broken:
+- `deepseek-r1` — returns HTTP 400; replaced with `mistral-small3.1:24b` for Planner
+- `gemma3:27b` — returns HTTP 400; replaced with `qwen3:30b-a3b` for Reviewer
+
+If an agent silently fails (no tool calls made, no error surfaced to the user), check `agno.log` for `Error in Agent run: ... does not support tools (status code: 400)`. Fix by replacing the model in `teams/engineering.yaml`.
+
+### MCP tool calls timing out
+
+The AGNOHive server uses `_MCP_TIMEOUT` (in `swarm/team.py`) as the `timeout_seconds` for all `MCPTools` connections. Default is 180s. If `lightrag_query` or large `get_file_content` calls are timing out, ensure the server is running with the latest code (i.e., was restarted after any `team.py` change).
+
+The old value was 60s. A server started before the 180s change was pushed will still use 60s until restarted.
+
+### LightRAG queries returning `[no results]`
+
+Three possible causes in order:
+
+1. **`initialize_storages()` not called** — check `lightrag.log` for `'NoneType' object has no attribute 'query'`. Fix: ensure the server was restarted after the `_get_ready_rag()` fix in `lightrag_mcp/server.py`.
+
+2. **Missing `workspace_id` on Qdrant points** — if points were indexed without `model_name` set on `EmbeddingFunc`, they have no `workspace_id` field. Run the workspace patch (see LightRAG MCP Server section above).
+
+3. **Port still held by previous process** — a new server start fails silently if port 9002 is still occupied. Check with `lsof -i:9002` and kill the old process with `fuser -k 9002/tcp` before restarting.
+
+### `record_success` LightRAG warning
+
+`swarm/feedback.py`'s `record_success()` tries to insert the task result into LightRAG directly (not via the MCP server). This uses the same `get_rag()` factory but does not call `initialize_storages()`. The result is a non-blocking warning in the log:
+
+```
+[feedback] record_success warning: 'NoneType' object has no attribute 'query'
+```
+
+This is cosmetic — task results are not lost; the failure log and session history are unaffected. Fix pending: add `initialize_storages()` call to `feedback.py`.
+
 ## Running Tests
 
 ```bash

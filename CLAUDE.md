@@ -117,10 +117,10 @@ ZGX infra is managed via `docker/docker-compose.zgx.yml`. Ollama runs natively f
 | Coordinator | `qwen3:30b-a3b` | Routes tasks, synthesises results |
 | ContextRouter | `llama3.1:8b` | Picks right memory/search backend |
 | Researcher | `mixtral:8x7b` | Reads and summarises codebase |
-| Planner | `deepseek-r1` | Breaks tasks into ordered steps |
-| Coder | `mistral-small3.1:24b` | Implements features and fixes |
+| Planner | `mistral-small3.1:24b` | Breaks tasks into ordered steps |
+| Coder | `kimi-k2.6:cloud` | Implements features and fixes |
 | Executor | `llama3.1:8b` | Runs commands and validates results |
-| Reviewer | `gemma3:27b` | Reviews code for correctness and security |
+| Reviewer | `qwen3:30b-a3b` | Reviews code for correctness and security |
 
 ## Running AGNOHive
 
@@ -208,6 +208,9 @@ git -C ~/agno-hive pull
 | LightRAG MCP server (Streamable HTTP) | Done (Phase 3) |
 | Automated code indexer (ZGX-side + hive-mcp bootstrap) | Done (Phase 4) |
 | MCP-based indexer (`index_via_mcp.py`) — file hash tracker, progress bar, large-file pre-splitter | Done |
+| LightRAG MCP server fix — `initialize_storages()` via `_get_ready_rag()` before all tool calls | Done |
+| MCP tool call timeout raised 60s → 180s (`_MCP_TIMEOUT` in `swarm/team.py`) | Done |
+| Engineering team model fix — `deepseek-r1` → `mistral-small3.1:24b` (Planner), `gemma3:27b` → `qwen3:30b-a3b` (Reviewer) | Done |
 | Self-improving loop | Done (Phase 5) |
 | OTel instrumentation → SigNoz | Done (Phase 6) |
 | Global memory (cross-project namespace) | Done |

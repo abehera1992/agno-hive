@@ -48,14 +48,16 @@ project MCP  ◄─────────────────────�
 
 ### Ollama Models (pull before first run)
 ```bash
-ollama pull qwen3:30b-a3b          # Coordinator
-ollama pull mistral-small3.1:24b   # Coder + LightRAG entity extraction
-ollama pull gemma3:27b             # Reviewer
-ollama pull deepseek-r1            # Planner
+ollama pull qwen3:30b-a3b          # Coordinator + Reviewer
+ollama pull mistral-small3.1:24b   # Planner + LightRAG entity extraction
 ollama pull mixtral:8x7b           # Researcher
 ollama pull llama3.1:8b            # Executor + ContextRouter
 ollama pull qwen3-embedding:0.6b   # LightRAG embeddings
 ```
+
+The Coder defaults to `kimi-k2.6:cloud` (cloud API — no pull required). To use a local model instead, set `CODER_MODEL=mistral-small3.1:24b` in `.env` and update `teams/engineering.yaml`.
+
+> **Note:** `deepseek-r1` and `gemma3:27b` are no longer used — both return HTTP 400 for tool calls in Ollama.
 
 ### Client Machine
 - Docker (for hive-mcp)
@@ -202,7 +204,18 @@ python main.py "How does authentication work in this project?"
 python main.py
 ```
 
-### 6. Index a codebase into LightRAG (ZGX-side)
+### 6. Index a codebase into LightRAG
+
+**Option A — MCP-based indexer** (reads files via project MCP, no direct filesystem access needed):
+```bash
+python index_via_mcp.py                    # incremental — only changed files (SHA-256 tracked)
+python index_via_mcp.py --force            # full reindex from scratch
+python index_via_mcp.py --force --progress # full reindex with live progress bar (TTY)
+```
+
+State file: `~/.agno-hive/index-state/{project_id}.json`
+
+**Option B — ZGX-side direct indexer** (requires filesystem access to the repo):
 ```bash
 python main.py --index --path /path/to/repo --project-id myproject
 python main.py --index --path /path/to/repo --project-id myproject --force
@@ -390,26 +403,31 @@ Or without slash:
 > reject src/api/auth.py
 ```
 
-#### Bootstrap — index project into LightRAG
+#### Index project into LightRAG
 
+Two paths — choose based on whether ZGX has direct filesystem access to the project:
+
+**MCP-based (recommended when ZGX can't reach the project filesystem):**
 ```bash
-# First time — index everything (runs inside hive-mcp container)
+# Run on ZGX from ~/agno-hive
+python index_via_mcp.py                    # incremental — skips unchanged files (SHA-256)
+python index_via_mcp.py --force --progress # full reindex with live progress bar
+```
+
+The script reads all files via the project MCP server (Streamable HTTP), pre-splits files >8 KB at language-aware boundaries (class/def/export) before inserting to avoid LLM worker timeouts, and saves a hash state file for fast incremental runs.
+
+**hive-mcp bootstrap (runs inside container on client machine):**
+```bash
 hive --bootstrap --lightrag-url http://<zgx-tailscale-ip>:9002/mcp
-
-# Incremental — only changed files
-hive --bootstrap
-
-# Force full reindex
-hive --bootstrap --force
-
-# Index only Python files
-hive --bootstrap --glob "**/*.py"
+hive --bootstrap          # incremental
+hive --bootstrap --force  # full reindex
+hive --bootstrap --glob "**/*.py"  # Python only
 ```
 
-After bootstrap, agents can query the project knowledge graph:
+After indexing, agents query automatically when LightRAG MCP is connected:
 ```
-memory_search("seller registration flow")
-lightrag_query("how does the auth middleware work", "EkamApp", mode="hybrid")
+lightrag_query("how does the auth middleware work", "ekam", mode="local")
+lightrag_query("cross-service patterns", "ekam", mode="global")
 ```
 
 #### MCP status
@@ -534,10 +552,12 @@ curl -X PATCH "http://localhost:9001/sessions/<id>/persist"
 | Coordinator | `qwen3:30b-a3b` | Routes tasks, synthesises results |
 | ContextRouter | `llama3.1:8b` | Picks the right memory/search backend |
 | Researcher | `mixtral:8x7b` | Reads and summarises the codebase |
-| Planner | `deepseek-r1` | Breaks tasks into ordered steps |
-| Coder | `mistral-small3.1:24b` | Implements features and fixes |
+| Planner | `mistral-small3.1:24b` | Breaks tasks into ordered steps |
+| Coder | `kimi-k2.6:cloud` | Implements features and fixes |
 | Executor | `llama3.1:8b` | Runs commands and validates results |
-| Reviewer | `gemma3:27b` | Reviews code for correctness and security |
+| Reviewer | `qwen3:30b-a3b` | Reviews code for correctness and security |
+
+All models are configurable via `.env` or `teams/*.yaml`. Models are swappable without code changes — the YAML spec drives which model each agent uses.
 
 ---
 
@@ -632,6 +652,10 @@ git -C ~/agno-hive pull   # on ZGX
 | Agno framework alignment (per-agent tool scoping, Team flags, agent descriptions) | Done |
 | hive.md project context snapshot (`--scan`, auto-inject via bootstrap) | Done |
 | External-docs grounding rules (EVIDENCE + DESIGN-INTENT, read code before docs) | Done |
+| MCP-based indexer (`index_via_mcp.py`) — file hash tracker, progress bar, large-file pre-splitter | Done |
+| LightRAG MCP server fix — `initialize_storages()` called before query/insert | Done |
+| MCP tool timeout raised 60s → 180s for LightRAG query synthesis | Done |
+| Engineering team model fix — replaced tool-incompatible deepseek-r1 (Planner) + gemma3:27b (Reviewer) | Done |
 | Cost-aware model routing | Planned |
 
 ---
