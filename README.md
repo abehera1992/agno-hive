@@ -60,6 +60,8 @@ ollama pull qwen3-embedding:0.6b   # LightRAG embeddings
 All agents run local Ollama models. Set any model via env var (e.g. `CODER_MODEL=qwen2.5-coder:32b`) or in `teams/engineering.yaml`.
 
 > **Note:** `deepseek-r1`, `gemma3:27b`, and `mixtral:8x7b` are no longer used — all return HTTP 400 for tool calls in Ollama. `kimi-k2.6:cloud` replaced with local `qwen2.5-coder:32b`. `llama3.1:8b` (ContextRouter) replaced with `qwen3:8b`.
+>
+> **ARM/Ollama bug:** On NVIDIA GB10/Grace (ARM) hardware, Ollama ≤ 0.17.0 segfaults on all `qwen3:*` models. Update to 0.23.4+: `curl -fsSL https://ollama.com/install.sh | sudo sh`
 
 ### Client Machine
 - Docker (for hive-mcp)
@@ -501,7 +503,7 @@ Sessions expire after **30 days** unless marked persistent.
 - **Tailscale auto-detection** — no manual URL config; CLI discovers both MCPs via `tailscale ip -4`
 - **Persistent sessions** — full conversation history in PostgreSQL, resumable by ID
 - **Auto-resume** — REPL auto-resumes last session for the current project
-- **Compaction** — sessions longer than 20 messages are summarised automatically by `qwen3:8b`
+- **Compaction** — sessions longer than 20 messages are summarised automatically by `config.router_model` (default `qwen3:8b`)
 - **HITL review mode** (`--review`) — plan shown before every task, requires your approval
 - **Write review** — every file write staged as `.hive_proposed`; arrow-key selector in CLI; VS Code diff via IPC if available
 - **Semantic bootstrap** (`--bootstrap`) — index project into LightRAG for knowledge graph queries
