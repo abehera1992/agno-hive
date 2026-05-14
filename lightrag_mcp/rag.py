@@ -19,6 +19,7 @@ def _build(project_id: str) -> LightRAG:
     from config.config import config
 
     _set_pg_env(config.postgres_uri)
+    os.environ["POSTGRES_WORKSPACE"] = project_id  # isolates all PG tables per project
 
     working_dir = os.path.join(
         os.getenv("LIGHTRAG_WORKING_DIR", os.path.expanduser("~/.agno-hive/lightrag")),
