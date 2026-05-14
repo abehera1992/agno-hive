@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import PROJECT_ROOT
 
-_STATE_DIR  = Path(os.getenv("HIVE_INDEX_STATE_DIR", "/tmp/hive-index"))
+_STATE_DIR  = Path(os.getenv("HIVE_INDEX_STATE_DIR", str(PROJECT_ROOT / ".hive-index-state")))
 _CHUNK_SIZE = 4000   # chars for non-Python files
 _IGNORE_DIRS = {
     ".git", "node_modules", "__pycache__", ".next", "dist", "build",
