@@ -296,7 +296,7 @@ async def compact_session(session_id: str) -> None:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f"{config.ollama_host}/api/generate",
-                json={"model": "llama3.1:8b", "prompt": prompt, "stream": False},
+                json={"model": "qwen3:8b", "prompt": prompt, "stream": False},
                 timeout=120,
             )
             resp.raise_for_status()

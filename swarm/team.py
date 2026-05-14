@@ -25,6 +25,15 @@ _COORDINATOR_INSTRUCTIONS = [
     "    → Delegate the write/implementation to the Coder immediately.",
     "    → Do NOT reply in plain prose about what you will do. Delegate and act.",
     "",
+    "  REJECT / CANCEL — user cancels a proposed action:",
+    "    If the user says 'reject', 'cancel', 'no don't', 'don't apply', 'stop', 'abort',",
+    "    'undo', 'revert', 'discard', 'roll back' in response to a proposed change → STOP.",
+    "    Do NOT delegate to Coder. Do NOT call apply_diff or write_file.",
+    "    If a .hive_proposed file was staged, reply exactly:",
+    "      'Understood — no changes applied. To discard the staged file, type /reject or /cleanup in your hive CLI.'",
+    "    If nothing was staged yet, reply: 'Understood — no changes applied.'",
+    "    Do NOT attempt to delete .hive_proposed files via run_command, run_shell, or any tool.",
+    "",
     "  CONVERSATIONAL — respond directly, NO tool calls:",
     "    - User shares an opinion, agrees, disagrees, or adds their own perspective",
     "    - User asks a simple follow-up that is already answered by the prior response",
@@ -144,6 +153,10 @@ _COORDINATOR_INSTRUCTIONS = [
     "  - confirm_write and reject_write do NOT exist — you cannot approve writes.",
     "  - Tell the human: 'review_pending: <path>' and wait.",
     "  - The human selects confirm/reject in their CLI — your job ends at 'review_pending'.",
+    "  - If the user asks to 'delete', 'undo', or 'reject' the .hive_proposed file:",
+    "    Do NOT call run_command, run_shell, or any agent tool.",
+    "    Reply: 'Type /reject <path> or /cleanup in your hive CLI to discard the pending change.'",
+    "    Agents cannot delete .hive_proposed files — all confirm/reject operations are CLI-only.",
 ]
 
 

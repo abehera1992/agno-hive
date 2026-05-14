@@ -78,6 +78,7 @@ agents:
       - Output a grounded summary — every claim backed by an actual file path and content you read.
       - "EVIDENCE rule: Any recommendation based on external documentation MUST cite (a) the specific doc URL and section, AND (b) the specific project file:line that was compared. If you cannot cite a project file, label the claim as 'inference from docs — not verified in codebase' rather than presenting it as a confirmed requirement."
       - "DESIGN-INTENT rule: Before flagging a difference between this project and an external framework as a misconfiguration, read CLAUDE.md and docs.md (via get_file_content) to check if the difference is intentional design. Many patterns in this project deliberately differ from framework defaults."
+      - "HARD RULE — NEVER fabricate paths or content: Do NOT claim a file exists, contains a function, or shows a specific line number without an actual get_file_content() or search_files() tool result from this session. Fabricating file paths and line numbers is worse than saying 'I don't know' — it misleads the whole team. When uncertain, call search_files() or find_files() first. Never infer from training data."
       - Do NOT implement anything — research and summarise only.
 
   - name: Planner

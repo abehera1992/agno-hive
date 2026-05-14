@@ -54,6 +54,7 @@ def _build(project_id: str) -> LightRAG:
         embedding_func=EmbeddingFunc(
             embedding_dim=embed_dim,
             max_token_size=8192,
+            model_name=project_id,   # sets workspace_id in Qdrant payload → project isolation
             func=_embed,
         ),
         # Storage backends — all four must be set explicitly

@@ -57,6 +57,9 @@ AGNO_MCP_URL         = os.getenv("AGNO_MCP_URL",         "")   # primary: projec
 AGNO_MCP_PORT        = os.getenv("AGNO_MCP_PORT",        "9000")
 AGNO_SYSTEM_MCP_URL  = os.getenv("AGNO_SYSTEM_MCP_URL",  "")   # secondary: hive-mcp (host actions)
 AGNO_SYSTEM_MCP_PORT = os.getenv("AGNO_SYSTEM_MCP_PORT", "9003")
+# Root directory scanned for .hive_proposed files — set to your project root if hive
+# is invoked from a different working directory (e.g. export AGNO_PROJECT_ROOT=/path/to/ekam)
+AGNO_PROJECT_ROOT    = os.getenv("AGNO_PROJECT_ROOT",    "")
 
 _LAST_SESSION_FILE = Path.home() / ".agno_last_session"
 
@@ -704,7 +707,7 @@ def run_task(
     show_resume: bool = False,
 ) -> str | None:
     """Run a task via streaming SSE; return session_id or None on error."""
-    before = set(Path.cwd().rglob(f"*{_PROPOSED_SUFFIX}"))
+    before = set((Path(AGNO_PROJECT_ROOT) if AGNO_PROJECT_ROOT else Path.cwd()).rglob(f"*{_PROPOSED_SUFFIX}"))
 
     has_esc = _start_escape_watcher()
     esc_hint = dim("  ESC to interrupt") if has_esc else dim("  Ctrl+C to interrupt")
@@ -780,7 +783,7 @@ def run_task(
     if done_data:
         _print_footer(done_data, show_resume=show_resume)
 
-    after = set(Path.cwd().rglob(f"*{_PROPOSED_SUFFIX}"))
+    after = set((Path(AGNO_PROJECT_ROOT) if AGNO_PROJECT_ROOT else Path.cwd()).rglob(f"*{_PROPOSED_SUFFIX}"))
     for p in after - before:
         _prompt_confirm_reject(p)
 
@@ -847,8 +850,9 @@ def review_task(
 # ── REPL slash commands ───────────────────────────────────────────────────────
 
 def _find_pending_diffs() -> list[Path]:
-    """Return all .hive_proposed files under cwd."""
-    return list(Path.cwd().rglob(f"*{_PROPOSED_SUFFIX}"))
+    """Return all .hive_proposed files under AGNO_PROJECT_ROOT (or cwd if unset)."""
+    root = Path(AGNO_PROJECT_ROOT) if AGNO_PROJECT_ROOT else Path.cwd()
+    return list(root.rglob(f"*{_PROPOSED_SUFFIX}"))
 
 
 def _cmd_diff() -> None:
