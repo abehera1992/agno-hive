@@ -29,6 +29,7 @@ async def run(repo_path: Path, project_id: str, force: bool = False) -> None:
     print(f"[indexer] '{project_id}': {len(changed)} to index, {len(deleted)} deleted")
 
     rag = get_rag(project_id)
+    await rag.initialize_storages()
 
     for i, rel in enumerate(changed, 1):
         chunks = chunk_file(repo_path / rel, repo_path)
