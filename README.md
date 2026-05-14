@@ -244,12 +244,13 @@ On Windows, the `hive` file is a Python script — either add it to your PATH or
 ```bash
 # Add to ~/.bashrc / ~/.zshrc / PowerShell profile
 export AGNO_HOST=http://<zgx-tailscale-ip>:9001   # AGNOHive server
-export AGNO_PROJECT=myproject                       # optional — auto-detected from git remote
+export AGNO_PROJECT=myproject                       # optional — auto-detected from git remote; set explicitly to pin project_id (e.g. AGNO_PROJECT=ekam)
 export AGNO_TEAM=engineering                        # optional — default team
 export AGNO_MCP_URL=http://<ip>:9000/mcp           # optional — project MCP (auto-detected via Tailscale)
 export AGNO_MCP_PORT=9000                           # optional — port for Tailscale auto-detection
 export AGNO_SYSTEM_MCP_URL=http://<ip>:9003/mcp    # optional — hive-mcp (auto-detected via Tailscale)
 export AGNO_SYSTEM_MCP_PORT=9003                    # optional — hive-mcp port for auto-detection
+export AGNO_PROJECT_ROOT=/path/to/project           # optional — set when running hive from outside the project root; ensures .hive_proposed files are detected correctly
 ```
 
 `AGNO_PROJECT` is auto-detected from `git remote get-url origin` — running `hive` inside a git repo uses that repo's name as the project id.
@@ -305,6 +306,8 @@ hive --persist            # start REPL with a permanent session
 | `/persist` | Mark the current session as permanent |
 | `/delete <id>` | Delete a session by ID |
 | `/delete-all` | Delete all sessions for this project (prompts) |
+| `/plan <question>` | Research and plan without executing — uses planning team (600s timeout) |
+| `/review <task>` | HITL: generate plan, approve, then execute |
 | `/diff` | Open VS Code diff for all pending `.hive_proposed` files |
 | `/confirm [path]` | Apply pending proposed file (auto-detects if only one pending) |
 | `/reject [path]` | Discard pending proposed file |
@@ -498,7 +501,7 @@ Sessions expire after **30 days** unless marked persistent.
 - **Tailscale auto-detection** — no manual URL config; CLI discovers both MCPs via `tailscale ip -4`
 - **Persistent sessions** — full conversation history in PostgreSQL, resumable by ID
 - **Auto-resume** — REPL auto-resumes last session for the current project
-- **Compaction** — sessions longer than 20 messages are summarised automatically by `llama3.1:8b`
+- **Compaction** — sessions longer than 20 messages are summarised automatically by `qwen3:8b`
 - **HITL review mode** (`--review`) — plan shown before every task, requires your approval
 - **Write review** — every file write staged as `.hive_proposed`; arrow-key selector in CLI; VS Code diff via IPC if available
 - **Semantic bootstrap** (`--bootstrap`) — index project into LightRAG for knowledge graph queries
@@ -658,6 +661,12 @@ git -C ~/agno-hive pull   # on ZGX
 | LightRAG MCP server fix — `initialize_storages()` called before query/insert | Done |
 | MCP tool timeout raised 60s → 180s for LightRAG query synthesis | Done |
 | Engineering team model fix — replaced tool-incompatible deepseek-r1 (Planner) + gemma3:27b (Reviewer) | Done |
+| Agent reliability — Researcher HARD RULE (no fabricated paths/line numbers), Coordinator REJECT/CANCEL signal | Done |
+| LightRAG per-project isolation — `model_name=project_id` (Qdrant: `lightrag_vdb_*_{id}_1024d`) + `POSTGRES_WORKSPACE=project_id` | Done |
+| Bootstrap index state persistence — `PROJECT_ROOT/.hive-index-state` via existing Docker volume (no container restart loss) | Done |
+| Session compaction model upgraded: `llama3.1:8b` → `qwen3:8b` | Done |
+| `AGNO_PROJECT_ROOT` CLI env var — `.hive_proposed` detection works from any working directory | Done |
+| `/plan` and `/review` REPL slash commands | Done |
 | Cost-aware model routing | Planned |
 
 ---
