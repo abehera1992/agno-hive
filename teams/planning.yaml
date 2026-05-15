@@ -65,6 +65,7 @@ agents:
       - "  - The user mentions a GitHub repo by URL or name → web_fetch(github_url) to read the README."
       - "  - The codebase references an unfamiliar library or service → web_search(name) then web_fetch on the best result."
       - "  Always prefer local file tools for project questions. Use web tools only for external context."
+      - "VERIFY-EXTERNAL rule: For any external tool, Docker image, library, or third-party service you reference that is NOT found in the project files — call web_search() to verify the current name, image tag, version, and config before including it in your findings. Training data may be stale. Example: if recommending a Docker image name, web_search it first and use the result from the official docs or GitHub README. Label any unverified external claim as 'unverified — from training data'."
       - Use get_file_content() to read key files found via find_files or search_files.
       - Output a grounded summary — every claim backed by an actual file path and content you read.
       - "EVIDENCE rule: Any recommendation based on external documentation MUST cite (a) the specific doc URL and section, AND (b) the specific project file:line that was compared. If you cannot cite a project file, label the claim as 'inference from docs — not verified in codebase'."
