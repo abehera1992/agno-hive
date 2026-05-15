@@ -16,7 +16,7 @@ hive-mcp  ◄──────────────────────�
   index_project
   scan_project_context → hive.md
   web_search / web_fetch                ──────────────────────────────────────
-                                           Coordinator (qwen3:30b)
+                                           Coordinator (nemotron3:33b)
 project MCP  ◄───────────────────────────  orchestrates all agents
   get_file_content
   find_files
@@ -31,7 +31,7 @@ project MCP  ◄─────────────────────�
 
 **Graceful fallback**: if hive-mcp is unreachable, agents automatically fall back to project MCP for reads. If both are down, the run fails with a clear error. If only one MCP is provided, it handles everything.
 
-1. Bootstrap tries hive-mcp first for `hive.md` + `patterns/**/*.md`, falls back to project MCP — coordinator gets grounded context before the first tool call
+1. Coordinator's first action is `get_file_content('hive.md')` — grounded project context loaded on demand, not pre-injected (prevents models from answering without tool calls)
 2. Failure context from past runs is injected into the coordinator's instructions
 3. The coordinator routes operations to the right MCP — member agents see only their scoped tool subset
 4. After each run, successes go to LightRAG (vector memory) and failures go to PostgreSQL (failure log)
@@ -50,20 +50,19 @@ project MCP  ◄─────────────────────�
 
 ### Ollama Models (pull before first run)
 ```bash
-ollama pull qwen3:30b-a3b          # Coordinator
-ollama pull qwen3:8b               # ContextRouter
+ollama pull nemotron3:33b          # Coordinator (Llama-based, ARM-safe)
+ollama pull llama3.1:8b            # ContextRouter + Executor + session compaction
 ollama pull devstral:24b           # Researcher
 ollama pull mistral-small3.1:24b   # Planner + LightRAG entity extraction
 ollama pull qwen2.5-coder:32b      # Coder + Reviewer
-ollama pull llama3.1:8b            # Executor
 ollama pull qwen3-embedding:0.6b   # LightRAG embeddings
 ```
 
 All agents run local Ollama models. Set any model via env var (e.g. `CODER_MODEL=qwen2.5-coder:32b`) or in `teams/engineering.yaml`.
 
 > **Note:** `deepseek-r1`, `gemma3:27b`, and `mixtral:8x7b` are no longer used — all return HTTP 400 for tool calls in Ollama.
-> 
-> **qwen3 ARM64 incompatibility (active):** `qwen3:30b-a3b` and `qwen3:8b` crash on load on the GB10 ARM64 Ollama runner (tested Ollama 0.17.0–0.23.4). Hardware-level segfault — not a model download issue. Active workaround in `.env`: `LEADER_MODEL=mistral-small3.1:24b`, `ROUTER_MODEL=llama3.1:8b`. Session compaction uses `config.router_model` (patched in `sessions.py`). Revert when upstream fixes the ARM runner.
+>
+> **qwen3 ARM64 incompatibility (active):** `qwen3:30b-a3b` and `qwen3:8b` crash on load on the GB10 ARM64 Ollama runner (tested Ollama 0.17.0–0.23.4). Hardware-level segfault — not a model download issue. Current workaround: `nemotron3:33b` as coordinator (Llama architecture, ARM-safe), `llama3.1:8b` as ContextRouter. Revert to qwen3 models when Ollama upstream fixes the ARM runner.
 
 ### Client Machine
 - Docker (for hive-mcp)
@@ -558,8 +557,8 @@ curl -X PATCH "http://localhost:9001/sessions/<id>/persist"
 
 | Agent | Model | Role |
 |---|---|---|
-| Coordinator | `qwen3:30b-a3b` *(active override: `mistral-small3.1:24b`)* | Routes tasks, synthesises results |
-| ContextRouter | `qwen3:8b` *(active override: `llama3.1:8b`)* | Picks the right memory/search backend |
+| Coordinator | `nemotron3:33b` | Routes tasks, synthesises results |
+| ContextRouter | `llama3.1:8b` | Picks the right memory/search backend |
 | Researcher | `devstral:24b` | Reads and summarises the codebase |
 | Planner | `mistral-small3.1:24b` | Breaks tasks into ordered steps |
 | Coder | `qwen2.5-coder:32b` | Implements features and fixes |
@@ -687,6 +686,11 @@ git -C ~/agno-hive pull   # on ZGX
 | bootstrap multi-URL — tries hive-mcp first for `hive.md` + patterns, falls back to project MCP | Done |
 | ripgrep (`rg`) in `find_files` and `search_files` — both containers; Python fallback if rg absent | Done |
 | `agno_run` + `agno_list_teams` excluded from coordinator MCP tools via `exclude_tools` | Done |
+| `nemotron3:33b` promoted to coordinator — Llama-based 33B dense model, ARM-safe, replaces qwen3:30b-a3b + mistral-small3.1:24b workaround | Done |
+| Bootstrap removed from pre-load — coordinator calls `get_file_content('hive.md')` as first tool action; eliminates "I already know" no-tool-call loop | Done |
+| `exclude_tools` scoped to project-mcp only — hive-mcp never receives `exclude_tools` (fixes 0-tools bug in agno 2.5.17 when listed names absent) | Done |
+| fastmcp upgraded to `>=3.2.0` in hive-mcp — required for agno `MCPTools` compatibility (fastmcp 2.x was incompatible) | Done |
+| `agno_run` `team` param renamed to `swarm_team` — avoids `got multiple values for keyword argument 'team'` collision with agno framework internals | Done |
 | Cost-aware model routing | Planned |
 
 ---
