@@ -10,14 +10,15 @@ class Config:
     # Ollama inference server (native on ZGX, not in Docker)
     ollama_host: str = os.getenv("OLLAMA_HOST", "")
 
-    # Models — coordinator + core agents
-    leader_model: str = os.getenv("LEADER_MODEL", "qwen3:30b-a3b")
-    coder_model: str = os.getenv("CODER_MODEL", "mistral-small3.1:24b")
-    reviewer_model: str = os.getenv("REVIEWER_MODEL", "gemma3:27b")
-
-    # Models — expanded agent roster (Phase 2)
-    planner_model: str = os.getenv("PLANNER_MODEL", "deepseek-r1")
-    researcher_model: str = os.getenv("RESEARCHER_MODEL", "mixtral:8x7b")
+    # Models — coordinator + full agent roster
+    # NOTE: For API/hive calls the YAML team spec (teams/*.yaml) takes precedence.
+    # These defaults apply only to CLI runs (python3 main.py "task") and custom agent calls.
+    # qwen3:30b-a3b and qwen3:8b are excluded — they crash on GB10 ARM (Ollama 0.17–0.23).
+    leader_model: str = os.getenv("LEADER_MODEL", "mistral-small3.1:24b")
+    coder_model: str = os.getenv("CODER_MODEL", "qwen2.5-coder:32b")
+    reviewer_model: str = os.getenv("REVIEWER_MODEL", "qwen2.5-coder:32b")
+    planner_model: str = os.getenv("PLANNER_MODEL", "mistral-small3.1:24b")
+    researcher_model: str = os.getenv("RESEARCHER_MODEL", "devstral:24b")
     executor_model: str = os.getenv("EXECUTOR_MODEL", "llama3.1:8b")
     router_model: str = os.getenv("ROUTER_MODEL", "llama3.1:8b")
 
