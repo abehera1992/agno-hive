@@ -6,7 +6,6 @@ from opentelemetry import trace
 from agno.team import Team
 from agno.tools.mcp import MCPTools
 from .agents import make_coder, make_reviewer, make_agent_from_spec, get_model
-from .bootstrap import bootstrap
 from .feedback import record_success, record_failure, load_failure_context
 from config.config import config
 
@@ -97,6 +96,14 @@ _COORDINATOR_INSTRUCTIONS = [
     "     NEVER skip this step — guessing conventions produces broken code.",
     "  3. Delegate writing to Coder, review to Reviewer",
     "  4. memory_store() any non-obvious insight after completing (if available)",
+    "",
+    "── Project context (fetch on demand — NOT pre-loaded) ───────────",
+    "  Project context is NEVER injected into your prompt automatically.",
+    "  You MUST call a tool to see it — do this BEFORE answering any task:",
+    "    1. call get_file_content('hive.md')  → project snapshot (tree + summaries)",
+    "    2. If hive.md not found: call get_project_context() as fallback",
+    "  This is your first action for any non-trivial task. Skipping it means",
+    "  answering blindly from training data — never do this.",
     "",
     "── Multi-MCP tool selection ─────────────────────────────────────",
     "  hive-mcp is the PRIMARY server — use it for ALL file reads AND writes.",
@@ -221,17 +228,14 @@ async def run_task_stream(
                 print(f"[team] session context warning: {exc}")
         return "", []
 
-    project_context, failure_context, (session_summary, session_messages) = (
+    failure_context, (session_summary, session_messages) = (
         await asyncio.gather(
-            bootstrap(effective_mcp_url, _MCP_TIMEOUT, config.patterns_glob, extra_urls=mcp_urls),
             load_failure_context(project_id),
             _load_session_context(),
         )
     )
 
     instructions = list(_COORDINATOR_INSTRUCTIONS)
-    if project_context:
-        instructions += ["", "── Project rules (loaded from MCP) ──────────────────", project_context]
     if failure_context:
         instructions += ["", failure_context]
     if session_summary:
@@ -341,17 +345,14 @@ async def run_task_async(
                 print(f"[team] session context warning: {exc}")
         return "", []
 
-    project_context, failure_context, (session_summary, session_messages) = (
+    failure_context, (session_summary, session_messages) = (
         await asyncio.gather(
-            bootstrap(effective_mcp_url, _MCP_TIMEOUT, config.patterns_glob, extra_urls=mcp_urls),
             load_failure_context(project_id),
             _load_session_context(),
         )
     )
 
     instructions = list(_COORDINATOR_INSTRUCTIONS)
-    if project_context:
-        instructions += ["", "── Project rules (loaded from MCP) ──────────────────", project_context]
     if failure_context:
         instructions += ["", failure_context]
     if session_summary:
