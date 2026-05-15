@@ -99,12 +99,12 @@ _COORDINATOR_INSTRUCTIONS = [
     "  4. memory_store() any non-obvious insight after completing (if available)",
     "",
     "── Multi-MCP tool selection ─────────────────────────────────────",
-    "  When multiple MCP servers are connected, use the right one for each job:",
-    "  - PROJECT MCP: reading context, understanding the project, app-specific workflows.",
-    "    Typical tools: get_file_content, find_files, search_files, list_directory_tree,",
-    "    list_directory, memory_search, and any project-specific context or search tools.",
-    "  - hive-mcp: writing files, running commands, Docker operations, all host-level actions.",
-    "    Typical tools: apply_diff, write_file, run_shell, run_docker, git_status, git_log.",
+    "  hive-mcp is the PRIMARY server — use it for ALL file reads AND writes.",
+    "  Typical hive-mcp tools: find_files, search_files, get_file_content, list_directory_tree,",
+    "  list_directory, apply_diff, write_file, run_shell, run_docker, git_status, git_log,",
+    "  web_search, web_fetch.",
+    "  Project MCP is SUPPLEMENTARY — use only for tools not in hive-mcp:",
+    "  memory_search, get_context_section, and other project-specific tools.",
     "  If only one MCP is connected, use it for everything.",
     "  Discover available tools from the connected MCP — do not assume tool names exist.",
     "",
@@ -223,7 +223,7 @@ async def run_task_stream(
 
     project_context, failure_context, (session_summary, session_messages) = (
         await asyncio.gather(
-            bootstrap(effective_mcp_url, _MCP_TIMEOUT, config.patterns_glob),
+            bootstrap(effective_mcp_url, _MCP_TIMEOUT, config.patterns_glob, extra_urls=mcp_urls),
             load_failure_context(project_id),
             _load_session_context(),
         )
@@ -246,15 +246,22 @@ async def run_task_stream(
         lines.append("──────────────────────────────────────────────────────────────────")
         instructions += [""] + lines
 
-    all_mcp_urls = [u for u in [effective_mcp_url] + (mcp_urls or []) if u]
+    # hive-mcp first (primary — full read+write+shell+ripgrep), project-mcp second (supplementary)
+    all_mcp_urls = [u for u in (mcp_urls or []) + [effective_mcp_url] if u]
 
     async with AsyncExitStack() as stack:
         mcp_list = []
         for url in all_mcp_urls:
-            mcp = await stack.enter_async_context(
-                MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=["agno_run", "agno_list_teams"])
-            )
-            mcp_list.append(mcp)
+            try:
+                mcp = await stack.enter_async_context(
+                    MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=["agno_run", "agno_list_teams"])
+                )
+                mcp_list.append(mcp)
+                print(f"[team] MCP connected: {url}")
+            except Exception as e:
+                print(f"[team] MCP unavailable, skipping ({url}): {e}")
+        if not mcp_list:
+            raise RuntimeError("No MCP server available — check hive-mcp and project MCP are running")
 
         if agent_specs:
             members = [make_agent_from_spec(spec, *mcp_list) for spec in agent_specs]
@@ -332,7 +339,7 @@ async def run_task_async(
 
     project_context, failure_context, (session_summary, session_messages) = (
         await asyncio.gather(
-            bootstrap(effective_mcp_url, _MCP_TIMEOUT, config.patterns_glob),
+            bootstrap(effective_mcp_url, _MCP_TIMEOUT, config.patterns_glob, extra_urls=mcp_urls),
             load_failure_context(project_id),
             _load_session_context(),
         )
@@ -358,15 +365,22 @@ async def run_task_async(
         instructions += [""] + lines
 
     # Collect all MCP URLs: primary (project context) + secondary (host actions)
-    all_mcp_urls = [u for u in [effective_mcp_url] + (mcp_urls or []) if u]
+    # hive-mcp first (primary — full read+write+shell+ripgrep), project-mcp second (supplementary)
+    all_mcp_urls = [u for u in (mcp_urls or []) + [effective_mcp_url] if u]
 
     async with AsyncExitStack() as stack:
         mcp_list = []
         for url in all_mcp_urls:
-            mcp = await stack.enter_async_context(
-                MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=["agno_run", "agno_list_teams"])
-            )
-            mcp_list.append(mcp)
+            try:
+                mcp = await stack.enter_async_context(
+                    MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=["agno_run", "agno_list_teams"])
+                )
+                mcp_list.append(mcp)
+                print(f"[team] MCP connected: {url}")
+            except Exception as e:
+                print(f"[team] MCP unavailable, skipping ({url}): {e}")
+        if not mcp_list:
+            raise RuntimeError("No MCP server available — check hive-mcp and project MCP are running")
 
         if agent_specs:
             members = [make_agent_from_spec(spec, *mcp_list) for spec in agent_specs]

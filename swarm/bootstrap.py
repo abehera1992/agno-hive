@@ -11,19 +11,26 @@ async def bootstrap(
     mcp_url: str,
     timeout: int,
     patterns_glob: str = "patterns/**/*.md",
+    extra_urls: list[str] | None = None,
 ) -> str:
-    """Return project_context fetched from the MCP server.
+    """Return project_context fetched from the first reachable MCP server.
 
-    Falls back to "" if the MCP server is unreachable.
+    Tries extra_urls (hive-mcp) first, falls back to mcp_url (project-mcp).
+    Returns "" if all servers are unreachable.
     """
-    try:
-        async with streamablehttp_client(mcp_url) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                return await _load_from_session(session, patterns_glob)
-    except Exception as exc:
-        print(f"[agno-hive] bootstrap warning: {exc}")
-        return ""
+    urls_to_try = [u for u in (extra_urls or []) + [mcp_url] if u]
+    for url in urls_to_try:
+        try:
+            async with streamablehttp_client(url) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    result = await _load_from_session(session, patterns_glob)
+                    if result:
+                        print(f"[agno-hive] bootstrap loaded from {url}")
+                    return result
+        except Exception as exc:
+            print(f"[agno-hive] bootstrap warning ({url}): {exc}")
+    return ""
 
 
 async def _load_from_session(session: ClientSession, patterns_glob: str) -> str:
