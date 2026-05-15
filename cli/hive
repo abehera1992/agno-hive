@@ -422,7 +422,7 @@ def _start_escape_watcher() -> bool:
 
 def _run_in_thread(fn, *args, **kwargs):
     """Run fn(*args, **kwargs) in a thread; return (result, error).
-    Polls _cancel_event — returns (None, 'interrupted') if ESC pressed."""
+    Polls _cancel_event — returns (None, 'interrupted') if ESC or Ctrl+C pressed."""
     result_box: list = [None]
     error_box:  list = [None]
 
@@ -434,10 +434,14 @@ def _run_in_thread(fn, *args, **kwargs):
 
     t = threading.Thread(target=_target, daemon=True)
     t.start()
-    while t.is_alive():
-        if _cancel_event.is_set():
-            return None, "interrupted"
-        time.sleep(0.1)
+    try:
+        while t.is_alive():
+            if _cancel_event.is_set():
+                return None, "interrupted"
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        _cancel_event.set()
+        return None, "interrupted"
     _cancel_event.set()  # stop watcher
     return result_box[0], error_box[0]
 
@@ -710,7 +714,7 @@ def run_task(
     before = set((Path(AGNO_PROJECT_ROOT) if AGNO_PROJECT_ROOT else Path.cwd()).rglob(f"*{_PROPOSED_SUFFIX}"))
 
     has_esc = _start_escape_watcher()
-    esc_hint = dim("  ESC to interrupt") if has_esc else dim("  Ctrl+C to interrupt")
+    esc_hint = dim("  Ctrl+C to interrupt") + (dim(" / ESC") if has_esc else "")
 
     payload = {
         "task":       task,
@@ -759,6 +763,10 @@ def run_task(
                 print(f"\n{red('  error: ' + event.get('content', 'unknown'))}")
                 return None
 
+    except KeyboardInterrupt:
+        print(f"\n{yellow('  interrupted')}")
+        _cancel_event.set()
+        return None
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
         try:
@@ -798,7 +806,7 @@ def review_task(
 ) -> str | None:
     """HITL flow — plan -> approve -> execute. Returns session_id or None."""
     has_esc = _start_escape_watcher()
-    esc_hint = dim("  ESC to interrupt") if has_esc else dim("  Ctrl+C to interrupt")
+    esc_hint = dim("  Ctrl+C to interrupt") + (dim(" / ESC") if has_esc else "")
     print(f"\n{bold('Planning...')} {dim('(ContextRouter -> Researcher -> Planner)')}  {esc_hint}\n")
 
     plan_payload = {"task": task, "project_id": project_id}
@@ -1107,7 +1115,7 @@ def _cmd_scan(project_id: str, force: bool = False) -> None:
 def _cmd_plan(task: str, project_id: str) -> None:
     """Run the planning team and show analysis — no execution, no approval prompt."""
     has_esc = _start_escape_watcher()
-    esc_hint = dim("  ESC to interrupt") if has_esc else dim("  Ctrl+C to interrupt")
+    esc_hint = dim("  Ctrl+C to interrupt") + (dim(" / ESC") if has_esc else "")
     print(f"\n{bold('Planning...')} {dim('(ContextRouter → Researcher → Planner)')}  {esc_hint}\n")
 
     payload = {"task": task, "project_id": project_id}
@@ -1286,7 +1294,7 @@ def repl(
     if review:
         print(dim("  review mode: plan shown before every task  ·  prefix with ! to skip"))
 
-    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff  /cleanup  /plan  /review  /mcp  /exit  ·  ESC to interrupt\n"))
+    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff  /cleanup  /plan  /review  /mcp  /exit  ·  Ctrl+C to interrupt\n"))
 
     try:
         while True:
