@@ -251,13 +251,17 @@ async def run_task_stream(
 
     async with AsyncExitStack() as stack:
         mcp_list = []
+        # exclude_tools only for project-mcp (which exposes agno_run/agno_list_teams)
+        # hive-mcp does not have these tools — passing exclude_tools causes agno to return 0 tools
+        _project_mcp_url = effective_mcp_url
         for url in all_mcp_urls:
+            _exclude = ["agno_run", "agno_list_teams"] if url == _project_mcp_url else None
             try:
                 mcp = await stack.enter_async_context(
-                    MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=["agno_run", "agno_list_teams"])
+                    MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=_exclude)
                 )
                 mcp_list.append(mcp)
-                print(f"[team] MCP connected: {url}")
+                print(f"[team] MCP connected: {url} ({len(mcp.functions)} tools)")
             except Exception as e:
                 print(f"[team] MCP unavailable, skipping ({url}): {e}")
         if not mcp_list:
@@ -370,13 +374,17 @@ async def run_task_async(
 
     async with AsyncExitStack() as stack:
         mcp_list = []
+        # exclude_tools only for project-mcp (which exposes agno_run/agno_list_teams)
+        # hive-mcp does not have these tools — passing exclude_tools causes agno to return 0 tools
+        _project_mcp_url = effective_mcp_url
         for url in all_mcp_urls:
+            _exclude = ["agno_run", "agno_list_teams"] if url == _project_mcp_url else None
             try:
                 mcp = await stack.enter_async_context(
-                    MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=["agno_run", "agno_list_teams"])
+                    MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=_exclude)
                 )
                 mcp_list.append(mcp)
-                print(f"[team] MCP connected: {url}")
+                print(f"[team] MCP connected: {url} ({len(mcp.functions)} tools)")
             except Exception as e:
                 print(f"[team] MCP unavailable, skipping ({url}): {e}")
         if not mcp_list:
