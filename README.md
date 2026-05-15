@@ -26,10 +26,12 @@ project MCP  ◄─────────────────────�
 ```
 
 **Two MCP connections per run** (dual-MCP):
-- **Project MCP** — project-specific context: read code, search memory, app workflows
-- **hive-mcp** — host-level actions: file writes, shell, Docker, git, semantic bootstrap
+- **hive-mcp** (primary) — all file reads + writes + shell + Docker + git + ripgrep + web. Used for everything by default.
+- **Project MCP** (supplementary) — project-specific tools not in hive-mcp: `memory_search`, `get_context_section`, app workflows. Optional — hive works without it.
 
-1. Bootstrap reads `hive.md` first (pre-built project snapshot), then `patterns/**/*.md` — coordinator gets grounded context before the first tool call
+**Graceful fallback**: if hive-mcp is unreachable, agents automatically fall back to project MCP for reads. If both are down, the run fails with a clear error. If only one MCP is provided, it handles everything.
+
+1. Bootstrap tries hive-mcp first for `hive.md` + `patterns/**/*.md`, falls back to project MCP — coordinator gets grounded context before the first tool call
 2. Failure context from past runs is injected into the coordinator's instructions
 3. The coordinator routes operations to the right MCP — member agents see only their scoped tool subset
 4. After each run, successes go to LightRAG (vector memory) and failures go to PostgreSQL (failure log)
@@ -499,7 +501,7 @@ Sessions expire after **30 days** unless marked persistent.
 - **hive.md context snapshot** (`--scan`) — one-time project scan writes a structured context file; auto-injected into every session bootstrap; incremental updates cover committed + staged + unstaged + untracked changes so agents always see the current project state
 - **Per-agent tool scoping** — each YAML agent only sees the MCP tools it needs (Reviewer can't call `apply_diff`, Executor can't call `find_files`); reduces tool-misuse with local Ollama models
 - **Grounding rules** — coordinator and Researcher are instructed to read project files before fetching external docs, cite file:line + doc URL for any comparison claim, and check CLAUDE.md before flagging a difference as a misconfiguration
-- **Dual-MCP** — project MCP for context + hive-mcp for host actions; coordinator sees all tools, member agents are scoped
+- **Dual-MCP with graceful fallback** — hive-mcp is primary (reads + writes + ripgrep + web); project MCP is supplementary (memory_search, project-specific tools); if hive-mcp is down, agents fall back to project MCP automatically; coordinator sees all tools from both
 - **Tailscale auto-detection** — no manual URL config; CLI discovers both MCPs via `tailscale ip -4`
 - **Persistent sessions** — full conversation history in PostgreSQL, resumable by ID
 - **Auto-resume** — REPL auto-resumes last session for the current project
@@ -581,30 +583,37 @@ Create a new team by adding a YAML file in `teams/` — no code changes needed.
 
 ## MCP Tools
 
-### Project MCP (context — app-specific)
-
-| Tool | Purpose | Required |
-|---|---|---|
-| `find_files(pattern)` | Discover files by glob | Recommended |
-| `get_file_content(path)` | Read a file | Recommended |
-| `search_files(pattern, glob)` | Search across codebase | Recommended |
-| `get_project_context()` | Full project overview | Optional |
-| `run_command(cmd)` | Run tests / linters (read-only) | Optional |
-| `memory_search(query)` | Recall prior findings | Optional |
-
-### hive-mcp (host actions — generic)
+### hive-mcp (primary — generic, works with any project)
 
 | Tool | Purpose |
 |---|---|
+| `find_files(pattern)` | Glob file discovery — uses ripgrep, respects .gitignore |
+| `search_files(pattern, glob)` | Regex content search — uses ripgrep, falls back to Python re |
+| `get_file_content(path)` | Read a file |
+| `list_directory_tree(depth)` | Full directory skeleton, dirs only, no cap |
+| `list_directory(path)` | Immediate children of a directory |
+| `get_project_context()` | Reads CLAUDE.md / AGENTS.md / README.md / DOCS.md if present |
 | `apply_diff(path, old_string, new_string)` | Surgical file edit (WRITE_REVIEW-aware) |
 | `write_file(path, content)` | Create a new file (WRITE_REVIEW-aware) |
-| `run_shell(cmd)` | Run any shell command |
+| `run_command(cmd)` | Read-only shell (tests, linters — writes blocked when WRITE_REVIEW=true) |
+| `run_shell(cmd)` | Full shell access (npm install, docker compose, etc.) |
 | `run_docker(cmd)` | Docker / docker compose commands |
 | `git_status/log/diff/blame` | Git operations |
-| `scan_project_context(force)` | Generate/update `hive.md` — full scan or incremental via 4-layer git diff |
+| `scan_project_context(force)` | Generate/update `hive.md` — full scan or incremental |
 | `index_project(project_id, lightrag_url, ...)` | Semantic bootstrap into LightRAG |
-| `web_search(query, max_results)` | DuckDuckGo search — titles, URLs, snippets (requires `WEB_SEARCH_ENABLED=true`) |
-| `web_fetch(url, max_chars)` | Fetch a URL and return clean text; GitHub repos return README + metadata via API (requires `WEB_SEARCH_ENABLED=true`) |
+| `web_search(query, max_results)` | DuckDuckGo search (requires `WEB_SEARCH_ENABLED=true`) |
+| `web_fetch(url, max_chars)` | Fetch a URL — GitHub repos return README + metadata via API (requires `WEB_SEARCH_ENABLED=true`) |
+
+### Project MCP (supplementary — app-specific tools only)
+
+| Tool | Purpose | Required |
+|---|---|---|
+| `memory_search(query)` | pgvector semantic search over project history | Optional |
+| `get_context_section(topic)` | Targeted DOCS.md section by keyword | Optional |
+| `search_knowledge_graph(query)` | Graph search (graphify) | Optional |
+| Any other project-specific tools | App workflows, custom context | Optional |
+
+> Agents use hive-mcp for all reads and writes. Project MCP is only consulted for tools not present in hive-mcp. If project MCP is unavailable, agents continue with hive-mcp alone.
 
 > **Transport:** All MCP servers must use **Streamable HTTP** (`/mcp` endpoint). The deprecated `/sse` transport is not used.
 
@@ -673,6 +682,11 @@ git -C ~/agno-hive pull   # on ZGX
 | `sessions.py` compaction model uses `config.router_model` — no longer hardcoded to `qwen3:8b` | Done |
 | `AGNO_PROJECT_ROOT` CLI env var — `.hive_proposed` detection works from any working directory | Done |
 | `/plan` and `/review` REPL slash commands | Done |
+| hive-mcp promoted to primary MCP — full read+write+ripgrep+web; project MCP supplementary | Done |
+| Graceful MCP fallback — unreachable MCP skipped; run continues with remaining MCPs | Done |
+| bootstrap multi-URL — tries hive-mcp first for `hive.md` + patterns, falls back to project MCP | Done |
+| ripgrep (`rg`) in `find_files` and `search_files` — both containers; Python fallback if rg absent | Done |
+| `agno_run` + `agno_list_teams` excluded from coordinator MCP tools via `exclude_tools` | Done |
 | Cost-aware model routing | Planned |
 
 ---
