@@ -15,6 +15,12 @@ _tracer = trace.get_tracer("agno-hive.team")
 _MCP_TIMEOUT = 180  # lightrag_query needs ~90-120s for LLM synthesis
 
 _COORDINATOR_INSTRUCTIONS = [
+    "── Tool restrictions ────────────────────────────────────────────",
+    "  NEVER call the `agno_run` tool — you are the top-level coordinator;",
+    "  calling agno_run would recurse back into this same swarm and deadlock.",
+    "  Delegate all work to your team members (ContextRouter, Researcher,",
+    "  Planner, Coder, Executor, Reviewer) directly.",
+    "",
     "── Conversational turn detection (read this first) ─────────────",
     "  Not every message is a task. Classify the message before reaching for tools:",
     "",
@@ -246,7 +252,7 @@ async def run_task_stream(
         mcp_list = []
         for url in all_mcp_urls:
             mcp = await stack.enter_async_context(
-                MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT)
+                MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=["agno_run", "agno_list_teams"])
             )
             mcp_list.append(mcp)
 
@@ -358,7 +364,7 @@ async def run_task_async(
         mcp_list = []
         for url in all_mcp_urls:
             mcp = await stack.enter_async_context(
-                MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT)
+                MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=["agno_run", "agno_list_teams"])
             )
             mcp_list.append(mcp)
 

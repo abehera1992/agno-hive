@@ -59,9 +59,9 @@ ollama pull qwen3-embedding:0.6b   # LightRAG embeddings
 
 All agents run local Ollama models. Set any model via env var (e.g. `CODER_MODEL=qwen2.5-coder:32b`) or in `teams/engineering.yaml`.
 
-> **Note:** `deepseek-r1`, `gemma3:27b`, and `mixtral:8x7b` are no longer used — all return HTTP 400 for tool calls in Ollama. `kimi-k2.6:cloud` replaced with local `qwen2.5-coder:32b`. `llama3.1:8b` (ContextRouter) replaced with `qwen3:8b`.
->
-> **ARM/Ollama bug:** On NVIDIA GB10/Grace (ARM) hardware, Ollama ≤ 0.17.0 segfaults on all `qwen3:*` models. Update to 0.23.4+: `curl -fsSL https://ollama.com/install.sh | sudo sh`
+> **Note:** `deepseek-r1`, `gemma3:27b`, and `mixtral:8x7b` are no longer used — all return HTTP 400 for tool calls in Ollama.
+> 
+> **qwen3 ARM64 incompatibility (active):** `qwen3:30b-a3b` and `qwen3:8b` crash on load on the GB10 ARM64 Ollama runner (tested Ollama 0.17.0–0.23.4). Hardware-level segfault — not a model download issue. Active workaround in `.env`: `LEADER_MODEL=mistral-small3.1:24b`, `ROUTER_MODEL=llama3.1:8b`. Session compaction uses `config.router_model` (patched in `sessions.py`). Revert when upstream fixes the ARM runner.
 
 ### Client Machine
 - Docker (for hive-mcp)
@@ -503,7 +503,7 @@ Sessions expire after **30 days** unless marked persistent.
 - **Tailscale auto-detection** — no manual URL config; CLI discovers both MCPs via `tailscale ip -4`
 - **Persistent sessions** — full conversation history in PostgreSQL, resumable by ID
 - **Auto-resume** — REPL auto-resumes last session for the current project
-- **Compaction** — sessions longer than 20 messages are summarised automatically by `config.router_model` (default `qwen3:8b`)
+- **Compaction** — sessions longer than 20 messages are summarised automatically by `config.router_model` (default: `llama3.1:8b`; was `qwen3:8b` but changed due to ARM incompatibility)
 - **HITL review mode** (`--review`) — plan shown before every task, requires your approval
 - **Write review** — every file write staged as `.hive_proposed`; arrow-key selector in CLI; VS Code diff via IPC if available
 - **Semantic bootstrap** (`--bootstrap`) — index project into LightRAG for knowledge graph queries
@@ -556,8 +556,8 @@ curl -X PATCH "http://localhost:9001/sessions/<id>/persist"
 
 | Agent | Model | Role |
 |---|---|---|
-| Coordinator | `qwen3:30b-a3b` | Routes tasks, synthesises results |
-| ContextRouter | `qwen3:8b` | Picks the right memory/search backend |
+| Coordinator | `qwen3:30b-a3b` *(active override: `mistral-small3.1:24b`)* | Routes tasks, synthesises results |
+| ContextRouter | `qwen3:8b` *(active override: `llama3.1:8b`)* | Picks the right memory/search backend |
 | Researcher | `devstral:24b` | Reads and summarises the codebase |
 | Planner | `mistral-small3.1:24b` | Breaks tasks into ordered steps |
 | Coder | `qwen2.5-coder:32b` | Implements features and fixes |
@@ -667,6 +667,10 @@ git -C ~/agno-hive pull   # on ZGX
 | LightRAG per-project isolation — `model_name=project_id` (Qdrant: `lightrag_vdb_*_{id}_1024d`) + `POSTGRES_WORKSPACE=project_id` | Done |
 | Bootstrap index state persistence — `PROJECT_ROOT/.hive-index-state` via existing Docker volume (no container restart loss) | Done |
 | Session compaction model upgraded: `llama3.1:8b` → `qwen3:8b` | Done |
+| `agno_run` excluded from coordinator MCP tools (`exclude_tools`) — prevents recursive self-call deadlock | Done |
+| All agent model overrides in `.env` — replaces stale `config.py` defaults (`deepseek-r1`, `gemma3:27b`, `mixtral:8x7b`) | Done |
+| qwen3 ARM64 crash workaround — `LEADER_MODEL=mistral-small3.1:24b`, `ROUTER_MODEL=llama3.1:8b` in `.env` | Done |
+| `sessions.py` compaction model uses `config.router_model` — no longer hardcoded to `qwen3:8b` | Done |
 | `AGNO_PROJECT_ROOT` CLI env var — `.hive_proposed` detection works from any working directory | Done |
 | `/plan` and `/review` REPL slash commands | Done |
 | Cost-aware model routing | Planned |
