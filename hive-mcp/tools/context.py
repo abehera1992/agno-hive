@@ -90,9 +90,8 @@ def get_file_content(relative_path: str) -> str:
 
 def find_files(glob_pattern: str, max_results: int = 200) -> str:
     """
-    Find files and directories by glob pattern. Returns paths relative to project root.
-    Use this before get_file_content when you don't know the exact path.
-    Directories are shown with a trailing /.
+    Find files by glob pattern. Returns paths relative to project root.
+    Uses ripgrep when available (fast, respects .gitignore); falls back to pathlib.
 
     Args:
         glob_pattern: e.g. '**/*.py', 'src/**/*.ts', '**/docker-compose*.yml'
@@ -103,6 +102,24 @@ def find_files(glob_pattern: str, max_results: int = 200) -> str:
         find_files('**/Dockerfile*')      → all Dockerfiles
         find_files('**/.env*')            → env files
     """
+    import subprocess, shutil
+    rg = shutil.which("rg")
+    if rg:
+        try:
+            result = subprocess.run(
+                [rg, "--files", "--glob", glob_pattern],
+                capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=30,
+            )
+            lines = [l for l in result.stdout.splitlines() if l.strip()]
+            if not lines and result.returncode not in (0, 1):
+                raise RuntimeError(result.stderr.strip())
+            matches = sorted(lines[:max_results])
+            if not matches:
+                return f"No matches for: {glob_pattern}"
+            return f"{len(matches)} result(s) for '{glob_pattern}':\n" + "\n".join(matches)
+        except Exception:
+            pass  # fall through to pathlib
+
     matches = []
     try:
         for p in sorted(PROJECT_ROOT.glob(glob_pattern)):
@@ -117,25 +134,50 @@ def find_files(glob_pattern: str, max_results: int = 200) -> str:
 
     if not matches:
         return f"No matches for: {glob_pattern}"
-    header = f"{len(matches)} result(s) for '{glob_pattern}':\n"
-    return header + "\n".join(matches)
+    return f"{len(matches)} result(s) for '{glob_pattern}':\n" + "\n".join(matches)
 
 
 def search_files(pattern: str, glob_filter: str = "**/*", max_results: int = 80) -> str:
     """
-    Search file contents with a regex pattern. Returns matching lines with path and line number.
-    Use this to find usages, verify conventions, or locate code before editing.
+    Search file contents with a regex pattern. Returns matching lines with path:line: content.
+    Uses ripgrep when available (fast, respects .gitignore); falls back to Python re.
 
     Args:
         pattern:     Regex or literal string to search for
         glob_filter: Restrict to files matching this glob (e.g. '**/*.py', '**/*.ts')
-        max_results: Max matching lines to return (default 40)
+        max_results: Max matching lines to return (default 80)
 
     Examples:
         search_files('def handle_', '**/*.py')        → Python handler functions
         search_files('import.*React', '**/*.tsx')     → React imports
         search_files('WRITE_REVIEW', '**/*.py')       → env var usages
     """
+    import subprocess, shutil
+    rg = shutil.which("rg")
+    if rg:
+        try:
+            result = subprocess.run(
+                [rg, "-n", "-i", "--no-heading", "--glob", glob_filter,
+                 "--max-count", "1", pattern],
+                capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=30,
+            )
+            if result.returncode not in (0, 1):
+                raise RuntimeError(result.stderr.strip())
+            lines = [l for l in result.stdout.splitlines() if l.strip()]
+            if not lines:
+                return f"No matches for: {pattern}"
+            # rg output: path:line:content — reformat to path:line: content
+            out = []
+            for ln in lines[:max_results]:
+                parts = ln.split(":", 2)
+                if len(parts) == 3:
+                    out.append(f"{parts[0]}:{parts[1]}: {parts[2]}")
+                else:
+                    out.append(ln)
+            return "\n".join(out)
+        except Exception:
+            pass  # fall through to Python re
+
     try:
         regex = re.compile(pattern, re.IGNORECASE)
     except re.error as e:

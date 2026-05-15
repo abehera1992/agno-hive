@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     openssh-client \
     ca-certificates \
+    ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
 # Docker CLI from official image (no daemon, talks to host socket via mount)
