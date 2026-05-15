@@ -1,10 +1,10 @@
 name: engineering
 description: Full engineering team — routes context, researches codebase, plans, implements, executes, and reviews.
-coordinator_model: qwen3:30b-a3b
+coordinator_model: mistral-small3.1:24b
 
 agents:
   - name: ContextRouter
-    model: qwen3:8b
+    model: llama3.1:8b
     description: Lightweight query router. Pick the fastest retrieval path and return raw results — never interpret or answer yourself.
     role: Routing agent that retrieves the right context from the right backend.
     tools:

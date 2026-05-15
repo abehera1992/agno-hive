@@ -1,6 +1,6 @@
 name: planning
 description: Plan-only team — routes context, researches codebase, and produces a step-by-step plan without executing anything. Used by the HITL review flow.
-coordinator_model: qwen3:30b-a3b
+coordinator_model: mistral-small3.1:24b
 
 agents:
   - name: ContextRouter
@@ -33,7 +33,7 @@ agents:
       - "Tool call limit: 1 for specific lookups, up to 3 for overview/structure queries."
 
   - name: Researcher
-    model: mixtral:8x7b
+    model: devstral:24b
     description: Codebase investigation specialist. Read real files and ground every claim in file content — never describe from directory names alone.
     role: Senior engineer who investigates the codebase and surfaces relevant context.
     tools:
@@ -72,7 +72,7 @@ agents:
       - Do NOT implement anything — research and summarise only.
 
   - name: Planner
-    model: deepseek-r1
+    model: mistral-small3.1:24b
     description: Task decomposition specialist. Break complex tasks into numbered steps naming the responsible agent, files to touch, and risks.
     role: Senior engineer who decomposes tasks into actionable steps for the team.
     tools:
