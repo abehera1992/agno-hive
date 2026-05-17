@@ -62,7 +62,7 @@ All agents run local Ollama models. Set any model via env var (e.g. `CODER_MODEL
 
 > **Note:** `deepseek-r1`, `gemma3:27b`, and `mixtral:8x7b` are no longer used — all return HTTP 400 for tool calls in Ollama.
 >
-> **qwen3 ARM64 incompatibility (active):** `qwen3:30b-a3b` and `qwen3:8b` crash on load on the GB10 ARM64 Ollama runner (tested Ollama 0.17.0–0.23.4). Hardware-level segfault — not a model download issue. Current workaround: `nemotron3:33b` as coordinator (Llama architecture, ARM-safe), `llama3.1:8b` as ContextRouter. Revert to qwen3 models when Ollama upstream fixes the ARM runner.
+> **qwen3 ARM64 workaround (Ollama ≥0.24.0 fix available):** `qwen3:30b-a3b` (MoE) crashes on GB10 on Ollama ≤0.23.4 — the new `ollama-engine` required by MoE models segfaults on ARM64 GPU backend. **Fix path:** upgrade to Ollama 0.24.0 (released 2026-05-14) and use `qwen3:30b` (dense, legacy llama.cpp runner, ARM-safe) as coordinator. Current workaround: `nemotron3:33b` as coordinator, `llama3.1:8b` as ContextRouter — set in `~/agno-hive/.env`.
 
 ### Client Machine
 - Docker (for hive-mcp)
@@ -502,7 +502,7 @@ Sessions expire after **30 days** unless marked persistent.
 - **Grounding rules** — coordinator and Researcher are instructed to read project files before fetching external docs, cite file:line + doc URL for any comparison claim, and check CLAUDE.md before flagging a difference as a misconfiguration
 - **Dual-MCP with graceful fallback** — hive-mcp is primary (reads + writes + ripgrep + web); project MCP is supplementary (memory_search, project-specific tools); if hive-mcp is down, agents fall back to project MCP automatically; coordinator sees all tools from both
 - **Tailscale auto-detection** — no manual URL config; CLI discovers both MCPs via `tailscale ip -4`
-- **Persistent sessions** — full conversation history in PostgreSQL, resumable by ID
+- **Persistent sessions** — full conversation history in PostgreSQL, resumable by ID; `session_id` from any `/run` response can be passed back to chain context across API calls (equivalent to REPL mode)
 - **Auto-resume** — REPL auto-resumes last session for the current project
 - **Compaction** — sessions longer than 20 messages are summarised automatically by `config.router_model` (default: `llama3.1:8b`; was `qwen3:8b` but changed due to ARM incompatibility)
 - **HITL review mode** (`--review`) — plan shown before every task, requires your approval
@@ -543,7 +543,23 @@ curl -X POST http://localhost:9001/plan \
   -d '{"task": "Add rate limiting to login", "project_id": "EkamApp"}'
 ```
 
-### Session endpoints
+### Session chaining — carry context across API calls
+
+Pass `session_id` from a previous `/run` response to resume context in the next call. Without it every call is stateless (`context_size=0`). With it, prior agent findings are injected into the coordinator — equivalent to staying in REPL mode.
+
+```bash
+# Step 1 — new session; response includes "session": {"session_id": "abc123-..."}
+curl -X POST http://localhost:9001/run \
+  -d '{"task": "Read businessApi.ts then scaffold emailApi.ts", "project_id": "EkamApp", ...}'
+
+# Step 2 — resume; Coder inherits Researcher output from step 1
+curl -X POST http://localhost:9001/run \
+  -d '{"task": "Add tabs to page.tsx", "session_id": "abc123-...", "project_id": "EkamApp", ...}'
+```
+
+From the `agno_run` MCP tool the session UUID appears on the last result line as `[session: abc123-...]` — pass it as the `session_id` argument on the next call.
+
+### Session management endpoints
 ```bash
 curl "http://localhost:9001/sessions?project_id=EkamApp"
 curl "http://localhost:9001/sessions/<id>"
@@ -691,6 +707,8 @@ git -C ~/agno-hive pull   # on ZGX
 | `exclude_tools` scoped to project-mcp only — hive-mcp never receives `exclude_tools` (fixes 0-tools bug in agno 2.5.17 when listed names absent) | Done |
 | fastmcp upgraded to `>=3.2.0` in hive-mcp — required for agno `MCPTools` compatibility (fastmcp 2.x was incompatible) | Done |
 | `agno_run` `team` param renamed to `swarm_team` — avoids `got multiple values for keyword argument 'team'` collision with agno framework internals | Done |
+| `session_id` param added to `agno_run` MCP tool — chains context across one-shot calls from Claude Code, equivalent to REPL mode | Done |
+| Ollama upgraded to 0.24.0 on ZGX — improved qwen3 / Blackwell GB10 GPU support | Done |
 | Cost-aware model routing | Planned |
 
 ---
