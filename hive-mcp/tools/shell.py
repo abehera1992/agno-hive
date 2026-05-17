@@ -6,12 +6,23 @@ The Docker socket is mounted from the host so docker commands target
 the host daemon (not a daemon inside this container).
 """
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import PROJECT_ROOT
+from config import PROJECT_ROOT, WRITE_REVIEW
+
+# Same write-detection pattern as run_command in files.py
+_WRITE_CMD_RE = re.compile(
+    r"\s>>?\s"
+    r"|\bsed\s+\S*-i"
+    r"|\bperl\s+\S*-i"
+    r"|\btee\b"
+    r"|\btruncate\b"
+    r"|\bdd\b.*of="
+)
 
 
 def _run(cmd: list[str], timeout: int = 60, cwd=None) -> str:
@@ -60,6 +71,11 @@ def run_shell(command: str, timeout: int = 120) -> str:
         run_shell('python -m pytest tests/ -v --tb=short')
         run_shell('curl -s http://localhost:8000/health')
     """
+    if WRITE_REVIEW and _WRITE_CMD_RE.search(command):
+        return (
+            "blocked: run_shell cannot write files when WRITE_REVIEW is enabled. "
+            "Use apply_diff() to edit an existing file or write_file() to create a new one."
+        )
     try:
         r = subprocess.run(
             command,

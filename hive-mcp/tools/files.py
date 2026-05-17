@@ -50,7 +50,8 @@ def _inline_diff(original: Path, proposed: Path) -> str:
 def write_file(relative_path: str, content: str) -> str:
     """
     Write content to a file. Use ONLY for brand-new files that do not exist yet.
-    For existing files always use apply_diff() instead.
+    For existing files always use apply_diff() instead — this function is BLOCKED
+    on existing files to prevent accidental full rewrites.
     Creates parent directories if needed.
 
     When WRITE_REVIEW=true the change is staged as a .hive_proposed file.
@@ -61,6 +62,12 @@ def write_file(relative_path: str, content: str) -> str:
         content:       Full file content to write
     """
     target = PROJECT_ROOT / relative_path
+    if target.exists():
+        return (
+            f"write_file blocked: '{relative_path}' already exists. "
+            f"Use apply_diff() to make surgical edits to existing files — "
+            f"call get_file_content('{relative_path}') first to get the exact text to replace."
+        )
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
 
