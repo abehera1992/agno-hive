@@ -166,8 +166,11 @@ async def index_project(
         try:
             from mcp.client.streamable_http import streamablehttp_client
             from mcp import ClientSession
+            # Ensure trailing slash — httpx (used by streamablehttp_client) does not
+            # follow POST 307 redirects, so /mcp must already be the canonical path.
+            _lr_url = lightrag_url.rstrip("/") + "/"
             # Open ONE session for all inserts — avoids per-chunk connection overhead
-            async with streamablehttp_client(lightrag_url) as (read, write, _):
+            async with streamablehttp_client(_lr_url) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     for p, rel, sha in to_process:
