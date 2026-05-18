@@ -139,26 +139,40 @@ async def index_project(
 
     files_seen = files_skipped = chunks_sent = errors = files_indexed = 0
 
-    # Collect candidates first (fast — no I/O beyond stat/hash)
+    # Derive a simple filename pattern from the glob (e.g. "**/*.py" → "*.py").
+    # Directory pruning via os.walk makes the scan fast even on Docker Windows mounts.
+    import fnmatch as _fnmatch
+    _file_pat = glob_filter.split("/")[-1] if "/" in glob_filter else glob_filter
+
+    # Collect candidates — os.walk with in-place dir pruning avoids descending into
+    # node_modules / .next / __pycache__ etc., which Path.glob visits before filtering.
     to_process: list[tuple[Path, str, str]] = []
-    for p in sorted(PROJECT_ROOT.glob(glob_filter)):
-        if not p.is_file():
-            continue
-        rel   = p.relative_to(PROJECT_ROOT).as_posix()
-        parts = rel.split("/")
-        if any(part in _IGNORE_DIRS or part.startswith(".") for part in parts):
-            continue
-        if p.suffix.lower() in _SKIP_EXTS:
-            continue
-        files_seen += 1
-        try:
-            sha = _sha(p)
-        except Exception:
-            continue
-        if not force and state.get(rel) == sha:
-            files_skipped += 1
-            continue
-        to_process.append((p, rel, sha))
+    for dirpath, dirnames, filenames in os.walk(PROJECT_ROOT, topdown=True):
+        # Prune ignored + hidden dirs so os.walk never descends into them
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in _IGNORE_DIRS and not d.startswith(".")
+        )
+        for filename in filenames:
+            if not _fnmatch.fnmatch(filename, _file_pat):
+                continue
+            p = Path(dirpath) / filename
+            if p.suffix.lower() in _SKIP_EXTS:
+                continue
+            try:
+                rel = p.relative_to(PROJECT_ROOT).as_posix()
+            except ValueError:
+                continue
+            files_seen += 1
+            try:
+                sha = _sha(p)
+            except Exception:
+                continue
+            if not force and state.get(rel) == sha:
+                files_skipped += 1
+                continue
+            to_process.append((p, rel, sha))
+    to_process.sort(key=lambda x: x[1])  # stable alphabetical order
 
     budget_exceeded = False
 

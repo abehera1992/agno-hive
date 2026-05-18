@@ -1289,9 +1289,9 @@ def _cmd_bootstrap(
                     "lightrag_url":        lightrag_url,
                     "glob_filter":         glob_filter,
                     "force":               force and pass_num == 1,
-                    "time_budget_seconds": 240,
+                    "time_budget_seconds": 480,
                 },
-                300,
+                600,
             )
         except KeyboardInterrupt:
             print(yellow("\n  Interrupted — progress saved; run again to continue."))
