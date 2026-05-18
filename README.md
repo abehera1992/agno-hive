@@ -53,7 +53,8 @@ project MCP  ◄─────────────────────�
 ollama pull nemotron3:33b          # Coordinator (Llama-based, ARM-safe)
 ollama pull llama3.1:8b            # ContextRouter + Executor + session compaction
 ollama pull devstral:24b           # Researcher
-ollama pull mistral-small3.1:24b   # Planner + LightRAG entity extraction
+ollama pull mistral-small3.1:24b   # Planner
+ollama pull llama3.1:8b            # LightRAG entity extraction (stable on GB10)
 ollama pull qwen2.5-coder:32b      # Coder + Reviewer
 ollama pull qwen3-embedding:0.6b   # LightRAG embeddings
 ```
@@ -168,7 +169,7 @@ POSTGRES_PORT=5432
 # LightRAG MCP (Streamable HTTP, port 9002)
 LIGHTRAG_MCP_PORT=9002
 LIGHTRAG_MCP_URL=http://localhost:9002/mcp
-LIGHTRAG_LLM_MODEL=mistral-small3.1:24b
+LIGHTRAG_LLM_MODEL=llama3.1:8b
 LIGHTRAG_EMBED_MODEL=qwen3-embedding:0.6b
 LIGHTRAG_EMBED_DIM=1024
 
