@@ -101,25 +101,6 @@ def _save_state(project_id: str, state: dict) -> None:
     (_STATE_DIR / f"{project_id}.json").write_text(json.dumps(state))
 
 
-# ── LightRAG MCP client ───────────────────────────────────────────────────────
-
-async def _insert_via_mcp(lightrag_url: str, text: str, project_id: str) -> bool:
-    """Send one chunk to LightRAG MCP server via Streamable HTTP."""
-    try:
-        from mcp.client.streamable_http import streamablehttp_client
-        from mcp import ClientSession
-        async with streamablehttp_client(lightrag_url) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(
-                    "lightrag_insert",
-                    {"text": text, "project_id": project_id},
-                )
-                return not (result.isError if hasattr(result, "isError") else False)
-    except Exception:
-        return False
-
-
 # ── Main tool ─────────────────────────────────────────────────────────────────
 
 async def index_project(
@@ -127,6 +108,7 @@ async def index_project(
     lightrag_url: str,
     glob_filter: str = "**/*",
     force: bool = False,
+    time_budget_seconds: int = 240,
 ) -> str:
     """
     Index the project into LightRAG for semantic search and knowledge graph queries.
@@ -134,70 +116,107 @@ async def index_project(
     Walks the project directory, chunks files (Python files are parsed with AST
     for function/class-level granularity; all other files use text windows).
     Skips unchanged files based on SHA-256 checksums unless force=True.
-    Connects to the LightRAG MCP server at lightrag_url via Streamable HTTP.
+    Connects to the LightRAG MCP server at lightrag_url via Streamable HTTP
+    using a single shared session (not one connection per chunk).
+
+    State is saved after every file so interrupted runs resume from where they
+    left off. When time_budget_seconds is reached the tool returns a "Partial"
+    result — call again (without force) to continue from saved state.
 
     Args:
-        project_id:   Namespace for this project in LightRAG (e.g. 'ekam', 'myapp').
-        lightrag_url: LightRAG MCP server URL (e.g. 'http://100.96.86.82:9002/mcp').
-        glob_filter:  Glob to restrict which files are indexed (default: all files).
-        force:        Re-index all files even if unchanged (default: False).
-
-    Examples:
-        index_project('myapp', 'http://100.96.86.82:9002/mcp')
-        index_project('myapp', 'http://100.96.86.82:9002/mcp', glob_filter='**/*.py')
-        index_project('myapp', 'http://100.96.86.82:9002/mcp', force=True)
+        project_id:          Namespace for this project in LightRAG.
+        lightrag_url:        LightRAG MCP server URL.
+        glob_filter:         Glob to restrict which files are indexed.
+        force:               Re-index all files even if unchanged.
+        time_budget_seconds: Stop after this many seconds and return partial
+                             result (default 240). Caller loops until "Done".
     """
-    state      = {} if force else _load_state(project_id)
-    new_state  = dict(state)
+    import time
+    t_start = time.monotonic()
 
-    files_seen = files_skipped = chunks_sent = errors = 0
-    lines      = [f"Indexing project '{project_id}' → {lightrag_url}"]
+    state     = {} if force else _load_state(project_id)
+    new_state = dict(state)
 
+    files_seen = files_skipped = chunks_sent = errors = files_indexed = 0
+
+    # Collect candidates first (fast — no I/O beyond stat/hash)
+    to_process: list[tuple[Path, str, str]] = []
     for p in sorted(PROJECT_ROOT.glob(glob_filter)):
         if not p.is_file():
             continue
-        rel = p.relative_to(PROJECT_ROOT).as_posix()
-
-        # Skip ignored dirs and binary extensions
+        rel   = p.relative_to(PROJECT_ROOT).as_posix()
         parts = rel.split("/")
         if any(part in _IGNORE_DIRS or part.startswith(".") for part in parts):
             continue
         if p.suffix.lower() in _SKIP_EXTS:
             continue
-
         files_seen += 1
         try:
             sha = _sha(p)
         except Exception:
             continue
-
         if not force and state.get(rel) == sha:
             files_skipped += 1
             continue
+        to_process.append((p, rel, sha))
 
-        # Choose chunker
-        chunks = _py_chunks(p) if p.suffix == ".py" else _text_chunks(p)
+    budget_exceeded = False
 
-        ok = True
-        for chunk in chunks:
-            success = await _insert_via_mcp(lightrag_url, chunk, project_id)
-            if success:
-                chunks_sent += 1
-            else:
-                errors += 1
-                ok = False
-
-        if ok:
-            new_state[rel] = sha
+    if to_process:
+        try:
+            from mcp.client.streamable_http import streamablehttp_client
+            from mcp import ClientSession
+            # Open ONE session for all inserts — avoids per-chunk connection overhead
+            async with streamablehttp_client(lightrag_url) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    for p, rel, sha in to_process:
+                        if time.monotonic() - t_start >= time_budget_seconds:
+                            budget_exceeded = True
+                            break
+                        chunks = _py_chunks(p) if p.suffix == ".py" else _text_chunks(p)
+                        ok = True
+                        for chunk in chunks:
+                            try:
+                                result = await session.call_tool(
+                                    "lightrag_insert",
+                                    {"text": chunk, "project_id": project_id},
+                                )
+                                if result.isError if hasattr(result, "isError") else False:
+                                    errors += 1
+                                    ok = False
+                                else:
+                                    chunks_sent += 1
+                            except Exception:
+                                errors += 1
+                                ok = False
+                        if ok:
+                            new_state[rel] = sha
+                        files_indexed += 1
+                        _save_state(project_id, new_state)  # persist after every file
+        except Exception as e:
+            errors += 1
+            _save_state(project_id, new_state)
+            return (
+                f"Indexing project '{project_id}' → {lightrag_url}\n"
+                f"Error connecting to LightRAG: {e}"
+            )
 
     _save_state(project_id, new_state)
 
-    lines += [
-        f"Files scanned:  {files_seen}",
-        f"Files skipped:  {files_skipped}  (unchanged)",
-        f"Files indexed:  {files_seen - files_skipped}",
-        f"Chunks sent:    {chunks_sent}",
-        f"Errors:         {errors}",
-        "Done — project knowledge is now queryable via lightrag_query.",
-    ]
-    return "\n".join(lines)
+    remaining = len(to_process) - files_indexed
+    status = (
+        f"Partial — {remaining} files remaining — run again to continue."
+        if budget_exceeded
+        else "Done — project knowledge is now queryable via lightrag_query."
+    )
+
+    return "\n".join([
+        f"Indexing project '{project_id}' → {lightrag_url}",
+        f"Files scanned:   {files_seen}",
+        f"Files skipped:   {files_skipped}  (unchanged)",
+        f"Files indexed:   {files_indexed}",
+        f"Chunks sent:     {chunks_sent}",
+        f"Errors:          {errors}",
+        status,
+    ])
