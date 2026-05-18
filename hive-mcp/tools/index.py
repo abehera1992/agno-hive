@@ -5,7 +5,6 @@ lightrag_insert for each chunk. Tracks SHA-256 state for incremental
 re-indexing so unchanged files are skipped.
 """
 import ast
-import hashlib
 import json
 import os
 import re
@@ -82,8 +81,10 @@ def _text_chunks(path: Path) -> list[str]:
     return chunks
 
 
-def _sha(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _file_key(path: Path) -> str:
+    """Fast change-detection key using mtime + size — no file read required."""
+    s = path.stat()
+    return f"{s.st_mtime_ns}:{s.st_size}"
 
 
 # ── State tracking ────────────────────────────────────────────────────────────
@@ -165,13 +166,13 @@ async def index_project(
                 continue
             files_seen += 1
             try:
-                sha = _sha(p)
+                key = _file_key(p)
             except Exception:
                 continue
-            if not force and state.get(rel) == sha:
+            if not force and state.get(rel) == key:
                 files_skipped += 1
                 continue
-            to_process.append((p, rel, sha))
+            to_process.append((p, rel, key))
     to_process.sort(key=lambda x: x[1])  # stable alphabetical order
 
     budget_exceeded = False
