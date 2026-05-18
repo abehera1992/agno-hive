@@ -1168,7 +1168,7 @@ def _mcp_call_direct(mcp_url: str, tool: str, args: dict, call_timeout: int = 30
     Bypasses the agent pipeline so no 180s _MCP_TIMEOUT applies.
     Returns the tool's text output, or an error string starting with 'Error:'.
     """
-    base = mcp_url.rstrip("/") + "/"  # FastMCP requires trailing slash
+    base = mcp_url.rstrip("/")  # no trailing slash; redirect handler resolves the canonical path
 
     def _post(url, body, extra_headers=None, to=10):
         hdrs = {
@@ -1177,8 +1177,17 @@ def _mcp_call_direct(mcp_url: str, tool: str, args: dict, call_timeout: int = 30
         }
         if extra_headers:
             hdrs.update(extra_headers)
-        req = urllib.request.Request(url, data=body, method="POST", headers=hdrs)
-        return urllib.request.urlopen(req, timeout=to)
+        # urllib raises HTTPError on POST+307 instead of following — handle manually (up to 3 hops)
+        for _ in range(3):
+            req = urllib.request.Request(url, data=body, method="POST", headers=hdrs)
+            try:
+                return urllib.request.urlopen(req, timeout=to)
+            except urllib.error.HTTPError as e:
+                if e.code in (301, 302, 307, 308) and e.headers.get("Location"):
+                    url = e.headers["Location"]
+                    continue
+                raise
+        raise RuntimeError(f"Too many redirects for {url}")
 
     # 1. Initialize session
     try:
