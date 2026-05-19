@@ -700,85 +700,45 @@ hive-mcp/tools/web.py   # web_search, web_fetch, _clean_html, _github_repo_summa
 
 ## Automated Code Indexer
 
-Three paths to index a project into LightRAG:
+Two paths to index a project into LightRAG:
 
-### 1. MCP-based (`index_via_mcp.py`) — EkamApp primary path
+### 1. ZGX-side (`python main.py --index`)
 
-Runs on ZGX. Reads every file via the **project's MCP server** (Streamable HTTP) so it works even when ZGX has no filesystem access to the client machine. Pre-splits large files before inserting to avoid LLM timeouts. Supports incremental runs via SHA-256 hash tracking.
+Runs directly on ZGX, calls `rag.ainsert()` without going through MCP. Use when ZGX has direct filesystem access to the project (e.g. indexing agno-hive itself).
 
 ```bash
-# From ~/agno-hive on ZGX
-python index_via_mcp.py                   # incremental — skips files unchanged since last run
-python index_via_mcp.py --force           # full reindex (ignores hash cache)
-python index_via_mcp.py --progress        # live progress bar (TTY); plain log lines otherwise
-python index_via_mcp.py --force --progress
+python main.py --index --path /path/to/repo --project-id myproject
+python main.py --index --path /path/to/repo --project-id myproject --force
 ```
 
 State: `~/.agno-hive/index-state/{project_id}.json`
 
-**How it works:**
-1. **Scan phase** — calls `find_files(glob)` for each configured glob, prints per-glob file counts and total before indexing starts
-2. **Hash check** — skips files whose SHA-256 matches the saved state (incremental mode only)
-3. **Pre-split** — files over 8 000 chars are split at language-aware boundaries (class/def for Python, export/function for TS/TSX, selectors for SCSS) before `ainsert()`. Each part is tagged `"File: path (part N/M)"` so LightRAG links them as siblings. Prevents LLM worker timeouts on large files.
-4. **Insert** — `rag.ainsert()` per chunk; Qdrant + PostgreSQL/AGE updated in parallel
+### 2. Client-side (`hive --bootstrap` via hive-mcp)
 
-**Progress display (--progress):**
-```
-[indexing ekam]  ████████████░░░░░░░░  62.0%  200/321 files
-  current : API/business-service/router/modules_api.py
-  indexed : 142  (178 inserts)   skipped: 54   errors: 4
-  elapsed : 2:18:42   eta: ~1:24:00
-```
-
-**Config (top of script):**
-| Constant | Default | Description |
-|---|---|---|
-| `MCP_URL` | `http://100.87.159.86:9000/mcp` | EkamApp MCP server |
-| `PROJECT_ID` | `ekam` | Qdrant collection prefix + Postgres workspace |
-| `MAX_INSERT_CHARS` | `8000` | Max chars per `ainsert()` call before splitting |
-| `GLOBS` | API/**/*.py, src/**/*.ts/tsx/scss, patterns/**/*.md, … | File patterns to index |
-
-### 2. ZGX-side (`python main.py --index`)
-
-Runs directly on ZGX, calls `rag.ainsert()` without going through MCP. Fastest option when ZGX has direct filesystem access to the project.
+Runs inside the hive-mcp container on the client machine. Calls `index_project` **directly on hive-mcp** (bypasses the AGNOHive agent pipeline — no 180s `_MCP_TIMEOUT` applies). Loops automatically on `Partial` results until `Done`. This is the primary path for EkamApp and any project where ZGX has no direct filesystem access.
 
 ```bash
-python main.py --index --path /path/to/repo --project-id ekam
-python main.py --index --path /path/to/repo --project-id ekam --force
-```
-
-State: `~/.agno-hive/index-state/{project_id}.json`
-
-### 3. Client-side (`hive --bootstrap` via hive-mcp)
-
-Runs inside the hive-mcp container on the client machine. Calls `index_project` **directly on hive-mcp** (bypasses the AGNOHive agent pipeline — no 180s `_MCP_TIMEOUT` applies). Loops automatically on `Partial` results until `Done`.
-
-```bash
-hive --bootstrap                                    # index all source files
+hive --bootstrap                                    # index all source files (default glob: **/*)
 hive --bootstrap --lightrag-url http://<zgx>:9002/mcp
-hive --bootstrap --glob "**/*.py"                   # Python files only (recommended for large projects)
-hive --bootstrap --glob "**/*.ts"                   # TypeScript only
+hive --bootstrap --glob "Client/**/*.ts"            # scoped to a specific directory + extension
 hive --bootstrap --force                            # reindex everything (ignores state)
 ```
 
-**For large projects** (10k+ files), use targeted globs to avoid scan timeouts. Each pass processes ~80–100 files in 480s then auto-resumes. Run separate passes per file type:
-```bash
-hive --bootstrap --glob "**/*.py"
-hive --bootstrap --glob "**/*.ts"
-hive --bootstrap --glob "**/*.tsx"
-```
+**Directory-scoped globs** — `Client/**/*.ts` correctly limits the scan to `Client/` only (does not match `signoz/foo.ts`). Uses `PurePosixPath.match()` for full path matching.
 
 **`AGNO_PROJECT` must be set in the active shell session** — the env var is read at Python import time so a User-level `SetEnvironmentVariable` only takes effect in new terminals:
 ```powershell
 $env:AGNO_PROJECT = "ekam"   # set for this session
-hive --bootstrap --glob "**/*.py"
+hive --bootstrap
 ```
 Without this, `detect_project()` falls back to the git remote name (e.g. `EkamApp`) and creates a separate LightRAG workspace.
 
 **How `index_project` works (current implementation):**
-- **File scan**: `os.walk` with in-place directory pruning — `node_modules`, `.next`, `__pycache__`, `.venv` etc. are never descended into (unlike `Path.glob` which visits them before filtering)
-- **Change detection**: `mtime+size` via `os.stat()` — no file read required; ~23s for 11k files vs 64s for SHA-256 hashing
-- **Single LightRAG session**: one `streamablehttp_client` session shared across all inserts (vs. a new connection per chunk previously)
+- **File scan**: `os.walk` with in-place directory pruning — ignored dirs are never descended into
+- **Ignored directories**: `node_modules`, `.next`, `__pycache__`, `.venv`, `dist`, `build`, `signoz`, `graphify-out`, `infra`, and all hidden dirs (`.git`, etc.)
+- **Skipped extensions**: binaries, media, archives, `.lock`, `.pem`, `.key`, `.crt`, `.cer`, `.p12`, `.pfx`
+- **Change detection**: `mtime+size` via `os.stat()` — no file read required
+- **Single LightRAG session**: one `streamablehttp_client` session shared across all inserts
 - **Incremental saves**: state written after every file — `Ctrl+C` is safe, next run resumes from last completed file
 - **Time budget**: stops at `time_budget_seconds` (default 480s) and returns `Partial — N files remaining` so the CLI can loop
 
@@ -800,12 +760,12 @@ class User(Base):
 ### Checking Index Progress
 
 ```bash
-# On ZGX — how many docs are processed
+# On ZGX — how many docs are processed for a specific workspace
 docker exec agno-postgres-age psql -U agno -d agno_graph \
-  -c "SELECT status, count(*) FROM agno.lightrag_doc_status GROUP BY status;"
+  -c "SELECT status, count(*) FROM agno.lightrag_doc_status WHERE workspace='ekam' GROUP BY status ORDER BY status;"
 
-# Tail live log (index_via_mcp.py)
-tail -f ~/agno-hive/index.log | grep -v "^INFO"
+# Tail live log (ZGX-side indexer)
+tail -f /tmp/agno-hive-index.log
 ```
 
 ### Re-indexing After Code Changes
@@ -874,34 +834,42 @@ If `AGNO_PROJECT` is unset, `detect_project()` may return the git repo name (e.g
 
 ### Wiping and Re-indexing
 
-Required when switching from unscoped (legacy `workspace=default`) to scoped storage:
+> ⚠️ **Always ask the user for confirmation before running any of these commands.** See the DB Safety Rule in the Troubleshooting section.
+
+Use **scoped DELETE** (not TRUNCATE) to remove data for a single workspace without affecting others:
 
 ```bash
-# 1. Stop any running indexer
-pkill -f "index_via_mcp.py"
+# 1. Delete PostgreSQL data for one workspace only
+docker exec agno-postgres-age psql -U agno -d agno_graph -c "
+DELETE FROM agno.lightrag_doc_status WHERE workspace='ekam';
+DELETE FROM agno.lightrag_doc_chunks WHERE workspace='ekam';
+DELETE FROM agno.lightrag_doc_full WHERE workspace='ekam';
+DELETE FROM agno.lightrag_entity_chunks WHERE workspace='ekam';
+DELETE FROM agno.lightrag_full_entities WHERE workspace='ekam';
+DELETE FROM agno.lightrag_full_relations WHERE workspace='ekam';
+DELETE FROM agno.lightrag_llm_cache WHERE workspace='ekam';
+DELETE FROM agno.lightrag_relation_chunks WHERE workspace='ekam';"
 
-# 2. Truncate all PostgreSQL lightrag tables (keeps schema)
-docker exec agno-postgres-age psql -U agno -d agno_graph -c \
-  "TRUNCATE agno.lightrag_doc_status, agno.lightrag_doc_chunks, agno.lightrag_doc_full,
-   agno.lightrag_entity_chunks, agno.lightrag_full_entities, agno.lightrag_full_relations,
-   agno.lightrag_llm_cache, agno.lightrag_relation_chunks CASCADE;"
-
-# 3. Delete Qdrant collections
+# 2. Delete Qdrant collections for this workspace
 for col in lightrag_vdb_chunks_ekam_1024d lightrag_vdb_entities_ekam_1024d \
            lightrag_vdb_relationships_ekam_1024d; do
   curl -s -X DELETE "http://localhost:6333/collections/$col"
 done
 
-# 4. Delete index state files
-rm ~/.agno-hive/index-state/ekam.json
+# 3. Delete index state files
+rm ~/.agno-hive/index-state/ekam.json               # ZGX-side state
+# On Windows client: delete EkamApp/.hive-index-state/ekam.json
 
-# 5. Restart LightRAG MCP server (clears cached RAG instances)
-pkill -f "main.py --serve-lightrag"
-cd ~/agno-hive && nohup python3 main.py --serve-lightrag >> ~/lightrag.log 2>&1 &
+# 4. Restart LightRAG MCP server (clears cached RAG instances)
+pkill -f "serve-lightrag"
+cd ~/agno-hive && nohup python3 main.py --serve-lightrag >> /tmp/lightrag-server.log 2>&1 &
 
-# 6. Re-index
-python3 index_via_mcp.py --force --progress >> ~/ekam-index.log 2>&1 &
+# 5. Re-index via hive --bootstrap (client machine)
+$env:AGNO_PROJECT = "ekam"
+hive --bootstrap
 ```
+
+> **Warning:** `TRUNCATE` without a `WHERE` clause wipes ALL workspaces (ekam, agno-hive, global, etc.). Always use `DELETE FROM ... WHERE workspace='x'` for scoped removal.
 
 ## Human-in-the-Loop (HITL) Plan Review
 

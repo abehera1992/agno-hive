@@ -212,20 +212,25 @@ python main.py
 
 ### 6. Index a codebase into LightRAG
 
-**Option A — MCP-based indexer** (reads files via project MCP, no direct filesystem access needed):
-```bash
-python index_via_mcp.py                    # incremental — only changed files (SHA-256 tracked)
-python index_via_mcp.py --force            # full reindex from scratch
-python index_via_mcp.py --force --progress # full reindex with live progress bar (TTY)
+**Option A — hive-mcp bootstrap** (primary path — runs on client machine, no ZGX filesystem access needed):
+```powershell
+$env:AGNO_PROJECT = "ekam"
+hive --bootstrap                          # index all source files
+hive --bootstrap --force                  # full reindex from scratch
+hive --bootstrap --glob "Client/**/*.ts"  # scoped to a specific directory + extension
 ```
 
-State file: `~/.agno-hive/index-state/{project_id}.json`
+State file: `PROJECT_ROOT/.hive-index-state/{project_id}.json`
 
-**Option B — ZGX-side direct indexer** (requires filesystem access to the repo):
+Excluded automatically: `node_modules`, `.next`, `dist`, `build`, `signoz`, `graphify-out`, `infra`, hidden dirs, binaries, certs (`.pem`, `.key`, `.crt`).
+
+**Option B — ZGX-side direct indexer** (use when ZGX has direct filesystem access to the repo):
 ```bash
 python main.py --index --path /path/to/repo --project-id myproject
 python main.py --index --path /path/to/repo --project-id myproject --force
 ```
+
+State file: `~/.agno-hive/index-state/{project_id}.json`
 
 ---
 
@@ -416,21 +421,12 @@ Or without slash:
 
 Two paths — choose based on whether ZGX has direct filesystem access to the project:
 
-**MCP-based (recommended when ZGX can't reach the project filesystem):**
+**hive-mcp bootstrap — primary path (runs inside container on client machine):**
 ```bash
-# Run on ZGX from ~/agno-hive
-python index_via_mcp.py                    # incremental — skips unchanged files (SHA-256)
-python index_via_mcp.py --force --progress # full reindex with live progress bar
-```
-
-The script reads all files via the project MCP server (Streamable HTTP), pre-splits files >8 KB at language-aware boundaries (class/def/export) before inserting to avoid LLM worker timeouts, and saves a hash state file for fast incremental runs.
-
-**hive-mcp bootstrap (runs inside container on client machine):**
-```bash
+hive --bootstrap                           # index all source files
+hive --bootstrap --force                   # full reindex
+hive --bootstrap --glob "Client/**/*.ts"   # scoped to directory + extension
 hive --bootstrap --lightrag-url http://<zgx-tailscale-ip>:9002/mcp
-hive --bootstrap          # incremental
-hive --bootstrap --force  # full reindex
-hive --bootstrap --glob "**/*.py"  # Python only
 ```
 
 After indexing, agents query automatically when LightRAG MCP is connected:
@@ -684,7 +680,8 @@ git -C ~/agno-hive pull   # on ZGX
 | Agno framework alignment (per-agent tool scoping, Team flags, agent descriptions) | Done |
 | hive.md project context snapshot (`--scan`, auto-inject via bootstrap) | Done |
 | External-docs grounding rules (EVIDENCE + DESIGN-INTENT, read code before docs) | Done |
-| MCP-based indexer (`index_via_mcp.py`) — file hash tracker, progress bar, large-file pre-splitter | Done |
+| `hive --bootstrap` glob fix — directory-prefix globs (`Client/**/*.ts`) correctly scoped via `PurePosixPath.match()` | Done |
+| `hive --bootstrap` exclusions — `signoz/`, `graphify-out/`, `infra/`, cert/key file extensions excluded by default | Done |
 | LightRAG MCP server fix — `initialize_storages()` called before query/insert | Done |
 | MCP tool timeout raised 60s → 180s for LightRAG query synthesis | Done |
 | Engineering team model fix — replaced tool-incompatible deepseek-r1 (Planner) + gemma3:27b (Reviewer) | Done |
