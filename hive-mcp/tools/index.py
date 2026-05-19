@@ -19,12 +19,12 @@ _CHUNK_SIZE = 4000   # chars for non-Python files
 _IGNORE_DIRS = {
     ".git", "node_modules", "__pycache__", ".next", "dist", "build",
     ".venv", "venv", "env", ".mypy_cache", ".pytest_cache", "coverage",
-    ".tox", ".eggs", "signoz", "graphify-out",
+    ".tox", ".eggs", "signoz", "graphify-out", "infra",
 }
 _SKIP_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2",
     ".ttf", ".eot", ".bin", ".exe", ".dll", ".so", ".dylib", ".zip",
-    ".tar", ".gz", ".pdf", ".lock",
+    ".tar", ".gz", ".pdf", ".lock", ".pem", ".key", ".crt", ".cer", ".p12", ".pfx",
 }
 
 
