@@ -140,10 +140,14 @@ async def index_project(
 
     files_seen = files_skipped = chunks_sent = errors = files_indexed = 0
 
-    # Derive a simple filename pattern from the glob (e.g. "**/*.py" → "*.py").
-    # Directory pruning via os.walk makes the scan fast even on Docker Windows mounts.
+    # Match files against the full glob pattern (supports directory prefixes like
+    # "Client/**/*.ts"). PurePosixPath.match() handles ** correctly so
+    # "Client/**/*.ts" only matches files under Client/, not signoz/.
+    # _file_pat is a fast filename-only pre-filter to skip obvious non-matches cheaply.
     import fnmatch as _fnmatch
+    from pathlib import PurePosixPath
     _file_pat = glob_filter.split("/")[-1] if "/" in glob_filter else glob_filter
+    _dir_scoped = bool(glob_filter.split("/")[0].strip("*"))  # True when glob starts with a real dir name
 
     # Collect candidates — os.walk with in-place dir pruning avoids descending into
     # node_modules / .next / __pycache__ etc., which Path.glob visits before filtering.
@@ -163,6 +167,10 @@ async def index_project(
             try:
                 rel = p.relative_to(PROJECT_ROOT).as_posix()
             except ValueError:
+                continue
+            # Full glob match — enforces directory prefix (e.g. "Client/**/*.ts"
+            # must not match "signoz/foo.ts"). PurePosixPath.match() supports **.
+            if _dir_scoped and not PurePosixPath(rel).match(glob_filter):
                 continue
             files_seen += 1
             try:
