@@ -1074,6 +1074,15 @@ Run this once after initial index if queries return `[no results]` despite data 
 
 ## Troubleshooting
 
+### ⚠️ Database Safety Rule — Read Before Any DB Cleanup
+
+**Never truncate, drop, or delete data from PostgreSQL or Qdrant without explicit confirmation from the user.**
+This applies to all destructive operations: `TRUNCATE`, `DROP TABLE`, `DELETE FROM`, Qdrant `DELETE /collections/{name}`, and any bulk data removal.
+Always describe exactly what will be deleted (workspace, row count, collections) and wait for "yes, proceed" before executing.
+Workspace-scoped deletes (`DELETE FROM ... WHERE workspace='x'`) are still destructive and still require confirmation.
+
+> **Why:** A `TRUNCATE` without a `WHERE` clause wiped all LightRAG workspaces (ekam + agno-hive) when only ekam data was intended to be removed. Use `DELETE FROM ... WHERE workspace='x'` for scoped removal, and always confirm first.
+
 ### Agent returns HTTP 400 for tool calls
 
 Some Ollama models do not support tool/function calling. Confirmed broken:
