@@ -76,10 +76,10 @@ async def load_failure_context(project_id: str, limit: int = 3) -> str:
         if not failures:
             return ""
 
-        lines = ["── Past failures — avoid repeating these mistakes ──────────"]
+        lines = ["── Past failures (USER FEEDBACK) — read every point before writing code ──"]
         for task_text, err_type, err_msg in failures:
-            lines.append(f"  Task:  {task_text[:120]}")
-            lines.append(f"  Error: {err_type}: {err_msg[:120]}")
+            lines.append(f"  Task:  {task_text[:300]}")
+            lines.append(f"  Correction: {err_msg[:800]}")
             lines.append("")
         return "\n".join(lines)
     except Exception as exc:
