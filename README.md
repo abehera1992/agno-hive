@@ -584,12 +584,13 @@ All models are configurable via `.env` or `teams/*.yaml`. Models are swappable w
 
 ## Teams
 
-| Team | Agents | Used for |
-|---|---|---|
-| `engineering` | All 6 (default) | Full implementation tasks |
-| `planning` | ContextRouter + Researcher + Planner | HITL plan review via `POST /plan` |
+| Team | Agents | Mode | Used for |
+|---|---|---|---|
+| `engineering` | All 6 (default) | `coordinate` | Full implementation tasks |
+| `planning` | ContextRouter + Researcher + Planner | `coordinate` | HITL plan review via `POST /plan` |
+| `parallel-review` | Researcher + SecurityReviewer + PerformanceReviewer | `collaborate` | Read-only parallel analysis — all agents run simultaneously |
 
-Create a new team by adding a YAML file in `teams/` — no code changes needed.
+Create a new team by adding a YAML file in `teams/` — no code changes needed. Set `mode: collaborate` in the YAML to run all agents in parallel, or override per-request via the `mode` field in `POST /run`.
 
 ---
 
@@ -682,6 +683,8 @@ git -C ~/agno-hive pull   # on ZGX
 | External-docs grounding rules (EVIDENCE + DESIGN-INTENT, read code before docs) | Done |
 | `hive --bootstrap` glob fix — directory-prefix globs (`Client/**/*.ts`) correctly scoped via `PurePosixPath.match()` | Done |
 | `hive --bootstrap` exclusions — `signoz/`, `graphify-out/`, `infra/`, cert/key file extensions excluded by default | Done |
+| Team mode support — `mode` field in YAML + per-request override in `POST /run`; `coordinate`/`collaborate`/`route` | Done |
+| `parallel-review` team — Researcher + SecurityReviewer + PerformanceReviewer running simultaneously via `collaborate` mode | Done |
 | LightRAG MCP server fix — `initialize_storages()` called before query/insert | Done |
 | MCP tool timeout raised 60s → 180s for LightRAG query synthesis | Done |
 | Engineering team model fix — replaced tool-incompatible deepseek-r1 (Planner) + gemma3:27b (Reviewer) | Done |

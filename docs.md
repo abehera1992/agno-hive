@@ -134,6 +134,7 @@ Runs a task. Returns the result with session metadata.
 | `task` | string | required | The task or question |
 | `project_id` | string | `"default"` | Namespace for memory and failure tracking |
 | `team` | string | `"engineering"` | Team spec from `teams/*.yaml` |
+| `mode` | string | — | Override team mode: `"coordinate"` (default), `"collaborate"`, `"route"` |
 | `agents` | array | — | Inline agent specs (overrides team) |
 | `mcp_url` | string | — | Primary MCP (project context); overrides `MCP_URL` env var |
 | `mcp_urls` | list[string] | — | Additional MCPs (e.g. hive-mcp for host actions) |
@@ -141,6 +142,8 @@ Runs a task. Returns the result with session metadata.
 | `persist` | bool | `false` | Mark new session as permanent |
 
 **Resolution order for team:** `agents` inline > `team` named > default `engineering` team.
+
+**Mode resolution order:** `mode` in request > `mode` in team YAML > default `"coordinate"`.
 
 **Response:**
 ```json
@@ -188,6 +191,7 @@ Files in `teams/*.yaml` define reusable agent configurations.
 name: coding
 description: General-purpose coding assistant.
 coordinator_model: qwen3:30b-a3b   # optional, falls back to LEADER_MODEL
+mode: coordinate                   # optional: coordinate (default) | collaborate | route
 
 agents:
   - name: Coder
@@ -219,6 +223,17 @@ agents:
 
 ### Field reference
 
+**Top-level fields:**
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | yes | Team name — used in `POST /run` `team` field and `GET /teams` |
+| `description` | yes | One-line summary shown in `GET /teams` |
+| `coordinator_model` | no | Coordinator Ollama model; falls back to `LEADER_MODEL` env var |
+| `mode` | no | Agno Team mode: `coordinate` (default), `collaborate`, `route`. Can be overridden per-request via `mode` in `POST /run`. |
+
+**Agent fields:**
+
 | Field | Required | Description |
 |---|---|---|
 | `name` | yes | Agent name — shown in team output and used for delegation |
@@ -227,6 +242,14 @@ agents:
 | `instructions` | yes | List of instruction strings appended to the agent's system message |
 | `description` | no | One-sentence description prepended to the agent's own system message |
 | `tools` | no | Allowlist of MCP tool names. Only matching `Function` objects from connected MCPs are passed to the model. If absent or no names match, all MCP tools are used as fallback. |
+
+### Team modes
+
+| Mode | Behaviour |
+|---|---|
+| `coordinate` | Coordinator delegates to one member at a time sequentially (default) |
+| `collaborate` | All members receive the task simultaneously and work in parallel — best for read-only analysis where agents cover different concerns independently |
+| `route` | Task routed to a single best-fit agent with no coordinator overhead |
 
 ### How tool scoping works
 
