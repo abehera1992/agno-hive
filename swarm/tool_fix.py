@@ -48,24 +48,37 @@ class OllamaToolFix(Ollama):
                     pass
             return calls
 
-        # Format 3 / 4: bare JSON objects
+        # Format 3 / 4: bare JSON objects at start of content
         stripped = content.strip()
-        if not stripped.startswith("{"):
-            return calls
+        if stripped.startswith("{"):
+            decoder = json.JSONDecoder()
+            pos = 0
+            while pos < len(stripped):
+                remaining = stripped[pos:].lstrip()
+                if not remaining:
+                    break
+                skipped = len(stripped[pos:]) - len(remaining)
+                try:
+                    obj, end = decoder.raw_decode(remaining)
+                    calls.append(obj)
+                    pos += skipped + end
+                except json.JSONDecodeError:
+                    break
 
-        decoder = json.JSONDecoder()
-        pos = 0
-        while pos < len(stripped):
-            remaining = stripped[pos:].lstrip()
-            if not remaining:
-                break
-            skipped = len(stripped[pos:]) - len(remaining)
-            try:
-                obj, end = decoder.raw_decode(remaining)
-                calls.append(obj)
-                pos += skipped + end
-            except json.JSONDecodeError:
-                break
+        # Format 5: tool-call JSON embedded in prose
+        # qwen2.5-coder sometimes wraps {"name":..., "arguments":...} in explanatory text
+        if not calls:
+            import re
+            decoder = json.JSONDecoder()
+            for match in re.finditer(r'\{"name"\s*:', content):
+                try:
+                    obj, _ = decoder.raw_decode(content[match.start():])
+                    if isinstance(obj, dict) and obj.get("name") and (
+                        "arguments" in obj or "parameters" in obj
+                    ):
+                        calls.append(obj)
+                except json.JSONDecodeError:
+                    continue
 
         return calls
 
