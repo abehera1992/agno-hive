@@ -16,6 +16,7 @@ class RunRequest(BaseModel):
     task: str
     project_id: str = "default"
     team: str | None = None
+    mode: str | None = None               # team mode override: "coordinate" | "collaborate" | "route"
     agents: list[AgentSpec] | None = None
     mcp_url: str | None = None            # primary MCP — project context + app-specific tools
     mcp_urls: list[str] | None = None     # secondary MCPs — e.g. hive-mcp for host actions

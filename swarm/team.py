@@ -208,6 +208,7 @@ async def run_task_stream(
     mcp_urls: list[str] | None = None,
     project_id: str = "default",
     session_id: str | None = None,
+    mode: str = "coordinate",
 ):
     """Same setup as run_task_async but yields text chunks as the coordinator generates them.
 
@@ -278,7 +279,7 @@ async def run_task_stream(
 
         team = Team(
             name="AgnoHive",
-            mode="coordinate",
+            mode=mode,
             model=get_model(effective_coordinator, config.ollama_host),
             members=members,
             tools=mcp_list,
@@ -330,6 +331,7 @@ async def run_task_async(
     mcp_urls: list[str] | None = None,   # secondary MCPs (e.g. hive-mcp for host actions)
     project_id: str = "default",
     session_id: str | None = None,
+    mode: str = "coordinate",
 ) -> str:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer."""
     effective_mcp_url = mcp_url or config.mcp_url
@@ -398,7 +400,7 @@ async def run_task_async(
 
         team = Team(
             name="AgnoHive",
-            mode="coordinate",
+            mode=mode,
             model=get_model(effective_coordinator, config.ollama_host),
             members=members,
             tools=mcp_list,

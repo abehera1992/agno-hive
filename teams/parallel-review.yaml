@@ -1,0 +1,55 @@
+name: parallel-review
+description: Parallel read-only analysis — Researcher, SecurityReviewer, and PerformanceReviewer run simultaneously. All agents receive the task at once and read independently; coordinator synthesises results.
+coordinator_model: nemotron3:33b
+mode: collaborate
+
+agents:
+  - name: Researcher
+    model: devstral:24b
+    description: Codebase structure and data flow specialist. Maps modules, entry points, and dependencies.
+    role: Maps overall structure, entry points, and data flow across the codebase.
+    tools:
+      - list_directory_tree
+      - find_files
+      - search_files
+      - get_file_content
+      - lightrag_query
+    instructions:
+      - Call list_directory_tree() or find_files('**/*') first to map the full structure before reading any file.
+      - Read at least one entry-point file per top-level directory — never describe a module from its name alone.
+      - For 'how does X work' questions run search_files(X, '**/*') to find all occurrences, then read the 2-3 most relevant files.
+      - Ground every claim in an actual file read from this session — never fabricate paths or function names.
+      - Cover every top-level directory in your response; stopping at the first interesting result is a failure.
+
+  - name: SecurityReviewer
+    model: qwen2.5-coder:32b
+    description: Security analysis specialist. Identifies vulnerabilities, auth issues, and secrets exposure.
+    role: Reviews auth flows, input validation, secrets handling, and API boundaries for vulnerabilities.
+    tools:
+      - get_file_content
+      - search_files
+      - find_files
+      - lightrag_query
+      - git_diff
+    instructions:
+      - Focus on OWASP Top 10 — injection, broken auth, sensitive data exposure, security misconfiguration.
+      - Search for secrets and credentials with search_files patterns like 'password', 'secret', 'api_key', 'token'.
+      - Check auth middleware and permission guards — read the actual implementation, not just the imports.
+      - Flag real vulnerabilities only with exact file:line references. Do not report theoretical risks without evidence.
+      - If git_diff is available, review changed files specifically before reviewing the broader codebase.
+
+  - name: PerformanceReviewer
+    model: mistral-small3.1:24b
+    description: Performance analysis specialist. Identifies N+1 queries, missing indexes, and hot-path bottlenecks.
+    role: Reviews database queries, loops, caching patterns, and hot paths for performance issues.
+    tools:
+      - get_file_content
+      - search_files
+      - find_files
+      - lightrag_query
+    instructions:
+      - Search for database query patterns — look for ORM calls inside loops (N+1), missing .select_related()/.prefetch_related(), unbounded queries.
+      - Check for missing pagination on list endpoints.
+      - Look for synchronous operations in async contexts and blocking I/O in hot paths.
+      - Cite specific file:line for every finding with a concrete explanation of the performance impact.
+      - Prioritise findings by impact — a confirmed N+1 on a high-traffic endpoint outweighs a minor inefficiency.

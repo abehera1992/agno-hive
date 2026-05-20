@@ -46,7 +46,8 @@ def _load_team(name: str) -> tuple[list[AgentSpec], str]:
     data = yaml.safe_load(path.read_text())
     agents = [AgentSpec(**a) for a in data["agents"]]
     coordinator = data.get("coordinator_model", config.leader_model)
-    return agents, coordinator
+    mode = data.get("mode", "coordinate")
+    return agents, coordinator, mode
 
 
 @app.on_event("startup")
@@ -89,12 +90,15 @@ async def run(request: RunRequest):
     if request.agents:
         agent_specs = request.agents
         coordinator_model = config.leader_model
+        team_mode = request.mode or "coordinate"
         team_name = request.team or "custom"
     elif request.team:
-        agent_specs, coordinator_model = _load_team(request.team)
+        agent_specs, coordinator_model, team_mode = _load_team(request.team)
+        team_mode = request.mode or team_mode  # request-level override wins
         team_name = request.team
     else:
-        agent_specs, coordinator_model = _load_team("engineering")
+        agent_specs, coordinator_model, team_mode = _load_team("engineering")
+        team_mode = request.mode or team_mode
         team_name = "engineering"
 
     all_models = list({coordinator_model} | {a.model for a in agent_specs})
@@ -127,6 +131,7 @@ async def run(request: RunRequest):
         mcp_urls=request.mcp_urls,
         project_id=request.project_id,
         session_id=session_id,
+        mode=team_mode,
     )
 
     # Append this turn to session
@@ -174,7 +179,7 @@ async def plan(request: RunRequest):
     Used by the hive CLI --review flag for human-in-the-loop approval before execution.
     """
     start = time.perf_counter()
-    agent_specs, coordinator_model = _load_team("planning")
+    agent_specs, coordinator_model, _ = _load_team("planning")
     mcp_url = request.mcp_url or config.mcp_url
 
     all_models = list({coordinator_model} | {a.model for a in agent_specs})
@@ -210,10 +215,13 @@ async def stream_endpoint(request: RunRequest):
     if request.agents:
         agent_specs = request.agents
         coordinator_model = config.leader_model
+        stream_mode = request.mode or "coordinate"
     elif request.team:
-        agent_specs, coordinator_model = _load_team(request.team)
+        agent_specs, coordinator_model, stream_mode = _load_team(request.team)
+        stream_mode = request.mode or stream_mode
     else:
-        agent_specs, coordinator_model = _load_team("engineering")
+        agent_specs, coordinator_model, stream_mode = _load_team("engineering")
+        stream_mode = request.mode or stream_mode
 
     mcp_url = request.mcp_url or config.mcp_url
 
@@ -242,6 +250,7 @@ async def stream_endpoint(request: RunRequest):
                 mcp_urls=request.mcp_urls,
                 project_id=request.project_id,
                 session_id=session_id,
+                mode=stream_mode,
             ):
                 if isinstance(chunk, str):
                     yield f"data: {_json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
