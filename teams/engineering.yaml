@@ -1,6 +1,6 @@
 name: engineering
 description: Full engineering team — routes context, researches codebase, plans, implements, executes, and reviews.
-coordinator_model: nemotron3:33b
+coordinator_model: qwen2.5-coder:32b
 
 agents:
   - name: ContextRouter
