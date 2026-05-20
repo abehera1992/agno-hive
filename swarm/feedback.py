@@ -14,6 +14,7 @@ async def record_success(task: str, result: str, project_id: str) -> None:
     try:
         from lightrag_mcp.rag import get_rag
         rag = get_rag(project_id)
+        await rag.initialize_storages()
         text = (
             f"Past task outcome (SUCCESS)\n"
             f"Project: {project_id}\n"

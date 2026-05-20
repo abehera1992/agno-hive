@@ -6,10 +6,11 @@ from pathlib import Path
 import yaml
 from fastapi import FastAPI, HTTPException
 
-from api.models import AgentSpec, RunRequest, RunResponse, PlanResponse, ScanRequest, ScanResponse
+from api.models import AgentSpec, RunRequest, RunResponse, PlanResponse, ScanRequest, ScanResponse, FeedbackRequest, FeedbackResponse
 from fastapi.responses import StreamingResponse
 from swarm.ollama import ensure_models
 from swarm.team import run_task_async, run_task_stream
+from swarm.feedback import record_failure, record_success
 from config.config import config
 from observability.setup import setup_telemetry
 from swarm.sessions import (
@@ -408,3 +409,23 @@ async def persist_session_endpoint(session_id: str):
     if not updated:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"persisted": session_id}
+
+
+@app.post("/feedback", response_model=FeedbackResponse)
+async def feedback(request: FeedbackRequest):
+    """Record human feedback on a hive output. Bad ratings inject the correction
+    into the coordinator instructions on the next run for this project."""
+    if request.rating == "bad":
+        await record_failure(
+            request.task,
+            f"[USER FEEDBACK] {request.notes}",
+            request.project_id,
+            agent="output_quality",
+        )
+        return FeedbackResponse(
+            recorded=True,
+            message="Correction recorded — will be injected into next run for this project",
+        )
+    else:
+        await record_success(request.task, request.notes or "user marked as correct", request.project_id)
+        return FeedbackResponse(recorded=True, message="Success pattern recorded to memory")

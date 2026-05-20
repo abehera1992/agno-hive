@@ -89,3 +89,16 @@ class SessionDetail(BaseModel):
     summary: str | None
     message_count: int
     messages: list[SessionMessage]
+
+
+class FeedbackRequest(BaseModel):
+    session_id: str = ""
+    task: str
+    project_id: str = "default"
+    rating: str  # "good" or "bad"
+    notes: str = ""  # specific correction or praise
+
+
+class FeedbackResponse(BaseModel):
+    recorded: bool
+    message: str
