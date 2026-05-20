@@ -66,7 +66,7 @@ agno-hive/
 | Variable | Default | Description |
 |---|---|---|
 | `OLLAMA_HOST` | `` | Ollama server URL, e.g. `http://<zgx-ip>:11434` |
-| `LEADER_MODEL` | `nemotron3:33b` | Coordinator agent model |
+| `LEADER_MODEL` | `qwen2.5-coder:32b` | Coordinator agent model (overridden per-team via `coordinator_model` in YAML) |
 | `CODER_MODEL` | `qwen2.5-coder:32b` | Coder agent model |
 | `REVIEWER_MODEL` | `qwen2.5-coder:32b` | Reviewer agent model |
 | `PLANNER_MODEL` | `mistral-small3.1:24b` | Planner agent model |
@@ -182,6 +182,33 @@ Runs the planning team (ContextRouter + Researcher + Planner) and returns a step
 | `GET` | `/sessions/{id}` | Full session with all messages and summary |
 | `DELETE` | `/sessions/{id}` | Hard delete (including persisted sessions) |
 | `PATCH` | `/sessions/{id}/persist` | Mark session as permanent |
+
+### `POST /feedback`
+
+Submit human feedback on a hive output. Closes the self-improving loop beyond just technical errors.
+
+**Request:**
+```json
+{
+  "session_id": "optional-uuid",
+  "task": "description of the task that was run",
+  "project_id": "EkamApp",
+  "rating": "bad",
+  "notes": "specific correction — e.g. __table_args__ tuple must have dict last, not first"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `session_id` | string | Optional — links feedback to a specific run |
+| `task` | string | Task description (used as the failure_log `task` field) |
+| `project_id` | string | Project namespace — must match the project used in `/run` |
+| `rating` | string | `"bad"` or `"good"` |
+| `notes` | string | Correction text (bad) or confirmation note (good) |
+
+**Behaviour:**
+- `rating=bad` → writes `[USER FEEDBACK] <notes>` to `failure_log` with `agent=output_quality` → injected into coordinator instructions on the next `/run` for this project
+- `rating=good` → calls `record_success()` → stores pattern to LightRAG for future recall
 
 ## Team YAML Format
 
@@ -1085,7 +1112,7 @@ Some Ollama models do not support tool/function calling. Confirmed broken:
 
 **Fix available:** Ollama 0.24.0 (released 2026-05-14) includes improved GB10 / Blackwell support and explicit qwen3 fixes. After upgrading, test `qwen3:30b` (dense, NOT `a3b`).
 
-**Current workaround (in effect):** `nemotron3:33b` as coordinator (Llama architecture, ARM-safe) and `llama3.1:8b` as ContextRouter — set in `~/agno-hive/.env`.
+**Current fix (in effect):** `qwen2.5-coder:32b` as coordinator for all teams — set via `coordinator_model` in each `teams/*.yaml`. `nemotron3:33b` was initially used as coordinator but was found to get stuck at 100–130% CPU in Ollama 0.24.0 when the `--ollama-engine` backend is selected for large file reads + large diff generation tasks (the llama.cpp runner handles these correctly). `qwen2.5-coder:32b` uses llama.cpp on ARM64 GB10 and is stable across all task types.
 
 If Ollama becomes unresponsive due to a stuck runner, restart the service (requires sudo):
 ```bash
@@ -1177,15 +1204,9 @@ Kill stuck runners: `sudo kill <runner-pid>` (find with `ps aux | grep "ollama r
 
 If timeouts persist after the glob fix, check that the hive-mcp container is running the latest image (`docker compose -f docker-compose.hive.yml pull && docker compose up -d`).
 
-### `record_success` LightRAG warning
+### `record_success` LightRAG warning — FIXED
 
-`swarm/feedback.py`'s `record_success()` tries to insert the task result into LightRAG directly (not via the MCP server). This uses the same `get_rag()` factory but does not call `initialize_storages()`. The result is a non-blocking warning in the log:
-
-```
-[feedback] record_success warning: 'NoneType' object has no attribute 'query'
-```
-
-This is cosmetic — task results are not lost; the failure log and session history are unaffected. Fix pending: add `initialize_storages()` call to `feedback.py`.
+`swarm/feedback.py`'s `record_success()` now calls `initialize_storages()` before `ainsert()`. The previous silent NoneType failure has been resolved — successful run patterns are now stored correctly to LightRAG.
 
 ## Running Tests
 

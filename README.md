@@ -564,13 +564,31 @@ curl -X DELETE "http://localhost:9001/sessions/<id>"
 curl -X PATCH "http://localhost:9001/sessions/<id>/persist"
 ```
 
+### Submit output feedback (self-improving loop)
+```bash
+# Mark an output as incorrect — correction is injected into next run for this project
+curl -X POST http://localhost:9001/feedback \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "<session-id>",
+    "task": "write migration for auth.users",
+    "project_id": "EkamApp",
+    "rating": "bad",
+    "notes": "__table_args__ tuple must have dict last, not first — (UniqueConstraint(...), {schema})"
+  }'
+
+# Mark an output as correct — stored in LightRAG for future pattern recall
+curl -X POST http://localhost:9001/feedback \
+  -d '{"task": "...", "project_id": "EkamApp", "rating": "good", "notes": "migration applied cleanly"}'
+```
+
 ---
 
 ## Agent Roster
 
 | Agent | Model | Role |
 |---|---|---|
-| Coordinator | `nemotron3:33b` | Routes tasks, synthesises results |
+| Coordinator | `qwen2.5-coder:32b` | Routes tasks, synthesises results |
 | ContextRouter | `llama3.1:8b` | Picks the right memory/search backend |
 | Researcher | `devstral:24b` | Reads and summarises the codebase |
 | Planner | `mistral-small3.1:24b` | Breaks tasks into ordered steps |
@@ -579,6 +597,8 @@ curl -X PATCH "http://localhost:9001/sessions/<id>/persist"
 | Reviewer | `qwen2.5-coder:32b` | Reviews code for correctness and security |
 
 All models are configurable via `.env` or `teams/*.yaml`. Models are swappable without code changes — the YAML spec drives which model each agent uses.
+
+> **Note:** `nemotron3:33b` was previously used as coordinator but gets stuck at 100–130% CPU in Ollama 0.24.0 when the `--ollama-engine` backend is activated for large file reads + large diff generation. `qwen2.5-coder:32b` uses the stable llama.cpp backend on ARM64 GB10 and is reliable across all task types.
 
 ---
 
@@ -704,6 +724,9 @@ git -C ~/agno-hive pull   # on ZGX
 | ripgrep (`rg`) in `find_files` and `search_files` — both containers; Python fallback if rg absent | Done |
 | `agno_run` + `agno_list_teams` excluded from coordinator MCP tools via `exclude_tools` | Done |
 | `nemotron3:33b` promoted to coordinator — Llama-based 33B dense model, ARM-safe, replaces qwen3:30b-a3b + mistral-small3.1:24b workaround | Done |
+| `qwen2.5-coder:32b` replaces `nemotron3:33b` as coordinator for all teams — nemotron3 gets stuck at 100–130% CPU via `--ollama-engine` on Ollama 0.24.0 ARM64 under large-file tasks | Done |
+| `POST /feedback` endpoint — `rating=bad` injects correction into `failure_log` (coordinator sees it on next run); `rating=good` stores pattern to LightRAG | Done |
+| `record_success` fixed — `initialize_storages()` now called before `ainsert()`, eliminating silent NoneType failure on every successful run | Done |
 | Bootstrap removed from pre-load — coordinator calls `get_file_content('hive.md')` as first tool action; eliminates "I already know" no-tool-call loop | Done |
 | `exclude_tools` scoped to project-mcp only — hive-mcp never receives `exclude_tools` (fixes 0-tools bug in agno 2.5.17 when listed names absent) | Done |
 | fastmcp upgraded to `>=3.2.0` in hive-mcp — required for agno `MCPTools` compatibility (fastmcp 2.x was incompatible) | Done |
