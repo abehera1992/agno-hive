@@ -25,6 +25,7 @@ _SKIP_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2",
     ".ttf", ".eot", ".bin", ".exe", ".dll", ".so", ".dylib", ".zip",
     ".tar", ".gz", ".pdf", ".lock", ".pem", ".key", ".crt", ".cer", ".p12", ".pfx",
+    ".tsbuildinfo",
 }
 
 
