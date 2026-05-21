@@ -1,6 +1,6 @@
 name: engineering
 description: Full engineering team — routes context, researches codebase, plans, implements, executes, and reviews.
-coordinator_model: qwen2.5-coder:7b
+coordinator_model: kimi-k2.6:cloud
 
 agents:
   - name: ContextRouter
