@@ -1,6 +1,6 @@
 name: engineering
 description: Full engineering team — routes context, researches codebase, plans, implements, executes, and reviews.
-coordinator_model: mistral-small3.1:24b
+coordinator_model: devstral:24b
 
 agents:
   - name: ContextRouter
