@@ -1,6 +1,6 @@
 name: engineering
 description: Full engineering team — routes context, researches codebase, plans, implements, executes, and reviews.
-coordinator_model: ibm/granite4.1:8b
+coordinator_model: ibm/granite4.1:30b
 
 agents:
   - name: ContextRouter
