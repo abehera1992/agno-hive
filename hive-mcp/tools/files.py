@@ -139,9 +139,11 @@ def apply_diff(relative_path: str, old_string: str, new_string: str) -> str:
             diff = _inline_diff(target, proposed) if _IN_DOCKER else ""
             diff_section = f"\n\nProposed diff:\n```diff\n{diff}\n```" if diff else ""
             return (
-                f"review_pending: {relative_path}{diff_section}\n"
-                f"You may continue with more apply_diff calls to this same file.\n"
-                f"STOP and report 'review_pending' only after ALL changes to this file are staged."
+                f"review_pending: {relative_path} — this change is now staged.{diff_section}\n"
+                f"If you have MORE changes for this file: call get_file_content('{relative_path}.hive_proposed') "
+                f"to see the current staged state, then apply ONLY the NEXT distinct change not yet staged.\n"
+                f"DO NOT re-apply a change that is already in the staged file.\n"
+                f"STOP and report 'review_pending: {relative_path}' only when ALL changes to this file are complete."
             )
 
         target.write_text(proposed_content, encoding="utf-8")
