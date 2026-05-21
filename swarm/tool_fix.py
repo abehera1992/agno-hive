@@ -5,7 +5,14 @@ Supported formats:
   2. <|python_tag|>{"type": "function", "name": ..., "parameters": ...} (llama3.3)
   3. {"name": ..., "arguments": ...} bare JSON (qwen2.5 non-streaming)
   4. Multiple bare JSON objects concatenated with whitespace
+  5. JSON embedded in prose (qwen2.5-coder in explanatory text)
+
+NOTE: agno-internal tools (delegate_task_to_member, delegate_task_to_members) are
+intentionally excluded from MCP tool call interception so agno can handle them natively.
 """
+
+# agno team internal tools — do not strip from content, let agno handle natively
+_AGNO_INTERNAL_TOOLS = {"delegate_task_to_member", "delegate_task_to_members", "get_member_information"}
 import json
 import re
 from typing import Any
@@ -85,6 +92,9 @@ class OllamaToolFix(Ollama):
         result = []
         for call in parsed:
             name = call.get("name") or call.get("function", {}).get("name")
+            # Skip agno-internal tools — agno handles these natively, not via MCP
+            if name in _AGNO_INTERNAL_TOOLS:
+                continue
             # Support "arguments" (qwen2.5), "parameters" (llama3.3), or nested "function.arguments"
             args = (
                 call.get("arguments")
