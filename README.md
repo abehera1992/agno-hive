@@ -16,7 +16,7 @@ hive-mcp  ◄──────────────────────�
   index_project
   scan_project_context → hive.md
   web_search / web_fetch                ──────────────────────────────────────
-                                           Coordinator (nemotron3:33b)
+                                           Coordinator (ibm/granite4.1:30b)
 project MCP  ◄───────────────────────────  orchestrates all agents
   get_file_content
   find_files
@@ -50,11 +50,10 @@ project MCP  ◄─────────────────────�
 
 ### Ollama Models (pull before first run)
 ```bash
-ollama pull nemotron3:33b          # Coordinator (Llama-based, ARM-safe)
+ollama pull ibm/granite4.1:30b     # Coordinator — native tool calling, dense model, ARM64 safe
 ollama pull llama3.1:8b            # ContextRouter + Executor + session compaction
 ollama pull devstral:24b           # Researcher
 ollama pull mistral-small3.1:24b   # Planner
-ollama pull llama3.1:8b            # LightRAG entity extraction (stable on GB10)
 ollama pull qwen2.5-coder:32b      # Coder + Reviewer
 ollama pull qwen3-embedding:0.6b   # LightRAG embeddings
 ```
@@ -63,7 +62,12 @@ All agents run local Ollama models. Set any model via env var (e.g. `CODER_MODEL
 
 > **Note:** `deepseek-r1`, `gemma3:27b`, and `mixtral:8x7b` are no longer used — all return HTTP 400 for tool calls in Ollama.
 >
-> **qwen3 ARM64 workaround (Ollama ≥0.24.0 fix available):** `qwen3:30b-a3b` (MoE) crashes on GB10 on Ollama ≤0.23.4 — the new `ollama-engine` required by MoE models segfaults on ARM64 GPU backend. **Fix path:** upgrade to Ollama 0.24.0 (released 2026-05-14) and use `qwen3:30b` (dense, legacy llama.cpp runner, ARM-safe) as coordinator. Current workaround: `nemotron3:33b` as coordinator, `llama3.1:8b` as ContextRouter — set in `~/agno-hive/.env`.
+> **ARM64 GB10 model compatibility:**
+> - `ibm/granite4.1:30b` — ✅ Dense model, native tool calling, stable on GB10. Current coordinator.
+> - `qwen2.5-coder:32b` — ✅ Reliable tool use but causes CUDA crash after ~14 min continuous inference on GB10.
+> - `nemotron3:33b` — ❌ Gets stuck at 100–130% CPU under `--ollama-engine` on GB10 (Ollama 0.24.0).
+> - `qwen3:30b-a3b`, `gemma4:26b/31b` — ❌ MoE models segfault on GB10 ARM64 in Ollama.
+> - `devstral:24b`, `mistral-small3.1:24b`, `lfm2:24b` — ✅ Work fine but cannot orchestrate as coordinator (lack multi-step delegation capability).
 
 ### Client Machine
 - Docker (for hive-mcp)
@@ -400,6 +404,26 @@ When hive-mcp has `WRITE_REVIEW=true`, every file write is staged for your appro
 # Arrow keys ↑/↓ to choose, Enter to confirm
 ```
 
+#### Multi-step changes to the same file
+
+When the Coder needs to make two related changes to one file (e.g. add an import AND add a function call), it makes two sequential `apply_diff` calls. Each call accumulates into the same `.hive_proposed` file:
+
+1. First `apply_diff` → import line updated → staged in `.hive_proposed` → `review_pending`
+2. Coder reads `.hive_proposed` to verify → applies second diff on top → `review_pending`
+3. You confirm **once** and both changes land together
+
+The review dialog fires only after the task completes — not between individual diffs — so you see the combined result. This is handled by Guard 11 in `patterns/ekam-code-generation-guards.md`.
+
+#### Updating hive-mcp after code changes
+
+`docker restart hive-mcp` does **NOT** pick up a newly built image. After any `hive-mcp/**` push (which CI auto-builds):
+
+```powershell
+docker pull ghcr.io/abehera1992/hive-mcp:latest
+$env:PROJECT_PATH = "C:\path\to\your\project"
+docker compose -f docker-compose.hive.yml up -d --force-recreate
+```
+
 REPL commands for managing proposed files:
 
 ```bash
@@ -588,7 +612,7 @@ curl -X POST http://localhost:9001/feedback \
 
 | Agent | Model | Role |
 |---|---|---|
-| Coordinator | `qwen2.5-coder:32b` | Routes tasks, synthesises results |
+| Coordinator | `ibm/granite4.1:30b` | Routes tasks, delegates to agents, synthesises results |
 | ContextRouter | `llama3.1:8b` | Picks the right memory/search backend |
 | Researcher | `devstral:24b` | Reads and summarises the codebase |
 | Planner | `mistral-small3.1:24b` | Breaks tasks into ordered steps |
@@ -598,7 +622,7 @@ curl -X POST http://localhost:9001/feedback \
 
 All models are configurable via `.env` or `teams/*.yaml`. Models are swappable without code changes — the YAML spec drives which model each agent uses.
 
-> **Note:** `nemotron3:33b` was previously used as coordinator but gets stuck at 100–130% CPU in Ollama 0.24.0 when the `--ollama-engine` backend is activated for large file reads + large diff generation. `qwen2.5-coder:32b` uses the stable llama.cpp backend on ARM64 GB10 and is reliable across all task types.
+> **Coordinator model:** `ibm/granite4.1:30b` (IBM Granite 4.1) — selected for native OpenAI-compatible tool calling (no custom parsing), dense architecture (ARM64 GB10 safe, no segfault), and 30B reasoning capacity for multi-step orchestration. Runs each turn in ~2-4 minutes. Previous coordinator `qwen2.5-coder:32b` was reliable but caused CUDA illegal memory access after ~14 minutes of continuous inference.
 
 ---
 
