@@ -336,11 +336,17 @@ async def run_task_stream(
                 combined = "".join(full_content) or "(no response)"
                 tokens = _extract_tokens(last_event)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
-                await record_success(task, combined, project_id)
+                try:
+                    await record_success(task, combined, project_id)
+                except Exception:
+                    pass  # LightRAG indexing is best-effort; never crash the run
                 yield {"__done__": True, "content": combined, "tokens": tokens}
             except Exception as exc:
                 task_counter.add(1, {"project_id": project_id, "outcome": "failure"})
-                await record_failure(task, str(exc), project_id)
+                try:
+                    await record_failure(task, str(exc), project_id)
+                except Exception:
+                    pass  # LightRAG indexing is best-effort; never crash the run
                 raise
             finally:
                 task_duration.record(time.perf_counter() - t0, {"project_id": project_id})
@@ -460,13 +466,19 @@ async def run_task_async(
                 tokens = _extract_tokens(result)
                 span.set_status(trace.StatusCode.OK)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
-                await record_success(task, content, project_id)
+                try:
+                    await record_success(task, content, project_id)
+                except Exception:
+                    pass  # LightRAG indexing is best-effort; never crash the run
                 return content, tokens
             except Exception as exc:
                 span.record_exception(exc)
                 span.set_status(trace.StatusCode.ERROR, str(exc))
                 task_counter.add(1, {"project_id": project_id, "outcome": "failure"})
-                await record_failure(task, str(exc), project_id)
+                try:
+                    await record_failure(task, str(exc), project_id)
+                except Exception:
+                    pass  # LightRAG indexing is best-effort; never crash the run
                 raise  # callers receive (content, tokens) on success; exception on failure
             finally:
                 task_duration.record(
