@@ -68,7 +68,6 @@ class OllamaToolFix(Ollama):
         # Format 5: tool-call JSON embedded in prose
         # qwen2.5-coder sometimes wraps {"name":..., "arguments":...} in explanatory text
         if not calls:
-            import re
             decoder = json.JSONDecoder()
             for match in re.finditer(r'\{"name"\s*:', content):
                 try:
