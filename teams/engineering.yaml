@@ -1,6 +1,6 @@
 name: engineering
 description: Full engineering team — routes context, researches codebase, plans, implements, executes, and reviews.
-coordinator_model: devstral:24b
+coordinator_model: qwen2.5-coder:7b
 
 agents:
   - name: ContextRouter

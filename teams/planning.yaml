@@ -1,6 +1,6 @@
 name: planning
 description: Plan-only team — routes context, researches codebase, and produces a step-by-step plan without executing anything. Used by the HITL review flow.
-coordinator_model: devstral:24b
+coordinator_model: qwen2.5-coder:7b
 
 agents:
   - name: ContextRouter
