@@ -96,7 +96,10 @@ def apply_diff(relative_path: str, old_string: str, new_string: str) -> str:
     Fails safely if old_string is not found or appears more than once.
 
     When WRITE_REVIEW=true the proposed result is staged for human review.
-    STOP after receiving 'review_pending' — the human confirms via hive CLI.
+    You MAY make multiple apply_diff calls to the SAME file — each call
+    accumulates into the same .hive_proposed file so the human sees one
+    combined diff. STOP and report 'review_pending' only after ALL changes
+    to a file are complete, or before modifying a DIFFERENT file.
 
     IMPORTANT rules:
     - To APPEND after a line: include the anchor in BOTH old_string AND new_string.
@@ -104,6 +107,8 @@ def apply_diff(relative_path: str, old_string: str, new_string: str) -> str:
       new_string = 'last_line\\nnew_content'
     - To REPLACE a line: put only that line in old_string.
     - Never omit content from new_string unless intentionally deleting it.
+    - When adding a new symbol (class, function, variable): update the import
+      line FIRST, then add the usage — both as separate apply_diff calls.
 
     Args:
         relative_path: Path relative to project root
@@ -114,7 +119,13 @@ def apply_diff(relative_path: str, old_string: str, new_string: str) -> str:
     if not target.exists():
         return f"File not found: {relative_path}"
     try:
-        content = target.read_text(encoding="utf-8")
+        proposed = _proposed_path(target)
+
+        # If a staged version already exists, apply the diff on top of it
+        # so multiple apply_diff calls accumulate into one proposed file.
+        source = proposed if (WRITE_REVIEW and proposed.exists()) else target
+        content = source.read_text(encoding="utf-8")
+
         count = content.count(old_string)
         if count == 0:
             return f"apply_diff failed: old_string not found in {relative_path}"
@@ -124,13 +135,13 @@ def apply_diff(relative_path: str, old_string: str, new_string: str) -> str:
         proposed_content = content.replace(old_string, new_string, 1)
 
         if WRITE_REVIEW:
-            proposed = _proposed_path(target)
             proposed.write_text(proposed_content, encoding="utf-8")
             diff = _inline_diff(target, proposed) if _IN_DOCKER else ""
             diff_section = f"\n\nProposed diff:\n```diff\n{diff}\n```" if diff else ""
             return (
                 f"review_pending: {relative_path}{diff_section}\n"
-                f"The user will confirm or reject via the hive CLI."
+                f"You may continue with more apply_diff calls to this same file.\n"
+                f"STOP and report 'review_pending' only after ALL changes to this file are staged."
             )
 
         target.write_text(proposed_content, encoding="utf-8")
