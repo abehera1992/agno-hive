@@ -1,6 +1,6 @@
 name: parallel-review
 description: Parallel read-only analysis — Researcher, SecurityReviewer, and PerformanceReviewer run simultaneously. All agents receive the task at once and read independently; coordinator synthesises results.
-coordinator_model: qwen2.5-coder:32b
+coordinator_model: mistral-small3.1:24b
 mode: collaborate
 
 agents:

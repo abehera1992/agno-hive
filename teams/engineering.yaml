@@ -1,6 +1,6 @@
 name: engineering
 description: Full engineering team — routes context, researches codebase, plans, implements, executes, and reviews.
-coordinator_model: qwen2.5-coder:32b
+coordinator_model: mistral-small3.1:24b
 
 agents:
   - name: ContextRouter
@@ -122,7 +122,9 @@ agents:
       - Always read relevant files via get_file_content() before modifying code.
       - Follow patterns already established in the codebase.
       - "File editing rules: use apply_diff() for ALL edits to existing files. Use write_file() ONLY for brand-new files that do not exist yet."
-      - "If apply_diff() or write_file() returns 'review_pending', STOP immediately. Do not call any other tool. Report 'review_pending: <path>' back to the coordinator and wait for human confirmation."
+      - "When apply_diff() returns 'review_pending': call get_file_content('<path>.hive_proposed') to read the current staged state. Then apply ONLY the NEXT distinct change not already in the staged file. DO NOT re-apply a change that is already staged — check the staged file first."
+      - "Typical two-call pattern: (1) update the import line → read .hive_proposed to verify → (2) add the usage in the function body. These are TWO DIFFERENT changes; never repeat the same change twice."
+      - "STOP and report 'review_pending: <path>' to the coordinator only after ALL changes to the file are staged."
       - If memory_store is available via MCP, call it with a descriptive key after completing.
 
   - name: Executor
