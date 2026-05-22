@@ -115,6 +115,10 @@ def apply_diff(relative_path: str, old_string: str, new_string: str) -> str:
         old_string:    Exact text to replace (must appear exactly once)
         new_string:    Replacement text
     """
+    # Guard: models sometimes pass the staged path — strip the suffix silently
+    if relative_path.endswith(_PROPOSED_SUFFIX):
+        relative_path = relative_path[: -len(_PROPOSED_SUFFIX)]
+
     target = PROJECT_ROOT / relative_path
     if not target.exists():
         return f"File not found: {relative_path}"
