@@ -89,7 +89,7 @@ def write_file(relative_path: str, content: str) -> str:
         return f"write_file failed: {e}"
 
 
-def apply_diff(relative_path: str, old_string: str, new_string: str) -> str:
+def apply_diff(relative_path: str, old_string: str, new_string: str, preserve_indent: bool = False) -> str:
     """
     Surgical edit — replace an exact string in an existing file.
     Always call get_file_content() first to obtain the exact text to replace.
