@@ -124,11 +124,21 @@ def apply_diff(relative_path: str, old_string: str, new_string: str) -> str:
         # If a staged version already exists, apply the diff on top of it
         # so multiple apply_diff calls accumulate into one proposed file.
         source = proposed if (WRITE_REVIEW and proposed.exists()) else target
-        content = source.read_text(encoding="utf-8")
+        raw = source.read_text(encoding="utf-8")
+
+        # Normalize CRLF → LF so Windows-hosted files match Unix-style old_string.
+        # The final write uses the normalized form to keep the file LF-clean.
+        content = raw.replace("\r\n", "\n")
+        old_string = old_string.replace("\r\n", "\n")
+        new_string = new_string.replace("\r\n", "\n")
 
         count = content.count(old_string)
         if count == 0:
-            return f"apply_diff failed: old_string not found in {relative_path}"
+            return (
+                f"apply_diff failed: old_string not found in {relative_path}. "
+                f"Call get_file_content('{relative_path}') to read the current exact text, "
+                f"then retry with the correct old_string."
+            )
         if count > 1:
             return f"apply_diff failed: old_string appears {count} times — be more specific"
 

@@ -125,6 +125,7 @@ agents:
       - "When apply_diff() returns 'review_pending': call get_file_content('<path>.hive_proposed') to read the current staged state. Then apply ONLY the NEXT distinct change not already in the staged file. DO NOT re-apply a change that is already staged — check the staged file first."
       - "Typical two-call pattern: (1) update the import line → read .hive_proposed to verify → (2) add the usage in the function body. These are TWO DIFFERENT changes; never repeat the same change twice."
       - "STOP and report 'review_pending: <path>' to the coordinator only after ALL changes to the file are staged."
+      - "HARD RULE — apply_diff failure: If apply_diff() returns 'apply_diff failed:', the change was NOT made. Report the exact error verbatim to the coordinator and STOP. NEVER describe the change as applied or claim review_pending. Call get_file_content(path) to re-read the file, then retry with the exact matching text."
       - If memory_store is available via MCP, call it with a descriptive key after completing.
 
   - name: Executor
