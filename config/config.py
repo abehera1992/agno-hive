@@ -13,7 +13,6 @@ class Config:
     # Models — coordinator + full agent roster
     # NOTE: For API/hive calls the YAML team spec (teams/*.yaml) takes precedence.
     # These defaults apply only to CLI runs (python3 main.py "task") and custom agent calls.
-    # qwen3:30b-a3b and qwen3:8b are excluded — they crash on GB10 ARM (Ollama 0.17–0.23).
     leader_model: str = os.getenv("LEADER_MODEL", "qwen2.5-coder:32b")
     coder_model: str = os.getenv("CODER_MODEL", "qwen2.5-coder:32b")
     reviewer_model: str = os.getenv("REVIEWER_MODEL", "qwen2.5-coder:32b")

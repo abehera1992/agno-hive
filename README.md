@@ -65,8 +65,6 @@ All agents run local Ollama models. Set any model via env var (e.g. `CODER_MODEL
 > **ARM64 GB10 model compatibility:**
 > - `ibm/granite4.1:30b` — ✅ Dense model, native tool calling, stable on GB10. Current coordinator.
 > - `qwen2.5-coder:32b` — ✅ Reliable tool use but causes CUDA crash after ~14 min continuous inference on GB10.
-> - `nemotron3:33b` — ❌ Gets stuck at 100–130% CPU under `--ollama-engine` on GB10 (Ollama 0.24.0).
-> - `qwen3:30b-a3b`, `gemma4:26b/31b` — ❌ MoE models segfault on GB10 ARM64 in Ollama.
 > - `devstral:24b`, `mistral-small3.1:24b`, `lfm2:24b` — ✅ Work fine but cannot orchestrate as coordinator (lack multi-step delegation capability).
 
 ### Client Machine
