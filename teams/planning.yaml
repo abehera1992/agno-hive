@@ -73,7 +73,7 @@ agents:
       - Do NOT implement anything — research and summarise only.
 
   - name: Planner
-    model: mistral-small3.1:24b
+    model: qwen2.5-coder:32b
     description: Task decomposition specialist. Break complex tasks into numbered steps naming the responsible agent, files to touch, and risks.
     role: Senior engineer who decomposes tasks into actionable steps for the team.
     tools:

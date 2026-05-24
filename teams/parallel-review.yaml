@@ -39,7 +39,7 @@ agents:
       - If git_diff is available, review changed files specifically before reviewing the broader codebase.
 
   - name: PerformanceReviewer
-    model: mistral-small3.1:24b
+    model: qwen2.5-coder:32b
     description: Performance analysis specialist. Identifies N+1 queries, missing indexes, and hot-path bottlenecks.
     role: Reviews database queries, loops, caching patterns, and hot paths for performance issues.
     tools:
