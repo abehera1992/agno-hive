@@ -124,6 +124,8 @@ class OllamaToolFix(Ollama):
                 if tool_calls:  # only strip content if valid named tool calls found
                     model_response.tool_calls = tool_calls
                     model_response.content = ""
+                    for tc in tool_calls:
+                        print(f"[tool_fix] {tc.get('function',{}).get('name','?')}({list(tc.get('function',{}).get('arguments',{}).keys())})", flush=True)
 
         return model_response
 
