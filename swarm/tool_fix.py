@@ -115,6 +115,9 @@ class OllamaToolFix(Ollama):
         model_response = super()._parse_provider_response(response)
 
         if model_response.tool_calls:
+            for tc in (model_response.tool_calls or []):
+                name = getattr(getattr(tc, 'function', None), 'name', None) or (tc.get('function',{}).get('name','?') if isinstance(tc, dict) else '?')
+                print(f'[tool_fix:native] {name}', flush=True)
             return model_response
 
         if model_response.content:
@@ -133,6 +136,9 @@ class OllamaToolFix(Ollama):
         model_response = super()._parse_provider_response_delta(response)
 
         if model_response.tool_calls:
+            for tc in (model_response.tool_calls or []):
+                name = getattr(getattr(tc, 'function', None), 'name', None) or (tc.get('function',{}).get('name','?') if isinstance(tc, dict) else '?')
+                print(f'[tool_fix:native] {name}', flush=True)
             return model_response
 
         if model_response.content:
