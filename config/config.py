@@ -34,7 +34,7 @@ class Config:
     # LightRAG MCP server
     lightrag_mcp_port: int = int(os.getenv("LIGHTRAG_MCP_PORT", "9002"))
     lightrag_mcp_url: str = os.getenv("LIGHTRAG_MCP_URL", "http://localhost:9002/mcp")
-    lightrag_llm_model: str = os.getenv("LIGHTRAG_LLM_MODEL", "mistral-small3.1:24b")
+    lightrag_llm_model: str = os.getenv("LIGHTRAG_LLM_MODEL", "llama3.1:8b")
     lightrag_embed_model: str = os.getenv("LIGHTRAG_EMBED_MODEL", "qwen3-embedding:0.6b")
     lightrag_embed_dim: int = int(os.getenv("LIGHTRAG_EMBED_DIM", "1024"))
     lightrag_working_dir: str = os.getenv("LIGHTRAG_WORKING_DIR", os.path.expanduser("~/.agno-hive/lightrag"))

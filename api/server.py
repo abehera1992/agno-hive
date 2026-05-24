@@ -24,6 +24,14 @@ from swarm.sessions import (
 
 setup_telemetry()
 
+
+def _resolve_mcp_urls(request_urls, lightrag_url: str) -> list[str]:
+    """Always include LightRAG MCP so agents get lightrag_query without explicit opt-in."""
+    urls = list(request_urls or [])
+    if lightrag_url and lightrag_url not in urls:
+        urls.append(lightrag_url)
+    return urls or None
+
 app = FastAPI(title="AgnoHive", version="1.0.0")
 
 # Auto-instrument FastAPI — adds spans for every HTTP request
@@ -129,7 +137,7 @@ async def run(request: RunRequest):
         agent_specs=agent_specs,
         coordinator_model=coordinator_model,
         mcp_url=mcp_url,
-        mcp_urls=request.mcp_urls,
+        mcp_urls=_resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url),
         project_id=request.project_id,
         session_id=session_id,
         mode=team_mode,
@@ -191,7 +199,7 @@ async def plan(request: RunRequest):
         agent_specs=agent_specs,
         coordinator_model=coordinator_model,
         mcp_url=mcp_url,
-        mcp_urls=request.mcp_urls,
+        mcp_urls=_resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url),
         project_id=request.project_id,
     )
     return PlanResponse(
@@ -248,7 +256,7 @@ async def stream_endpoint(request: RunRequest):
                 agent_specs=agent_specs,
                 coordinator_model=coordinator_model,
                 mcp_url=mcp_url,
-                mcp_urls=request.mcp_urls,
+                mcp_urls=_resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url),
                 project_id=request.project_id,
                 session_id=session_id,
                 mode=stream_mode,
