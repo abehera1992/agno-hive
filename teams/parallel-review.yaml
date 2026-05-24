@@ -5,7 +5,7 @@ mode: collaborate
 
 agents:
   - name: Researcher
-    model: devstral:24b
+    model: qwen2.5-coder:32b
     description: Codebase structure and data flow specialist. Maps modules, entry points, and dependencies.
     role: Maps overall structure, entry points, and data flow across the codebase.
     tools:

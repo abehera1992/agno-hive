@@ -36,7 +36,7 @@ agents:
       - "Tool call limit: 1 for specific lookups. Up to 3 for overview/structure queries to ensure complete coverage."
 
   - name: Researcher
-    model: devstral:24b
+    model: qwen2.5-coder:32b
     description: Codebase investigation specialist. Read real files and ground every claim in file content — never describe from directory names alone.
     role: Senior engineer who investigates the codebase and surfaces relevant context.
     tools:

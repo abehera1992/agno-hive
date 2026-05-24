@@ -52,7 +52,7 @@ project MCP  ◄─────────────────────�
 ```bash
 ollama pull ibm/granite4.1:30b     # Coordinator — native tool calling, dense model, ARM64 safe
 ollama pull llama3.1:8b            # ContextRouter + Executor + session compaction
-ollama pull devstral:24b           # Researcher
+# ollama pull devstral:24b        # Researcher — replaced by qwen2.5-coder:32b (2026-05-24)
 ollama pull qwen2.5-coder:32b      # Coder + Reviewer + Planner
 ollama pull qwen2.5-coder:32b      # Coder + Reviewer
 ollama pull qwen3-embedding:0.6b   # LightRAG embeddings
@@ -65,7 +65,7 @@ All agents run local Ollama models. Set any model via env var (e.g. `CODER_MODEL
 > **ARM64 GB10 model compatibility:**
 > - `ibm/granite4.1:30b` — ✅ Dense model, native tool calling, stable on GB10. Current coordinator.
 > - `qwen2.5-coder:32b` — ✅ Reliable tool use but causes CUDA crash after ~14 min continuous inference on GB10.
-> - `devstral:24b` — ✅ Works fine but cannot orchestrate as coordinator.
+> - `devstral:24b` — Previously Researcher; replaced by `qwen2.5-coder:32b` (2026-05-24). Failed tool-calling discipline: hallucinated file content instead of reading via get_file_content().
 > - `mistral-small3.1:24b` — Previously used for Planner; replaced by `qwen2.5-coder:32b` (2026-05-24). 21% speed improvement from eliminating model-swap overhead.
 > - `lfm2:24b` — ✅ Reads files correctly but cannot orchestrate as coordinator.
 
@@ -614,7 +614,7 @@ curl -X POST http://localhost:9001/feedback \
 |---|---|---|
 | Coordinator | `ibm/granite4.1:30b` | Routes tasks, delegates to agents, synthesises results |
 | ContextRouter | `llama3.1:8b` | Picks the right memory/search backend |
-| Researcher | `devstral:24b` | Reads and summarises the codebase |
+| Researcher | `qwen2.5-coder:32b` | Reads and summarises the codebase |
 | Planner | `qwen2.5-coder:32b` | Breaks tasks into ordered steps |
 | Coder | `qwen2.5-coder:32b` | Implements features and fixes |
 | Executor | `llama3.1:8b` | Runs commands and validates results |
