@@ -88,32 +88,54 @@ def get_file_content(relative_path: str) -> str:
         return f"Could not read {relative_path}: {e}"
 
 
+# When PROJECT_ROOT is a monorepo, short paths like "src/lib/**" are often
+# relative to a subdirectory (e.g. the frontend root), not PROJECT_ROOT itself.
+# Try these prefixes in order before giving up.
+_GLOB_FALLBACK_PREFIXES = [
+    "Client/EcommClient-Web/ekamweb",  # src/lib/** → ekamweb/src/lib/**
+    "**",                               # src/lib/** → **/src/lib/**
+]
+
+
+def _rg_glob(rg: str, glob_pattern: str, max_results: int) -> list[str]:
+    import subprocess
+    result = subprocess.run(
+        [rg, "--files", "--glob", glob_pattern],
+        capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=30,
+    )
+    if not result.stdout and result.returncode not in (0, 1):
+        raise RuntimeError(result.stderr.strip())
+    return sorted([l for l in result.stdout.splitlines() if l.strip()][:max_results])
+
+
 def find_files(glob_pattern: str, max_results: int = 200) -> str:
     """
     Find files by glob pattern. Returns paths relative to project root.
     Uses ripgrep when available (fast, respects .gitignore); falls back to pathlib.
 
+    Short paths relative to the frontend root (e.g. 'src/lib/**') are automatically
+    resolved via fallback prefixes — agents do not need to know the full path.
+
     Args:
         glob_pattern: e.g. '**/*.py', 'src/**/*.ts', '**/docker-compose*.yml'
 
     Examples:
-        find_files('**/*.py')             → all Python files
-        find_files('src/**/*.ts')         → TypeScript in src/
-        find_files('**/Dockerfile*')      → all Dockerfiles
-        find_files('**/.env*')            → env files
+        find_files('**/*.py')               → all Python files
+        find_files('src/**/*.ts')           → TypeScript in src/ (auto-prefixed if needed)
+        find_files('src/lib/api/services/**') → frontend service files (auto-prefixed)
+        find_files('**/Dockerfile*')        → all Dockerfiles
+        find_files('**/.env*')              → env files
     """
-    import subprocess, shutil
+    import shutil
     rg = shutil.which("rg")
     if rg:
         try:
-            result = subprocess.run(
-                [rg, "--files", "--glob", glob_pattern],
-                capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=30,
-            )
-            lines = [l for l in result.stdout.splitlines() if l.strip()]
-            if not lines and result.returncode not in (0, 1):
-                raise RuntimeError(result.stderr.strip())
-            matches = sorted(lines[:max_results])
+            matches = _rg_glob(rg, glob_pattern, max_results)
+            if not matches:
+                for prefix in _GLOB_FALLBACK_PREFIXES:
+                    matches = _rg_glob(rg, f"{prefix}/{glob_pattern}", max_results)
+                    if matches:
+                        break
             if not matches:
                 return f"No matches for: {glob_pattern}"
             return f"{len(matches)} result(s) for '{glob_pattern}':\n" + "\n".join(matches)
@@ -121,13 +143,17 @@ def find_files(glob_pattern: str, max_results: int = 200) -> str:
             pass  # fall through to pathlib
 
     matches = []
+    patterns_to_try = [glob_pattern] + [f"{p}/{glob_pattern}" for p in _GLOB_FALLBACK_PREFIXES]
     try:
-        for p in sorted(PROJECT_ROOT.glob(glob_pattern)):
-            rel = p.relative_to(PROJECT_ROOT).as_posix()
-            if _is_ignored(rel):
-                continue
-            matches.append(rel + "/" if p.is_dir() else rel)
-            if len(matches) >= max_results:
+        for pat in patterns_to_try:
+            for p in sorted(PROJECT_ROOT.glob(pat)):
+                rel = p.relative_to(PROJECT_ROOT).as_posix()
+                if _is_ignored(rel):
+                    continue
+                matches.append(rel + "/" if p.is_dir() else rel)
+                if len(matches) >= max_results:
+                    break
+            if matches:
                 break
     except Exception as e:
         return f"find_files failed: {e}"
