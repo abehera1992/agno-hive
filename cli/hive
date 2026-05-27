@@ -397,6 +397,102 @@ def _prompt_confirm_reject(proposed: Path) -> None:
     print()
 
 
+# ── External platform action review ──────────────────────────────────────────
+
+_ACTION_PENDING_DIR = ".hive_pending_actions"
+
+
+def _find_pending_actions(root: Path) -> list[Path]:
+    action_dir = root / _ACTION_PENDING_DIR
+    if not action_dir.is_dir():
+        return []
+    return sorted(action_dir.glob("*.json"))
+
+
+def _hive_mcp_base() -> str:
+    """Derive hive-mcp base URL from AGNO_SYSTEM_MCP_URL (strips /mcp suffix)."""
+    url = AGNO_SYSTEM_MCP_URL.rstrip("/")
+    if url.endswith("/mcp"):
+        url = url[:-4]
+    return url
+
+
+def _confirm_action_remote(action_id: str) -> str:
+    """POST /actions/confirm to hive-mcp and return the result string."""
+    base = _hive_mcp_base()
+    if not base:
+        return "hive-mcp URL unknown — set AGNO_SYSTEM_MCP_URL"
+    payload = json.dumps({"action_id": action_id}).encode()
+    req = urllib.request.Request(
+        f"{base}/actions/confirm",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+            return data.get("result", str(data))
+    except Exception as e:
+        return f"confirm failed: {e}"
+
+
+def _reject_action_remote(action_id: str) -> None:
+    """POST /actions/reject to hive-mcp (best-effort; also deletes local file)."""
+    base = _hive_mcp_base()
+    if base:
+        payload = json.dumps({"action_id": action_id}).encode()
+        req = urllib.request.Request(
+            f"{base}/actions/reject",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass  # fallback: file stays, agent sees it next time
+
+
+def _prompt_confirm_action(action_file: Path) -> None:
+    """Show a pending external platform action and ask the user to confirm or reject."""
+    try:
+        action = json.loads(action_file.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(red(f"  could not read action file: {e}"))
+        return
+
+    action_id = action.get("id", "?")
+    platform  = action.get("platform", "?")
+    tool      = action.get("tool", "?")
+    summary   = action.get("summary", "?")
+
+    sep = dim("  " + "─" * 54)
+    print(f"\n{sep}")
+    print(f"  {bold('action pending')}  {cyan(f'{platform}/{tool}')}")
+    print(f"  {summary}")
+    print(sep)
+
+    opts   = ["confirm", "reject", "skip"]
+    hints  = ["execute this action", "discard", "decide later"]
+    choice = _arrow_select(opts, hints)
+    print()
+
+    if choice == 0:
+        result = _confirm_action_remote(action_id)
+        print(green(f"  confirmed: {result}"))
+    elif choice == 1:
+        _reject_action_remote(action_id)
+        try:
+            action_file.unlink()
+        except Exception:
+            pass
+        print(yellow(f"  rejected: {platform}/{tool} — no action taken"))
+    else:
+        print(dim("  skipped — /confirm-action or /reject-action when ready"))
+    print()
+
+
 # ── ESC interrupt ─────────────────────────────────────────────────────────────
 
 _cancel_event = threading.Event()
@@ -711,7 +807,9 @@ def run_task(
     show_resume: bool = False,
 ) -> str | None:
     """Run a task via streaming SSE; return session_id or None on error."""
-    before = set((Path(AGNO_PROJECT_ROOT) if AGNO_PROJECT_ROOT else Path.cwd()).rglob(f"*{_PROPOSED_SUFFIX}"))
+    _root   = Path(AGNO_PROJECT_ROOT) if AGNO_PROJECT_ROOT else Path.cwd()
+    before  = set(_root.rglob(f"*{_PROPOSED_SUFFIX}"))
+    before_actions = set(_find_pending_actions(_root))
 
     has_esc = _start_escape_watcher()
     esc_hint = dim("  Ctrl+C to interrupt") + (dim(" / ESC") if has_esc else "")
@@ -791,9 +889,13 @@ def run_task(
     if done_data:
         _print_footer(done_data, show_resume=show_resume)
 
-    after = set((Path(AGNO_PROJECT_ROOT) if AGNO_PROJECT_ROOT else Path.cwd()).rglob(f"*{_PROPOSED_SUFFIX}"))
+    after = set(_root.rglob(f"*{_PROPOSED_SUFFIX}"))
     for p in after - before:
         _prompt_confirm_reject(p)
+
+    after_actions = set(_find_pending_actions(_root))
+    for p in after_actions - before_actions:
+        _prompt_confirm_action(p)
 
     return returned_session_id
 

@@ -35,6 +35,21 @@ from tools.git import git_status, git_log, git_diff, git_log_file, git_blame
 from tools.index import index_project
 from tools.scan import scan_project_context
 from tools.web import web_search, web_fetch
+from tools.integrations import confirm_action, reject_action
+
+_INTEGRATION_TOOLS = []
+if config.NOTION_API_KEY:
+    from tools.integrations.notion import (
+        notion_search,
+        notion_get_page,
+        notion_create_page,
+        notion_update_page_props,
+        notion_append_blocks,
+    )
+    _INTEGRATION_TOOLS += [
+        notion_search, notion_get_page,
+        notion_create_page, notion_update_page_props, notion_append_blocks,
+    ]
 
 _instructions = (
     "You are connected to a project via hive-mcp. "
@@ -51,7 +66,12 @@ _instructions = (
     "IMPORTANT: If apply_diff() or write_file() returns 'review_pending', "
     "STOP immediately. Do not call any other tool. "
     "Tell the human the change is staged for review — they approve via the hive CLI. "
-    "confirm_write and reject_write do not exist as tools."
+    "confirm_write and reject_write do not exist as tools. "
+    ""
+    "IMPORTANT: If a Notion/Google tool returns 'action_pending', "
+    "STOP immediately. Do not call any other tool. "
+    "Tell the human the action is staged — they approve via the hive CLI. "
+    "Do NOT call confirm_action yourself."
 )
 
 mcp = FastMCP(config.MCP_NAME, instructions=_instructions)
@@ -92,6 +112,47 @@ mcp.tool()(scan_project_context)
 # ── Web search + fetch (gated by WEB_SEARCH_ENABLED) ─────────────────────────
 mcp.tool()(web_search)
 mcp.tool()(web_fetch)
+
+# ── External integrations (activated by env vars) ─────────────────────────────
+# confirm/reject are always registered so the CLI confirm flow works regardless
+# of which platforms are active.
+mcp.tool()(confirm_action)
+mcp.tool()(reject_action)
+
+for _tool in _INTEGRATION_TOOLS:
+    mcp.tool()(_tool)
+
+# ── HTTP routes for CLI confirm/reject (bypasses agent pipeline) ──────────────
+# The hive CLI calls these directly: POST /actions/confirm  {"action_id": "..."}
+#                                    POST /actions/reject   {"action_id": "..."}
+try:
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    @mcp.custom_route("/actions/confirm", methods=["POST"])
+    async def _http_confirm(request: Request) -> JSONResponse:
+        body      = await request.json()
+        action_id = body.get("action_id", "")
+        if not action_id:
+            return JSONResponse({"error": "action_id required"}, status_code=400)
+        result = confirm_action(action_id)
+        return JSONResponse({"result": result})
+
+    @mcp.custom_route("/actions/reject", methods=["POST"])
+    async def _http_reject(request: Request) -> JSONResponse:
+        body      = await request.json()
+        action_id = body.get("action_id", "")
+        if not action_id:
+            return JSONResponse({"error": "action_id required"}, status_code=400)
+        result = reject_action(action_id)
+        return JSONResponse({"result": result})
+
+except (AttributeError, TypeError):
+    # FastMCP version doesn't support custom_route — confirm/reject still work
+    # as MCP tools; the CLI falls back to instructing the agent to call them.
+    log = __import__("structlog").get_logger()
+    log.warning("hive_mcp_custom_route_unavailable",
+                 note="confirm/reject HTTP shortcuts not available; MCP tool fallback active")
 
 
 if __name__ == "__main__":
