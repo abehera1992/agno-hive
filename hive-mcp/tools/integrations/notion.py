@@ -58,7 +58,7 @@ def _execute(tool: str, args: dict) -> str:
             if args.get("after"):
                 body["after"] = args["after"]
             result = _request("PATCH", f"/blocks/{block_id}/children", body)
-            count  = len(result.get("results", []))
+            count  = len(args["children"])
             pos    = f" after {args['after'][:8]}" if args.get("after") else ""
             return f"notion: appended {count} block(s) to {block_id}{pos}"
 
