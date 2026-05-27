@@ -53,10 +53,14 @@ def _execute(tool: str, args: dict) -> str:
             return f"notion page updated: {result.get('url', result.get('id'))}"
 
         if tool == "append_blocks":
-            block_id = args["block_id"]
-            result   = _request("PATCH", f"/blocks/{block_id}/children", {"children": args["children"]})
-            count    = len(result.get("results", []))
-            return f"notion: appended {count} block(s) to {block_id}"
+            block_id  = args["block_id"]
+            body: dict = {"children": args["children"]}
+            if args.get("after"):
+                body["after"] = args["after"]
+            result = _request("PATCH", f"/blocks/{block_id}/children", body)
+            count  = len(result.get("results", []))
+            pos    = f" after {args['after'][:8]}" if args.get("after") else ""
+            return f"notion: appended {count} block(s) to {block_id}{pos}"
 
         if tool == "create_database":
             result = _request("POST", "/databases", args["payload"])
@@ -174,24 +178,27 @@ def notion_update_page_props(page_id: str, properties: dict) -> str:
     return _execute("update_page_props", {"page_id": page_id, "properties": properties})
 
 
-def notion_append_blocks(block_id: str, blocks: list) -> str:
+def notion_append_blocks(block_id: str, blocks: list, after_block_id: str = "") -> str:
     """
     Append content blocks to a Notion page or block.
     Requires human approval when WRITE_REVIEW is enabled.
 
     Args:
-        block_id: ID of the parent page or block to append to
-        blocks:   List of Notion block objects
-                  e.g. [{"object":"block","type":"paragraph",
-                          "paragraph":{"rich_text":[{"type":"text","text":{"content":"..."}}]}}]
+        block_id:       ID of the parent page or block to append to
+        blocks:         List of Notion block objects
+                        e.g. [{"object":"block","type":"paragraph",
+                                "paragraph":{"rich_text":[{"type":"text","text":{"content":"..."}}]}}]
+        after_block_id: Optional ID of an existing child block to insert after.
+                        Omit (or pass empty string) to append at the end.
     """
+    pos_note = f" after {after_block_id[:8]}..." if after_block_id else ""
     if WRITE_REVIEW:
         return _stage_action(
             "notion", "append_blocks",
-            f"Append {len(blocks)} block(s) to {block_id[:8]}...",
-            {"block_id": block_id, "children": blocks},
+            f"Append {len(blocks)} block(s) to {block_id[:8]}...{pos_note}",
+            {"block_id": block_id, "children": blocks, "after": after_block_id},
         )
-    return _execute("append_blocks", {"block_id": block_id, "children": blocks})
+    return _execute("append_blocks", {"block_id": block_id, "children": blocks, "after": after_block_id})
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
