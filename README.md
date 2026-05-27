@@ -699,65 +699,56 @@ git -C ~/agno-hive pull   # on ZGX
 
 ---
 
-## What's Built
+## External Platform Integrations
 
-| Component | Status |
-|---|---|
-| Engineering team (6 agents) | Done |
-| Dynamic YAML team specs | Done |
-| FastAPI server + `/run` endpoint | Done |
-| Bootstrap project context from MCP | Done |
-| OllamaToolFix (all tool-call formats) | Done |
-| ZGX infra — Qdrant + PostgreSQL/AGE (Docker) | Done |
-| LightRAG MCP server (Streamable HTTP) | Done |
-| Automated code indexer (AST + incremental) | Done |
-| Self-improving loop (success → LightRAG, failure → Postgres) | Done |
-| OTel instrumentation → SigNoz | Done |
-| Global memory (cross-project shared namespace) | Done |
-| HITL plan review (`POST /plan` + `hive --review`) | Done |
-| VSCode diff + CLI arrow-key review (WRITE_REVIEW) | Done |
-| Persistent chat sessions (PostgreSQL, TTL, compaction) | Done |
-| hive-mcp (generic Docker host-action MCP, GHCR image) | Done |
-| Dual-MCP architecture (project context + hive-mcp host actions) | Done |
-| Tailscale auto-detection for MCP URLs | Done |
-| `hive bootstrap` / `index_project` (LightRAG via hive-mcp) | Done |
-| Web search + fetch (`web_search`, `web_fetch` via hive-mcp, `WEB_SEARCH_ENABLED`) | Done |
-| Agno framework alignment (per-agent tool scoping, Team flags, agent descriptions) | Done |
-| hive.md project context snapshot (`--scan`, auto-inject via bootstrap) | Done |
-| External-docs grounding rules (EVIDENCE + DESIGN-INTENT, read code before docs) | Done |
-| `hive --bootstrap` glob fix — directory-prefix globs (`Client/**/*.ts`) correctly scoped via `PurePosixPath.match()` | Done |
-| `hive --bootstrap` exclusions — `signoz/`, `graphify-out/`, `infra/`, cert/key file extensions excluded by default | Done |
-| Team mode support — `mode` field in YAML + per-request override in `POST /run`; `coordinate`/`collaborate`/`route` | Done |
-| `parallel-review` team — Researcher + SecurityReviewer + PerformanceReviewer running simultaneously via `collaborate` mode | Done |
-| LightRAG MCP server fix — `initialize_storages()` called before query/insert | Done |
-| MCP tool timeout raised 60s → 180s for LightRAG query synthesis | Done |
-| Engineering team model fix — replaced tool-incompatible deepseek-r1 (Planner) + gemma3:27b (Reviewer) | Done |
-| Agent reliability — Researcher HARD RULE (no fabricated paths/line numbers), Coordinator REJECT/CANCEL signal | Done |
-| LightRAG per-project isolation — `model_name=project_id` (Qdrant: `lightrag_vdb_*_{id}_1024d`) + `POSTGRES_WORKSPACE=project_id` | Done |
-| Bootstrap index state persistence — `PROJECT_ROOT/.hive-index-state` via existing Docker volume (no container restart loss) | Done |
-| Session compaction model upgraded: `llama3.1:8b` → `qwen3:8b` | Done |
-| `agno_run` excluded from coordinator MCP tools (`exclude_tools`) — prevents recursive self-call deadlock | Done |
-| All agent model overrides in `.env` — replaces stale `config.py` defaults (`deepseek-r1`, `gemma3:27b`, `mixtral:8x7b`) | Done |
-| qwen3 ARM64 crash workaround — `LEADER_MODEL=mistral-small3.1:24b`, `ROUTER_MODEL=llama3.1:8b` in `.env` | Done |
-| `sessions.py` compaction model uses `config.router_model` — no longer hardcoded to `qwen3:8b` | Done |
-| `AGNO_PROJECT_ROOT` CLI env var — `.hive_proposed` detection works from any working directory | Done |
-| `/plan` and `/review` REPL slash commands | Done |
-| hive-mcp promoted to primary MCP — full read+write+ripgrep+web; project MCP supplementary | Done |
-| Graceful MCP fallback — unreachable MCP skipped; run continues with remaining MCPs | Done |
-| bootstrap multi-URL — tries hive-mcp first for `hive.md` + patterns, falls back to project MCP | Done |
-| ripgrep (`rg`) in `find_files` and `search_files` — both containers; Python fallback if rg absent | Done |
-| `agno_run` + `agno_list_teams` excluded from coordinator MCP tools via `exclude_tools` | Done |
-| `nemotron3:33b` promoted to coordinator — Llama-based 33B dense model, ARM-safe, replaces qwen3:30b-a3b + mistral-small3.1:24b workaround | Done |
-| `qwen2.5-coder:32b` replaces `nemotron3:33b` as coordinator for all teams — nemotron3 gets stuck at 100–130% CPU via `--ollama-engine` on Ollama 0.24.0 ARM64 under large-file tasks | Done |
-| `POST /feedback` endpoint — `rating=bad` injects correction into `failure_log` (coordinator sees it on next run); `rating=good` stores pattern to LightRAG | Done |
-| `record_success` fixed — `initialize_storages()` now called before `ainsert()`, eliminating silent NoneType failure on every successful run | Done |
-| Bootstrap removed from pre-load — coordinator calls `get_file_content('hive.md')` as first tool action; eliminates "I already know" no-tool-call loop | Done |
-| `exclude_tools` scoped to project-mcp only — hive-mcp never receives `exclude_tools` (fixes 0-tools bug in agno 2.5.17 when listed names absent) | Done |
-| fastmcp upgraded to `>=3.2.0` in hive-mcp — required for agno `MCPTools` compatibility (fastmcp 2.x was incompatible) | Done |
-| `agno_run` `team` param renamed to `swarm_team` — avoids `got multiple values for keyword argument 'team'` collision with agno framework internals | Done |
-| `session_id` param added to `agno_run` MCP tool — chains context across one-shot calls from Claude Code, equivalent to REPL mode | Done |
-| Ollama upgraded to 0.24.0 on ZGX — improved qwen3 / Blackwell GB10 GPU support | Done |
-| Cost-aware model routing | Planned |
+hive-mcp can connect to external platforms (Notion, Google, etc.) using API keys. All platform writes go through the same human-approval gate as file writes.
+
+### Activating integrations
+
+Set the relevant env var before starting hive-mcp:
+
+```bash
+# Notion — integration token from notion.so/my-integrations
+export NOTION_API_KEY=secret_xxxx
+
+docker compose -f docker-compose.hive.yml pull
+docker rm -f hive-mcp
+docker compose -f docker-compose.hive.yml up -d
+```
+
+### Approval flow
+
+```
+agent calls notion_create_page(parent_id, title, ...)
+  └─ WRITE_REVIEW=true
+       ├─ writes .hive_pending_actions/<id>.json to project volume
+       └─ returns "action_pending: notion/create_page — ..."
+              ↓
+       agent STOPS and tells the user the action is staged
+              ↓
+       hive CLI detects new .json files in .hive_pending_actions/
+              ↓
+       CLI shows action summary + arrow-key selector:
+         ❯ confirm  — POST /actions/confirm → platform API call executes
+           reject   — discard
+           skip     — decide later
+```
+
+Read operations (`notion_search`, `notion_get_page`) pass through immediately — no approval required.
+
+### Adding a new platform
+
+1. Create `hive-mcp/tools/integrations/<platform>.py`
+2. Implement `_execute(tool, args)` and call `register_executor("<platform>", _execute)` at module level
+3. Add read and write tool functions — write tools call `_stage_action()` when `WRITE_REVIEW=true`
+4. Guard activation in `hive-mcp/main.py` with the env var check
+5. Add the env var to `hive-mcp/config.py` and `docker-compose.hive.yml`
+
+### Available platforms
+
+| Platform | Env var | Read tools | Write tools |
+|---|---|---|---|
+| Notion | `NOTION_API_KEY` | `notion_search`, `notion_get_page` | `notion_create_page`, `notion_update_page_props`, `notion_append_blocks` |
 
 ---
 
