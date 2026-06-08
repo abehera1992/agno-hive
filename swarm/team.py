@@ -208,6 +208,25 @@ _COORDINATOR_INSTRUCTIONS = [
 ]
 
 
+def _scope_coordinator_tools(tool_names: list[str] | None, mcp_list: list):
+    """Scope the coordinator's direct MCP tool surface to an explicit allowlist.
+
+    Mirrors make_agent_from_spec's per-agent scoping (swarm/agents.py) — without this,
+    the coordinator receives every tool from every connected MCP unfiltered, including
+    write/staging tools (apply_diff, write_file, notion_*, confirm_action/reject_action)
+    that read-only teams (planning, parallel-review) must never call. Falls back to the
+    full mcp_list when no allowlist is given (preserves existing engineering-team behavior)
+    or when none of the named tools are found on the connected MCPs.
+    """
+    if not tool_names:
+        return mcp_list
+    all_funcs: dict = {}
+    for mcp in mcp_list:
+        all_funcs.update(mcp.functions)
+    scoped = [all_funcs[t] for t in tool_names if t in all_funcs]
+    return scoped if scoped else mcp_list
+
+
 def _extract_tokens(result) -> dict:
     """Pull input/output/total token counts from an Agno RunResponse metrics object."""
     try:
@@ -239,6 +258,7 @@ async def run_task_stream(
     task: str,
     agent_specs: list | None = None,
     coordinator_model: str | None = None,
+    coordinator_tools: list[str] | None = None,
     mcp_url: str | None = None,
     mcp_urls: list[str] | None = None,
     project_id: str = "default",
@@ -317,7 +337,7 @@ async def run_task_stream(
             mode=mode,
             model=get_model(effective_coordinator, config.ollama_host),
             members=members,
-            tools=mcp_list,
+            tools=_scope_coordinator_tools(coordinator_tools, mcp_list),
             instructions=instructions,
             show_members_responses=True,
             share_member_interactions=True,
@@ -368,6 +388,7 @@ async def run_task_async(
     task: str,
     agent_specs: list | None = None,
     coordinator_model: str | None = None,
+    coordinator_tools: list[str] | None = None,
     mcp_url: str | None = None,
     mcp_urls: list[str] | None = None,   # secondary MCPs (e.g. hive-mcp for host actions)
     project_id: str = "default",
@@ -444,7 +465,7 @@ async def run_task_async(
             mode=mode,
             model=get_model(effective_coordinator, config.ollama_host),
             members=members,
-            tools=mcp_list,
+            tools=_scope_coordinator_tools(coordinator_tools, mcp_list),
             instructions=instructions,
             show_members_responses=True,
             share_member_interactions=True,

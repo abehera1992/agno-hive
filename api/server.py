@@ -44,7 +44,7 @@ except ImportError:
 _TEAMS_DIR = Path(__file__).parent.parent / "teams"
 
 
-def _load_team(name: str) -> tuple[list[AgentSpec], str]:
+def _load_team(name: str) -> tuple[list[AgentSpec], str, str, list[str] | None]:
     path = _TEAMS_DIR / f"{name}.yaml"
     if not path.exists():
         available = [f.stem for f in _TEAMS_DIR.glob("*.yaml")]
@@ -56,7 +56,11 @@ def _load_team(name: str) -> tuple[list[AgentSpec], str]:
     agents = [AgentSpec(**a) for a in data["agents"]]
     coordinator = data.get("coordinator_model", config.leader_model)
     mode = data.get("mode", "coordinate")
-    return agents, coordinator, mode
+    # Optional read-only allowlist scoping the coordinator's direct MCP tool surface
+    # (mirrors per-agent `tools:` scoping). None means "no scoping — full surface" —
+    # the existing behavior, preserved for teams like `engineering` that need write access.
+    coordinator_tools = data.get("coordinator_tools")
+    return agents, coordinator, mode, coordinator_tools
 
 
 @app.on_event("startup")
@@ -101,12 +105,13 @@ async def run(request: RunRequest):
         coordinator_model = config.leader_model
         team_mode = request.mode or "coordinate"
         team_name = request.team or "custom"
+        coordinator_tools = None
     elif request.team:
-        agent_specs, coordinator_model, team_mode = _load_team(request.team)
+        agent_specs, coordinator_model, team_mode, coordinator_tools = _load_team(request.team)
         team_mode = request.mode or team_mode  # request-level override wins
         team_name = request.team
     else:
-        agent_specs, coordinator_model, team_mode = _load_team("engineering")
+        agent_specs, coordinator_model, team_mode, coordinator_tools = _load_team("engineering")
         team_mode = request.mode or team_mode
         team_name = "engineering"
 
@@ -136,6 +141,7 @@ async def run(request: RunRequest):
         task=request.task,
         agent_specs=agent_specs,
         coordinator_model=coordinator_model,
+        coordinator_tools=coordinator_tools,
         mcp_url=mcp_url,
         mcp_urls=_resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url),
         project_id=request.project_id,
@@ -188,7 +194,7 @@ async def plan(request: RunRequest):
     Used by the hive CLI --review flag for human-in-the-loop approval before execution.
     """
     start = time.perf_counter()
-    agent_specs, coordinator_model, _ = _load_team("planning")
+    agent_specs, coordinator_model, _, coordinator_tools = _load_team("planning")
     mcp_url = request.mcp_url or config.mcp_url
 
     all_models = list({coordinator_model} | {a.model for a in agent_specs})
@@ -198,6 +204,7 @@ async def plan(request: RunRequest):
         task=request.task,
         agent_specs=agent_specs,
         coordinator_model=coordinator_model,
+        coordinator_tools=coordinator_tools,
         mcp_url=mcp_url,
         mcp_urls=_resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url),
         project_id=request.project_id,
@@ -225,11 +232,12 @@ async def stream_endpoint(request: RunRequest):
         agent_specs = request.agents
         coordinator_model = config.leader_model
         stream_mode = request.mode or "coordinate"
+        coordinator_tools = None
     elif request.team:
-        agent_specs, coordinator_model, stream_mode = _load_team(request.team)
+        agent_specs, coordinator_model, stream_mode, coordinator_tools = _load_team(request.team)
         stream_mode = request.mode or stream_mode
     else:
-        agent_specs, coordinator_model, stream_mode = _load_team("engineering")
+        agent_specs, coordinator_model, stream_mode, coordinator_tools = _load_team("engineering")
         stream_mode = request.mode or stream_mode
 
     mcp_url = request.mcp_url or config.mcp_url
@@ -255,6 +263,7 @@ async def stream_endpoint(request: RunRequest):
                 task=request.task,
                 agent_specs=agent_specs,
                 coordinator_model=coordinator_model,
+                coordinator_tools=coordinator_tools,
                 mcp_url=mcp_url,
                 mcp_urls=_resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url),
                 project_id=request.project_id,

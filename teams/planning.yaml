@@ -1,6 +1,19 @@
 name: planning
 description: Plan-only team — routes context, researches codebase, and produces a step-by-step plan without executing anything. Used by the HITL review flow.
 coordinator_model: qwen2.5-coder:7b
+# Read-only allowlist for the coordinator's direct tool surface (members are scoped separately
+# via their own `tools:` lists). Without this, the coordinator receives every tool from every
+# connected MCP unfiltered — including write/staging tools (apply_diff, write_file, notion_*,
+# confirm_action/reject_action) that this team must never call. Keep this list read-only.
+coordinator_tools:
+  - list_directory_tree
+  - find_files
+  - search_files
+  - get_file_content
+  - list_directory
+  - memory_search
+  - lightrag_query
+  - get_context_section
 
 agents:
   - name: ContextRouter
