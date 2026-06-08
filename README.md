@@ -68,6 +68,8 @@ All agents run local Ollama models. Set any model via env var (e.g. `CODER_MODEL
 > - `devstral:24b` — Previously Researcher; replaced by `qwen2.5-coder:32b` (2026-05-24). Failed tool-calling discipline: hallucinated file content instead of reading via get_file_content().
 > - `mistral-small3.1:24b` — Previously used for Planner; replaced by `qwen2.5-coder:32b` (2026-05-24). 21% speed improvement from eliminating model-swap overhead.
 > - `lfm2:24b` — ✅ Reads files correctly but cannot orchestrate as coordinator.
+>
+> **Ollama upgraded 0.24.0 → 0.30.6 (2026-06-07):** the new build ships `cuda_v13` libraries that correctly list GB10's compute capability (`cc=1210`) — the old `cuda_v12` libs' compiled architecture list (`[500 520 600 610 700 750 800 860 890 900 1200]`) didn't include 1210, which was likely the root cause of several MoE crashes (`qwen3:30b-a3b`, `gemma4` MoE, `nemotron3:33b` instability). Post-upgrade, `agno_run` was re-verified end-to-end (planning team, byte-for-byte grounded results, 77s vs ~268s pre-upgrade for a comparable task) — full functionality confirmed, no regressions. See [Ollama Upgrade & GB10 Compatibility](docs.md#ollama-upgrade--gb10-compatibility-20260607) in docs.md for the full writeup including a binary-swap gotcha.
 
 ### Client Machine
 - Docker (for hive-mcp)
