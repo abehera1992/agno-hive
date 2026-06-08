@@ -1,6 +1,6 @@
 """Self-improving loop — records task outcomes and loads past context.
 
-Success path  → lightweight text inserted into LightRAG (agents can retrieve via memory_search)
+Success path  → lightweight text inserted into LightRAG (agents can retrieve via lightrag_query)
 Failure path  → structured record in PostgreSQL failure_log table
 Context load  → queries failure_log before each task, injected into coordinator instructions
 """

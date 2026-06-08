@@ -11,7 +11,7 @@ coordinator_tools:
   - search_files
   - get_file_content
   - list_directory
-  - memory_search
+  - search_knowledge_graph
   - lightrag_query
   - get_context_section
 
@@ -26,7 +26,7 @@ agents:
       - search_files
       - list_directory
       - get_file_content
-      - memory_search
+      - search_knowledge_graph
       - lightrag_query
       - web_search
       - web_fetch
@@ -39,7 +39,7 @@ agents:
       - "  - Overview/structure questions → list_directory_tree() if available, else find_files('**/*')"
       - "  - 'How does X work' questions  → search_files(X, '**/*') across the whole codebase"
       - "  - Specific file/symbol         → find_files() or search_files() with a targeted pattern"
-      - "  - Semantic/memory questions    → lightrag_query() if available, else memory_search()"
+      - "  - Semantic/memory questions    → lightrag_query() if available, else search_knowledge_graph()"
       - "  - User shares a URL or GitHub link → web_fetch(url) immediately if available"
       - "  - External tool/library/repo   → web_search(name) then web_fetch on best result if available"
       - Return only the retrieved context. Do not answer the question yourself.
@@ -55,13 +55,13 @@ agents:
       - get_file_content
       - list_directory
       - list_directory_tree
-      - memory_search
+      - search_knowledge_graph
       - lightrag_query
       - web_search
       - web_fetch
     instructions:
       - "SESSION CONTEXT: Before any other tool call, try get_file_content('hive.md') once — it has the full directory tree and per-module summaries. Use it as your starting point. Skip silently if not found."
-      - If memory_search or lightrag_query is available via MCP, call it with relevant keywords before starting.
+      - If lightrag_query is available via MCP, call it with relevant keywords before starting.
       - You are the research specialist. Understand the existing codebase before anyone plans.
       - "SCAN-FIRST rule: Always run list_directory_tree() (or find_files('**/*') if unavailable) before answering any structure or overview question."
       - "  Never describe a directory from its name alone — read at least one entry file inside it to ground your answer."
@@ -93,11 +93,11 @@ agents:
       - find_files
       - search_files
       - get_file_content
-      - memory_search
+      - search_knowledge_graph
       - lightrag_query
     instructions:
       - "SESSION CONTEXT: Before planning, try get_file_content('hive.md') once — it has project structure context that informs your plan. Skip silently if not found."
-      - If lightrag_query or memory_search is available via MCP, call it to check if similar tasks were solved before.
+      - If lightrag_query is available via MCP, call it to check if similar tasks were solved before.
       - You are the planning specialist. Detect the query type first and adjust your output accordingly.
       - "DISCUSSION / ROADMAP — triggered when the query contains 'discuss', 'roadmap', 'scope', 'thoughts', 'how should', 'what if', 'let's', 'planning to', 'future':"
       - "  Output a STRATEGIC ANALYSIS. Do NOT produce a numbered implementation step list."

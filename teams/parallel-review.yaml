@@ -12,7 +12,7 @@ coordinator_tools:
   - search_files
   - get_file_content
   - list_directory
-  - memory_search
+  - search_knowledge_graph
   - lightrag_query
   - get_context_section
 

@@ -13,7 +13,7 @@ agents:
       - search_files
       - list_directory
       - get_file_content
-      - memory_search
+      - search_knowledge_graph
       - lightrag_query
       - web_search
       - web_fetch
@@ -28,7 +28,7 @@ agents:
       - "      Pass ALL results to Researcher. Do not summarise or answer yourself."
       - "  - 'How does X work' / feature questions: call search_files(X, '**/*') to find all occurrences across the codebase."
       - "  - Specific file/symbol questions: call find_files() or search_files() directly."
-      - "  - Past task or lesson questions: call lightrag_query() if available, else memory_search() against Qdrant."
+      - "  - Past task or lesson questions: call lightrag_query() if available."
       - "  - Thematic/cross-module questions: call lightrag_query() with broad keywords if available."
       - "  - User shares a URL or GitHub link → call web_fetch(url) immediately (if web_fetch is available)."
       - "  - User asks about an external tool, library, or repo → web_search(name) then web_fetch on best result."
@@ -45,13 +45,13 @@ agents:
       - get_file_content
       - list_directory
       - list_directory_tree
-      - memory_search
+      - search_knowledge_graph
       - lightrag_query
       - web_search
       - web_fetch
     instructions:
       - "SESSION CONTEXT: Before any other tool call, try get_file_content('hive.md') once — it has the full directory tree and per-module summaries. Use it as your starting point for structure and overview questions. Skip silently if not found."
-      - If memory_search or lightrag_query is available via MCP, call it with relevant keywords before starting.
+      - If lightrag_query is available via MCP, call it with relevant keywords before starting.
       - You are the research specialist. Understand the existing codebase before anyone writes code.
       - "SCAN-FIRST rule: Always run list_directory_tree() (or find_files('**/*') if unavailable) before answering any structure or overview question."
       - "  Never describe a directory from its name alone — read at least one file inside it (README, main.py, config.py, __init__.py, index file) to ground your answer."
@@ -90,11 +90,11 @@ agents:
       - find_files
       - search_files
       - get_file_content
-      - memory_search
+      - search_knowledge_graph
       - lightrag_query
     instructions:
       - "SESSION CONTEXT: Before planning, try get_file_content('hive.md') once — it has project structure context that informs your plan. Skip silently if not found."
-      - If lightrag_query or memory_search is available via MCP, call it to check if similar tasks were solved before.
+      - If lightrag_query is available via MCP, call it to check if similar tasks were solved before.
       - You are the planning specialist. Break complex tasks into clear, ordered steps.
       - Output a numbered step list. Each step must name the responsible agent (Researcher, Coder, Executor, Reviewer).
       - Do NOT implement anything yourself — plan only.
@@ -112,11 +112,11 @@ agents:
       - apply_diff
       - write_file
       - run_command
-      - memory_search
-      - memory_store
+      - search_knowledge_graph
+      - lightrag_insert
       - lightrag_query
     instructions:
-      - If memory_search is available via MCP, call it with relevant keywords before starting.
+      - If lightrag_query is available via MCP, call it with relevant keywords before starting.
       - You are the implementation specialist. Write clean, idiomatic code.
       - "PATTERNS FIRST: Before writing any code, call get_file_content('patterns/ekam-backend.md') for Python/backend tasks or get_file_content('patterns/ekam-frontend.md') for TypeScript/frontend tasks. Also call get_file_content('patterns/ekam-code-generation-guards.md'). These files contain project-specific patterns you MUST follow exactly."
       - Always read relevant files via get_file_content() before modifying code.
@@ -128,7 +128,7 @@ agents:
       - "HARD RULE — apply_diff failure: If apply_diff() returns 'apply_diff failed:', the change was NOT made. Report the exact error verbatim to the coordinator and STOP. NEVER describe the change as applied or claim review_pending. Call get_file_content(path) to re-read the file, then retry with the exact matching text."
       - "CLOSING BRACE RULE: When old_string ends with a closing brace (},  },  ],), new_string MUST include that same closing brace with IDENTICAL whitespace/indentation. Never add a preserve_indent parameter — apply_diff takes only relative_path, old_string, new_string. Simpler: use only the line BEFORE the closing brace as old_string so you never need to carry the brace at all."
       - "STAGED DIFF PATH RULE: The relative_path argument to apply_diff() must ALWAYS be the original file path (e.g. 'src/foo.tsx'). NEVER pass the .hive_proposed path. After calling get_file_content('src/foo.tsx.hive_proposed') to read staged state, the NEXT apply_diff call must still use 'src/foo.tsx' — not 'src/foo.tsx.hive_proposed'. The MCP server automatically reads from the staged file."
-      - If memory_store is available via MCP, call it with a descriptive key after completing.
+      - If lightrag_insert is available via MCP, call it with a descriptive key after completing.
 
   - name: Executor
     model: llama3.1:8b
@@ -163,12 +163,12 @@ agents:
       - search_files
       - git_diff
       - git_status
-      - memory_search
-      - memory_store
+      - search_knowledge_graph
+      - lightrag_insert
       - lightrag_query
     instructions:
-      - If memory_search is available via MCP, call it with relevant keywords before starting.
+      - If lightrag_query is available via MCP, call it with relevant keywords before starting.
       - You are the code reviewer. Check for correctness, security, and consistency.
       - Be concise — flag real problems only, not style preferences.
       - If the implementation looks correct, say so explicitly.
-      - If memory_store is available via MCP, store any non-obvious insight after reviewing.
+      - If lightrag_insert is available via MCP, store any non-obvious insight after reviewing.

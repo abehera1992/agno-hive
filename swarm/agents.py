@@ -12,8 +12,8 @@ def get_model(model_id: str, host: str):
 
 _BASE_PREAMBLE = [
     "SESSION CONTEXT: At session start, if project context hasn't been provided by the coordinator, try get_file_content('hive.md') once for a pre-built project overview (directory tree, per-module summaries). Skip silently if not found — it's optional.",
-    "If memory_search is available via MCP, call it with relevant keywords before starting.",
-    "If memory_store is available via MCP, call it with a descriptive key after completing.",
+    "If lightrag_query is available via MCP, call it with relevant keywords before starting.",
+    "If lightrag_insert is available via MCP, call it with a descriptive key after completing.",
 ]
 
 
@@ -94,7 +94,7 @@ def make_planner(*mcps: MCPTools) -> Agent:
         instructions=[
             *_BASE_PREAMBLE,
             "Break complex tasks into clear, ordered steps.",
-            "Before planning, call memory_search() to check if similar tasks were solved before.",
+            "Before planning, call lightrag_query() to check if similar tasks were solved before.",
             "Output a numbered step list. Each step must name the responsible agent (Researcher, Coder, Executor, Reviewer).",
             "Do NOT implement anything yourself — plan only.",
             "If the task is simple enough for a single agent, say so and recommend skipping the plan.",
@@ -154,7 +154,7 @@ def make_context_router(*mcps: MCPTools) -> Agent:
             "  - Overview/structure questions → list_directory_tree() if available, else find_files('**/*')",
             "  - 'How does X work' questions  → search_files(X, '**/*') across the whole codebase",
             "  - Specific file/symbol         → find_files() or search_files() with a targeted pattern",
-            "  - Semantic/memory questions    → lightrag_query() if available, else memory_search()",
+            "  - Semantic/memory questions    → lightrag_query() if available, else search_knowledge_graph()",
             "  - Cross-project patterns       → lightrag_query(query, 'global', mode='hybrid') if available",
             "  - User shares a URL or GitHub link → web_fetch(url) immediately if available",
             "  - External tool/library/repo   → web_search(name) then web_fetch on best result if available",
