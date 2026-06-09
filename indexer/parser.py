@@ -17,6 +17,7 @@ _SPECIAL_TOKEN_RE = re.compile(r"<\|[a-zA-Z0-9_]+\|>")
 _SKIP_DIRS = {
     ".git", "__pycache__", "node_modules", ".venv", "venv",
     "dist", "build", ".next", ".mypy_cache", ".pytest_cache",
+    "backups",
 }
 _SKIP_EXT = {
     ".pyc", ".pyo", ".pyd", ".so", ".lock", ".log",
