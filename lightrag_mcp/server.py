@@ -1,7 +1,11 @@
 """LightRAG MCP server — exposes lightrag_insert and lightrag_query as MCP tools over Streamable HTTP."""
 import asyncio
 import os
+import re
 from dotenv import load_dotenv
+
+# Strip tiktoken special tokens (e.g. <|endoftext|>) that raise ValueError on encode.
+_SPECIAL_TOKEN_RE = re.compile(r"<\|[a-zA-Z0-9_]+\|>")
 
 load_dotenv()
 
@@ -37,7 +41,7 @@ async def lightrag_insert(text: str, project_id: str) -> str:
     """
     try:
         rag = await _get_ready_rag(project_id)
-        await rag.ainsert(text)
+        await rag.ainsert(_SPECIAL_TOKEN_RE.sub("", text))
         return f"Indexed {len(text)} characters for project '{project_id}'."
     except Exception as exc:
         return f"Insert failed: {exc}"
@@ -56,7 +60,7 @@ async def lightrag_insert_global(text: str) -> str:
     """
     try:
         rag = await _get_ready_rag(_GLOBAL)
-        await rag.ainsert(text)
+        await rag.ainsert(_SPECIAL_TOKEN_RE.sub("", text))
         return f"Indexed {len(text)} characters into global memory."
     except Exception as exc:
         return f"Global insert failed: {exc}"

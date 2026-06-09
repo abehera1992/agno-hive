@@ -5,7 +5,13 @@ built-in ast module. All other file types fall back to fixed-size text chunks.
 """
 import ast
 import hashlib
+import re
 from pathlib import Path
+
+# tiktoken raises ValueError on special tokens like <|endoftext|> by default.
+# Strip them from source text before chunking so the indexer never errors on
+# files that happen to contain these strings (minified JS, model outputs, etc).
+_SPECIAL_TOKEN_RE = re.compile(r"<\|[a-zA-Z0-9_]+\|>")
 
 # Directories and extensions to skip entirely
 _SKIP_DIRS = {
@@ -43,6 +49,7 @@ def chunk_file(path: Path, repo_root: Path) -> list[str]:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return []
+    text = _SPECIAL_TOKEN_RE.sub("", text)
     if not text.strip():
         return []
     if path.suffix.lower() == ".py":
