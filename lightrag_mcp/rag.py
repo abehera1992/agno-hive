@@ -41,7 +41,9 @@ def _build(project_id: str) -> LightRAG:
             system_prompt=system_prompt,
             history_messages=history_messages or [],
             host=ollama_host,
-            options={"num_ctx": 32768},
+            # 8K ctx is ample: chunks are <=1200 tokens + extraction prompt.
+            # 32K KV caches starved Ollama's parallel slots (NUM_PARALLEL=4).
+            options={"num_ctx": 8192},
             **kwargs,
         )
 
@@ -52,6 +54,14 @@ def _build(project_id: str) -> LightRAG:
         working_dir=working_dir,
         llm_model_name=llm_model,   # sets global_config["llm_model_name"] used by ollama_model_complete
         llm_model_func=_llm,
+        # Indexing throughput tuning (defaults: max_parallel_insert=2,
+        # embedding_batch_num=10, gleaning=1). llm_model_max_async stays at
+        # its default 4 to match OLLAMA_NUM_PARALLEL=4 on the GB10.
+        max_parallel_insert=4,
+        embedding_batch_num=32,
+        # Gleaning is a second full LLM pass per chunk for marginal extra
+        # entities — poor trade on code corpora; halves extraction calls.
+        entity_extract_max_gleaning=0,
         embedding_func=EmbeddingFunc(
             embedding_dim=embed_dim,
             max_token_size=8192,

@@ -11,6 +11,7 @@ that rewrites files without changing their content. Legacy entries without the
 "|<sha256>" suffix are upgraded in place on the next pass without re-indexing.
 """
 import ast
+import asyncio
 import hashlib
 import json
 import os
@@ -234,26 +235,31 @@ async def index_project(
             async with streamablehttp_client(_lr_url) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
-                    for p, rel, key in to_process:
-                        if time.monotonic() - t_start >= time_budget_seconds:
-                            budget_exceeded = True
-                            break
-                        chunks = _py_chunks(p) if p.suffix == ".py" else _text_chunks(p)
-                        ok = True
-                        for chunk in chunks:
+                    # Concurrent chunk inserts: LightRAG's pipeline parallelism
+                    # (max_parallel_insert / llm_model_max_async) is wasted when
+                    # chunks arrive strictly serially over the MCP session.
+                    insert_sem = asyncio.Semaphore(4)
+
+                    async def _send_chunk(chunk: str) -> bool:
+                        async with insert_sem:
                             try:
                                 result = await session.call_tool(
                                     "lightrag_insert",
                                     {"text": chunk, "project_id": project_id},
                                 )
-                                if result.isError if hasattr(result, "isError") else False:
-                                    errors += 1
-                                    ok = False
-                                else:
-                                    chunks_sent += 1
+                                return not (result.isError if hasattr(result, "isError") else False)
                             except Exception:
-                                errors += 1
-                                ok = False
+                                return False
+
+                    for p, rel, key in to_process:
+                        if time.monotonic() - t_start >= time_budget_seconds:
+                            budget_exceeded = True
+                            break
+                        chunks = _py_chunks(p) if p.suffix == ".py" else _text_chunks(p)
+                        flags = await asyncio.gather(*[_send_chunk(c) for c in chunks])
+                        chunks_sent += sum(flags)
+                        errors += len(flags) - sum(flags)
+                        ok = all(flags)
                         if ok:
                             try:
                                 new_state[rel] = f"{key}|{_sha256(p)}"
