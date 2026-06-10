@@ -1,10 +1,17 @@
 """Project indexing tool — walks the project, chunks files, inserts into LightRAG.
 
 Connects to the LightRAG MCP server via Streamable HTTP and calls
-lightrag_insert for each chunk. Tracks SHA-256 state for incremental
+lightrag_insert for each chunk. Tracks per-file state for incremental
 re-indexing so unchanged files are skipped.
+
+State entry format: "<mtime_ns>:<size>|<sha256>". The mtime:size part is a
+fast pre-check (no file read); when it mismatches the content SHA-256 decides.
+This makes the state immune to metadata-only churn (git checkout/reset, touch)
+that rewrites files without changing their content. Legacy entries without the
+"|<sha256>" suffix are upgraded in place on the next pass without re-indexing.
 """
 import ast
+import hashlib
 import json
 import os
 import re
@@ -88,6 +95,11 @@ def _file_key(path: Path) -> str:
     return f"{s.st_mtime_ns}:{s.st_size}"
 
 
+def _sha256(path: Path) -> str:
+    """Content hash — used when the fast key mismatches (e.g. after git reset)."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 # ── State tracking ────────────────────────────────────────────────────────────
 
 def _load_state(project_id: str) -> dict:
@@ -117,7 +129,9 @@ async def index_project(
 
     Walks the project directory, chunks files (Python files are parsed with AST
     for function/class-level granularity; all other files use text windows).
-    Skips unchanged files based on SHA-256 checksums unless force=True.
+    Skips unchanged files unless force=True: fast mtime+size check first, then
+    content SHA-256 when metadata changed — so git checkout/reset alone never
+    triggers a re-index.
     Connects to the LightRAG MCP server at lightrag_url via Streamable HTTP
     using a single shared session (not one connection per chunk).
 
@@ -178,9 +192,30 @@ async def index_project(
                 key = _file_key(p)
             except Exception:
                 continue
-            if not force and state.get(rel) == key:
-                files_skipped += 1
-                continue
+            stored = state.get(rel) or ""
+            if not force and stored:
+                s_fast, _, s_sha = stored.partition("|")
+                if s_fast == key:
+                    # Fast path: mtime+size unchanged. Lazily upgrade legacy
+                    # entries (no sha) to the dual format — one read, no re-index.
+                    files_skipped += 1
+                    if not s_sha:
+                        try:
+                            new_state[rel] = f"{key}|{_sha256(p)}"
+                        except Exception:
+                            pass
+                    continue
+                if s_sha:
+                    # mtime/size changed — check whether content actually did.
+                    try:
+                        cur_sha = _sha256(p)
+                    except Exception:
+                        continue
+                    if cur_sha == s_sha:
+                        # Metadata-only churn (git reset, touch): re-key, skip.
+                        files_skipped += 1
+                        new_state[rel] = f"{key}|{s_sha}"
+                        continue
             to_process.append((p, rel, key))
     to_process.sort(key=lambda x: x[1])  # stable alphabetical order
 
@@ -197,7 +232,7 @@ async def index_project(
             async with streamablehttp_client(_lr_url) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
-                    for p, rel, sha in to_process:
+                    for p, rel, key in to_process:
                         if time.monotonic() - t_start >= time_budget_seconds:
                             budget_exceeded = True
                             break
@@ -218,7 +253,10 @@ async def index_project(
                                 errors += 1
                                 ok = False
                         if ok:
-                            new_state[rel] = sha
+                            try:
+                                new_state[rel] = f"{key}|{_sha256(p)}"
+                            except Exception:
+                                new_state[rel] = key
                         files_indexed += 1
                         _save_state(project_id, new_state)  # persist after every file
         except Exception as e:
