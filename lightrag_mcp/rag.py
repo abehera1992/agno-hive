@@ -36,14 +36,18 @@ def _build(project_id: str) -> LightRAG:
         # ollama_model_complete reads model from global_config["llm_model_name"],
         # not from a kwarg — passing model= here causes a duplicate-arg TypeError.
         kwargs.pop("model", None)
+        # Size the context window to the prompt: extraction calls (one <=1200
+        # token chunk) fit in 8K and keep Ollama's 4 parallel slots cheap;
+        # query calls assemble up to ~30K tokens of graph context and need the
+        # full 32K — a fixed 8K window truncates them into garbage answers.
+        approx_tokens = (len(prompt) + len(system_prompt or "")) // 4
+        num_ctx = 8192 if approx_tokens <= 5500 else 32768
         return await ollama_model_complete(
             prompt,
             system_prompt=system_prompt,
             history_messages=history_messages or [],
             host=ollama_host,
-            # 8K ctx is ample: chunks are <=1200 tokens + extraction prompt.
-            # 32K KV caches starved Ollama's parallel slots (NUM_PARALLEL=4).
-            options={"num_ctx": 8192},
+            options={"num_ctx": num_ctx},
             **kwargs,
         )
 
