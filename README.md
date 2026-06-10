@@ -226,9 +226,18 @@ hive --bootstrap --force                  # full reindex from scratch
 hive --bootstrap --glob "Client/**/*.ts"  # scoped to a specific directory + extension
 ```
 
-State file: `PROJECT_ROOT/.hive-index-state/{project_id}.json`
+State file: `PROJECT_ROOT/.hive-index-state/{project_id}.json` — entries are
+`"<mtime_ns>:<size>|<sha256>"`. The fast mtime+size key is checked first (no file
+read); on mismatch the content SHA-256 decides, so metadata-only churn
+(`git reset --hard`, checkout, `touch`) never triggers a re-index. Legacy
+mtime-only entries upgrade in place on the next pass.
 
-Excluded automatically: `node_modules`, `.next`, `dist`, `build`, `signoz`, `graphify-out`, `infra`, hidden dirs, binaries, certs (`.pem`, `.key`, `.crt`).
+Excluded automatically: `node_modules`, `.next`, `dist`, `build`, `signoz`, `graphify-out`, `infra`, `backups` (DB dumps — never index), `.hive-index-state`, hidden dirs, binaries, certs (`.pem`, `.key`, `.crt`).
+
+Throughput (2026-06-10): chunk inserts run 4-concurrent over the shared MCP
+session, matched by LightRAG-side tuning (`max_parallel_insert=4`,
+`entity_extract_max_gleaning=0`, `embedding_batch_num=32`, dynamic `num_ctx`
+8K/32K) — roughly 4–6× faster than the old serial pipeline.
 
 **Option B — ZGX-side direct indexer** (use when ZGX has direct filesystem access to the repo):
 ```bash
