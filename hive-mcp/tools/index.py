@@ -27,6 +27,8 @@ _IGNORE_DIRS = {
     ".git", "node_modules", "__pycache__", ".next", "dist", "build",
     ".venv", "venv", "env", ".mypy_cache", ".pytest_cache", "coverage",
     ".tox", ".eggs", "signoz", "graphify-out", "infra",
+    # backups holds DB dumps (incl. Phase secrets DB) — must never be indexed
+    "backups", ".hive-index-state",
 }
 _SKIP_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2",
