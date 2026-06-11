@@ -1,6 +1,9 @@
 name: engineering
 description: Full engineering team — routes context, researches codebase, plans, implements, executes, and reviews.
-coordinator_model: ibm/granite4.1:30b
+# EXPERIMENT 2026-06-11: qwen3:30b-a3b MoE re-trial on Ollama 0.30.6 (GB10 ARM64
+# fixes). Was the fastest coordinator measured (~26s vs granite ~76s) but
+# segfaulted under Ollama 0.24 — revert to ibm/granite4.1:30b if unstable.
+coordinator_model: qwen3:30b-a3b
 
 agents:
   - name: ContextRouter
