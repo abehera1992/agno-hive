@@ -5,7 +5,7 @@ description: Full engineering team — routes context, researches codebase, plan
 # ~1K hidden reasoning tokens per turn → 318s pipeline vs granite's 76s.
 # qwen3-coder:30b is the non-thinking A3B MoE: 0 thinking tokens, ~68 tok/s.
 # Revert to ibm/granite4.1:30b if unstable or low delegation quality.
-coordinator_model: qwen3-coder:30b
+coordinator_model: ibm/granite4.1:30b  # TEMP control run for A/B benchmark
 
 agents:
   - name: ContextRouter
