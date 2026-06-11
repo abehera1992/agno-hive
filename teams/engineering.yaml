@@ -1,11 +1,12 @@
 name: engineering
 description: Full engineering team — routes context, researches codebase, plans, implements, executes, and reviews.
-# EXPERIMENT 2026-06-11: MoE coordinator re-trial on Ollama 0.30.6 (GB10 ARM64
-# fixes — no segfaults observed). qwen3:30b-a3b (thinking) was stable but burned
-# ~1K hidden reasoning tokens per turn → 318s pipeline vs granite's 76s.
-# qwen3-coder:30b is the non-thinking A3B MoE: 0 thinking tokens, ~68 tok/s.
-# Revert to ibm/granite4.1:30b if unstable or low delegation quality.
-coordinator_model: ibm/granite4.1:30b  # TEMP control run for A/B benchmark
+# Coordinator benchmark 2026-06-11 (same task, full 7-agent pipeline, Ollama 0.30.6):
+#   ibm/granite4.1:30b   217s — hallucinated service purposes from dir names
+#   qwen3:30b-a3b        318s — accurate but ~1K hidden thinking tokens/turn
+#   qwen3-coder:30b       84s — accurate, grounded (read every service), 0 thinking
+# No GB10 ARM64 segfaults on either MoE — the Ollama 0.24 instability is fixed.
+# Revert to ibm/granite4.1:30b if delegation quality degrades on complex tasks.
+coordinator_model: qwen3-coder:30b
 
 agents:
   - name: ContextRouter
