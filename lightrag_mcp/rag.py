@@ -19,7 +19,12 @@ def _build(project_id: str) -> LightRAG:
     from config.config import config
 
     _set_pg_env(config.postgres_uri)
-    os.environ["POSTGRES_WORKSPACE"] = project_id  # isolates all PG tables per project
+    # NOTE: this env var only seeds the process-wide shared PG client
+    # (ClientManager singleton) the FIRST time any project initializes — it
+    # does NOT isolate later projects. Real isolation is the per-instance
+    # `workspace=` constructor field below. Keeping the env set for the
+    # db-level default only.
+    os.environ["POSTGRES_WORKSPACE"] = project_id
 
     working_dir = os.path.join(
         os.getenv("LIGHTRAG_WORKING_DIR", os.path.expanduser("~/.agno-hive/lightrag")),
@@ -56,6 +61,11 @@ def _build(project_id: str) -> LightRAG:
 
     return LightRAG(
         working_dir=working_dir,
+        # Per-instance workspace — passed to every storage backend. Without
+        # this, all projects shared whatever POSTGRES_WORKSPACE happened to be
+        # set when the process-wide PG client first initialized (restart-order
+        # roulette): an agno-hive bootstrap once wrote into the ekam workspace.
+        workspace=project_id,
         llm_model_name=llm_model,   # sets global_config["llm_model_name"] used by ollama_model_complete
         llm_model_func=_llm,
         # Indexing throughput tuning (defaults: max_parallel_insert=2,
