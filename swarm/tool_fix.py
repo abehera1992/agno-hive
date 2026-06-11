@@ -6,6 +6,7 @@ Supported formats:
   3. {"name": ..., "arguments": ...} bare JSON (qwen2.5 non-streaming)
   4. Multiple bare JSON objects concatenated with whitespace
   5. JSON embedded in prose (qwen2.5-coder in explanatory text)
+  6. <function=NAME><parameter=KEY>VALUE</parameter>...</function> (qwen3-coder XML)
 
 NOTE: agno-internal tools (delegate_task_to_member, delegate_task_to_members) are
 intentionally excluded from MCP tool call interception so agno can handle them natively.
@@ -54,6 +55,26 @@ class OllamaToolFix(Ollama):
                 except json.JSONDecodeError:
                     pass
             return calls
+
+        # Format 6: qwen3-coder XML — <function=NAME><parameter=KEY>VALUE</parameter></function>
+        # The closing </function> is sometimes missing or followed by a stray
+        # </tool_call>, so match each block up to the next <function= or end of string.
+        if "<function=" in content:
+            blocks = re.findall(
+                r"<function=([\w./-]+)>(.*?)(?=</function>|<function=|\Z)",
+                content,
+                re.DOTALL,
+            )
+            for name, body in blocks:
+                params = {
+                    k: v.strip()
+                    for k, v in re.findall(
+                        r"<parameter=([\w./-]+)>(.*?)</parameter>", body, re.DOTALL
+                    )
+                }
+                calls.append({"name": name, "arguments": params})
+            if calls:
+                return calls
 
         # Format 3 / 4: bare JSON objects at start of content
         stripped = content.strip()
