@@ -19,12 +19,15 @@ def _build(project_id: str) -> LightRAG:
     from config.config import config
 
     _set_pg_env(config.postgres_uri)
-    # NOTE: this env var only seeds the process-wide shared PG client
-    # (ClientManager singleton) the FIRST time any project initializes — it
-    # does NOT isolate later projects. Real isolation is the per-instance
-    # `workspace=` constructor field below. Keeping the env set for the
-    # db-level default only.
-    os.environ["POSTGRES_WORKSPACE"] = project_id
+    # POSTGRES_WORKSPACE must NEVER be set. LightRAG's PG storage classes
+    # contain `if self.db.workspace: self.workspace = self.db.workspace` —
+    # i.e. the shared ClientManager singleton's env-derived workspace
+    # OVERRIDES the per-instance `workspace=` constructor field whenever it
+    # is set, pinning every project in the process to whichever initialized
+    # first after a restart (caused cross-project contamination twice:
+    # 2026-06-11 and 2026-06-12). With the env unset, each instance keeps
+    # its own workspace from the constructor below.
+    os.environ.pop("POSTGRES_WORKSPACE", None)
 
     working_dir = os.path.join(
         os.getenv("LIGHTRAG_WORKING_DIR", os.path.expanduser("~/.agno-hive/lightrag")),
