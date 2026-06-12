@@ -239,6 +239,13 @@ session, matched by LightRAG-side tuning (`max_parallel_insert=4`,
 `entity_extract_max_gleaning=0`, `embedding_batch_num=32`, dynamic `num_ctx`
 8K/32K) — roughly 4–6× faster than the old serial pipeline.
 
+Version correctness (2026-06-12): re-indexing a changed file first deletes its
+previous documents (`lightrag_delete_by_file` — LightRAG indexing is otherwise
+append-only and stale versions could win retrieval), and every insert carries
+`file_path` metadata. Each run ends with a pipeline kick (a dedupe-rejected
+re-send of the last chunk) so LightRAG never leaves the final batch sitting
+in 'pending'.
+
 **Option B — ZGX-side direct indexer** (use when ZGX has direct filesystem access to the repo):
 ```bash
 python main.py --index --path /path/to/repo --project-id myproject
