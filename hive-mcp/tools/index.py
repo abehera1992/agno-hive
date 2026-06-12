@@ -219,7 +219,9 @@ async def index_project(
                         files_skipped += 1
                         new_state[rel] = f"{key}|{s_sha}"
                         continue
-            to_process.append((p, rel, key))
+            # was_indexed: file had a previous state entry -> stale docs may
+            # exist in LightRAG and must be deleted before re-inserting.
+            to_process.append((p, rel, key, bool(stored)))
     to_process.sort(key=lambda x: x[1])  # stable alphabetical order
 
     budget_exceeded = False
@@ -240,23 +242,37 @@ async def index_project(
                     # chunks arrive strictly serially over the MCP session.
                     insert_sem = asyncio.Semaphore(4)
 
-                    async def _send_chunk(chunk: str) -> bool:
+                    async def _send_chunk(chunk: str, rel: str) -> bool:
                         async with insert_sem:
                             try:
                                 result = await session.call_tool(
                                     "lightrag_insert",
-                                    {"text": chunk, "project_id": project_id},
+                                    {"text": chunk, "project_id": project_id, "file_path": rel},
                                 )
                                 return not (result.isError if hasattr(result, "isError") else False)
                             except Exception:
                                 return False
 
-                    for p, rel, key in to_process:
+                    async def _delete_stale(rel: str) -> None:
+                        """LightRAG indexing is append-only — remove the file's
+                        previous docs so stale versions can't win retrieval.
+                        Best-effort: older lightrag servers lack the tool."""
+                        try:
+                            await session.call_tool(
+                                "lightrag_delete_by_file",
+                                {"file_path": rel, "project_id": project_id},
+                            )
+                        except Exception:
+                            pass
+
+                    for p, rel, key, was_indexed in to_process:
                         if time.monotonic() - t_start >= time_budget_seconds:
                             budget_exceeded = True
                             break
+                        if was_indexed:
+                            await _delete_stale(rel)
                         chunks = _py_chunks(p) if p.suffix == ".py" else _text_chunks(p)
-                        flags = await asyncio.gather(*[_send_chunk(c) for c in chunks])
+                        flags = await asyncio.gather(*[_send_chunk(c, rel) for c in chunks])
                         chunks_sent += sum(flags)
                         errors += len(flags) - sum(flags)
                         ok = all(flags)

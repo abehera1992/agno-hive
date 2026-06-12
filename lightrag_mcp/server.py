@@ -32,19 +32,59 @@ async def _get_ready_rag(project_id: str):
 
 
 @mcp.tool()
-async def lightrag_insert(text: str, project_id: str) -> str:
+async def lightrag_insert(text: str, project_id: str, file_path: str = "") -> str:
     """Index a block of text into LightRAG for the given project.
 
     Args:
         text:       The text content to index (code, docs, notes, etc.)
         project_id: Project namespace — keeps each project's data isolated.
+        file_path:  Source file the text came from (relative path). Stored as
+                    doc metadata so stale versions can be deleted when the
+                    file is re-indexed (see lightrag_delete_by_file).
     """
     try:
         rag = await _get_ready_rag(project_id)
-        await rag.ainsert(_SPECIAL_TOKEN_RE.sub("", text))
+        clean = _SPECIAL_TOKEN_RE.sub("", text)
+        if file_path:
+            await rag.ainsert(clean, file_paths=file_path)
+        else:
+            await rag.ainsert(clean)
         return f"Indexed {len(text)} characters for project '{project_id}'."
     except Exception as exc:
         return f"Insert failed: {exc}"
+
+
+@mcp.tool()
+async def lightrag_delete_by_file(file_path: str, project_id: str) -> str:
+    """Delete all previously indexed documents that came from a source file.
+
+    Call BEFORE re-inserting a changed file's chunks — LightRAG indexing is
+    append-only, so without this, stale versions of changed files accumulate
+    and can win retrieval over the current content.
+
+    Args:
+        file_path:  The relative source path whose old docs should be removed.
+        project_id: Project namespace to delete from.
+    """
+    try:
+        import asyncpg
+        from config.config import config
+
+        rag = await _get_ready_rag(project_id)
+        conn = await asyncpg.connect(config.postgres_uri)
+        try:
+            rows = await conn.fetch(
+                "SELECT id FROM agno.lightrag_doc_status WHERE workspace=$1 AND file_path=$2",
+                project_id, file_path,
+            )
+        finally:
+            await conn.close()
+        ids = [r["id"] for r in rows]
+        for doc_id in ids:
+            await rag.adelete_by_doc_id(doc_id)
+        return f"Deleted {len(ids)} stale document(s) for '{file_path}' in project '{project_id}'."
+    except Exception as exc:
+        return f"Delete failed: {exc}"
 
 
 @mcp.tool()

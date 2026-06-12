@@ -3,15 +3,18 @@
 hive.md is automatically read by AGNOHive's bootstrap on every session start,
 giving the coordinator a grounded project snapshot without repeated MCP calls.
 
-Incremental update strategy (4 layers of change detection):
-  1. Committed changes since last scan  (git diff --name-only <hash>..HEAD)
-  2. Staged changes                     (git diff --cached --name-only)
-  3. Unstaged changes                   (git diff --name-only)
-  4. Untracked new files                (git ls-files --others --exclude-standard)
+Incremental update strategy (2 layers of change detection):
+  1. Committed changes since last scan  (git diff --name-only <hash>..HEAD — object-db only, fast)
+  2. Worktree state in ONE walk         (git status --porcelain — covers staged,
+     unstaged, and untracked; worktree walks cost ~76-96s on Docker Desktop
+     bind mounts, so the three separate commands this replaced exceeded the
+     gateway timeout)
 
-If nothing changed across all four layers: returns "up to date" instantly.
-If anything changed: rebuilds the full hive.md (fast — capped file reads only).
-Falls back to full scan when git is unavailable or hive.md doesn't exist yet.
+If nothing changed across both layers: returns "up to date".
+If anything changed — or change detection FAILS (timeout/git error) — rebuilds
+the full hive.md (fail-open: a scan that cannot determine changes must never
+claim "up to date"). Falls back to full scan when git is unavailable or
+hive.md doesn't exist yet.
 """
 import re
 import subprocess
