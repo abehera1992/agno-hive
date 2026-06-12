@@ -221,7 +221,10 @@ async def index_project(
                         continue
             # was_indexed: file had a previous state entry -> stale docs may
             # exist in LightRAG and must be deleted before re-inserting.
-            to_process.append((p, rel, key, bool(stored)))
+            # force=True implies was_indexed for every file: without this,
+            # a force run neither deletes old docs nor re-extracts (identical
+            # chunks bounce off content dedupe) — i.e. it silently does nothing.
+            to_process.append((p, rel, key, force or bool(stored)))
     to_process.sort(key=lambda x: x[1])  # stable alphabetical order
 
     budget_exceeded = False
