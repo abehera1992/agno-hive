@@ -76,11 +76,33 @@ def _read_stored_hash(hive_md: Path) -> str:
         return ""
 
 
-def _get_changed_files(last_hash: str) -> list[str]:
-    """Return all changed paths across all four change layers.
+def _worktree_status() -> list[str] | None:
+    """All staged + unstaged + untracked paths in ONE worktree walk.
 
-    Fail-open: if any detection layer fails (timeout, git error), a sentinel
-    is returned so the caller rebuilds instead of falsely reporting
+    `git status --porcelain` covers what previously took three separate
+    commands (diff --cached, diff, ls-files --others), each walking the
+    worktree — at ~76s per walk on Docker Desktop bind mounts that made
+    scans exceed the API gateway timeout. Returns None on failure.
+    """
+    out = _git(["status", "--porcelain"], timeout=_WORKTREE_TIMEOUT)
+    if out is None:
+        return None
+    paths: list[str] = []
+    for line in out.splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:]
+        if " -> " in path:  # rename: "R  old -> new"
+            path = path.split(" -> ", 1)[1]
+        paths.append(path.strip().strip('"'))
+    return paths
+
+
+def _get_changed_files(last_hash: str, worktree: list[str] | None) -> list[str]:
+    """Return all changed paths: committed since last scan + worktree state.
+
+    Fail-open: if detection fails (timeout, git error), a sentinel is
+    returned so the caller rebuilds instead of falsely reporting
     'up to date'.
     """
     changed: set[str] = set()
@@ -92,34 +114,21 @@ def _get_changed_files(last_hash: str) -> list[str]:
         elif out:
             changed.update(out.splitlines())
 
-    for cmd in (
-        ["diff", "--cached", "--name-only"],
-        ["diff", "--name-only"],
-        ["ls-files", "--others", "--exclude-standard"],
-    ):
-        out = _git(cmd, timeout=_WORKTREE_TIMEOUT)
-        if out is None:
-            changed.add("<change-detection-failed>")
-        elif out:
-            changed.update(out.splitlines())
+    if worktree is None:
+        changed.add("<change-detection-failed>")
+    else:
+        changed.update(worktree)
 
     return [f for f in changed if f]
 
 
-def _uncommitted_summary() -> str:
+def _uncommitted_summary(worktree: list[str] | None) -> str:
     """Short human-readable list of files with uncommitted changes."""
-    all_changed: set[str] = set()
-    for cmd in (
-        ["diff", "--cached", "--name-only"],
-        ["diff", "--name-only"],
-        ["ls-files", "--others", "--exclude-standard"],
-    ):
-        out = _git(cmd, timeout=_WORKTREE_TIMEOUT)
-        if out:
-            all_changed.update(out.splitlines())
-    if not all_changed:
+    if worktree is None:
+        return "unknown — git status failed"
+    if not worktree:
         return "none"
-    files = sorted(all_changed)
+    files = sorted(set(worktree))
     if len(files) > 8:
         return ", ".join(files[:8]) + f" … (+{len(files) - 8} more)"
     return ", ".join(files)
@@ -251,7 +260,10 @@ def scan_project_context(force: bool = False) -> str:
     """
     hive_md = PROJECT_ROOT / _HIVE_MD
     head = _current_head()
-    uncommitted = _uncommitted_summary()
+    # ONE worktree walk per scan — shared by change detection and the
+    # uncommitted-files summary (each walk costs ~76s on bind mounts).
+    worktree = _worktree_status()
+    uncommitted = _uncommitted_summary(worktree)
 
     # Full scan when forced or file missing
     if force or not hive_md.exists():
@@ -262,7 +274,7 @@ def scan_project_context(force: bool = False) -> str:
 
     # Incremental: check what changed
     last_hash = _read_stored_hash(hive_md)
-    changed = _get_changed_files(last_hash)
+    changed = _get_changed_files(last_hash, worktree)
 
     if not changed and last_hash == head:
         return f"up to date: {_HIVE_MD} — no changes since commit {head[:8]}"
