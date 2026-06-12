@@ -38,16 +38,28 @@ _DIR_CANDIDATES = ["README.md", "__init__.py", "main.py", "config.py",
 
 # ── Git helpers ───────────────────────────────────────────────────────────────
 
-def _git(args: list[str]) -> str:
-    """Run a git command in PROJECT_ROOT. Returns stdout or '' on any error."""
+def _git(args: list[str], timeout: int = 10) -> str | None:
+    """Run a git command in PROJECT_ROOT.
+
+    Returns stdout on success ('' is a legitimate empty result), or None on
+    any failure/timeout — callers must distinguish 'no changes' from
+    'could not determine changes'.
+    """
     try:
         r = subprocess.run(
             ["git"] + args,
-            capture_output=True, text=True, cwd=PROJECT_ROOT, timeout=10,
+            capture_output=True, text=True, cwd=PROJECT_ROOT, timeout=timeout,
         )
-        return r.stdout.strip() if r.returncode == 0 else ""
+        return r.stdout.strip() if r.returncode == 0 else None
     except Exception:
-        return ""
+        return None
+
+
+# Worktree-walking commands (diff against the working tree, untracked scan)
+# stat every tracked file. On Docker Desktop bind mounts this measured 70-80s
+# for a ~650-file project — far beyond the old 10s timeout, which made the
+# scan silently blind to unstaged/untracked changes ("up to date" lie).
+_WORKTREE_TIMEOUT = 180
 
 
 def _current_head() -> str:
@@ -65,12 +77,19 @@ def _read_stored_hash(hive_md: Path) -> str:
 
 
 def _get_changed_files(last_hash: str) -> list[str]:
-    """Return all changed paths across all four change layers."""
+    """Return all changed paths across all four change layers.
+
+    Fail-open: if any detection layer fails (timeout, git error), a sentinel
+    is returned so the caller rebuilds instead of falsely reporting
+    'up to date'.
+    """
     changed: set[str] = set()
 
     if last_hash and last_hash != "unknown":
         out = _git(["diff", "--name-only", f"{last_hash}..HEAD"])
-        if out:
+        if out is None:
+            changed.add("<change-detection-failed>")
+        elif out:
             changed.update(out.splitlines())
 
     for cmd in (
@@ -78,8 +97,10 @@ def _get_changed_files(last_hash: str) -> list[str]:
         ["diff", "--name-only"],
         ["ls-files", "--others", "--exclude-standard"],
     ):
-        out = _git(cmd)
-        if out:
+        out = _git(cmd, timeout=_WORKTREE_TIMEOUT)
+        if out is None:
+            changed.add("<change-detection-failed>")
+        elif out:
             changed.update(out.splitlines())
 
     return [f for f in changed if f]
@@ -93,7 +114,7 @@ def _uncommitted_summary() -> str:
         ["diff", "--name-only"],
         ["ls-files", "--others", "--exclude-standard"],
     ):
-        out = _git(cmd)
+        out = _git(cmd, timeout=_WORKTREE_TIMEOUT)
         if out:
             all_changed.update(out.splitlines())
     if not all_changed:
