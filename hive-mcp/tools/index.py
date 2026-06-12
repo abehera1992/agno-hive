@@ -37,6 +37,17 @@ _SKIP_EXTS = {
     ".tar", ".gz", ".pdf", ".lock", ".pem", ".key", ".crt", ".cer", ".p12", ".pfx",
     ".tsbuildinfo",
 }
+# Secret-bearing filenames — extension matching can't catch these (".env" has
+# no suffix in pathlib terms). .env.example is allowed: it documents shape,
+# not values.
+_SKIP_FILENAMES = {".env", ".env.local", ".env.production", ".env.development", ".npmrc", ".pypirc"}
+
+
+def _is_secret_file(filename: str) -> bool:
+    lower = filename.lower()
+    if lower in _SKIP_FILENAMES:
+        return True
+    return lower.startswith(".env.") and not lower.endswith(".example")
 
 
 # ── File chunking ─────────────────────────────────────────────────────────────
@@ -178,6 +189,8 @@ async def index_project(
         )
         for filename in filenames:
             if not _fnmatch.fnmatch(filename, _file_pat):
+                continue
+            if _is_secret_file(filename):
                 continue
             p = Path(dirpath) / filename
             if p.suffix.lower() in _SKIP_EXTS:
