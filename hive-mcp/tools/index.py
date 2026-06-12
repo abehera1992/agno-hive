@@ -265,6 +265,7 @@ async def index_project(
                         except Exception:
                             pass
 
+                    last_chunk: tuple[str, str] | None = None
                     for p, rel, key, was_indexed in to_process:
                         if time.monotonic() - t_start >= time_budget_seconds:
                             budget_exceeded = True
@@ -272,6 +273,8 @@ async def index_project(
                         if was_indexed:
                             await _delete_stale(rel)
                         chunks = _py_chunks(p) if p.suffix == ".py" else _text_chunks(p)
+                        if chunks:
+                            last_chunk = (chunks[-1], rel)
                         flags = await asyncio.gather(*[_send_chunk(c, rel) for c in chunks])
                         chunks_sent += sum(flags)
                         errors += len(flags) - sum(flags)
@@ -283,6 +286,21 @@ async def index_project(
                                 new_state[rel] = key
                         files_indexed += 1
                         _save_state(project_id, new_state)  # persist after every file
+
+                    # Pipeline kick: LightRAG can leave the final batch of docs
+                    # 'pending' indefinitely when they enqueue while a processing
+                    # cycle is already running — pending docs only drain on the
+                    # next ainsert. Re-send the last chunk: guaranteed
+                    # dedupe-rejection (no new doc), but the insert's process
+                    # step picks up everything still pending.
+                    if last_chunk is not None and chunks_sent:
+                        try:
+                            await session.call_tool(
+                                "lightrag_insert",
+                                {"text": last_chunk[0], "project_id": project_id, "file_path": last_chunk[1]},
+                            )
+                        except Exception:
+                            pass
         except Exception as e:
             errors += 1
             _save_state(project_id, new_state)
