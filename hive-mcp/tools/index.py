@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -118,15 +119,35 @@ def _sha256(path: Path) -> str:
 
 def _load_state(project_id: str) -> dict:
     f = _STATE_DIR / f"{project_id}.json"
-    try:
-        return json.loads(f.read_text()) if f.exists() else {}
-    except Exception:
-        return {}
+    if not f.exists():
+        return {}  # legitimately empty — first run for this project
+    # An EXISTING state file that fails to read/parse must NOT silently reset
+    # to {}. Doing so makes the pass start from empty and _save_state then
+    # truncates all prior progress (observed 2026-06-12: a transient read
+    # during concurrent container ops left 346/632 files tracked while
+    # LightRAG kept all 632). Retry briefly, then fail loud so the caller
+    # aborts/retries instead of corrupting state.
+    last_exc = None
+    for _ in range(3):
+        try:
+            return json.loads(f.read_text())
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            time.sleep(0.2)
+    raise RuntimeError(
+        f"state file {f} exists but could not be read after retries "
+        f"(refusing to reset and truncate): {last_exc}"
+    )
 
 
 def _save_state(project_id: str, state: dict) -> None:
     _STATE_DIR.mkdir(parents=True, exist_ok=True)
-    (_STATE_DIR / f"{project_id}.json").write_text(json.dumps(state))
+    # Atomic write: serialize to a temp file then replace, so a reader never
+    # observes a half-written (corrupt) state file mid-save.
+    target = _STATE_DIR / f"{project_id}.json"
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state))
+    os.replace(tmp, target)
 
 
 # ── Main tool ─────────────────────────────────────────────────────────────────
