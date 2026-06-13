@@ -21,6 +21,19 @@ mcp = FastMCP("lightrag", host=_mcp_host, port=_mcp_port)
 _GLOBAL = "global"  # cross-project shared namespace
 _initialized: set[str] = set()  # tracks which project RAGs have been initialized
 
+# Grounding guard — appended to every query's generation prompt. Counters the
+# RAG failure mode where a leading question ("does it do X via an AI agent?")
+# gets its presupposition confirmed: the index holds only code that EXISTS, so
+# the absence of a feature cannot be retrieved, and the model otherwise stitches
+# a semantically-near file into a false "yes". Forces evidence-or-abstain.
+_GROUNDING_GUARD = (
+    "Answer strictly from the retrieved context about code that ACTUALLY EXISTS. "
+    "Do not confirm a capability just because the question presupposes it. "
+    "If the context does not contain direct evidence for a claim, say "
+    "'not found in the indexed code' for that claim instead of inferring it from "
+    "a similar or adjacent file. Cite the file/function for every concrete claim."
+)
+
 
 async def _get_ready_rag(project_id: str):
     """Return a fully initialized LightRAG instance, calling initialize_storages() once per project."""
@@ -130,7 +143,7 @@ async def lightrag_query(query: str, project_id: str, mode: str = "hybrid") -> s
             _get_ready_rag(project_id),
             _get_ready_rag(_GLOBAL),
         )
-        param = QueryParam(mode=mode)
+        param = QueryParam(mode=mode, user_prompt=_GROUNDING_GUARD)
 
         # Query both namespaces in parallel
         project_result, global_result = await asyncio.gather(
