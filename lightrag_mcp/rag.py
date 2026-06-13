@@ -6,6 +6,43 @@ from lightrag import LightRAG
 from lightrag.llm.ollama import ollama_model_complete, ollama_embed
 from lightrag.utils import EmbeddingFunc
 
+# ── Disable LightRAG's rebuild-on-delete (deadlock workaround, 2026-06-13) ────
+# Re-indexing a changed file deletes the old doc version then re-inserts the new
+# one. LightRAG's adelete_by_doc_id runs rebuild_knowledge_from_chunks() to scrub
+# the deleted chunks' contributions from every affected entity/relationship. For
+# high-degree entities (e.g. tenant_id in ~294 chunks, user_id in ~193) that
+# parallel rebuild wedges in LightRAG 1.4.16's keyed-lock layer
+# (operate.rebuild_knowledge_from_chunks -> get_storage_keyed_lock): tasks block
+# on lock acquisition and never reach the LLM, hanging the whole bootstrap with
+# Ollama idle, Postgres idle, and the event loop parked. Reproduced on every
+# bootstrap that touched those entities.
+#
+# The rebuild is redundant for our workflow: we always delete-then-REINSERT, and
+# the reinsert re-extracts those same entities from the new chunks. So we no-op
+# the rebuild. (Only a pure delete with no following insert would skip the
+# scrub, which the indexer never does.) lightrag.lightrag binds the symbol at
+# module load (from .operate import rebuild_knowledge_from_chunks) and calls it
+# by bare name, so the patch must target THAT module's namespace.
+import logging as _logging
+import lightrag.lightrag as _lr_module
+
+_rebuild_log = _logging.getLogger("lightrag_mcp.rag")
+
+
+async def _skip_rebuild_knowledge_from_chunks(*args, **kwargs):
+    ents = kwargs.get("entities_to_rebuild") or {}
+    rels = kwargs.get("relationships_to_rebuild") or {}
+    if ents or rels:
+        _rebuild_log.info(
+            "rebuild_knowledge_from_chunks skipped (reindex no-op): "
+            "%d entities, %d relationships",
+            len(ents), len(rels),
+        )
+    return None
+
+
+_lr_module.rebuild_knowledge_from_chunks = _skip_rebuild_knowledge_from_chunks
+
 _cache: dict[str, LightRAG] = {}
 
 
