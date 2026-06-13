@@ -287,9 +287,12 @@ def scan_project_context(force: bool = False) -> str:
     hive_md.write_text(content, encoding="utf-8")
 
     if changed:
-        preview = ", ".join(changed[:5]) + ("…" if len(changed) > 5 else "")
-        return (
-            f"updated: {_HIVE_MD} ({hive_md.stat().st_size:,} bytes) — "
-            f"{len(changed)} file(s) changed [{preview}]"
-        )
+        # The fail-open sentinel triggers a rebuild but is not a real file —
+        # keep it out of the human-facing preview and count.
+        detection_failed = "<change-detection-failed>" in changed
+        real = [c for c in changed if c != "<change-detection-failed>"]
+        preview = ", ".join(real[:5]) + ("…" if len(real) > 5 else "")
+        note = " (change detection fell back to full rebuild)" if detection_failed else ""
+        body = f"{len(real)} file(s) changed [{preview}]" if real else "rebuilt"
+        return f"updated: {_HIVE_MD} ({hive_md.stat().st_size:,} bytes) — {body}{note}"
     return f"updated: {_HIVE_MD} — commit advanced to {head[:8]}"

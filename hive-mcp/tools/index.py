@@ -43,6 +43,20 @@ _SKIP_EXTS = {
 # prod.env, .xcode.env all carry env values. .env.example documents shape only.
 _SKIP_FILENAMES = {".npmrc", ".pypirc"}
 
+# Dependency lock files — huge, near-zero semantic value, pure noise in the
+# entity graph (a single package-lock.json is ~176 chunks). Their extension is
+# .json/.yaml/.toml so _SKIP_EXTS can't catch them; match by exact filename.
+_SKIP_LOCKFILES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json",
+    "poetry.lock", "pdm.lock", "cargo.lock", "composer.lock", "gemfile.lock",
+    "podfile.lock", "packages.lock.json",
+}
+
+
+def _is_skippable_file(filename: str) -> bool:
+    """True if the file should never be indexed (secret OR noise lock file)."""
+    return filename.lower() in _SKIP_LOCKFILES or _is_secret_file(filename)
+
 
 def _is_secret_file(filename: str) -> bool:
     lower = filename.lower()
@@ -220,7 +234,7 @@ async def index_project(
         for filename in filenames:
             if not _fnmatch.fnmatch(filename, _file_pat):
                 continue
-            if _is_secret_file(filename):
+            if _is_skippable_file(filename):
                 continue
             p = Path(dirpath) / filename
             if p.suffix.lower() in _SKIP_EXTS:
