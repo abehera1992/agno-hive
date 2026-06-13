@@ -39,16 +39,25 @@ _SKIP_EXTS = {
     ".tsbuildinfo",
 }
 # Secret-bearing filenames — extension matching can't catch these (".env" has
-# no suffix in pathlib terms). .env.example is allowed: it documents shape,
-# not values.
-_SKIP_FILENAMES = {".env", ".env.local", ".env.production", ".env.development", ".npmrc", ".pypirc"}
+# no pathlib suffix). Think in filename PATTERNS, not exact names: phase.env,
+# prod.env, .xcode.env all carry env values. .env.example documents shape only.
+_SKIP_FILENAMES = {".npmrc", ".pypirc"}
 
 
 def _is_secret_file(filename: str) -> bool:
     lower = filename.lower()
     if lower in _SKIP_FILENAMES:
         return True
-    return lower.startswith(".env.") and not lower.endswith(".example")
+    if lower.endswith(".example"):
+        return False  # .env.example etc. — shape, not values
+    # Any *.env or .env.* file: ".env", "phase.env", ".xcode.env", ".env.local"
+    if lower == ".env" or lower.endswith(".env") or lower.startswith(".env."):
+        return True
+    # SQL DUMPS only (backup.sql, phase-db-backup.sql, *_dump.sql) — schema,
+    # migration, and init SQL are useful code and stay indexed.
+    if lower.endswith(".sql") and ("backup" in lower or "dump" in lower):
+        return True
+    return False
 
 
 # ── File chunking ─────────────────────────────────────────────────────────────
