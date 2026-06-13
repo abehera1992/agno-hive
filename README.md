@@ -232,10 +232,11 @@ read); on mismatch the content SHA-256 decides, so metadata-only churn
 (`git reset --hard`, checkout, `touch`) never triggers a re-index. Legacy
 mtime-only entries upgrade in place on the next pass.
 
-Excluded automatically: `node_modules`, `.next`, `dist`, `build`, `signoz`, `graphify-out`, `infra`, `backups` (DB dumps — never index), `.hive-index-state`, hidden dirs, binaries, certs (`.pem`, `.key`, `.crt`).
+Excluded automatically: `node_modules`, `.next`, `dist`, `build`, `signoz`, `graphify-out`, `infra`, `backups` (DB dumps — never index), `.hive-index-state`, hidden dirs, binaries, certs (`.pem`, `.key`, `.crt`). Secret/dump files are skipped by **filename pattern** (extension matching can't catch `.env`): any `*.env` / `.env.*` (except `.env.example`), `.npmrc`, `.pypirc`, and SQL files named `backup`/`dump` — while schema/migration/init SQL stays indexed.
 
-Throughput (2026-06-10): chunk inserts run 4-concurrent over the shared MCP
-session, matched by LightRAG-side tuning (`max_parallel_insert=4`,
+Throughput (2026-06-12): chunk inserts run **6-concurrent** over the shared MCP
+session, matched by LightRAG-side tuning (`max_parallel_insert=6`,
+`llm_model_max_async=6` to match `OLLAMA_NUM_PARALLEL=6`,
 `entity_extract_max_gleaning=0`, `embedding_batch_num=32`, dynamic `num_ctx`
 8K/32K) — roughly 4–6× faster than the old serial pipeline.
 
@@ -244,7 +245,16 @@ previous documents (`lightrag_delete_by_file` — LightRAG indexing is otherwise
 append-only and stale versions could win retrieval), and every insert carries
 `file_path` metadata. Each run ends with a pipeline kick (a dedupe-rejected
 re-send of the last chunk) so LightRAG never leaves the final batch sitting
-in 'pending'.
+in 'pending'. State load fails loud (never silently resets to `{}` and
+truncates progress); saves are atomic.
+
+Per-project isolation: each `project_id` gets its own Qdrant collections, AGE
+graph, and PostgreSQL `workspace` (set via the per-instance `LightRAG(workspace=…)`
+constructor — **`POSTGRES_WORKSPACE` must never be set**, it overrides the
+per-instance value and cross-contaminates projects). Queries carry a grounding
+guard (answer from retrieved evidence, say "not found" for unsupported claims) —
+and should be phrased neutrally, since RAG can confirm a leading question's
+false presupposition.
 
 **Option B — ZGX-side direct indexer** (use when ZGX has direct filesystem access to the repo):
 ```bash
