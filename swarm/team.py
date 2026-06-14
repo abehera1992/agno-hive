@@ -11,7 +11,7 @@ from config.config import config
 
 _tracer = trace.get_tracer("agno-hive.team")
 
-_MCP_TIMEOUT = 180  # lightrag_query needs ~90-120s for LLM synthesis
+_MCP_TIMEOUT = 300  # lightrag_query synthesis ~90-120s; large file reads over Docker bind mounts can be slow — headroom so multi-read tasks don't die mid-read
 
 _COORDINATOR_INSTRUCTIONS = [
     "── Tool restrictions ────────────────────────────────────────────",

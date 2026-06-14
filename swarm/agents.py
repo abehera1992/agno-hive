@@ -14,6 +14,7 @@ _BASE_PREAMBLE = [
     "SESSION CONTEXT: At session start, if project context hasn't been provided by the coordinator, try get_file_content('hive.md') once for a pre-built project overview (directory tree, per-module summaries). Skip silently if not found — it's optional.",
     "If lightrag_query is available via MCP, call it with relevant keywords before starting.",
     "If lightrag_insert is available via MCP, call it with a descriptive key after completing.",
+    "HONESTY: never claim a change was made or that a task succeeded if a tool returned an error, an empty result, or did not apply. Report the exact failure instead. A partial result is a FAILURE, not a success.",
 ]
 
 
@@ -62,6 +63,7 @@ def make_coder(*mcps: MCPTools) -> Agent:
             "When apply_diff() returns 'review_pending': call get_file_content('<path>.hive_proposed') to read the current staged state. Then apply ONLY the NEXT distinct change not already in the staged file. DO NOT re-apply a change already staged — check first.",
             "Typical two-call pattern: (1) update the import line → check .hive_proposed → (2) add the usage in the function body. These are TWO DIFFERENT changes; never repeat the same change twice.",
             "NEVER drop existing code lines when building old_string: your old_string must match exactly what is in the file, and new_string must preserve all lines not being changed.",
+            "If apply_diff() returns an error or its old_string did not match (i.e. NOT 'review_pending' and NOT success), STOP and report exactly which diff failed and why — never report that change as done. If a large multi-line block will not match, retry with a SMALLER, uniquely-anchored old_string covering only the lines that change.",
         ],
         role="Senior software engineer who implements features and fixes bugs.",
         **_COMMON_AGENT_KWARGS,
@@ -78,6 +80,7 @@ def make_reviewer(*mcps: MCPTools) -> Agent:
             *_BASE_PREAMBLE,
             "Check for correctness, security, and consistency.",
             "Be concise — flag real problems only, not style preferences.",
+            "Verify every change the Coder claimed was ACTUALLY applied — check the staged .hive_proposed file (or the file itself). If any apply_diff failed to match or a file was not written, report the task as INCOMPLETE and list what is missing; never confirm success on a partial apply.",
             "If the implementation looks correct, say so explicitly.",
         ],
         role="Senior engineer who reviews code for correctness and security.",
