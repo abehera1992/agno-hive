@@ -103,7 +103,6 @@ _COORDINATOR_INSTRUCTIONS = [
     "  2. ALWAYS read at least one existing reference file of the same type before writing.",
     "     NEVER skip this step — guessing conventions produces broken code.",
     "  3. Delegate writing to Coder, review to Reviewer",
-    "  4. lightrag_insert() any non-obvious insight after completing (if available)",
     "",
     "── Project context (fetch on demand — NOT pre-loaded) ───────────",
     "  Project context is NEVER injected into your prompt automatically.",

@@ -1,19 +1,33 @@
 """Self-improving loop — records task outcomes and loads past context.
 
-Success path  → lightweight text inserted into LightRAG (agents can retrieve via lightrag_query)
+Success path  → task outcome inserted into an ISOLATED LightRAG "experience"
+                namespace ({project_id}_experience), NOT the project's code
+                namespace. This prevents past task Q&A (which can contain
+                draft/incorrect specifics) from being retrieved by, and
+                poisoning, code-grounding queries on the project namespace.
 Failure path  → structured record in PostgreSQL failure_log table
 Context load  → queries failure_log before each task, injected into coordinator instructions
 """
 import asyncio
 
 
+# Suffix for the isolated experience-replay namespace. Task outcomes live here
+# so code-grounding queries on `project_id` only ever see indexed source files.
+EXPERIENCE_SUFFIX = "_experience"
+
+
+def experience_namespace(project_id: str) -> str:
+    return f"{project_id}{EXPERIENCE_SUFFIX}"
+
+
 # ── Success ───────────────────────────────────────────────────────────────────
 
 async def record_success(task: str, result: str, project_id: str) -> None:
-    """Insert a successful task outcome into LightRAG for future retrieval."""
+    """Insert a successful task outcome into the isolated experience namespace."""
     try:
         from lightrag_mcp.rag import get_rag
-        rag = get_rag(project_id)
+        # Isolated namespace — never the project's code namespace (grounding poison).
+        rag = get_rag(experience_namespace(project_id))
         await rag.initialize_storages()
         text = (
             f"Past task outcome (SUCCESS)\n"
@@ -21,7 +35,8 @@ async def record_success(task: str, result: str, project_id: str) -> None:
             f"Task: {task}\n"
             f"Result:\n{result[:1500]}"
         )
-        await rag.ainsert(text)
+        # Tag with a real file_path so these are identifiable (never "unknown_source").
+        await rag.ainsert(text, file_paths="task_outcome")
     except Exception as exc:
         print(f"[feedback] record_success warning: {exc}")
 
