@@ -1,6 +1,12 @@
 name: sprint-master
 description: Generic, platform-agnostic PM team — reads and writes backlog/sprint work items (epics, features, stories, tasks, bugs) on the connected work-tracking platform. Never edits code, runs shell, or touches files — board CRUD only.
-coordinator_model: qwen2.5-coder:7b
+coordinator_model: qwen3-coder:30b
+# Escalated from qwen2.5-coder:7b after smoke test 2026-06-19: the 7b coordinator emitted
+# delegate_task_to_member as malformed single-quoted JSON in content (OllamaToolFix could not
+# parse it), so delegation silently no-op'd and no write was staged. qwen3-coder:30b is the
+# non-thinking MoE used by the engineering team — best tool-call grounding, handles the XML
+# tool-call format via OllamaToolFix format 6. Already resident on ZGX (no new download).
+#
 # Read-only allowlist for the coordinator's direct tool surface. Writes are delegated to
 # StoryWriter — the coordinator can inspect the board and read docs but cannot write itself.
 # Keep this list read-only.
