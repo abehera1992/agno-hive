@@ -126,23 +126,46 @@ def notion_search(query: str, filter_type: str = "") -> str:
         return f"notion_search failed: {e}"
 
 
-def notion_get_page(page_id: str) -> str:
+def notion_get_page(page_id: str, max_lines: int = 600) -> str:
     """
-    Read a Notion page's properties and top-level blocks.
-    Read-only — no approval required.
+    Read a Notion page's FULL content — paginates ALL top-level blocks (not just the first
+    page of 25) and renders table rows, so long pages (roadmaps, rate tables) are read
+    end-to-end. Read-only — no approval required.
 
     Args:
-        page_id: Notion page ID (32-char hex, UUID format, or last segment of page URL)
+        page_id:   Notion page ID (32-char hex, UUID format, or last segment of page URL).
+        max_lines: Safety cap on output lines (default 600).
     """
     try:
         clean  = _clean_id(page_id)
         page   = _request("GET", f"/pages/{clean}")
-        blocks = _request("GET", f"/blocks/{clean}/children?page_size=25")
         title  = _extract_title(page)
         url    = page.get("url", "")
         lines  = [f"notion page: {title}  ({url})"]
-        for b in blocks.get("results", []):
-            lines.append("  " + _block_summary(b))
+        cursor = None
+        while len(lines) < max_lines:
+            path = f"/blocks/{clean}/children?page_size=100"
+            if cursor:
+                path += f"&start_cursor={cursor}"
+            data = _request("GET", path)
+            for b in data.get("results", []):
+                lines.append("  " + _block_summary(b))
+                # Expand table blocks — render each row's cells (table_row children).
+                if b.get("type") == "table" and b.get("has_children"):
+                    rows = _request("GET", f"/blocks/{b['id']}/children?page_size=100")
+                    for row in rows.get("results", []):
+                        if row.get("type") == "table_row":
+                            cells = row.get("table_row", {}).get("cells", [])
+                            text = " | ".join(
+                                "".join(t.get("plain_text", "") for t in cell) for cell in cells
+                            )
+                            lines.append("      " + text)
+                if len(lines) >= max_lines:
+                    lines.append("  … (truncated at max_lines)")
+                    break
+            if not data.get("has_more") or len(lines) >= max_lines:
+                break
+            cursor = data.get("next_cursor")
         return "\n".join(lines)
     except Exception as e:
         return f"notion_get_page failed: {e}"
