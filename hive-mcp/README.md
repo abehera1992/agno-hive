@@ -91,9 +91,11 @@ dicts/lists, which previously caused "expected dict, got string" failures).
 | `notion_search(query)` | None | Search pages and databases by title/content |
 | `notion_get_page(page_id)` | None | Read a page's properties and top-level blocks |
 | `notion_get_database_schema(database_id)` | None | List a database's property names + types (and select/status option names) — use to learn valid field/option names before writing |
+| `notion_query_database(database_id, filter, sorts, page_size)` | None | List / filter database rows in ONE call (e.g. all Work Items in a sprint). `filter` is a Notion filter object/JSON string; a relation filter's `contains` accepts a page id or URL. Compact one-line-per-row output |
 | `notion_create_page(parent_id, title, properties, content, parent_type)` | Staged | Create a database row (or child page). `properties` = dict of simple field values; `title` goes to the database's title property automatically |
 | `notion_update_page_props(page_id, properties)` | Staged | Update fields by simple value, e.g. `{"Status": "Done"}`. status / select / relation / date are coerced from the schema; pass `null` to clear a field |
 | `notion_append_blocks(block_id, blocks, after_block_id)` | Staged | Append blocks. `blocks` may be a list of plain strings (each becomes a paragraph) or full block dicts; `after_block_id` controls insertion position |
+| `notion_trash_page(page_id, restore)` | Staged | Trash a page (remove it from the board/database); `restore=True` brings it back. Trashing also drops the row from query results and from any relations |
 
 ---
 
