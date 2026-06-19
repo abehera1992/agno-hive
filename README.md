@@ -662,8 +662,25 @@ All models are configurable via `.env` or `teams/*.yaml`. Models are swappable w
 | `engineering` | All 6 (default) | `coordinate` | Full implementation tasks |
 | `planning` | ContextRouter + Researcher + Planner | `coordinate` | HITL plan review via `POST /plan` |
 | `parallel-review` | Researcher + SecurityReviewer + PerformanceReviewer | `collaborate` | Read-only parallel analysis — all agents run simultaneously |
+| `sprint-master` | BacklogResearcher + StoryWriter | `coordinate` | Backlog/sprint work-item CRUD on the connected work-tracking platform — board management only, never code |
 
 Create a new team by adding a YAML file in `teams/` — no code changes needed. Set `mode: collaborate` in the YAML to run all agents in parallel, or override per-request via the `mode` field in `POST /run`.
+
+### Sprint Master — delivery-board PM team
+
+`sprint-master` (added 2026-06-19) is a **generic, platform-agnostic PM team** for delivery tracking. It reads the board schema + current state, then creates, updates, and nests work items (epics, features, stories, tasks, bugs) on whatever work-tracking platform is connected — Notion today, Jira/Linear later (each is just a new `hive-mcp` integration). It is **board CRUD only**: no agent holds `apply_diff` / `write_file` / `run_command`.
+
+- **Coordinator:** `qwen3-coder:30b` (escalated from `qwen2.5-coder:7b`, which emitted unparseable delegation calls). Holds the board read **and** write tools, scoped via `coordinator_tools` so it never gets code/shell tools. `WRITE_REVIEW`, not tool restriction, gates every write.
+- **Agents:** BacklogResearcher + StoryWriter (`qwen2.5-coder:32b`).
+- **Property handling:** pass `properties` as a plain dict of simple values (`{"Status": "Done", "Sprint": "<page-url>"}`); the platform tool coerces each to the right type from the schema. Relations (Sprint, parent) take a page id or URL and must be set **in the same create call**.
+- **Project board facts** (data-source IDs, field/option names, native sub-item nesting) live in the *project's* repo — e.g. EkamApp `docs/delivery-board.md` — which the team reads, so the team stays project-agnostic.
+
+```bash
+hive --project ekam --team sprint-master "mark Feature EK-42 done"
+hive --project ekam --team sprint-master "add a Story 'wire up X' under epic EK-12 in the current sprint"
+# from Claude Code / Claude Desktop:
+#   agno_run("add a Story under EK-12 in the current sprint", swarm_team="sprint-master")
+```
 
 ---
 
