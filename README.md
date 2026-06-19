@@ -777,7 +777,13 @@ Read operations (`notion_search`, `notion_get_page`) pass through immediately â€
 
 | Platform | Env var | Read tools | Write tools |
 |---|---|---|---|
-| Notion | `NOTION_API_KEY` | `notion_search`, `notion_get_page` | `notion_create_page`, `notion_update_page_props`, `notion_append_blocks` |
+| Notion | `NOTION_API_KEY` | `notion_search`, `notion_get_page`, `notion_get_database_schema` | `notion_create_page`, `notion_update_page_props`, `notion_append_blocks` |
+
+> **Notion write tools take simple values.** Pass `properties` as a plain dict
+> (`{"Status": "Done", "Area": "Platform", "Sprint": "<page-url>"}`); the tool reads the database
+> schema and maps each value to the correct Notion type (select / status / relation / number /
+> date / â€¦). Relations accept a page id or URL. Nested params passed as JSON strings are parsed
+> automatically. See `hive-mcp/README.md` for the full per-tool reference.
 
 ---
 

@@ -75,13 +75,25 @@ Agents choose which MCP to use based on operation type. The coordinator instruct
 Activated by env var — tools only appear when the platform is configured.
 
 **Notion** (`NOTION_API_KEY` required)
+
+Write tools accept **simple values** — pass `properties` as a plain dict of field → value
+(e.g. `{"Status": "Done", "Area": "Platform", "Sprint": "<page-url>"}`) and the tool reads the
+target database schema and coerces each value into the correct Notion property shape
+(title / rich_text / select / **status** / multi_select / number / checkbox / date / url /
+relation / people). The caller never has to know whether a field is a select vs status vs
+relation. Relation values may be a page id **or** full page URL (the id is extracted). Unknown
+field names are skipped so a typo doesn't fail the whole write. Nested params may also arrive as
+JSON strings — they are parsed automatically (the agno/ollama tool-call path stringifies
+dicts/lists, which previously caused "expected dict, got string" failures).
+
 | Tool | Approval | Description |
 |---|---|---|
 | `notion_search(query)` | None | Search pages and databases by title/content |
 | `notion_get_page(page_id)` | None | Read a page's properties and top-level blocks |
-| `notion_create_page(parent_id, title, content, parent_type)` | Staged | Create a page in a database or as a child page |
-| `notion_update_page_props(page_id, properties)` | Staged | Update page properties (title, status, date, selects) |
-| `notion_append_blocks(block_id, blocks, after_block_id)` | Staged | Append content blocks; `after_block_id` controls insertion position |
+| `notion_get_database_schema(database_id)` | None | List a database's property names + types (and select/status option names) — use to learn valid field/option names before writing |
+| `notion_create_page(parent_id, title, properties, content, parent_type)` | Staged | Create a database row (or child page). `properties` = dict of simple field values; `title` goes to the database's title property automatically |
+| `notion_update_page_props(page_id, properties)` | Staged | Update fields by simple value, e.g. `{"Status": "Done"}`. status / select / relation / date are coerced from the schema; pass `null` to clear a field |
+| `notion_append_blocks(block_id, blocks, after_block_id)` | Staged | Append blocks. `blocks` may be a list of plain strings (each becomes a paragraph) or full block dicts; `after_block_id` controls insertion position |
 
 ---
 
