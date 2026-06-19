@@ -441,12 +441,16 @@ def _format_row(page: dict) -> str:
     title = _extract_title(page)
     uid, parts = "", []
     for name, p in props.items():
-        if p.get("type") == "title":
+        ptype = p.get("type")
+        # Skip the title (shown separately) and relations: a relation renders as "N linked",
+        # which models misread as a value (e.g. "Sprint=1 linked" read as "Sprint 1"). The row's
+        # relation membership is already implied by the query filter; use notion_get_page for detail.
+        if ptype in ("title", "relation"):
             continue
         val = _prop_value(p)
         if val is None or val == "" or val is False:
             continue
-        if p.get("type") == "unique_id":
+        if ptype == "unique_id":
             uid = f"[{val}] "
             continue
         parts.append(f"{name}={val}")
