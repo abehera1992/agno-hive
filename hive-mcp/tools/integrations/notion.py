@@ -167,6 +167,53 @@ def notion_get_database_schema(database_id: str) -> str:
         return f"notion_get_database_schema failed: {e}"
 
 
+def notion_query_database(
+    database_id: str,
+    filter: dict | str | None = None,
+    sorts: list | str | None = None,
+    page_size: int = 50,
+) -> str:
+    """
+    Query a database and LIST / FILTER its rows — e.g. "all Work Items in a given sprint",
+    "every Bug with Status = Open". Read-only — no approval required. This is the right tool for
+    reporting questions; do NOT page through rows one by one.
+
+    Args:
+        database_id: Notion database ID (32-char hex, UUID, or last URL segment).
+        filter:      Optional Notion filter object (or JSON string). Examples:
+                       relation: {"property": "Sprint", "relation": {"contains": "<page-id-or-url>"}}
+                       select:   {"property": "Type", "select": {"equals": "Story"}}
+                       status:   {"property": "Status", "status": {"equals": "Done"}}
+                       compound: {"and": [ {...}, {...} ]}   (also supports "or")
+                     For a relation filter, the value must be a page id (use _clean_id form or a URL).
+        sorts:       Optional list of {"property": "<name>", "direction": "ascending"|"descending"}.
+        page_size:   Max rows to return (default 50, max 100).
+    """
+    try:
+        body: dict = {"page_size": max(1, min(int(page_size), 100))}
+        f = _as_dict(filter)
+        if f:
+            # coerce a relation filter's contains value (URL -> id) for convenience
+            rel = f.get("relation") if isinstance(f, dict) else None
+            if isinstance(rel, dict) and "contains" in rel:
+                rel["contains"] = _extract_id(rel["contains"])
+            body["filter"] = f
+        s = _as_list(sorts)
+        if s:
+            body["sorts"] = s
+        data    = _request("POST", f"/databases/{_clean_id(database_id)}/query", body)
+        results = data.get("results", [])
+        if not results:
+            return "notion: query returned 0 rows"
+        more  = " (more available — raise page_size or paginate)" if data.get("has_more") else ""
+        lines = [f"notion: {len(results)} row(s){more}:"]
+        for r in results:
+            lines.append("  " + _format_row(r))
+        return "\n".join(lines)
+    except Exception as e:
+        return f"notion_query_database failed: {e}"
+
+
 # ── Write tools (staged when WRITE_REVIEW=true) ───────────────────────────────
 
 def notion_create_page(
@@ -332,6 +379,51 @@ def _block_summary(block: dict) -> str:
     rich  = inner.get("rich_text", [])
     text  = "".join(t.get("plain_text", "") for t in rich)[:80]
     return f"[{btype}] {text}" if text else f"[{btype}]"
+
+
+def _prop_value(p: dict):
+    """Extract a compact human-readable value from a Notion property object."""
+    t = p.get("type")
+    v = p.get(t)
+    if v is None:
+        return None
+    if t in ("select", "status"):
+        return v.get("name")
+    if t == "multi_select":
+        return ", ".join(o.get("name", "") for o in v) or None
+    if t in ("number", "checkbox", "url", "email", "phone_number"):
+        return v
+    if t == "date":
+        return v.get("start")
+    if t == "relation":
+        return f"{len(v)} linked" if v else None
+    if t == "people":
+        return f"{len(v)} people" if v else None
+    if t == "unique_id":
+        num = v.get("number")
+        return f"{v.get('prefix')}-{num}" if num is not None else None
+    if t in ("rich_text", "title"):
+        return "".join(x.get("plain_text", "") for x in v) or None
+    return None
+
+
+def _format_row(page: dict) -> str:
+    """One compact line per row: [EK-79] Title (trashed?) | Prop=val  Prop=val ..."""
+    props = page.get("properties", {})
+    title = _extract_title(page)
+    uid, parts = "", []
+    for name, p in props.items():
+        if p.get("type") == "title":
+            continue
+        val = _prop_value(p)
+        if val is None or val == "" or val is False:
+            continue
+        if p.get("type") == "unique_id":
+            uid = f"[{val}] "
+            continue
+        parts.append(f"{name}={val}")
+    flag = " (trashed)" if page.get("in_trash") or page.get("archived") else ""
+    return f"{uid}{title}{flag}" + (" | " + "  ".join(parts) if parts else "")
 
 
 def _get_database_schema(database_id: str) -> tuple[dict, str]:

@@ -42,12 +42,14 @@ if config.NOTION_API_KEY:
     from tools.integrations.notion import (
         notion_search,
         notion_get_page,
+        notion_get_database_schema,
+        notion_query_database,
         notion_create_page,
         notion_update_page_props,
         notion_append_blocks,
     )
     _INTEGRATION_TOOLS += [
-        notion_search, notion_get_page,
+        notion_search, notion_get_page, notion_get_database_schema, notion_query_database,
         notion_create_page, notion_update_page_props, notion_append_blocks,
     ]
 

@@ -18,6 +18,7 @@ coordinator_tools:
   - notion_search
   - notion_get_page
   - notion_get_database_schema
+  - notion_query_database
   - notion_create_page
   - notion_update_page_props
   - notion_append_blocks
@@ -33,13 +34,15 @@ agents:
       - notion_search
       - notion_get_page
       - notion_get_database_schema
+      - notion_query_database
       - get_file_content
       - find_files
     instructions:
       - You manage delivery tracking, not code. Your job is to gather the exact current state and the valid field/option names BEFORE any work item is created or changed. You never write anything yourself.
       - "BOARD FACTS: call get_file_content('docs/delivery-board.md') first — it holds the work-tracking data-source IDs, the field list (Type, Status, Stage, Priority, Area, Sprint, Spec), the exact option values for each, and the native Sub-item / Parent item 1 nesting rule. Treat it as the source of truth for field and option names."
       - "LIVE SCHEMA: call notion_get_database_schema(database_id) to confirm the current field names and the select/status option values. Never guess an option name — use only values present in the schema or the board doc."
-      - "STATE: use notion_search / notion_get_page to read the backlog or sprint items relevant to the task — e.g. find the parent epic, the current sprint page, or an existing item to update — and capture their page ids."
+      - "STATE: use notion_search / notion_get_page to find specific pages (the parent epic, the current sprint page, an item to update) and capture their page ids."
+      - "LIST / FILTER: to report or enumerate rows — e.g. all work items in the current sprint, every Bug with Status Open — call notion_query_database(database_id, filter). For a sprint, filter on the Sprint relation: {\"property\": \"Sprint\", \"relation\": {\"contains\": \"<sprint-page-id>\"}}. Do NOT page through items one by one — that is what this tool is for."
       - "REPORT to the writer: the database / data-source id, the exact field names and option values to use, the parent item id (when nesting), and the sprint page id (when attaching). Do not create or modify anything."
 
   - name: StoryWriter
@@ -50,6 +53,7 @@ agents:
       - notion_search
       - notion_get_page
       - notion_get_database_schema
+      - notion_query_database
       - notion_create_page
       - notion_update_page_props
       - notion_append_blocks
