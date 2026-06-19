@@ -67,6 +67,13 @@ def _execute(tool: str, args: dict) -> str:
             set_names = ", ".join(props.keys()) or "(nothing)"
             return f"notion page updated ({set_names}): {result.get('url', result.get('id'))}"
 
+        if tool == "trash_page":
+            page_id  = _clean_id(args["page_id"])
+            archived = not args.get("restore", False)
+            result   = _request("PATCH", f"/pages/{page_id}", {"archived": archived})
+            state    = "restored" if not archived else "trashed"
+            return f"notion page {state}: {result.get('url', result.get('id'))}"
+
         if tool == "append_blocks":
             block_id = _clean_id(args["block_id"])
             children = _coerce_blocks(args["children"])
@@ -308,6 +315,27 @@ def notion_append_blocks(block_id: str, blocks: list | str, after_block_id: str 
             {"block_id": block_id, "children": blocks, "after": after_block_id},
         )
     return _execute("append_blocks", {"block_id": block_id, "children": blocks, "after": after_block_id})
+
+
+def notion_trash_page(page_id: str, restore: bool = False) -> str:
+    """
+    Move a Notion page (e.g. a work item) to trash — i.e. remove it from the board / database.
+    Set restore=True to bring a trashed page back. Requires human approval when WRITE_REVIEW is
+    enabled. This is the delete verb for board CRUD; note trashing a row also drops it from any
+    database query results.
+
+    Args:
+        page_id: ID of the page to trash (or restore).
+        restore: False (default) trashes the page; True restores it from trash.
+    """
+    if WRITE_REVIEW:
+        verb = "Restore" if restore else "Trash"
+        return _stage_action(
+            "notion", "trash_page",
+            f"{verb} page {page_id[:8]}...",
+            {"page_id": page_id, "restore": bool(restore)},
+        )
+    return _execute("trash_page", {"page_id": page_id, "restore": bool(restore)})
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────

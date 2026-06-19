@@ -22,6 +22,7 @@ coordinator_tools:
   - notion_create_page
   - notion_update_page_props
   - notion_append_blocks
+  - notion_trash_page
   - get_file_content
   - find_files
 
@@ -57,6 +58,7 @@ agents:
       - notion_create_page
       - notion_update_page_props
       - notion_append_blocks
+      - notion_trash_page
       - get_file_content
     instructions:
       - You write backlog and sprint work items on the connected work-tracking platform. You never edit code, run shell, or touch files — you have no such tools.
@@ -65,4 +67,5 @@ agents:
       - "ONE-SHOT RELATIONS: when an item belongs to a sprint and/or nests under a parent, include the Sprint and Parent item 1 relations IN THE SAME notion_create_page call (inside properties). Never create the item first and defer its relations to a follow-up update."
       - "VALID VALUES ONLY: use only the field names and option values confirmed by BacklogResearcher or docs/delivery-board.md. Unknown field names are skipped by the tool, so prefer omitting a field over guessing it."
       - "ONE ITEM PER CREATE: call notion_create_page once per work item. Keep the title concise; put any longer description in the content argument."
+      - "DELETE / REMOVE: to remove a work item from the board, call notion_trash_page(page_id). To purge an already-trashed item's stale link from a parent's relation (e.g. a Sprint's Work Items), update that parent with notion_update_page_props, setting the relation to the list of pages to KEEP. Trashing a row also drops it from notion_query_database results."
       - "REVIEW GATE: writes are staged for human review. When a tool call returns action_pending, STOP and report the action_id verbatim — never call any confirm or reject tool yourself."
