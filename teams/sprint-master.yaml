@@ -7,13 +7,20 @@ coordinator_model: qwen3-coder:30b
 # non-thinking MoE used by the engineering team — best tool-call grounding, handles the XML
 # tool-call format via OllamaToolFix format 6. Already resident on ZGX (no new download).
 #
-# Read-only allowlist for the coordinator's direct tool surface. Writes are delegated to
-# StoryWriter — the coordinator can inspect the board and read docs but cannot write itself.
-# Keep this list read-only.
+# coordinator_tools scopes the coordinator to BOARD CRUD + reads: it can create/update/nest
+# work items DIRECTLY (writes are still gated by WRITE_REVIEW) or delegate to a worker. We
+# allowlist explicitly so the coordinator never gets code/shell tools (apply_diff / write_file /
+# run_command) — board CRUD only. Smoke test 2026-06-19: a read-only coordinator could not
+# complete writes (it lacked the write tool and delegation to the worker was unreliable — it
+# thrashed ~400s then gave up). Giving the coordinator the board write tools makes the path
+# robust; the WRITE_REVIEW gate, not tool restriction, is what keeps writes safe.
 coordinator_tools:
   - notion_search
   - notion_get_page
   - notion_get_database_schema
+  - notion_create_page
+  - notion_update_page_props
+  - notion_append_blocks
   - get_file_content
   - find_files
 
