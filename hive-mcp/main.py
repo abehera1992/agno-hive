@@ -54,6 +54,10 @@ if config.NOTION_API_KEY:
         notion_create_page, notion_update_page_props, notion_append_blocks, notion_trash_page,
     ]
 
+if config.MIGRATIONS_ENABLED:
+    from tools.integrations.migrations import run_migration
+    _INTEGRATION_TOOLS += [run_migration]
+
 _instructions = (
     "You are connected to a project via hive-mcp. "
     "The project files are at the root level — use get_file_content, find_files, "

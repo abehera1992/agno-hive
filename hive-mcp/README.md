@@ -97,6 +97,24 @@ dicts/lists, which previously caused "expected dict, got string" failures).
 | `notion_append_blocks(block_id, blocks, after_block_id)` | Staged | Append blocks. `blocks` may be a list of plain strings (each becomes a paragraph) or full block dicts; `after_block_id` controls insertion position |
 | `notion_trash_page(page_id, restore)` | Staged | Trash a page (remove it from the board/database); `restore=True` brings it back. Trashing also drops the row from query results and from any relations |
 
+**Migration runner** (`MIGRATIONS_ENABLED=true` required — review-gated)
+
+Lets hive **apply** an Alembic migration as the **DB owner** via the mounted docker socket — only when
+the task explicitly asks. Hive otherwise just writes migration files (it does not run them). Doubly
+gated: the agent calls it only on explicit instruction, and `WRITE_REVIEW` stages it for human confirm
+before it runs. It runs `alembic <direction> <revision>` **online** inside the service container (so DDL
+is permitted and `op.bulk_insert` seed rows are applied — unlike offline `--sql`).
+
+| Tool | Approval | Description |
+|---|---|---|
+| `run_migration(service, revision="head", direction="upgrade")` | Staged | Apply a migration for a configured service as the DB owner. `service` is a key in `MIGRATION_SERVICES`. Revision validated; owner password read from the db container at run time (never logged). |
+
+Config (env): `MIGRATIONS_ENABLED`, `MIGRATION_DB_CONTAINER`, `MIGRATION_DB_OWNER`, `MIGRATION_DB_NAME`,
+`MIGRATION_DB_HOST` (default `postgres`), `MIGRATION_DB_PORT` (default `5432`),
+`MIGRATION_SERVICES` (`name:container,name:container`). Requires the host docker socket (already mounted).
+**Security:** runs as the DB superuser — the review gate is the safeguard; the owner password is passed
+to alembic via stdin (never in process args) and redacted from output.
+
 ---
 
 ## Setup

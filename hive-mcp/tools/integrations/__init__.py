@@ -109,3 +109,8 @@ try:
     )
 except ImportError:
     pass  # notion module missing or notion-client not installed
+
+try:
+    from tools.integrations.migrations import run_migration  # noqa: F401  (registers "migration" executor)
+except ImportError:
+    pass
