@@ -208,6 +208,10 @@ def notion_query_database(
     "every Bug with Status = Open". Read-only — no approval required. This is the right tool for
     reporting questions; do NOT page through rows one by one.
 
+    Each result row includes its `(page_id: <hex>)` — pass that id straight to
+    notion_update_page_props / notion_trash_page to act on a row you found here (do NOT use the
+    display id like "EK-16"; that is not a page id).
+
     Args:
         database_id: Notion database ID (32-char hex, UUID, or last URL segment).
         filter:      Optional Notion filter object (or JSON string). Examples:
@@ -459,9 +463,11 @@ def _prop_value(p: dict):
 
 
 def _format_row(page: dict) -> str:
-    """One compact line per row: [EK-79] Title (trashed?) | Prop=val  Prop=val ..."""
+    """One compact line per row, including the row's page_id so it can be updated directly:
+    [EK-79] Title (trashed?) (page_id: <hex>) | Prop=val  Prop=val ..."""
     props = page.get("properties", {})
     title = _extract_title(page)
+    page_id = _clean_id(page.get("id", ""))
     uid, parts = "", []
     for name, p in props.items():
         ptype = p.get("type")
@@ -478,7 +484,8 @@ def _format_row(page: dict) -> str:
             continue
         parts.append(f"{name}={val}")
     flag = " (trashed)" if page.get("in_trash") or page.get("archived") else ""
-    return f"{uid}{title}{flag}" + (" | " + "  ".join(parts) if parts else "")
+    idpart = f" (page_id: {page_id})" if page_id else ""
+    return f"{uid}{title}{flag}{idpart}" + (" | " + "  ".join(parts) if parts else "")
 
 
 def _get_database_schema(database_id: str) -> tuple[dict, str]:
