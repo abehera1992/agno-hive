@@ -58,7 +58,16 @@ def _execute(tool: str, args: dict) -> str:
     try:
         if tool == "create_page":
             result = _request("POST", "/pages", _build_create_payload(**args))
-            return f"notion page created: {result.get('url', result.get('id'))}"
+            page_id = result.get("id")
+            # Append any blocks beyond the 100-block create cap (rich markdown_content).
+            if page_id and args.get("markdown_content"):
+                _append_in_batches(page_id, _markdown_to_blocks(args["markdown_content"])[100:])
+            return f"notion page created: {result.get('url', page_id)}"
+
+        if tool == "append_markdown":
+            block_id = _clean_id(args["block_id"])
+            n = _append_in_batches(block_id, _markdown_to_blocks(args["markdown"]))
+            return f"notion: appended {n} markdown block(s) to {args['block_id']}"
 
         if tool == "update_page_props":
             page_id = _clean_id(args["page_id"])
@@ -256,6 +265,7 @@ def notion_create_page(
     properties: dict | str | None = None,
     content: str = "",
     parent_type: str = "database_id",
+    markdown_content: str = "",
 ) -> str:
     """
     Create a new Notion page (a database row, or a child of another page).
@@ -276,11 +286,16 @@ def notion_create_page(
                      Unknown field names are skipped (so a typo won't 400 the whole call).
         content:     Optional plain-text paragraph added as the first block.
         parent_type: 'database_id' (default) or 'page_id'.
+        markdown_content: Optional RICH body in Notion-flavored markdown — headings (#/##/###),
+                     paragraphs, bullet/number lists, fenced code blocks, block quotes, dividers,
+                     tables, with inline **bold** / `code` / [label](url). Converted to Notion
+                     blocks. Use this (not `content`) for technical docs / multi-section pages.
     """
     props = _as_dict(properties)
     args = {
         "parent_id": parent_id, "parent_type": parent_type,
         "title": title, "content": content, "properties": props,
+        "markdown_content": markdown_content,
     }
     if WRITE_REVIEW:
         extra = (" + " + ", ".join(props.keys())) if props else ""
@@ -342,6 +357,28 @@ def notion_append_blocks(block_id: str, blocks: list | str, after_block_id: str 
             {"block_id": block_id, "children": blocks, "after": after_block_id},
         )
     return _execute("append_blocks", {"block_id": block_id, "children": blocks, "after": after_block_id})
+
+
+def notion_append_markdown(block_id: str, markdown: str) -> str:
+    """
+    Append RICH content to a Notion page/block from Notion-flavored markdown — headings (#/##/###),
+    paragraphs, bullet/number lists, fenced code blocks, block quotes, dividers, tables, with inline
+    **bold** / `code` / [label](url). Use this to write technical docs / multi-section bodies (the
+    rich counterpart to notion_append_blocks, which only takes plain paragraphs). Batches over the
+    100-block API cap automatically. Requires human approval when WRITE_REVIEW is enabled.
+
+    Args:
+        block_id: ID of the page (or block) to append to.
+        markdown: The markdown body to render as Notion blocks.
+    """
+    if WRITE_REVIEW:
+        n = len(_markdown_to_blocks(markdown))
+        return _stage_action(
+            "notion", "append_markdown",
+            f"Append {n} markdown block(s) to {block_id[:8]}...",
+            {"block_id": block_id, "markdown": markdown},
+        )
+    return _execute("append_markdown", {"block_id": block_id, "markdown": markdown})
 
 
 def notion_trash_page(page_id: str, restore: bool = False) -> str:
@@ -556,6 +593,7 @@ def _build_create_payload(
     title: str,
     content: str = "",
     properties: dict | None = None,
+    markdown_content: str = "",
 ) -> dict:
     payload: dict = {"parent": {parent_type: parent_id}}
     if parent_type == "database_id":
@@ -565,12 +603,18 @@ def _build_create_payload(
         payload["properties"] = {
             "title": {"title": [{"type": "text", "text": {"content": title}}]}
         }
-    if content:
-        payload["children"] = [{
+    children: list = []
+    if markdown_content:
+        children = _markdown_to_blocks(markdown_content)
+    elif content:
+        children = [{
             "object": "block",
             "type": "paragraph",
             "paragraph": {"rich_text": [{"type": "text", "text": {"content": content}}]},
         }]
+    if children:
+        # Notion caps children at 100 per create; the rest are appended after (see _execute).
+        payload["children"] = children[:100]
     return payload
 
 
@@ -606,3 +650,139 @@ def _coerce_blocks(blocks) -> list:
         elif isinstance(b, dict):
             out.append(b)
     return out
+
+
+# ── Markdown -> Notion blocks ─────────────────────────────────────────────────
+# Converts Notion-flavored markdown (headings, paragraphs, bullet/number lists, code fences,
+# block quotes, dividers, tables, with inline **bold** / `code` / [link](url)) into Notion block
+# objects, so write tools can author rich pages instead of plain paragraphs.
+
+_NOTION_LANGS = {
+    "py": "python", "js": "javascript", "ts": "typescript", "tsx": "typescript",
+    "jsx": "javascript", "sh": "shell", "bash": "shell", "yml": "yaml",
+    "dockerfile": "docker", "text": "plain text", "txt": "plain text", "": "plain text",
+}
+_NOTION_LANG_SET = {
+    "python", "javascript", "typescript", "shell", "bash", "json", "yaml", "sql", "markdown",
+    "plain text", "go", "rust", "java", "c", "c++", "c#", "html", "css", "diff", "docker",
+    "graphql", "php", "ruby", "kotlin", "swift", "scala", "xml", "toml", "ini", "powershell",
+}
+_INLINE = re.compile(r"(\*\*.+?\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))")
+_MAX_RT = 1900  # Notion caps a single rich_text content at 2000 chars
+
+
+def _rt(content: str, **ann) -> list[dict]:
+    """One or more rich_text items for `content`, chunked under the 2000-char cap."""
+    content = content or ""
+    items = []
+    for j in range(0, max(len(content), 1), _MAX_RT):
+        chunk = content[j:j + _MAX_RT]
+        item = {"type": "text", "text": {"content": chunk}}
+        if ann:
+            item["annotations"] = ann
+        items.append(item)
+    return items
+
+
+def _rich(text: str) -> list[dict]:
+    """Parse inline markdown (**bold**, `code`, [label](url)) into Notion rich_text items."""
+    if not text:
+        return []
+    out: list[dict] = []
+    for part in _INLINE.split(text):
+        if not part:
+            continue
+        if part.startswith("**") and part.endswith("**"):
+            out += _rt(part[2:-2], bold=True)
+        elif part.startswith("`") and part.endswith("`"):
+            out += _rt(part[1:-1], code=True)
+        elif part.startswith("[") and "](" in part and part.endswith(")"):
+            label = part[1:part.index("]")]
+            url = part[part.index("](") + 2:-1]
+            out.append({"type": "text", "text": {"content": label, "link": {"url": url}}})
+        else:
+            out += _rt(part)
+    return out
+
+
+def _split_row(line: str) -> list[str]:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _markdown_to_blocks(md: str) -> list[dict]:
+    """Convert Notion-flavored markdown into a list of Notion block objects."""
+    lines = (md or "").split("\n")
+    blocks: list[dict] = []
+    i, n = 0, len(lines)
+    while i < n:
+        raw = lines[i]
+        s = raw.strip()
+
+        if s.startswith("```"):                                   # code fence
+            lang = s[3:].strip().lower()
+            lang = _NOTION_LANGS.get(lang, lang if lang in _NOTION_LANG_SET else "plain text")
+            code: list[str] = []
+            i += 1
+            while i < n and not lines[i].strip().startswith("```"):
+                code.append(lines[i]); i += 1
+            i += 1
+            blocks.append({"object": "block", "type": "code",
+                           "code": {"rich_text": _rt("\n".join(code)), "language": lang}})
+            continue
+
+        if s.startswith("|") and i + 1 < n and set(lines[i + 1].strip()) <= set("|-: "):  # table
+            header = _split_row(s)
+            width = len(header)
+            i += 2
+            rows = [header]
+            while i < n and lines[i].strip().startswith("|"):
+                rows.append(_split_row(lines[i].strip())); i += 1
+            tr = [{"type": "table_row",
+                   "table_row": {"cells": [_rich(c) for c in (r + [""] * width)[:width]]}}
+                  for r in rows]
+            blocks.append({"object": "block", "type": "table",
+                           "table": {"table_width": width, "has_column_header": True,
+                                     "has_row_header": False, "children": tr}})
+            continue
+
+        if s in ("---", "***", "___"):                            # divider
+            blocks.append({"object": "block", "type": "divider", "divider": {}}); i += 1; continue
+
+        m = re.match(r"(#{1,3})\s+(.*)", s)                        # heading 1-3
+        if m:
+            lvl = len(m.group(1))
+            blocks.append({"object": "block", "type": f"heading_{lvl}",
+                           f"heading_{lvl}": {"rich_text": _rich(m.group(2))}}); i += 1; continue
+
+        if s.startswith(">"):                                      # quote
+            blocks.append({"object": "block", "type": "quote",
+                           "quote": {"rich_text": _rich(s[1:].strip())}}); i += 1; continue
+
+        if re.match(r"[-*+]\s+", s):                               # bulleted list
+            blocks.append({"object": "block", "type": "bulleted_list_item",
+                           "bulleted_list_item": {"rich_text": _rich(re.sub(r"^[-*+]\s+", "", s))}})
+            i += 1; continue
+
+        if re.match(r"\d+\.\s+", s):                               # numbered list
+            blocks.append({"object": "block", "type": "numbered_list_item",
+                           "numbered_list_item": {"rich_text": _rich(re.sub(r"^\d+\.\s+", "", s))}})
+            i += 1; continue
+
+        if not s:                                                 # blank
+            i += 1; continue
+
+        blocks.append({"object": "block", "type": "paragraph",                # paragraph
+                       "paragraph": {"rich_text": _rich(s)}}); i += 1
+    return blocks
+
+
+def _append_in_batches(block_id: str, blocks: list) -> int:
+    """Append blocks to a page/block in batches of 100 (Notion's per-request cap). Returns count."""
+    clean = _clean_id(block_id)
+    total = 0
+    for k in range(0, len(blocks), 100):
+        batch = blocks[k:k + 100]
+        if batch:
+            _request("PATCH", f"/blocks/{clean}/children", {"children": batch})
+            total += len(batch)
+    return total

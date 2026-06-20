@@ -106,6 +106,7 @@ try:
         notion_create_page,
         notion_update_page_props,
         notion_append_blocks,
+        notion_append_markdown,
     )
 except ImportError:
     pass  # notion module missing or notion-client not installed
