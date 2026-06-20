@@ -89,7 +89,7 @@ dicts/lists, which previously caused "expected dict, got string" failures).
 | Tool | Approval | Description |
 |---|---|---|
 | `notion_search(query)` | None | Search pages and databases by title/content |
-| `notion_get_page(page_id)` | None | Read a page's properties and top-level blocks |
+| `notion_get_page(page_id, max_lines)` | None | Read a page's **full content** — paginates ALL top-level blocks (not just the first 25) and **renders table rows**, so long pages (roadmaps, rate tables) are read end-to-end. Capped at `max_lines` (default 600) |
 | `notion_get_database_schema(database_id)` | None | List a database's property names + types (and select/status option names) — use to learn valid field/option names before writing |
 | `notion_query_database(database_id, filter, sorts, page_size)` | None | List / filter database rows in ONE call (e.g. all Work Items in a sprint). `filter` is a Notion filter object/JSON string; a relation filter's `contains` accepts a page id or URL. Compact one-line-per-row output — title + `[ID]` + select/status/number/date values; **relation properties are omitted** (a relation rendered as `Sprint=1 linked` was misread by models as the value "Sprint 1" — membership is implied by the filter; use `notion_get_page` for relation detail) |
 | `notion_create_page(parent_id, title, properties, content, parent_type)` | Staged | Create a database row (or child page). `properties` = dict of simple field values; `title` goes to the database's title property automatically |
