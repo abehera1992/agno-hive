@@ -63,6 +63,15 @@ def _load_team(name: str) -> tuple[list[AgentSpec], str, str, list[str] | None]:
     return agents, coordinator, mode, coordinator_tools
 
 
+# EK-88 router-of-teams: the child teams the "router" virtual team delegates to, each with the
+# description the router leader reads to pick exactly one.
+ROUTABLE_TEAMS = {
+    "engineering":   "Full implementation: writes code, multi-file edits, runs tests.",
+    "sprint-master": "Delivery-board CRUD and spec-grounded planning; reads Notion. No code writes.",
+    "planning":      "Lightweight read-only reasoning / design. No code grounding.",
+}
+
+
 @app.on_event("startup")
 async def _start_cleanup_loop():
     asyncio.create_task(_session_cleanup_loop())
@@ -100,11 +109,27 @@ async def run(request: RunRequest):
     start = time.perf_counter()
 
     # Resolve team spec
+    router_children = None
     if request.agents:
         agent_specs = request.agents
         coordinator_model = config.leader_model
         team_mode = request.mode or "coordinate"
         team_name = request.team or "custom"
+        coordinator_tools = None
+    elif request.team == "router":
+        # EK-88 router-of-teams: load each child's spec; run_task_async composes the route-mode parent.
+        router_children = []
+        for _cname, _cdesc in ROUTABLE_TEAMS.items():
+            _cspecs, _ccoord, _cmode, _ctools = _load_team(_cname)
+            router_children.append({
+                "name": _cname, "description": _cdesc,
+                "agent_specs": _cspecs, "coordinator_model": _ccoord,
+                "coordinator_tools": _ctools, "mode": _cmode,
+            })
+        agent_specs = []
+        coordinator_model = config.leader_model
+        team_mode = "route"
+        team_name = "router"
         coordinator_tools = None
     elif request.team:
         agent_specs, coordinator_model, team_mode, coordinator_tools = _load_team(request.team)
@@ -115,7 +140,8 @@ async def run(request: RunRequest):
         team_mode = request.mode or team_mode
         team_name = "engineering"
 
-    all_models = list({coordinator_model} | {a.model for a in agent_specs})
+    all_models = list({coordinator_model} | {a.model for a in agent_specs}
+                      | {a.model for c in (router_children or []) for a in c["agent_specs"]})
     models_pulled = await ensure_models(all_models, config.ollama_host)
 
     mcp_url = request.mcp_url or config.mcp_url
@@ -147,6 +173,7 @@ async def run(request: RunRequest):
         project_id=request.project_id,
         session_id=session_id,
         mode=team_mode,
+        router_children=router_children,
     )
 
     # Append this turn to session

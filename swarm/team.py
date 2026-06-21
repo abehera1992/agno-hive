@@ -348,6 +348,7 @@ async def run_task_stream(
     project_id: str = "default",
     session_id: str | None = None,
     mode: str = "coordinate",
+    router_children: list[dict] | None = None,
 ):
     """Same setup as run_task_async but yields text chunks as the coordinator generates them.
 
@@ -411,9 +412,12 @@ async def run_task_stream(
         if not mcp_list:
             raise RuntimeError("No MCP server available — check hive-mcp and project MCP are running")
 
-        team = _build_team(
-            agent_specs, effective_coordinator, coordinator_tools, mode, mcp_list, instructions
-        )
+        if router_children:
+            team = _build_router_team(router_children, effective_coordinator, mcp_list, instructions)
+        else:
+            team = _build_team(
+                agent_specs, effective_coordinator, coordinator_tools, mode, mcp_list, instructions
+            )
 
         full_content: list[str] = []
         last_event = None
@@ -463,6 +467,7 @@ async def run_task_async(
     project_id: str = "default",
     session_id: str | None = None,
     mode: str = "coordinate",
+    router_children: list[dict] | None = None,
 ) -> str:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer."""
     effective_mcp_url = mcp_url or config.mcp_url
@@ -524,9 +529,12 @@ async def run_task_async(
         if not mcp_list:
             raise RuntimeError("No MCP server available — check hive-mcp and project MCP are running")
 
-        team = _build_team(
-            agent_specs, effective_coordinator, coordinator_tools, mode, mcp_list, instructions
-        )
+        if router_children:
+            team = _build_router_team(router_children, effective_coordinator, mcp_list, instructions)
+        else:
+            team = _build_team(
+                agent_specs, effective_coordinator, coordinator_tools, mode, mcp_list, instructions
+            )
 
         span_attrs = {
             "project_id": project_id,
