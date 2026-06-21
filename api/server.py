@@ -127,7 +127,7 @@ async def run(request: RunRequest):
                 "coordinator_tools": _ctools, "mode": _cmode,
             })
         agent_specs = []
-        coordinator_model = config.leader_model
+        coordinator_model = config.router_model  # config-driven router leader (qwen3-coder:30b MoE)
         team_mode = "route"
         team_name = "router"
         coordinator_tools = None

@@ -19,7 +19,7 @@ class Config:
     planner_model: str = os.getenv("PLANNER_MODEL", "qwen2.5-coder:32b")
     researcher_model: str = os.getenv("RESEARCHER_MODEL", "qwen2.5-coder:32b")
     executor_model: str = os.getenv("EXECUTOR_MODEL", "llama3.1:8b")
-    router_model: str = os.getenv("ROUTER_MODEL", "llama3.1:8b")
+    router_model: str = os.getenv("ROUTER_MODEL", "qwen3-coder:30b")  # router-of-teams (EK-88) leader: qwen3-coder:30b MoE — best tool-call grounding; was llama3.1:8b (too weak to route reliably). Override via ROUTER_MODEL.
 
     # MCP context server — point at any project's MCP server
     mcp_url: str = os.getenv("MCP_URL", "")
