@@ -66,9 +66,9 @@ def _load_team(name: str) -> tuple[list[AgentSpec], str, str, list[str] | None]:
 # EK-88 router-of-teams: the child teams the "router" virtual team delegates to, each with the
 # description the router leader reads to pick exactly one.
 ROUTABLE_TEAMS = {
-    "engineering":   "Full implementation: writes code, multi-file edits, runs tests.",
-    "sprint-master": "Delivery-board CRUD and spec-grounded planning; reads Notion. No code writes.",
-    "planning":      "Lightweight read-only reasoning / design. No code grounding.",
+    "engineering":   "ONLY for tasks that WRITE or CHANGE code: implement a feature, edit/create files, fix a bug, refactor, run tests. Do NOT choose this for planning, design, or read-only analysis even if the task mentions reading code.",
+    "sprint-master": "Choose this for PLANNING and DESIGN: produce an implementation plan, break a feature into sub-tasks, read a spec / Notion page and a codebase to plan (no code is written), or do delivery-board (epic/feature/task/bug) CRUD. ANY task that says 'plan', 'design', 'break into sub-tasks', or 'planning only' belongs here.",
+    "planning":      "Quick read-only reasoning or Q&A that needs no codebase or spec grounding.",
 }
 
 

@@ -291,8 +291,8 @@ def _build_team(
 
 _ROUTER_INSTRUCTIONS = [
     "You are a ROUTER. Read each member team's description and delegate the task to the SINGLE best-fit team.",
-    "Implementation / writing code -> the engineering team. Delivery-board CRUD or spec-grounded planning -> the sprint-master team. Quick read-only reasoning with no code grounding -> the planning team.",
-    "Do NOT attempt the task yourself. Delegate to exactly one member team and return that team's result.",
+    "Decide by the task's GOAL, not the words it happens to mention. A task that PLANS, designs, breaks work into sub-tasks, or says 'planning only' / 'do not write code' goes to the sprint-master team -- even if it also says to read code or a spec. Only a task that actually WRITES or CHANGES code goes to the engineering team. Quick read-only reasoning with no grounding goes to the planning team.",
+    "Do NOT attempt the task yourself. Delegate to exactly one member team and return that team's result verbatim.",
 ]
 
 
