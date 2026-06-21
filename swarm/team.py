@@ -262,22 +262,74 @@ def _build_team(
     instructions: list,
     *,
     name: str = "AgnoHive",
+    description: str | None = None,
 ) -> Team:
     """Build a coordinator Team from agent specs (or the default Coder+Reviewer), sharing the
     already-connected `mcp_list`. Factored out of run_task_async / run_task_stream so the same
     build is reusable for router sub-teams (EK-88). `coordinator_model` is the already-resolved
-    model name. Behaviour is identical to the previous inline Team(...) construction."""
+    model name. `description` (default None = previous behaviour) lets the router leader route to
+    this team. Behaviour is identical to the previous inline Team(...) construction when omitted."""
     if agent_specs:
         members = [make_agent_from_spec(spec, *mcp_list) for spec in agent_specs]
     else:
         members = [make_coder(*mcp_list), make_reviewer(*mcp_list)]
     return Team(
         name=name,
+        description=description,
         mode=mode,
         model=get_model(coordinator_model, config.ollama_host),
         members=members,
         tools=_scope_coordinator_tools(coordinator_tools, mcp_list),
         instructions=instructions,
+        show_members_responses=True,
+        share_member_interactions=True,
+        add_member_tools_to_context=True,
+        markdown=True,
+        max_iterations=config.max_iterations,
+    )
+
+
+_ROUTER_INSTRUCTIONS = [
+    "You are a ROUTER. Read each member team's description and delegate the task to the SINGLE best-fit team.",
+    "Implementation / writing code -> the engineering team. Delivery-board CRUD or spec-grounded planning -> the sprint-master team. Quick read-only reasoning with no code grounding -> the planning team.",
+    "Do NOT attempt the task yourself. Delegate to exactly one member team and return that team's result.",
+]
+
+
+def _build_router_team(
+    children: list[dict],
+    router_model: str,
+    mcp_list: list,
+    instructions: list,
+    *,
+    name: str = "Router",
+) -> Team:
+    """Build a route-mode parent Team whose members are sub-Teams (EK-88 router-of-teams).
+
+    Each child dict has: name, description, agent_specs, coordinator_model, coordinator_tools, mode.
+    Each child is built via _build_team sharing the already-connected `mcp_list` (no extra MCP
+    connections), carrying a `description` the router leader uses to route. The parent runs in route
+    mode (`respond_directly=True` in agno 2.5.17) — it delegates to ONE member and returns its
+    result. `instructions` are the standard coordinator instructions passed to each sub-team."""
+    members = [
+        _build_team(
+            c["agent_specs"],
+            c["coordinator_model"] or config.leader_model,
+            c["coordinator_tools"],
+            c["mode"],
+            mcp_list,
+            instructions,
+            name=c["name"],
+            description=c.get("description"),
+        )
+        for c in children
+    ]
+    return Team(
+        name=name,
+        respond_directly=True,  # route mode (agno 2.5.17): leader delegates to exactly ONE member
+        model=get_model(router_model, config.ollama_host),
+        members=members,
+        instructions=_ROUTER_INSTRUCTIONS,
         show_members_responses=True,
         share_member_interactions=True,
         add_member_tools_to_context=True,
