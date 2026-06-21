@@ -289,64 +289,6 @@ def _build_team(
     )
 
 
-_ROUTER_INSTRUCTIONS = [
-    "── Tool restrictions ────────────────────────────────────────────",
-    "  NEVER call the `agno_run` tool — it recurses into this swarm and deadlocks.",
-    "  NEVER output a JSON object to delegate (e.g. {\"name\": \"delegate_task_to_member\", ...}).",
-    "  To delegate you MUST actually CALL the delegation tool — never print the call as text.",
-    "",
-    "You are a ROUTER. Your ONLY job is to pick the single best member team and delegate the task to it.",
-    "Your members are THREE teams, named EXACTLY: engineering, sprint-master, planning. Delegate to one of those exact names (never an agent name like 'planner').",
-    "Decide by the task's GOAL, not the words it happens to mention:",
-    "  - PLANS / designs / breaks work into sub-tasks, or says 'planning only' / 'do not write code' -> delegate to sprint-master (even if it also says to read code or a spec).",
-    "  - Actually WRITES or CHANGES code (implement, edit files, fix a bug, run tests) -> delegate to engineering.",
-    "  - A quick read-only question needing NO codebase or spec grounding -> delegate to planning.",
-    "Delegate to EXACTLY ONE team, then return that team's result. Do NOT attempt the task yourself.",
-]
-
-
-def _build_router_team(
-    children: list[dict],
-    router_model: str,
-    mcp_list: list,
-    instructions: list,
-    *,
-    name: str = "Router",
-) -> Team:
-    """Build a route-mode parent Team whose members are sub-Teams (EK-88 router-of-teams).
-
-    Each child dict has: name, description, agent_specs, coordinator_model, coordinator_tools, mode.
-    Each child is built via _build_team sharing the already-connected `mcp_list` (no extra MCP
-    connections), carrying a `description` the router leader uses to route. The parent runs in route
-    mode (`respond_directly=True` in agno 2.5.17) — it delegates to ONE member and returns its
-    result. `instructions` are the standard coordinator instructions passed to each sub-team."""
-    members = [
-        _build_team(
-            c["agent_specs"],
-            c["coordinator_model"] or config.leader_model,
-            c["coordinator_tools"],
-            c["mode"],
-            mcp_list,
-            instructions,
-            name=c["name"],
-            description=c.get("description"),
-        )
-        for c in children
-    ]
-    return Team(
-        name=name,
-        respond_directly=True,  # route mode (agno 2.5.17): leader delegates to exactly ONE member
-        model=get_model(router_model, config.ollama_host),
-        members=members,
-        instructions=_ROUTER_INSTRUCTIONS,
-        show_members_responses=True,
-        share_member_interactions=True,
-        add_member_tools_to_context=True,
-        markdown=True,
-        max_iterations=config.max_iterations,
-    )
-
-
 async def run_task_stream(
     task: str,
     agent_specs: list | None = None,
@@ -357,7 +299,6 @@ async def run_task_stream(
     project_id: str = "default",
     session_id: str | None = None,
     mode: str = "coordinate",
-    router_children: list[dict] | None = None,
 ):
     """Same setup as run_task_async but yields text chunks as the coordinator generates them.
 
@@ -421,12 +362,9 @@ async def run_task_stream(
         if not mcp_list:
             raise RuntimeError("No MCP server available — check hive-mcp and project MCP are running")
 
-        if router_children:
-            team = _build_router_team(router_children, effective_coordinator, mcp_list, instructions)
-        else:
-            team = _build_team(
-                agent_specs, effective_coordinator, coordinator_tools, mode, mcp_list, instructions
-            )
+        team = _build_team(
+            agent_specs, effective_coordinator, coordinator_tools, mode, mcp_list, instructions
+        )
 
         full_content: list[str] = []
         last_event = None
@@ -476,7 +414,6 @@ async def run_task_async(
     project_id: str = "default",
     session_id: str | None = None,
     mode: str = "coordinate",
-    router_children: list[dict] | None = None,
 ) -> str:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer."""
     effective_mcp_url = mcp_url or config.mcp_url
@@ -538,12 +475,9 @@ async def run_task_async(
         if not mcp_list:
             raise RuntimeError("No MCP server available — check hive-mcp and project MCP are running")
 
-        if router_children:
-            team = _build_router_team(router_children, effective_coordinator, mcp_list, instructions)
-        else:
-            team = _build_team(
-                agent_specs, effective_coordinator, coordinator_tools, mode, mcp_list, instructions
-            )
+        team = _build_team(
+            agent_specs, effective_coordinator, coordinator_tools, mode, mcp_list, instructions
+        )
 
         span_attrs = {
             "project_id": project_id,
