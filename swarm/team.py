@@ -253,6 +253,39 @@ def _extract_tokens(result) -> dict:
         return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
 
+def _build_team(
+    agent_specs: list | None,
+    coordinator_model: str,
+    coordinator_tools: list[str] | None,
+    mode: str,
+    mcp_list: list,
+    instructions: list,
+    *,
+    name: str = "AgnoHive",
+) -> Team:
+    """Build a coordinator Team from agent specs (or the default Coder+Reviewer), sharing the
+    already-connected `mcp_list`. Factored out of run_task_async / run_task_stream so the same
+    build is reusable for router sub-teams (EK-88). `coordinator_model` is the already-resolved
+    model name. Behaviour is identical to the previous inline Team(...) construction."""
+    if agent_specs:
+        members = [make_agent_from_spec(spec, *mcp_list) for spec in agent_specs]
+    else:
+        members = [make_coder(*mcp_list), make_reviewer(*mcp_list)]
+    return Team(
+        name=name,
+        mode=mode,
+        model=get_model(coordinator_model, config.ollama_host),
+        members=members,
+        tools=_scope_coordinator_tools(coordinator_tools, mcp_list),
+        instructions=instructions,
+        show_members_responses=True,
+        share_member_interactions=True,
+        add_member_tools_to_context=True,
+        markdown=True,
+        max_iterations=config.max_iterations,
+    )
+
+
 async def run_task_stream(
     task: str,
     agent_specs: list | None = None,
@@ -326,23 +359,8 @@ async def run_task_stream(
         if not mcp_list:
             raise RuntimeError("No MCP server available — check hive-mcp and project MCP are running")
 
-        if agent_specs:
-            members = [make_agent_from_spec(spec, *mcp_list) for spec in agent_specs]
-        else:
-            members = [make_coder(*mcp_list), make_reviewer(*mcp_list)]
-
-        team = Team(
-            name="AgnoHive",
-            mode=mode,
-            model=get_model(effective_coordinator, config.ollama_host),
-            members=members,
-            tools=_scope_coordinator_tools(coordinator_tools, mcp_list),
-            instructions=instructions,
-            show_members_responses=True,
-            share_member_interactions=True,
-            add_member_tools_to_context=True,
-            markdown=True,
-            max_iterations=config.max_iterations,
+        team = _build_team(
+            agent_specs, effective_coordinator, coordinator_tools, mode, mcp_list, instructions
         )
 
         full_content: list[str] = []
@@ -351,7 +369,7 @@ async def run_task_stream(
         with _tracer.start_as_current_span("agno.task.stream", attributes={
             "project_id": project_id,
             "coordinator_model": effective_coordinator,
-            "agent_count": len(members),
+            "agent_count": len(team.members),
             "task": task[:120],
         }):
             from observability.metrics import task_duration, task_counter
@@ -454,29 +472,14 @@ async def run_task_async(
         if not mcp_list:
             raise RuntimeError("No MCP server available — check hive-mcp and project MCP are running")
 
-        if agent_specs:
-            members = [make_agent_from_spec(spec, *mcp_list) for spec in agent_specs]
-        else:
-            members = [make_coder(*mcp_list), make_reviewer(*mcp_list)]
-
-        team = Team(
-            name="AgnoHive",
-            mode=mode,
-            model=get_model(effective_coordinator, config.ollama_host),
-            members=members,
-            tools=_scope_coordinator_tools(coordinator_tools, mcp_list),
-            instructions=instructions,
-            show_members_responses=True,
-            share_member_interactions=True,
-            add_member_tools_to_context=True,
-            markdown=True,
-            max_iterations=config.max_iterations,
+        team = _build_team(
+            agent_specs, effective_coordinator, coordinator_tools, mode, mcp_list, instructions
         )
 
         span_attrs = {
             "project_id": project_id,
             "coordinator_model": effective_coordinator,
-            "agent_count": len(members),
+            "agent_count": len(team.members),
             "task": task[:120],
         }
 
