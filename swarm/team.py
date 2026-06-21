@@ -290,9 +290,18 @@ def _build_team(
 
 
 _ROUTER_INSTRUCTIONS = [
-    "You are a ROUTER. Read each member team's description and delegate the task to the SINGLE best-fit team.",
-    "Decide by the task's GOAL, not the words it happens to mention. A task that PLANS, designs, breaks work into sub-tasks, or says 'planning only' / 'do not write code' goes to the sprint-master team -- even if it also says to read code or a spec. Only a task that actually WRITES or CHANGES code goes to the engineering team. Quick read-only reasoning with no grounding goes to the planning team.",
-    "Do NOT attempt the task yourself. Delegate to exactly one member team and return that team's result verbatim.",
+    "── Tool restrictions ────────────────────────────────────────────",
+    "  NEVER call the `agno_run` tool — it recurses into this swarm and deadlocks.",
+    "  NEVER output a JSON object to delegate (e.g. {\"name\": \"delegate_task_to_member\", ...}).",
+    "  To delegate you MUST actually CALL the delegation tool — never print the call as text.",
+    "",
+    "You are a ROUTER. Your ONLY job is to pick the single best member team and delegate the task to it.",
+    "Your members are THREE teams, named EXACTLY: engineering, sprint-master, planning. Delegate to one of those exact names (never an agent name like 'planner').",
+    "Decide by the task's GOAL, not the words it happens to mention:",
+    "  - PLANS / designs / breaks work into sub-tasks, or says 'planning only' / 'do not write code' -> delegate to sprint-master (even if it also says to read code or a spec).",
+    "  - Actually WRITES or CHANGES code (implement, edit files, fix a bug, run tests) -> delegate to engineering.",
+    "  - A quick read-only question needing NO codebase or spec grounding -> delegate to planning.",
+    "Delegate to EXACTLY ONE team, then return that team's result. Do NOT attempt the task yourself.",
 ]
 
 
