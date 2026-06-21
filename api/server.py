@@ -72,6 +72,38 @@ ROUTABLE_TEAMS = {
 }
 
 
+async def _route_to_team(task: str, choices: dict, model: str, ollama_host: str) -> str:
+    """Classifier-then-dispatch routing (EK-88). One cheap LLM call picks the single best team name
+    for `task`; the caller then runs that team via the normal path. This deliberately avoids agno
+    route-mode nested delegation — delegate_task_to_member is unreliable over ollama (intermittently
+    emitted as text). Returns a key of `choices`; falls back to the first key on any failure or
+    unrecognised answer."""
+    import httpx
+    menu = "\n".join(f"- {name}: {desc}" for name, desc in choices.items())
+    prompt = (
+        "You are a task router. Pick the SINGLE best team for the task below. "
+        "Reply with ONLY the team name (exactly one of the listed names) and nothing else.\n\n"
+        f"Teams:\n{menu}\n\nTask:\n{task[:1500]}\n\nTeam name:"
+    )
+    host = ollama_host or "http://localhost:11434"
+    answer = ""
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                f"{host}/api/generate",
+                json={"model": model, "prompt": prompt, "stream": False,
+                      "options": {"temperature": 0, "num_predict": 16}},
+            )
+            resp.raise_for_status()
+            answer = (resp.json().get("response") or "").strip().lower()
+    except Exception as e:
+        print(f"[router] classify failed ({e}); falling back to first team")
+    for name in choices:
+        if name.lower() in answer:
+            return name
+    return next(iter(choices))  # fallback: first team (engineering)
+
+
 @app.on_event("startup")
 async def _start_cleanup_loop():
     asyncio.create_task(_session_cleanup_loop())
@@ -109,7 +141,6 @@ async def run(request: RunRequest):
     start = time.perf_counter()
 
     # Resolve team spec
-    router_children = None
     if request.agents:
         agent_specs = request.agents
         coordinator_model = config.leader_model
@@ -117,20 +148,11 @@ async def run(request: RunRequest):
         team_name = request.team or "custom"
         coordinator_tools = None
     elif request.team == "router":
-        # EK-88 router-of-teams: load each child's spec; run_task_async composes the route-mode parent.
-        router_children = []
-        for _cname, _cdesc in ROUTABLE_TEAMS.items():
-            _cspecs, _ccoord, _cmode, _ctools = _load_team(_cname)
-            router_children.append({
-                "name": _cname, "description": _cdesc,
-                "agent_specs": _cspecs, "coordinator_model": _ccoord,
-                "coordinator_tools": _ctools, "mode": _cmode,
-            })
-        agent_specs = []
-        coordinator_model = config.router_model  # config-driven router leader (qwen3-coder:30b MoE)
-        team_mode = "route"
-        team_name = "router"
-        coordinator_tools = None
+        # EK-88 classifier-then-dispatch: one cheap LLM call picks the team, then run it normally.
+        chosen = await _route_to_team(request.task, ROUTABLE_TEAMS, config.router_model, config.ollama_host)
+        agent_specs, coordinator_model, team_mode, coordinator_tools = _load_team(chosen)
+        team_mode = request.mode or team_mode
+        team_name = f"router:{chosen}"
     elif request.team:
         agent_specs, coordinator_model, team_mode, coordinator_tools = _load_team(request.team)
         team_mode = request.mode or team_mode  # request-level override wins
@@ -140,8 +162,7 @@ async def run(request: RunRequest):
         team_mode = request.mode or team_mode
         team_name = "engineering"
 
-    all_models = list({coordinator_model} | {a.model for a in agent_specs}
-                      | {a.model for c in (router_children or []) for a in c["agent_specs"]})
+    all_models = list({coordinator_model} | {a.model for a in agent_specs})
     models_pulled = await ensure_models(all_models, config.ollama_host)
 
     mcp_url = request.mcp_url or config.mcp_url
@@ -173,7 +194,6 @@ async def run(request: RunRequest):
         project_id=request.project_id,
         session_id=session_id,
         mode=team_mode,
-        router_children=router_children,
     )
 
     # Append this turn to session
