@@ -96,6 +96,8 @@ dicts/lists, which previously caused "expected dict, got string" failures).
 | `notion_update_page_props(page_id, properties)` | Staged | Update fields by simple value, e.g. `{"Status": "Done"}`. status / select / relation / date are coerced from the schema; pass `null` to clear a field |
 | `notion_append_blocks(block_id, blocks, after_block_id)` | Staged | Append blocks. `blocks` may be a list of plain strings (each becomes a paragraph) or full block dicts; `after_block_id` controls insertion position |
 | `notion_append_markdown(block_id, markdown)` | Staged | Append RICH content from Notion-flavored markdown (headings, lists, fenced code, tables, **bold**/`code`/links) — the rich counterpart to `notion_append_blocks`. Batches over the 100-block API cap automatically |
+| `notion_update_block(block_id, text, checked)` | Staged | Edit an EXISTING block IN PLACE — rewrite its text (inline **bold**/`code`/links parsed) or toggle a `to_do` checkbox. Use this for "update / fix / change" an existing line; `notion_append_*` can only add new blocks |
+| `notion_delete_block(block_id, restore)` | Staged | Trash an existing block (and its children); `restore=True` brings it back. Use to remove a stale line/section — prefer `notion_update_block` to replace text rather than delete |
 | `notion_trash_page(page_id, restore)` | Staged | Trash a page (remove it from the board/database); `restore=True` brings it back. Trashing also drops the row from query results and from any relations |
 
 **Migration runner** (`MIGRATIONS_ENABLED=true` required — review-gated)

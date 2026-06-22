@@ -28,6 +28,12 @@ _NOTION_PROP_KEYS = (
     "date", "url", "email", "phone_number", "people", "relation", "files",
 )
 
+# Block types that carry editable rich_text (so notion_update_block can rewrite their text).
+_RICH_TEXT_BLOCKS = {
+    "paragraph", "heading_1", "heading_2", "heading_3",
+    "bulleted_list_item", "numbered_list_item", "to_do", "toggle", "quote", "callout", "code",
+}
+
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
@@ -91,6 +97,31 @@ def _execute(tool: str, args: dict) -> str:
                 body["after"] = _clean_id(args["after"])
             _request("PATCH", f"/blocks/{block_id}/children", body)
             return f"notion: appended {len(children)} block(s) to {args['block_id']}"
+
+        if tool == "update_block":
+            block_id = _clean_id(args["block_id"])
+            blk      = _request("GET", f"/blocks/{block_id}")
+            btype    = blk.get("type")
+            inner: dict = {}
+            if args.get("text") is not None:
+                if btype not in _RICH_TEXT_BLOCKS:
+                    return (f"notion update_block: block type '{btype}' has no editable text "
+                            f"(only {', '.join(sorted(_RICH_TEXT_BLOCKS))})")
+                inner["rich_text"] = _rich(args["text"])
+            if args.get("checked") is not None and btype == "to_do":
+                inner["checked"] = bool(args["checked"])
+            if not inner:
+                return "notion update_block: nothing to update — pass text and/or checked"
+            _request("PATCH", f"/blocks/{block_id}", {btype: inner})
+            return f"notion: updated {btype} block {args['block_id']}"
+
+        if tool == "delete_block":
+            block_id = _clean_id(args["block_id"])
+            if args.get("restore"):
+                _request("PATCH", f"/blocks/{block_id}", {"archived": False})
+                return f"notion: restored block {args['block_id']}"
+            _request("DELETE", f"/blocks/{block_id}")
+            return f"notion: deleted (trashed) block {args['block_id']}"
 
         if tool == "create_database":
             result = _request("POST", "/databases", args["payload"])
@@ -400,6 +431,62 @@ def notion_trash_page(page_id: str, restore: bool = False) -> str:
             {"page_id": page_id, "restore": bool(restore)},
         )
     return _execute("trash_page", {"page_id": page_id, "restore": bool(restore)})
+
+
+def notion_update_block(block_id: str, text: str | None = None, checked: bool | None = None) -> str:
+    """
+    Edit an EXISTING block's text IN PLACE — e.g. rewrite a roadmap line, tick a checkbox.
+    This is the counterpart to notion_append_markdown (which only adds NEW blocks): use this
+    when the user asks to "update / change / fix" text that is already on the page. Requires
+    human approval when WRITE_REVIEW is enabled.
+
+    Get the target block_id from notion_get_page (each line shows its block) or from the
+    /blocks/<id>/children listing. Works on text-bearing blocks: paragraph, heading_1/2/3,
+    bulleted_list_item, numbered_list_item, to_do, toggle, quote, callout, code.
+
+    Args:
+        block_id: ID of the existing block to edit.
+        text:     New text — Notion-flavored inline markdown (**bold**, `code`, [label](url))
+                  is parsed. Replaces the block's entire text. Omit to leave text unchanged
+                  (e.g. when only toggling `checked`).
+        checked:  For to_do blocks only — True/False to set the checkbox state.
+    """
+    if WRITE_REVIEW:
+        bits = []
+        if text is not None:
+            bits.append(f"text -> '{text[:40]}'")
+        if checked is not None:
+            bits.append(f"checked={bool(checked)}")
+        return _stage_action(
+            "notion", "update_block",
+            f"Update block {block_id[:8]}... ({'; '.join(bits) or 'no-op'})",
+            {"block_id": block_id, "text": text, "checked": checked},
+        )
+    return _execute("update_block", {"block_id": block_id, "text": text, "checked": checked})
+
+
+def notion_delete_block(block_id: str, restore: bool = False) -> str:
+    """
+    Delete (trash) an EXISTING block — e.g. remove a stale roadmap line or a duplicated
+    section. Set restore=True to bring a trashed block back. Requires human approval when
+    WRITE_REVIEW is enabled.
+
+    Get the block_id from notion_get_page or the /blocks/<id>/children listing. Deleting a
+    block also removes its children. To replace text rather than remove it, prefer
+    notion_update_block.
+
+    Args:
+        block_id: ID of the block to trash (or restore).
+        restore:  False (default) trashes the block; True restores it from trash.
+    """
+    if WRITE_REVIEW:
+        verb = "Restore" if restore else "Delete"
+        return _stage_action(
+            "notion", "delete_block",
+            f"{verb} block {block_id[:8]}...",
+            {"block_id": block_id, "restore": bool(restore)},
+        )
+    return _execute("delete_block", {"block_id": block_id, "restore": bool(restore)})
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
