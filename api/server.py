@@ -148,8 +148,8 @@ async def run(request: RunRequest):
         team_name = request.team or "custom"
         coordinator_tools = None
     elif request.team == "router":
-        # EK-88 classifier-then-dispatch: one cheap LLM call picks the team, then run it normally.
-        chosen = await _route_to_team(request.task, ROUTABLE_TEAMS, config.router_model, config.ollama_host)
+        # EK-88 classifier-then-dispatch: one LLM call picks the team, then run it normally.
+        chosen = await _route_to_team(request.task, ROUTABLE_TEAMS, config.router_classifier_model, config.ollama_host)
         agent_specs, coordinator_model, team_mode, coordinator_tools = _load_team(chosen)
         team_mode = request.mode or team_mode
         team_name = f"router:{chosen}"
