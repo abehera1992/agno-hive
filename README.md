@@ -663,8 +663,11 @@ All models are configurable via `.env` or `teams/*.yaml`. Models are swappable w
 | `planning` | ContextRouter + Researcher + Planner | `coordinate` | HITL plan review via `POST /plan` |
 | `parallel-review` | Researcher + SecurityReviewer + PerformanceReviewer | `collaborate` | Read-only parallel analysis — all agents run simultaneously |
 | `sprint-master` | BacklogResearcher + StoryWriter | `coordinate` | Backlog/sprint work-item CRUD on the connected work-tracking platform — board management only, never code |
+| `router` | _(virtual — no agents of its own)_ | classify → dispatch | Auto-routes a task to the best team above (`engineering` / `sprint-master` / `planning`) |
 
 Create a new team by adding a YAML file in `teams/` — no code changes needed. Set `mode: collaborate` in the YAML to run all agents in parallel, or override per-request via the `mode` field in `POST /run`.
+
+**`router`** is a *virtual* team (not a YAML file). `swarm_team="router"` runs a one-shot classifier (`ROUTER_CLASSIFIER_MODEL`, default `qwen3-coder:30b`) that reads the candidate teams' descriptions, picks the single best one, then dispatches the task to that team via the normal path — the response reports `team: router:<chosen>`. This **classifier-then-dispatch** design deliberately avoids agno's route-mode nested-team delegation, which is unreliable over ollama (`delegate_task_to_member` is intermittently emitted as plain text). A single team delegating to its own agents is reliable. Routing needs a strong model — `llama3.1:8b` mis-routes (it just picks the longest description), `qwen3-coder:30b` routes accurately.
 
 ### Sprint Master — delivery-board PM team
 
