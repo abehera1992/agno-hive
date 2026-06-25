@@ -663,7 +663,7 @@ All models are configurable via `.env` or `teams/*.yaml`. Models are swappable w
 | `planning` | ContextRouter + Researcher + Planner | `coordinate` | HITL plan review via `POST /plan` |
 | `parallel-review` | Researcher + SecurityReviewer + PerformanceReviewer | `collaborate` | Read-only parallel analysis — all agents run simultaneously |
 | `sprint-master` | BacklogResearcher + StoryWriter | `coordinate` | Backlog/sprint work-item CRUD on the connected work-tracking platform — board management only, never code |
-| `router` | _(virtual — no agents of its own)_ | classify → dispatch | Auto-routes a task to the best team above (`engineering` / `sprint-master` / `planning`) |
+| `router` | _(virtual — no agents of its own)_ | classify → dispatch | Auto-routes a task to the best team above (`engineering` / `parallel-review` / `sprint-master` / `planning`); read-only grounding/verification probes route to `engineering` |
 
 Create a new team by adding a YAML file in `teams/` — no code changes needed. Set `mode: collaborate` in the YAML to run all agents in parallel, or override per-request via the `mode` field in `POST /run`.
 
