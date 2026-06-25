@@ -797,7 +797,7 @@ Read operations (`notion_search`, `notion_get_page`) pass through immediately â€
 
 | Platform | Env var | Read tools | Write tools |
 |---|---|---|---|
-| Notion | `NOTION_API_KEY` | `notion_search`, `notion_get_page`, `notion_get_database_schema`, `notion_query_database` | `notion_create_page` (+`markdown_content`), `notion_update_page_props`, `notion_append_blocks`, `notion_append_markdown`, `notion_trash_page` |
+| Notion | `NOTION_API_KEY` | `notion_search`, `notion_get_page` (prints each `(block_id: â€¦)`), `notion_get_database_schema`, `notion_query_database` | `notion_create_page` (+`markdown_content`), `notion_update_page_props`, `notion_append_blocks`, `notion_append_markdown`, `notion_update_content` (in-place search/replace), `notion_update_block`, `notion_delete_block`, `notion_trash_page` |
 
 > **Notion write tools take simple values.** Pass `properties` as a plain dict
 > (`{"Status": "Done", "Area": "Platform", "Sprint": "<page-url>"}`); the tool reads the database
