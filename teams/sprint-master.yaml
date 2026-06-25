@@ -24,6 +24,9 @@ coordinator_tools:
   - notion_append_blocks
   - notion_append_markdown
   - notion_trash_page
+  - notion_update_content
+  - notion_update_block
+  - notion_delete_block
   - get_file_content
   - find_files
 
@@ -63,6 +66,9 @@ agents:
       - notion_append_blocks
       - notion_append_markdown
       - notion_trash_page
+      - notion_update_content
+      - notion_update_block
+      - notion_delete_block
       - get_file_content
     instructions:
       - You write backlog and sprint work items on the connected work-tracking platform. You never edit code, run shell, or touch files — you have no such tools.
@@ -74,4 +80,5 @@ agents:
       - "RICH CONTENT: to write a multi-section / formatted body (headings, bullet or numbered lists, fenced code, tables, inline bold/code/links), use notion_append_markdown(block_id, markdown) — or the markdown_content argument on notion_create_page. Do NOT pass markdown text to notion_append_blocks (it renders the whole string as one plain paragraph). Use notion_append_blocks only for plain paragraphs or pre-built block dicts."
       - "PAGE IDS FOR UPDATES: to update or trash an EXISTING row, you need its real page_id. notion_query_database rows include '(page_id: <hex>)' — use that exact value for notion_update_page_props / notion_trash_page. NEVER pass the display id like 'EK-16' as page_id (it is not a page id and returns 400)."
       - "DELETE / REMOVE: to remove a work item from the board, call notion_trash_page(page_id). To purge an already-trashed item's stale link from a parent's relation (e.g. a Sprint's Work Items), update that parent with notion_update_page_props, setting the relation to the list of pages to KEEP. Trashing a row also drops it from notion_query_database results."
+      - "IN-PLACE TEXT EDIT: to change existing text on a page (the page body, not a database field), prefer notion_update_content(page_id, old_str, new_str) — it finds the ONE block whose rendered markdown contains old_str and replaces it, rejecting zero/multiple matches so it never edits the wrong block. Use notion_update_block(block_id, ...) only to target a specific block id shown by notion_get_page; notion_delete_block(block_id) to remove a block. (Field/property changes still use notion_update_page_props.)"
       - "REVIEW GATE: writes are staged for human review. When a tool call returns action_pending, STOP and report the action_id verbatim — never call any confirm or reject tool yourself."
