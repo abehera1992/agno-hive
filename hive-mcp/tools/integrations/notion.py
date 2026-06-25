@@ -37,19 +37,19 @@ _RICH_TEXT_BLOCKS = {
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-def _headers() -> dict:
+def _headers(version: str = _NOTION_VERSION) -> dict:
     return {
         "Authorization": f"Bearer {config.NOTION_API_KEY}",
-        "Notion-Version": _NOTION_VERSION,
+        "Notion-Version": version,
         "Content-Type": "application/json",
     }
 
 
-def _request(method: str, path: str, body: dict | None = None) -> dict:
+def _request(method: str, path: str, body: dict | None = None, version: str = _NOTION_VERSION) -> dict:
     import httpx
     resp = httpx.request(
         method, f"{_NOTION_BASE}{path}",
-        headers=_headers(),
+        headers=_headers(version),
         json=body,
         timeout=30,
     )
@@ -340,7 +340,9 @@ def notion_create_page(
                      - number: pass a number; checkbox: true/false; date: "YYYY-MM-DD".
                      Unknown field names are skipped (so a typo won't 400 the whole call).
         content:     Optional plain-text paragraph added as the first block.
-        parent_type: 'database_id' (default) or 'page_id'.
+        parent_type: 'database_id' (default) or 'page_id'. For 'database_id' the value may be a
+                     database id OR a data-source/collection id — the latter is resolved to its
+                     database automatically.
         markdown_content: Optional RICH body in Notion-flavored markdown — headings (#/##/###),
                      paragraphs, bullet/number lists, fenced code blocks, block quotes, dividers,
                      tables, with inline **bold** / `code` / [label](url). Converted to Notion
@@ -729,6 +731,22 @@ def _build_properties(schema: dict, title_name: str, title, properties) -> dict:
     return out
 
 
+def _resolve_database_id(maybe_id: str) -> str:
+    """A `database_id` parent that isn't actually a database may be a data-source / collection
+    id (the 2022-06-28 API can't use that as a database parent). Look up its parent database
+    via the 2025-09-03 `data_sources` endpoint so callers can pass EITHER id. Returns the
+    original id if it can't be resolved."""
+    cid = _clean_id(maybe_id)
+    try:
+        ds = _request("GET", f"/data_sources/{cid}", version="2025-09-03")
+        db = (ds.get("parent") or {}).get("database_id")
+        if db:
+            return _clean_id(db)
+    except Exception:
+        pass
+    return cid
+
+
 def _build_create_payload(
     parent_id: str,
     parent_type: str,
@@ -739,7 +757,13 @@ def _build_create_payload(
 ) -> dict:
     payload: dict = {"parent": {parent_type: parent_id}}
     if parent_type == "database_id":
-        schema, title_name = _get_database_schema(parent_id)
+        db_id = _clean_id(parent_id)
+        try:
+            schema, title_name = _get_database_schema(db_id)
+        except Exception:
+            db_id = _resolve_database_id(parent_id)  # accept a data-source/collection id too
+            schema, title_name = _get_database_schema(db_id)
+        payload["parent"] = {"database_id": db_id}
         payload["properties"] = _build_properties(schema, title_name, title, properties)
     else:
         payload["properties"] = {
