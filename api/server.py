@@ -66,9 +66,10 @@ def _load_team(name: str) -> tuple[list[AgentSpec], str, str, list[str] | None]:
 # EK-88 router-of-teams: the child teams the "router" virtual team delegates to, each with the
 # description the router leader reads to pick exactly one.
 ROUTABLE_TEAMS = {
-    "engineering":   "ONLY for tasks that WRITE or CHANGE code: implement a feature, edit/create files, fix a bug, refactor, run tests. Do NOT choose this for planning, design, or read-only analysis even if the task mentions reading code.",
-    "sprint-master": "Choose this for PLANNING and DESIGN: produce an implementation plan, break a feature into sub-tasks, read a spec / Notion page and a codebase to plan (no code is written), or do delivery-board (epic/feature/task/bug) CRUD. ANY task that says 'plan', 'design', 'break into sub-tasks', or 'planning only' belongs here.",
-    "planning":      "Quick read-only reasoning or Q&A that needs no codebase or spec grounding.",
+    "engineering":   "Choose for (1) any task that WRITES or CHANGES code — implement a feature, edit/create files, fix a bug, refactor, run tests; OR (2) a read-only task whose answer must be GROUNDED in the actual codebase — a verification/groundedness probe, 'what does file X contain', 'confirm how Y works'. This is the only team that reliably opens and quotes real files, so pick it whenever the answer must be accurate to the code, even if the task is read-only.",
+    "parallel-review": "Choose for read-only multi-perspective REVIEW of existing code: code review before merge, security audit (auth / secrets / OWASP), or performance review (N+1 queries, missing indexes). Use for 'review / audit / critique this code'. Do NOT use it to verify specific facts about the code — that is engineering.",
+    "sprint-master": "Choose for PLANNING and DESIGN: produce an implementation plan, break a feature into sub-tasks, read a spec / Notion page and a codebase to plan (no code is written), or do delivery-board (epic / feature / task / bug) CRUD. ANY task that says 'plan', 'design', 'break into sub-tasks', or 'planning only' belongs here.",
+    "planning":      "Choose ONLY for quick read-only conceptual Q&A or reasoning that needs NO codebase or spec grounding (it does not reliably read files). If the answer must be grounded in real code, pick engineering instead.",
 }
 
 
