@@ -123,6 +123,28 @@ def _execute(tool: str, args: dict) -> str:
             _request("DELETE", f"/blocks/{block_id}")
             return f"notion: deleted (trashed) block {args['block_id']}"
 
+        if tool == "update_content":
+            old_str, new_str = args["old_str"], args["new_str"]
+            blocks: list[dict] = []
+            _collect_blocks(args["page_id"], blocks)
+            matches = []
+            for b in blocks:
+                bt = b.get("type")
+                if bt not in _RICH_TEXT_BLOCKS:
+                    continue
+                md = _rich_to_md(b.get(bt, {}).get("rich_text", []))
+                if old_str in md:
+                    matches.append((b, bt, md))
+            if not matches:
+                return "notion update_content: old_str not found in any block — no change made"
+            if len(matches) > 1:
+                return (f"notion update_content: AMBIGUOUS — old_str matched {len(matches)} blocks; "
+                        "make old_str longer/unique so it identifies exactly one block")
+            b, bt, md = matches[0]
+            _request("PATCH", f"/blocks/{_clean_id(b['id'])}",
+                     {bt: {"rich_text": _rich(md.replace(old_str, new_str))}})
+            return f"notion: update_content replaced text in {bt} block {_clean_id(b['id'])}"
+
         if tool == "create_database":
             result = _request("POST", "/databases", args["payload"])
             return f"notion database created: {result.get('url', result.get('id'))}"
@@ -491,6 +513,32 @@ def notion_delete_block(block_id: str, restore: bool = False) -> str:
     return _execute("delete_block", {"block_id": block_id, "restore": bool(restore)})
 
 
+def notion_update_content(page_id: str, old_str: str, new_str: str) -> str:
+    """Reliable in-place search/replace on a Notion page — the safe alternative to
+    notion_update_block.
+
+    Finds the ONE block whose rendered markdown CONTAINS `old_str`, replaces `old_str` →
+    `new_str` inside it, and patches that block. Because it matches the FULL block text (not a
+    'starts-with' prefix), it never edits the wrong block when several blocks share a prefix
+    across sections. `old_str` must identify exactly ONE block: if it matches zero or more than
+    one block the call is rejected (make `old_str` longer / more unique). Searches nested
+    children (sub-bullets) too. `new_str` may carry inline markdown (**bold** / `code` /
+    [label](url)). Requires human approval when WRITE_REVIEW is enabled.
+
+    Args:
+        page_id:  Notion page id (or the last segment of a page URL).
+        old_str:  Exact text (as rendered markdown) to find within a single block.
+        new_str:  Replacement text (inline markdown supported).
+    """
+    if WRITE_REVIEW:
+        return _stage_action(
+            "notion", "update_content",
+            f"Search/replace one block on page {_clean_id(page_id)[:8]}...",
+            {"page_id": page_id, "old_str": old_str, "new_str": new_str},
+        )
+    return _execute("update_content", {"page_id": page_id, "old_str": old_str, "new_str": new_str})
+
+
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _as_dict(value) -> dict:
@@ -797,6 +845,42 @@ def _rich(text: str) -> list[dict]:
         else:
             out += _rt(part)
     return out
+
+
+def _rich_to_md(rich: list) -> str:
+    """Inverse of _rich: render a Notion rich_text array back to inline markdown, so a
+    search/replace can match the same **bold** / `code` / [label](url) form _rich produces."""
+    out = []
+    for t in rich or []:
+        txt = t.get("plain_text", "")
+        ann = t.get("annotations", {}) or {}
+        link = (t.get("text") or {}).get("link")
+        if link and link.get("url"):
+            txt = f"[{txt}]({link['url']})"
+        elif ann.get("code"):
+            txt = f"`{txt}`"
+        elif ann.get("bold"):
+            txt = f"**{txt}**"
+        out.append(txt)
+    return "".join(out)
+
+
+def _collect_blocks(parent_id: str, acc: list, max_blocks: int = 2000) -> None:
+    """Recursively collect ALL descendant blocks under a page/block id (so nested sub-bullets
+    are reachable — notion_get_page only renders top level + table rows)."""
+    cursor = None
+    while len(acc) < max_blocks:
+        path = f"/blocks/{_clean_id(parent_id)}/children?page_size=100"
+        if cursor:
+            path += f"&start_cursor={cursor}"
+        data = _request("GET", path)
+        for b in data.get("results", []):
+            acc.append(b)
+            if b.get("has_children") and b.get("type") not in ("child_page", "child_database", "table"):
+                _collect_blocks(b["id"], acc, max_blocks)
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
 
 
 def _split_row(line: str) -> list[str]:
