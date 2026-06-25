@@ -170,7 +170,9 @@ def notion_get_page(page_id: str, max_lines: int = 600) -> str:
     """
     Read a Notion page's FULL content — paginates ALL top-level blocks (not just the first
     page of 25) and renders table rows, so long pages (roadmaps, rate tables) are read
-    end-to-end. Read-only — no approval required.
+    end-to-end. Read-only — no approval required. Each block line shows its real
+    `(block_id: <hex>)` — pass that id to notion_update_block / notion_delete_block to
+    rewrite or remove that exact block (never fabricate or guess a block id).
 
     Args:
         page_id:   Notion page ID (32-char hex, UUID format, or last segment of page URL).
@@ -557,7 +559,9 @@ def _block_summary(block: dict) -> str:
     inner = block.get(btype, {})
     rich  = inner.get("rich_text", [])
     text  = "".join(t.get("plain_text", "") for t in rich)[:80]
-    return f"[{btype}] {text}" if text else f"[{btype}]"
+    bid   = _clean_id(block.get("id", ""))
+    tag   = f"[{btype}] (block_id: {bid})" if bid else f"[{btype}]"
+    return f"{tag} {text}" if text else tag
 
 
 def _prop_value(p: dict):
