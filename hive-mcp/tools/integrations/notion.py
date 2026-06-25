@@ -627,6 +627,9 @@ def _coerce_property(ptype: str, value):
     if isinstance(value, dict) and any(k in value for k in _NOTION_PROP_KEYS):
         return value
     if value is None:
+        # Array-valued props are cleared with [], not null (Notion 400s on e.g. {"relation": null}).
+        if ptype in ("relation", "multi_select", "people", "files", "rich_text", "title"):
+            return {ptype: []}
         return {ptype: None}
 
     if ptype == "title":
