@@ -47,6 +47,9 @@ class Config:
     vllm_llm_model: str = os.getenv("VLLM_LLM_MODEL", "RedHatAI/Qwen2.5-Coder-7B-Instruct-FP8-dynamic")
     vllm_embed_base_url: str = os.getenv("VLLM_EMBED_BASE_URL", "http://localhost:8002/v1")
     vllm_embed_model: str = os.getenv("VLLM_EMBED_MODEL", "Qwen/Qwen3-Embedding-0.6B")
+    # Agno swarm gateway — LiteLLM proxy (:4000) -> llama-swap (:9100, on-demand swap) -> vLLM.
+    # agno talks OpenAI to LiteLLM; LiteLLM gives aliases/fallbacks/observability.
+    vllm_gateway_url: str = os.getenv("VLLM_GATEWAY_URL", "http://localhost:4000/v1")
 
     # Observability — OTLP endpoint for any OTel-compatible backend
     # e.g. existing SigNoz: http://<ekam-host>:4318

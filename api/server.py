@@ -90,13 +90,24 @@ async def _route_to_team(task: str, choices: dict, model: str, ollama_host: str)
     answer = ""
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                f"{host}/api/generate",
-                json={"model": model, "prompt": prompt, "stream": False,
-                      "options": {"temperature": 0, "num_predict": 16}},
-            )
-            resp.raise_for_status()
-            answer = (resp.json().get("response") or "").strip().lower()
+            if config.inference_backend == "vllm":
+                # llama-swap OpenAI gateway (':' -> '-' served name)
+                resp = await client.post(
+                    f"{config.vllm_gateway_url}/chat/completions",
+                    json={"model": model.replace(":", "-"),
+                          "messages": [{"role": "user", "content": prompt}],
+                          "stream": False, "temperature": 0, "max_tokens": 16},
+                )
+                resp.raise_for_status()
+                answer = (resp.json()["choices"][0]["message"]["content"] or "").strip().lower()
+            else:
+                resp = await client.post(
+                    f"{host}/api/generate",
+                    json={"model": model, "prompt": prompt, "stream": False,
+                          "options": {"temperature": 0, "num_predict": 16}},
+                )
+                resp.raise_for_status()
+                answer = (resp.json().get("response") or "").strip().lower()
     except Exception as e:
         print(f"[router] classify failed ({e}); falling back to first team")
     for name in choices:

@@ -4,9 +4,30 @@ from .tool_fix import OllamaToolFix
 from config.config import config
 
 
+# Ollama model tag -> llama-swap served name (vLLM backend). llama-swap serves each
+# model under these names via --served-model-name; the rule is just ':' -> '-', so
+# unmapped ids fall back to that transform.
+_VLLM_MODEL_MAP = {
+    "qwen3-coder:30b": "qwen3-coder-30b",
+    "qwen2.5-coder:32b": "qwen2.5-coder-32b",
+    "qwen2.5-coder:7b": "qwen2.5-coder-7b",
+    "llama3.1:8b": "llama3.1-8b",
+}
+
+
 def get_model(model_id: str, host: str):
-    """OllamaToolFix handles all Ollama tool call formats
-    (native tool_calls, <tool_call> tags, <|python_tag|>, bare JSON)."""
+    """Build the model object for an agent, honoring INFERENCE_BACKEND.
+
+    vllm   -> llama-swap OpenAI gateway. vLLM serves native tool-calls via its
+              per-model parsers (--tool-call-parser), so stock OpenAILike works with
+              NO tool-fix. Model id is mapped to the llama-swap served name.
+    ollama -> OllamaToolFix, which extracts tool calls from Ollama's text formats
+              (native tool_calls, <tool_call> tags, <|python_tag|>, bare JSON, qwen3 XML).
+    """
+    if config.inference_backend == "vllm":
+        from agno.models.openai.like import OpenAILike
+        served = _VLLM_MODEL_MAP.get(model_id) or model_id.replace(":", "-")
+        return OpenAILike(id=served, base_url=config.vllm_gateway_url, api_key="EMPTY")
     return OllamaToolFix(id=model_id, host=host)
 
 

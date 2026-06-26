@@ -21,6 +21,9 @@ async def pull_model(model: str, ollama_host: str) -> None:
 
 async def ensure_models(models: list[str], ollama_host: str) -> list[str]:
     """Pull any models not already in Ollama. Returns list of models that were pulled."""
+    from config.config import config
+    if config.inference_backend == "vllm":
+        return []  # vLLM backend: models are served by vLLM/llama-swap, not Ollama
     available = await list_models(ollama_host)
     # Match both exact tags (deepseek-r1:latest) and tagless names (deepseek-r1)
     available_exact = set(available)
