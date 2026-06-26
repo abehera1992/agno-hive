@@ -2,9 +2,12 @@
 import os
 from urllib.parse import urlparse
 
+import numpy as np
+from openai import AsyncOpenAI
+
 from lightrag import LightRAG
 from lightrag.llm.ollama import ollama_model_complete, ollama_embed
-from lightrag.llm.openai import openai_complete_if_cache, openai_embed
+from lightrag.llm.openai import openai_complete_if_cache
 from lightrag.utils import EmbeddingFunc
 
 # ── Disable LightRAG's rebuild-on-delete (deadlock workaround, 2026-06-13) ────
@@ -97,13 +100,17 @@ def _build(project_id: str) -> LightRAG:
                 **kwargs,
             )
 
+        # Call vLLM's /v1/embeddings directly (NOT lightrag's openai_embed wrapper):
+        # that wrapper is an EmbeddingFunc preset to OpenAI's 1536 dim and reshapes the
+        # flat response by 1536, mangling our native-1024 vectors. The qwen3 embedder
+        # returns 1024-dim natively, so we send no `dimensions` param.
+        _embed_client = AsyncOpenAI(base_url=config.vllm_embed_base_url, api_key="EMPTY")
+
         async def _embed(texts: list[str]):
-            return await openai_embed(
-                texts,
-                model=config.vllm_embed_model,
-                base_url=config.vllm_embed_base_url,
-                api_key="EMPTY",
+            resp = await _embed_client.embeddings.create(
+                model=config.vllm_embed_model, input=texts,
             )
+            return np.array([d.embedding for d in resp.data], dtype=np.float32)
     else:
         ollama_host = config.ollama_host
         llm_model = config.lightrag_llm_model
