@@ -5,17 +5,18 @@ from config.config import config
 
 
 # Ollama model tag -> served name on the vLLM gateway. Default rule is ':' -> '-'.
-# vLLM-SPECIFIC CONSOLIDATION: on vLLM the roster is kept resident (30B coordinator +
-# 32B worker), and model diversity costs ~4-min llama-swap reloads. So the cheap-router
-# agents (ContextRouter/Executor, tagged llama3.1:8b) are routed to the resident 32B
-# instead of an 8B that would have to swap in/out — an engineering run then touches only
-# resident models (30B+32B), zero swaps. (Ollama path is untouched; the 8B stays cheap
-# there because Ollama keeps it warm.)
+# vLLM ALL-MoE CONSOLIDATION (2026-06-26): the entire vLLM roster collapses onto the single
+# resident MoE coordinator (qwen3-coder:30b, A3B ~3B active/token). On the GB10 the dense
+# qwen2.5-coder:32b is ~5-7x slower per token with no measurable code-quality edge (worker A/B),
+# so there is no reason to keep it. vLLM continuous-batching serves the coordinator + every
+# agent's grounding lightrag_query + all worker calls concurrently on the one fast model, which
+# is run at high gpu-mem-util for a large KV pool. No model swaps, no dense-model latency.
+# (Ollama path is untouched — it keeps the diverse 30B/32B/8B roster warm with no swap cost.)
 _VLLM_MODEL_MAP = {
     "qwen3-coder:30b": "qwen3-coder-30b",
-    "qwen2.5-coder:32b": "qwen2.5-coder-32b",
-    "qwen2.5-coder:7b": "qwen2.5-coder-7b",
-    "llama3.1:8b": "qwen2.5-coder-32b",  # consolidate 8B -> resident 32B (no swap)
+    "qwen2.5-coder:32b": "qwen3-coder-30b",
+    "qwen2.5-coder:7b": "qwen3-coder-30b",
+    "llama3.1:8b": "qwen3-coder-30b",
 }
 
 

@@ -43,8 +43,11 @@ class Config:
     # Inference backend — Ollama->vLLM migration (EK-105). "ollama" (default) or "vllm".
     # Both code paths stay live in rag.py; flip this + restart to switch (revert = set ollama).
     inference_backend: str = os.getenv("INFERENCE_BACKEND", "ollama")
-    # LightRAG LLM (extraction + query synthesis) shares the resident 30B coordinator via the
-    # LiteLLM gateway — no dedicated LightRAG LLM server (validated ~= 7B quality, frees ~14.5GB).
+    # LightRAG LLM (extraction + query synthesis) shares the resident 30B coordinator via LiteLLM.
+    # IMPORTANT: it must be the 30B (qwen3-coder, A3B MoE ~3B active) and NOT the dense 32B —
+    # LightRAG generates long answers and the dense 32B is ~5x slower per token on the GB10
+    # (measured: 37s on the 30B vs 186s on the 32B for the same query). Contention with the
+    # coordinator on the 30B is the lesser evil vs the dense model's generation latency.
     vllm_llm_base_url: str = os.getenv("VLLM_LLM_BASE_URL", "http://localhost:4000/v1")
     vllm_llm_model: str = os.getenv("VLLM_LLM_MODEL", "qwen3-coder-30b")
     vllm_embed_base_url: str = os.getenv("VLLM_EMBED_BASE_URL", "http://localhost:8002/v1")
