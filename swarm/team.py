@@ -6,7 +6,7 @@ from opentelemetry import trace
 from agno.team import Team
 from agno.tools.mcp import MCPTools
 from .agents import make_coder, make_reviewer, make_agent_from_spec, get_model
-from .feedback import record_success, record_failure, load_failure_context
+from .feedback import record_success, record_success_bg, record_failure, load_failure_context
 from config.config import config
 
 _tracer = trace.get_tracer("agno-hive.team")
@@ -388,10 +388,8 @@ async def run_task_stream(
                 combined = "".join(full_content) or "(no response)"
                 tokens = _extract_tokens(last_event)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
-                try:
-                    await record_success(task, combined, project_id)
-                except Exception:
-                    pass  # LightRAG indexing is best-effort; never crash the run
+                # Fire-and-forget: don't block the response on post-run experience indexing.
+                record_success_bg(task, combined, project_id)
                 yield {"__done__": True, "content": combined, "tokens": tokens}
             except Exception as exc:
                 task_counter.add(1, {"project_id": project_id, "outcome": "failure"})
@@ -504,10 +502,8 @@ async def run_task_async(
                 tokens = _extract_tokens(result)
                 span.set_status(trace.StatusCode.OK)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
-                try:
-                    await record_success(task, content, project_id)
-                except Exception:
-                    pass  # LightRAG indexing is best-effort; never crash the run
+                # Fire-and-forget: don't block the response on post-run experience indexing.
+                record_success_bg(task, content, project_id)
                 return content, tokens
             except Exception as exc:
                 span.record_exception(exc)

@@ -10,7 +10,7 @@ from api.models import AgentSpec, RunRequest, RunResponse, PlanResponse, ScanReq
 from fastapi.responses import StreamingResponse
 from swarm.ollama import ensure_models
 from swarm.team import run_task_async, run_task_stream
-from swarm.feedback import record_failure, record_success
+from swarm.feedback import record_failure, record_success, drain_background_tasks
 from config.config import config
 from observability.setup import setup_telemetry
 from swarm.sessions import (
@@ -119,6 +119,13 @@ async def _route_to_team(task: str, choices: dict, model: str, ollama_host: str)
 @app.on_event("startup")
 async def _start_cleanup_loop():
     asyncio.create_task(_session_cleanup_loop())
+
+
+@app.on_event("shutdown")
+async def _drain_feedback_tasks():
+    # Await any in-flight fire-and-forget experience-indexing tasks so a graceful
+    # shutdown doesn't drop an outcome that returned just before exit.
+    await drain_background_tasks()
 
 
 async def _session_cleanup_loop():

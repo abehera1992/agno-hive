@@ -41,6 +41,35 @@ async def record_success(task: str, result: str, project_id: str) -> None:
         print(f"[feedback] record_success warning: {exc}")
 
 
+# Track in-flight fire-and-forget feedback tasks so a graceful shutdown can await them
+# (otherwise an outcome could be dropped if the process exits right after returning a result).
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def record_success_bg(task: str, result: str, project_id: str) -> None:
+    """Fire-and-forget record_success — schedules the experience-namespace indexing as a
+    background task so the /run response is NOT blocked by post-run LightRAG extraction.
+    The outcome is still recorded (same namespace, same data); it just no longer pads
+    wall-clock. This is the AUTO post-run recording only — the explicit /feedback endpoint
+    still awaits record_success directly. Tasks are tracked for drain_background_tasks()."""
+    t = asyncio.create_task(record_success(task, result, project_id))
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
+
+async def drain_background_tasks(timeout: float = 30.0) -> None:
+    """Await any in-flight background feedback tasks. Call on graceful shutdown so no
+    outcome is dropped if the process exits right after returning a result."""
+    if not _bg_tasks:
+        return
+    pending = list(_bg_tasks)
+    print(f"[feedback] draining {len(pending)} background feedback task(s)…")
+    try:
+        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=timeout)
+    except asyncio.TimeoutError:
+        print(f"[feedback] drain timed out with {len(_bg_tasks)} task(s) still pending")
+
+
 # ── Failure ───────────────────────────────────────────────────────────────────
 
 async def record_failure(task: str, error: str, project_id: str, agent: str = "unknown") -> None:
