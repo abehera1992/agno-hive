@@ -40,6 +40,14 @@ class Config:
     lightrag_embed_dim: int = int(os.getenv("LIGHTRAG_EMBED_DIM", "1024"))
     lightrag_working_dir: str = os.getenv("LIGHTRAG_WORKING_DIR", os.path.expanduser("~/.agno-hive/lightrag"))
 
+    # Inference backend — Ollama->vLLM migration (EK-105). "ollama" (default) or "vllm".
+    # Both code paths stay live in rag.py; flip this + restart to switch (revert = set ollama).
+    inference_backend: str = os.getenv("INFERENCE_BACKEND", "ollama")
+    vllm_llm_base_url: str = os.getenv("VLLM_LLM_BASE_URL", "http://localhost:8001/v1")
+    vllm_llm_model: str = os.getenv("VLLM_LLM_MODEL", "RedHatAI/Qwen2.5-Coder-7B-Instruct-FP8-dynamic")
+    vllm_embed_base_url: str = os.getenv("VLLM_EMBED_BASE_URL", "http://localhost:8002/v1")
+    vllm_embed_model: str = os.getenv("VLLM_EMBED_MODEL", "Qwen/Qwen3-Embedding-0.6B")
+
     # Observability — OTLP endpoint for any OTel-compatible backend
     # e.g. existing SigNoz: http://<ekam-host>:4318
     otlp_endpoint: str = os.getenv("OTLP_ENDPOINT", "")

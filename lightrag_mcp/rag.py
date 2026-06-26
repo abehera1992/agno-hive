@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 
 from lightrag import LightRAG
 from lightrag.llm.ollama import ollama_model_complete, ollama_embed
+from lightrag.llm.openai import openai_complete_if_cache, openai_embed
 from lightrag.utils import EmbeddingFunc
 
 # ── Disable LightRAG's rebuild-on-delete (deadlock workaround, 2026-06-13) ────
@@ -72,32 +73,63 @@ def _build(project_id: str) -> LightRAG:
     )
     os.makedirs(working_dir, exist_ok=True)
 
-    ollama_host = config.ollama_host
-    llm_model = config.lightrag_llm_model
-    embed_model = config.lightrag_embed_model
     embed_dim = config.lightrag_embed_dim
+    backend = (config.inference_backend or "ollama").lower()
+    _rebuild_log.info("LightRAG[%s] inference backend = %s", project_id, backend)
 
-    async def _llm(prompt, system_prompt=None, history_messages=None, **kwargs):
-        # ollama_model_complete reads model from global_config["llm_model_name"],
-        # not from a kwarg — passing model= here causes a duplicate-arg TypeError.
-        kwargs.pop("model", None)
-        # Size the context window to the prompt: extraction calls (one <=1200
-        # token chunk) fit in 8K and keep Ollama's 4 parallel slots cheap;
-        # query calls assemble up to ~30K tokens of graph context and need the
-        # full 32K — a fixed 8K window truncates them into garbage answers.
-        approx_tokens = (len(prompt) + len(system_prompt or "")) // 4
-        num_ctx = 8192 if approx_tokens <= 5500 else 32768
-        return await ollama_model_complete(
-            prompt,
-            system_prompt=system_prompt,
-            history_messages=history_messages or [],
-            host=ollama_host,
-            options={"num_ctx": num_ctx},
-            **kwargs,
-        )
+    if backend == "vllm":
+        # OpenAI-compatible vLLM endpoints (Ollama->vLLM migration, EK-105). Extraction
+        # LLM + embeddings are served by vLLM behind an OpenAI API; both stay 1024-dim
+        # so the existing Qdrant/AGE index is reused (verified: cosine 0.999 vs Ollama).
+        llm_model = config.vllm_llm_model
 
-    async def _embed(texts: list[str]) -> list[list[float]]:
-        return await ollama_embed(texts, embed_model=embed_model, host=ollama_host)
+        async def _llm(prompt, system_prompt=None, history_messages=None, **kwargs):
+            kwargs.pop("model", None)
+            kwargs.pop("host", None)
+            kwargs.pop("options", None)
+            return await openai_complete_if_cache(
+                config.vllm_llm_model,
+                prompt,
+                system_prompt=system_prompt,
+                history_messages=history_messages or [],
+                base_url=config.vllm_llm_base_url,
+                api_key="EMPTY",
+                **kwargs,
+            )
+
+        async def _embed(texts: list[str]):
+            return await openai_embed(
+                texts,
+                model=config.vllm_embed_model,
+                base_url=config.vllm_embed_base_url,
+                api_key="EMPTY",
+            )
+    else:
+        ollama_host = config.ollama_host
+        llm_model = config.lightrag_llm_model
+        embed_model = config.lightrag_embed_model
+
+        async def _llm(prompt, system_prompt=None, history_messages=None, **kwargs):
+            # ollama_model_complete reads model from global_config["llm_model_name"],
+            # not from a kwarg — passing model= here causes a duplicate-arg TypeError.
+            kwargs.pop("model", None)
+            # Size the context window to the prompt: extraction calls (one <=1200
+            # token chunk) fit in 8K and keep Ollama's 4 parallel slots cheap;
+            # query calls assemble up to ~30K tokens of graph context and need the
+            # full 32K — a fixed 8K window truncates them into garbage answers.
+            approx_tokens = (len(prompt) + len(system_prompt or "")) // 4
+            num_ctx = 8192 if approx_tokens <= 5500 else 32768
+            return await ollama_model_complete(
+                prompt,
+                system_prompt=system_prompt,
+                history_messages=history_messages or [],
+                host=ollama_host,
+                options={"num_ctx": num_ctx},
+                **kwargs,
+            )
+
+        async def _embed(texts: list[str]) -> list[list[float]]:
+            return await ollama_embed(texts, embed_model=embed_model, host=ollama_host)
 
     return LightRAG(
         working_dir=working_dir,
