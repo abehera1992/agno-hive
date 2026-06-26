@@ -43,8 +43,10 @@ class Config:
     # Inference backend — Ollama->vLLM migration (EK-105). "ollama" (default) or "vllm".
     # Both code paths stay live in rag.py; flip this + restart to switch (revert = set ollama).
     inference_backend: str = os.getenv("INFERENCE_BACKEND", "ollama")
-    vllm_llm_base_url: str = os.getenv("VLLM_LLM_BASE_URL", "http://localhost:8001/v1")
-    vllm_llm_model: str = os.getenv("VLLM_LLM_MODEL", "RedHatAI/Qwen2.5-Coder-7B-Instruct-FP8-dynamic")
+    # LightRAG LLM (extraction + query synthesis) shares the resident 30B coordinator via the
+    # LiteLLM gateway — no dedicated LightRAG LLM server (validated ~= 7B quality, frees ~14.5GB).
+    vllm_llm_base_url: str = os.getenv("VLLM_LLM_BASE_URL", "http://localhost:4000/v1")
+    vllm_llm_model: str = os.getenv("VLLM_LLM_MODEL", "qwen3-coder-30b")
     vllm_embed_base_url: str = os.getenv("VLLM_EMBED_BASE_URL", "http://localhost:8002/v1")
     vllm_embed_model: str = os.getenv("VLLM_EMBED_MODEL", "Qwen/Qwen3-Embedding-0.6B")
     # Agno swarm gateway — LiteLLM proxy (:4000) -> llama-swap (:9100, on-demand swap) -> vLLM.

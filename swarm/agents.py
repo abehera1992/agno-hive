@@ -4,14 +4,18 @@ from .tool_fix import OllamaToolFix
 from config.config import config
 
 
-# Ollama model tag -> llama-swap served name (vLLM backend). llama-swap serves each
-# model under these names via --served-model-name; the rule is just ':' -> '-', so
-# unmapped ids fall back to that transform.
+# Ollama model tag -> served name on the vLLM gateway. Default rule is ':' -> '-'.
+# vLLM-SPECIFIC CONSOLIDATION: on vLLM the roster is kept resident (30B coordinator +
+# 32B worker), and model diversity costs ~4-min llama-swap reloads. So the cheap-router
+# agents (ContextRouter/Executor, tagged llama3.1:8b) are routed to the resident 32B
+# instead of an 8B that would have to swap in/out — an engineering run then touches only
+# resident models (30B+32B), zero swaps. (Ollama path is untouched; the 8B stays cheap
+# there because Ollama keeps it warm.)
 _VLLM_MODEL_MAP = {
     "qwen3-coder:30b": "qwen3-coder-30b",
     "qwen2.5-coder:32b": "qwen2.5-coder-32b",
     "qwen2.5-coder:7b": "qwen2.5-coder-7b",
-    "llama3.1:8b": "llama3.1-8b",
+    "llama3.1:8b": "qwen2.5-coder-32b",  # consolidate 8B -> resident 32B (no swap)
 }
 
 
