@@ -3,6 +3,7 @@
 Generic — works with any project layout. Discovers context files
 (CLAUDE.md, AGENTS.md, README.md, DOCS.md) automatically from PROJECT_ROOT.
 """
+import ast
 import os
 import re
 import sys
@@ -58,24 +59,116 @@ def get_project_context() -> str:
     and CONTRIBUTING.md if they exist at the project root.
     Always call this at the start of any task to understand the project conventions.
     """
+    _CAP = 40_000  # per-file cap so a huge CLAUDE.md/DOCS.md can't dominate the context
     parts = []
     for name in _CONTEXT_FILES:
         path = PROJECT_ROOT / name
         if path.exists():
             content = path.read_text(encoding="utf-8", errors="replace")
+            if len(content) > _CAP:
+                content = content[:_CAP] + (
+                    f"\n\n… [{name} truncated at {_CAP:,} of {len(content):,} bytes — "
+                    f"read it directly with get_file_content('{name}') for the rest]"
+                )
             parts.append(f"# {name}\n\n{content}")
     if not parts:
         return "No context files found (CLAUDE.md, AGENTS.md, README.md, DOCS.md)."
     return "\n\n---\n\n".join(parts)
 
 
-def get_file_content(relative_path: str) -> str:
+# Files at or below this size are returned whole. Larger files are reduced (skeleton
+# for code, head+tail for data) so a single read can never overflow the agent context.
+_MAX_FULL_BYTES = 200_000
+_CODE_EXT = {
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".java", ".go", ".rs",
+    ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".kt", ".swift", ".scala",
+}
+
+
+def _py_skeleton(src: str):
+    """Structural skeleton of Python source: imports + class/def signatures + the first
+    docstring line, with bodies elided. Returns None if the source does not parse."""
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError):
+        return None
+    lines = src.splitlines()
+    out: list[str] = []
+
+    def emit(node, indent):
+        pad = "    " * indent
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            seg = ast.get_source_segment(src, node)
+            if seg:
+                out.append(seg)
+            return
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for dec in node.decorator_list:
+                ds = ast.get_source_segment(src, dec)
+                if ds:
+                    out.append(f"{pad}@{ds}")
+            end = node.body[0].lineno - 1 if node.body else node.end_lineno
+            end = max(end, node.lineno)  # guard one-line defs
+            header = "\n".join(lines[node.lineno - 1:end]).rstrip()
+            if header:
+                out.append(header)
+            doc = ast.get_docstring(node, clean=False)
+            if doc:
+                out.append(f'{pad}    """{doc.strip().splitlines()[0][:120]}"""')
+            if isinstance(node, ast.ClassDef):
+                members = [c for c in node.body
+                           if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+                for c in members:
+                    emit(c, indent + 1)
+                if not members:
+                    out.append(f"{pad}    ...")
+            else:
+                out.append(f"{pad}    ...")
+            out.append("")
+        elif indent == 0 and isinstance(node, (ast.Assign, ast.AnnAssign)):
+            seg = ast.get_source_segment(src, node)
+            if seg:
+                out.append(seg.splitlines()[0][:200])
+
+    mod_doc = ast.get_docstring(tree, clean=False)
+    if mod_doc:
+        out.append(f'"""{mod_doc.strip().splitlines()[0][:160]}"""')
+    for node in tree.body:
+        emit(node, 0)
+    return "\n".join(out).strip()
+
+
+def _regex_skeleton(src: str):
+    """Best-effort declaration-line skeleton for non-Python code (TS/JS/Go/Java/…)."""
+    keep = []
+    for ln in src.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if (s.startswith((
+                "import ", "export ", "from ", "package ", "func ", "function ",
+                "class ", "interface ", "type ", "enum ", "struct ", "trait ",
+                "public ", "private ", "protected ", "def ", "module ", "@"))
+                or re.match(r"^(export\s+)?(default\s+)?(async\s+)?function\b", s)
+                or re.match(r"^(export\s+)?(const|let|var)\s+\w+\s*[:=]", s)
+                or re.match(r"^[\w<>,\[\]\s]+\s+\w+\s*\([^)]*\)\s*[:{]?\s*$", s)):
+            keep.append(ln.rstrip())
+    return "\n".join(keep) if keep else None
+
+
+def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str:
     """
     Read a file from the project by its path relative to the project root.
     Always read a file before editing it — get the exact content to use as old_string in apply_diff.
 
+    Large files are NOT dumped whole (that overflows the model context): a file over
+    ~200KB returns a structural SKELETON (signatures + docstrings, bodies elided) for code,
+    or HEAD+TAIL for data files. Pass offset/limit to read an exact line range of any file.
+
     Args:
         relative_path: e.g. 'src/api/routes.py', 'package.json', 'docker-compose.yml'
+        offset: 0-based first line for a ranged read (default 0 = start of file)
+        limit:  number of lines to return from offset (default 0 = to end / whole file)
     """
     target = PROJECT_ROOT / relative_path
     if not target.exists():
@@ -83,9 +176,39 @@ def get_file_content(relative_path: str) -> str:
     if not target.is_file():
         return f"Not a file: {relative_path}"
     try:
-        return target.read_text(encoding="utf-8", errors="replace")
+        data = target.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         return f"Could not read {relative_path}: {e}"
+
+    # Explicit line-range read — exact and bounded, takes precedence.
+    if offset or limit:
+        lines = data.splitlines()
+        start = max(offset, 0)
+        end = start + limit if limit > 0 else len(lines)
+        body = "\n".join(lines[start:end])
+        return f"# {relative_path} — lines {start}..{min(end, len(lines))} of {len(lines)}\n{body}"
+
+    if len(data) <= _MAX_FULL_BYTES:
+        return data
+
+    # Oversized file — reduce it so it can't blow the context window.
+    ext = target.suffix.lower()
+    if ext in _CODE_EXT:
+        skel = _py_skeleton(data) if ext == ".py" else _regex_skeleton(data)
+        if skel:
+            return (
+                f"# {relative_path} is {len(data):,} bytes — too large to return whole.\n"
+                f"# STRUCTURAL SKELETON below (signatures + docstrings; bodies elided as ...).\n"
+                f"# Read a specific part with get_file_content('{relative_path}', offset=<line>, limit=<n>).\n\n"
+                + skel
+            )
+    head, tail = data[:8000], data[-4000:]
+    return (
+        f"# {relative_path} is {len(data):,} bytes — too large to return whole (data/non-code file).\n"
+        f"# HEAD (8KB) + TAIL (4KB) shown; use search_files to find specific content,\n"
+        f"# or get_file_content('{relative_path}', offset=<line>, limit=<n>) for a line range.\n\n"
+        f"===== HEAD =====\n{head}\n\n===== TAIL =====\n{tail}"
+    )
 
 
 # When PROJECT_ROOT is a monorepo, short paths like "src/lib/**" are often
