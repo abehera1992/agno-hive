@@ -3,12 +3,13 @@ import os
 from urllib.parse import urlparse
 
 import numpy as np
+import tiktoken
 from openai import AsyncOpenAI
 
 from lightrag import LightRAG
 from lightrag.llm.ollama import ollama_model_complete, ollama_embed
 from lightrag.llm.openai import openai_complete_if_cache
-from lightrag.utils import EmbeddingFunc
+from lightrag.utils import EmbeddingFunc, Tokenizer
 
 # ── Disable LightRAG's rebuild-on-delete (deadlock workaround, 2026-06-13) ────
 # Re-indexing a changed file deletes the old doc version then re-inserts the new
@@ -46,6 +47,26 @@ async def _skip_rebuild_knowledge_from_chunks(*args, **kwargs):
 
 
 _lr_module.rebuild_knowledge_from_chunks = _skip_rebuild_knowledge_from_chunks
+
+
+# ── Tokenizer that tolerates LLM special tokens appearing in source text ──────
+# agno-hive source files (e.g. swarm/team.py, lightrag_mcp/server.py — the tool-
+# call parsing code) contain literal strings like "<|endoftext|>". LightRAG's
+# chunker calls tiktoken.encode() with the default disallowed_special check, which
+# RAISES "disallowed special token" on those and fails the WHOLE document — exactly
+# why those two files failed every bootstrap. Encode special tokens as normal text.
+class _SpecialSafeTiktoken:
+    def __init__(self, model_name: str = "gpt-4o-mini"):
+        self._enc = tiktoken.encoding_for_model(model_name)
+
+    def encode(self, content: str):
+        return self._enc.encode(content, disallowed_special=())
+
+    def decode(self, tokens):
+        return self._enc.decode(tokens)
+
+
+_SAFE_TOKENIZER = Tokenizer("gpt-4o-mini", _SpecialSafeTiktoken())
 
 _cache: dict[str, LightRAG] = {}
 
@@ -140,6 +161,8 @@ def _build(project_id: str) -> LightRAG:
 
     return LightRAG(
         working_dir=working_dir,
+        # Treat LLM special tokens (<|endoftext|> etc.) in source text as normal text.
+        tokenizer=_SAFE_TOKENIZER,
         # Per-instance workspace — passed to every storage backend. Without
         # this, all projects shared whatever POSTGRES_WORKSPACE happened to be
         # set when the process-wide PG client first initialized (restart-order
