@@ -1,0 +1,17 @@
+# LiteLLM gateway routing (mounted into the litellm container at /app/config.yaml).
+# ALL-MoE: only the qwen3-coder-30b route is actually used (the whole roster maps to it
+# via swarm/agents.py _VLLM_MODEL_MAP). The 32b/7b/8b routes are kept for the optional
+# "diverse roster" variant (dedicated 32B on :8004 + llama-swap pool on :9100) — harmless
+# when unused. api_key is a dummy; vLLM ignores it.
+model_list:
+  - model_name: qwen3-coder-30b
+    litellm_params: {model: openai/qwen3-coder-30b, api_base: http://localhost:8003/v1, api_key: "dummy"}
+  # --- optional (diverse-roster variant; not started by the all-MoE compose) ---
+  - model_name: qwen2.5-coder-32b
+    litellm_params: {model: openai/qwen2.5-coder-32b, api_base: http://localhost:8004/v1, api_key: "dummy"}
+  - model_name: qwen2.5-coder-7b
+    litellm_params: {model: openai/qwen2.5-coder-7b, api_base: http://localhost:9100/v1, api_key: "dummy"}
+  - model_name: llama3.1-8b
+    litellm_params: {model: openai/llama3.1-8b, api_base: http://localhost:9100/v1, api_key: "dummy"}
+litellm_settings:
+  request_timeout: 600

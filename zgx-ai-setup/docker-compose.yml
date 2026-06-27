@@ -1,0 +1,64 @@
+# zgx-ai-setup — the GB10 (ZGX) vLLM serving stack for AGNOHive.
+# Captures the ad-hoc `docker run` commands that were previously hand-typed on the box.
+#
+# Bring up:   HF_TOKEN=<read-token> docker compose -f docker-compose.yml up -d
+# The GB10 GPU is shared via CDI (NVIDIA Container Toolkit). HF_TOKEN must be exported
+# (a HuggingFace read token) so the images can pull the FP8 weights on first start.
+#
+# This is the ALL-MoE layout (the production config): one resident 30B coordinator
+# serves the whole agno roster + LightRAG; a small embedding server is the only other
+# resident vLLM process. The optional dedicated-32B and llama-swap pool (for the
+# "diverse roster" variant) are documented in README.md, not started here.
+
+services:
+  # Resident coordinator — serves qwen3-coder-30b to the whole roster via LiteLLM.
+  vllm-coord:
+    image: timothystewart6/vllm-gb10:latest
+    container_name: vllm-coord
+    restart: unless-stopped
+    entrypoint: ["vllm"]
+    command: >
+      serve Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
+      --served-model-name qwen3-coder-30b
+      --enable-auto-tool-choice --tool-call-parser qwen3_coder
+      --gpu-memory-utilization 0.6 --max-model-len 65536
+      --host 0.0.0.0 --port 8000
+    ports:
+      - "8003:8000"
+    volumes:
+      - /home/abehera1992/.cache/vllm-hf:/root/.cache/huggingface
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+    devices:
+      - nvidia.com/gpu=all   # CDI device (mirrors `--device nvidia.com/gpu=all`)
+
+  # Resident embedding server for LightRAG (qwen3-embedding, 1024-dim). Always up.
+  vllm-embed:
+    image: timothystewart6/vllm-gb10:latest
+    container_name: vllm-embed
+    restart: unless-stopped
+    entrypoint: ["vllm"]
+    command: >
+      serve Qwen/Qwen3-Embedding-0.6B
+      --runner pooling
+      --gpu-memory-utilization 0.05 --max-model-len 8192
+      --host 0.0.0.0 --port 8000
+    ports:
+      - "8002:8000"
+    volumes:
+      - /home/abehera1992/.cache/vllm-hf:/root/.cache/huggingface
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+    devices:
+      - nvidia.com/gpu=all
+
+  # OpenAI-compatible gateway. agno + LightRAG talk to this (:4000); it routes model
+  # names to the vLLM servers. Host network so the localhost:800x api_bases resolve.
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: litellm
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000"]

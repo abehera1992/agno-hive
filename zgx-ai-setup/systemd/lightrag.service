@@ -1,0 +1,18 @@
+# Install:  cp lightrag.service ~/.config/systemd/user/
+#           systemctl --user daemon-reload && systemctl --user enable --now lightrag.service
+# Manage:   systemctl --user {status,restart,stop} lightrag  (export XDG_RUNTIME_DIR=/run/user/$(id -u))
+# Logs:     journalctl --user -u lightrag -f
+[Unit]
+Description=AgnoHive LightRAG MCP server
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/abehera1992/agno-hive
+ExecStart=/home/abehera1992/miniforge3/envs/zgx/bin/python main.py --serve-lightrag
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,19 @@
+# Install:  cp agno-api.service ~/.config/systemd/user/
+#           loginctl enable-linger $USER   # survive logout + start on boot
+#           systemctl --user daemon-reload && systemctl --user enable --now agno-api.service
+# Manage:   systemctl --user {status,restart,stop} agno-api  (export XDG_RUNTIME_DIR=/run/user/$(id -u))
+# Logs:     journalctl --user -u agno-api -f
+[Unit]
+Description=AgnoHive API (swarm orchestrator)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/abehera1992/agno-hive
+ExecStart=/home/abehera1992/miniforge3/envs/zgx/bin/python main.py --serve
+Restart=always
+RestartSec=5
+TimeoutStopSec=50
+
+[Install]
+WantedBy=default.target

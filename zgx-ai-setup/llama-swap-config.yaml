@@ -1,0 +1,18 @@
+# OPTIONAL — only for the "diverse roster" variant (NOT used by all-MoE).
+# llama-swap is a host binary (arm64) that runs as `./llama-swap -config config.yaml
+# -listen :9100`; it starts a model's vLLM container on first request and evicts idle
+# ones (one resident at a time). In the all-MoE layout nothing requests these models,
+# so llama-swap can stay stopped. Kept here so the swap-pool path is reproducible.
+healthCheckTimeout: 900
+logLevel: info
+models:
+  "llama3.1-8b":
+    cmd: docker run --rm --name vllm-swap-8b --device nvidia.com/gpu=all -p ${PORT}:8000 -v /home/abehera1992/.cache/vllm-hf:/root/.cache/huggingface -e HF_TOKEN --entrypoint vllm timothystewart6/vllm-gb10:latest serve RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8 --served-model-name llama3.1-8b --enable-auto-tool-choice --tool-call-parser llama3_json --gpu-memory-utilization 0.15 --max-model-len 8192 --enforce-eager --host 0.0.0.0 --port 8000
+    cmdStop: docker stop vllm-swap-8b
+    proxy: "http://localhost:${PORT}"
+    ttl: 600
+  "qwen2.5-coder-7b":
+    cmd: docker run --rm --name vllm-swap-7b --device nvidia.com/gpu=all -p ${PORT}:8000 -v /home/abehera1992/.cache/vllm-hf:/root/.cache/huggingface -e HF_TOKEN --entrypoint vllm timothystewart6/vllm-gb10:latest serve RedHatAI/Qwen2.5-Coder-7B-Instruct-FP8-dynamic --served-model-name qwen2.5-coder-7b --enable-auto-tool-choice --tool-call-parser hermes --gpu-memory-utilization 0.15 --max-model-len 16384 --enforce-eager --host 0.0.0.0 --port 8000
+    cmdStop: docker stop vllm-swap-7b
+    proxy: "http://localhost:${PORT}"
+    ttl: 1800
