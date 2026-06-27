@@ -72,6 +72,42 @@ systemctl --user enable --now agno-api.service lightrag.service
 #    cd ~/llama-swap && ./llama-swap -config <this>/llama-swap-config.yaml -listen :9100
 ```
 
+## After a reboot / power outage (GPU CDI spec recovery)
+
+On a cold boot the vLLM containers may come back **Exited (255)** with
+`CDI device injection failed: unresolvable CDI devices nvidia.com/gpu=all`. The driver is
+fine — the cause is that the NVIDIA **CDI spec** (which maps `nvidia.com/gpu=all` to the GPU
+device nodes) was only written to `/var/run/cdi`, and that path is **tmpfs — wiped on every
+reboot**. Docker then has nothing to resolve the device against.
+
+**Permanent fix (one-time, needs sudo):** regenerate the spec into the *persistent*
+`/etc/cdi` so it survives future reboots:
+
+```bash
+sudo mkdir -p /etc/cdi && sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+docker start vllm-coord vllm-embed          # existing containers — replays original run config
+```
+
+`docker start` (not recreate) replays each container's original `docker run` config, so no
+flags need re-typing. The 30B reloads ~3–5 min on cold start (`embed` is ready in ~30 s);
+watch `docker logs -f vllm-coord` for `Loading safetensors checkpoint shards` → ready, then
+re-check the health table above.
+
+Once `/etc/cdi/nvidia.yaml` exists it persists across reboots, so subsequent power cycles
+should bring the containers back automatically (they carry `--restart unless-stopped`).
+Quick triage if a future reboot still fails:
+
+```bash
+nvidia-smi -L                 # driver/GPU healthy?  ("N/A" memory column is a GB10 quirk, not an error)
+ls /etc/cdi/ /var/run/cdi/    # is a CDI spec present anywhere?
+nvidia-ctk cdi generate --format=yaml | head   # does generation still work? (no root needed for dry-run)
+```
+
+> Networking note: ZGX and the dev PC are reached over **Tailscale**, whose `100.x` IPs are
+> stable across LAN changes — a network switch does **not** require any config edits here.
+> SSH/MCP to ZGX uses the MagicDNS hostname `zgx-32df` (= `100.96.86.82`); avoid pinning the
+> LAN IP (`192.168.x.x`), which changes per network.
+
 ## Memory budget (121 GB unified)
 
 vLLM **reserves `gpu_memory_utilization × 121 GB` up front** per server (weights + KV
