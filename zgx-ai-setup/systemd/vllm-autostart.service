@@ -1,0 +1,21 @@
+# Install:  cp vllm-autostart.service ~/.config/systemd/user/
+#           loginctl enable-linger $USER   # survive logout + start on boot
+#           systemctl --user daemon-reload && systemctl --user enable vllm-autostart.service
+# Manage:   systemctl --user {status,start} vllm-autostart  (export XDG_RUNTIME_DIR=/run/user/$(id -u))
+# Logs:     journalctl --user -u vllm-autostart -f
+#
+# Why this exists: the vLLM containers carry `--restart unless-stopped`, but on a cold
+# boot Docker's restart attempt races GPU/CDI availability and they can come up Exited(255).
+# This oneshot waits until Docker + the GPU + the persistent CDI spec (/etc/cdi/nvidia.yaml)
+# are all ready, then `docker start`s them once. Idempotent: a no-op if they are already up.
+[Unit]
+Description=Start vLLM GPU containers after boot (waits for Docker + GPU + CDI)
+After=default.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'for i in $(seq 1 60); do if docker info >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1 && [ -f /etc/cdi/nvidia.yaml ]; then docker start vllm-coord vllm-embed; exit 0; fi; sleep 5; done; echo "timed out waiting for docker/gpu/cdi after 300s"; exit 1'
+
+[Install]
+WantedBy=default.target

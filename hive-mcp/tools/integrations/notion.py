@@ -312,6 +312,76 @@ def notion_query_database(
         return f"notion_query_database failed: {e}"
 
 
+def notion_items_in_sprint(
+    database_id: str,
+    sprint_id: str,
+    status: str | None = None,
+    exclude_status: str | None = None,
+    sprint_property: str = "Sprint",
+    status_property: str = "Status",
+) -> str:
+    """
+    List every work item in a sprint — filtered by the Sprint RELATION, with full pagination.
+    Read-only — no approval required.
+
+    Purpose-built so you only pass a sprint id: this tool builds the nested relation filter and
+    pages through ALL results for you (the two steps to get wrong by hand). Prefer this over
+    notion_query_database for any "what is in / what is left in sprint X" question. Do NOT list
+    the whole database and filter by eye — relation values are omitted from row output on purpose.
+
+    Each row includes its `(page_id: <hex>)` for use with notion_update_page_props / notion_trash_page.
+
+    Args:
+        database_id:     Work-items database id (hex / UUID / URL, or a data-source/collection id).
+        sprint_id:       The sprint PAGE id or URL — matched against each item's Sprint relation.
+        status:          Optional — keep only rows whose Status equals this (e.g. "In progress").
+        exclude_status:  Optional — drop rows whose Status equals this (e.g. "Done" → what's left).
+        sprint_property: Relation property linking an item to its sprint (default "Sprint").
+        status_property: Status property name (default "Status").
+    """
+    try:
+        db         = _clean_id(database_id)
+        rel_target = _extract_id(sprint_id)
+        base = {"page_size": 100,
+                "filter": {"property": sprint_property, "relation": {"contains": rel_target}}}
+        rows, cursor, total, resolved = [], None, 0, False
+        while True:
+            body = dict(base)
+            if cursor:
+                body["start_cursor"] = cursor
+            try:
+                data = _request("POST", f"/databases/{db}/query", body)
+            except Exception:
+                if resolved:
+                    raise
+                db, resolved = _resolve_database_id(database_id), True  # accept a data-source id
+                data = _request("POST", f"/databases/{db}/query", body)
+            page = data.get("results", [])
+            total += len(page)
+            for r in page:
+                sp = r.get("properties", {}).get(status_property, {})
+                st = _prop_value(sp) if sp else None
+                if status and st != status:
+                    continue
+                if exclude_status and st == exclude_status:
+                    continue
+                rows.append(r)
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+        if total == 0:
+            return (f"notion: 0 items in sprint {rel_target} — check database_id "
+                    f"and that '{sprint_property}' is the relation to the sprint")
+        filt = (f" with {status_property}={status}" if status
+                else f" (excluding {status_property}={exclude_status})" if exclude_status else "")
+        lines = [f"notion: {len(rows)} of {total} sprint item(s){filt}:"]
+        for r in rows:
+            lines.append("  " + _format_row(r))
+        return "\n".join(lines)
+    except Exception as e:
+        return f"notion_items_in_sprint failed: {e}"
+
+
 # ── Write tools (staged when WRITE_REVIEW=true) ───────────────────────────────
 
 def notion_create_page(

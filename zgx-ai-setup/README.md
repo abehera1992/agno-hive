@@ -39,6 +39,7 @@ vLLM continuous-batching serves the concurrent agent + LightRAG load on the one 
 | LiteLLM gateway | 4000 | `docker-compose.yml` | host network |
 | AGNO API (swarm) | 9001 | `systemd/agno-api.service` | self-healing |
 | LightRAG MCP | 9002 | `systemd/lightrag.service` | self-healing |
+| vLLM autostart | — | `systemd/vllm-autostart.service` | oneshot at boot — `docker start`s vLLM once GPU/CDI ready |
 | llama-swap (optional) | 9100 | host binary | diverse-roster variant only |
 | dedicated 32B (optional) | 8004 | ad-hoc | diverse-roster variant only |
 
@@ -63,10 +64,11 @@ docker compose -f docker-compose.yml up -d
 
 # 2. systemd --user services (self-healing, boot-persistent)
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
-cp systemd/agno-api.service systemd/lightrag.service ~/.config/systemd/user/
+cp systemd/agno-api.service systemd/lightrag.service systemd/vllm-autostart.service ~/.config/systemd/user/
 loginctl enable-linger "$USER"
 systemctl --user daemon-reload
 systemctl --user enable --now agno-api.service lightrag.service
+systemctl --user enable vllm-autostart.service   # oneshot — re-starts vLLM on next boot
 
 # 3. (optional, diverse-roster variant only) llama-swap pool:
 #    cd ~/llama-swap && ./llama-swap -config <this>/llama-swap-config.yaml -listen :9100
@@ -93,9 +95,22 @@ flags need re-typing. The 30B reloads ~3–5 min on cold start (`embed` is ready
 watch `docker logs -f vllm-coord` for `Loading safetensors checkpoint shards` → ready, then
 re-check the health table above.
 
-Once `/etc/cdi/nvidia.yaml` exists it persists across reboots, so subsequent power cycles
-should bring the containers back automatically (they carry `--restart unless-stopped`).
-Quick triage if a future reboot still fails:
+Once `/etc/cdi/nvidia.yaml` exists it persists across reboots. The containers carry
+`--restart unless-stopped`, but on a cold boot Docker's restart attempt can still race
+GPU/CDI availability and leave them `Exited (255)`. To close that gap, a oneshot
+`systemd --user` unit waits for Docker + GPU + the CDI spec to all be ready, then
+`docker start`s the two containers once (idempotent — a no-op if they are already up):
+
+```bash
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+cp systemd/vllm-autostart.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable vllm-autostart.service     # runs at boot via linger
+systemctl --user start vllm-autostart.service      # run once now to verify
+```
+
+This is the no-sudo path (the user runs Docker + `nvidia-smi` without root). If a future
+reboot still leaves vLLM down, triage:
 
 ```bash
 nvidia-smi -L                 # driver/GPU healthy?  ("N/A" memory column is a GB10 quirk, not an error)
