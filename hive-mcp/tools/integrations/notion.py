@@ -312,9 +312,36 @@ def notion_query_database(
         return f"notion_query_database failed: {e}"
 
 
+_SPRINTS_DB_ID = "b44d50e8-ade7-4142-803f-faf3b2c5bc30"
+
+
+def _resolve_sprint_id(sprint_name: str) -> str:
+    """Resolve a sprint name/number to its page id via the Sprints database.
+
+    notion_search returns a different page id format than the one stored in Work Item
+    Sprint relations, so we always query the Sprints DB directly.
+    """
+    body = {
+        "page_size": 10,
+        "filter": {"property": "Name", "title": {"contains": sprint_name}},
+    }
+    data = _request("POST", f"/databases/{_SPRINTS_DB_ID}/query", body)
+    results = data.get("results", [])
+    if not results:
+        raise ValueError(f"No sprint found matching '{sprint_name}' in Sprints DB")
+    if len(results) == 1:
+        return _clean_id(results[0]["id"])
+    # Multiple matches — prefer exact title match
+    for r in results:
+        if _extract_title(r).strip() == sprint_name.strip():
+            return _clean_id(r["id"])
+    return _clean_id(results[0]["id"])
+
+
 def notion_items_in_sprint(
     database_id: str,
-    sprint_id: str,
+    sprint_id: str = "",
+    sprint_name: str = "",
     status: str | None = None,
     exclude_status: str | None = None,
     sprint_property: str = "Sprint",
@@ -324,25 +351,30 @@ def notion_items_in_sprint(
     List every work item in a sprint — filtered by the Sprint RELATION, with full pagination.
     Read-only — no approval required.
 
-    Purpose-built so you only pass a sprint id: this tool builds the nested relation filter and
-    pages through ALL results for you (the two steps to get wrong by hand). Prefer this over
-    notion_query_database for any "what is in / what is left in sprint X" question. Do NOT list
-    the whole database and filter by eye — relation values are omitted from row output on purpose.
+    Pass EITHER sprint_id (a known page UUID) OR sprint_name (e.g. "6" or "Sprint 6") — do NOT
+    use notion_search to find a sprint id; it returns a different page id format that does not
+    match Work Item Sprint relations and will return zero results. When sprint_name is given the
+    tool resolves it internally via the Sprints database — no manual lookup needed.
 
     Each row includes its `(page_id: <hex>)`. Use the page_id with:
     - notion_update_page_props / notion_trash_page to act on the row
-    - notion_get_page(page_id) to retrieve relation fields (Parent item 1, Sub-item, etc.) —
-      relation data is intentionally omitted from the summary output to avoid model misreads.
+    - notion_get_item_with_relations(page_id) to get the item's parent feature/epic and status.
 
     Args:
         database_id:     Work-items database id (hex / UUID / URL, or a data-source/collection id).
-        sprint_id:       The sprint PAGE id or URL — matched against each item's Sprint relation.
+        sprint_id:       The sprint PAGE id or URL (omit if using sprint_name).
+        sprint_name:     Sprint name or number to look up, e.g. "6" or "Sprint 6" (preferred —
+                         resolves via Sprints DB so the correct relation id is always used).
         status:          Optional — keep only rows whose Status equals this (e.g. "In progress").
         exclude_status:  Optional — drop rows whose Status equals this (e.g. "Done" → what's left).
         sprint_property: Relation property linking an item to its sprint (default "Sprint").
         status_property: Status property name (default "Status").
     """
     try:
+        if sprint_name and not sprint_id:
+            sprint_id = _resolve_sprint_id(sprint_name)
+        if not sprint_id:
+            return "notion_items_in_sprint: provide sprint_id or sprint_name"
         db         = _clean_id(database_id)
         rel_target = _extract_id(sprint_id)
         base = {"page_size": 100,
