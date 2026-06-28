@@ -329,7 +329,10 @@ def notion_items_in_sprint(
     notion_query_database for any "what is in / what is left in sprint X" question. Do NOT list
     the whole database and filter by eye — relation values are omitted from row output on purpose.
 
-    Each row includes its `(page_id: <hex>)` for use with notion_update_page_props / notion_trash_page.
+    Each row includes its `(page_id: <hex>)`. Use the page_id with:
+    - notion_update_page_props / notion_trash_page to act on the row
+    - notion_get_page(page_id) to retrieve relation fields (Parent item 1, Sub-item, etc.) —
+      relation data is intentionally omitted from the summary output to avoid model misreads.
 
     Args:
         database_id:     Work-items database id (hex / UUID / URL, or a data-source/collection id).
