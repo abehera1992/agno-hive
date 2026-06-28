@@ -20,6 +20,7 @@ coordinator_tools:
   - notion_get_database_schema
   - notion_query_database
   - notion_items_in_sprint
+  - notion_get_item_with_relations
   - notion_create_page
   - notion_update_page_props
   - notion_append_blocks
@@ -42,6 +43,7 @@ agents:
       - notion_get_database_schema
       - notion_query_database
       - notion_items_in_sprint
+      - notion_get_item_with_relations
       - get_file_content
       - find_files
     instructions:

@@ -385,6 +385,89 @@ def notion_items_in_sprint(
         return f"notion_items_in_sprint failed: {e}"
 
 
+def notion_get_item_with_relations(page_id: str, include_siblings: bool = False) -> str:
+    """
+    Get a work item's full context — its own EK number/title/status plus its parent feature/epic.
+    Relation fields are omitted from notion_items_in_sprint output by design; use this to drill into
+    a specific item after a sprint query.
+
+    Args:
+        page_id:        Notion page ID (32-char hex, UUID format, or last segment of page URL).
+        include_siblings: If True, also fetch EK number and status for each sub-item.
+    """
+    try:
+        clean = _clean_id(page_id)
+        page = _request("GET", f"/pages/{clean}")
+        title = _extract_title(page)
+        page_id = _clean_id(page.get("id", ""))
+        uid = ""
+        status = None
+        props = page.get("properties", {})
+        
+        # Extract EK number and status
+        for name, p in props.items():
+            ptype = p.get("type")
+            if ptype == "unique_id":
+                uid = f"[{p.get('unique_id', {}).get('prefix')}-{p.get('unique_id', {}).get('number')}] "
+            elif ptype == "status":
+                status = _prop_value(p)
+                
+        # Extract parent item relation
+        parent_ids = []
+        for name, p in props.items():
+            if p.get("type") == "relation" and name == "Parent item 1":
+                parent_ids = [item.get("id") for item in p.get("relation", [])]
+                break
+                
+        # Build output string
+        lines = [f"{uid}{title}  Status={status or 'Unknown'}  (page_id: {page_id})"]
+        
+        # Add parent info if available
+        for parent_id in parent_ids:
+            parent_page = _request("GET", f"/pages/{parent_id}")
+            parent_title = _extract_title(parent_page)
+            parent_uid = ""
+            parent_status = None
+            
+            parent_props = parent_page.get("properties", {})
+            for name, p in parent_props.items():
+                ptype = p.get("type")
+                if ptype == "unique_id":
+                    parent_uid = f"[{p.get('unique_id', {}).get('prefix')}-{p.get('unique_id', {}).get('number')}] "
+                elif ptype == "status":
+                    parent_status = _prop_value(p)
+                    
+            lines.append(f"  Parent: {parent_uid}{parent_title}  Status={parent_status or 'Unknown'}  (page_id: {parent_id})")
+            
+        # Handle siblings if requested
+        if include_siblings:
+            sibling_ids = []
+            for name, p in props.items():
+                if p.get("type") == "relation" and name == "Sub-item":
+                    sibling_ids = [item.get("id") for item in p.get("relation", [])]
+                    break
+                    
+            for sibling_id in sibling_ids:
+                sibling_page = _request("GET", f"/pages/{sibling_id}")
+                sibling_title = _extract_title(sibling_page)
+                sibling_uid = ""
+                sibling_status = None
+                
+                sibling_props = sibling_page.get("properties", {})
+                for name, p in sibling_props.items():
+                    ptype = p.get("type")
+                    if ptype == "unique_id":
+                        sibling_uid = f"[{p.get('unique_id', {}).get('prefix')}-{p.get('unique_id', {}).get('number')}] "
+                    elif ptype == "status":
+                        sibling_status = _prop_value(p)
+                        
+                lines.append(f"  Sub-item: {sibling_uid}{sibling_title}  Status={sibling_status or 'Unknown'}  (page_id: {sibling_id})")
+        
+        return "\n".join(lines)
+    except Exception as e:
+        return f"notion_get_item_with_relations failed: {e}"
+
+
 # ── Write tools (staged when WRITE_REVIEW=true) ───────────────────────────────
 
 def notion_create_page(
