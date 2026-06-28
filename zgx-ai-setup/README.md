@@ -142,15 +142,20 @@ To roll back to Ollama:
 ```bash
 docker stop vllm-coord vllm-embed              # free GPU memory first
 sed -i 's/^INFERENCE_BACKEND=.*/INFERENCE_BACKEND=ollama/' ~/agno-hive/.env
-systemctl --user restart agno-api lightrag
-# ... and to return: flip back to vllm, `docker start vllm-coord vllm-embed`, restart services
+XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart agno-api lightrag
+# verify: curl http://localhost:9001/health  → {"status":"ok"}
+# return: flip back to vllm, `docker start vllm-coord vllm-embed`, restart services
 ```
 
-> **Caveat (verified 2026-06-27):** the Ollama code path is intact (the migration did not
-> break it), BUT Ollama loads `qwen3-coder:30b` at its **256K-context default → ~104 GB**,
-> which starves delegation workers and makes the full swarm crawl. For a usable rollback,
-> cap the Ollama context (`OLLAMA_CONTEXT_LENGTH` env on the Ollama service, or a model
-> `num_ctx`) to ~16–32K before relying on it. (Tracked: EK-121 / EK-124.)
+> **Context cap — already in place (verified 2026-06-28, EK-124):**
+> `OLLAMA_MAX_NUM_CTX=32768` is set in `/etc/systemd/system/ollama.service.d/override.conf`,
+> capping every Ollama request at 32K tokens (the 256K-context / ~104 GB concern is resolved).
+> All 5 models are resident on disk (`ollama list` confirms). Escape hatch proven: agno-api
+> health check returned `{"status":"ok"}` on the Ollama path, and a direct Ollama API call
+> returned `OLLAMA_ESCAPE_HATCH_OK`. Note: while vLLM holds ~78 GB GPU, only models
+> that fit in the remaining ~35 GB free (e.g. llama3.1:8b, qwen2.5-coder:7b) will run
+> GPU-accelerated via Ollama simultaneously — the 30B coordinator needs vLLM stopped first.
+> Ollama binds to `100.96.86.82:11434` (Tailscale IP), not localhost.
 
 ## Management & logs
 
