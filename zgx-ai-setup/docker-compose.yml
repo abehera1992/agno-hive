@@ -52,6 +52,28 @@ services:
     devices:
       - nvidia.com/gpu=all
 
+  # LightRAG EXTRACT role — fast 8B model for entity extraction (role_llm_configs, EK-105).
+  # LiteLLM alias "llama3.1-8b" routes here (:9100). Only needed for indexing workloads;
+  # stop this container when not indexing to free ~13GB of unified memory.
+  vllm-extract:
+    image: timothystewart6/vllm-gb10:latest
+    container_name: vllm-extract
+    restart: unless-stopped
+    entrypoint: ["vllm"]
+    command: >
+      serve RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8
+      --served-model-name llama3.1-8b
+      --gpu-memory-utilization 0.1 --max-model-len 8192
+      --host 0.0.0.0 --port 8000
+    ports:
+      - "9100:8000"
+    volumes:
+      - /home/abehera1992/.cache/vllm-hf:/root/.cache/huggingface
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+    devices:
+      - nvidia.com/gpu=all
+
   # OpenAI-compatible gateway. agno + LightRAG talk to this (:4000); it routes model
   # names to the vLLM servers. Host network so the localhost:800x api_bases resolve.
   litellm:
