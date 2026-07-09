@@ -121,6 +121,23 @@ def _build(project_id: str) -> LightRAG:
                 **kwargs,
             )
 
+        # EXTRACT role — fast 8B model (Meta-Llama-3.1-8B-Instruct-FP8) via LiteLLM
+        # alias "llama3.1-8b" → port 9100. Extraction prompts are short (≤1200 tokens
+        # per chunk), so a 7B/8B model is sufficient and 3-4× faster than the 30B.
+        async def _extract_llm(prompt, system_prompt=None, history_messages=None, **kwargs):
+            kwargs.pop("model", None)
+            kwargs.pop("host", None)
+            kwargs.pop("options", None)
+            return await openai_complete_if_cache(
+                config.vllm_extract_model,
+                prompt,
+                system_prompt=system_prompt,
+                history_messages=history_messages or [],
+                base_url=config.vllm_extract_base_url,
+                api_key="EMPTY",
+                **kwargs,
+            )
+
         # Call vLLM's /v1/embeddings directly (NOT lightrag's openai_embed wrapper):
         # that wrapper is an EmbeddingFunc preset to OpenAI's 1536 dim and reshapes the
         # flat response by 1536, mangling our native-1024 vectors. The qwen3 embedder
@@ -159,7 +176,7 @@ def _build(project_id: str) -> LightRAG:
         async def _embed(texts: list[str]) -> list[list[float]]:
             return await ollama_embed(texts, embed_model=embed_model, host=ollama_host)
 
-    return LightRAG(
+    _lightrag_kwargs: dict = dict(
         working_dir=working_dir,
         # Treat LLM special tokens (<|endoftext|> etc.) in source text as normal text.
         tokenizer=_SAFE_TOKENIZER,
@@ -171,12 +188,13 @@ def _build(project_id: str) -> LightRAG:
         llm_model_name=llm_model,   # sets global_config["llm_model_name"] used by ollama_model_complete
         llm_model_func=_llm,
         # Indexing throughput tuning (defaults: max_parallel_insert=2,
-        # embedding_batch_num=10, gleaning=1). llm_model_max_async=6 matches
-        # OLLAMA_NUM_PARALLEL=6 on the GB10 (bumped 2026-06-12 from 4 — the
-        # GPU drew only ~50W with zero throttle flags during the full rebuild,
-        # so 4 slots was the throughput ceiling, not a thermal/power limit).
-        max_parallel_insert=6,
-        llm_model_max_async=6,
+        # embedding_batch_num=10, gleaning=1). Both raised 6→12 (2026-07-08):
+        # vLLM continuous batching handles concurrent requests natively at the
+        # GPU level — no slot serialisation like Ollama. 12 async slots halves
+        # extraction time for large files (~360s → ~180s LLM-only on a 33-chunk
+        # file). Original 6 matched OLLAMA_NUM_PARALLEL=6 (now unused).
+        max_parallel_insert=12,
+        llm_model_max_async=12,
         embedding_batch_num=32,
         # Gleaning is a second full LLM pass per chunk for marginal extra
         # entities — poor trade on code corpora; halves extraction calls.
@@ -197,6 +215,28 @@ def _build(project_id: str) -> LightRAG:
             "url": config.qdrant_url,
         },
     )
+
+    # Role-split LLMs (LightRAG >= 1.5.0): EXTRACT → fast 8B, QUERY → 30B.
+    # Guarded so deploying this before the ZGX pip upgrade doesn't crash the service.
+    try:
+        import importlib.metadata as _meta
+        _lr_version = tuple(int(x) for x in _meta.version("lightrag-hku").split(".")[:3])
+        if _lr_version >= (1, 5, 0):
+            _extract_func = _extract_llm if backend == "vllm" else _llm
+            _lightrag_kwargs["role_llm_configs"] = {
+                "EXTRACT": {"func": _extract_func, "max_async": 12},
+                "QUERY": {"func": _llm, "max_async": 12},
+            }
+            _rebuild_log.info(
+                "LightRAG[%s] role_llm_configs active: EXTRACT=%s QUERY=%s",
+                project_id,
+                config.vllm_extract_model if backend == "vllm" else "ollama-default",
+                config.vllm_llm_model if backend == "vllm" else llm_model,
+            )
+    except Exception as _e:
+        _rebuild_log.warning("role_llm_configs skipped: %s", _e)
+
+    return LightRAG(**_lightrag_kwargs)
 
 
 def _set_pg_env(postgres_uri: str) -> None:

@@ -55,6 +55,11 @@ class Config:
     # Agno swarm gateway — LiteLLM proxy (:4000) -> llama-swap (:9100, on-demand swap) -> vLLM.
     # agno talks OpenAI to LiteLLM; LiteLLM gives aliases/fallbacks/observability.
     vllm_gateway_url: str = os.getenv("VLLM_GATEWAY_URL", "http://localhost:4000/v1")
+    # LightRAG EXTRACT role — 7B/8B fast model for entity extraction (role_llm_configs, v1.5.0+).
+    # Routes through LiteLLM (:4000) alias "llama3.1-8b" → vllm-extract on port 9100
+    # (Meta-Llama-3.1-8B-Instruct-FP8). Port 9100 must be running before this takes effect.
+    vllm_extract_base_url: str = os.getenv("VLLM_EXTRACT_BASE_URL", "http://localhost:4000/v1")
+    vllm_extract_model: str = os.getenv("VLLM_EXTRACT_MODEL", "llama3.1-8b")
 
     # Observability — OTLP endpoint for any OTel-compatible backend
     # e.g. existing SigNoz: http://<ekam-host>:4318
