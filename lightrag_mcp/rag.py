@@ -224,11 +224,11 @@ def _build(project_id: str) -> LightRAG:
         if _lr_version >= (1, 5, 0):
             _extract_func = _extract_llm if backend == "vllm" else _llm
             _lightrag_kwargs["role_llm_configs"] = {
-                "EXTRACT": {"func": _extract_func, "max_async": 12},
-                "QUERY": {"func": _llm, "max_async": 12},
+                "extract": {"func": _extract_func, "max_async": 12},
+                "query": {"func": _llm, "max_async": 12},
             }
             _rebuild_log.info(
-                "LightRAG[%s] role_llm_configs active: EXTRACT=%s QUERY=%s",
+                "LightRAG[%s] role_llm_configs active: extract=%s query=%s",
                 project_id,
                 config.vllm_extract_model if backend == "vllm" else "ollama-default",
                 config.vllm_llm_model if backend == "vllm" else llm_model,
