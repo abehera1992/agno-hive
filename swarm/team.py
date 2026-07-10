@@ -275,9 +275,11 @@ def _extract_handoff_summary(task: str, content: str) -> str:
     import re
     from datetime import datetime, timezone
 
-    # File paths quoted in backticks (common in markdown reviewer output)
-    backtick_paths = re.findall(r"`([^`]+\.[a-zA-Z]{1,6})`", content)
-    file_refs = list(dict.fromkeys(p for p in backtick_paths if "/" in p or "\\" in p))
+    # File paths: backtick-quoted OR bare paths with a known extension and a slash
+    backtick_paths = re.findall(r"`([^`\n]+)`", content)
+    bare_paths = re.findall(r"(?<!\w)([\w./\\-]+/[\w./\\-]+\.(?:py|ts|tsx|scss|json|md|yaml|yml))\b", content)
+    all_paths = backtick_paths + bare_paths
+    file_refs = list(dict.fromkeys(p for p in all_paths if ("/" in p or "\\" in p) and "." in p.split("/")[-1]))
 
     # review_pending paths
     pending = re.findall(r"review_pending[:\s]+([^\s\n`'\"]+)", content)
@@ -285,9 +287,9 @@ def _extract_handoff_summary(task: str, content: str) -> str:
 
     status = "PENDING_REVIEW" if ("review_pending" in content or pending) else "COMPLETE"
 
-    # Bullet points as key outcomes (lines starting with - or *)
-    bullets = re.findall(r"^[-*]\s+(.+)$", content, re.MULTILINE)
-    key_outcomes = [b for b in bullets if len(b) > 10][:5]
+    # Key outcomes: bullet points (-, *, 1.) that are long enough to be meaningful
+    bullets = re.findall(r"^(?:[-*]|\d+\.)\s+(.+)$", content, re.MULTILINE)
+    key_outcomes = [b.lstrip("*# ") for b in bullets if len(b.strip()) > 15][:5]
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     task_short = task[:200].replace("\n", " ")

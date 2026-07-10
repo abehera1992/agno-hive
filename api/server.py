@@ -198,10 +198,13 @@ async def run(request: RunRequest):
         await _persist_session(session_id)
 
     # Capture context size before run (for footer metadata)
-    _, prior_messages = await get_context(session_id)
-    context_size = len(prior_messages)
+    session_summary, prior_messages = await get_context(session_id)
     session_before = await get_session(session_id)
     has_summary = bool(session_before and session_before.get("summary"))
+    is_chain_handoff = session_summary.startswith("── Chain handoff")
+    # When a chain-handoff digest is active, team.py skips injecting the message
+    # history — report 0 injected context rather than the (unenforced) message count.
+    context_size = 0 if is_chain_handoff else len(prior_messages)
 
     result, tokens = await run_task_async(
         task=request.task,
@@ -318,10 +321,11 @@ async def stream_endpoint(request: RunRequest):
     elif request.persist:
         await _persist_session(session_id)
 
-    _, prior_messages = await get_context(session_id)
-    context_size = len(prior_messages)
+    session_summary, prior_messages = await get_context(session_id)
     session_before = await get_session(session_id)
     has_summary = bool(session_before and session_before.get("summary"))
+    is_chain_handoff = session_summary.startswith("── Chain handoff")
+    context_size = 0 if is_chain_handoff else len(prior_messages)
 
     async def generate():
         try:
