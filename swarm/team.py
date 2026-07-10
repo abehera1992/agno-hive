@@ -266,6 +266,50 @@ def _extract_tokens(result) -> dict:
         return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
 
+def _extract_handoff_summary(task: str, content: str) -> str:
+    """Extract a compact chain-boundary handoff block from a completed run's output.
+
+    Stored as the session summary so the next chained call gets a small structured
+    digest instead of the full message history — preventing context overflow.
+    """
+    import re
+    from datetime import datetime, timezone
+
+    # File paths quoted in backticks (common in markdown reviewer output)
+    backtick_paths = re.findall(r"`([^`]+\.[a-zA-Z]{1,6})`", content)
+    file_refs = list(dict.fromkeys(p for p in backtick_paths if "/" in p or "\\" in p))
+
+    # review_pending paths
+    pending = re.findall(r"review_pending[:\s]+([^\s\n`'\"]+)", content)
+    pending = list(dict.fromkeys(pending))
+
+    status = "PENDING_REVIEW" if ("review_pending" in content or pending) else "COMPLETE"
+
+    # Bullet points as key outcomes (lines starting with - or *)
+    bullets = re.findall(r"^[-*]\s+(.+)$", content, re.MULTILINE)
+    key_outcomes = [b for b in bullets if len(b) > 10][:5]
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    task_short = task[:200].replace("\n", " ")
+
+    lines = [
+        f"── Chain handoff ({ts}) ──────────────────────────────────────────",
+        f"Task: {task_short}",
+        f"Status: {status}",
+    ]
+    if file_refs:
+        lines.append(f"Files referenced: {', '.join(file_refs[:8])}")
+    if pending:
+        lines.append(f"Pending reviews: {', '.join(pending)}")
+    if key_outcomes:
+        lines.append("Key outcomes:")
+        for b in key_outcomes:
+            lines.append(f"  - {b[:100]}")
+    lines.append("──────────────────────────────────────────────────────────────────")
+
+    return "\n".join(lines)
+
+
 def _build_team(
     agent_specs: list | None,
     coordinator_model: str,
@@ -343,11 +387,20 @@ async def run_task_stream(
     if failure_context:
         instructions += ["", failure_context]
     if session_summary:
+        is_chain_handoff = session_summary.startswith("── Chain handoff")
         instructions += [
             "", "── Session summary (older turns) ─────────────────────────────────",
             session_summary, "──────────────────────────────────────────────────────────────────",
         ]
-    if session_messages:
+        # For chain-boundary handoffs, skip full message history — the compact digest
+        # above replaces it. Injecting both causes context overflow on long chains.
+        if not is_chain_handoff and session_messages:
+            lines = ["── Recent messages ───────────────────────────────────────────────"]
+            for msg in session_messages:
+                lines.append(f"[{msg['role']}] {msg['content'][:800]}")
+            lines.append("──────────────────────────────────────────────────────────────────")
+            instructions += [""] + lines
+    elif session_messages:
         lines = ["── Recent messages ───────────────────────────────────────────────"]
         for msg in session_messages:
             lines.append(f"[{msg['role']}] {msg['content'][:800]}")
@@ -403,6 +456,12 @@ async def run_task_stream(
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
                 # Fire-and-forget: don't block the response on post-run experience indexing.
                 record_success_bg(task, combined, project_id)
+                # Save a compact chain-boundary handoff summary so the next chained call
+                # gets a small structured digest instead of the full message history.
+                if session_id:
+                    from swarm.sessions import save_handoff_summary
+                    handoff = _extract_handoff_summary(task, combined)
+                    asyncio.ensure_future(save_handoff_summary(session_id, handoff))
                 yield {"__done__": True, "content": combined, "tokens": tokens}
             except Exception as exc:
                 task_counter.add(1, {"project_id": project_id, "outcome": "failure"})
@@ -451,13 +510,22 @@ async def run_task_async(
     if failure_context:
         instructions += ["", failure_context]
     if session_summary:
+        is_chain_handoff = session_summary.startswith("── Chain handoff")
         instructions += [
             "",
             "── Session summary (older turns) ─────────────────────────────────",
             session_summary,
             "──────────────────────────────────────────────────────────────────",
         ]
-    if session_messages:
+        # For chain-boundary handoffs, skip full message history — the compact digest
+        # above replaces it. Injecting both causes context overflow on long chains.
+        if not is_chain_handoff and session_messages:
+            lines = ["── Recent messages ───────────────────────────────────────────────"]
+            for msg in session_messages:
+                lines.append(f"[{msg['role']}] {msg['content'][:800]}")
+            lines.append("──────────────────────────────────────────────────────────────────")
+            instructions += [""] + lines
+    elif session_messages:
         lines = ["── Recent messages ───────────────────────────────────────────────"]
         for msg in session_messages:
             lines.append(f"[{msg['role']}] {msg['content'][:800]}")
@@ -517,6 +585,12 @@ async def run_task_async(
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
                 # Fire-and-forget: don't block the response on post-run experience indexing.
                 record_success_bg(task, content, project_id)
+                # Save a compact chain-boundary handoff summary so the next chained call
+                # gets a small structured digest instead of the full message history.
+                if session_id:
+                    from swarm.sessions import save_handoff_summary
+                    handoff = _extract_handoff_summary(task, content)
+                    asyncio.ensure_future(save_handoff_summary(session_id, handoff))
                 return content, tokens
             except Exception as exc:
                 span.record_exception(exc)

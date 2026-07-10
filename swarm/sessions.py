@@ -250,6 +250,28 @@ async def get_context(session_id: str) -> tuple[str, list[dict]]:
     return summary, messages
 
 
+async def save_handoff_summary(session_id: str, summary: str) -> None:
+    """Store a chain-boundary handoff summary in the session's summary column.
+
+    Called fire-and-forget after each successful run so the next chained call
+    receives a compact structured digest instead of full message history.
+    """
+    try:
+        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
+            await _ensure_tables(conn)
+            await conn.execute(
+                """
+                UPDATE chat_sessions
+                SET summary = %s, updated_at = NOW()
+                WHERE id = %s
+                """,
+                (summary, session_id),
+            )
+            await conn.commit()
+    except Exception as exc:
+        print(f"[sessions] save_handoff_summary warning: {exc}")
+
+
 # ── Compaction ────────────────────────────────────────────────────────────────
 
 async def compact_session(session_id: str) -> None:
