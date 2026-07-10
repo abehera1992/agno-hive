@@ -525,6 +525,7 @@ hive --delete-all-sessions    # prompts for confirmation
 | `turn 3` | Prompt/response pairs in this session |
 | `4 msgs in context` | Verbatim messages injected into the coordinator |
 | `summary + N msgs` | Older turns compacted — summary + recent messages injected |
+| `chain handoff` | Chain-boundary digest from prior run — ~20 lines (task, files, outcomes, status). No message history injected. |
 | `expires 2026-05-31` | TTL expiry date |
 | `[persistent]` | Session will never auto-delete |
 
@@ -553,6 +554,7 @@ Sessions expire after **30 days** unless marked persistent.
 - **Tailscale auto-detection** — no manual URL config; CLI discovers both MCPs via `tailscale ip -4`
 - **Persistent sessions** — full conversation history in PostgreSQL, resumable by ID; `session_id` from any `/run` response can be passed back to chain context across API calls (equivalent to REPL mode)
 - **Auto-resume** — REPL auto-resumes last session for the current project
+- **Chain-boundary handoff** — after each successful run with a `session_id`, a compact structured digest (task, files referenced, key outcomes, status) is saved to the session's `summary` column. On the next chained call this digest replaces the full message history in the coordinator's context — preventing context-window overflow on long multi-step chains while preserving prior-run awareness. Footer shows `context: 0 msgs` to distinguish from injected message history.
 - **Compaction** — sessions longer than 20 messages are summarised automatically by `config.router_model` (default: `llama3.1:8b`; was `qwen3:8b` but changed due to ARM incompatibility)
 - **HITL review mode** (`--review`) — plan shown before every task, requires your approval
 - **Write review** — every file write staged as `.hive_proposed`; arrow-key selector in CLI; VS Code diff via IPC if available
@@ -594,7 +596,9 @@ curl -X POST http://localhost:9001/plan \
 
 ### Session chaining — carry context across API calls
 
-Pass `session_id` from a previous `/run` response to resume context in the next call. Without it every call is stateless (`context_size=0`). With it, prior agent findings are injected into the coordinator — equivalent to staying in REPL mode.
+Pass `session_id` from a previous `/run` response to resume context in the next call. Without it every call is stateless (`context_size=0`). With it, a compact **chain-boundary handoff digest** (task, files referenced, key outcomes, status) from the previous run is injected into the coordinator — equivalent to staying in REPL mode without the full message-history overhead that can overflow the context window.
+
+The handoff digest is ~20 lines. The coordinator does not receive the full message history when a digest is present — this is what keeps long multi-step chains from exhausting the model's context window.
 
 ```bash
 # Step 1 — new session; response includes "session": {"session_id": "abc123-..."}
