@@ -127,6 +127,79 @@ def _text_chunks(path: Path) -> list[str]:
     return chunks
 
 
+def _structure_chunks(data: object, rel: str, file_type: str) -> list[str]:
+    """Recursively split a parsed JSON/YAML structure into LightRAG-friendly chunks.
+
+    Drills into dicts/lists until each chunk fits within _CHUNK_SIZE. Every chunk
+    carries a 'Section' breadcrumb so LightRAG knows where in the file it came from.
+    """
+    header = f"File: {rel}\nType: {file_type}"
+    chunks: list[str] = []
+    _EMPTY_VALUES = frozenset(("{}", "[]", '""', "null", "~"))
+
+    def _emit(obj: object, path_hint: str) -> None:
+        text = json.dumps(obj, indent=2, ensure_ascii=False, default=str)
+        body = f"{header}\nSection: {path_hint}\n\n{text}"
+        if len(body) <= _CHUNK_SIZE:
+            if text.strip() not in _EMPTY_VALUES:
+                chunks.append(body)
+            return
+        # Too large — drill one level deeper before emitting
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                _emit(v, f"{path_hint}.{k}")
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                _emit(item, f"{path_hint}[{i}]")
+        else:
+            # Large primitive (base64, minified blob): hard-truncate
+            chunks.append(body[:_CHUNK_SIZE])
+
+    root = data if isinstance(data, dict) else {"root": data}
+    for k, v in root.items():
+        _emit(v, k)
+    return chunks
+
+
+def _json_chunks(path: Path) -> list[str]:
+    """Parse any JSON file and emit one structural chunk per logical section."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return _text_chunks(path)
+    if not isinstance(data, (dict, list)):
+        return _text_chunks(path)
+    rel = path.relative_to(PROJECT_ROOT).as_posix()
+    return _structure_chunks(data, rel, "json") or _text_chunks(path)
+
+
+def _yaml_chunks(path: Path) -> list[str]:
+    """Parse any YAML file and emit one structural chunk per top-level section."""
+    try:
+        import yaml  # noqa: PLC0415
+        data = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
+    except ImportError:
+        return _text_chunks(path)
+    except Exception:
+        return _text_chunks(path)
+    if not isinstance(data, (dict, list)):
+        return _text_chunks(path)
+    rel = path.relative_to(PROJECT_ROOT).as_posix()
+    return _structure_chunks(data, rel, "yaml") or _text_chunks(path)
+
+
+def _get_chunks(path: Path) -> list[str]:
+    """Dispatch to the right chunker based on file extension."""
+    suffix = path.suffix.lower()
+    if suffix == ".py":
+        return _py_chunks(path)
+    if suffix == ".json":
+        return _json_chunks(path)
+    if suffix in (".yaml", ".yml"):
+        return _yaml_chunks(path)
+    return _text_chunks(path)
+
+
 def _file_key(path: Path) -> str:
     """Fast change-detection key using mtime + size — no file read required."""
     s = path.stat()
@@ -332,7 +405,7 @@ async def index_project(
                             break
                         if was_indexed:
                             await _delete_stale(rel)
-                        chunks = _py_chunks(p) if p.suffix == ".py" else _text_chunks(p)
+                        chunks = _get_chunks(p)
                         if chunks:
                             last_chunk = (chunks[-1], rel)
                         flags = await asyncio.gather(*[_send_chunk(c, rel) for c in chunks])
