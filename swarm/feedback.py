@@ -9,6 +9,7 @@ Failure path  → structured record in PostgreSQL failure_log table
 Context load  → queries failure_log before each task, injected into coordinator instructions
 """
 import asyncio
+from datetime import datetime
 
 
 # Suffix for the isolated experience-replay namespace. Task outcomes live here
@@ -22,15 +23,28 @@ def experience_namespace(project_id: str) -> str:
 
 # ── Success ───────────────────────────────────────────────────────────────────
 
+# Minimum result length — short/boilerplate outcomes don't have enough content
+# for LightRAG entity extraction and land as failed doc_status rows.
+_MIN_RESULT_LENGTH = 120
+
+
 async def record_success(task: str, result: str, project_id: str) -> None:
     """Insert a successful task outcome into the isolated experience namespace."""
     try:
+        # Skip indexing when the result is too short to yield useful entities.
+        if len(result.strip()) < _MIN_RESULT_LENGTH:
+            print(f"[feedback] skipping short outcome ({len(result)} chars) — not worth indexing")
+            return
         from lightrag_mcp.rag import get_rag
         # Isolated namespace — never the project's code namespace (grounding poison).
         rag = get_rag(experience_namespace(project_id))
         await rag.initialize_storages()
+        # Timestamp makes each submission unique so identical task/result pairs
+        # don't collide on the same LightRAG content hash (which causes the
+        # "Duplicate document detected" warning on every re-run).
+        ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         text = (
-            f"Past task outcome (SUCCESS)\n"
+            f"Past task outcome (SUCCESS) [{ts}]\n"
             f"Project: {project_id}\n"
             f"Task: {task}\n"
             f"Result:\n{result[:1500]}"
