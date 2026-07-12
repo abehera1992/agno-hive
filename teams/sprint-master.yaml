@@ -21,6 +21,7 @@ coordinator_tools:
   - notion_query_database
   - notion_items_in_sprint
   - notion_get_item_with_relations
+  - notion_find_work_item
   - notion_create_page
   - notion_update_page_props
   - notion_append_blocks
@@ -44,11 +45,13 @@ agents:
       - notion_query_database
       - notion_items_in_sprint
       - notion_get_item_with_relations
+      - notion_find_work_item
       - get_file_content
       - find_files
     instructions:
       - You manage delivery tracking, not code. Your job is to gather the exact current state and the valid field/option names BEFORE any work item is created or changed. You never write anything yourself.
       - "BOARD FACTS: call get_file_content('docs/delivery-board.md') first — it holds the work-tracking data-source IDs, the field list (Type, Status, Stage, Priority, Area, Sprint, Spec), the exact option values for each, and the native Sub-item / Parent item 1 nesting rule. Treat it as the source of truth for field and option names."
+      - "PARENT LOOKUP: when the task says 'nest under EK-NNN' or 'place under <epic/feature title>', call notion_find_work_item('EK-NNN') FIRST. It returns a 'Parent item 1 URL' line — copy that URL verbatim and pass it to StoryWriter as the 'Parent item 1' property value. NEVER guess or construct the URL yourself; always use the URL from notion_find_work_item."
       - "LIVE SCHEMA: call notion_get_database_schema(database_id) to confirm the current field names and the select/status option values. Never guess an option name — use only values present in the schema or the board doc."
       - "STATE: use notion_search / notion_get_page to find specific pages (the parent epic, the current sprint page, an item to update) and capture their page ids."
       - "SPRINT QUESTIONS — USE THE PURPOSE-BUILT TOOL: for ANY 'what is in / what is left in sprint X' question, call notion_items_in_sprint(database_id='23ec0447-1573-4b91-a30d-347105081060', sprint_name='<number or name, e.g. 6>', exclude_status='Done'). The sprint_name parameter resolves the sprint page id internally via the Sprints database — you do NOT look up the sprint id yourself and you NEVER use notion_search for this (it returns the wrong id format). Pass exclude_status='Done' for open items, or status='In progress' for in-flight only. The tool builds the relation filter and paginates ALL rows. When the question ALSO asks for parent items, parent features, parent epics, sub-tasks, child items, or any relation between work items: each row in the result includes a (page_id: <hex>); call notion_get_item_with_relations(page_id) on each item — it returns the item's EK number/title/status AND its parent feature/epic EK number/title/status in one call."
@@ -78,7 +81,7 @@ agents:
     instructions:
       - You write backlog and sprint work items on the connected work-tracking platform. You never edit code, run shell, or touch files — you have no such tools.
       - "SIMPLE VALUES: pass properties as a plain dict of field -> simple value (e.g. Status to 'Done', Area to 'Platform', Priority to 'P2'). The platform tool maps each value to the correct type from the schema — do NOT build typed property objects yourself."
-      - "RELATIONS: set a relation (Sprint, or a parent) with the target page id or full URL. To nest a child under a parent, set the child's native single-parent relation (per docs/delivery-board.md this field is 'Parent item 1'). Use the native single-parent relation only — never the legacy 'Parent item' / 'Sub-items' pair."
+      - "RELATIONS: set a relation (Sprint, or a parent) with the FULL page URL (https://app.notion.com/p/<id>). To nest a child under a parent, set 'Parent item 1' to the URL returned by notion_find_work_item. Use the native single-parent relation only — the field is exactly 'Parent item 1' (not 'Parent item'). NEVER use a bare UUID — always use the full URL."
       - "ONE-SHOT RELATIONS: when an item belongs to a sprint and/or nests under a parent, include the Sprint and Parent item 1 relations IN THE SAME notion_create_page call (inside properties). Never create the item first and defer its relations to a follow-up update."
       - "VALID VALUES ONLY: use only the field names and option values confirmed by BacklogResearcher or docs/delivery-board.md. Unknown field names are skipped by the tool, so prefer omitting a field over guessing it."
       - "ONE ITEM PER CREATE: call notion_create_page once per work item. Keep the title concise; put any longer description in the content argument."

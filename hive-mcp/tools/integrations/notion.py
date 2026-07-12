@@ -312,7 +312,9 @@ def notion_query_database(
         return f"notion_query_database failed: {e}"
 
 
-_SPRINTS_DB_ID = "b44d50e8-ade7-4142-803f-faf3b2c5bc30"
+_SPRINTS_DB_ID    = "b44d50e8-ade7-4142-803f-faf3b2c5bc30"
+_WORK_ITEMS_DB_ID = "23ec0447-1573-4b91-a30d-347105081060"
+_EK_RE = re.compile(r"[Ee][Kk]-?(\d+)")
 
 
 def _resolve_sprint_id(sprint_name: str) -> str:
@@ -500,6 +502,59 @@ def notion_get_item_with_relations(page_id: str, include_siblings: bool = False)
         return f"notion_get_item_with_relations failed: {e}"
 
 
+def notion_find_work_item(query: str) -> str:
+    """
+    Find a work item in the eKam Work Items database by EK number (e.g. "EK-186") or title
+    fragment. Returns the page_id AND the full Notion URL ready to paste directly as the
+    'Parent item 1' property when creating a nested task. Read-only — no approval required.
+
+    Args:
+        query: EK number (e.g. "EK-186" or "EK186") or a title keyword to search for.
+    """
+    try:
+        m = _EK_RE.search(query)
+        if m:
+            ek_num = int(m.group(1))
+            body = {
+                "page_size": 5,
+                "filter": {"property": "ID", "unique_id": {"equals": ek_num}},
+            }
+            data = _request("POST", f"/databases/{_WORK_ITEMS_DB_ID}/query", body)
+            results = data.get("results", [])
+        else:
+            # Title keyword fallback via Notion search
+            data = _request("POST", "/search", {
+                "query": query,
+                "filter": {"value": "page", "property": "object"},
+                "page_size": 10,
+            })
+            results = data.get("results", [])
+
+        if not results:
+            return f"notion_find_work_item: no work items found for '{query}'"
+
+        lines = [f"notion: {len(results)} result(s) for '{query}':"]
+        for r in results:
+            page_id = _clean_id(r.get("id", ""))
+            url = r.get("url", "") or f"https://app.notion.com/p/{page_id}"
+            title = _extract_title(r)
+            uid, status = "", ""
+            for name, p in r.get("properties", {}).items():
+                if p.get("type") == "unique_id":
+                    num = p.get("unique_id", {})
+                    uid = f"[{num.get('prefix')}-{num.get('number')}] "
+                elif p.get("type") == "status":
+                    status = f"  Status={_prop_value(p)}"
+            lines.append(
+                f"  {uid}{title}{status}\n"
+                f"    page_id: {page_id}\n"
+                f"    Parent item 1 URL: {url}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"notion_find_work_item failed: {e}"
+
+
 # ── Write tools (staged when WRITE_REVIEW=true) ───────────────────────────────
 
 def notion_create_page(
@@ -522,7 +577,7 @@ def notion_create_page(
                        {"Type": "Task", "Status": "In progress", "Stage": "In-flight",
                         "Area": "Platform", "Priority": "P2",
                         "Sprint": "https://app.notion.com/p/<sprint-id>",
-                        "Parent item": "<epic-page-id-or-url>"}
+                        "Parent item 1": "<epic-page-url from notion_find_work_item>"}
                      - select/status: pass the option name as a string.
                      - relation: pass a page id/url (or a list of them).
                      - number: pass a number; checkbox: true/false; date: "YYYY-MM-DD".
@@ -850,7 +905,8 @@ def _format_row(page: dict) -> str:
             continue
         parts.append(f"{name}={val}")
     flag = " (trashed)" if page.get("in_trash") or page.get("archived") else ""
-    idpart = f" (page_id: {page_id})" if page_id else ""
+    url = page.get("url", "") or (f"https://app.notion.com/p/{page_id}" if page_id else "")
+    idpart = f" (page_id: {page_id}  url: {url})" if page_id else ""
     return f"{uid}{title}{flag}{idpart}" + (" | " + "  ".join(parts) if parts else "")
 
 
