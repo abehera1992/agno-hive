@@ -46,6 +46,7 @@ if config.NOTION_API_KEY:
         notion_query_database,
         notion_items_in_sprint,
         notion_get_item_with_relations,
+        notion_find_work_item,
         notion_create_page,
         notion_update_page_props,
         notion_append_blocks,
@@ -59,6 +60,7 @@ if config.NOTION_API_KEY:
         notion_search, notion_get_page, notion_get_database_schema, notion_query_database,
         notion_items_in_sprint,
         notion_get_item_with_relations,
+        notion_find_work_item,
         notion_create_page, notion_update_page_props, notion_append_blocks, notion_append_markdown,
         notion_update_block, notion_delete_block, notion_trash_page, notion_update_content,
     ]
