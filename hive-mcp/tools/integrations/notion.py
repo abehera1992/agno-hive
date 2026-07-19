@@ -245,7 +245,14 @@ def notion_get_database_schema(database_id: str) -> str:
         database_id: Notion database ID (32-char hex, UUID, or last URL segment)
     """
     try:
-        data  = _request("GET", f"/databases/{_clean_id(database_id)}")
+        db = _clean_id(database_id)
+        try:
+            data = _request("GET", f"/databases/{db}")
+        except Exception:
+            resolved = _resolve_database_id(database_id)  # accept a data-source id
+            if resolved == db:
+                raise
+            data = _request("GET", f"/databases/{resolved}")
         props = data.get("properties", {})
         lines = [f"notion database schema — {len(props)} properties:"]
         for name, p in props.items():
@@ -299,7 +306,14 @@ def notion_query_database(
         s = _as_list(sorts)
         if s:
             body["sorts"] = s
-        data    = _request("POST", f"/databases/{_clean_id(database_id)}/query", body)
+        db = _clean_id(database_id)
+        try:
+            data = _request("POST", f"/databases/{db}/query", body)
+        except Exception:
+            resolved = _resolve_database_id(database_id)  # accept a data-source id
+            if resolved == db:
+                raise
+            data = _request("POST", f"/databases/{resolved}/query", body)
         results = data.get("results", [])
         if not results:
             return "notion: query returned 0 rows"
@@ -312,9 +326,45 @@ def notion_query_database(
         return f"notion_query_database failed: {e}"
 
 
-_SPRINTS_DB_ID    = "b44d50e8-ade7-4142-803f-faf3b2c5bc30"
-_WORK_ITEMS_DB_ID = "23ec0447-1573-4b91-a30d-347105081060"
 _EK_RE = re.compile(r"[Ee][Kk]-?(\d+)")
+
+# Board databases are discovered BY NAME at runtime via Notion search — never hardcoded.
+# Database ids and data-source ids are different namespaces (Notion's 2025-09 data-source
+# split), and /v1/databases/{id}/query on Notion-Version 2022-06-28 only accepts the
+# database id; search (filter object=database) returns exactly that id. Results are
+# cached in-process and invalidated + rediscovered once if a query against a cached id fails.
+_DB_CACHE: dict[str, str] = {}
+
+
+def _discover_db(title: str) -> str:
+    """Find a database id by title via Notion search (exact-title match preferred, cached)."""
+    if title in _DB_CACHE:
+        return _DB_CACHE[title]
+    data = _request("POST", "/search", {
+        "query": title,
+        "filter": {"value": "database", "property": "object"},
+        "page_size": 10,
+    })
+    results = data.get("results", [])
+    match = next(
+        (r for r in results if _extract_title(r).strip().lower() == title.strip().lower()),
+        results[0] if results else None,
+    )
+    if match is None:
+        raise ValueError(
+            f"No Notion database found matching '{title}' — is it shared with the integration?"
+        )
+    _DB_CACHE[title] = _clean_id(match["id"])
+    return _DB_CACHE[title]
+
+
+def _board_query(db_title: str, body: dict) -> dict:
+    """Query a by-name-discovered board database; on failure rediscover once and retry."""
+    try:
+        return _request("POST", f"/databases/{_discover_db(db_title)}/query", body)
+    except Exception:
+        _DB_CACHE.pop(db_title, None)
+        return _request("POST", f"/databases/{_discover_db(db_title)}/query", body)
 
 
 def _resolve_sprint_id(sprint_name: str) -> str:
@@ -323,25 +373,38 @@ def _resolve_sprint_id(sprint_name: str) -> str:
     notion_search returns a different page id format than the one stored in Work Item
     Sprint relations, so we always query the Sprints DB directly.
     """
-    body = {
+    name = sprint_name.strip()
+    # Filter on the DB's actual title property (schema-derived — e.g. "Sprint Name"),
+    # never a hardcoded property name.
+    _, title_prop = _get_database_schema(_discover_db("Sprints"))
+    # Exact-title candidates FIRST — a bare `contains "7"` filter matches "Sprint 17"
+    # as readily as "Sprint 7", and result order is not guaranteed.
+    exact_candidates = [f"Sprint {name}", name] if name.isdigit() else [name]
+    for cand in exact_candidates:
+        data = _board_query("Sprints", {
+            "page_size": 5,
+            "filter": {"property": title_prop, "title": {"equals": cand}},
+        })
+        results = data.get("results", [])
+        if results:
+            return _clean_id(results[0]["id"])
+    # Fallback: contains match, preferring an exact-title hit among the results
+    data = _board_query("Sprints", {
         "page_size": 10,
-        "filter": {"property": "Name", "title": {"contains": sprint_name}},
-    }
-    data = _request("POST", f"/databases/{_SPRINTS_DB_ID}/query", body)
+        "filter": {"property": title_prop, "title": {"contains": name}},
+    })
     results = data.get("results", [])
     if not results:
         raise ValueError(f"No sprint found matching '{sprint_name}' in Sprints DB")
-    if len(results) == 1:
-        return _clean_id(results[0]["id"])
-    # Multiple matches — prefer exact title match
+    wanted = {name.lower(), f"sprint {name}".lower()}
     for r in results:
-        if _extract_title(r).strip() == sprint_name.strip():
+        if _extract_title(r).strip().lower() in wanted:
             return _clean_id(r["id"])
     return _clean_id(results[0]["id"])
 
 
 def notion_items_in_sprint(
-    database_id: str,
+    database_id: str = "",
     sprint_id: str = "",
     sprint_name: str = "",
     status: str | None = None,
@@ -363,7 +426,8 @@ def notion_items_in_sprint(
     - notion_get_item_with_relations(page_id) to get the item's parent feature/epic and status.
 
     Args:
-        database_id:     Work-items database id (hex / UUID / URL, or a data-source/collection id).
+        database_id:     Optional — Work-items database id (hex / UUID / URL, or a data-source id).
+                         Omit entirely to use the auto-discovered "Work Items" database (preferred).
         sprint_id:       The sprint PAGE id or URL (omit if using sprint_name).
         sprint_name:     Sprint name or number to look up, e.g. "6" or "Sprint 6" (preferred —
                          resolves via Sprints DB so the correct relation id is always used).
@@ -377,7 +441,7 @@ def notion_items_in_sprint(
             sprint_id = _resolve_sprint_id(sprint_name)
         if not sprint_id:
             return "notion_items_in_sprint: provide sprint_id or sprint_name"
-        db         = _clean_id(database_id)
+        db         = _clean_id(database_id) if database_id else _discover_db("Work Items")
         rel_target = _extract_id(sprint_id)
         base = {"page_size": 100,
                 "filter": {"property": sprint_property, "relation": {"contains": rel_target}}}
@@ -391,7 +455,12 @@ def notion_items_in_sprint(
             except Exception:
                 if resolved:
                     raise
-                db, resolved = _resolve_database_id(database_id), True  # accept a data-source id
+                if database_id:
+                    db = _resolve_database_id(database_id)  # accept a data-source id
+                else:
+                    _DB_CACHE.pop("Work Items", None)       # stale cache — rediscover by name
+                    db = _discover_db("Work Items")
+                resolved = True
                 data = _request("POST", f"/databases/{db}/query", body)
             page = data.get("results", [])
             total += len(page)
@@ -519,7 +588,7 @@ def notion_find_work_item(query: str) -> str:
                 "page_size": 5,
                 "filter": {"property": "ID", "unique_id": {"equals": ek_num}},
             }
-            data = _request("POST", f"/databases/{_WORK_ITEMS_DB_ID}/query", body)
+            data = _board_query("Work Items", body)
             results = data.get("results", [])
         else:
             # Title keyword fallback via Notion search
@@ -844,6 +913,9 @@ def _extract_title(obj: dict) -> str:
         if key in props:
             rich = props[key].get("title", [])
             return "".join(t.get("plain_text", "") for t in rich)
+    # Database objects carry a top-level `title` rich-text array, not a properties dict
+    if isinstance(obj.get("title"), list):
+        return "".join(t.get("plain_text", "") for t in obj["title"])
     return obj.get("id", "untitled")
 
 
