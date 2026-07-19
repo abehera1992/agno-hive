@@ -63,7 +63,10 @@ def _execute(tool: str, args: dict) -> str:
     """Execute a confirmed Notion write operation."""
     try:
         if tool == "create_page":
-            result = _request("POST", "/pages", _build_create_payload(**args))
+            payload = _build_create_payload(**args)
+            # data_source_id parents only exist on the 2025-09-03 API version
+            ver = "2025-09-03" if "data_source_id" in payload.get("parent", {}) else _NOTION_VERSION
+            result = _request("POST", "/pages", payload, version=ver)
             page_id = result.get("id")
             # Append any blocks beyond the 100-block create cap (rich markdown_content).
             if page_id and args.get("markdown_content"):
@@ -1073,13 +1076,31 @@ def _build_create_payload(
 ) -> dict:
     payload: dict = {"parent": {parent_type: parent_id}}
     if parent_type == "database_id":
-        db_id = _clean_id(parent_id)
+        # Notion's 2025-09 data-source split: page CREATES must parent on the DATA-SOURCE
+        # id (POST /v1/pages 404s on the container database id for data-source-backed
+        # databases), while SCHEMA reads need the database id. The caller may pass either
+        # form — resolve both ids from whichever we got.
+        cid = _clean_id(parent_id)
+        ds_id = None
+        db_id = cid
         try:
-            schema, title_name = _get_database_schema(db_id)
+            ds = _request("GET", f"/data_sources/{cid}", version="2025-09-03")
+            ds_id = _clean_id(ds.get("id") or cid)
+            db_id = _clean_id((ds.get("parent") or {}).get("database_id") or cid)
         except Exception:
-            db_id = _resolve_database_id(parent_id)  # accept a data-source/collection id too
-            schema, title_name = _get_database_schema(db_id)
-        payload["parent"] = {"database_id": db_id}
+            # Not a data-source id — treat as database id and look up its data source
+            try:
+                dbobj = _request("GET", f"/databases/{cid}", version="2025-09-03")
+                srcs = dbobj.get("data_sources") or []
+                if srcs:
+                    ds_id = _clean_id(srcs[0].get("id"))
+            except Exception:
+                pass
+        schema, title_name = _get_database_schema(db_id)
+        if ds_id:
+            payload["parent"] = {"type": "data_source_id", "data_source_id": ds_id}
+        else:
+            payload["parent"] = {"database_id": db_id}
         payload["properties"] = _build_properties(schema, title_name, title, properties)
     else:
         payload["properties"] = {
