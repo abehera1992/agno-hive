@@ -32,6 +32,10 @@ _SKIP_DIRS = {
     ".git", "__pycache__", "node_modules", ".next", "dist", "build",
     ".venv", "venv", "env", ".mypy_cache", ".pytest_cache", "coverage",
     ".tox", ".eggs", "eggs",
+    # Generated / machine-local artifact dirs — never source. graphify-out holds
+    # an Obsidian vault export (one .md per code symbol, ~1,200 files) that once
+    # made up ~75% of the hive.md tree; backups/ has held secret DB dumps.
+    "graphify-out", "graphify-cache", "backups",
 }
 _SKIP_EXTENSIONS = {".pyc", ".pyo", ".class", ".so", ".dll", ".exe", ".bin", ".lock"}
 _ROOT_DOCS = ["CLAUDE.md", "README.md", "docs.md", "AGENTS.md", ".env.example"]
@@ -152,7 +156,16 @@ def _read_file(rel_path: str, max_chars: int = 2500) -> str:
     return ""
 
 
-def _directory_tree(max_depth: int = 3) -> str:
+def _directory_tree(max_depth: int = 3, max_files_per_dir: int = 15) -> str:
+    """Directory skeleton for the hive.md "Project Structure" block.
+
+    Files per directory are capped (default 15) with a "… (+N more files)"
+    marker: a generated artifact dir or an unusually large source dir would
+    otherwise blow the tree past the coordinator's context budget. Generated
+    dirs are hard-skipped via _SKIP_DIRS; this cap is a defensive bound so a
+    future explosion can't silently re-bloat hive.md. Dirs are always shown in
+    full (never capped) so the structural skeleton stays complete.
+    """
     lines: list[str] = [PROJECT_ROOT.name + "/"]
 
     def _walk(path: Path, depth: int, prefix: str = "") -> None:
@@ -168,12 +181,21 @@ def _directory_tree(max_depth: int = 3) -> str:
             and e.name not in _SKIP_DIRS
             and (e.is_dir() or e.suffix not in _SKIP_EXTENSIONS)
         ]
-        for i, entry in enumerate(visible):
-            connector = "└── " if i == len(visible) - 1 else "├── "
+        # Dirs first (sort key already orders is_file() False before True), then
+        # a capped sample of files. overflow renders as a trailing marker line.
+        dirs = [e for e in visible if e.is_dir()]
+        files = [e for e in visible if e.is_file()]
+        overflow = max(0, len(files) - max_files_per_dir)
+        shown = dirs + files[:max_files_per_dir]
+        for i, entry in enumerate(shown):
+            last = i == len(shown) - 1 and overflow == 0
+            connector = "└── " if last else "├── "
             lines.append(f"{prefix}{connector}{entry.name}{'/' if entry.is_dir() else ''}")
             if entry.is_dir():
-                ext = "    " if i == len(visible) - 1 else "│   "
+                ext = "    " if last else "│   "
                 _walk(entry, depth + 1, prefix + ext)
+        if overflow:
+            lines.append(f"{prefix}└── … (+{overflow} more files)")
 
     _walk(PROJECT_ROOT, 1)
     return "\n".join(lines)
