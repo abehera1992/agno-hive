@@ -148,6 +148,67 @@ def _execute(tool: str, args: dict) -> str:
                      {bt: {"rich_text": _rich(md.replace(old_str, new_str))}})
             return f"notion: update_content replaced text in {bt} block {_clean_id(b['id'])}"
 
+        if tool == "replace_section":
+            # Reliably swap a whole section: find its heading, delete the heading + all blocks
+            # under it (up to the next same-or-higher heading), and drop new markdown in its place.
+            page_id = _clean_id(args["page_id"])
+            anchor  = args["section_heading"]
+            new_md  = args.get("new_markdown", "") or ""
+
+            def _norm(t: str) -> str:
+                return t.lstrip("#").strip().casefold()
+
+            children = _direct_children(page_id)   # ordered top-level blocks (headings are here)
+            target = _norm(anchor)
+            heads = []
+            for idx, b in enumerate(children):
+                bt = b.get("type", "")
+                if bt in ("heading_1", "heading_2", "heading_3"):
+                    txt = "".join(t.get("plain_text", "")
+                                  for t in b.get(bt, {}).get("rich_text", []))
+                    heads.append((idx, bt, _norm(txt)))
+            # Prefer an exact heading match; fall back to a unique substring match.
+            chosen = [h for h in heads if h[2] == target]
+            if not chosen and target:
+                chosen = [h for h in heads if target in h[2]]
+            if not chosen:
+                return (f"notion replace_section: heading '{anchor}' not found among "
+                        f"{len(heads)} heading(s) on the page — check the exact heading text")
+            if len(chosen) > 1:
+                return (f"notion replace_section: AMBIGUOUS — '{anchor}' matched {len(chosen)} "
+                        "headings; pass the full, exact heading text")
+            h_idx, h_type, _ = chosen[0]
+            h_level = int(h_type[-1])              # heading_1/2/3 -> 1/2/3
+            # Section ends at the next heading of the same or higher rank (<= level), else page end.
+            end = len(children)
+            for j in range(h_idx + 1, len(children)):
+                bt = children[j].get("type", "")
+                if bt in ("heading_1", "heading_2", "heading_3") and int(bt[-1]) <= h_level:
+                    end = j
+                    break
+            old_ids = [b["id"] for b in children[h_idx:end]]
+            new_blocks = _markdown_to_blocks(new_md)
+            # Insert the new blocks immediately AFTER the old section's last block, then trash the
+            # old blocks. This preserves position wherever the section sits (start/middle/end) —
+            # once the old slot is emptied, the new blocks occupy it. Insert-before-delete means a
+            # partial failure duplicates content (recoverable) rather than losing it.
+            after = old_ids[-1]
+            inserted = 0
+            for k in range(0, len(new_blocks), 100):
+                batch = new_blocks[k:k + 100]
+                if not batch:
+                    continue
+                resp = _request("PATCH", f"/blocks/{page_id}/children",
+                                {"children": batch, "after": _clean_id(after)})
+                created = resp.get("results", [])
+                inserted += len(created)
+                if created:
+                    after = created[-1]["id"]      # chain further batches after the last inserted
+            for bid in old_ids:
+                _request("DELETE", f"/blocks/{_clean_id(bid)}")
+            return (f"notion: replaced section '{anchor}' — deleted {len(old_ids)} old block(s), "
+                    f"inserted {inserted} new block(s)")
+
         if tool == "create_database":
             result = _request("POST", "/databases", args["payload"])
             return f"notion database created: {result.get('url', result.get('id'))}"
@@ -707,6 +768,38 @@ def notion_update_page_props(page_id: str, properties: dict | str) -> str:
     return _execute("update_page_props", {"page_id": page_id, "properties": props})
 
 
+def notion_replace_section(page_id: str, section_heading: str, new_markdown: str) -> str:
+    """
+    Reliably REPLACE a whole section of a Notion page in ONE call: locate the section by its
+    heading, delete that heading plus every block under it (up to the next heading of the same
+    or higher level), and insert `new_markdown` in its place — position preserved.
+
+    Use this to CORRECT a wrong/outdated section. The append tools (notion_append_markdown /
+    notion_append_blocks) can only ADD content at the end; they cannot remove or replace an
+    existing section, which otherwise forces stacking a duplicate correction on top.
+    Requires human approval when WRITE_REVIEW is enabled.
+
+    Args:
+        page_id:         ID of the page to edit.
+        section_heading: Exact heading text of the section to replace (with or without a leading
+                         '#'). Matched against the page's headings and must identify exactly one
+                         (exact match preferred, else a unique substring). Pass an empty
+                         new_markdown to simply DELETE the section.
+        new_markdown:    Notion-flavored markdown for the replacement (usually starting with its
+                         own heading). Rendered by the same converter as notion_append_markdown.
+    """
+    if WRITE_REVIEW:
+        return _stage_action(
+            "notion", "replace_section",
+            f"Replace section '{section_heading[:60]}' on page {page_id[:8]}...",
+            {"page_id": page_id, "section_heading": section_heading, "new_markdown": new_markdown},
+        )
+    return _execute(
+        "replace_section",
+        {"page_id": page_id, "section_heading": section_heading, "new_markdown": new_markdown},
+    )
+
+
 def notion_append_blocks(block_id: str, blocks: list | str, after_block_id: str = "") -> str:
     """
     Append content blocks to a Notion page or block.
@@ -1242,6 +1335,24 @@ def _collect_blocks(parent_id: str, acc: list, max_blocks: int = 2000) -> None:
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
+
+
+def _direct_children(parent_id: str) -> list[dict]:
+    """Ordered TOP-LEVEL children of a page/block (non-recursive), following pagination.
+    replace_section needs siblings in document order to compute a section's block span; the
+    recursive _collect_blocks flattens nesting and loses that top-level ordering."""
+    out: list[dict] = []
+    cursor = None
+    while True:
+        path = f"/blocks/{_clean_id(parent_id)}/children?page_size=100"
+        if cursor:
+            path += f"&start_cursor={cursor}"
+        data = _request("GET", path)
+        out.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    return out
 
 
 def _split_row(line: str) -> list[str]:
