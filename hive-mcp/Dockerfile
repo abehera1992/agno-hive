@@ -19,6 +19,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Docker CLI from official image (no daemon, talks to host socket via mount)
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 
+# Trust the bind-mounted project dir. The container runs as root but /project is
+# owned by the host user, so git otherwise refuses with "dubious ownership" —
+# which breaks scan_project_context's `git status`/`git diff` change detection
+# (hive.md reports "git status failed" and incremental scans fall back to full
+# rebuilds). --system writes to /etc/gitconfig, which is NOT masked by the
+# runtime /root/.gitconfig bind mount (a --global entry would be).
+RUN git config --system --add safe.directory /project
+
 # Python deps
 WORKDIR /app
 COPY requirements.txt .
