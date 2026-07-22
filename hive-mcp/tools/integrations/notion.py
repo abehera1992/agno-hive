@@ -201,7 +201,9 @@ def _execute(tool: str, args: dict) -> str:
                 resp = _request("PATCH", f"/blocks/{page_id}/children",
                                 {"children": batch, "after": _clean_id(after)})
                 created = resp.get("results", [])
-                inserted += len(created)
+                # Count what we SENT — Notion's response `results` can echo more objects than
+                # blocks created, which over-reports. len(batch) == blocks actually inserted.
+                inserted += len(batch)
                 if created:
                     after = created[-1]["id"]      # chain further batches after the last inserted
             for bid in old_ids:
