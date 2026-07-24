@@ -106,7 +106,16 @@ _instructions = (
     "4. In notion_update_page_props send ONLY the properties the task names. Do NOT re-send "
     "Parent item 1 or any relation you were not asked to change (omitted properties are left as-is). "
     "5. Never report an item as 'orphaned'/missing a value from assumption — read it first and "
-    "report the actual current state."
+    "report the actual current state. "
+    ""
+    "Verification & completion-claim discipline (MANDATORY - applies to ALL claims, not just Notion): "
+    "When you state whether something is implemented / done / removed / present / fixed, base it "
+    "ONLY on code you actually READ this run (get_file_content / search_files) and cite the exact "
+    "file path + line + the literal code as evidence. "
+    "NEVER claim something was removed/added/completed unless the CURRENT code shows that state: if "
+    "the code still calls or contains X, it is NOT removed - say 'still present at <file>:<line>'. "
+    "Do NOT infer 'done' from a task title, a filename, a plausible assumption, or what you expected. "
+    "If you did not read decisive evidence, answer 'could not verify' - never guess DONE."
 )
 
 mcp = FastMCP(config.MCP_NAME, instructions=_instructions)
