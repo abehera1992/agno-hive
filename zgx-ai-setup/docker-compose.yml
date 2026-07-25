@@ -11,16 +11,20 @@
 # "diverse roster" variant) are documented in README.md, not started here.
 
 services:
-  # Resident coordinator — serves qwen3-coder-30b to the whole roster via LiteLLM.
+  # Resident coordinator — serves the agno roster + LightRAG via LiteLLM under the
+  # stable alias qwen3-coder-30b (kept so litellm-config + agents _VLLM_MODEL_MAP need
+  # no change). Backing model is Qwen3-30B-A3B-Instruct-2507 (general-instruct, non-thinking,
+  # 3B-active MoE) — swapped in 2026-07-25 to replace Qwen3-Coder-30B; uses the hermes
+  # tool-parser (general instruct), not qwen3_coder.
   vllm-coord:
     image: timothystewart6/vllm-gb10:latest
     container_name: vllm-coord
     restart: unless-stopped
     entrypoint: ["vllm"]
     command: >
-      serve Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
+      serve Qwen/Qwen3-30B-A3B-Instruct-2507-FP8
       --served-model-name qwen3-coder-30b
-      --enable-auto-tool-choice --tool-call-parser qwen3_coder
+      --enable-auto-tool-choice --tool-call-parser hermes
       --gpu-memory-utilization 0.6 --max-model-len 65536
       --host 0.0.0.0 --port 8000
     ports:
