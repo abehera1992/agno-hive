@@ -19,6 +19,15 @@ WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "false").lower() == "true"
 NOTION_API_KEY             = os.getenv("NOTION_API_KEY", "")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")  # path to JSON file
 
+# ── Read-only SQL (optional — activate by setting HIVE_DB_URL) ──────────────────
+# Generic read-only DB grounding: db_schema() + db_query() let hive VERIFY facts against
+# the live database instead of grepping files. Point at a READ-ONLY role's DSN, e.g.
+# postgresql://hive_ro:<pw>@host.docker.internal:5433/ekamApp — the tool holds no schema
+# knowledge; the access boundary is the role's grants. Tools register only when this is set.
+HIVE_DB_URL        = os.getenv("HIVE_DB_URL", "")
+HIVE_DB_MAX_ROWS   = int(os.getenv("HIVE_DB_MAX_ROWS", "1000"))
+HIVE_DB_TIMEOUT_MS = int(os.getenv("HIVE_DB_TIMEOUT_MS", "5000"))
+
 # ── Migration runner (optional, review-gated — activate with MIGRATIONS_ENABLED=true) ─
 # Lets hive APPLY Alembic migrations as the DB owner via the mounted docker socket.
 # The owner password is read from the db container at run time (never stored here).

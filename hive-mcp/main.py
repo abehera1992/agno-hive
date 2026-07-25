@@ -71,6 +71,10 @@ if config.MIGRATIONS_ENABLED:
     from tools.integrations.migrations import run_migration
     _INTEGRATION_TOOLS += [run_migration]
 
+if config.HIVE_DB_URL:
+    from tools.integrations.db import db_query, db_schema
+    _INTEGRATION_TOOLS += [db_query, db_schema]
+
 _instructions = (
     "You are connected to a project via hive-mcp. "
     "The project files are at the root level — use get_file_content, find_files, "
@@ -124,7 +128,15 @@ _instructions = (
     "count. If the target is a big literal (a large dict / list / table / seed block), GREP it - do not "
     "scroll it and guess. Research thoroughly first: a value may live in more than one place (e.g. a DB "
     "table AND a code fallback), so search_files across the WHOLE repo to confirm you found every "
-    "occurrence before stating a total, and state which sources you checked."
+    "occurrence before stating a total, and state which sources you checked. "
+    ""
+    "Database-backed facts (when db_query / db_schema are available): if a value is stored "
+    "in a database table (a count of rows, the current value of a column, 'how many X have "
+    "status Y'), the LIVE TABLE is the source of truth — a file grep of a seed/migration/code "
+    "fallback can be stale or incomplete. Call db_schema(table) to confirm the exact schema + "
+    "column names, then db_query with an aggregate (SELECT col, count(*) ... GROUP BY col) to "
+    "get the authoritative number. Report the DB result as the total; treat file greps as "
+    "SUPPLEMENTARY subtotals (and note when the DB and the code/seed disagree — they often do)."
 )
 
 mcp = FastMCP(config.MCP_NAME, instructions=_instructions)

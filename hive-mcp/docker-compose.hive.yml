@@ -43,6 +43,9 @@ services:
       - WEB_SEARCH_ENABLED=${WEB_SEARCH_ENABLED:-false}
       - NOTION_API_KEY=${NOTION_API_KEY:-}
       - GOOGLE_SERVICE_ACCOUNT_JSON=${GOOGLE_SERVICE_ACCOUNT_JSON:-}
+      # Read-only SQL grounding (db_schema/db_query) — set to a read-only role DSN to enable.
+      # On Docker Desktop the host DB is reachable at host.docker.internal:<published-port>.
+      - HIVE_DB_URL=${HIVE_DB_URL:-}
 
   # ── agno-hive instance — points at the agno-hive repo itself ─────────────────
   # Start with: docker compose -f docker-compose.hive.yml --profile agno up -d
