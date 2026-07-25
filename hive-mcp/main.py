@@ -115,7 +115,16 @@ _instructions = (
     "NEVER claim something was removed/added/completed unless the CURRENT code shows that state: if "
     "the code still calls or contains X, it is NOT removed - say 'still present at <file>:<line>'. "
     "Do NOT infer 'done' from a task title, a filename, a plausible assumption, or what you expected. "
-    "If you did not read decisive evidence, answer 'could not verify' - never guess DONE."
+    "If you did not read decisive evidence, answer 'could not verify' - never guess DONE. "
+    ""
+    "Counting & exhaustiveness (MANDATORY): for ANY count, total, 'how many', 'all', or exhaustive "
+    "enumeration over a file or the codebase, derive the number from a DETERMINISTIC tool and report "
+    "that tool's ACTUAL output - use run_command with grep -c / rg -c / grep -oE '...' | wc -l / wc -l, "
+    "or search_files. NEVER read a large file partially and estimate, extrapolate, sample, or eyeball a "
+    "count. If the target is a big literal (a large dict / list / table / seed block), GREP it - do not "
+    "scroll it and guess. Research thoroughly first: a value may live in more than one place (e.g. a DB "
+    "table AND a code fallback), so search_files across the WHOLE repo to confirm you found every "
+    "occurrence before stating a total, and state which sources you checked."
 )
 
 mcp = FastMCP(config.MCP_NAME, instructions=_instructions)
