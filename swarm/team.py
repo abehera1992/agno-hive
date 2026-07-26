@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 from contextlib import AsyncExitStack
 
@@ -40,6 +41,20 @@ _COORDINATOR_INSTRUCTIONS = [
     "  If you were asked to update records but could not determine what to change (or the writes",
     "  were not staged), state that explicitly instead of inventing changes. A partial or staged",
     "  result is NOT 'done' — report it as staged/pending awaiting approval.",
+    "",
+    "── Counts must be tool-filled, NEVER written by you (CRITICAL) ──",
+    "  You are FORBIDDEN from writing any count / total / 'how many' / 'all' as a bare number",
+    "  you computed by reading — reading and tallying is unreliable and treated as fabrication.",
+    "  Instead, emit a COUNT MARKER and the system fills in the EXACT ripgrep count for you:",
+    "      [[COUNT pattern=`<ripgrep-regex>` glob=`<glob>`]]",
+    "  Example: 'There are [[COUNT pattern=`: *12\\.0` glob=`**/gst_resolver.py`]] entries at 12%.'",
+    "  - pattern = a ripgrep regex (backtick-delimited); glob = files to scan (e.g. **/gst_resolver.py, **/*.py).",
+    "  - The system replaces the marker with the real number AFTER you finish — you never supply",
+    "    the digit, so the count cannot be wrong. Use ONE marker per distinct count.",
+    "  - For a count of rows in a DATABASE table, use db_query (SELECT ... COUNT(*)) instead — its",
+    "    result is authoritative. Do NOT grep files for a value that lives in the DB.",
+    "  - If you already ran count_matches / grep -c yourself and have the exact tool output, you may",
+    "    state that number directly. Otherwise ALWAYS use the marker — never guess.",
     "",
     "── Conversational turn detection (read this first) ─────────────",
     "  Not every message is a task. Classify the message before reaching for tools:",
@@ -138,9 +153,9 @@ _COORDINATOR_INSTRUCTIONS = [
     "",
     "── Multi-MCP tool selection ─────────────────────────────────────",
     "  hive-mcp is the PRIMARY server — use it for ALL file reads AND writes.",
-    "  Typical hive-mcp tools: find_files, search_files, get_file_content, list_directory_tree,",
-    "  list_directory, apply_diff, write_file, run_shell, run_docker, git_status, git_log,",
-    "  web_search, web_fetch.",
+    "  Typical hive-mcp tools: find_files, search_files, count_matches (deterministic counts),",
+    "  get_file_content, list_directory_tree, list_directory, apply_diff, write_file, run_shell,",
+    "  run_docker, git_status, git_log, web_search, web_fetch. db_query/db_schema when a DB is configured.",
     "  Project MCP is SUPPLEMENTARY — use only for tools not in hive-mcp:",
     "  search_knowledge_graph, get_context_section, and other project-specific tools.",
     "  If only one MCP is connected, use it for everything.",
@@ -312,6 +327,68 @@ def _extract_handoff_summary(task: str, content: str) -> str:
     return "\n".join(lines)
 
 
+# ── Count-marker verification guard (Tier 3) ───────────────────────────────────
+# The coordinator is instructed to write counts as [[COUNT pattern=`..` glob=`..`]]
+# markers instead of bare numbers it computed by reading. After the run, this guard
+# re-runs each marker through hive-mcp's DETERMINISTIC count_matches tool and substitutes
+# the real number — so any count that goes through a marker is correct-by-construction
+# (the model never supplies the digit and cannot confabulate it). No-op if no markers.
+_COUNT_MARKER_RE = re.compile(r"\[\[COUNT\s+pattern=`(.*?)`\s+glob=`(.*?)`\]\]", re.DOTALL)
+_COUNT_MARKER_ANY = re.compile(r"\[\[COUNT[^\]]*\]\]")
+
+
+def _extract_mcp_text(result) -> str:
+    if not result or not getattr(result, "content", None):
+        return ""
+    return "\n".join(
+        item.text for item in result.content if hasattr(item, "text") and item.text
+    )
+
+
+async def _fill_count_markers(content: str, hive_mcp_url: str | None) -> str:
+    """Replace [[COUNT pattern=`..` glob=`..`]] markers with the exact count from
+    hive-mcp's count_matches tool. The number is ALWAYS tool-derived. Malformed or
+    unresolvable markers become '[count unavailable]'. No-op when there are no markers."""
+    if not content or "[[COUNT" not in content:
+        return content
+    if not hive_mcp_url:
+        return _COUNT_MARKER_ANY.sub("[count unavailable]", content)
+
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    matches = list(_COUNT_MARKER_RE.finditer(content))
+    if not matches:
+        return _COUNT_MARKER_ANY.sub("[count unavailable]", content)
+
+    cache: dict = {}
+    try:
+        async with streamablehttp_client(hive_mcp_url) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                for mt in matches:
+                    key = (mt.group(1), mt.group(2))
+                    if key in cache:
+                        continue
+                    try:
+                        res = await session.call_tool(
+                            "count_matches", {"pattern": key[0], "glob_filter": key[1]}
+                        )
+                        m = re.search(r"TOTAL:\s*(\d+)", _extract_mcp_text(res))
+                        cache[key] = m.group(1) if m else "[count unavailable]"
+                    except Exception as exc:
+                        print(f"[team] count verify failed ({key!r}): {exc}")
+                        cache[key] = "[count unavailable]"
+    except Exception as exc:
+        print(f"[team] count-marker guard: hive-mcp unreachable ({hive_mcp_url}): {exc}")
+        return _COUNT_MARKER_ANY.sub("[count unavailable]", content)
+
+    out = content
+    for mt in matches:
+        out = out.replace(mt.group(0), cache.get((mt.group(1), mt.group(2)), "[count unavailable]"))
+    return _COUNT_MARKER_ANY.sub("[count unavailable]", out)  # strip any malformed leftovers
+
+
 def _build_team(
     agent_specs: list | None,
     coordinator_model: str,
@@ -454,6 +531,12 @@ async def run_task_stream(
                         full_content.append(chunk)
                         yield chunk
                 combined = "".join(full_content) or "(no response)"
+                # Tier-3 guard: fill [[COUNT ...]] markers in the final content (streamed
+                # chunks above are pre-substitution; the done-sentinel content is corrected).
+                try:
+                    combined = await _fill_count_markers(combined, all_mcp_urls[0] if all_mcp_urls else None)
+                except Exception as exc:
+                    print(f"[team] count-marker guard warning: {exc}")
                 tokens = _extract_tokens(last_event)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
                 # Fire-and-forget: don't block the response on post-run experience indexing.
@@ -582,6 +665,11 @@ async def run_task_async(
                             content = msg_content
                             break
                 content = content or "(no response)"
+                # Tier-3 guard: fill any [[COUNT ...]] markers with deterministic counts.
+                try:
+                    content = await _fill_count_markers(content, all_mcp_urls[0] if all_mcp_urls else None)
+                except Exception as exc:
+                    print(f"[team] count-marker guard warning: {exc}")
                 tokens = _extract_tokens(result)
                 span.set_status(trace.StatusCode.OK)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})

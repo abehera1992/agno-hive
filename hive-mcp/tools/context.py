@@ -353,6 +353,70 @@ def search_files(pattern: str, glob_filter: str = "**/*", max_results: int = 80)
     return "\n".join(results) if results else f"No matches for: {pattern}"
 
 
+def count_matches(pattern: str, glob_filter: str = "**/*",
+                  fixed_string: bool = False, ignore_case: bool = False) -> str:
+    """
+    Count occurrences of a pattern across files — DETERMINISTIC, computed by ripgrep.
+
+    USE THIS FOR ANY count / total / "how many" / "all" question over file contents.
+    NEVER count by reading a file and tallying in your head — that is unreliable and is
+    treated as a fabrication. This tool returns the EXACT total (occurrences, matching
+    grep -oE ... | wc -l) plus a per-file breakdown. The first line is always
+    "TOTAL: <n> ..." so the number can be read/relayed verbatim.
+
+    Args:
+        pattern:      regex to count (or a literal string if fixed_string=True).
+        glob_filter:  restrict to files matching this glob, e.g. '**/*.py',
+                      '**/gst_resolver.py'. Default '**/*' = every file.
+        fixed_string: treat pattern as a literal string, not a regex.
+        ignore_case:  case-insensitive match.
+
+    Examples:
+        count_matches(': *12\\.0', '**/gst_resolver.py')  → occurrences of ': 12.0'
+        count_matches('def ', '**/*.py')                  → function-def lines
+        count_matches('TODO', '**/*', fixed_string=True)  → literal TODO count
+    """
+    import subprocess, shutil
+    rg = shutil.which("rg")
+    if not rg:
+        return "count_matches unavailable: ripgrep (rg) not installed in this environment"
+    args = [rg, "--count-matches", "--glob", glob_filter]
+    if fixed_string:
+        args.append("-F")
+    if ignore_case:
+        args.append("-i")
+    args.append(pattern)
+    try:
+        result = subprocess.run(
+            args, capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=30,
+        )
+        # rg exit: 0 = matches, 1 = no matches, 2+ = real error
+        if result.returncode not in (0, 1):
+            return f"count_matches failed: {result.stderr.strip() or 'rg error'}"
+        total = 0
+        per_file: list[tuple[str, int]] = []
+        for ln in result.stdout.splitlines():
+            path, sep, cnt = ln.rpartition(":")
+            if not sep:
+                continue
+            try:
+                c = int(cnt)
+            except ValueError:
+                continue
+            total += c
+            per_file.append((path, c))
+        head = (f"TOTAL: {total} match(es) for pattern {pattern!r} in '{glob_filter}' "
+                f"across {len(per_file)} file(s)")
+        if not per_file:
+            return f"TOTAL: 0 match(es) for pattern {pattern!r} in '{glob_filter}'"
+        body = "\n".join(f"  {p}: {c}" for p, c in sorted(per_file, key=lambda x: -x[1])[:50])
+        return head + "\n" + body
+    except subprocess.TimeoutExpired:
+        return "count_matches failed: timed out after 30s"
+    except Exception as e:
+        return f"count_matches failed: {e}"
+
+
 def list_directory_tree(max_depth: int = 3) -> str:
     """
     Return the full directory tree of the project up to max_depth levels deep.

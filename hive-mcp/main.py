@@ -26,6 +26,7 @@ from tools.context import (
     get_file_content,
     find_files,
     search_files,
+    count_matches,
     list_directory,
     list_directory_tree,
 )
@@ -123,8 +124,9 @@ _instructions = (
     ""
     "Counting & exhaustiveness (MANDATORY): for ANY count, total, 'how many', 'all', or exhaustive "
     "enumeration over a file or the codebase, derive the number from a DETERMINISTIC tool and report "
-    "that tool's ACTUAL output - use run_command with grep -c / rg -c / grep -oE '...' | wc -l / wc -l, "
-    "or search_files. NEVER read a large file partially and estimate, extrapolate, sample, or eyeball a "
+    "that tool's ACTUAL output - PREFER count_matches(pattern, glob_filter) which returns the exact "
+    "'TOTAL: <n>' computed by ripgrep; or run_command with grep -c / grep -oE '...' | wc -l / wc -l. "
+    "NEVER read a large file partially and estimate, extrapolate, sample, or eyeball a "
     "count. If the target is a big literal (a large dict / list / table / seed block), GREP it - do not "
     "scroll it and guess. Research thoroughly first: a value may live in more than one place (e.g. a DB "
     "table AND a code fallback), so search_files across the WHOLE repo to confirm you found every "
@@ -146,6 +148,7 @@ mcp.tool()(get_project_context)
 mcp.tool()(get_file_content)
 mcp.tool()(find_files)
 mcp.tool()(search_files)
+mcp.tool()(count_matches)
 mcp.tool()(list_directory)
 mcp.tool()(list_directory_tree)
 
