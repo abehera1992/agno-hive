@@ -16,6 +16,9 @@ services:
   # no change). Backing model is Qwen3-30B-A3B-Instruct-2507 (general-instruct, non-thinking,
   # 3B-active MoE) — swapped in 2026-07-25 to replace Qwen3-Coder-30B; uses the hermes
   # tool-parser (general instruct), not qwen3_coder.
+  # --max-model-len 131072 (128K): the fixed per-run injection (~56K: hive.md + patterns)
+  # plus a real multi-tool engineering task overflows 65536; 131072 gives headroom and is
+  # memory-stable at util 0.6 on this box. 262144 was tried and OOM'd under load (2026-07-26).
   vllm-coord:
     image: timothystewart6/vllm-gb10:latest
     container_name: vllm-coord
@@ -25,7 +28,7 @@ services:
       serve Qwen/Qwen3-30B-A3B-Instruct-2507-FP8
       --served-model-name qwen3-coder-30b
       --enable-auto-tool-choice --tool-call-parser hermes
-      --gpu-memory-utilization 0.6 --max-model-len 65536
+      --gpu-memory-utilization 0.6 --max-model-len 131072
       --host 0.0.0.0 --port 8000
     ports:
       - "8003:8000"
