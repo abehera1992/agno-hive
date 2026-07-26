@@ -699,6 +699,7 @@ hive --project ekam --team sprint-master "add a Story 'wire up X' under epic EK-
 |---|---|
 | `find_files(pattern)` | Glob file discovery — uses ripgrep, respects .gitignore |
 | `search_files(pattern, glob)` | Regex content search — uses ripgrep, falls back to Python re |
+| `count_matches(pattern, glob_filter)` | Deterministic occurrence count (ripgrep) — returns `TOTAL: <n>`; use for any "how many / count / all" instead of reading + tallying |
 | `get_file_content(path)` | Read a file |
 | `list_directory_tree(depth)` | Full directory skeleton, dirs only, no cap |
 | `list_directory(path)` | Immediate children of a directory |

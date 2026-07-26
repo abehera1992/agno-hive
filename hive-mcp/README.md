@@ -32,6 +32,7 @@ Agents choose which MCP to use based on operation type. The coordinator instruct
 | `get_file_content(path)` | Read a file |
 | `find_files(pattern)` | Glob search (ripgrep-backed, with frontend prefix fallbacks) |
 | `search_files(pattern, glob)` | Regex content search |
+| `count_matches(pattern, glob_filter)` | **Deterministic occurrence count** (ripgrep `--count-matches`) — returns `TOTAL: <n>` + per-file breakdown. Use for ANY count/total/"how many" instead of reading and tallying (which models confabulate). |
 | `list_directory(path)` | Immediate children of a directory |
 | `list_directory_tree()` | Full directory skeleton (no depth cap) |
 | `scan_project_context()` | Generate a `hive.md` project snapshot for fast context loading |
