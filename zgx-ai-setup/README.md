@@ -15,7 +15,10 @@ agno swarm + LightRAG
 LiteLLM  :4000   (gateway — model-name routing, request_timeout)
         |
         v
-vLLM coordinator :8003   Qwen3-Coder-30B-A3B-Instruct-FP8  (served as qwen3-coder-30b)
+vLLM coordinator :8003   Qwen3-30B-A3B-Instruct-2507-FP8  (served as qwen3-coder-30b;
+                         --tool-call-parser hermes; general-instruct, non-thinking, 3B-active
+                         MoE — swapped 2026-07-25 from Qwen3-Coder-30B for stronger grounding
+                         within the same ~30 GB footprint)
                          util 0.6, 64K ctx — the WHOLE roster runs here (coordinator,
                          all workers, ContextRouter/Executor, and LightRAG's LLM)
 vLLM embeddings  :8002   Qwen3-Embedding-0.6B (1024-dim, always resident)

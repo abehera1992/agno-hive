@@ -15,6 +15,7 @@ ZGX (AGNOHive)
   └── hive-mcp     →  apply_diff, write_file, run_shell, run_docker, git_*
                         index_project (bootstrap into LightRAG)
                         web_search, web_fetch
+                        db_schema, db_query (read-only SQL grounding)
                         notion_*, google_* (external platform integrations)
 ```
 
@@ -70,6 +71,38 @@ Agents choose which MCP to use based on operation type. The coordinator instruct
 |---|---|
 | `web_search(query)` | DuckDuckGo search — no API key required |
 | `web_fetch(url)` | Fetch and clean any URL; GitHub repo URLs return README + metadata |
+
+### Read-only SQL grounding (gated by `HIVE_DB_URL`)
+Activated only when `HIVE_DB_URL` is set. Lets agents **verify facts against the live database**
+instead of grepping files — a value stored in a table (a count, a current column value) is ground
+truth only in the table; seed/migration/code text can be stale or incomplete. **Generic:** the tool
+holds no project/schema knowledge — the access boundary is the DB role's grants, so point it at any
+project's DB by changing the DSN.
+
+| Tool | Approval | Description |
+|---|---|---|
+| `db_schema(table=None)` | None | No arg → list every `schema.table` (system schemas excluded). With a `schema.table` or bare table name → its columns, types, nullability. Call this first to confirm exact names before querying. |
+| `db_query(sql)` | None | Run ONE read-only `SELECT` / `WITH … SELECT` / `EXPLAIN` / `TABLE` / `VALUES` / `SHOW`. Rows capped at `HIVE_DB_MAX_ROWS`; per-call `statement_timeout`. Use an aggregate (`SELECT col, count(*) … GROUP BY col`) for authoritative counts. |
+
+**Defense in depth (all enforced):** (1) connect as a **read-only DB role** — recommended a member of
+`pg_read_all_data` with `default_transaction_read_only = on`, so the database itself refuses any write;
+(2) the psycopg connection is forced `read_only`; (3) a **single-statement allowlist** rejects writes,
+DDL, and `;`-chained statements; (4) results capped + timed out. Writes are blocked at BOTH the allowlist
+and the DB role.
+
+Config (env): `HIVE_DB_URL` (a read-only DSN, e.g. `postgresql://hive_ro:<pw>@host.docker.internal:5433/mydb`;
+on Docker Desktop the host DB is reachable at `host.docker.internal:<published-port>`), `HIVE_DB_MAX_ROWS`
+(default 1000), `HIVE_DB_TIMEOUT_MS` (default 5000). One-time role setup (Postgres):
+```sql
+CREATE ROLE hive_ro LOGIN PASSWORD '<pw>';
+ALTER ROLE hive_ro SET default_transaction_read_only = on;
+GRANT CONNECT ON DATABASE "<db>" TO hive_ro;
+GRANT pg_read_all_data TO hive_ro;   -- reads ALL schemas, present + future, no per-schema maintenance
+```
+
+> **Behavioral note:** the agent uses these tools when the prompt asks a **DB-targeted question**
+> ("how many rows in table X have value Y"). A prompt that explicitly steers to `search_files` for a
+> DB-backed fact will bypass them — so phrase DB-fact tasks as DB questions.
 
 ### External platform integrations
 Activated by env var — tools only appear when the platform is configured.
@@ -178,6 +211,9 @@ docker run -d \
 | `WEB_SEARCH_ENABLED` | `false` | Enable `web_search` and `web_fetch` tools |
 | `NOTION_API_KEY` | _(unset)_ | Notion integration token — activates all `notion_*` tools |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | _(unset)_ | Path to Google service account JSON — activates Google tools when implemented |
+| `HIVE_DB_URL` | _(unset)_ | Read-only DSN — activates `db_schema` / `db_query` grounding tools |
+| `HIVE_DB_MAX_ROWS` | `1000` | Max rows returned by `db_query` |
+| `HIVE_DB_TIMEOUT_MS` | `5000` | Per-query `statement_timeout` |
 
 ---
 
@@ -203,6 +239,7 @@ services:
       - WEB_SEARCH_ENABLED=${WEB_SEARCH_ENABLED:-false}
       - NOTION_API_KEY=${NOTION_API_KEY:-}
       - GOOGLE_SERVICE_ACCOUNT_JSON=${GOOGLE_SERVICE_ACCOUNT_JSON:-}
+      - HIVE_DB_URL=${HIVE_DB_URL:-}   # read-only DSN → db_schema / db_query
 ```
 
 Env vars you can set in `.env` (same directory as the compose file) or in your shell:
