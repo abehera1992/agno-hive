@@ -92,8 +92,4 @@ services:
     network_mode: host
     volumes:
       - ./litellm-config.yaml:/app/config.yaml:ro
-    # --detailed_debug: TEMPORARY diagnostic flag (2026-07-29) to inspect raw tool_calls
-    # payloads after sprint-master fabricated a Notion write without ever calling the
-    # tool. Remove once the root cause is confirmed -- verbose logging leaks full
-    # request/response bodies, not for permanent use.
-    command: ["--config", "/app/config.yaml", "--port", "4000", "--detailed_debug"]
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
