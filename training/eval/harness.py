@@ -35,8 +35,14 @@ from typing import Any
 
 CASES_DIR = Path(__file__).parent / "cases"
 
-# A line-number assertion in prose: "line 209", "line: 209", "at line 42".
-_LINE_CLAIM_RE = re.compile(r"\bline[s]?\b\W{0,3}(\d{1,5})", re.I)
+# A line-number assertion in prose.
+# Must tolerate markdown between the word and the digits — the first version allowed
+# only 3 non-word chars and so MISSED "**Line number**: `209`", reporting "no line
+# asserted" for an output that plainly asserted one. That silently awarded full
+# citation credit to any fabricated line formatted that way, i.e. the scorer failed
+# at precisely the thing it exists to detect. Widened to allow an optional
+# "number"/"no." plus up to 12 non-digit, same-line characters.
+_LINE_CLAIM_RE = re.compile(r"\blines?\b(?:\s*(?:numbers?|nos?\.?))?[^\d\n]{0,12}(\d{1,5})", re.I)
 
 
 # ── model client ──────────────────────────────────────────────────────────────
