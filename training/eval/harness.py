@@ -365,9 +365,14 @@ def main() -> None:
     print(f"BASELINE — {a.label}")
     print("=" * 62)
     for dim, (letter, _) in SCORERS.items():
-        if dim in agg:
-            n = sum(1 for r in results if dim in r.get("scores", {}))
-            print(f"  {letter}. {dim:11s} {agg[dim]*100:5.1f}%   (n={n})")
+        if dim not in agg:
+            continue
+        # `guard` holds the MERGED Axis D score (token + structural), so its n must
+        # count both scorers or the printed n contradicts the printed percentage.
+        keys = {"guard", "structural"} if dim == "guard" else {dim}
+        n = sum(1 for r in results if keys & set(r.get("scores", {})))
+        note = "  (Axis D sub-score, already inside guard)" if dim == "structural" else ""
+        print(f"  {letter}. {dim:11s} {agg[dim]*100:5.1f}%   (n={n}){note}")
     errs = [r for r in results if r.get("error")]
     if errs:
         print(f"  !! {len(errs)} case(s) errored")
