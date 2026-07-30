@@ -42,6 +42,7 @@ class PatternsMdSource(Source):
     name = "patterns_md"
 
     def __init__(self, path: str):
+        super().__init__()
         # Accepts a directory of *.md or a single file.
         self.path = Path(path)
 
@@ -67,6 +68,7 @@ class PatternsMdSource(Source):
                         break
 
                 if not pair:
+                    self.drop("guard has no splittable WRONG/CORRECT block (prose-only)")
                     # Prose-only guard, or markers we cannot split with confidence.
                     # Skipping is deliberate: a fabricated "correct" side would poison
                     # the very behaviour this corpus is meant to teach.

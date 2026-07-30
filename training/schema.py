@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from dataclasses import dataclass, field, asdict
 from typing import Any, Iterable, Literal
 
@@ -65,9 +66,22 @@ class Record:
 
 
 class Source:
-    """Base class for a data source. Subclasses implement `load()`."""
+    """Base class for a data source. Subclasses implement `load()`.
+
+    `drops` exists so source-internal filtering is VISIBLE in the quality report.
+    A source that silently discards rows produces a report claiming "rejected: none"
+    while quietly throwing away a third of the corpus — which is worse than no report,
+    because it looks like evidence of cleanliness. Any `continue` in a load() must be
+    accompanied by a self.drop("reason").
+    """
 
     name: str = "unnamed"
+
+    def __init__(self) -> None:
+        self.drops: Counter[str] = Counter()
+
+    def drop(self, reason: str) -> None:
+        self.drops[reason] += 1
 
     def load(self) -> Iterable[Record]:  # pragma: no cover - interface
         raise NotImplementedError

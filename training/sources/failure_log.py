@@ -35,6 +35,7 @@ class FailureLogSource(Source):
         project_id: str | None = None,
         human_only: bool = True,
     ):
+        super().__init__()
         self.postgres_uri = postgres_uri or os.getenv(
             "POSTGRES_URI", "postgresql://agno:agno@localhost:5432/agno_graph"
         )
@@ -67,6 +68,7 @@ class FailureLogSource(Source):
                 note = note[len(_FEEDBACK_PREFIX):]
             note = note.strip()
             if not (task or "").strip() or not note:
+                self.drop("missing task or note")
                 continue
 
             if (rejected or "").strip() and (corrected or "").strip():

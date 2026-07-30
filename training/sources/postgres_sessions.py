@@ -41,6 +41,7 @@ class PostgresSessionsSource(Source):
     name = "postgres_sessions"
 
     def __init__(self, postgres_uri: str | None = None, project_id: str | None = None):
+        super().__init__()
         self.postgres_uri = postgres_uri or os.getenv(
             "POSTGRES_URI", "postgresql://agno:agno@localhost:5432/agno_graph"
         )
@@ -71,19 +72,30 @@ class PostgresSessionsSource(Source):
         for sid, _mid, role, content, project in rows:
             content = (content or "").strip()
             if role == "user":
-                pending = (str(sid), content) if len(content) >= _MIN_USER_CHARS else None
+                if len(content) < _MIN_USER_CHARS:
+                    self.drop("user turn too short")
+                    pending = None
+                else:
+                    pending = (str(sid), content)
                 continue
-            if role != "assistant" or pending is None or pending[0] != str(sid):
+            if role != "assistant":
+                continue
+            if pending is None or pending[0] != str(sid):
+                self.drop("assistant turn with no paired user turn")
                 continue
 
             user_text = pending[1]
             pending = None
 
             if len(content) < _MIN_ASSISTANT_CHARS:
+                self.drop("assistant reply too short")
                 continue
-            if any(mark in content for mark in _REJECT_MARKERS):
+            hit = next((m for m in _REJECT_MARKERS if m in content), None)
+            if hit:
+                self.drop(f"reject marker: {hit!r}")
                 continue
             if len(user_text) > _MAX_CHARS or len(content) > _MAX_CHARS:
+                self.drop("turn exceeds max length")
                 continue
 
             yield Record(

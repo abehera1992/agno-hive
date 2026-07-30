@@ -40,6 +40,12 @@ def build(patterns_path: str | None, project: str | None, postgres_uri: str | No
             rejected[f"{src.name}: SOURCE FAILED ({type(exc).__name__}: {exc})"] += 1
             continue
 
+        # Rows the source filtered out internally, before they ever became Records.
+        # Merged here so the report reflects the WHOLE funnel, not just the tail.
+        for reason, n in src.drops.items():
+            rejected[f"{src.name}: {reason}"] += n
+            per_source_raw[src.name] += n
+
         for r in records:
             per_source_raw[r.source] += 1
             err = r.validate()
