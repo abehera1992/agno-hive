@@ -24,6 +24,7 @@ Every scorer returns (score in 0..1, detail string) so failures are explainable.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import statistics
@@ -157,12 +158,141 @@ def score_guard(case: dict, text: str) -> tuple[float, str]:
     return score, detail
 
 
+# ── structural (AST) checks for Axis D ────────────────────────────────────────
+# Token matching can only express a guard whose rule IS a token (GUARD 18 -> `text(`).
+# Most guards are STRUCTURAL — ordering, positional-vs-keyword, presence of a kwarg,
+# snapshot-before-mutation — and cannot be scored by substring at all. These parse the
+# model's code and check the actual shape, so the rule is measured rather than its
+# incidental vocabulary.
+
+_CODE_FENCE_RE = re.compile(r"```(?:\w+)?\n(.*?)```", re.S)
+
+
+def _extract_code(text: str) -> str:
+    blocks = _CODE_FENCE_RE.findall(text)
+    return "\n\n".join(blocks) if blocks else text
+
+
+def _calls(tree):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            f = node.func
+            name = getattr(f, "id", None) or getattr(f, "attr", None)
+            if name:
+                yield name, node
+
+
+def _chk_call_order(tree, spec) -> tuple[bool, str]:
+    """`first` must be called before `second` (e.g. flush() before commit())."""
+    order = [(n.lineno, name) for name, n in _calls(tree)]
+    firsts = [ln for ln, nm in order if nm == spec["first"]]
+    seconds = [ln for ln, nm in order if nm == spec["second"]]
+    if not firsts:
+        return False, f"{spec['first']}() never called"
+    if not seconds:
+        return False, f"{spec['second']}() never called"
+    return (min(firsts) < max(seconds),
+            f"{spec['first']}()@{min(firsts)} vs {spec['second']}()@{max(seconds)}")
+
+
+def _chk_kwarg_present(tree, spec) -> tuple[bool, str]:
+    """A call to `call` must carry every kwarg in `kwargs`."""
+    for name, node in _calls(tree):
+        if name != spec["call"]:
+            continue
+        have = {k.arg for k in node.keywords if k.arg}
+        missing = [k for k in spec["kwargs"] if k not in have]
+        if not missing:
+            return True, f"{name}(...) has {spec['kwargs']}"
+        return False, f"{name}(...) missing kwarg(s) {missing}; has {sorted(have)}"
+    return False, f"no call to {spec['call']}()"
+
+
+def _chk_positional_before_keyword(tree, spec) -> tuple[bool, str]:
+    """In `call`, a positional arg mentioning `token` must precede keyword args.
+
+    Python enforces this syntactically, so a violation is a SyntaxError — meaning the
+    real test is whether the model emits parseable code at all. Scored via the parse
+    plus a check that the token really is positional, not passed as a kwarg.
+    """
+    for name, node in _calls(tree):
+        if name != spec["call"]:
+            continue
+        pos_src = " ".join(ast.dump(a) for a in node.args)
+        if spec["token"] in pos_src:
+            return True, f"{spec['token']} is positional in {name}(...)"
+        kw_src = " ".join(ast.dump(k.value) for k in node.keywords)
+        if spec["token"] in kw_src:
+            return False, f"{spec['token']} passed as a KEYWORD in {name}(...)"
+        return False, f"{spec['token']} absent from {name}(...)"
+    return False, f"no call to {spec['call']}()"
+
+
+def _chk_absent_call(tree, spec) -> tuple[bool, str]:
+    """`call` must NOT appear anywhere (e.g. no ForeignKey on a tenant_id column)."""
+    hits = [ln for ln, nm in [(n.lineno, nm) for nm, n in _calls(tree)] if nm == spec["call"]]
+    return (not hits, "absent" if not hits else f"{spec['call']}() present at line(s) {hits}")
+
+
+def _chk_assign_before_mutate(tree, spec) -> tuple[bool, str]:
+    """A snapshot must be read into a local BEFORE the attribute is reassigned."""
+    attr = spec["attr"]
+    reads, writes = [], []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Attribute) and t.attr == attr:
+                    writes.append(node.lineno)
+            src = ast.dump(node.value)
+            if f"attr='{attr}'" in src:
+                reads.append(node.lineno)
+    if not writes:
+        return False, f"`.{attr}` is never assigned"
+    if not reads:
+        return False, f"old `.{attr}` never snapshotted before mutation"
+    return (min(reads) < min(writes),
+            f"snapshot@{min(reads)} vs mutation@{min(writes)}")
+
+
+_STRUCT = {
+    "call_order": _chk_call_order,
+    "kwarg_present": _chk_kwarg_present,
+    "positional_before_keyword": _chk_positional_before_keyword,
+    "absent_call": _chk_absent_call,
+    "assign_before_mutate": _chk_assign_before_mutate,
+}
+
+
+def score_structural(case: dict, text: str) -> tuple[float, str]:
+    """D (structural). Parses the emitted code and checks its SHAPE against the rule."""
+    code = _extract_code(text)
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return 0.0, f"emitted code does not parse ({e.msg} line {e.lineno})"
+
+    results = []
+    for spec in case["structural"]:
+        fn = _STRUCT.get(spec["type"])
+        if fn is None:
+            return 0.0, f"unknown structural check {spec['type']!r}"
+        ok, detail = fn(tree, spec)
+        results.append((ok, f"{spec['type']}: {detail}"))
+
+    passed = sum(1 for ok, _ in results if ok)
+    return passed / len(results), "; ".join(d for _, d in results)
+
+
 SCORERS = {
     "tool_call": ("A", score_tool_call),
     "grounding": ("B", score_grounding),
     "citation": ("C", score_citation),
     "guard": ("D", score_guard),
+    "structural": ("D", score_structural),
 }
+
+# Both `guard` and `structural` measure Axis D; the harness aggregates them together.
+AXIS_OF = {"tool_call": "A", "grounding": "B", "citation": "C", "guard": "D", "structural": "D"}
 
 
 # ── runner ────────────────────────────────────────────────────────────────────
@@ -219,12 +349,17 @@ def main() -> None:
             summary = "  ".join(f"{d}={r['scores'][d]:.2f}" for d in r["scores"])
             print(f"  {r['id']:28s} {summary}   ({r['elapsed_s']}s)")
 
-    # Aggregate per dimension across only the cases that declared it.
-    agg = {}
-    for dim in SCORERS:
-        vals = [r["scores"][dim] for r in results if dim in r.get("scores", {})]
-        if vals:
-            agg[dim] = round(statistics.mean(vals), 3)
+    # Aggregate per AXIS, not per scorer: `guard` (token) and `structural` (AST) are
+    # two ways of measuring Axis D and must combine into one number, or the gate would
+    # see two half-populated axes instead of one properly-sized one.
+    by_axis: dict[str, list[float]] = {}
+    for r in results:
+        for dim, val in r.get("scores", {}).items():
+            by_axis.setdefault(dim, []).append(val)
+    agg = {d: round(statistics.mean(v), 3) for d, v in by_axis.items() if v}
+    d_vals = by_axis.get("guard", []) + by_axis.get("structural", [])
+    if d_vals:
+        agg["guard"] = round(statistics.mean(d_vals), 3)   # gate reads `guard` for Axis D
 
     print("\n" + "=" * 62)
     print(f"BASELINE — {a.label}")

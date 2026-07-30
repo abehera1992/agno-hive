@@ -37,15 +37,61 @@ AXES = {
 
 
 def n_cases(report: dict, axis: str) -> int:
-    return sum(1 for r in report.get("results", []) if axis in r.get("scores", {}))
+    """Count cases that scored this AXIS. `structural` is a second Axis D scorer."""
+    keys = {"guard", "structural"} if axis == "guard" else {axis}
+    return sum(1 for r in report.get("results", [])
+               if keys & set(r.get("scores", {})))
+
+
+def dry_run(cfg: dict) -> int:
+    """Check ONLY that every axis carries enough cases to be scored meaningfully.
+
+    Separate from the real gate on purpose. The promotion gate compares a TRAINED
+    candidate and is expected to FAIL against an untuned baseline — if it passed, the
+    untuned model would already meet the promotion bar and Phase 3 would be pointless.
+    This checks suite readiness, which is the thing that can be verified before training.
+    """
+    import glob
+    from collections import Counter
+
+    cases_dir = Path(__file__).parent / "cases"
+    counts: Counter[str] = Counter()
+    for f in glob.glob(str(cases_dir / "*.json")):
+        case = json.loads(Path(f).read_text(encoding="utf-8"))
+        for s in case.get("scorers", []):
+            # `guard` (token) and `structural` (AST) are both Axis D.
+            counts["guard" if s == "structural" else s] += 1
+
+    need = cfg["gate"].get("min_cases_per_axis", 1)
+    print("=" * 62)
+    print(f"GATE DRY-RUN — suite readiness (min_cases_per_axis = {need})")
+    print("=" * 62)
+    ok = True
+    for axis, letter in (("tool_call", "A"), ("grounding", "B"),
+                         ("citation", "C"), ("guard", "D")):
+        n = counts[axis]
+        good = n >= need
+        ok &= good
+        print(f"  {letter}. {axis:11s} n={n:3d}   {'PASS' if good else f'FAIL (need {need})'}")
+    print("=" * 62)
+    print("RESULT: suite is ready to score a candidate."
+          if ok else "RESULT: suite NOT ready — expand the short axes.")
+    return 0 if ok else 1
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("--baseline", required=True)
-    ap.add_argument("--candidate", required=True)
+    ap.add_argument("--baseline", default=None)
+    ap.add_argument("--candidate", default=None)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="check per-axis case counts only; no model comparison")
     a = ap.parse_args()
+
+    if a.dry_run:
+        sys.exit(dry_run(yaml.safe_load(Path(a.config).read_text(encoding="utf-8"))))
+    if not (a.baseline and a.candidate):
+        raise SystemExit("--baseline and --candidate are required unless --dry-run")
 
     cfg = yaml.safe_load(Path(a.config).read_text(encoding="utf-8"))
     gate = cfg["gate"]
