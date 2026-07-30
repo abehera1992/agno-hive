@@ -97,6 +97,11 @@ class FeedbackRequest(BaseModel):
     project_id: str = "default"
     rating: str  # "good" or "bad"
     notes: str = ""  # specific correction or praise
+    # Preference-pair capture (training Phase 1). Supplying both turns the row into
+    # a usable DPO/ORPO triple: (task, rejected_output, corrected_output).
+    # `notes` stays the human-readable WHY; these two are the verbatim outputs.
+    rejected_output: str = ""   # what the model actually produced (the bad answer)
+    corrected_output: str = ""  # what it should have produced instead
 
 
 class FeedbackResponse(BaseModel):

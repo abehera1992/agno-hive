@@ -86,8 +86,22 @@ async def drain_background_tasks(timeout: float = 30.0) -> None:
 
 # ── Failure ───────────────────────────────────────────────────────────────────
 
-async def record_failure(task: str, error: str, project_id: str, agent: str = "unknown") -> None:
-    """Write a failure record to the PostgreSQL failure_log table."""
+async def record_failure(
+    task: str,
+    error: str,
+    project_id: str,
+    agent: str = "unknown",
+    rejected_output: str | None = None,
+    corrected_output: str | None = None,
+) -> None:
+    """Write a failure record to the PostgreSQL failure_log table.
+
+    `rejected_output` / `corrected_output` are optional and exist to make the row
+    usable as a DPO/ORPO preference pair: (task, rejected_output, corrected_output).
+    Runtime failures leave them None — only human `/feedback` supplies them.
+    They are NOT truncated as aggressively as error_message: a training pair needs
+    the full text on both sides to be usable.
+    """
     try:
         import psycopg
         from config.config import config
@@ -99,10 +113,15 @@ async def record_failure(task: str, error: str, project_id: str, agent: str = "u
             await _ensure_table(conn)
             await conn.execute(
                 """
-                INSERT INTO failure_log (project_id, task, error_type, error_message, agent)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO failure_log
+                    (project_id, task, error_type, error_message, agent,
+                     rejected_output, corrected_output)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
-                (project_id, task[:300], error_type, error_msg, agent),
+                (
+                    project_id, task[:300], error_type, error_msg, agent,
+                    (rejected_output or None), (corrected_output or None),
+                ),
             )
             await conn.commit()
     except Exception as exc:
@@ -170,5 +189,16 @@ async def _ensure_table(conn) -> None:
     )
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS failure_log_project_idx ON failure_log (project_id, created_at DESC)"
+    )
+    # Preference-pair capture (training Phase 1). DPO/ORPO needs a
+    # (prompt, rejected, chosen) triple; `task` is the prompt and `error_message`
+    # is the human explanation, but the model's ACTUAL bad output was never stored
+    # — without it a correction cannot be turned into a training pair.
+    # Added as nullable columns so every existing row stays valid.
+    await conn.execute(
+        "ALTER TABLE failure_log ADD COLUMN IF NOT EXISTS rejected_output TEXT"
+    )
+    await conn.execute(
+        "ALTER TABLE failure_log ADD COLUMN IF NOT EXISTS corrected_output TEXT"
     )
     await conn.commit()

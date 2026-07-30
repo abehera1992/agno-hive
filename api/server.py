@@ -508,10 +508,17 @@ async def feedback(request: FeedbackRequest):
             f"[USER FEEDBACK] {request.notes}",
             request.project_id,
             agent="output_quality",
+            rejected_output=request.rejected_output,
+            corrected_output=request.corrected_output,
         )
+        paired = bool(request.rejected_output and request.corrected_output)
         return FeedbackResponse(
             recorded=True,
-            message="Correction recorded — will be injected into next run for this project",
+            message=(
+                "Correction recorded — will be injected into next run for this project"
+                + (" (usable as a DPO preference pair)" if paired
+                   else " (note: pass rejected_output + corrected_output to make this a training pair)")
+            ),
         )
     else:
         await record_success(request.task, request.notes or "user marked as correct", request.project_id)
