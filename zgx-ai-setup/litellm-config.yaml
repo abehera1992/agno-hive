@@ -6,6 +6,24 @@
 model_list:
   - model_name: qwen3-coder-30b
     litellm_params: {model: openai/qwen3-coder-30b, api_base: http://localhost:8003/v1, api_key: "dummy"}
+
+  # --- Phase 3 candidate registry (2026-07-30) ---------------------------------
+  # `qwen3-30b-instruct` is an ALIAS for the live baseline on :8003 — the same served
+  # process as qwen3-coder-30b, exposed under the agreed baseline identifier so eval
+  # reports name it consistently. Adds no memory.
+  - model_name: qwen3-30b-instruct
+    litellm_params: {model: openai/qwen3-coder-30b, api_base: http://localhost:8003/v1, api_key: "dummy"}
+  # `qwen3-30b-hive-v1` routes to :8005, where the MERGED BF16 candidate is served
+  # DURING the maintenance window only. This is a registry entry, NOT concurrent A/B:
+  #   * Stage D proved vLLM cannot serve a LoRA over an FP8 base (Triton `dot` rejects
+  #     fp8e4nv), so the candidate must be a separately merged checkpoint; and
+  #   * BF16 candidate (~61 GB) + FP8 baseline (~30 GB) + embed/extract does not fit a
+  #     121 GB shared pool that also hosts Postgres, Qdrant and hive-mcp.
+  # Requests to this route 502 whenever the candidate container is not up. That is the
+  # intended behaviour: it fails loudly rather than silently answering from the baseline.
+  - model_name: qwen3-30b-hive-v1
+    litellm_params: {model: openai/candidate, api_base: http://localhost:8005/v1, api_key: "dummy"}
+
   # --- optional (diverse-roster variant; not started by the all-MoE compose) ---
   - model_name: qwen2.5-coder-32b
     litellm_params: {model: openai/qwen2.5-coder-32b, api_base: http://localhost:8004/v1, api_key: "dummy"}
