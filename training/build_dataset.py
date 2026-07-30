@@ -18,14 +18,23 @@ from .schema import Record
 from .sources.patterns_md import PatternsMdSource
 from .sources.failure_log import FailureLogSource
 from .sources.postgres_sessions import PostgresSessionsSource
+from .sources.synthetic_citation import SyntheticCitationSource
 
 
-def build(patterns_path: str | None, project: str | None, postgres_uri: str | None):
+def build(
+    patterns_path: str | None,
+    project: str | None,
+    postgres_uri: str | None,
+    citation_root: str | None = None,
+    citation_per_file: int = 3,
+):
     sources = []
     if patterns_path:
         sources.append(PatternsMdSource(patterns_path))
     sources.append(FailureLogSource(postgres_uri=postgres_uri, project_id=project))
     sources.append(PostgresSessionsSource(postgres_uri=postgres_uri, project_id=project))
+    if citation_root:
+        sources.append(SyntheticCitationSource(citation_root, max_per_file=citation_per_file))
 
     kept: list[Record] = []
     seen: set[str] = set()
@@ -99,9 +108,15 @@ def main() -> None:
     ap.add_argument("--patterns", default=None, help="path to a project's patterns/ dir")
     ap.add_argument("--project", default=None, help="project_id filter for DB sources")
     ap.add_argument("--postgres-uri", default=None)
+    ap.add_argument("--citation-root", default=None,
+                    help="repo root to synthesise citation-restraint pairs from")
+    ap.add_argument("--citation-per-file", type=int, default=3)
     args = ap.parse_args()
 
-    kept, rejected, raw, kept_by_src = build(args.patterns, args.project, args.postgres_uri)
+    kept, rejected, raw, kept_by_src = build(
+        args.patterns, args.project, args.postgres_uri,
+        citation_root=args.citation_root, citation_per_file=args.citation_per_file,
+    )
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

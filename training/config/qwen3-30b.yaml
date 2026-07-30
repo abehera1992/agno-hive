@@ -1,0 +1,75 @@
+# Phase 3 recipe — QLoRA + ORPO on Qwen3-30B-A3B-Instruct-2507 (BF16 base).
+#
+# Target: Axis C (citation precision, baseline 50%). Axes A and D are already at 100%
+# — there is NO headroom there, so the ONLY acceptable outcome for them is "unchanged".
+# Every hyperparameter below is chosen to move C while disturbing A/D as little as
+# possible. When in doubt, prefer the weaker intervention.
+
+base_model: Qwen/Qwen3-30B-A3B-Instruct-2507   # BF16. The served FP8 CANNOT be tuned.
+staging_dir: /home/abehera1992/models
+output_dir: /home/abehera1992/models/adapters/worker-behaviour-v1
+
+# ── data ──────────────────────────────────────────────────────────────────────
+dataset: training/data/v2.jsonl
+# ORPO over DPO: ORPO folds the SFT term into the preference objective, so one pass
+# handles both record kinds and there is no separate reference model resident — which
+# matters on a shared 121 GB pool. Set to "dpo" only if a reference model is affordable.
+objective: orpo
+# Preference pairs are the whole point; SFT rows are ballast that protects general
+# ability. Cap them so the citation signal is not drowned 10:1.
+max_sft_records: 150
+
+# ── LoRA ──────────────────────────────────────────────────────────────────────
+lora:
+  # r=16 is deliberately modest. Citation restraint is a narrow behavioural edit, not
+  # new knowledge; higher rank buys capacity we do not need and raises the odds of
+  # eroding the guard/tool-call behaviour that is already perfect.
+  r: 16
+  alpha: 32            # 2x rank — standard, keeps effective LR sane
+  dropout: 0.0         # Unsloth's fast path; regularisation comes from few epochs
+  bias: none
+  # Attention-only. The MLP/expert projections are where factual and stylistic
+  # competence lives; leaving gate/up/down untouched is the single strongest guard
+  # against catastrophic forgetting on Axes A and D. Widen ONLY if C fails to move
+  # and the eval shows A/D holding.
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  use_gradient_checkpointing: unsloth
+
+# ── optimisation ──────────────────────────────────────────────────────────────
+train:
+  max_seq_length: 2048
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8      # effective batch 8
+  # 5e-6 is ~40x lower than the 2e-4 used for the 0.5B toy. Preference tuning on a
+  # 30B with a few hundred pairs diverges fast at SFT-scale rates; low + short is the
+  # regime that edits behaviour without rewriting it.
+  learning_rate: 5.0e-6
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.05
+  # ONE epoch. The corpus is small and repetitive (synthetic citation pairs share a
+  # template); a second pass memorises phrasing rather than learning restraint.
+  num_train_epochs: 1
+  max_steps: -1                        # epoch-bounded, not step-bounded
+  optim: adamw_8bit
+  weight_decay: 0.01
+  # ORPO: how hard the odds-ratio (preference) term pushes vs the SFT term.
+  # 0.1 is the conservative default. Raise toward 0.3 only if Axis C is flat AND
+  # A/D are unharmed — it is the main lever for "prioritise citation restraint".
+  beta: 0.1
+  bf16: true
+  seed: 42
+  logging_steps: 5
+  save_strategy: epoch
+
+# ── quantisation ──────────────────────────────────────────────────────────────
+load_in_4bit: true      # QLoRA. ~17 GB for the 30B MoE; verified path on sm_121.
+
+# ── promotion gate (Phase 3 -> 4) ─────────────────────────────────────────────
+# Evaluated on the MERGED BF16 candidate, offline, BEFORE any FP8 requantise.
+# A and D are regression guards, not targets: they are already 100%.
+gate:
+  citation_min: 0.80     # Axis C — the reason this run exists
+  grounding_min: 0.85    # Axis B
+  tool_call_min: 0.98    # Axis A — must not regress
+  guard_min: 0.98        # Axis D — must not regress
+  min_cases_per_axis: 4  # refuse to score an axis on fewer than 4 cases
