@@ -5,7 +5,9 @@
 # Every hyperparameter below is chosen to move C while disturbing A/D as little as
 # possible. When in doubt, prefer the weaker intervention.
 
-base_model: Qwen/Qwen3-30B-A3B-Instruct-2507   # BF16. The served FP8 CANNOT be tuned.
+# Local BF16 snapshot (downloaded 2026-07-30, 57 GB, 16 shards). A repo id would NOT
+# resolve here: snapshot_download used local_dir, so the weights are not in the HF cache.
+base_model: /home/abehera1992/models/Qwen3-30B-A3B-Instruct-2507
 staging_dir: /home/abehera1992/models
 
 # ── naming standard (2026-07-30) ──────────────────────────────────────────────
