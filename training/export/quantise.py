@@ -52,6 +52,13 @@ def main() -> None:
     ap.add_argument("--out", required=True, help="FP8 output dir")
     ap.add_argument("--ignore", nargs="*", default=None,
                     help="modules to leave unquantised (default: lm_head + MoE router)")
+    ap.add_argument("--check", action="store_true",
+                    help="resolve imports and build the recipe, then exit without loading "
+                         "the model. Run this BEFORE opening a maintenance window: it "
+                         "exercises the real file in the real container, so a stale "
+                         "checkout or a moved API fails in seconds with hive still up "
+                         "instead of 60s into a window (which is how 2026-07-30's first "
+                         "attempt aborted — /repo was one commit behind the import fix).")
     a = ap.parse_args()
 
     ignore = a.ignore if a.ignore is not None else DEFAULT_IGNORE
@@ -72,6 +79,11 @@ def main() -> None:
         from llmcompressor.transformers import oneshot
 
     recipe = QuantizationModifier(targets="Linear", scheme="FP8_DYNAMIC", ignore=ignore)
+
+    if a.check:
+        print(f"[quantise] --check OK: oneshot resolved from {oneshot.__module__}, "
+              f"recipe {type(recipe).__name__} built. Not loading the model.")
+        return
 
     oneshot(model=a.model, recipe=recipe, output_dir=a.out)
 
