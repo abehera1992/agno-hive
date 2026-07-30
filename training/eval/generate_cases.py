@@ -177,22 +177,36 @@ def guard_cases(patterns: Path, target: int) -> tuple[list[dict], list[int]]:
             held.append(num)
             rationale = body[: body.find("```")].strip()[:400]
             # Tokens the correct form has and the wrong form does not.
-            ctok = {t for t in re.findall(r"[\w().]{4,}", correct)}
-            wtok = {t for t in re.findall(r"[\w().]{4,}", wrong)}
+            # Extract tokens from CODE ONLY. Naive extraction over the whole block
+            # pulled words out of comments and prose — one case required 'Reading' and
+            # forbade 'HALLUCINATION' (both from comment text), another forbade 'after',
+            # an ordinary English word that appears in any correct explanation. Those
+            # cases scored a competent model at 0 and dragged Axis D to 23%.
+            def code_tokens(block: str) -> set[str]:
+                body = "\n".join(
+                    ln.split("#")[0].split("//")[0]
+                    for ln in block.splitlines()
+                    if ln.strip() and not ln.strip().startswith(("#", "//"))
+                )
+                return {
+                    t for t in re.findall(r"[\w().\[\]]{4,}", body)
+                    # Must look like CODE, not prose: a call, an attribute access, a
+                    # snake_case or CamelCase identifier. And never a doc placeholder.
+                    if ("..." not in t)
+                    and ("(" in t or "." in t or "_" in t or not t.islower())
+                }
+
+            ctok, wtok = code_tokens(correct), code_tokens(wrong)
             required = sorted(ctok - wtok)[:2]
             forbidden = sorted(wtok - ctok)[:2]
             if not required:
-                # Some guards differ by ORDERING or whitespace rather than by any token
-                # unique to the correct form (e.g. GUARD 6). Set-difference finds nothing,
-                # but the case is still worth scoring — fall back to the most distinctive
-                # code line of the correct form so the guard is not silently dropped.
-                code_lines = [
-                    ln.strip() for ln in correct.splitlines()
-                    if ln.strip() and not ln.strip().startswith(("#", "//"))
-                ]
-                if not code_lines:
-                    continue
-                required = [max(code_lines, key=len)[:60]]
+                # Guards that differ only by ORDERING or whitespace have no token unique
+                # to the correct form, so substring scoring cannot express them at all.
+                # SKIP them: a case whose pass condition is not checkable produces a
+                # confident-looking score with no meaning behind it. Axis D is a
+                # regression guard, and a smaller trustworthy set beats a larger noisy one.
+                # (skipped - see comment above)
+                continue
             out.append({
                 "id": f"D-guard{num}",
                 "kind": "guard",
