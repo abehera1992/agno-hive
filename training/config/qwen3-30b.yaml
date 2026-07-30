@@ -13,14 +13,14 @@ staging_dir: /home/abehera1992/models
 # ── naming standard (2026-07-30) ──────────────────────────────────────────────
 # candidate : qwen3-30b-hive-v1   <- the tuned artifact
 # baseline  : qwen3-30b-instruct  <- the untuned reference the gate compares against
-candidate_name: qwen3-30b-hive-v1
+candidate_name: qwen3-30b-hive-v2
 baseline_name: qwen3-30b-instruct
 
 # LoRA adapter lands here. The MERGED BF16 checkpoint is written separately by
 # export/merge.py --out; keep the two apart so a failed merge cannot clobber the
 # adapter that produced it.
-output_dir: checkpoints/qwen3-30b-hive-v1
-merged_dir: checkpoints/qwen3-30b-hive-v1-merged-bf16
+output_dir: checkpoints/qwen3-30b-hive-v2
+merged_dir: checkpoints/qwen3-30b-hive-v2-merged-bf16
 
 # ── data ──────────────────────────────────────────────────────────────────────
 dataset: training/data/corpus_v2.jsonl
@@ -58,11 +58,14 @@ lora:
   alpha: 32            # 2x rank — standard, keeps effective LR sane
   dropout: 0.0         # Unsloth's fast path; regularisation comes from few epochs
   bias: none
-  # Attention-only. The MLP/expert projections are where factual and stylistic
-  # competence lives; leaving gate/up/down untouched is the single strongest guard
-  # against catastrophic forgetting on Axes A and D. Widen ONLY if C fails to move
-  # and the eval shows A/D holding.
-  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  # v2 (2026-07-30): widened from attention-only to all 7 linear projections after v1
+  # came out completely INERT (reward margins negative, every axis delta 0.000).
+  # Listed EXPLICITLY rather than as the string "all-linear": on a 128-expert MoE,
+  # "all-linear" can also attach to every expert's projections, which would multiply
+  # trainable params and VRAM unpredictably. This list is the intended "all 7".
+  # This is the lever most likely to cause catastrophic forgetting on A/D - the gate's
+  # no-regression check is what catches it.
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
   use_gradient_checkpointing: unsloth
 
 # ── optimisation ──────────────────────────────────────────────────────────────
@@ -70,22 +73,20 @@ train:
   max_seq_length: 2048
   per_device_train_batch_size: 1
   gradient_accumulation_steps: 8      # effective batch 8
-  # 5e-6 is ~40x lower than the 2e-4 used for the 0.5B toy. Preference tuning on a
-  # 30B with a few hundred pairs diverges fast at SFT-scale rates; low + short is the
-  # regime that edits behaviour without rewriting it.
-  learning_rate: 5.0e-6
+  # v2: 5e-6 -> 2e-5 (4x). At 5e-6 over 24 steps the run was inert; nothing moved.
+  learning_rate: 2.0e-5
   lr_scheduler_type: cosine
   warmup_ratio: 0.05
-  # ONE epoch. The corpus is small and repetitive (synthetic citation pairs share a
-  # template); a second pass memorises phrasing rather than learning restraint.
-  num_train_epochs: 1
+  # v2: 1 -> 4 epochs (24 -> ~96 optimiser steps). 24 steps was too few to move a 30B.
+  # Watch for the memorisation risk the v1 comment warned about: the synthetic citation
+  # pairs share a template, so over-training can teach the PHRASING of restraint rather
+  # than restraint itself. Axis C rising while B/D fall would be that signature.
+  num_train_epochs: 4
   max_steps: -1                        # epoch-bounded, not step-bounded
   optim: adamw_8bit
   weight_decay: 0.01
-  # ORPO: how hard the odds-ratio (preference) term pushes vs the SFT term.
-  # 0.1 is the conservative default. Raise toward 0.3 only if Axis C is flat AND
-  # A/D are unharmed — it is the main lever for "prioritise citation restraint".
-  beta: 0.1
+  # v2: 0.1 -> 0.3. Main lever for "prioritise citation restraint".
+  beta: 0.3
   bf16: true
   seed: 42
   logging_steps: 5

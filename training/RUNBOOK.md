@@ -185,8 +185,12 @@ kill it — something is not in 4-bit.
 Serve the **merged BF16** on a spare port (8005) so the real coordinator config is untouched:
 
 ```bash
+# --entrypoint vllm is REQUIRED. docker-compose.yml sets entrypoint: ["vllm"], but a
+# bare `docker run` does NOT inherit it — without the flag this fails instantly with
+# `Error: No such command '/model'` (hit for real on 2026-07-30).
 docker run -d --name vllm-candidate --device nvidia.com/gpu=all \
-  -v /home/abehera1992/models/merged/worker-v1-bf16:/model:ro \
+  --entrypoint vllm \
+  -v /home/abehera1992/agno-hive/checkpoints/qwen3-30b-hive-v2-merged-bf16:/model:ro \
   -p 8005:8000 timothystewart6/vllm-gb10:latest \
   serve /model --served-model-name candidate \
   --enable-auto-tool-choice --tool-call-parser hermes \
@@ -204,11 +208,17 @@ docker run -d --name vllm-candidate --device nvidia.com/gpu=all \
 ### e) Gate
 
 ```bash
+# NEVER read $? straight after a pipe — it reports the LAST command's status, not the
+# gate's. Piping through `tail` on 2026-07-30 printed "GATE exit=0" for a run that had
+# actually exited 1 (DO NOT PROMOTE). A promotion decision read off the wrong exit code
+# is the most dangerous mistake available in this runbook.
 ~/miniforge3/envs/zgx/bin/python -m training.eval.gate \
   --config training/config/qwen3-30b.yaml \
   --baseline training/eval/baseline.json \
-  --candidate training/eval/candidate.json
-echo "exit=$?"    # 0 = promote, 1 = do not promote
+  --candidate training/eval/candidate.json 2>&1 | tee /tmp/gate_v2.log
+GATE_RC=${PIPESTATUS[0]}          # <- the GATE's status, not tee's
+echo "gate exit=$GATE_RC"         # 0 = promote, 1 = do not promote
+[ "$GATE_RC" -eq 0 ] || echo ">>> DO NOT QUANTISE <<<"
 ```
 
 Enforces C ≥ 0.80, B ≥ 0.85, A ≥ 0.98, D ≥ 0.98, **plus** no regression >2 pts on any
