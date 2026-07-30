@@ -177,7 +177,17 @@ def guard_cases(patterns: Path, target: int) -> tuple[list[dict], list[int]]:
             required = sorted(ctok - wtok)[:2]
             forbidden = sorted(wtok - ctok)[:2]
             if not required:
-                continue
+                # Some guards differ by ORDERING or whitespace rather than by any token
+                # unique to the correct form (e.g. GUARD 6). Set-difference finds nothing,
+                # but the case is still worth scoring — fall back to the most distinctive
+                # code line of the correct form so the guard is not silently dropped.
+                code_lines = [
+                    ln.strip() for ln in correct.splitlines()
+                    if ln.strip() and not ln.strip().startswith(("#", "//"))
+                ]
+                if not code_lines:
+                    continue
+                required = [max(code_lines, key=len)[:60]]
             out.append({
                 "id": f"D-guard{num}",
                 "kind": "guard",
