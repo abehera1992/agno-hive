@@ -291,6 +291,11 @@ def main() -> None:
     ap.add_argument("--src", required=True, help="dir of fetched EkamApp source")
     ap.add_argument("--patterns", required=True, help="dir of fetched patterns/*.md")
     ap.add_argument("--per-axis", type=int, default=16)
+    ap.add_argument("--auto-guards", type=int, default=0,
+                    help="how many AUTO-GENERATED Axis D cases to emit. Default 0: they "
+                         "require example-specific literals (db.add(invite), old_used) and so "
+                         "test memorisation of the doc example rather than the rule. Axis D is "
+                         "covered by hand-authored token-based cases in captured/ instead.")
     ap.add_argument("--seed", type=int, default=11)
     a = ap.parse_args()
 
@@ -299,7 +304,10 @@ def main() -> None:
 
     cites = citation_cases(Path(a.src), a.per_axis, rng)
     grounds = grounding_cases(Path(a.src), a.per_axis, rng)
-    guards, held = guard_cases(Path(a.patterns), a.per_axis)
+    guards, held = guard_cases(Path(a.patterns), a.auto_guards) if a.auto_guards else ([], [])
+    if not a.auto_guards:
+        # Holdout list is still needed for --exclude-guards even when not emitting cases.
+        _, held = guard_cases(Path(a.patterns), 99)
     tools = tool_cases(a.per_axis)
 
     n_cap = 0
@@ -315,7 +323,8 @@ def main() -> None:
 
     print(f"citation : {len(cites)}")
     print(f"grounding: {len(grounds)}")
-    print(f"guard    : {len(guards)}   (EVAL-ONLY guards held out: {sorted(held)})")
+    print(f"guard    : {len(guards)} auto  (+ hand-authored in captured/)"
+          f"   EVAL-ONLY guards held out: {sorted(held)}")
     print(f"tool_call: {len(tools)}")
     print(f"captured : {n_cap}  (real production failures — hand-authored)")
     print(f"\nwrote to {CASES_DIR}")
