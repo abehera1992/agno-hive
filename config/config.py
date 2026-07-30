@@ -78,5 +78,11 @@ class Config:
     compact_threshold: int = int(os.getenv("AGNO_COMPACT_THRESHOLD", "20"))
     session_cleanup_interval: int = int(os.getenv("SESSION_CLEANUP_INTERVAL", "3600"))
 
+    # Self-improvement loop — how many recent failures load_failure_context replays
+    # into the coordinator. Was hard-coded at 3; corrections older than that silently
+    # rolled off and the swarm re-offended. Raise for a longer correction memory,
+    # lower if the injected block starts crowding the context window.
+    failure_context_limit: int = int(os.getenv("AGNO_FAILURE_CONTEXT_LIMIT", "10"))
+
 
 config = Config()

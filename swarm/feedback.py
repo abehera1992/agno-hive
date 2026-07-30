@@ -111,11 +111,18 @@ async def record_failure(task: str, error: str, project_id: str, agent: str = "u
 
 # ── Context loader ────────────────────────────────────────────────────────────
 
-async def load_failure_context(project_id: str, limit: int = 3) -> str:
-    """Return a formatted string of recent failures to inject into coordinator instructions."""
+async def load_failure_context(project_id: str, limit: int | None = None) -> str:
+    """Return a formatted string of recent failures to inject into coordinator instructions.
+
+    `limit` defaults to config.failure_context_limit (env AGNO_FAILURE_CONTEXT_LIMIT,
+    default 10). Pass an explicit int to override per call.
+    """
     try:
         import psycopg
         from config.config import config
+
+        if limit is None:
+            limit = config.failure_context_limit
 
         async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
             await _ensure_table(conn)
