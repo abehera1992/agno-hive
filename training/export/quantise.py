@@ -60,11 +60,20 @@ def main() -> None:
     print(f"[quantise] ignore: {ignore}")
 
     from llmcompressor.modifiers.quantization import QuantizationModifier
-    from llmcompressor.transformers import oneshot
+    try:
+        # llmcompressor >= 0.4 exposes oneshot at the top level.
+        from llmcompressor import oneshot
+    except ImportError:  # pragma: no cover - only hit if pip resolves an old release
+        # <= 0.3 kept it under .transformers. Pinning compressed-tensors==0.17.0 to match
+        # vLLM's pin makes pip resolve BACKWARDS to 0.3.0, so this path is reachable by
+        # accident; verified 2026-07-30. Let llmcompressor bring its own
+        # compressed-tensors (0.17.1) instead — the on-disk FP8 format is unchanged at
+        # patch level and the serving container still loads it with 0.17.0.
+        from llmcompressor.transformers import oneshot
 
     recipe = QuantizationModifier(targets="Linear", scheme="FP8_DYNAMIC", ignore=ignore)
 
-    oneshot(model=a.model, recipe=recipe, output_dir=a.out, tie_word_embeddings=True)
+    oneshot(model=a.model, recipe=recipe, output_dir=a.out)
 
     out = Path(a.out)
     shards = sorted(out.glob("*.safetensors"))
