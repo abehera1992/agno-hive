@@ -89,4 +89,9 @@ gate:
   grounding_min: 0.85    # Axis B
   tool_call_min: 0.98    # Axis A — must not regress
   guard_min: 0.98        # Axis D — must not regress
-  min_cases_per_axis: 4  # refuse to score an axis on fewer than 4 cases
+  # Raised 4 -> 12 after the Phase 2.5 expansion (2026-07-30). At n=4 the score
+  # granularity is 25 points, so a ">=0.80" floor really meant "100%" and a single case
+  # flipping moved the whole gate. The suite now carries >=15 cases per axis
+  # (C=16, B=16, D=15, A=16), giving ~6-point resolution. 12 leaves headroom for a few
+  # cases to be retired without silently disabling the check.
+  min_cases_per_axis: 12
