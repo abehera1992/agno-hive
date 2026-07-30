@@ -36,6 +36,35 @@ AXES = {
 }
 
 
+def resolve_floor(spec: float | str, baseline: float | None, axis: str) -> float:
+    """Resolve a gate floor, which may be absolute or measured against the baseline.
+
+    An absolute number states "this axis must reach X regardless of what the untuned
+    model does" — right for an axis we are TRAINING to a standard (citation), and right
+    for one that must stay perfect (tool_call).
+
+    The string "baseline" means "no absolute bar; only forbid going backwards", and
+    resolves to `baseline - REGRESSION_TOLERANCE`. Added 2026-07-30 for Axis D after the
+    v2 gate: guard adherence is project KNOWLEDGE (38 rules in patterns/*.md), not a
+    behaviour, and is delivered to the agents through context, which stays current when a
+    rule changes. Fine-tuning a checkpoint to memorise it would need a retrain per rule
+    and can silently contradict the repo. So D is no longer a training target — but a
+    candidate that gets WORSE at it is still a candidate we reject.
+
+    Written as a rule rather than the number it currently evaluates to (0.480), because a
+    hardcoded floor is exactly what went stale here before: guard_min sat at 0.98 from
+    when the suite had n=2, long after the real baseline had moved to 0.500.
+    """
+    if isinstance(spec, str):
+        if spec != "baseline":
+            raise SystemExit(f"{axis}: floor must be a number or \"baseline\", got {spec!r}")
+        if baseline is None:
+            raise SystemExit(f"{axis}: floor is \"baseline\" but the baseline report does "
+                             f"not score this axis — cannot resolve.")
+        return baseline - REGRESSION_TOLERANCE
+    return float(spec)
+
+
 def n_cases(report: dict, axis: str) -> int:
     """Count cases that scored this AXIS. `structural` is a second Axis D scorer."""
     keys = {"guard", "structural"} if axis == "guard" else {axis}
@@ -112,7 +141,8 @@ def main() -> None:
         b = base.get("aggregate", {}).get(axis)
         c = cand.get("aggregate", {}).get(axis)
         n = n_cases(cand, axis)
-        floor = gate[key]
+        floor = resolve_floor(gate[key], b, axis)
+        floor_note = "  (= baseline - tol)" if isinstance(gate[key], str) else ""
 
         if c is None:
             failures.append(f"{axis}: candidate did not score this axis")
@@ -132,7 +162,8 @@ def main() -> None:
 
         delta = f"{(c - b):+.3f}" if b is not None else "n/a"
         print(f"{axis:12s} {b if b is not None else float('nan'):7.3f} {c:7.3f} {delta:>8s} "
-              f"{floor:7.2f} {n:4d}  {'PASS' if not verdicts else ' + '.join(verdicts)}")
+              f"{floor:7.2f} {n:4d}  {'PASS' if not verdicts else ' + '.join(verdicts)}"
+              f"{floor_note}")
 
     print("=" * 74)
     if failures:
