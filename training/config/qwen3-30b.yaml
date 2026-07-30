@@ -10,14 +10,31 @@ staging_dir: /home/abehera1992/models
 output_dir: /home/abehera1992/models/adapters/worker-behaviour-v1
 
 # ── data ──────────────────────────────────────────────────────────────────────
-dataset: training/data/v2.jsonl
-# ORPO over DPO: ORPO folds the SFT term into the preference objective, so one pass
-# handles both record kinds and there is no separate reference model resident — which
-# matters on a shared 121 GB pool. Set to "dpo" only if a reference model is affordable.
+dataset: training/data/corpus_v2.jsonl
+#
+# TRAINS ON PREFERENCE PAIRS ONLY (decision 2026-07-30). Expected composition:
+#   162  synthetic_citation  (81 with_excerpt + 81 no_excerpt)  <- Axis C, the target
+#    31  patterns_md         (WRONG -> CORRECT guard pairs)     <- Axis D regression guard
+#     2  failure_log         (captured failures, ids 61/62)
+#   ---
+#   195  pairs handed to the trainer
+#
+# The 345 `kind: sft` rows in the same file are IGNORED BY DESIGN, not by oversight:
+#   * 287 come from postgres_sessions — UNVERIFIED past hive outputs. 46 of them assert
+#     line numbers nobody checked. The source filters catch error envelopes and refusals,
+#     but a confidently FABRICATED citation reads exactly like a good answer and passes
+#     through. Training on them would teach fluent fabrication while the 162 synthetic
+#     pairs teach restraint — a corpus arguing with itself, unverified side winning 287:162.
+#   * They are also redundant: ORPO applies an SFT cross-entropy term to the `chosen`
+#     response of every pair, so the preference set carries its own regularisation.
+#     No separate SFT ballast is needed to protect general ability.
+# To reintroduce SFT later, VERIFY it first (check each line claim against the repo and
+# drop the ones that fail) rather than trusting the source filter.
+#
+# ORPO over DPO: folds the SFT term into the preference objective AND needs no separate
+# reference model resident — which matters on a shared 121 GB pool. Use "dpo" only if a
+# reference model is affordable.
 objective: orpo
-# Preference pairs are the whole point; SFT rows are ballast that protects general
-# ability. Cap them so the citation signal is not drowned 10:1.
-max_sft_records: 150
 
 # ── LoRA ──────────────────────────────────────────────────────────────────────
 lora:

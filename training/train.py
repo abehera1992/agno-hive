@@ -5,6 +5,24 @@
 Model-agnostic by construction: base id, target modules and every hyperparameter come
 from the config, never from this file. Swapping the served model is a YAML edit.
 
+TRAINS ON PREFERENCE PAIRS ONLY (decision 2026-07-30)
+-----------------------------------------------------
+Any `kind: "sft"` rows in the dataset are IGNORED and reported as such. Two reasons:
+
+  1. Poisoning. The SFT rows come from `postgres_sessions` — unverified past hive
+     outputs. 46 of 287 assert line numbers that nobody checked; the source filters
+     catch error envelopes and refusals, but a confidently FABRICATED citation looks
+     exactly like a good answer and passes straight through. Training on them would
+     teach fluent fabrication while the synthetic pairs teach the opposite — a corpus
+     arguing with itself, with the unverified side outnumbering the verified one.
+
+  2. Redundancy. ORPO's objective already applies an SFT cross-entropy term to the
+     `chosen` response of every pair, so the preference set carries its own
+     regularisation. Separate SFT ballast is unnecessary as well as risky.
+
+To reintroduce SFT later, VERIFY it first (check every line claim against the repo and
+drop the ones that do not hold) rather than trusting the source filter.
+
 Run this in the `zgx-train` env ONLY. Installing unsloth into the serving env (`zgx`)
 will bump torch out from under vLLM — see AGNOHive 2.3, risk #3 (materialised).
 """
@@ -13,8 +31,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import time
+from collections import Counter
 from pathlib import Path
 
 import yaml
@@ -24,42 +42,68 @@ def load_jsonl(path: str) -> list[dict]:
     return [json.loads(l) for l in Path(path).read_text(encoding="utf-8").splitlines() if l.strip()]
 
 
+def summarise(rows: list[dict]) -> tuple[list[dict], str]:
+    """Split the corpus and build an honest, itemised telemetry block.
+
+    Reports the composition of what ACTUALLY trains plus what was skipped, so the log
+    can never imply a record contributed when it did not.
+    """
+    prefs = [r for r in rows if r.get("kind") == "pref"]
+    skipped = [r for r in rows if r.get("kind") != "pref"]
+
+    lines = [f"corpus file      : {len(rows)} records"]
+    lines.append(f"TRAINING ON     : {len(prefs)} preference pairs (ORPO/DPO)")
+    for (src, shape), n in Counter(
+        (r["source"], r.get("meta", {}).get("shape", "-")) for r in prefs
+    ).most_common():
+        label = f"{src}/{shape}" if shape != "-" else src
+        lines.append(f"                    {n:5d}  {label}")
+
+    if skipped:
+        lines.append(f"IGNORED         : {len(skipped)} non-preference records "
+                     f"(sft rows are excluded by design — see module docstring)")
+        for src, n in Counter(r["source"] for r in skipped).most_common():
+            lines.append(f"                    {n:5d}  {src}")
+    return prefs, "\n".join(lines)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--dry-run", action="store_true",
-                    help="build datasets + print the plan, load no weights")
+                    help="build the dataset + print the plan, load no weights")
     a = ap.parse_args()
 
     cfg = yaml.safe_load(Path(a.config).read_text(encoding="utf-8"))
     lora, tr = cfg["lora"], cfg["train"]
 
     rows = load_jsonl(cfg["dataset"])
-    prefs = [r for r in rows if r["kind"] == "pref"]
-    sfts = [r for r in rows if r["kind"] == "sft"][: cfg.get("max_sft_records", 0)]
+    prefs, telemetry = summarise(rows)
+    print(telemetry)
 
-    print(f"corpus: {len(rows)} rows -> {len(prefs)} preference, {len(sfts)} sft (capped)")
+    if not prefs:
+        raise SystemExit("no preference pairs in the corpus — nothing to train on")
     if len(prefs) < 50:
         print("\n  !! WARNING: fewer than 50 preference pairs. A behavioural edit on a 30B")
         print("     model is unlikely to move an eval axis at this volume, and will")
         print("     overfit the phrasing of what little is there. Expand the corpus")
-        print("     (see training/sources/synthetic_citation.py) before spending a")
-        print("     maintenance window on this run.\n")
+        print("     (training/sources/synthetic_citation.py) before spending a window.\n")
 
     if a.dry_run:
         print("\n--- DRY RUN — no weights loaded ---")
         print(f"base            : {cfg['base_model']}")
-        print(f"objective       : {cfg['objective']}")
+        print(f"objective       : {cfg['objective']}  (implicit SFT on `chosen`)")
         print(f"lora            : r={lora['r']} alpha={lora['alpha']} modules={lora['target_modules']}")
         print(f"lr / epochs     : {tr['learning_rate']} / {tr['num_train_epochs']}")
-        print(f"eff. batch      : {tr['per_device_train_batch_size']} x {tr['gradient_accumulation_steps']}")
+        print(f"eff. batch      : {tr['per_device_train_batch_size']} x {tr['gradient_accumulation_steps']}"
+              f" = {tr['per_device_train_batch_size'] * tr['gradient_accumulation_steps']}")
+        print(f"steps/epoch     : ~{len(prefs) // (tr['per_device_train_batch_size'] * tr['gradient_accumulation_steps'])}")
         print(f"output          : {cfg['output_dir']}")
-        if prefs:
-            p = prefs[0]
-            print("\nsample pair:")
-            print("  prompt  :", p["prompt"][:110].replace("\n", " "))
-            print("  chosen  :", p["chosen"][:110].replace("\n", " "))
-            print("  rejected:", p["rejected"][:110].replace("\n", " "))
+        p = prefs[0]
+        print("\nsample pair:")
+        print("  prompt  :", p["prompt"][:110].replace("\n", " "))
+        print("  chosen  :", p["chosen"][:110].replace("\n", " "))
+        print("  rejected:", p["rejected"][:110].replace("\n", " "))
         return
 
     # Heavy imports only on a real run — unsloth must be imported before transformers.
@@ -87,45 +131,35 @@ def main() -> None:
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[train] LoRA attached — {trainable:,} trainable params")
 
+    # The ONLY dataset handed to the trainer: prompt / chosen / rejected.
     ds = Dataset.from_list([
         {"prompt": r["prompt"], "chosen": r["chosen"], "rejected": r["rejected"]}
         for r in prefs
     ])
+    print(f"[train] dataset -> {len(ds)} rows, columns {ds.column_names}")
 
     obj = cfg["objective"].lower()
+    common = dict(
+        per_device_train_batch_size=tr["per_device_train_batch_size"],
+        gradient_accumulation_steps=tr["gradient_accumulation_steps"],
+        learning_rate=tr["learning_rate"],
+        lr_scheduler_type=tr["lr_scheduler_type"],
+        warmup_ratio=tr["warmup_ratio"],
+        num_train_epochs=tr["num_train_epochs"],
+        optim=tr["optim"], weight_decay=tr["weight_decay"],
+        beta=tr["beta"], bf16=tr["bf16"], seed=tr["seed"],
+        logging_steps=tr["logging_steps"], save_strategy=tr["save_strategy"],
+        max_length=tr["max_seq_length"],
+        output_dir=cfg["output_dir"], report_to="none",
+    )
+
     if obj == "orpo":
         from trl import ORPOConfig, ORPOTrainer
-        args = ORPOConfig(
-            per_device_train_batch_size=tr["per_device_train_batch_size"],
-            gradient_accumulation_steps=tr["gradient_accumulation_steps"],
-            learning_rate=tr["learning_rate"],
-            lr_scheduler_type=tr["lr_scheduler_type"],
-            warmup_ratio=tr["warmup_ratio"],
-            num_train_epochs=tr["num_train_epochs"],
-            optim=tr["optim"], weight_decay=tr["weight_decay"],
-            beta=tr["beta"], bf16=tr["bf16"], seed=tr["seed"],
-            logging_steps=tr["logging_steps"], save_strategy=tr["save_strategy"],
-            max_length=tr["max_seq_length"],
-            output_dir=cfg["output_dir"], report_to="none",
-        )
-        trainer = ORPOTrainer(model=model, args=args, train_dataset=ds,
-                              processing_class=tokenizer)
+        trainer = ORPOTrainer(model=model, args=ORPOConfig(**common),
+                              train_dataset=ds, processing_class=tokenizer)
     elif obj == "dpo":
         from trl import DPOConfig, DPOTrainer
-        args = DPOConfig(
-            per_device_train_batch_size=tr["per_device_train_batch_size"],
-            gradient_accumulation_steps=tr["gradient_accumulation_steps"],
-            learning_rate=tr["learning_rate"],
-            lr_scheduler_type=tr["lr_scheduler_type"],
-            warmup_ratio=tr["warmup_ratio"],
-            num_train_epochs=tr["num_train_epochs"],
-            optim=tr["optim"], weight_decay=tr["weight_decay"],
-            beta=tr["beta"], bf16=tr["bf16"], seed=tr["seed"],
-            logging_steps=tr["logging_steps"], save_strategy=tr["save_strategy"],
-            max_length=tr["max_seq_length"],
-            output_dir=cfg["output_dir"], report_to="none",
-        )
-        trainer = DPOTrainer(model=model, ref_model=None, args=args,
+        trainer = DPOTrainer(model=model, ref_model=None, args=DPOConfig(**common),
                              train_dataset=ds, processing_class=tokenizer)
     else:
         raise SystemExit(f"unknown objective {obj!r} (want 'orpo' or 'dpo')")
