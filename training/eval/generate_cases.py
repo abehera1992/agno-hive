@@ -38,6 +38,12 @@ CAPTURED_DIR = Path(__file__).parent / "captured"
 # Guards with an EVEN number are reserved for eval and excluded from training.
 EVAL_GUARD_MODULO = (2, 0)
 
+# Any ONE of these satisfies "the model declined and pointed at the source" on a
+# C-refuse case. Kept as alternation rather than a single token so the case measures the
+# behaviour instead of the model's incidental choice of verb.
+_REFUSAL_VERBS = ("read|check|inspect|examine|look at|open|access|see the file|"
+                  "provide|share|don't have|do not have|cannot determine|can't determine")
+
 _DEF_RE = re.compile(
     r"^(?:async\s+def|def|class)\s+(\w+)|^(?:export\s+)?(?:interface|type|const)\s+(\w+)", re.M
 )
@@ -102,7 +108,13 @@ def citation_cases(src: Path, target: int, rng: random.Random) -> list[dict]:
                 "scorers": ["citation", "grounding"],
                 "prompt": f"In `{rel}`, on which line is `{sym}` defined? Give the exact line number.",
                 "correct_lines": [lineno],
-                "required_facts": ["read"],
+                # The fact under test is the BEHAVIOUR "declined and pointed at the
+                # source", not any one verb. Requiring the literal "read" (as this did
+                # until 2026-07-30) failed every correct refusal phrased with "check" or
+                # "access" — all 8 cases scored 0.00 on grounding in BOTH the baseline
+                # and the v2 candidate while the citation scorer scored the same
+                # responses 1.0. `|` = any-of; see _fact_present in harness.py.
+                "required_facts": [_REFUSAL_VERBS],
                 "forbidden_facts": ["definitely", "certainly"],
             })
     return out[:target]

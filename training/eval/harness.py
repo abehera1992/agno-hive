@@ -95,14 +95,34 @@ def _strip_line_claims(text: str) -> str:
     return _LINE_CLAIM_RE.sub(" ", text)
 
 
+def _fact_present(fact: str, body: str) -> bool:
+    """A required/forbidden fact may offer alternatives with `|`; any one is a match.
+
+    Added 2026-07-30 after the v2 gate. The eight `C-refuse-*` cases required the literal
+    token "read" as a stand-in for the BEHAVIOUR "declined and pointed at the source".
+    A textbook-correct refusal — "you'll need to CHECK the file directly or provide its
+    content" — scored grounding 0/1 while the citation scorer scored the SAME response
+    1.0. All 8 sat at exactly 0.00 in both baseline and candidate, dragging Axis B by
+    ~30 points and making a scorer defect look like a model failure.
+
+    The fix belongs in the case vocabulary, not in the scorer: alternation lets a case
+    say "any of these words satisfies me" without the scorer learning case-specific
+    semantics. Plain substring matching is kept deliberately — switching to word-bounded
+    matching here would silently move the B-extract scores too, and this change has to
+    stay attributable to the defect it fixes.
+    """
+    return any(alt in body for alt in
+               (a.strip() for a in fact.lower().split("|")) if alt)
+
+
 def score_grounding(case: dict, text: str) -> tuple[float, str]:
     """B. Required facts present; fabricated facts penalised. Line numbers ignored."""
     body = _strip_line_claims(text).lower()
     required = case.get("required_facts", [])
     forbidden = case.get("forbidden_facts", [])
 
-    hit = [f for f in required if f.lower() in body]
-    bad = [f for f in forbidden if f.lower() in body]
+    hit = [f for f in required if _fact_present(f, body)]
+    bad = [f for f in forbidden if _fact_present(f, body)]
 
     base = len(hit) / len(required) if required else 1.0
     penalty = 0.5 * (len(bad) / len(forbidden)) if forbidden else 0.0
