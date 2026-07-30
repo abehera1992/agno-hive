@@ -29,6 +29,11 @@ import re
 from pathlib import Path
 
 CASES_DIR = Path(__file__).parent / "cases"
+# Real production failures, hand-authored and version-controlled. Copied into cases/ on
+# every regeneration and NEVER auto-generated: their prompts are LEADING (E-1
+# presupposes the answer exists), which is materially harder than the blunt generated
+# C-refuse prompts the model refuses easily. A suite without them overstates the model.
+CAPTURED_DIR = Path(__file__).parent / "captured"
 
 # Guards with an EVEN number are reserved for eval and excluded from training.
 EVAL_GUARD_MODULO = (2, 0)
@@ -283,6 +288,12 @@ def main() -> None:
     guards, held = guard_cases(Path(a.patterns), a.per_axis)
     tools = tool_cases(a.per_axis)
 
+    n_cap = 0
+    for src_case in sorted(CAPTURED_DIR.glob("*.json")):
+        (CASES_DIR / src_case.name).write_text(
+            src_case.read_text(encoding="utf-8"), encoding="utf-8")
+        n_cap += 1
+
     for group in (cites, grounds, guards, tools):
         for c in group:
             (CASES_DIR / f"{c['id']}.json").write_text(
@@ -292,6 +303,7 @@ def main() -> None:
     print(f"grounding: {len(grounds)}")
     print(f"guard    : {len(guards)}   (EVAL-ONLY guards held out: {sorted(held)})")
     print(f"tool_call: {len(tools)}")
+    print(f"captured : {n_cap}  (real production failures — hand-authored)")
     print(f"\nwrote to {CASES_DIR}")
     print("\nIMPORTANT: rebuild the training corpus with --exclude-guards "
           f"\"{','.join(map(str, sorted(held)))}\" so Axis D is not scored on training data.")

@@ -129,13 +129,26 @@ def score_citation(case: dict, text: str) -> tuple[float, str]:
     return score, f"asserted {claimed}; correct {right or '[]'}; FABRICATED {wrong or '[]'}"
 
 
+def _token_present(token: str, text: str) -> bool:
+    """Substring match, but word-bounded for bare identifiers.
+
+    Naive `in` matching auto-failed correct answers: a case with
+    forbidden=["Session"] and required=["AsyncSession"] flagged a VIOLATION on the
+    correct code, because "Session" is a substring of "AsyncSession". Identifiers are
+    matched on word boundaries; anything containing punctuation (e.g. "db.execute(")
+    falls back to plain substring, where boundaries do not apply.
+    """
+    if re.fullmatch(r"\w+", token):
+        return re.search(rf"(?<!\w){re.escape(token)}(?!\w)", text, re.I) is not None
+    return token.lower() in text.lower()
+
+
 def score_guard(case: dict, text: str) -> tuple[float, str]:
-    """D. Guard adherence via required/forbidden substrings."""
+    """D. Guard adherence via required/forbidden tokens (word-bounded for identifiers)."""
     req = case.get("guard_required", [])
     forb = case.get("guard_forbidden", [])
-    low = text.lower()
-    hit = [s for s in req if s.lower() in low]
-    bad = [s for s in forb if s.lower() in low]
+    hit = [s for s in req if _token_present(s, text)]
+    bad = [s for s in forb if _token_present(s, text)]
     base = len(hit) / len(req) if req else 1.0
     score = 0.0 if bad else base
     detail = f"required {len(hit)}/{len(req)}"
