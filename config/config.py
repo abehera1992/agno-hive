@@ -79,10 +79,15 @@ class Config:
     session_cleanup_interval: int = int(os.getenv("SESSION_CLEANUP_INTERVAL", "3600"))
 
     # Self-improvement loop — how many recent failures load_failure_context replays
-    # into the coordinator. Was hard-coded at 3; corrections older than that silently
-    # rolled off and the swarm re-offended. Raise for a longer correction memory,
-    # lower if the injected block starts crowding the context window.
-    failure_context_limit: int = int(os.getenv("AGNO_FAILURE_CONTEXT_LIMIT", "10"))
+    # into the coordinator. Previously hard-coded at 3; now tunable per deployment.
+    #
+    # Measured injected size (ekam, 2026-07-30): limit=3 -> ~2.2k chars (~540 tok);
+    # limit=10 -> ~6.2k chars (~1.6k tok). Against a 262k window the size delta is
+    # negligible (~0.4%) — the real cost of a high value is PROMPT DILUTION: ten
+    # competing corrections compete for attention and weaken adherence to any one.
+    # Default 3 for signal density. Raise only if corrections are demonstrably
+    # rolling off before they stick.
+    failure_context_limit: int = int(os.getenv("AGNO_FAILURE_CONTEXT_LIMIT", "3"))
 
 
 config = Config()
