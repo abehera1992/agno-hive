@@ -7,7 +7,18 @@
 
 base_model: Qwen/Qwen3-30B-A3B-Instruct-2507   # BF16. The served FP8 CANNOT be tuned.
 staging_dir: /home/abehera1992/models
-output_dir: /home/abehera1992/models/adapters/worker-behaviour-v1
+
+# ── naming standard (2026-07-30) ──────────────────────────────────────────────
+# candidate : qwen3-30b-hive-v1   <- the tuned artifact
+# baseline  : qwen3-30b-instruct  <- the untuned reference the gate compares against
+candidate_name: qwen3-30b-hive-v1
+baseline_name: qwen3-30b-instruct
+
+# LoRA adapter lands here. The MERGED BF16 checkpoint is written separately by
+# export/merge.py --out; keep the two apart so a failed merge cannot clobber the
+# adapter that produced it.
+output_dir: checkpoints/qwen3-30b-hive-v1
+merged_dir: checkpoints/qwen3-30b-hive-v1-merged-bf16
 
 # ── data ──────────────────────────────────────────────────────────────────────
 dataset: training/data/corpus_v2.jsonl
