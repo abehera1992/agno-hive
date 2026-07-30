@@ -19,7 +19,7 @@ from typing import Iterable
 from ..schema import Record, Source
 
 # `## GUARD 18: Wrap raw SQL strings in text() ...`
-_GUARD_RE = re.compile(r"^## (GUARD \d+:.*?)$", re.M)
+_GUARD_RE = re.compile(r"^## (GUARD (\d+):.*?)$", re.M)
 # fenced block + its language tag
 _FENCE_RE = re.compile(r"```(\w*)\n(.*?)```", re.S)
 # a WRONG/CORRECT marker line in any comment style
@@ -41,10 +41,13 @@ def _split_fence(code: str) -> tuple[str, str] | None:
 class PatternsMdSource(Source):
     name = "patterns_md"
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, exclude_guards: set[int] | None = None):
         super().__init__()
         # Accepts a directory of *.md or a single file.
         self.path = Path(path)
+        # Guard numbers reserved for EVAL. Training must not see them or Axis D is
+        # scored on data the model was tuned on. See eval/generate_cases.py.
+        self.exclude_guards = exclude_guards or set()
 
     def _files(self) -> list[Path]:
         if self.path.is_file():
@@ -57,6 +60,10 @@ class PatternsMdSource(Source):
             hits = list(_GUARD_RE.finditer(text))
             for i, m in enumerate(hits):
                 title = m.group(1).strip()
+                gnum = int(m.group(2))
+                if gnum in self.exclude_guards:
+                    self.drop(f"GUARD {gnum} held out for eval")
+                    continue
                 body = text[m.end(): hits[i + 1].start() if i + 1 < len(hits) else len(text)]
 
                 pair = None

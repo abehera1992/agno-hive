@@ -27,10 +27,11 @@ def build(
     postgres_uri: str | None,
     citation_root: str | None = None,
     citation_per_file: int = 3,
+    exclude_guards: set[int] | None = None,
 ):
     sources = []
     if patterns_path:
-        sources.append(PatternsMdSource(patterns_path))
+        sources.append(PatternsMdSource(patterns_path, exclude_guards=exclude_guards))
     sources.append(FailureLogSource(postgres_uri=postgres_uri, project_id=project))
     sources.append(PostgresSessionsSource(postgres_uri=postgres_uri, project_id=project))
     if citation_root:
@@ -111,11 +112,14 @@ def main() -> None:
     ap.add_argument("--citation-root", default=None,
                     help="repo root to synthesise citation-restraint pairs from")
     ap.add_argument("--citation-per-file", type=int, default=3)
+    ap.add_argument("--exclude-guards", default="",
+                    help="comma-separated guard numbers reserved for eval")
     args = ap.parse_args()
 
     kept, rejected, raw, kept_by_src = build(
         args.patterns, args.project, args.postgres_uri,
         citation_root=args.citation_root, citation_per_file=args.citation_per_file,
+        exclude_guards={int(x) for x in args.exclude_guards.split(',') if x.strip()},
     )
 
     out = Path(args.out)
