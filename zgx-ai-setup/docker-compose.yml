@@ -26,28 +26,18 @@ services:
     container_name: vllm-coord
     restart: unless-stopped
     entrypoint: ["vllm"]
-    # --enable-lora (EK fine-tuning Phase 0 / Stage D, 2026-07-30): lets a trained
-    # LoRA adapter be served on top of the FP8 base without a merge+requantise cycle.
-    # Qwen3MoeForCausalLM declares SupportsLoRA in this vLLM build; the open question
-    # was whether the flag is accepted against an FP8-QUANTISED base. max-lora-rank 16
-    # covers the planned r=8-16. VLLM_ALLOW_RUNTIME_LORA_UPDATING allows adapters to be
-    # attached/detached via /v1/load_lora_adapter with no restart (A/B without downtime).
-    # If this ever destabilises serving, drop the two --*-lora* flags and recreate.
     command: >
       serve Qwen/Qwen3-30B-A3B-Instruct-2507-FP8
       --served-model-name qwen3-coder-30b
       --enable-auto-tool-choice --tool-call-parser hermes
       --gpu-memory-utilization 0.6 --max-model-len 262144
-      --enable-lora --max-lora-rank 16
       --host 0.0.0.0 --port 8000
     ports:
       - "8003:8000"
     volumes:
       - /home/abehera1992/.cache/vllm-hf:/root/.cache/huggingface
-      - /home/abehera1992/zgx-train-spike:/adapters:ro
     environment:
       - HF_TOKEN=${HF_TOKEN}
-      - VLLM_ALLOW_RUNTIME_LORA_UPDATING=1
     devices:
       - nvidia.com/gpu=all   # CDI device (mirrors `--device nvidia.com/gpu=all`)
 
