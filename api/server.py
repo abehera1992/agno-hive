@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 
 from api.models import AgentSpec, RunRequest, RunResponse, PlanResponse, ScanRequest, ScanResponse, FeedbackRequest, FeedbackResponse
 from fastapi.responses import StreamingResponse
@@ -154,8 +154,52 @@ async def list_teams():
     return {"teams": teams}
 
 
+_DISCONNECT_POLL_S = 2.0
+
+
+async def _run_cancel_on_disconnect(http_request, coro):
+    """Await `coro`, but cancel it if the HTTP client goes away.
+
+    Without this a client that times out, is Ctrl-C'd, or loses its connection leaves
+    the run executing to completion on the GPU with nobody to receive the answer. Those
+    orphans accumulate: on 2026-07-31 a handful of abandoned eval runs kept the GPU at
+    96% and made every subsequent measurement look pathological — a trivial one-file
+    read timed out at 600s that completes in 74s on an idle box. It also burns real
+    money and thermal budget for output that is discarded.
+
+    Cancellation propagates the whole way down: cancelling the task raises
+    CancelledError at the next await, which closes the httpx connection to vLLM, and
+    vLLM aborts generation when its client disconnects. So the GPU work actually stops
+    rather than merely being ignored.
+
+    The poll interval is deliberately coarse. is_disconnected() on a request whose body
+    is already consumed is cheap, but this runs for the entire life of a multi-minute
+    task, and detecting an abandoned run 2s late costs nothing.
+    """
+    task = asyncio.ensure_future(coro)
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=_DISCONNECT_POLL_S)
+            if done:
+                return task.result()
+            if await http_request.is_disconnected():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                print("[api] client disconnected — run cancelled, GPU work aborted")
+                # 499 (nginx's "client closed request"): nobody is listening, but the
+                # status distinguishes an abandoned run from a real server failure in
+                # the access log.
+                raise HTTPException(status_code=499, detail="client disconnected")
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+
+
 @app.post("/run", response_model=RunResponse)
-async def run(request: RunRequest):
+async def run(request: RunRequest, http_request: Request):
     from api.models import SessionMeta
     start = time.perf_counter()
 
@@ -206,16 +250,19 @@ async def run(request: RunRequest):
     # history — report 0 injected context rather than the (unenforced) message count.
     context_size = 0 if is_chain_handoff else len(prior_messages)
 
-    result, tokens = await run_task_async(
-        task=request.task,
-        agent_specs=agent_specs,
-        coordinator_model=coordinator_model,
-        coordinator_tools=coordinator_tools,
-        mcp_url=mcp_url,
-        mcp_urls=_resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url),
-        project_id=request.project_id,
-        session_id=session_id,
-        mode=team_mode,
+    result, tokens = await _run_cancel_on_disconnect(
+        http_request,
+        run_task_async(
+            task=request.task,
+            agent_specs=agent_specs,
+            coordinator_model=coordinator_model,
+            coordinator_tools=coordinator_tools,
+            mcp_url=mcp_url,
+            mcp_urls=_resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url),
+            project_id=request.project_id,
+            session_id=session_id,
+            mode=team_mode,
+        ),
     )
 
     # Append this turn to session
