@@ -70,6 +70,39 @@ _NOISE = {
     "get", "post", "put", "delete", "patch", "data", "error", "result", "value",
 }
 
+_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*\s*?\n(.*?)```", re.S)
+
+
+def _lint_code(answer: str) -> list[str]:
+    """Check fenced code blocks against project convention rules. Returns violations.
+
+    Existence checking cannot catch a convention breach: emitted Tailwind classes are not
+    a nonexistent symbol, they are the wrong system for this repo, and grep has nothing to
+    flag. Measured 2026-07-31: a component answer using bare className strings passed
+    verification cleanly while being unusable in the project.
+    """
+    blocks = _FENCE_RE.findall(answer or "")
+    if not blocks:
+        return []
+    code = "\n".join(blocks)
+    out = []
+    for rule in config.CODE_LINT_FORBID:
+        pat, _, msg = rule.partition("::")
+        try:
+            if re.search(pat, code):
+                out.append(f"FORBIDDEN pattern {pat!r} present — {msg or 'violates project convention'}")
+        except re.error:
+            continue
+    for rule in config.CODE_LINT_REQUIRE:
+        pat, _, msg = rule.partition("::")
+        try:
+            if not re.search(pat, code):
+                out.append(f"MISSING required pattern {pat!r} — {msg or 'required by project convention'}")
+        except re.error:
+            continue
+    return out
+
+
 _MAX_CLAIMS = 25   # subprocess per claim; keep the whole check inside a few seconds
 
 
@@ -186,9 +219,9 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             if r not in routes:
                 routes.append(r)
 
-    if not (idents or file_lines or routes):
+    if not (idents or file_lines or routes) and not _lint_code(answer):
         return ("verify_claims: no checkable claims found (no backticked symbols, "
-                "file:line citations, or API routes). Nothing to verify.")
+                "file:line citations, API routes, or convention violations).")
 
     out: list[str] = ["verify_claims — deterministic grep of the claims in this answer", ""]
     problems = 0
@@ -276,6 +309,14 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                 problems += 1
                 out.append(f"  NOT FOUND  {r:44s} <-- no trace of segment {probe!r}")
         out.append("")
+
+    lint = _lint_code(answer)
+    if lint:
+        out.append(f"CONVENTIONS ({len(lint)} violation(s)):")
+        for v in lint:
+            out.append(f"  VIOLATION  {v}")
+        out.append("")
+        problems += len(lint)
 
     if problems:
         out.append(f"VERDICT: {problems} claim(s) could NOT be found in the project. "

@@ -30,6 +30,16 @@ EXCLUDE_ALLOW = [a.strip() for a in os.getenv("EXCLUDE_ALLOW", "").split(",") if
 # under /v1, /rest or /graphql sets its own here. Set to empty to switch route checking
 # off entirely (symbols and file:line citations are still checked).
 #   e.g. ROUTE_PREFIXES=/api,/v1,/graphql
+
+# Code-convention lint applied to fenced code blocks in an answer, by verify_claims.
+# Rules are "regex::message", separated by ";;". Project-specific by design — hive-mcp
+# ships NONE, because "which styling system" or "which import style" is a fact about a
+# repo, not about software. Set them in the project env.
+#   CODE_LINT_FORBID=className="::use styles.x, not a bare className string
+#   CODE_LINT_REQUIRE=styles\.::components must reference SCSS module classes
+# REQUIRE rules only apply when the answer actually contains a code block.
+CODE_LINT_FORBID  = [r.strip() for r in os.getenv("CODE_LINT_FORBID", "").split(";;") if r.strip()]
+CODE_LINT_REQUIRE = [r.strip() for r in os.getenv("CODE_LINT_REQUIRE", "").split(";;") if r.strip()]
 ROUTE_PREFIXES = [p.strip().rstrip("/") for p in os.getenv("ROUTE_PREFIXES", "/api").split(",") if p.strip()]
 # Hard ceiling on characters returned by a search tool. A result that overflows the
 # model's context is worse than no result: the agent loses the conversation, not just
