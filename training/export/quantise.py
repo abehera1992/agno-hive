@@ -38,6 +38,14 @@ from pathlib import Path
 DEFAULT_IGNORE = ["lm_head", r"re:.*mlp\.gate$"]
 
 
+def peak_rss_gb() -> float:
+    """Peak resident set size of this process. Reported so the memory headroom is a
+    measured number in the log, not an estimate — the first attempt died at ~122 GB and
+    nobody had recorded what the real peak was."""
+    import resource
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 ** 2)  # KB -> GiB
+
+
 def du(p: str | Path) -> str:
     try:
         return subprocess.run(["du", "-sh", str(p)], capture_output=True, text=True
@@ -80,12 +88,51 @@ def main() -> None:
 
     recipe = QuantizationModifier(targets="Linear", scheme="FP8_DYNAMIC", ignore=ignore)
 
+    # Load with experts ALREADY linearized (2D). Passing a bare path to oneshot instead
+    # loads the packed 3D experts and linearizes AFTER, holding both representations at
+    # once: that peaked ~122 GB on a 121 GB box and was SIGKILLed by the OOM killer on
+    # 2026-07-30 (QUANTISE_RC=137), with 115 GB free at the time — there was nothing left
+    # to free, so the peak itself had to come down.
+    #
+    # This only helps if a conversion mapping is registered for the architecture;
+    # without one the context manager silently falls back to the same post-load path.
+    # Verified for this model: has_linearize_load_mappings("qwen3_moe") is True and
+    # conversion_mappings exports Qwen3MoeExperts. The assert below keeps that a checked
+    # fact rather than an assumption, since the failure mode is a 15-minute outage.
+    import json
+
+    from llmcompressor.modeling.moe.linearize import (has_linearize_load_mappings,
+                                                      load_quantizable_moe)
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    model_type = json.loads((Path(a.model) / "config.json").read_text())["model_type"]
+    direct = has_linearize_load_mappings(model_type)
+    print(f"[quantise] model_type={model_type}  linearized-load mapping: {direct}")
+
     if a.check:
-        print(f"[quantise] --check OK: oneshot resolved from {oneshot.__module__}, "
-              f"recipe {type(recipe).__name__} built. Not loading the model.")
+        print(f"[quantise] --check OK: oneshot from {oneshot.__module__}, "
+              f"recipe {type(recipe).__name__} built, direct-linearize={direct}. "
+              f"Not loading the model.")
         return
 
-    oneshot(model=a.model, recipe=recipe, output_dir=a.out)
+    if not direct:
+        raise SystemExit(
+            f"[quantise] ABORT: no linearized-load mapping for {model_type!r}. "
+            f"load_quantizable_moe would fall back to post-load linearization, which "
+            f"needs ~2x the model size in RAM and was OOM-killed here before. Register a "
+            f"conversion mapping or quantise with disk offload instead.")
+
+    with load_quantizable_moe():
+        model = AutoModelForCausalLM.from_pretrained(
+            a.model, torch_dtype="auto", device_map="cpu", low_cpu_mem_usage=True)
+    print(f"[quantise] loaded linearized; peak RSS so far {peak_rss_gb():.1f} GB")
+
+    oneshot(model=model, recipe=recipe, output_dir=a.out)
+
+    # oneshot given a MODEL OBJECT does not carry the tokenizer across the way passing a
+    # path does; vLLM will not serve a directory without one.
+    AutoTokenizer.from_pretrained(a.model).save_pretrained(a.out)
+    print(f"[quantise] peak RSS {peak_rss_gb():.1f} GB")
 
     out = Path(a.out)
     shards = sorted(out.glob("*.safetensors"))
