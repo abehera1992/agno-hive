@@ -345,6 +345,76 @@ def _extract_mcp_text(result) -> str:
     )
 
 
+async def _verify_claims(content: str, hive_mcp_url: str | None) -> tuple[str, bool]:
+    """Run hive-mcp's verify_claims over a draft answer. Returns (report, has_problems).
+
+    Deterministic grep, no model involved. Never raises: a verifier that breaks the run
+    would be worse than the fabrication it is meant to catch, so any failure here is
+    reported as "no problems" and logged.
+    """
+    if not content or not hive_mcp_url:
+        return "", False
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+    try:
+        async with streamablehttp_client(hive_mcp_url) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                res = await session.call_tool("verify_claims", {"answer": content})
+                report = _extract_mcp_text(res)
+    except Exception as exc:
+        print(f"[team] verify_claims unavailable ({hive_mcp_url}): {exc}")
+        return "", False
+    return report, "could NOT be found" in report
+
+
+async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | None) -> str:
+    """Check the draft's claims and, if any are unverifiable, give the team ONE chance
+    to correct itself against the evidence.
+
+    Why a correction round rather than appending the report to the answer: appending
+    leaves the fabricated sentence in place as the primary text, and — because the report
+    contains phrases like "does not exist in the project" — it would also make a wrong
+    answer look right to any downstream check that greps for hedging. That moves the
+    metric without fixing the answer. Re-running costs one model round, but only on
+    drafts that actually failed, which measured as a minority of runs.
+
+    Bounded at ONE retry on purpose. If the second attempt still cannot support its
+    claims, the correction is not converging and looping burns tokens; the verifier's
+    findings are surfaced instead so a human sees exactly which claims are unsupported.
+    """
+    report, bad = await _verify_claims(content, hive_mcp_url)
+    if not bad:
+        return content
+
+    print(f"[team] verify_claims flagged unsupported claims — retrying once")
+    retry_prompt = (
+        "Your draft answer contains claims that do NOT exist in this repository.\n\n"
+        f"--- your draft ---\n{content}\n\n"
+        f"--- deterministic verification of that draft ---\n{report}\n\n"
+        "Rewrite the answer using ONLY what the repository actually contains. "
+        "Every NOT FOUND item is something you invented: remove it. Do not substitute a "
+        "similarly-named symbol that happens to exist — if the thing asked about is not "
+        "in the codebase, say plainly that it does not exist and name what IS there "
+        "instead. Read the relevant file to confirm before answering."
+    )
+    try:
+        retry = await team.arun(retry_prompt)
+        corrected = retry.content if hasattr(retry, "content") else str(retry)
+    except Exception as exc:
+        print(f"[team] verify retry failed: {exc}")
+        return content
+    if not corrected:
+        return content
+
+    report2, still_bad = await _verify_claims(corrected, hive_mcp_url)
+    if still_bad:
+        # Surface rather than hide: the reader needs to know which claims are unsupported.
+        return (f"{corrected}\n\n---\n**Unverified claims flagged automatically "
+                f"(these could not be found in the repository):**\n```\n{report2}\n```")
+    return corrected
+
+
 async def _fill_count_markers(content: str, hive_mcp_url: str | None) -> str:
     """Replace [[COUNT pattern=`..` glob=`..`]] markers with the exact count from
     hive-mcp's count_matches tool. The number is ALWAYS tool-derived. Malformed or
@@ -670,6 +740,14 @@ async def run_task_async(
                     content = await _fill_count_markers(content, all_mcp_urls[0] if all_mcp_urls else None)
                 except Exception as exc:
                     print(f"[team] count-marker guard warning: {exc}")
+                # Tier-4 guard: grep the draft's claims; one correction round if any are
+                # unsupported. Instruction-level verification was tried first and the
+                # model ignored it, so this is enforced outside the model.
+                try:
+                    content = await _verified_answer(
+                        content, task, team, all_mcp_urls[0] if all_mcp_urls else None)
+                except Exception as exc:
+                    print(f"[team] verify guard warning: {exc}")
                 tokens = _extract_tokens(result)
                 span.set_status(trace.StatusCode.OK)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
