@@ -53,7 +53,21 @@ def _request(method: str, path: str, body: dict | None = None, version: str = _N
         json=body,
         timeout=30,
     )
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        # raise_for_status() discards the response BODY, which is where Notion puts the
+        # only useful part: "body.filter.unique_id.equals should be a number". Agents were
+        # getting `400 Bad Request ... see developer.mozilla.org` and had no way to
+        # self-correct a malformed filter — observed 2026-07-30 when a board query failed
+        # and the agent could only report "a problem with the filter request".
+        detail = ""
+        try:
+            err = resp.json()
+            detail = err.get("message") or str(err)
+            if err.get("code"):
+                detail = f"[{err['code']}] {detail}"
+        except Exception:
+            detail = resp.text[:400]
+        raise RuntimeError(f"Notion {resp.status_code} on {method} {path}: {detail}")
     return resp.json()
 
 
@@ -334,6 +348,37 @@ def notion_get_database_schema(database_id: str) -> str:
         return f"notion_get_database_schema failed: {e}"
 
 
+def _coerce_unique_id(f: dict) -> None:
+    """Rewrite unique_id filter values from "EK-271" to 271, in place and recursively.
+
+    Notion's unique_id filter takes the NUMBER only; the "EK-" prefix belongs to the
+    property, not the value. But every human and every agent refers to these items as
+    "EK-271" — that is how they are written in CLAUDE.md, in tickets, and in conversation
+    — so passing the string is the natural mistake, and it returns a bare 400. Observed
+    2026-07-30: a board query failed this exact way and the agent, given no error detail,
+    reported the item could not be retrieved when it existed and was reachable.
+
+    Coercing here rather than documenting harder: the correct value is unambiguously
+    derivable from the string, so refusing it buys nothing. Compound and/or filters are
+    walked because a unique_id clause is usually one arm of a larger filter.
+    """
+    for key in ("and", "or"):
+        if isinstance(f.get(key), list):
+            for sub in f[key]:
+                if isinstance(sub, dict):
+                    _coerce_unique_id(sub)
+    uid = f.get("unique_id")
+    if not isinstance(uid, dict):
+        return
+    for op in ("equals", "does_not_equal", "greater_than", "less_than",
+               "greater_than_or_equal_to", "less_than_or_equal_to"):
+        val = uid.get(op)
+        if isinstance(val, str):
+            m = _EK_RE.search(val) or re.search(r"(\d+)", val)
+            if m:
+                uid[op] = int(m.group(1))
+
+
 def notion_query_database(
     database_id: str,
     filter: dict | str | None = None,
@@ -368,6 +413,7 @@ def notion_query_database(
             rel = f.get("relation") if isinstance(f, dict) else None
             if isinstance(rel, dict) and "contains" in rel:
                 rel["contains"] = _extract_id(rel["contains"])
+            _coerce_unique_id(f)
             body["filter"] = f
         s = _as_list(sorts)
         if s:
