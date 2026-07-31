@@ -165,12 +165,17 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     if routes:
         out.append(f"ROUTES ({len(routes[:_MAX_CLAIMS])} checked):")
         for r in routes[:_MAX_CLAIMS]:
-            # Route literals are usually built from a prefix plus a path segment, so the
-            # full string rarely appears verbatim. Search the most distinctive segment
-            # instead — a whole-string miss would be a false alarm, which would train
-            # agents to ignore this tool.
+            # Route literals are usually assembled from a prefix plus a path segment, so
+            # the full string rarely appears verbatim; probe a segment instead.
+            #
+            # Probe the LAST non-parameter segment, not the longest. The longest is
+            # almost always the service name ("inventoryservice"), which every route in
+            # the service shares — so a fabricated /api/inventoryservice/items/bulk came
+            # back PLAUSIBLE because "inventoryservice" exists. That rubber-stamps
+            # anything and would teach agents to ignore this tool. The trailing segment
+            # ("bulk") is the part that actually distinguishes one route from another.
             segs = [s for s in r.split("/") if s and "{" not in s and s != "api"]
-            probe = max(segs, key=len) if segs else r
+            probe = segs[-1] if segs else r
             hits = _rg(probe, fixed=True, glob_filter=glob_filter)
             if hits:
                 out.append(f"  PLAUSIBLE  {r:44s} (segment {probe!r} found)")
