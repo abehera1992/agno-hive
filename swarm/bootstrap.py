@@ -90,6 +90,28 @@ async def _read_file(session: ClientSession, path: str) -> str:
     return ""
 
 
+async def _find_files(session: ClientSession, pattern: str) -> list[str]:
+    """Glob via MCP, tolerating either argument name and rejecting error text.
+
+    Same defect class as _read_file, found in the same session: the EkamApp server names
+    this `glob_pattern`, this called it `pattern`, and the argument error came back as a
+    RESULT rather than an exception. _fetch_patterns then saw no paths and fell through
+    to get_project_context, so CLAUDE.md/DOCS.md loaded and patterns/ never did — which
+    reads as "context is loading fine" right up until you grep it for '## GUARD'.
+    """
+    for kw in ("glob_pattern", "pattern"):
+        try:
+            result = await session.call_tool("find_files", {kw: pattern})
+            text = _extract_text(result)
+            if text and not _looks_like_error(text):
+                paths = [p.strip() for p in text.splitlines() if p.strip()]
+                if paths:
+                    return paths
+        except Exception:
+            continue
+    return []
+
+
 async def _fetch_hive_md(session: ClientSession) -> str:
     """Try to read hive.md from the project root via the MCP server."""
     return await _read_file(session, "hive.md")
@@ -98,9 +120,7 @@ async def _fetch_hive_md(session: ClientSession) -> str:
 async def _fetch_patterns(session: ClientSession, patterns_glob: str) -> str:
     # Primary: discover and read pattern files
     try:
-        find_result = await session.call_tool("find_files", {"pattern": patterns_glob})
-        paths_text = _extract_text(find_result)
-        paths = [p.strip() for p in paths_text.splitlines() if p.strip()]
+        paths = await _find_files(session, patterns_glob)
         if paths:
             parts = []
             for path in paths:
