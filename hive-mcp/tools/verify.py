@@ -50,6 +50,14 @@ _ROUTE_RE = (
 )
 # A bare identifier worth grepping: not prose, not a number.
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{2,}$")
+# Dotted member expressions (styles.warning, obj.field, mod.CONST). These carry the claim
+# just as often as bare names and were being SKIPPED: a fabricated `styles.warning` passed
+# a clean verdict because _IDENT_RE rejects the dot. Measured 2026-07-30 on a real miss.
+_DOTTED_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$")
+# Extensions that are documentation, not code. A symbol found ONLY here is not proof the
+# code defines it — a pattern file describing `handleSave` in a comment made a fabricated
+# function name read as FOUND.
+_DOC_EXTS = (".md", ".mdx", ".txt", ".rst", ".adoc")
 
 # Words that show up in backticks constantly and mean nothing on their own. Grepping
 # them wastes a subprocess and returns thousands of hits.
@@ -63,13 +71,18 @@ _NOISE = {
 _MAX_CLAIMS = 25   # subprocess per claim; keep the whole check inside a few seconds
 
 
-def _rg(pattern: str, fixed: bool = True, glob_filter: str = "") -> list[str]:
+def _rg(pattern: str, fixed: bool = True, glob_filter: str = "",
+        whole_word: bool = False) -> list[str]:
     rg = shutil.which("rg")
     if not rg:
         return []
     cmd = [rg, "-n", "--no-heading", "--max-count", "1"]
     if fixed:
         cmd.append("-F")
+    if whole_word:
+        # Without -w, a claimed `handleSave` matches an unrelated `handleSaveRole` and
+        # the fabrication reads as FOUND.
+        cmd.append("-w")
     if glob_filter:
         cmd += ["--glob", glob_filter]
     cmd += rg_args()
@@ -149,7 +162,7 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     idents: list[str] = []
     for span in _BACKTICK_RE.findall(answer):
         tok = span.strip().rstrip("()").strip()
-        if _IDENT_RE.match(tok) and tok.lower() not in _NOISE:
+        if (_IDENT_RE.match(tok) or _DOTTED_RE.match(tok)) and tok.lower() not in _NOISE:
             if tok not in idents:
                 idents.append(tok)
 
@@ -177,12 +190,20 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     if idents:
         out.append(f"SYMBOLS ({len(idents[:_MAX_CLAIMS])} checked):")
         for tok in idents[:_MAX_CLAIMS]:
-            hits = _rg(tok, fixed=True, glob_filter=glob_filter)
-            if hits:
-                out.append(f"  FOUND      {tok:38s} {hits[0][:90]}")
-            else:
+            dotted = "." in tok
+            hits = _rg(tok, fixed=True, glob_filter=glob_filter, whole_word=not dotted)
+            if not hits:
                 problems += 1
                 out.append(f"  NOT FOUND  {tok:38s} <-- does not exist in the project")
+                continue
+            code_hits = [h for h in hits
+                         if not h.split(":", 1)[0].lower().endswith(_DOC_EXTS)]
+            if not code_hits:
+                problems += 1
+                out.append(f"  DOC ONLY   {tok:38s} <-- appears only in documentation, "
+                           f"not in code: {hits[0][:70]}")
+            else:
+                out.append(f"  FOUND      {tok:38s} {code_hits[0][:90]}")
         out.append("")
 
     # ── file:line citations ───────────────────────────────────────────────────

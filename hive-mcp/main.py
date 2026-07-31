@@ -151,50 +151,89 @@ _instructions = (
 
 mcp = FastMCP(config.MCP_NAME, instructions=_instructions)
 
+
+def _traced(fn):
+    """Log every tool call: name, args, duration, result size, and any exception.
+
+    Without this the only evidence a tool ran is an anonymous `POST /mcp` in the uvicorn
+    access log, so "did the agent actually read the file, or answer from priors?" could
+    only be guessed at from response latency. That question came up repeatedly while
+    diagnosing fabricated answers (2026-07-30) and was never answerable from the logs.
+
+    Args are truncated hard — a write_file content payload or a large diff would
+    otherwise dominate the log and bury the signal it exists to provide.
+    """
+    import functools
+    import time as _t
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        shown = ", ".join(
+            [repr(a)[:60] for a in args]
+            + [f"{k}={repr(v)[:60]}" for k, v in kwargs.items()]
+        )[:180]
+        t0 = _t.time()
+        try:
+            result = fn(*args, **kwargs)
+            print(f"[tool] {fn.__name__}({shown}) -> {len(str(result)):,} chars "
+                  f"in {_t.time() - t0:.2f}s", flush=True)
+            return result
+        except Exception as e:
+            print(f"[tool] {fn.__name__}({shown}) RAISED {type(e).__name__}: {e} "
+                  f"after {_t.time() - t0:.2f}s", flush=True)
+            raise
+
+    return wrapper
+
+
+def _tool(fn):
+    """Register a tool with call tracing."""
+    return mcp.tool()(_traced(fn))
+
 # ── Context + file reading ────────────────────────────────────────────────────
-mcp.tool()(get_project_context)
-mcp.tool()(get_file_content)
-mcp.tool()(find_files)
-mcp.tool()(search_files)
-mcp.tool()(count_matches)
-mcp.tool()(verify_claims)
-mcp.tool()(list_directory)
-mcp.tool()(list_directory_tree)
+_tool(get_project_context)
+_tool(get_file_content)
+_tool(find_files)
+_tool(search_files)
+_tool(count_matches)
+_tool(verify_claims)
+_tool(list_directory)
+_tool(list_directory_tree)
 
 # ── File writing (WRITE_REVIEW-aware) + read-only shell ──────────────────────
-mcp.tool()(write_file)
-mcp.tool()(apply_diff)
-mcp.tool()(run_command)
+_tool(write_file)
+_tool(apply_diff)
+_tool(run_command)
 
 # ── Shell + Docker + environment ─────────────────────────────────────────────
-mcp.tool()(run_shell)
-mcp.tool()(run_docker)
-mcp.tool()(get_env_info)
-mcp.tool()(check_port)
-mcp.tool()(list_processes)
+_tool(run_shell)
+_tool(run_docker)
+_tool(get_env_info)
+_tool(check_port)
+_tool(list_processes)
 
 # ── Git ───────────────────────────────────────────────────────────────────────
-mcp.tool()(git_status)
-mcp.tool()(git_log)
-mcp.tool()(git_diff)
-mcp.tool()(git_log_file)
-mcp.tool()(git_blame)
+_tool(git_status)
+_tool(git_log)
+_tool(git_diff)
+_tool(git_log_file)
+_tool(git_blame)
 
 # ── Semantic indexing (bootstrap) ─────────────────────────────────────────────
-mcp.tool()(index_project)
+_tool(index_project)
 
 # ── Project context snapshot ──────────────────────────────────────────────────
-mcp.tool()(scan_project_context)
+_tool(scan_project_context)
 
 # ── Web search + fetch (gated by WEB_SEARCH_ENABLED) ─────────────────────────
-mcp.tool()(web_search)
-mcp.tool()(web_fetch)
+_tool(web_search)
+_tool(web_fetch)
 
 # ── External integrations (activated by env vars) ─────────────────────────────
 # confirm/reject are always registered so the CLI confirm flow works regardless
 # of which platforms are active.
-mcp.tool()(confirm_action)
-mcp.tool()(reject_action)
+_tool(confirm_action)
+_tool(reject_action)
 
 for _tool in _INTEGRATION_TOOLS:
     mcp.tool()(_tool)
