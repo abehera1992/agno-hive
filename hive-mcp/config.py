@@ -24,6 +24,13 @@ WRITE_REVIEW       = os.getenv("WRITE_REVIEW", "true").lower() == "true"
 EXCLUDE_DIRS  = [d.strip() for d in os.getenv("EXCLUDE_DIRS", "").split(",") if d.strip()]
 EXCLUDE_GLOBS = [g.strip() for g in os.getenv("EXCLUDE_GLOBS", "").split(",") if g.strip()]
 EXCLUDE_ALLOW = [a.strip() for a in os.getenv("EXCLUDE_ALLOW", "").split(",") if a.strip()]
+
+# URL prefixes that mark a string as an API route, for verify_claims. Comma-separated.
+# "/api" is the common default but it is a convention, not a rule — a project routing
+# under /v1, /rest or /graphql sets its own here. Set to empty to switch route checking
+# off entirely (symbols and file:line citations are still checked).
+#   e.g. ROUTE_PREFIXES=/api,/v1,/graphql
+ROUTE_PREFIXES = [p.strip().rstrip("/") for p in os.getenv("ROUTE_PREFIXES", "/api").split(",") if p.strip()]
 # Hard ceiling on characters returned by a search tool. A result that overflows the
 # model's context is worse than no result: the agent loses the conversation, not just
 # the answer.

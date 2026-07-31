@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 
+import config
 from config import PROJECT_ROOT
 
 from .exclusions import rg_args
@@ -37,8 +38,16 @@ from .exclusions import rg_args
 _BACKTICK_RE = re.compile(r"`([^`\n]{2,120})`")
 # path/to/file.ext:123  — the citation form the instructions ask for.
 _FILE_LINE_RE = re.compile(r"([A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6}):(\d{1,6})")
-# API routes, asserted constantly and invented almost as often.
-_ROUTE_RE = re.compile(r"(/api/[A-Za-z0-9_\-/{}.]+)")
+# API routes, asserted constantly and invented almost as often. The prefixes come from
+# config.ROUTE_PREFIXES because "/api" is a convention, not a rule — a project routing
+# under /v1 or /graphql would otherwise have its routes silently skipped, and one routing
+# everything under /api would be the only one this check protected. Empty config disables
+# route checking; symbols and citations are unaffected.
+_ROUTE_RE = (
+    re.compile(r"((?:" + "|".join(re.escape(p) for p in config.ROUTE_PREFIXES)
+               + r")/[A-Za-z0-9_\-/{}.]+)")
+    if config.ROUTE_PREFIXES else None
+)
 # A bare identifier worth grepping: not prose, not a number.
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{2,}$")
 
@@ -151,14 +160,15 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             file_lines.append(pair)
 
     routes: list[str] = []
-    for r in _ROUTE_RE.findall(answer):
-        r = r.rstrip(".,;)")
-        if r not in routes:
-            routes.append(r)
+    if _ROUTE_RE is not None:
+        for r in _ROUTE_RE.findall(answer):
+            r = r.rstrip(".,;)")
+            if r not in routes:
+                routes.append(r)
 
     if not (idents or file_lines or routes):
         return ("verify_claims: no checkable claims found (no backticked symbols, "
-                "file:line citations, or /api/ routes). Nothing to verify.")
+                "file:line citations, or API routes). Nothing to verify.")
 
     out: list[str] = ["verify_claims — deterministic grep of the claims in this answer", ""]
     problems = 0
