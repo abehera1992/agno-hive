@@ -25,13 +25,15 @@ from config import PROJECT_ROOT
 
 _STATE_DIR  = Path(os.getenv("HIVE_INDEX_STATE_DIR", str(PROJECT_ROOT / ".hive-index-state")))
 _CHUNK_SIZE = 4000   # chars for non-Python files
-_IGNORE_DIRS = {
-    ".git", "node_modules", "__pycache__", ".next", "dist", "build",
-    ".venv", "venv", "env", ".mypy_cache", ".pytest_cache", "coverage",
-    ".tox", ".eggs", "signoz", "graphify-out", "infra",
-    # backups holds DB dumps (incl. Phase secrets DB) — must never be indexed
-    "backups", ".hive-index-state",
-}
+# Shared with search / read / write / scan — one list, configured per project via
+# EXCLUDE_DIRS / EXCLUDE_GLOBS. "backups" and ".hive-index-state" are fail-safe defaults
+# in that shared set: backups commonly holds DB dumps (which have held secrets), and
+# indexing them would leak the contents into a vector store agents later quote from.
+#
+# Removed from here: "signoz", "graphify-out", "infra" — those named one project's
+# layout inside a project-independent server. Configure them per project instead.
+# "infra" was actively harmful as a default: it hid any legitimate infra/ directory.
+from .exclusions import EXCLUDE_DIRS as _IGNORE_DIRS
 _SKIP_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2",
     ".ttf", ".eot", ".bin", ".exe", ".dll", ".so", ".dylib", ".zip",

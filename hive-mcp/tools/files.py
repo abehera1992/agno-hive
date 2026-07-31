@@ -13,6 +13,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import PROJECT_ROOT, WRITE_REVIEW
 
+from .exclusions import is_excluded
+
 _PROPOSED_SUFFIX = ".hive_proposed"
 _IN_DOCKER = Path("/.dockerenv").exists()
 
@@ -61,6 +63,10 @@ def write_file(relative_path: str, content: str) -> str:
         relative_path: Path relative to project root (e.g. 'src/api/new_route.py')
         content:       Full file content to write
     """
+    if is_excluded(relative_path):
+        return (f"write_file blocked: '{relative_path}' is in an excluded path "
+                f"(dependency tree, build output, or a project EXCLUDE_DIRS/EXCLUDE_GLOBS "
+                f"entry). Writing there would be lost on the next install or build.")
     target = PROJECT_ROOT / relative_path
     if target.exists():
         return (
@@ -119,6 +125,10 @@ def apply_diff(relative_path: str, old_string: str, new_string: str, preserve_in
     if relative_path.endswith(_PROPOSED_SUFFIX):
         relative_path = relative_path[: -len(_PROPOSED_SUFFIX)]
 
+    if is_excluded(relative_path):
+        return (f"apply_diff blocked: '{relative_path}' is in an excluded path "
+                f"(dependency tree, build output, or a project EXCLUDE_DIRS/EXCLUDE_GLOBS "
+                f"entry). Edit the source that generates it instead.")
     target = PROJECT_ROOT / relative_path
     if not target.exists():
         return f"File not found: {relative_path}"

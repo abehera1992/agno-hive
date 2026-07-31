@@ -13,24 +13,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import config
 from config import PROJECT_ROOT
 
-_IGNORE_DIRS = {
-    ".git", "node_modules", "__pycache__", ".next", "dist", "build",
-    ".venv", "venv", "env", ".mypy_cache", ".pytest_cache", "coverage",
-    ".tox", ".eggs", "*.egg-info",
-}
+from .exclusions import EXCLUDE_DIRS, rg_args
 
-# Negative --glob filters for ripgrep. rg honours .gitignore, but build output and
-# vendored trees are often committed or present-and-untracked, so exclude them here too.
-#
-# LANGUAGE/TOOLING GENERIC ONLY. hive-mcp is project-independent: a vendored dependency
-# tree or a generated output directory that exists in one repo must NOT be named in this
-# source. Set SEARCH_EXCLUDE_GLOBS in that project's env file instead.
-_RG_EXCLUDES = [
-    "!**/node_modules/**", "!**/.git/**", "!**/dist/**", "!**/build/**",
-    "!**/.next/**", "!**/coverage/**", "!**/__pycache__/**", "!**/.venv/**",
-    "!**/vendor/**", "!**/*.min.js", "!**/*.min.css",
-    "!**/package-lock.json", "!**/yarn.lock", "!**/*.lock",
-] + [f"!{g}" if not g.startswith("!") else g for g in config.SEARCH_EXCLUDE_GLOBS]
+# Exclusions live in one place and apply to search, read, write, scan and index alike.
+# Project-specific entries come from EXCLUDE_DIRS / EXCLUDE_GLOBS in the project env.
+_IGNORE_DIRS = EXCLUDE_DIRS
+_RG_EXCLUDES = rg_args()          # already in ["--glob", "!pat", ...] form
 
 _MAX_OUTPUT_CHARS = config.SEARCH_MAX_OUTPUT_CHARS
 
@@ -345,8 +333,7 @@ def search_files(pattern: str, glob_filter: str = "**/*", max_results: int = 80)
         # fabrication it is supposed to help catch.
         if glob_filter and glob_filter not in ("**/*", "**", "*"):
             cmd += ["--glob", glob_filter]
-        for ex in _RG_EXCLUDES:
-            cmd += ["--glob", ex]
+        cmd += _RG_EXCLUDES
         cmd.append(pattern)
         try:
             result = subprocess.run(

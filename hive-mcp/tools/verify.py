@@ -31,7 +31,7 @@ import subprocess
 
 from config import PROJECT_ROOT
 
-from .context import _RG_EXCLUDES
+from .exclusions import rg_args
 
 # Backticked code spans are where models put symbols they are asserting exist.
 _BACKTICK_RE = re.compile(r"`([^`\n]{2,120})`")
@@ -63,8 +63,7 @@ def _rg(pattern: str, fixed: bool = True, glob_filter: str = "") -> list[str]:
         cmd.append("-F")
     if glob_filter:
         cmd += ["--glob", glob_filter]
-    for ex in _RG_EXCLUDES:
-        cmd += ["--glob", ex]
+    cmd += rg_args()
     cmd.append(pattern)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
@@ -90,8 +89,7 @@ def _resolve_path(rel_path: str) -> tuple[str | None, int]:
     if not rg:
         return None, 0
     cmd = [rg, "--files"]
-    for ex in _RG_EXCLUDES:
-        cmd += ["--glob", ex]
+    cmd += rg_args()
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
                            cwd=str(PROJECT_ROOT), timeout=20)
@@ -181,12 +179,22 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     if file_lines:
         out.append(f"CITATIONS ({len(file_lines[:_MAX_CLAIMS])} checked):")
         for path, num in file_lines[:_MAX_CLAIMS]:
-            line = _read_line(path, num)
+            resolved, n_cands = _resolve_path(path)
+            if resolved is None:
+                problems += 1
+                if n_cands > 1:
+                    # Ambiguous is NOT fabrication — say so, or the tool cries wolf.
+                    out.append(f"  AMBIGUOUS  {path}:{num} <-- {n_cands} files share that "
+                               f"name; cite a repo-relative path")
+                else:
+                    out.append(f"  BAD        {path}:{num} <-- no such file in the project")
+                continue
+            line = _read_line(resolved, num)
             if line is None:
                 problems += 1
-                out.append(f"  BAD        {path}:{num} <-- file or line does not exist")
+                out.append(f"  BAD        {resolved}:{num} <-- file exists but has no line {num}")
             else:
-                out.append(f"  LINE {num:<6} {path}")
+                out.append(f"  LINE {num:<6} {resolved}")
                 out.append(f"             | {line.strip()[:100]}")
         out.append("")
 

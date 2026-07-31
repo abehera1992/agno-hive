@@ -14,13 +14,16 @@ MCP_PORT           = int(os.getenv("MCP_PORT", "9000"))
 MCP_NAME           = "hive-mcp"
 WRITE_REVIEW       = os.getenv("WRITE_REVIEW", "true").lower() == "true"
 
-# ── search scoping ────────────────────────────────────────────────────────────
-# Extra ripgrep exclude globs for THIS project, comma-separated. hive-mcp ships only
-# language/tooling-generic excludes (node_modules, dist, __pycache__, ...); anything
-# specific to a repo — a vendored third-party tree, a generated output dir — belongs
-# here in that project's env file, not in the server's source.
-#   e.g. SEARCH_EXCLUDE_GLOBS=**/infra/vendored-stack/**,**/generated-out/**
-SEARCH_EXCLUDE_GLOBS    = [g.strip() for g in os.getenv("SEARCH_EXCLUDE_GLOBS", "").split(",") if g.strip()]
+# ── exclusions (search, read, write, index — one list, see tools/exclusions.py) ──
+# hive-mcp ships only language/tooling-generic exclusions. Anything specific to a repo —
+# a vendored third-party stack, a generated export dir — is configured here, per project,
+# and applies to EVERY path: grep, file read, file write, project scan and indexing.
+#   EXCLUDE_DIRS=signoz,graphify-out,vendored-stack        (directory names)
+#   EXCLUDE_GLOBS=**/infra/vendored-stack/**               (path globs)
+#   EXCLUDE_ALLOW=docs/generated/api.md                    (re-open one path)
+EXCLUDE_DIRS  = [d.strip() for d in os.getenv("EXCLUDE_DIRS", "").split(",") if d.strip()]
+EXCLUDE_GLOBS = [g.strip() for g in os.getenv("EXCLUDE_GLOBS", "").split(",") if g.strip()]
+EXCLUDE_ALLOW = [a.strip() for a in os.getenv("EXCLUDE_ALLOW", "").split(",") if a.strip()]
 # Hard ceiling on characters returned by a search tool. A result that overflows the
 # model's context is worse than no result: the agent loses the conversation, not just
 # the answer.

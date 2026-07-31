@@ -28,15 +28,11 @@ from config import PROJECT_ROOT
 _HIVE_MD = "hive.md"
 _META_RE = re.compile(r"<!--\s*hive-scan:\s*commit=(\S+)\s+timestamp=\S+\s*-->")
 
-_SKIP_DIRS = {
-    ".git", "__pycache__", "node_modules", ".next", "dist", "build",
-    ".venv", "venv", "env", ".mypy_cache", ".pytest_cache", "coverage",
-    ".tox", ".eggs", "eggs",
-    # Generated / machine-local artifact dirs — never source. graphify-out holds
-    # an Obsidian vault export (one .md per code symbol, ~1,200 files) that once
-    # made up ~75% of the hive.md tree; backups/ has held secret DB dumps.
-    "graphify-out", "graphify-cache", "backups",
-}
+# Shared with search / read / write / index — see tools/exclusions.py. Project-specific
+# generated dirs (an export vault, a graph cache) are configured via EXCLUDE_DIRS in the
+# project env rather than named here: one such export once made up ~75% of the scanned
+# tree, but that is a fact about one repo, not about every repo.
+from .exclusions import EXCLUDE_DIRS as _SKIP_DIRS
 _SKIP_EXTENSIONS = {".pyc", ".pyo", ".class", ".so", ".dll", ".exe", ".bin", ".lock"}
 _ROOT_DOCS = ["CLAUDE.md", "README.md", "docs.md", "AGENTS.md", ".env.example"]
 _DIR_CANDIDATES = ["README.md", "__init__.py", "main.py", "config.py",
