@@ -13,6 +13,23 @@ MCP_HOST           = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT           = int(os.getenv("MCP_PORT", "9000"))
 MCP_NAME           = "hive-mcp"
 WRITE_REVIEW       = os.getenv("WRITE_REVIEW", "true").lower() == "true"
+
+# ── search scoping ────────────────────────────────────────────────────────────
+# Extra ripgrep exclude globs for THIS project, comma-separated. hive-mcp ships only
+# language/tooling-generic excludes (node_modules, dist, __pycache__, ...); anything
+# specific to a repo — a vendored third-party tree, a generated output dir — belongs
+# here in that project's env file, not in the server's source.
+#   e.g. SEARCH_EXCLUDE_GLOBS=**/infra/vendored-stack/**,**/generated-out/**
+SEARCH_EXCLUDE_GLOBS    = [g.strip() for g in os.getenv("SEARCH_EXCLUDE_GLOBS", "").split(",") if g.strip()]
+# Hard ceiling on characters returned by a search tool. A result that overflows the
+# model's context is worse than no result: the agent loses the conversation, not just
+# the answer.
+SEARCH_MAX_OUTPUT_CHARS = int(os.getenv("SEARCH_MAX_OUTPUT_CHARS", "20000"))
+# Monorepo subdirectory prefixes tried when a short glob ("src/lib/**") is relative to a
+# sub-root rather than PROJECT_ROOT. "**" is always tried last and works for any layout;
+# set this only if a repo needs a specific prefix attempted first.
+#   e.g. GLOB_FALLBACK_PREFIXES=Client/WebApp,services/api
+GLOB_FALLBACK_PREFIXES  = [p.strip() for p in os.getenv("GLOB_FALLBACK_PREFIXES", "").split(",") if p.strip()]
 WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "false").lower() == "true"
 
 # ── External platform integrations (optional — activate by setting the env var) ─

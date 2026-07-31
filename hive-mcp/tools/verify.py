@@ -4,24 +4,22 @@ No LLM is involved, which is the entire point: a model cannot be trusted to audi
 output, and a second model just adds a second thing that can hallucinate. This extracts
 the checkable claims from a piece of text and greps for each one.
 
-Why it exists (measured on EkamApp, 2026-07-30). main.py already carries a MANDATORY
-instruction to cite file+line from code actually read this run. Asked for a bulk-delete
-hook that does not exist, the swarm answered:
-
-    "useDeleteItemMutation ... targets /api/inventoryservice/items with DELETE"
-
-inventing both the hook's role and a collection-level endpoint, in 5.6s, with no tool
-call. Told explicitly to grep first, the same swarm answered correctly in 14.3s. So the
-model verifies when compelled and not otherwise, and instruction-level fixes have already
-been tried and observed to fail. The remaining option is to check the output afterwards.
+Why it exists (measured 2026-07-30). main.py already carries a MANDATORY instruction to
+cite file+line from code actually read this run. Asked about a symbol that does not
+exist, the swarm named a similarly-spelled one that does, invented its behaviour and an
+endpoint to match, and returned in 5.6s having called no tool at all. Told explicitly to
+grep first, the same swarm answered correctly in 14.3s. So the model verifies when
+compelled and not otherwise, and instruction-level fixes have already been tried and
+observed to fail. The remaining option is to check the output afterwards.
 
 What it catches, honestly stated:
-  * INVENTED SYMBOLS      — fully. `useBulkDeleteItems` is either in the repo or it isn't.
+  * INVENTED SYMBOLS      — fully. A named function is either in the repo or it isn't.
   * WRONG LINE NUMBERS    — fully. Read the line, compare it to the claim.
   * INVENTED PATHS/ROUTES — fully, same as symbols.
-  * MISATTRIBUTED SYMBOLS — NOT caught. `deleteItem` exists; the false part is the claim
-    that it deletes many. Deciding that needs to read intent, which is what a reviewer or
-    a human is for. This tool marks the symbol FOUND and says nothing about the claim.
+  * MISATTRIBUTED SYMBOLS — NOT caught. When a real single-item function is claimed to
+    handle a batch, the symbol exists and only the claim about it is false. Deciding that
+    needs to read intent, which is what a reviewer or a human is for. This tool marks the
+    symbol FOUND and says nothing about the claim.
 Treat a clean report as "nothing provably invented", never as "the answer is correct".
 """
 
@@ -76,8 +74,39 @@ def _rg(pattern: str, fixed: bool = True, glob_filter: str = "") -> list[str]:
         return []
 
 
+def _resolve_path(rel_path: str) -> tuple[str | None, int]:
+    """Resolve a cited path to a real repo file. Returns (resolved_path, n_candidates).
+
+    Agents cite bare filenames ("someModule.ts:468") far more often than full
+    repo-relative paths, and PROJECT_ROOT/"someModule.ts" does not exist — so a correct
+    citation was being reported BAD. A false positive is the worst failure this tool can
+    have: it teaches agents that the checker is noise, and then the real fabrications get
+    ignored too. Resolve by suffix before declaring anything bad.
+    """
+    p = PROJECT_ROOT / rel_path
+    if p.is_file():
+        return rel_path, 1
+    rg = shutil.which("rg")
+    if not rg:
+        return None, 0
+    cmd = [rg, "--files"]
+    for ex in _RG_EXCLUDES:
+        cmd += ["--glob", ex]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           cwd=str(PROJECT_ROOT), timeout=20)
+    except Exception:
+        return None, 0
+    want = rel_path.replace("\\", "/").lstrip("./")
+    cands = [l.replace("\\", "/") for l in r.stdout.splitlines()
+             if l.replace("\\", "/").endswith("/" + want) or l.replace("\\", "/") == want]
+    if len(cands) == 1:
+        return cands[0], 1
+    return (None, len(cands))
+
+
 def _read_line(rel_path: str, lineno: int) -> str | None:
-    p = (PROJECT_ROOT / rel_path)
+    p = PROJECT_ROOT / rel_path
     try:
         if not p.is_file():
             return None
@@ -165,18 +194,28 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     if routes:
         out.append(f"ROUTES ({len(routes[:_MAX_CLAIMS])} checked):")
         for r in routes[:_MAX_CLAIMS]:
-            # Route literals are usually assembled from a prefix plus a path segment, so
-            # the full string rarely appears verbatim; probe a segment instead.
+            # A router usually declares only a SUFFIX of the full URL — a gateway or an
+            # app-level prefix supplies the rest — so the whole path rarely appears
+            # verbatim in source. Probe progressively shorter suffixes and stop at the
+            # first that matches, keeping {params} intact.
             #
-            # Probe the LAST non-parameter segment, not the longest. The longest is
-            # almost always the service name ("inventoryservice"), which every route in
-            # the service shares — so a fabricated /api/inventoryservice/items/bulk came
-            # back PLAUSIBLE because "inventoryservice" exists. That rubber-stamps
-            # anything and would teach agents to ignore this tool. The trailing segment
-            # ("bulk") is the part that actually distinguishes one route from another.
-            segs = [s for s in r.split("/") if s and "{" not in s and s != "api"]
-            probe = segs[-1] if segs else r
-            hits = _rg(probe, fixed=True, glob_filter=glob_filter)
+            # Measured 2026-07-30, which is why it is a suffix walk and not a segment:
+            #   single trailing segment  -> matched unrelated code (a common word)
+            #   two-segment suffix       -> correctly absent for a fabricated route,
+            #                               correctly present for a real one
+            #   params stripped          -> correctly-cited real routes went missing
+            # Requiring >= 2 segments avoids blessing a route because one common word in
+            # it appears somewhere in the repo.
+            segs = [s for s in r.split("/") if s]
+            probe, hits = None, []
+            for start in range(len(segs) - 1):
+                cand = "/".join(segs[start:])
+                found = _rg(cand, fixed=True, glob_filter=glob_filter)
+                if found:
+                    probe, hits = cand, found
+                    break
+                if probe is None:
+                    probe = cand   # report the most specific probe tried
             if hits:
                 out.append(f"  PLAUSIBLE  {r:44s} (segment {probe!r} found)")
             else:

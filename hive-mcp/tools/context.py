@@ -10,31 +10,29 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+import config
 from config import PROJECT_ROOT
 
 _IGNORE_DIRS = {
     ".git", "node_modules", "__pycache__", ".next", "dist", "build",
     ".venv", "venv", "env", ".mypy_cache", ".pytest_cache", "coverage",
     ".tox", ".eggs", "*.egg-info",
-    # Vendored third-party mail stack in EkamApp (dovecot/rspamd/imapsync). Not project
-    # source, and imapsync alone is a 400KB perl script whose help text matches almost
-    # any English word. Added 2026-07-30 with the search fixes below.
-    "mailcow", "graphify-out", "backups",
 }
 
-# Negative --glob filters for ripgrep. rg honours .gitignore, but these are often
-# committed or present-and-untracked, so they must be excluded explicitly.
+# Negative --glob filters for ripgrep. rg honours .gitignore, but build output and
+# vendored trees are often committed or present-and-untracked, so exclude them here too.
+#
+# LANGUAGE/TOOLING GENERIC ONLY. hive-mcp is project-independent: a vendored dependency
+# tree or a generated output directory that exists in one repo must NOT be named in this
+# source. Set SEARCH_EXCLUDE_GLOBS in that project's env file instead.
 _RG_EXCLUDES = [
-    "!**/node_modules/**", "!**/infra/mailcow/**", "!**/.git/**",
-    "!**/dist/**", "!**/build/**", "!**/.next/**", "!**/coverage/**",
-    "!**/backups/**", "!**/graphify-out/**", "!**/__pycache__/**",
-    "!**/*.min.js", "!**/*.min.css", "!**/package-lock.json", "!**/*.lock",
-]
+    "!**/node_modules/**", "!**/.git/**", "!**/dist/**", "!**/build/**",
+    "!**/.next/**", "!**/coverage/**", "!**/__pycache__/**", "!**/.venv/**",
+    "!**/vendor/**", "!**/*.min.js", "!**/*.min.css",
+    "!**/package-lock.json", "!**/yarn.lock", "!**/*.lock",
+] + [f"!{g}" if not g.startswith("!") else g for g in config.SEARCH_EXCLUDE_GLOBS]
 
-# A result that overflows the model's context is worse than no result — the agent loses
-# the whole conversation, not just the answer. Observed 2026-07-30: an unbounded search
-# returned 251KB and raised ContextWindowExceededError at 262144 tokens.
-_MAX_OUTPUT_CHARS = 20_000
+_MAX_OUTPUT_CHARS = config.SEARCH_MAX_OUTPUT_CHARS
 
 
 def _cap(text: str) -> str:
@@ -240,13 +238,15 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
     )
 
 
-# When PROJECT_ROOT is a monorepo, short paths like "src/lib/**" are often
-# relative to a subdirectory (e.g. the frontend root), not PROJECT_ROOT itself.
-# Try these prefixes in order before giving up.
-_GLOB_FALLBACK_PREFIXES = [
-    "Client/EcommClient-Web/ekamweb",  # src/lib/** → ekamweb/src/lib/**
-    "**",                               # src/lib/** → **/src/lib/**
-]
+# When PROJECT_ROOT is a monorepo, short paths like "src/lib/**" are often relative to a
+# subdirectory (e.g. a frontend root), not PROJECT_ROOT itself. Try these prefixes in
+# order before giving up.
+#
+# Kept PROJECT-INDEPENDENT: "**" resolves src/lib/** to **/src/lib/** and works for any
+# layout. A hardcoded subdirectory path used to sit here, which only helped one repo and
+# was dead weight (or a wrong first guess) in every other. Projects needing an explicit
+# prefix can set GLOB_FALLBACK_PREFIXES in their env file.
+_GLOB_FALLBACK_PREFIXES = config.GLOB_FALLBACK_PREFIXES + ["**"]
 
 
 def _rg_glob(rg: str, glob_pattern: str, max_results: int) -> list[str]:
@@ -336,12 +336,13 @@ def search_files(pattern: str, glob_filter: str = "**/*", max_results: int = 80)
         cmd = [rg, "-n", "-i", "--no-heading", "--max-count", "1"]
         # Only pass glob_filter when it NARROWS. Passing the catch-all "**/*" as an
         # --glob INCLUDE overrides ripgrep's .gitignore handling, so rg descends into
-        # node_modules and every ignored tree. Measured on EkamApp 2026-07-30:
-        #   'bulkDelete' with "**/*" 55.0s / 3 matches  -- without 11.8s / 0 matches
-        #   'duplicate'  with "**/*" 45.7s / 611 matches -- without 12.7s / 140 matches
-        # Both slower AND wrong: those 3 bulkDelete hits are third-party code, so an
-        # agent asking "does a bulk delete exist?" was handed evidence that it does.
-        # The search tool was manufacturing support for the fabrication it should catch.
+        # node_modules and every other ignored tree. Measured 2026-07-30 on a large repo:
+        #   symbol A: with "**/*" 55.0s / 3 matches  -- without 11.8s / 0 matches
+        #   symbol B: with "**/*" 45.7s / 611 matches -- without 12.7s / 140 matches
+        # Both slower AND wrong: the extra "matches" were all inside vendored dependency
+        # code, so an agent checking whether a symbol exists in the PROJECT was handed
+        # evidence that it does. The search tool was manufacturing support for the
+        # fabrication it is supposed to help catch.
         if glob_filter and glob_filter not in ("**/*", "**", "*"):
             cmd += ["--glob", glob_filter]
         for ex in _RG_EXCLUDES:
