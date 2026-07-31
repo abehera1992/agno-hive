@@ -8,9 +8,18 @@ venv/
 dist/
 build/
 .DS_Store
-docs/
+# `docs/*` (contents), NOT `docs/` (the directory): git does not descend into an ignored
+# directory, so a `!docs/sub/**` re-include under `docs/` never gets evaluated. The
+# superpowers files below are tracked only because they predate the rule — the negation
+# was never actually doing anything for new files.
+docs/*
 !docs/superpowers/
 !docs/superpowers/**
+# Operational runbooks are tracked: they describe how the deployed system is actually
+# run, so they must reach ZGX on a git pull. Everything else under docs/ stays ignored
+# because it is machine-local scratch (workstation paths, Tailscale IPs, session notes).
+!docs/runbooks/
+!docs/runbooks/**
 .claude/
 CLAUDE.md
 docs.md
