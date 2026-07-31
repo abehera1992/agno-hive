@@ -16,7 +16,36 @@ _IGNORE_DIRS = {
     ".git", "node_modules", "__pycache__", ".next", "dist", "build",
     ".venv", "venv", "env", ".mypy_cache", ".pytest_cache", "coverage",
     ".tox", ".eggs", "*.egg-info",
+    # Vendored third-party mail stack in EkamApp (dovecot/rspamd/imapsync). Not project
+    # source, and imapsync alone is a 400KB perl script whose help text matches almost
+    # any English word. Added 2026-07-30 with the search fixes below.
+    "mailcow", "graphify-out", "backups",
 }
+
+# Negative --glob filters for ripgrep. rg honours .gitignore, but these are often
+# committed or present-and-untracked, so they must be excluded explicitly.
+_RG_EXCLUDES = [
+    "!**/node_modules/**", "!**/infra/mailcow/**", "!**/.git/**",
+    "!**/dist/**", "!**/build/**", "!**/.next/**", "!**/coverage/**",
+    "!**/backups/**", "!**/graphify-out/**", "!**/__pycache__/**",
+    "!**/*.min.js", "!**/*.min.css", "!**/package-lock.json", "!**/*.lock",
+]
+
+# A result that overflows the model's context is worse than no result — the agent loses
+# the whole conversation, not just the answer. Observed 2026-07-30: an unbounded search
+# returned 251KB and raised ContextWindowExceededError at 262144 tokens.
+_MAX_OUTPUT_CHARS = 20_000
+
+
+def _cap(text: str) -> str:
+    """Clamp a tool result to _MAX_OUTPUT_CHARS. Applied on EVERY return path, including
+    the pure-Python fallback: max_results bounds the number of LINES, not their length,
+    and one matching line in a minified bundle or a JSON blob can be megabytes."""
+    if len(text) <= _MAX_OUTPUT_CHARS:
+        return text
+    return (text[:_MAX_OUTPUT_CHARS]
+            + f"\n... TRUNCATED at {_MAX_OUTPUT_CHARS} chars. Narrow `pattern` or pass a "
+              f"`glob_filter` such as '**/*.tsx'.")
 
 _CONTEXT_FILES = [
     "CLAUDE.md", "AGENTS.md", "GEMINI.md",
@@ -304,11 +333,23 @@ def search_files(pattern: str, glob_filter: str = "**/*", max_results: int = 80)
     import subprocess, shutil
     rg = shutil.which("rg")
     if rg:
+        cmd = [rg, "-n", "-i", "--no-heading", "--max-count", "1"]
+        # Only pass glob_filter when it NARROWS. Passing the catch-all "**/*" as an
+        # --glob INCLUDE overrides ripgrep's .gitignore handling, so rg descends into
+        # node_modules and every ignored tree. Measured on EkamApp 2026-07-30:
+        #   'bulkDelete' with "**/*" 55.0s / 3 matches  -- without 11.8s / 0 matches
+        #   'duplicate'  with "**/*" 45.7s / 611 matches -- without 12.7s / 140 matches
+        # Both slower AND wrong: those 3 bulkDelete hits are third-party code, so an
+        # agent asking "does a bulk delete exist?" was handed evidence that it does.
+        # The search tool was manufacturing support for the fabrication it should catch.
+        if glob_filter and glob_filter not in ("**/*", "**", "*"):
+            cmd += ["--glob", glob_filter]
+        for ex in _RG_EXCLUDES:
+            cmd += ["--glob", ex]
+        cmd.append(pattern)
         try:
             result = subprocess.run(
-                [rg, "-n", "-i", "--no-heading", "--glob", glob_filter,
-                 "--max-count", "1", pattern],
-                capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=30,
+                cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=30,
             )
             if result.returncode not in (0, 1):
                 raise RuntimeError(result.stderr.strip())
@@ -323,9 +364,22 @@ def search_files(pattern: str, glob_filter: str = "**/*", max_results: int = 80)
                     out.append(f"{parts[0]}:{parts[1]}: {parts[2]}")
                 else:
                     out.append(ln)
-            return "\n".join(out)
+            text = "\n".join(out)
+            if len(text) > _MAX_OUTPUT_CHARS:
+                text = (text[:_MAX_OUTPUT_CHARS]
+                        + f"\n... TRUNCATED at {_MAX_OUTPUT_CHARS} chars "
+                          f"({len(lines)} matching files). Narrow `pattern` or pass a "
+                          f"`glob_filter` such as '**/*.tsx'.")
+            return text
+        except subprocess.TimeoutExpired:
+            # Do NOT fall through. The Python fallback re-reads the whole tree with no
+            # timeout, so a 30s rg timeout escalated into a multi-minute hang — that is
+            # what blew the agent's 300s MCP deadline on 2026-07-30 and left it answering
+            # from priors instead of the repo. Fail fast so it narrows and retries.
+            return (f"search timed out after 30s for pattern: {pattern!r}. "
+                    f"Narrow it, or pass a `glob_filter` like '**/*.py' or '**/*.tsx'.")
         except Exception:
-            pass  # fall through to Python re
+            pass  # genuine rg failure (not a timeout) — fall through to Python re
 
     try:
         regex = re.compile(pattern, re.IGNORECASE)
@@ -344,13 +398,13 @@ def search_files(pattern: str, glob_filter: str = "**/*", max_results: int = 80)
                         if regex.search(line):
                             results.append(f"{rel}:{i}: {line.rstrip()}")
                             if len(results) >= max_results:
-                                return "\n".join(results)
+                                return _cap("\n".join(results))
             except Exception:
                 continue
     except Exception as e:
         return f"search_files failed: {e}"
 
-    return "\n".join(results) if results else f"No matches for: {pattern}"
+    return _cap("\n".join(results)) if results else f"No matches for: {pattern}"
 
 
 def count_matches(pattern: str, glob_filter: str = "**/*",

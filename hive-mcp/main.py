@@ -31,6 +31,7 @@ from tools.context import (
     list_directory_tree,
 )
 from tools.files import write_file, apply_diff, run_command
+from tools.verify import verify_claims
 from tools.shell import run_shell, run_docker, get_env_info, check_port, list_processes
 from tools.git import git_status, git_log, git_diff, git_log_file, git_blame
 from tools.index import index_project
@@ -117,6 +118,12 @@ _instructions = (
     "When you state whether something is implemented / done / removed / present / fixed, base it "
     "ONLY on code you actually READ this run (get_file_content / search_files) and cite the exact "
     "file path + line + the literal code as evidence. "
+    "BEFORE returning any answer that names a symbol, a file:line, or an /api/ route, call "
+    "verify_claims(your_draft_answer). It greps every claim against the repo and reports what does "
+    "not exist. If it returns NOT FOUND or BAD, the claim is fabricated - fix the answer, do not "
+    "return it. A symbol that merely LOOKS like the answer (a single-item deleteItem when asked "
+    "about bulk delete, a list query when asked which mutation returns a field) is the most common "
+    "failure: existing is not the same as doing what was asked. "
     "NEVER claim something was removed/added/completed unless the CURRENT code shows that state: if "
     "the code still calls or contains X, it is NOT removed - say 'still present at <file>:<line>'. "
     "Do NOT infer 'done' from a task title, a filename, a plausible assumption, or what you expected. "
@@ -149,6 +156,7 @@ mcp.tool()(get_file_content)
 mcp.tool()(find_files)
 mcp.tool()(search_files)
 mcp.tool()(count_matches)
+mcp.tool()(verify_claims)
 mcp.tool()(list_directory)
 mcp.tool()(list_directory_tree)
 
