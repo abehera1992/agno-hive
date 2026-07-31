@@ -387,16 +387,24 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     if not bad:
         return content
 
-    print(f"[team] verify_claims flagged unsupported claims — retrying once")
+    # Name ONLY the unsupported items, in prose. The first version of this prompt
+    # embedded the whole draft and the whole verification report; the coordinator echoed
+    # it back verbatim as its answer (the documented failure mode for long, structured,
+    # code-bearing prompts), producing output containing the prompt AND the report twice
+    # — strictly worse than the fabrication it was fixing. Keep it short and re-ask the
+    # ORIGINAL question rather than asking for an edit of the draft.
+    missing = [ln.split()[1] for ln in report.splitlines()
+               if ln.strip().startswith(("NOT FOUND", "DOC ONLY", "BAD")) and len(ln.split()) > 1]
+    if not missing:
+        return content
+    named = ", ".join(missing[:6])
     retry_prompt = (
-        "Your draft answer contains claims that do NOT exist in this repository.\n\n"
-        f"--- your draft ---\n{content}\n\n"
-        f"--- deterministic verification of that draft ---\n{report}\n\n"
-        "Rewrite the answer using ONLY what the repository actually contains. "
-        "Every NOT FOUND item is something you invented: remove it. Do not substitute a "
-        "similarly-named symbol that happens to exist — if the thing asked about is not "
-        "in the codebase, say plainly that it does not exist and name what IS there "
-        "instead. Read the relevant file to confirm before answering."
+        f"{task}\n\n"
+        f"IMPORTANT: a previous attempt at this question referred to {named}, which "
+        f"a repository-wide grep shows does not exist here. Do not mention those again. "
+        f"Read the relevant file and answer from what is actually there. If the thing "
+        f"being asked about does not exist in this codebase, say that plainly and name "
+        f"what does exist instead — do not offer a similarly-named symbol as a substitute."
     )
     try:
         retry = await team.arun(retry_prompt)

@@ -58,6 +58,8 @@ _DOTTED_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$"
 # code defines it — a pattern file describing `handleSave` in a comment made a fabricated
 # function name read as FOUND.
 _DOC_EXTS = (".md", ".mdx", ".txt", ".rst", ".adoc")
+# An escaped path parameter as it appears after re.escape(): \{id\}, \$\{id\}, :id
+_PARAM_RE = re.compile(r"(?:\\$)?\\{[^}]*\\}|:[A-Za-z_][A-Za-z0-9_]*")
 
 # Words that show up in backticks constantly and mean nothing on their own. Grepping
 # them wastes a subprocess and returns thousands of hits.
@@ -176,6 +178,11 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     if _ROUTE_RE is not None:
         for r in _ROUTE_RE.findall(answer):
             r = r.rstrip(".,;)")
+            # Skip file paths. "/api/services/inventory/inventoryApi.ts" was being
+            # extracted out of a repo path and checked as if it were an HTTP route.
+            last = r.rsplit("/", 1)[-1]
+            if "." in last and not last.endswith("}"):
+                continue
             if r not in routes:
                 routes.append(r)
 
@@ -245,11 +252,19 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             #   params stripped          -> correctly-cited real routes went missing
             # Requiring >= 2 segments avoids blessing a route because one common word in
             # it appears somewhere in the repo.
+            # Path params are written three ways for the same route -- {id} in docs,
+            # ${id} in a JS template literal, :id in some routers -- so a literal probe
+            # for "items/{id}" misses a real "items/${id}". Probe the param as a regex
+            # wildcard instead of a fixed string; a real route then matches whichever
+            # form the source uses. Measured 2026-07-30: the literal form reported a
+            # genuine endpoint as NOT FOUND, which is the false positive that teaches
+            # agents to ignore this tool.
             segs = [s for s in r.split("/") if s]
             probe, hits = None, []
             for start in range(len(segs) - 1):
                 cand = "/".join(segs[start:])
-                found = _rg(cand, fixed=True, glob_filter=glob_filter)
+                pat = _PARAM_RE.sub(r"[^/\"'`]+", re.escape(cand))
+                found = _rg(pat, fixed=False, glob_filter=glob_filter)
                 if found:
                     probe, hits = cand, found
                     break
