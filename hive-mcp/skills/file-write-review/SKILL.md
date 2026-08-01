@@ -14,6 +14,14 @@ File editing rules:
       new_string = "last_line\nnew_content"
   Never drop existing lines from new_string unless intentionally deleting them.
 
+Before staging ANY code via apply_diff or write_file: call verify_claims on the
+CODE you are about to write (the new_string / file content itself), not just the
+prose summary you plan to return. verify_claims checks fenced code blocks for
+fabricated attribute access (e.g. `item.stock_quantity` when no such field exists)
+in addition to backticked symbols in prose — but only if you give it the code to
+check. Restating a symbol in your summary is not the same as checking the code
+that will actually be applied.
+
 run_command is READ-ONLY (CRITICAL):
 - run_command is for tests, linters, grep, git status ONLY.
 - NEVER use run_command to modify files — no >, >>, sed -i, tee, perl -i.

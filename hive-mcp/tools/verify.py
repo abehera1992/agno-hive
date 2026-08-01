@@ -70,6 +70,17 @@ _NOISE = {
     "get", "post", "put", "delete", "patch", "data", "error", "result", "value",
 }
 
+# Module/package prefixes common enough that `prefix.attribute` inside generated code
+# is almost always a legitimate stdlib/framework call, not a project symbol worth
+# checking. Without this, csv.writer / io.StringIO / datetime.now flood the report
+# with NOT FOUND false positives — observed directly in a live test, 2026-08-01.
+_STDLIB_PREFIXES = {
+    "os", "sys", "io", "csv", "json", "re", "time", "logging", "subprocess",
+    "pathlib", "datetime", "typing", "asyncio", "functools", "itertools",
+    "collections",
+}
+_CODE_DOTTED_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\b")
+
 _FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*\s*?\n(.*?)```", re.S)
 
 
@@ -101,6 +112,29 @@ def _lint_code(answer: str) -> list[str]:
         except re.error:
             continue
     return out
+
+
+def _code_idents(answer: str) -> list[str]:
+    """Dotted attribute-access tokens (item.stock_quantity, Model.field) found INSIDE
+    fenced code blocks — not the prose summary around them.
+
+    verify_claims previously only read backticked spans in prose (see the "no
+    checkable claims found" message below), so a fabricated attribute that only
+    appeared in the generated code — never restated in backticks in the summary —
+    passed every check. Measured 2026-08-01: two independent write tasks both used
+    `item.stock_quantity` / `Item.stock_quantity`, a field that does not exist
+    anywhere in the project, and neither was caught, because the fabricated name
+    never appeared outside the ```python block.
+    """
+    idents: list[str] = []
+    for block in _FENCE_RE.findall(answer or ""):
+        for tok in _CODE_DOTTED_RE.findall(block):
+            left = tok.split(".", 1)[0].lower()
+            if left in _STDLIB_PREFIXES or left in _NOISE:
+                continue
+            if tok not in idents:
+                idents.append(tok)
+    return idents
 
 
 _MAX_CLAIMS = 25   # subprocess per claim; keep the whole check inside a few seconds
@@ -200,6 +234,9 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
         if (_IDENT_RE.match(tok) or _DOTTED_RE.match(tok)) and tok.lower() not in _NOISE:
             if tok not in idents:
                 idents.append(tok)
+    for tok in _code_idents(answer):
+        if tok not in idents:
+            idents.append(tok)
 
     file_lines: list[tuple[str, int]] = []
     for path, num in _FILE_LINE_RE.findall(answer):
@@ -221,7 +258,8 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
 
     if not (idents or file_lines or routes) and not _lint_code(answer):
         return ("verify_claims: no checkable claims found (no backticked symbols, "
-                "file:line citations, API routes, or convention violations).")
+                "code-block attribute references, file:line citations, API routes, "
+                "or convention violations).")
 
     out: list[str] = ["verify_claims — deterministic grep of the claims in this answer", ""]
     problems = 0
