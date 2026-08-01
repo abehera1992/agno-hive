@@ -181,8 +181,22 @@ _tool(web_fetch)
 _tool(confirm_action)
 _tool(reject_action)
 
-for _tool in _INTEGRATION_TOOLS:
-    mcp.tool()(_tool)
+def _register_integration_tools(tools: list) -> None:
+    """Register integration tools (db_query, db_schema, notion_*, run_migration)
+    through the same _tool() tracing every other tool gets.
+
+    Previously this was a bare `for _tool in _INTEGRATION_TOOLS: mcp.tool()(_tool)`
+    — the loop variable `_tool` shadowed this module's own `_tool()` tracing
+    helper of the same name, so it silently fell back to raw `mcp.tool()(...)` and
+    never wrapped these tools in `_traced()`. Confirmed 2026-08-01: a live
+    groundedness test could not tell whether db_query had actually been called,
+    because it never appeared in the [tool] log regardless of whether it ran.
+    """
+    for integration_tool in tools:
+        _tool(integration_tool)
+
+
+_register_integration_tools(_INTEGRATION_TOOLS)
 
 # ── HTTP routes for CLI confirm/reject (bypasses agent pipeline) ──────────────
 # The hive CLI calls these directly: POST /actions/confirm  {"action_id": "..."}
