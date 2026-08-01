@@ -18,6 +18,42 @@ from .exclusions import is_excluded
 _PROPOSED_SUFFIX = ".hive_proposed"
 _IN_DOCKER = Path("/.dockerenv").exists()
 
+# Detects a stuck retry loop: the exact same failing apply_diff call repeated
+# verbatim against the same file. Module-level and intentionally coarse — hive-mcp
+# runs as one long-lived process, and this only needs to catch "the identical call,
+# again," not build a general call history. Measured 2026-08-01: a single task
+# burned 30-40+ tool calls retrying against a file that kept returning the same
+# generic "old_string not found" message with no information about why.
+_last_failed_call: dict[str, tuple[str, str]] = {}
+
+
+def _near_match_hint(content: str, old_string: str, context: int = 2) -> str:
+	"""Best-effort explanation of why old_string didn't match: the closest existing
+	line in the file, so the model can see the actual mismatch (usually whitespace,
+	quoting, or a line already changed by an earlier edit) instead of guessing via
+	repeated re-reads. Returns "" when nothing is close enough to be useful — a
+	weak hint that misleads is worse than no hint.
+	"""
+	target = (old_string.splitlines() or [old_string])[0].strip()
+	if not target:
+		return ""
+	file_lines = content.splitlines()
+	best_idx, best_ratio = None, 0.0
+	for i, line in enumerate(file_lines):
+		ratio = difflib.SequenceMatcher(None, target, line.strip()).ratio()
+		if ratio > best_ratio:
+			best_idx, best_ratio = i, ratio
+	if best_idx is None or best_ratio < 0.5:
+		return ""
+	lo, hi = max(0, best_idx - context), min(len(file_lines), best_idx + context + 1)
+	snippet = "\n".join(f"  {n + 1}: {file_lines[n]}" for n in range(lo, hi))
+	return (
+		f"\nClosest existing text (line {best_idx + 1}, {best_ratio:.0%} similar to "
+		f"your first line):\n{snippet}\n"
+		f"Compare this against your old_string character-by-character — the mismatch "
+		f"is usually whitespace, quoting, or a nearby edit already applied."
+	)
+
 # Shell commands that write to files — blocked when WRITE_REVIEW=true
 _WRITE_CMD_RE = re.compile(
     r"\s>>?\s"
@@ -148,13 +184,26 @@ def apply_diff(relative_path: str, old_string: str, new_string: str, preserve_in
 
         count = content.count(old_string)
         if count == 0:
+            prev = _last_failed_call.get(relative_path)
+            if prev == (old_string, new_string):
+                _last_failed_call.pop(relative_path, None)  # reset — a later distinct retry isn't blocked
+                return (
+                    f"apply_diff STOPPED: this exact old_string/new_string was just retried "
+                    f"against {relative_path} and failed again with no change. Repeating it "
+                    f"again will not help. Call get_file_content('{relative_path}') ONE more "
+                    f"time, read the ENTIRE relevant function, and construct a DIFFERENT, "
+                    f"smaller, uniquely-anchored old_string — do not resubmit this one."
+                )
+            _last_failed_call[relative_path] = (old_string, new_string)
+            hint = _near_match_hint(content, old_string)
             return (
                 f"apply_diff failed: old_string not found in {relative_path}. "
                 f"Call get_file_content('{relative_path}') to read the current exact text, "
-                f"then retry with the correct old_string."
+                f"then retry with the correct old_string.{hint}"
             )
         if count > 1:
             return f"apply_diff failed: old_string appears {count} times — be more specific"
+        _last_failed_call.pop(relative_path, None)
 
         proposed_content = content.replace(old_string, new_string, 1)
 
