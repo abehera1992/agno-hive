@@ -32,6 +32,7 @@ from tools.context import (
 )
 from tools.files import write_file, apply_diff, run_command
 from tools.verify import verify_claims
+from tools.skills import list_skills, load_skill
 from tools.shell import run_shell, run_docker, get_env_info, check_port, list_processes
 from tools.git import git_status, git_log, git_diff, git_log_file, git_blame
 from tools.index import index_project
@@ -82,108 +83,15 @@ _instructions = (
     "The project files are at the root level — use get_file_content, find_files, "
     "and search_files to explore before making any changes. "
     ""
-    "File editing rules: "
-    "Use apply_diff() for ALL edits to existing files — surgical, line-level replacement. "
-    "Use write_file() ONLY for brand-new files. "
-    "Use run_command() for read-only checks (tests, linters). "
-    "Use run_shell() when you need to run install commands or start services. "
-    "Use run_docker() to inspect or manage Docker containers and compose services. "
-    ""
-    "IMPORTANT: If apply_diff() or write_file() returns 'review_pending', "
-    "STOP immediately. Do not call any other tool. "
-    "Tell the human the change is staged for review — they approve via the hive CLI. "
-    "confirm_write and reject_write do not exist as tools. "
-    ""
-    "IMPORTANT: If a Notion/Google tool returns 'action_pending', "
-    "STOP immediately. Do not call any other tool. "
-    "Tell the human the action is staged — they approve via the hive CLI. "
-    "Do NOT call confirm_action yourself. "
-    ""
-    "Notion GROUNDING rules (MANDATORY — read before you write, never guess): "
-    "1. NEVER fabricate or guess a Notion page_id. Resolve real ids first: "
-    "notion_find_work_item(query) for a work item (e.g. 'Phase 6'), "
-    "notion_items_in_sprint(...) / notion_search() / notion_query_database() for the rest. "
-    "2. BEFORE any notion_update_page_props or relation change, call "
-    "notion_get_item_with_relations(page_id) to READ the page's current properties and relations. "
-    "Never set a relation (Parent item 1, Sprint, Work Items) you have not just read. "
-    "3. Do NOT confuse 'Spec' (a doc-link property) with 'Parent item 1' (the work-item parent). "
-    "Change a parent only if the task explicitly asks, and only to a page you confirmed is a Work Item "
-    "via notion_get_item_with_relations — never to a Spec/doc URL. "
-    "4. In notion_update_page_props send ONLY the properties the task names. Do NOT re-send "
-    "Parent item 1 or any relation you were not asked to change (omitted properties are left as-is). "
-    "5. Never report an item as 'orphaned'/missing a value from assumption — read it first and "
-    "report the actual current state. "
-    ""
-    "Verification & completion-claim discipline (MANDATORY - applies to ALL claims, not just Notion): "
-    "When you state whether something is implemented / done / removed / present / fixed, base it "
-    "ONLY on code you actually READ this run (get_file_content / search_files) and cite the exact "
-    "file path + line + the literal code as evidence. "
-    "BEFORE returning any answer that names a symbol, a file:line, or an API route, call "
-    "verify_claims(your_draft_answer). It greps every claim against the repo and reports what does "
-    "not exist. If it returns NOT FOUND or BAD, the claim is fabricated - fix the answer, do not "
-    "return it. The most common failure is naming a symbol that merely RESEMBLES the answer: a "
-    "single-item function offered when asked about a batch operation, or a neighbouring symbol "
-    "from the same file. Existing is not the same as doing what was asked, and verify_claims "
-    "cannot catch that - it only proves the name exists. "
-    "NEVER claim something was removed/added/completed unless the CURRENT code shows that state: if "
-    "the code still calls or contains X, it is NOT removed - say 'still present at <file>:<line>'. "
-    "Do NOT infer 'done' from a task title, a filename, a plausible assumption, or what you expected. "
-    "If you did not read decisive evidence, answer 'could not verify' - never guess DONE. "
-    ""
-    "Counting & exhaustiveness (MANDATORY): for ANY count, total, 'how many', 'all', or exhaustive "
-    "enumeration over a file or the codebase, derive the number from a DETERMINISTIC tool and report "
-    "that tool's ACTUAL output - PREFER count_matches(pattern, glob_filter) which returns the exact "
-    "'TOTAL: <n>' computed by ripgrep; or run_command with grep -c / grep -oE '...' | wc -l / wc -l. "
-    "NEVER read a large file partially and estimate, extrapolate, sample, or eyeball a "
-    "count. If the target is a big literal (a large dict / list / table / seed block), GREP it - do not "
-    "scroll it and guess. Research thoroughly first: a value may live in more than one place (e.g. a DB "
-    "table AND a code fallback), so search_files across the WHOLE repo to confirm you found every "
-    "occurrence before stating a total, and state which sources you checked. "
-    ""
-    "Database-backed facts (when db_query / db_schema are available): if a value is stored "
-    "in a database table (a count of rows, the current value of a column, 'how many X have "
-    "status Y'), the LIVE TABLE is the source of truth — a file grep of a seed/migration/code "
-    "fallback can be stale or incomplete. Call db_schema(table) to confirm the exact schema + "
-    "column names, then db_query with an aggregate (SELECT col, count(*) ... GROUP BY col) to "
-    "get the authoritative number. Report the DB result as the total; treat file greps as "
-    "SUPPLEMENTARY subtotals (and note when the DB and the code/seed disagree — they often do)."
+    "Skills: call list_skills() to see the always-loaded catalog of available "
+    "protocols (Notion grounding, DB-backed facts, counting, file-write review, "
+    "verification discipline, and any project-specific skills). Call "
+    "load_skill(name) to fetch ONE skill's full instructions before acting on a "
+    "task its description matches — e.g. before writing to Notion, before citing "
+    "a database-backed number, before making any file change, before claiming "
+    "something is done/removed/verified. Do not load a skill unrelated to the "
+    "current task."
 )
-
-
-def _conventions_block() -> str:
-    """State the project's code conventions up front, from the configured lint rules.
-
-    verify_claims already checks emitted code against CODE_LINT_FORBID / CODE_LINT_REQUIRE
-    AFTER the fact. That is necessary but it is not where the cost is: measured 2026-07-31,
-    a "write a component following this project's conventions" task spent its whole run
-    HUNTING for the rules — "let me check the project's documentation… let me check the
-    CLAUDE.md" — and the outcome depended on whether the hunt happened to succeed. Across
-    three passes the same case produced a pass, a failure, and a 600s non-termination.
-
-    The rules are already in the loaded project context, but one line inside ~40K tokens is
-    not findable in practice. Restating them here costs ~30 tokens and removes the search.
-    hive-mcp still ships NO rules of its own — this only echoes what the project configured,
-    so the server stays project-independent.
-    """
-    req = [r.partition("::") for r in config.CODE_LINT_REQUIRE]
-    forb = [r.partition("::") for r in config.CODE_LINT_FORBID]
-    if not (req or forb):
-        return ""
-    parts = ["Project code conventions — these are AUTHORITATIVE and complete. Apply them "
-             "directly when writing or editing code; do NOT go searching the repo or the "
-             "docs for a styling/convention guide, and do not infer conventions from "
-             "unrelated files. "]
-    # No ALWAYS/NEVER prefixes. The configured messages are already written as
-    # directives, and a polarity prefix inverts them: a FORBID rule whose message reads
-    # "use styles.x, not a bare className string" becomes "NEVER: use styles.x" —
-    # instructing the exact opposite of the rule. Emit the messages verbatim.
-    for _, _, msg in req + forb:
-        if msg:
-            parts.append(f"- {msg.rstrip('.')}. ")
-    return "".join(parts)
-
-
-_instructions = _instructions + " " + _conventions_block()
 
 mcp = FastMCP(config.MCP_NAME, instructions=_instructions)
 
@@ -233,6 +141,8 @@ _tool(find_files)
 _tool(search_files)
 _tool(count_matches)
 _tool(verify_claims)
+_tool(list_skills)
+_tool(load_skill)
 _tool(list_directory)
 _tool(list_directory_tree)
 
