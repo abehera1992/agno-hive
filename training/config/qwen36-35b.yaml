@@ -1,0 +1,98 @@
+# Phase 3 recipe — QLoRA + ORPO on Qwen3.6-35B-A3B (BF16 base), cloned verbatim from
+# the proven qwen3-30b.yaml recipe (2026-07-30, promoted to production as
+# qwen3-30b-hive-v2). Only model identity / paths differ — see training/RUNBOOK.md
+# for the step-by-step this config is driven by.
+#
+# Base architecture is qwen3_5_moe (Qwen3.5/3.6 hybrid GDN+attention MoE) — NEW vs the
+# qwen3_moe base the proven recipe was built for. Verified compatible before this run
+# via a live smoke test on ZGX (2026-08-01):
+#   - transformers 5.5.0 resolves the architecture (min required for qwen3_5 is 5.2.0)
+#   - unsloth 2026.7.6 has explicit "Fast Qwen3_5_MoE patching" dispatch (not a
+#     generic/unsupported fallback) and already lists "qwen3_5" in FORCE_FLOAT32
+#     (GDN layers are known to NaN in float16 — forced float32 automatically) and in
+#     FLA_MODEL_TYPE_PREFIXES (bundled Triton kernels for the gated-deltanet layers,
+#     no separate install needed)
+#   - the ONLY crash hit during the smoke test was transformers' native FP8 quantizer
+#     (`Qwen3_5MoeTextConfig` has no `intermediate_size`, only `moe_intermediate_size`
+#     — a transformers bug in quantizer_finegrained_fp8.py, unrelated to Unsloth) when
+#     pointed at the FP8 checkpoint. This config trains on the BF16 base with
+#     bitsandbytes 4-bit (load_in_4bit), a completely different code path that never
+#     touches the broken FP8 quantizer — same reasoning the original recipe already
+#     documents for why training must use BF16, never FP8.
+base_model: /home/abehera1992/models/Qwen3.6-35B-A3B-bf16
+staging_dir: /home/abehera1992/models
+
+# ── naming standard (matches qwen3-30b.yaml convention) ──────────────────────
+# candidate : Qwen3.6-unsloth-hive-v1   <- the tuned artifact (name given 2026-08-01)
+# baseline  : qwen3.6-35b-a3b-instruct  <- the untuned reference the gate compares against
+candidate_name: Qwen3.6-unsloth-hive-v1
+baseline_name: qwen3.6-35b-a3b-instruct
+
+output_dir: checkpoints/qwen3.6-unsloth-hive-v1
+merged_dir: checkpoints/qwen3.6-unsloth-hive-v1-merged-bf16
+
+# ── data ──────────────────────────────────────────────────────────────────────
+# REUSED as-is from the proven v2 run, unchanged. The corpus is prompt/chosen/rejected
+# text pairs sourced from ground-truth EkamApp facts + patterns/*.md WRONG->CORRECT
+# guard pairs — none of it is base-model-specific, so it transfers directly. See
+# training/train.py module docstring for why only `kind: pref` rows train (SFT rows
+# from postgres_sessions are unverified and deliberately excluded).
+dataset: training/data/corpus_v2.jsonl
+objective: orpo
+
+# ── LoRA — IDENTICAL to the proven v2 recipe, deliberately not re-tuned ──────
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  bias: none
+  # Same explicit 7-projection list as v2 (not "all-linear" — see qwen3-30b.yaml for
+  # why that risks unpredictable VRAM on a MoE). This hybrid architecture also has
+  # gated-deltanet (linear-attention) layers that do NOT use these projection names,
+  # so LoRA attaches only where q/k/v/o/gate/up/down_proj actually exist — PEFT skips
+  # non-matching layers silently, it does not error. That is an accepted, deliberate
+  # scope for this run (train the same attention+MLP surface as v2), not a gap to fix
+  # here; widening to also cover GDN-layer projections is a future exercise if the
+  # gate result calls for it.
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  use_gradient_checkpointing: unsloth
+
+# ── optimisation — IDENTICAL to the proven v2 recipe ──────────────────────────
+train:
+  max_seq_length: 2048
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-5
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.05
+  num_train_epochs: 4
+  max_steps: -1
+  optim: adamw_8bit
+  weight_decay: 0.01
+  beta: 0.3
+  bf16: true
+  seed: 42
+  logging_steps: 5
+  save_strategy: epoch
+
+# ── quantisation ──────────────────────────────────────────────────────────────
+load_in_4bit: true      # QLoRA. v2 measured ~17GB for a 30B MoE; this 35B MoE should
+                         # be in the same ballpark — watch peak GPU in the train log.
+
+# ── promotion gate ─────────────────────────────────────────────────────────────
+# Same thresholds as the proven v2 recipe. IMPORTANT CAVEAT (2026-08-01): this repo
+# checkout only has the ORIGINAL 6-case eval suite (training/eval/cases/*.json), not
+# the widened 15-20-per-axis set RUNBOOK.md Phase 2.5.2 describes building for v2.
+# min_cases_per_axis: 12 below means the gate CANNOT exit 0 on this suite regardless
+# of how good the candidate is (current n: A=1, B=3, C=2, D=2 — all under the floor).
+# Do not lower this value to force a pass; it exists to stop a single flipped case from
+# deciding the whole gate. Treat any gate run against the 6-case suite as INFORMATIONAL
+# (same-methodology before/after comparison), not a real promotion verdict, until the
+# case set is actually widened.
+gate:
+  citation_min: 0.80
+  grounding_min: 0.85
+  tool_call_min: 0.98
+  guard_min: baseline
+  guard_target: 0.65
+  min_cases_per_axis: 12
