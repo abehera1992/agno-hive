@@ -405,8 +405,20 @@ _READ_TOOLS = {
     "web_fetch", "web_search",
 }
 
-# Claims that need evidence: a backticked identifier, or a path:line citation.
-_CLAIMY_RE = re.compile(r"`[A-Za-z_][A-Za-z0-9_.]{2,}`|[\w./-]+\.\w{1,6}:\d+")
+# Claims that need evidence: a backticked identifier, a path:line citation, or a
+# bare quantitative claim ("3 active, 3 inactive, 6 total items", "count of X is 42").
+# The first two forms were the only ones covered until 2026-08-01: a live-DB question
+# was answered "3 active / 3 inactive / 6 total" with ZERO tool calls (confirmed via
+# hive-mcp AND project-MCP trace logs across a 15-minute window) and this guard never
+# fired, because a bare number next to a count-flavoured noun matched neither pattern.
+# The answer happened to be correct by luck; the guard exists to not depend on luck.
+_CLAIMY_RE = re.compile(
+    r"`[A-Za-z_][A-Za-z0-9_.]{2,}`"
+    r"|[\w./-]+\.\w{1,6}:\d+"
+    r"|\b\d+\b[^.\n]{0,40}\b(rows?|records?|items?|entries|count|total)\b"
+    r"|\b(count|total|number) of\b[^.\n]{0,40}\b\d+\b",
+    re.IGNORECASE,
+)
 
 
 def _count_read_calls(result) -> int:
