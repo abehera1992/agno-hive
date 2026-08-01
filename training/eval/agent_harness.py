@@ -31,7 +31,8 @@ CASES_PATH = Path(__file__).parent / "agent_cases.json"
 
 
 def run_one(url: str, project: str, task: str, team: str, timeout: int,
-            mcp_url: str = "", mcp_urls: tuple[str, ...] = ()) -> tuple[str, float]:
+            mcp_url: str = "", mcp_urls: tuple[str, ...] = (),
+            read_only: bool = True) -> tuple[str, float]:
     """POST one task to the swarm.
 
     mcp_url / mcp_urls MUST mirror what the real caller sends. agno_run (the MCP tool
@@ -43,6 +44,12 @@ def run_one(url: str, project: str, task: str, team: str, timeout: int,
     during a harness run despite working when invoked through agno_run.
     """
     payload: dict = {"task": task, "project_id": project, "team": team}
+    if read_only:
+        # Enforced server-side by stripping mutating tools, not by asking the model.
+        # Without it the eval MUTATES the project: a "write a component" case staged
+        # .hive_proposed files into invented directories, and kept doing so even when
+        # the prompt explicitly forbade write_file (observed 2026-07-31).
+        payload["read_only"] = True
     if mcp_url:
         payload["mcp_url"] = mcp_url
     if mcp_urls:
@@ -76,6 +83,10 @@ def main() -> None:
                     help="comma-separated; hive-mcp must be here")
     ap.add_argument("--out", default="training/eval/agent_report.json")
     ap.add_argument("--only", default="", help="substring filter on case id")
+    ap.add_argument("--allow-writes", action="store_true",
+                    help="permit the run to mutate the project (default: read-only). "
+                         "The eval must not write; this exists only for deliberate "
+                         "write-path testing.")
     ap.add_argument("--repeats", type=int, default=3,
                     help="run each case N times; single runs cannot resolve this suite's variance")
     ap.add_argument("--aggregate", choices=("best", "majority", "strict"), default="best",
@@ -98,7 +109,8 @@ def main() -> None:
         runs are now counted and reported separately, never scored.
         """
         text, elapsed = run_one(a.url, a.project, c["prompt"], a.team, a.timeout,
-                                a.mcp_url, tuple(u.strip() for u in a.mcp_urls.split(',') if u.strip()))
+                                a.mcp_url, tuple(u.strip() for u in a.mcp_urls.split(',') if u.strip()),
+                                not a.allow_writes)
         if text.startswith("__ERROR__"):
             return None, {}, {"error": text[:200]}, elapsed, text
         g, gd = score_grounding(c, text)

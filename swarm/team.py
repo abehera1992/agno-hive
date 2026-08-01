@@ -235,7 +235,51 @@ _COORDINATOR_INSTRUCTIONS = [
 ]
 
 
-def _scope_coordinator_tools(tool_names: list[str] | None, mcp_list: list):
+# Tools that CHANGE something — the repo, the host, or an external system. Named here,
+# server-side, so a caller asking for a read-only run does not have to know (or keep in
+# sync with) which tools mutate. Prefix matching covers integration families that grow
+# over time, e.g. every notion_create_/update_/append_/delete_ variant.
+_MUTATING_TOOLS = {
+    "write_file", "apply_diff", "run_command", "run_shell", "run_docker",
+    "confirm_action", "reject_action", "index_project", "scan_project_context",
+    "lightrag_insert", "run_migration",
+}
+_MUTATING_PREFIXES = (
+    "notion_create", "notion_update", "notion_append", "notion_replace",
+    "notion_delete", "notion_trash",
+)
+
+
+def _is_mutating(name: str) -> bool:
+    return name in _MUTATING_TOOLS or name.startswith(_MUTATING_PREFIXES)
+
+
+def _strip_mutating(specs: list, tool_names: list[str] | None) -> tuple[list, list[str] | None]:
+    """Return (agent_specs, coordinator_tools) with every mutating tool removed.
+
+    Enforces read-only at the TOOL SURFACE rather than by instruction. Measured
+    2026-07-31: a task whose prompt said "do NOT call write_file or apply_diff, do not
+    create any file" called write_file anyway and staged a component — one of four
+    occasions that day where an explicit instruction failed to constrain an action.
+    Instructions shape what a model says; only the tool surface constrains what it does.
+
+    A coordinator with no allowlist (`coordinator_tools: null`, i.e. the full surface) is
+    given an explicit read-only allowlist here, since "no allowlist" otherwise means
+    "everything including writes".
+    """
+    import copy
+    out = []
+    for s in specs:
+        s2 = copy.deepcopy(s)
+        if getattr(s2, "tools", None):
+            s2.tools = [t for t in s2.tools if not _is_mutating(t)]
+        out.append(s2)
+    if tool_names:
+        return out, [t for t in tool_names if not _is_mutating(t)]
+    return out, None   # resolved against the live MCP surface in _scope_coordinator_tools
+
+
+def _scope_coordinator_tools(tool_names: list[str] | None, mcp_list: list, read_only: bool = False):
     """Scope the coordinator's direct MCP tool surface to an explicit allowlist.
 
     Mirrors make_agent_from_spec's per-agent scoping (swarm/agents.py) — without this,
@@ -245,12 +289,16 @@ def _scope_coordinator_tools(tool_names: list[str] | None, mcp_list: list):
     full mcp_list when no allowlist is given (preserves existing engineering-team behavior)
     or when none of the named tools are found on the connected MCPs.
     """
-    if not tool_names:
+    if not tool_names and not read_only:
         return mcp_list
     all_funcs: dict = {}
     for mcp in mcp_list:
         all_funcs.update(mcp.functions)
-    scoped = [all_funcs[t] for t in tool_names if t in all_funcs]
+    if not tool_names:
+        # read_only with no allowlist: everything the MCPs expose, minus mutating tools.
+        return [f for n, f in all_funcs.items() if not _is_mutating(n)] or mcp_list
+    scoped = [all_funcs[t] for t in tool_names
+              if t in all_funcs and not (read_only and _is_mutating(t))]
     return scoped if scoped else mcp_list
 
 
@@ -477,6 +525,7 @@ def _build_team(
     *,
     name: str = "AgnoHive",
     description: str | None = None,
+    read_only: bool = False,
 ) -> Team:
     """Build a coordinator Team from agent specs (or the default Coder+Reviewer), sharing the
     already-connected `mcp_list`. Factored out of run_task_async / run_task_stream so the same
@@ -493,7 +542,7 @@ def _build_team(
         mode=mode,
         model=get_model(coordinator_model, config.ollama_host),
         members=members,
-        tools=_scope_coordinator_tools(coordinator_tools, mcp_list),
+        tools=_scope_coordinator_tools(coordinator_tools, mcp_list, read_only),
         instructions=instructions,
         show_members_responses=True,
         share_member_interactions=True,
@@ -513,6 +562,7 @@ async def run_task_stream(
     project_id: str = "default",
     session_id: str | None = None,
     mode: str = "coordinate",
+    read_only: bool = False,
 ):
     """Same setup as run_task_async but yields text chunks as the coordinator generates them.
 
@@ -585,8 +635,13 @@ async def run_task_stream(
         if not mcp_list:
             raise RuntimeError("No MCP server available — check hive-mcp and project MCP are running")
 
+        # read_only strips mutating tools from both the agents and the coordinator, so a
+        # read-only run cannot write regardless of what the model decides to do.
+        _specs, _ctools = (_strip_mutating(agent_specs, coordinator_tools) if read_only
+                           else (agent_specs, coordinator_tools))
         team = _build_team(
-            agent_specs, effective_coordinator, coordinator_tools, mode, mcp_list, instructions
+            _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
+            read_only=read_only,
         )
 
         full_content: list[str] = []
@@ -647,6 +702,7 @@ async def run_task_async(
     project_id: str = "default",
     session_id: str | None = None,
     mode: str = "coordinate",
+    read_only: bool = False,
 ) -> str:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer."""
     effective_mcp_url = mcp_url or config.mcp_url
@@ -717,8 +773,13 @@ async def run_task_async(
         if not mcp_list:
             raise RuntimeError("No MCP server available — check hive-mcp and project MCP are running")
 
+        # read_only strips mutating tools from both the agents and the coordinator, so a
+        # read-only run cannot write regardless of what the model decides to do.
+        _specs, _ctools = (_strip_mutating(agent_specs, coordinator_tools) if read_only
+                           else (agent_specs, coordinator_tools))
         team = _build_team(
-            agent_specs, effective_coordinator, coordinator_tools, mode, mcp_list, instructions
+            _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
+            read_only=read_only,
         )
 
         span_attrs = {

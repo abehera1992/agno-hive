@@ -262,6 +262,7 @@ async def run(request: RunRequest, http_request: Request):
             project_id=request.project_id,
             session_id=session_id,
             mode=team_mode,
+            read_only=request.read_only,
         ),
     )
 

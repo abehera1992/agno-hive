@@ -22,6 +22,14 @@ class RunRequest(BaseModel):
     mcp_urls: list[str] | None = None     # secondary MCPs — e.g. hive-mcp for host actions
     session_id: str | None = None         # resume existing session
     persist: bool = False                 # mark new session as permanent
+    read_only: bool = False               # strip every mutating tool (write_file, apply_diff,
+                                          # run_shell/docker, notion_create/update/delete, ...)
+                                          # from the coordinator AND all agents for this run.
+                                          # Enforced at the TOOL SURFACE, not by instruction:
+                                          # a prompt saying "do NOT call write_file" was
+                                          # observed calling it anyway. Lets a write-capable
+                                          # team be used read-only per request instead of
+                                          # duplicating the team YAML.
 
 
 class SessionMeta(BaseModel):

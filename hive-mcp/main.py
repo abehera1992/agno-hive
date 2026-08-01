@@ -149,6 +149,42 @@ _instructions = (
     "SUPPLEMENTARY subtotals (and note when the DB and the code/seed disagree — they often do)."
 )
 
+
+def _conventions_block() -> str:
+    """State the project's code conventions up front, from the configured lint rules.
+
+    verify_claims already checks emitted code against CODE_LINT_FORBID / CODE_LINT_REQUIRE
+    AFTER the fact. That is necessary but it is not where the cost is: measured 2026-07-31,
+    a "write a component following this project's conventions" task spent its whole run
+    HUNTING for the rules — "let me check the project's documentation… let me check the
+    CLAUDE.md" — and the outcome depended on whether the hunt happened to succeed. Across
+    three passes the same case produced a pass, a failure, and a 600s non-termination.
+
+    The rules are already in the loaded project context, but one line inside ~40K tokens is
+    not findable in practice. Restating them here costs ~30 tokens and removes the search.
+    hive-mcp still ships NO rules of its own — this only echoes what the project configured,
+    so the server stays project-independent.
+    """
+    req = [r.partition("::") for r in config.CODE_LINT_REQUIRE]
+    forb = [r.partition("::") for r in config.CODE_LINT_FORBID]
+    if not (req or forb):
+        return ""
+    parts = ["Project code conventions — these are AUTHORITATIVE and complete. Apply them "
+             "directly when writing or editing code; do NOT go searching the repo or the "
+             "docs for a styling/convention guide, and do not infer conventions from "
+             "unrelated files. "]
+    # No ALWAYS/NEVER prefixes. The configured messages are already written as
+    # directives, and a polarity prefix inverts them: a FORBID rule whose message reads
+    # "use styles.x, not a bare className string" becomes "NEVER: use styles.x" —
+    # instructing the exact opposite of the rule. Emit the messages verbatim.
+    for _, _, msg in req + forb:
+        if msg:
+            parts.append(f"- {msg.rstrip('.')}. ")
+    return "".join(parts)
+
+
+_instructions = _instructions + " " + _conventions_block()
+
 mcp = FastMCP(config.MCP_NAME, instructions=_instructions)
 
 
