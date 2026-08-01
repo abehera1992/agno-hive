@@ -208,6 +208,17 @@ def _read_line(rel_path: str, lineno: int) -> str | None:
     return None
 
 
+# Detects a stuck retry loop: the exact same answer text checked twice in a row,
+# with nothing revised in between. Module-level and intentionally coarse, mirroring
+# hive-mcp/tools/files.py's _last_failed_call breaker for apply_diff. Measured
+# 2026-08-01: a live task called verify_claims 3 times on the byte-identical draft
+# answer (interleaved with re-reading files that never changed what got submitted),
+# ~50s each, before the run was cancelled — verify_claims itself never told the
+# caller that re-checking unchanged text is pointless.
+_last_checked_answer: str | None = None
+_repeat_count = 0
+
+
 def verify_claims(answer: str, glob_filter: str = "") -> str:
     """
     Check an answer's factual claims against the repository. Read-only, no approval.
@@ -224,8 +235,36 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     Limits: proves EXISTENCE, not correctness. A symbol that exists but does not do what
     the answer claims will pass — this cannot read intent.
     """
+    global _last_checked_answer, _repeat_count
     if not answer or not answer.strip():
         return "verify_claims: nothing to check (empty answer)."
+
+    if answer == _last_checked_answer:
+        _repeat_count += 1
+    else:
+        _last_checked_answer = answer
+        _repeat_count = 0
+
+    if _repeat_count >= 1:
+        _last_checked_answer = None  # reset — a later distinct check isn't blocked
+        _repeat_count = 0
+        # Deliberately contains "could NOT be found", the exact phrase
+        # swarm/team.py's _verify_claims uses to classify a report as "bad"
+        # ("could NOT be found" in report). That orchestrator-level guard calls
+        # this tool up to twice — an initial check, then a recheck of a correction
+        # round — and if the correction genuinely changes nothing, its second call
+        # lands here. It must still see this as bad: the underlying claims were
+        # never actually fixed, only re-submitted, so treating a stuck repeat as
+        # "verified good" would silently drop the fabrication disclaimer the
+        # orchestrator would otherwise attach.
+        return (
+            "verify_claims STOPPED: this exact answer text was already checked and "
+            "its claims could NOT be found in the project — checking it again "
+            "unchanged will not help. Either (a) revise the answer based on the "
+            "previous report's findings — read more of the codebase and change "
+            "what you are claiming, or (b) if you cannot find a grounded answer "
+            "after that, say so plainly instead of re-submitting the same draft."
+        )
 
     # ── collect candidate claims ──────────────────────────────────────────────
     idents: list[str] = []
