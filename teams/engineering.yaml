@@ -23,6 +23,9 @@ agents:
       - lightrag_query
       - web_search
       - web_fetch
+      - load_skill
+    skills:
+      - verification-discipline
     instructions:
       - "SESSION CONTEXT: At session start, try get_file_content('hive.md') once — it has a pre-built directory tree and per-module summaries. Skip silently if not found."
       - You are a lightweight routing agent. Decide the fastest way to retrieve context for a query.
@@ -55,6 +58,9 @@ agents:
       - lightrag_query
       - web_search
       - web_fetch
+      - load_skill
+    skills:
+      - verification-discipline
     instructions:
       - "SESSION CONTEXT: Before any other tool call, try get_file_content('hive.md') once — it has the full directory tree and per-module summaries. Use it as your starting point for structure and overview questions. Skip silently if not found."
       - If lightrag_query is available via MCP, call it with relevant keywords before starting.
@@ -102,6 +108,9 @@ agents:
       - get_file_content
       - search_knowledge_graph
       - lightrag_query
+      - load_skill
+    skills:
+      - verification-discipline
     instructions:
       - "SESSION CONTEXT: Before planning, try get_file_content('hive.md') once — it has project structure context that informs your plan. Skip silently if not found."
       - If lightrag_query is available via MCP, call it to check if similar tasks were solved before.
@@ -125,10 +134,16 @@ agents:
       - search_knowledge_graph
       - lightrag_insert
       - lightrag_query
+      - load_skill
+    skills:
+      - file-write-review
+      - counting-marker
+      - verification-discipline
+      - code-conventions
     instructions:
       - If lightrag_query is available via MCP, call it with relevant keywords before starting.
       - You are the implementation specialist. Write clean, idiomatic code.
-      - "PATTERNS FIRST: Before writing any code, call get_file_content('patterns/ekam-backend.md') for Python/backend tasks or get_file_content('patterns/ekam-frontend.md') for TypeScript/frontend tasks. Also call get_file_content('patterns/ekam-code-generation-guards.md'). These files contain project-specific patterns you MUST follow exactly."
+      - "PATTERNS FIRST: Before writing any code, call load_skill('code-conventions') for this project's required/forbidden code patterns. Also call get_file_content('patterns/ekam-backend.md') for Python/backend tasks or get_file_content('patterns/ekam-frontend.md') for TypeScript/frontend tasks, and get_file_content('patterns/ekam-code-generation-guards.md') — these files contain additional project-specific patterns you MUST follow exactly."
       - Always read relevant files via get_file_content() before modifying code.
       - Follow patterns already established in the codebase.
       - "File editing rules: use apply_diff() for ALL edits to existing files. Use write_file() ONLY for brand-new files that do not exist yet."
@@ -157,6 +172,10 @@ agents:
       - get_env_info
       - check_port
       - list_processes
+      - load_skill
+    skills:
+      - file-write-review
+      - verification-discipline
     instructions:
       - You are the execution specialist. Run commands and validate results.
       - Use run_command() to execute tests, linters, or build steps.
@@ -180,6 +199,10 @@ agents:
       - search_knowledge_graph
       - lightrag_insert
       - lightrag_query
+      - load_skill
+    skills:
+      - file-write-review
+      - verification-discipline
     instructions:
       - If lightrag_query is available via MCP, call it with relevant keywords before starting.
       - You are the code reviewer. Check for correctness, security, and consistency.

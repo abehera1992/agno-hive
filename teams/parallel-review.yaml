@@ -15,6 +15,7 @@ coordinator_tools:
   - search_knowledge_graph
   - lightrag_query
   - get_context_section
+  - load_skill
 
 agents:
   - name: Researcher
@@ -27,6 +28,9 @@ agents:
       - search_files
       - get_file_content
       - lightrag_query
+      - load_skill
+    skills:
+      - verification-discipline
     instructions:
       - Call list_directory_tree() or find_files('**/*') first to map the full structure before reading any file.
       - Read at least one entry-point file per top-level directory — never describe a module from its name alone.
@@ -44,6 +48,9 @@ agents:
       - find_files
       - lightrag_query
       - git_diff
+      - load_skill
+    skills:
+      - verification-discipline
     instructions:
       - Focus on OWASP Top 10 — injection, broken auth, sensitive data exposure, security misconfiguration.
       - Search for secrets and credentials with search_files patterns like 'password', 'secret', 'api_key', 'token'.
@@ -60,6 +67,9 @@ agents:
       - search_files
       - find_files
       - lightrag_query
+      - load_skill
+    skills:
+      - verification-discipline
     instructions:
       - Search for database query patterns — look for ORM calls inside loops (N+1), missing .select_related()/.prefetch_related(), unbounded queries.
       - Check for missing pagination on list endpoints.

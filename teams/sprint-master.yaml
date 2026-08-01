@@ -32,6 +32,7 @@ coordinator_tools:
   - notion_delete_block
   - get_file_content
   - find_files
+  - load_skill
 
 agents:
   - name: BacklogResearcher
@@ -48,6 +49,10 @@ agents:
       - notion_find_work_item
       - get_file_content
       - find_files
+      - load_skill
+    skills:
+      - notion-grounding
+      - verification-discipline
     instructions:
       - You manage delivery tracking, not code. Your job is to gather the exact current state and the valid field/option names BEFORE any work item is created or changed. You never write anything yourself.
       - "BOARD FACTS: call get_file_content('docs/delivery-board.md') first — it holds the work-tracking data-source IDs, the field list (Type, Status, Stage, Priority, Area, Sprint, Spec), the exact option values for each, and the native Sub-item / Parent item 1 nesting rule. Treat it as the source of truth for field and option names."
@@ -78,6 +83,10 @@ agents:
       - notion_update_block
       - notion_delete_block
       - get_file_content
+      - load_skill
+    skills:
+      - notion-grounding
+      - file-write-review
     instructions:
       - You write backlog and sprint work items on the connected work-tracking platform. You never edit code, run shell, or touch files — you have no such tools.
       - "SIMPLE VALUES: pass properties as a plain dict of field -> simple value (e.g. Status to 'Done', Area to 'Platform', Priority to 'P2'). The platform tool maps each value to the correct type from the schema — do NOT build typed property objects yourself."
