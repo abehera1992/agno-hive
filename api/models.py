@@ -10,6 +10,11 @@ class AgentSpec(BaseModel):
     instructions: list[str]
     description: str | None = None
     tools: list[str] | None = None
+    skills: list[str] | None = None       # names from the skill catalog this role should
+                                          # see in its L1 index. None means "no skills
+                                          # advertised" — the agent can still call
+                                          # load_skill(name) directly if it knows the
+                                          # name, but nothing is proactively listed.
 
 
 class RunRequest(BaseModel):

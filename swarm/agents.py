@@ -44,12 +44,37 @@ _BASE_PREAMBLE = [
 ]
 
 
-def make_agent_from_spec(spec, *mcps: MCPTools) -> Agent:
+def format_skill_catalog(catalog: list[dict], names: list[str] | None) -> str:
+    """Render the L1 skill catalog as one instruction-list entry.
+
+    names=None means "show everything" (the coordinator's case — it can delegate
+    to any skill-relevant task). A non-None list filters to those names only,
+    mirroring how spec.tools already filters the MCP tool surface per agent.
+    """
+    if not catalog:
+        return ""
+    entries = catalog if names is None else [c for c in catalog if c["name"] in names]
+    if not entries:
+        return ""
+    lines = [
+        "Available skills — call load_skill(name) for the full text of ONE before "
+        "acting on a task it covers. Do not load a skill unrelated to the task:"
+    ]
+    for e in sorted(entries, key=lambda c: c["name"]):
+        lines.append(f"  - {e['name']}: {e['description']}")
+    return "\n".join(lines)
+
+
+def make_agent_from_spec(spec, *mcps: MCPTools, skill_catalog: list[dict] | None = None) -> Agent:
     """Build an Agent from a dynamic spec.
 
     If spec.tools lists tool names, only those Function objects are passed to the
     agent — everything else in the connected MCPs is hidden from the model.
     Falls back to all MCPs when spec.tools is absent or none of the names match.
+
+    skill_catalog (already fetched once per run by swarm/team.py) is filtered to
+    spec.skills and appended as one more instruction entry — the always-on L1
+    index this agent sees. Omitted or empty catalog leaves instructions unchanged.
     """
     if spec.tools:
         all_funcs: dict = {}
@@ -60,11 +85,16 @@ def make_agent_from_spec(spec, *mcps: MCPTools) -> Agent:
     else:
         agent_tools = list(mcps)
 
+    instructions = list(spec.instructions)
+    catalog_text = format_skill_catalog(skill_catalog or [], getattr(spec, "skills", None))
+    if catalog_text:
+        instructions.append(catalog_text)
+
     return Agent(
         name=spec.name,
         model=get_model(spec.model, config.ollama_host),
         tools=agent_tools,
-        instructions=spec.instructions,
+        instructions=instructions,
         role=spec.role,
         description=spec.description,
         markdown=True,
