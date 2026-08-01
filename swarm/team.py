@@ -1,4 +1,5 @@
 import asyncio
+import json
 import re
 import time
 from contextlib import AsyncExitStack
@@ -6,7 +7,7 @@ from contextlib import AsyncExitStack
 from opentelemetry import trace
 from agno.team import Team
 from agno.tools.mcp import MCPTools
-from .agents import make_coder, make_reviewer, make_agent_from_spec, get_model
+from .agents import make_coder, make_reviewer, make_agent_from_spec, get_model, format_skill_catalog
 from .feedback import record_success, record_success_bg, record_failure, load_failure_context
 from config.config import config
 
@@ -42,19 +43,10 @@ _COORDINATOR_INSTRUCTIONS = [
     "  were not staged), state that explicitly instead of inventing changes. A partial or staged",
     "  result is NOT 'done' — report it as staged/pending awaiting approval.",
     "",
-    "── Counts must be tool-filled, NEVER written by you (CRITICAL) ──",
-    "  You are FORBIDDEN from writing any count / total / 'how many' / 'all' as a bare number",
-    "  you computed by reading — reading and tallying is unreliable and treated as fabrication.",
-    "  Instead, emit a COUNT MARKER and the system fills in the EXACT ripgrep count for you:",
-    "      [[COUNT pattern=`<ripgrep-regex>` glob=`<glob>`]]",
-    "  Example: 'There are [[COUNT pattern=`: *12\\.0` glob=`**/gst_resolver.py`]] entries at 12%.'",
-    "  - pattern = a ripgrep regex (backtick-delimited); glob = files to scan (e.g. **/gst_resolver.py, **/*.py).",
-    "  - The system replaces the marker with the real number AFTER you finish — you never supply",
-    "    the digit, so the count cannot be wrong. Use ONE marker per distinct count.",
-    "  - For a count of rows in a DATABASE table, use db_query (SELECT ... COUNT(*)) instead — its",
-    "    result is authoritative. Do NOT grep files for a value that lives in the DB.",
-    "  - If you already ran count_matches / grep -c yourself and have the exact tool output, you may",
-    "    state that number directly. Otherwise ALWAYS use the marker — never guess.",
+    "── Skills — on-demand instruction detail (CRITICAL) ─────────────",
+    "  Call load_skill(name) for the full text of a skill BEFORE acting on a task",
+    "  it covers — available skills are listed above/below in this prompt. Do NOT",
+    "  guess counting-marker or file-write-review behaviour from memory; load it.",
     "",
     "── Conversational turn detection (read this first) ─────────────",
     "  Not every message is a task. Classify the message before reaching for tools:",
@@ -161,24 +153,6 @@ _COORDINATOR_INSTRUCTIONS = [
     "  If only one MCP is connected, use it for everything.",
     "  Discover available tools from the connected MCP — do not assume tool names exist.",
     "",
-    "── Editing files (CRITICAL) ────────────────────────────────────",
-    "  - For existing files: ALWAYS use apply_diff(), NEVER write_file().",
-    "    apply_diff makes surgical line-level changes; write_file rewrites the whole file.",
-    "  - Only use write_file() when creating a brand-new file that does not exist yet.",
-    "  - Read the file first (get_file_content) to get the exact old_string to replace.",
-    "  - To APPEND content: include the anchor line in BOTH old_string AND new_string,",
-    "    then add the new content after it. Example:",
-    "      old_string = 'last_line'",
-    "      new_string = 'last_line\\nnew_content'",
-    "    Never drop existing lines from new_string unless intentionally deleting them.",
-    "",
-    "── run_command is READ-ONLY (CRITICAL) ─────────────────────────",
-    "  - run_command is for tests, linters, grep, git status ONLY.",
-    "  - NEVER use run_command to modify files — no >, >>, sed -i, tee, perl -i.",
-    "  - 'add a line', 'update a comment', 'change X to Y' → use apply_diff().",
-    "  - Attempting to write via run_command will be BLOCKED by the server.",
-    "  - For full shell access (npm install, docker compose, etc.) use run_shell().",
-    "",
     "── General rules ──────────────────────────────────────────────",
     "  - Base answers on file contents, not assumptions",
     "  - Synthesise member outputs into one coherent response",
@@ -204,28 +178,6 @@ _COORDINATOR_INSTRUCTIONS = [
     "  Self-analysis trap: when studying this project's own config or architecture",
     "  against a framework's examples, the project's established design takes",
     "  precedence over framework examples unless the code itself is broken.",
-    "",
-    "── File write review (CRITICAL) ───────────────────────────────",
-    "  - If write_file() or apply_diff() returns 'review_pending',",
-    "    the proposed change is staged for human review.",
-    "  - For apply_diff on the SAME file: you MAY continue calling apply_diff",
-    "    on that file — each call accumulates into the same .hive_proposed file.",
-    "    AFTER each apply_diff, read the staged file (<path>.hive_proposed) via",
-    "    get_file_content to verify what is already applied. Then apply ONLY the",
-    "    NEXT distinct change not yet in the staged file. NEVER repeat a change",
-    "    already staged — always check the staged file before each diff.",
-    "    Correct pattern (import + function body):",
-    "      1st call: update import line  → read .hive_proposed → verify import added",
-    "      2nd call: add usage in body   → review_pending (now STOP)",
-    "  - STOP and report 'review_pending: <path>' ONLY when:",
-    "      a) All changes to the current file are staged, OR",
-    "      b) You are about to write a DIFFERENT file.",
-    "  - confirm_write and reject_write do NOT exist — you cannot approve writes.",
-    "  - The human selects confirm/reject in their CLI — your job ends when you report.",
-    "  - If the user asks to 'delete', 'undo', or 'reject' the .hive_proposed file:",
-    "    Do NOT call run_command, run_shell, or any agent tool.",
-    "    Reply: 'Type /reject <path> or /cleanup in your hive CLI to discard the pending change.'",
-    "    Agents cannot delete .hive_proposed files — all confirm/reject operations are CLI-only.",
     "",
     "── Output format guard ─────────────────────────────────────────",
     "  NEVER output raw model template tokens such as <|im_start|>, <|im_end|>, <|endoftext|>",
@@ -416,6 +368,30 @@ async def _verify_claims(content: str, hive_mcp_url: str | None) -> tuple[str, b
     return report, "could NOT be found" in report
 
 
+async def _fetch_skill_catalog(hive_mcp_url: str | None) -> list[dict]:
+    """Fetch the L1 skill catalog once per run via hive-mcp's list_skills tool.
+
+    Returns [] — not an error — when hive-mcp isn't connected or the call fails.
+    Skills are an enhancement to instruction delivery, not a hard dependency: a run
+    must still work with no catalog, exactly like _verify_claims degrades to "skip
+    the check" rather than failing the run when hive-mcp is unreachable.
+    """
+    if not hive_mcp_url:
+        return []
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+    try:
+        async with streamablehttp_client(hive_mcp_url) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                res = await session.call_tool("list_skills", {})
+                text = _extract_mcp_text(res)
+                return json.loads(text)
+    except Exception as exc:
+        print(f"[team] skill catalog unavailable ({hive_mcp_url}): {exc}")
+        return []
+
+
 # Tools that gather EVIDENCE. An answer asserting facts about the codebase without one
 # of these has no basis beyond the model's priors and the loaded context.
 _READ_TOOLS = {
@@ -600,14 +576,18 @@ def _build_team(
     name: str = "AgnoHive",
     description: str | None = None,
     read_only: bool = False,
+    skill_catalog: list[dict] | None = None,
 ) -> Team:
     """Build a coordinator Team from agent specs (or the default Coder+Reviewer), sharing the
     already-connected `mcp_list`. Factored out of run_task_async / run_task_stream so the same
     build is reusable for router sub-teams (EK-88). `coordinator_model` is the already-resolved
     model name. `description` (default None = previous behaviour) lets the router leader route to
-    this team. Behaviour is identical to the previous inline Team(...) construction when omitted."""
+    this team. Behaviour is identical to the previous inline Team(...) construction when omitted.
+    `skill_catalog` (default None) is forwarded to each agent's spec-based construction so its
+    L1 catalog can be filtered per agent role — the default Coder+Reviewer fallback path (used
+    only when agent_specs is empty) does not take a catalog; that path predates team YAMLs."""
     if agent_specs:
-        members = [make_agent_from_spec(spec, *mcp_list) for spec in agent_specs]
+        members = [make_agent_from_spec(spec, *mcp_list, skill_catalog=skill_catalog) for spec in agent_specs]
     else:
         members = [make_coder(*mcp_list), make_reviewer(*mcp_list)]
     return Team(
@@ -657,14 +637,23 @@ async def run_task_stream(
                 print(f"[team] session context warning: {exc}")
         return "", []
 
-    failure_context, (session_summary, session_messages) = (
+    # Computed here (not after the gather, as before) because the skill-catalog fetch
+    # below needs it, and connecting MCPTools further down needs the same value — one
+    # computation, not two that could silently diverge.
+    # hive-mcp first (primary — full read+write+shell+ripgrep), project-mcp second (supplementary)
+    all_mcp_urls = [u for u in (mcp_urls or []) + [effective_mcp_url] if u]
+
+    failure_context, (session_summary, session_messages), skill_catalog = (
         await asyncio.gather(
             load_failure_context(project_id),
             _load_session_context(),
+            _fetch_skill_catalog(all_mcp_urls[0] if all_mcp_urls else None),
         )
     )
 
     instructions = list(_COORDINATOR_INSTRUCTIONS)
+    if skill_catalog:
+        instructions += ["", format_skill_catalog(skill_catalog, None)]
     if failure_context:
         instructions += ["", failure_context]
     if session_summary:
@@ -687,9 +676,6 @@ async def run_task_stream(
             lines.append(f"[{msg['role']}] {msg['content'][:800]}")
         lines.append("──────────────────────────────────────────────────────────────────")
         instructions += [""] + lines
-
-    # hive-mcp first (primary — full read+write+shell+ripgrep), project-mcp second (supplementary)
-    all_mcp_urls = [u for u in (mcp_urls or []) + [effective_mcp_url] if u]
 
     async with AsyncExitStack() as stack:
         mcp_list = []
@@ -715,7 +701,7 @@ async def run_task_stream(
                            else (agent_specs, coordinator_tools))
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
-            read_only=read_only,
+            read_only=read_only, skill_catalog=skill_catalog,
         )
 
         full_content: list[str] = []
@@ -792,14 +778,24 @@ async def run_task_async(
                 print(f"[team] session context warning: {exc}")
         return "", []
 
-    failure_context, (session_summary, session_messages) = (
+    # Collect all MCP URLs: primary (project context) + secondary (host actions).
+    # Computed here (not after the gather, as before) because the skill-catalog fetch
+    # below needs it, and connecting MCPTools further down needs the same value — one
+    # computation, not two that could silently diverge.
+    # hive-mcp first (primary — full read+write+shell+ripgrep), project-mcp second (supplementary)
+    all_mcp_urls = [u for u in (mcp_urls or []) + [effective_mcp_url] if u]
+
+    failure_context, (session_summary, session_messages), skill_catalog = (
         await asyncio.gather(
             load_failure_context(project_id),
             _load_session_context(),
+            _fetch_skill_catalog(all_mcp_urls[0] if all_mcp_urls else None),
         )
     )
 
     instructions = list(_COORDINATOR_INSTRUCTIONS)
+    if skill_catalog:
+        instructions += ["", format_skill_catalog(skill_catalog, None)]
     if failure_context:
         instructions += ["", failure_context]
     if session_summary:
@@ -825,10 +821,6 @@ async def run_task_async(
         lines.append("──────────────────────────────────────────────────────────────────")
         instructions += [""] + lines
 
-    # Collect all MCP URLs: primary (project context) + secondary (host actions)
-    # hive-mcp first (primary — full read+write+shell+ripgrep), project-mcp second (supplementary)
-    all_mcp_urls = [u for u in (mcp_urls or []) + [effective_mcp_url] if u]
-
     async with AsyncExitStack() as stack:
         mcp_list = []
         # exclude_tools only for project-mcp (which exposes agno_run/agno_list_teams)
@@ -853,7 +845,7 @@ async def run_task_async(
                            else (agent_specs, coordinator_tools))
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
-            read_only=read_only,
+            read_only=read_only, skill_catalog=skill_catalog,
         )
 
         span_attrs = {
