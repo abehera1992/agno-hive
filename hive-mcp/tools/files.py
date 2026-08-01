@@ -28,31 +28,31 @@ _last_failed_call: dict[str, tuple[str, str]] = {}
 
 
 def _near_match_hint(content: str, old_string: str, context: int = 2) -> str:
-	"""Best-effort explanation of why old_string didn't match: the closest existing
-	line in the file, so the model can see the actual mismatch (usually whitespace,
-	quoting, or a line already changed by an earlier edit) instead of guessing via
-	repeated re-reads. Returns "" when nothing is close enough to be useful — a
-	weak hint that misleads is worse than no hint.
-	"""
-	target = (old_string.splitlines() or [old_string])[0].strip()
-	if not target:
-		return ""
-	file_lines = content.splitlines()
-	best_idx, best_ratio = None, 0.0
-	for i, line in enumerate(file_lines):
-		ratio = difflib.SequenceMatcher(None, target, line.strip()).ratio()
-		if ratio > best_ratio:
-			best_idx, best_ratio = i, ratio
-	if best_idx is None or best_ratio < 0.5:
-		return ""
-	lo, hi = max(0, best_idx - context), min(len(file_lines), best_idx + context + 1)
-	snippet = "\n".join(f"  {n + 1}: {file_lines[n]}" for n in range(lo, hi))
-	return (
-		f"\nClosest existing text (line {best_idx + 1}, {best_ratio:.0%} similar to "
-		f"your first line):\n{snippet}\n"
-		f"Compare this against your old_string character-by-character — the mismatch "
-		f"is usually whitespace, quoting, or a nearby edit already applied."
-	)
+    """Best-effort explanation of why old_string didn't match: the closest existing
+    line in the file, so the model can see the actual mismatch (usually whitespace,
+    quoting, or a line already changed by an earlier edit) instead of guessing via
+    repeated re-reads. Returns "" when nothing is close enough to be useful — a
+    weak hint that misleads is worse than no hint.
+    """
+    target = (old_string.splitlines() or [old_string])[0].strip()
+    if not target:
+        return ""
+    file_lines = content.splitlines()
+    best_idx, best_ratio = None, 0.0
+    for i, line in enumerate(file_lines):
+        ratio = difflib.SequenceMatcher(None, target, line.strip()).ratio()
+        if ratio > best_ratio:
+            best_idx, best_ratio = i, ratio
+    if best_idx is None or best_ratio < 0.5:
+        return ""
+    lo, hi = max(0, best_idx - context), min(len(file_lines), best_idx + context + 1)
+    snippet = "\n".join(f"  {n + 1}: {file_lines[n]}" for n in range(lo, hi))
+    return (
+        f"\nClosest existing text (line {best_idx + 1}, {best_ratio:.0%} similar to "
+        f"your first line):\n{snippet}\n"
+        f"Compare this against your old_string character-by-character — the mismatch "
+        f"is usually whitespace, quoting, or a nearby edit already applied."
+    )
 
 # Shell commands that write to files — blocked when WRITE_REVIEW=true
 _WRITE_CMD_RE = re.compile(
