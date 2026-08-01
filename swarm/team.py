@@ -416,7 +416,52 @@ async def _verify_claims(content: str, hive_mcp_url: str | None) -> tuple[str, b
     return report, "could NOT be found" in report
 
 
-async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | None) -> str:
+# Tools that gather EVIDENCE. An answer asserting facts about the codebase without one
+# of these has no basis beyond the model's priors and the loaded context.
+_READ_TOOLS = {
+    "get_file_content", "search_files", "find_files", "count_matches",
+    "list_directory", "list_directory_tree", "get_project_context",
+    "get_context_section", "list_recent_files", "search_knowledge_graph",
+    "lightrag_query", "memory_search", "db_query", "db_schema",
+    "git_diff", "git_status", "git_log", "git_log_file", "git_blame",
+    "notion_get_page", "notion_query_database", "notion_search",
+    "notion_get_item_with_relations", "notion_find_work_item", "notion_items_in_sprint",
+    "web_fetch", "web_search",
+}
+
+# Claims that need evidence: a backticked identifier, or a path:line citation.
+_CLAIMY_RE = re.compile(r"`[A-Za-z_][A-Za-z0-9_.]{2,}`|[\w./-]+\.\w{1,6}:\d+")
+
+
+def _count_read_calls(result) -> int:
+    """Count evidence-gathering tool calls in a run. Returns -1 when undeterminable.
+
+    -1 (not 0) when the message shape is unrecognised: "we could not tell" must never be
+    treated as "it did not read". Reading absence as evidence of absence produced several
+    wrong diagnoses on 2026-07-31, and a guard that made the same mistake would force
+    pointless retries on correct answers.
+    """
+    msgs = getattr(result, "messages", None)
+    if not msgs:
+        return -1
+    n, recognised = 0, False
+    for m in msgs:
+        for tc in (getattr(m, "tool_calls", None) or []):
+            recognised = True
+            fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", None)
+            name = (fn or {}).get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+            if name in _READ_TOOLS:
+                n += 1
+        if getattr(m, "role", None) == "tool":
+            recognised = True
+            name = getattr(m, "tool_name", None) or getattr(m, "name", None)
+            if name in _READ_TOOLS:
+                n += 1
+    return n if recognised else -1
+
+
+async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | None,
+                           result=None) -> str:
     """Check the draft's claims and, if any are unverifiable, give the team ONE chance
     to correct itself against the evidence.
 
@@ -431,6 +476,35 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     claims, the correction is not converging and looping burns tokens; the verifier's
     findings are surfaced instead so a human sees exactly which claims are unsupported.
     """
+    # No-evidence check, BEFORE the grep-based one. Measured 2026-07-31 on the same case
+    # in the same configuration: a failing run made ONE tool call (verify_claims) and no
+    # reads, answering `pendingBadge` from context in 23s; a passing run made four reads
+    # and answered correctly in 154s. Whether it read is what decided correctness, and
+    # existence-checking cannot catch it — `pendingBadge` is a real class in the very file
+    # the question named, just attached to a different element.
+    #
+    # Only fires when the answer actually makes a checkable claim (a backticked symbol or
+    # a path:line). Conversational replies and "I could not determine" answers legitimately
+    # need no reads and must not be retried.
+    reads = _count_read_calls(result)
+    if reads == 0 and _CLAIMY_RE.search(content or ""):
+        print("[team] answer asserts code facts with ZERO read calls — retrying with evidence required")
+        try:
+            retry = await team.arun(
+                f"{task}\n\n"
+                f"IMPORTANT: answer this by READING the relevant file(s) first — use "
+                f"get_file_content or search_files. A previous attempt answered without "
+                f"opening anything and named a symbol that exists elsewhere in the "
+                f"codebase but does not apply here. Base every statement on text you have "
+                f"actually read this run, and if the thing asked about does not exist, say "
+                f"so plainly."
+            )
+            retried = retry.content if hasattr(retry, "content") else str(retry)
+            if retried:
+                content, result = retried, retry
+        except Exception as exc:
+            print(f"[team] evidence retry failed: {exc}")
+
     report, bad = await _verify_claims(content, hive_mcp_url)
     if not bad:
         return content
@@ -814,7 +888,8 @@ async def run_task_async(
                 # model ignored it, so this is enforced outside the model.
                 try:
                     content = await _verified_answer(
-                        content, task, team, all_mcp_urls[0] if all_mcp_urls else None)
+                        content, task, team, all_mcp_urls[0] if all_mcp_urls else None,
+                        result)
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
                 tokens = _extract_tokens(result)
