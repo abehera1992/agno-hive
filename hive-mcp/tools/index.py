@@ -4,11 +4,52 @@ Connects to the LightRAG MCP server via Streamable HTTP and calls
 lightrag_insert for each chunk. Tracks per-file state for incremental
 re-indexing so unchanged files are skipped.
 
-State entry format: "<mtime_ns>:<size>|<sha256>". The mtime:size part is a
-fast pre-check (no file read); when it mismatches the content SHA-256 decides.
-This makes the state immune to metadata-only churn (git checkout/reset, touch)
-that rewrites files without changing their content. Legacy entries without the
-"|<sha256>" suffix are upgraded in place on the next pass without re-indexing.
+State entry format: "<mtime_ns>:<size>|<sha256>|<chunk_count>". The mtime:size
+part is a fast pre-check (no file read); when it mismatches the content SHA-256
+decides. This makes the state immune to metadata-only churn (git checkout/reset,
+touch) that rewrites files without changing their content. Legacy entries
+missing "|<sha256>" or "|<chunk_count>" are upgraded in place on the next pass
+without re-indexing.
+
+chunk_count exists to make per-file deletion possible without querying LightRAG
+at all. Every chunk of a file is sent as its own separate LightRAG "document"
+under a deterministic id `doc-sha256(project_id:rel_path:chunk_index)` (see
+_chunk_doc_id) AND a deterministic, collision-free file_path (see
+_chunk_citation_path) — both matter; see below for why.
+
+Confirmed 2026-08-02, two layers deep:
+
+1. LightRAG (1.5.4) auto-derives an unspecified document's id from
+   `normalize_document_file_path(file_path)`, which collapses to the BASENAME
+   only (`Path(file_path).name`), dropping the directory. This looked like the
+   whole bug at first — but passing an explicit `ids=` does NOT fix it.
+
+2. The real gate is `apipeline_enqueue_documents`' step "3a. Filename-based
+   dedup" (lightrag/pipeline.py): before insert, it calls
+   `get_existing_doc_by_file_basename(doc_status, file_path)` and rejects the
+   NEW document as a duplicate if ANY existing doc_status row already has that
+   same basename — regardless of what doc_id was supplied. This is a
+   deliberate, hard-coded, basename-is-identity policy in LightRAG itself, not
+   an id-derivation quirk we can route around with our own ids.
+
+Verified empirically against a live LightRAG instance (disposable test
+project, cleaned up after): two distinct files sharing a basename, and
+separately two chunks of one file (same file_path for both), both logged
+"Duplicate document detected (filename)" and the second arrival got
+`status: failed` with zero chunks in storage — EVEN with distinct explicit
+`ids=` on each call. Only making file_path ITSELF basename-unique per
+(file, chunk_index) — via _chunk_citation_path, which folds the full
+relative path into the final path segment so `Path(...).name` can't drop
+it — made both inserts succeed. Real blast radius before this fix: EkamApp
+has 39 files named page.tsx, 17 __init__.py, 11 main.py — each group beyond
+the first ever indexed was silently dropped, and (independently) every
+file with more than one function/class/chunk only ever kept its first chunk.
+
+Trade-off: file_path is also what LightRAG shows as citation source, so a
+retrieval citation now reads e.g. "Client__routes__home__page.tsx::chunk0"
+instead of a clean "page.tsx" — LightRAG's insert API has no separate
+display-only field. Correctness (not silently losing most of a project's
+content) outweighs citation prettiness.
 """
 import ast
 import asyncio
@@ -213,6 +254,34 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _chunk_doc_id(project_id: str, rel: str, index: int) -> str:
+    """Deterministic per-chunk LightRAG document id.
+
+    Passed explicitly as `ids=` on every insert. NOTE: this alone does NOT
+    prevent the basename collision described in the module docstring —
+    LightRAG's filename-based dedup rejects by file_path regardless of the id
+    supplied. It's still worth passing: it keeps deletion (_delete_stale)
+    independent of replicating LightRAG's own id-hash algorithm, which could
+    change between versions. Stable across runs: the same (file, chunk
+    position) always maps to the same id.
+    """
+    return "doc-" + hashlib.sha256(f"{project_id}:{rel}:{index}".encode()).hexdigest()
+
+
+def _chunk_citation_path(rel: str, index: int) -> str:
+    """Deterministic, basename-unique file_path for one chunk of one file.
+
+    This is the actual fix for the collision described in the module
+    docstring — LightRAG's filename-based dedup keys on `Path(file_path).name`
+    (the final path segment only), so a bare relative path loses its directory
+    and collides with any other file/chunk sharing a basename. Folding the
+    full relative path into that final segment (replacing "/" so nothing is
+    lost to Path(...).name) makes every (file, chunk_index) pair unique
+    project-wide, regardless of what any two files' real basenames are.
+    """
+    return f"{rel.replace('/', '__')}::chunk{index}"
+
+
 # ── State tracking ────────────────────────────────────────────────────────────
 
 def _load_state(project_id: str) -> dict:
@@ -339,11 +408,13 @@ async def index_project(
             except Exception:
                 continue
             stored = state.get(rel) or ""
+            s_parts = stored.split("|") if stored else []
             if not force and stored:
-                s_fast, _, s_sha = stored.partition("|")
+                s_fast = s_parts[0]
+                s_sha = s_parts[1] if len(s_parts) > 1 else ""
                 if s_fast == key:
                     # Fast path: mtime+size unchanged. Lazily upgrade legacy
-                    # entries (no sha) to the dual format — one read, no re-index.
+                    # entries (missing sha and/or chunk_count) — one read, no re-index.
                     files_skipped += 1
                     if not s_sha:
                         try:
@@ -359,15 +430,28 @@ async def index_project(
                         continue
                     if cur_sha == s_sha:
                         # Metadata-only churn (git reset, touch): re-key, skip.
+                        # Preserve the chunk_count field if present.
                         files_skipped += 1
-                        new_state[rel] = f"{key}|{s_sha}"
+                        suffix = f"|{s_parts[2]}" if len(s_parts) > 2 else ""
+                        new_state[rel] = f"{key}|{s_sha}{suffix}"
                         continue
+            # Previous chunk count, used to reconstruct and delete this file's old
+            # doc ids before re-inserting (see _chunk_doc_id / _delete_stale). A
+            # legacy entry with no recorded count (pre-2026-08-02 state, or the
+            # metadata-churn path above which doesn't touch it) means we can't
+            # know what old ids to delete — those chunks live on under their
+            # OLD basename-derived id until this file changes again, at which
+            # point the count is known and cleanup resumes normally. One-time,
+            # self-limiting gap; not worse than the status quo before this fix.
+            prev_chunk_count = (
+                int(s_parts[2]) if len(s_parts) > 2 and s_parts[2].isdigit() else 0
+            )
             # was_indexed: file had a previous state entry -> stale docs may
             # exist in LightRAG and must be deleted before re-inserting.
             # force=True implies was_indexed for every file: without this,
             # a force run neither deletes old docs nor re-extracts (identical
             # chunks bounce off content dedupe) — i.e. it silently does nothing.
-            to_process.append((p, rel, key, force or bool(stored)))
+            to_process.append((p, rel, key, force or bool(stored), prev_chunk_count))
     to_process.sort(key=lambda x: x[1])  # stable alphabetical order
 
     budget_exceeded = False
@@ -388,46 +472,58 @@ async def index_project(
                     # chunks arrive strictly serially over the MCP session.
                     insert_sem = asyncio.Semaphore(4)
 
-                    async def _send_chunk(chunk: str, rel: str) -> bool:
+                    async def _send_chunk(chunk: str, rel: str, index: int) -> bool:
                         async with insert_sem:
                             try:
                                 result = await session.call_tool(
                                     "lightrag_insert",
-                                    {"text": chunk, "project_id": project_id, "file_path": rel},
+                                    {
+                                        "text": chunk,
+                                        "project_id": project_id,
+                                        # Must be basename-unique per (file, chunk) — see
+                                        # module docstring for why a bare rel path collides.
+                                        "file_path": _chunk_citation_path(rel, index),
+                                        "doc_id": _chunk_doc_id(project_id, rel, index),
+                                    },
                                 )
                                 return not (result.isError if hasattr(result, "isError") else False)
                             except Exception:
                                 return False
 
-                    async def _delete_stale(rel: str) -> None:
+                    async def _delete_stale(rel: str, prev_count: int) -> None:
                         """LightRAG indexing is append-only — remove the file's
-                        previous docs so stale versions can't win retrieval.
-                        Best-effort: older lightrag servers lack the tool."""
-                        try:
-                            await session.call_tool(
-                                "lightrag_delete_by_file",
-                                {"file_path": rel, "project_id": project_id},
-                            )
-                        except Exception:
-                            pass
+                        previous chunk docs (by their deterministic ids, see
+                        _chunk_doc_id) so stale versions can't win retrieval.
+                        Best-effort: a single failed delete shouldn't abort the
+                        whole file's re-index."""
+                        for i in range(prev_count):
+                            try:
+                                await session.call_tool(
+                                    "lightrag_delete_by_id",
+                                    {"doc_id": _chunk_doc_id(project_id, rel, i), "project_id": project_id},
+                                )
+                            except Exception:
+                                pass
 
-                    last_chunk: tuple[str, str] | None = None
-                    for p, rel, key, was_indexed in to_process:
+                    last_chunk: tuple[str, str, int] | None = None
+                    for p, rel, key, was_indexed, prev_chunk_count in to_process:
                         if time.monotonic() - t_start >= time_budget_seconds:
                             budget_exceeded = True
                             break
                         if was_indexed:
-                            await _delete_stale(rel)
+                            await _delete_stale(rel, prev_chunk_count)
                         chunks = _get_chunks(p)
                         if chunks:
-                            last_chunk = (chunks[-1], rel)
-                        flags = await asyncio.gather(*[_send_chunk(c, rel) for c in chunks])
+                            last_chunk = (chunks[-1], rel, len(chunks) - 1)
+                        flags = await asyncio.gather(
+                            *[_send_chunk(c, rel, i) for i, c in enumerate(chunks)]
+                        )
                         chunks_sent += sum(flags)
                         errors += len(flags) - sum(flags)
                         ok = all(flags)
                         if ok:
                             try:
-                                new_state[rel] = f"{key}|{_sha256(p)}"
+                                new_state[rel] = f"{key}|{_sha256(p)}|{len(chunks)}"
                             except Exception:
                                 new_state[rel] = key
                         files_indexed += 1
@@ -436,14 +532,23 @@ async def index_project(
                     # Pipeline kick: LightRAG can leave the final batch of docs
                     # 'pending' indefinitely when they enqueue while a processing
                     # cycle is already running — pending docs only drain on the
-                    # next ainsert. Re-send the last chunk: guaranteed
-                    # dedupe-rejection (no new doc), but the insert's process
-                    # step picks up everything still pending.
+                    # next ainsert. Re-send the last chunk under its own file_path
+                    # + doc_id: guaranteed dedupe-rejection against the
+                    # just-inserted real entry (no new doc), but the insert's
+                    # process step picks up everything still pending. Both must
+                    # match exactly what the real insert used, or this creates a
+                    # fresh, distinct phantom entry instead of colliding with it.
                     if last_chunk is not None and chunks_sent:
                         try:
+                            kick_text, kick_rel, kick_index = last_chunk
                             await session.call_tool(
                                 "lightrag_insert",
-                                {"text": last_chunk[0], "project_id": project_id, "file_path": last_chunk[1]},
+                                {
+                                    "text": kick_text,
+                                    "project_id": project_id,
+                                    "file_path": _chunk_citation_path(kick_rel, kick_index),
+                                    "doc_id": _chunk_doc_id(project_id, kick_rel, kick_index),
+                                },
                             )
                         except Exception:
                             pass

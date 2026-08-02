@@ -45,38 +45,110 @@ async def _get_ready_rag(project_id: str):
 
 
 @mcp.tool()
-async def lightrag_insert(text: str, project_id: str, file_path: str = "") -> str:
+async def lightrag_insert(text: str, project_id: str, file_path: str = "", doc_id: str = "") -> str:
     """Index a block of text into LightRAG for the given project.
 
     Args:
         text:       The text content to index (code, docs, notes, etc.)
         project_id: Project namespace — keeps each project's data isolated.
-        file_path:  Source file the text came from (relative path). Stored as
-                    doc metadata so stale versions can be deleted when the
-                    file is re-indexed (see lightrag_delete_by_file).
+        file_path:  Source file the text came from. Doubles as LightRAG's
+                    citation-display value AND its filename-dedup identity key
+                    — see below, this is NOT safe to pass as a bare relative
+                    path when a caller sends more than one document that could
+                    share a basename.
+        doc_id:     Explicit, caller-assigned unique id for this document.
+                    Recommended alongside a unique file_path (see below) so
+                    deletion doesn't depend on replicating LightRAG's own
+                    id-hash algorithm, which could change between versions.
+
+    CAUTION, confirmed 2026-08-02, two layers deep — passing a unique doc_id
+    ALONE does NOT prevent duplicate rejection:
+
+    1. When doc_id is omitted, LightRAG derives one from
+       `normalize_document_file_path(file_path)`, which collapses to the
+       BASENAME only (`Path(file_path).name`), dropping the directory.
+
+    2. The real gate is a SEPARATE, hard-coded check in
+       `apipeline_enqueue_documents` (lightrag/pipeline.py, step "3a.
+       Filename-based dedup"): before insert, it looks up any EXISTING
+       doc_status row with the same basename and rejects the new document as
+       a duplicate if one is found — regardless of what doc_id was supplied.
+       Verified empirically: two distinct files sharing a basename, and
+       separately two chunks of one file (same file_path for both), BOTH
+       still got rejected with distinct explicit doc_ids on each call — the
+       second arrival logged "Duplicate document detected (filename)", was
+       marked `status: failed`, and produced ZERO chunks in storage.
+
+    The only real fix is making file_path ITSELF basename-unique per document
+    — e.g. hive-mcp's index_project folds the full relative path plus a chunk
+    index into the final path segment (`rel.replace("/", "__") +
+    f"::chunk{i}"`) before it ever reaches `Path(...).name`. Real blast
+    radius before this fix: EkamApp has 39 files named page.tsx, 17
+    __init__.py, 11 main.py — every file beyond the first with a given
+    basename was silently dropped, and independently, any file with more
+    than one chunk only ever kept its first chunk. Trade-off: citations then
+    show the folded path (e.g. "Client__routes__home__page.tsx::chunk0")
+    instead of a clean "page.tsx" — LightRAG's insert API has no separate
+    display-only field, so correctness has to win that trade.
     """
     try:
         rag = await _get_ready_rag(project_id)
         clean = _SPECIAL_TOKEN_RE.sub("", text)
+        kwargs = {}
         if file_path:
-            await rag.ainsert(clean, file_paths=file_path)
-        else:
-            await rag.ainsert(clean)
+            kwargs["file_paths"] = file_path
+        if doc_id:
+            kwargs["ids"] = doc_id
+        await rag.ainsert(clean, **kwargs)
         return f"Indexed {len(text)} characters for project '{project_id}'."
     except Exception as exc:
         return f"Insert failed: {exc}"
 
 
 @mcp.tool()
-async def lightrag_delete_by_file(file_path: str, project_id: str) -> str:
-    """Delete all previously indexed documents that came from a source file.
+async def lightrag_delete_by_id(doc_id: str, project_id: str) -> str:
+    """Delete one previously indexed document by its exact id.
 
-    Call BEFORE re-inserting a changed file's chunks — LightRAG indexing is
-    append-only, so without this, stale versions of changed files accumulate
-    and can win retrieval over the current content.
+    The reliable counterpart to lightrag_delete_by_file (see its docstring for
+    why file_path lookups don't work): callers that assigned an explicit
+    doc_id on insert (see lightrag_insert) should delete by that same id
+    directly, rather than trying to look a document up by file_path.
 
     Args:
-        file_path:  The relative source path whose old docs should be removed.
+        doc_id:     The exact document id to delete (as passed to lightrag_insert).
+        project_id: Project namespace to delete from.
+    """
+    try:
+        rag = await _get_ready_rag(project_id)
+        await rag.adelete_by_doc_id(doc_id)
+        return f"Deleted document '{doc_id}' in project '{project_id}'."
+    except Exception as exc:
+        return f"Delete failed: {exc}"
+
+
+@mcp.tool()
+async def lightrag_delete_by_file(file_path: str, project_id: str) -> str:
+    """Delete all previously indexed documents whose stored file_path matches exactly.
+
+    CAUTION — confirmed 2026-08-02: `agno.lightrag_doc_status.file_path` stores
+    only the BASENAME LightRAG derived internally (normalize_document_file_path),
+    never the full relative path a caller may have passed to lightrag_insert. Two
+    consequences:
+      1. Calling this with a full relative path (e.g. "training/data/x.jsonl")
+         will match ZERO rows even though matching documents exist — the
+         comparison never succeeds. Pass a bare basename instead.
+      2. Passing a basename deletes EVERY document across the ENTIRE project
+         that shares it — not just the one file you intended. EkamApp alone has
+         39 files named page.tsx, 17 __init__.py, 11 main.py: calling this with
+         file_path="page.tsx" would delete content indexed from all of them.
+
+    Prefer lightrag_delete_by_id with an explicit doc_id you control (see
+    lightrag_insert) for anything file-specific. hive-mcp's index_project no
+    longer calls this tool for exactly this reason — kept for ad-hoc/manual
+    cleanup by basename where the collision is understood and intended.
+
+    Args:
+        file_path:  The BASENAME (not full path) whose old docs should be removed.
         project_id: Project namespace to delete from.
     """
     try:
