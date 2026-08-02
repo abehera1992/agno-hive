@@ -33,7 +33,7 @@ _CHUNK_SIZE = 4000   # chars for non-Python files
 # Removed from here: "signoz", "graphify-out", "infra" — those named one project's
 # layout inside a project-independent server. Configure them per project instead.
 # "infra" was actively harmful as a default: it hid any legitimate infra/ directory.
-from .exclusions import EXCLUDE_DIRS as _IGNORE_DIRS
+from .exclusions import EXCLUDE_DIRS as _IGNORE_DIRS, is_excluded
 _SKIP_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2",
     ".ttf", ".eot", ".bin", ".exe", ".dll", ".so", ".dylib", ".zip",
@@ -317,6 +317,17 @@ async def index_project(
             try:
                 rel = p.relative_to(PROJECT_ROOT).as_posix()
             except ValueError:
+                continue
+            # os.walk dir-pruning above only applies EXCLUDE_DIRS (directory NAMES).
+            # EXCLUDE_GLOBS (e.g. "training/data/*.jsonl") is file-pattern-scoped and
+            # can't prune a directory, so it was never enforced here — confirmed
+            # 2026-08-02: agno-hive's own training/eval/** data (98 near-identical
+            # eval-case JSON files + a 1.3MB corpus) got indexed into LightRAG despite
+            # EXCLUDE_GLOBS being set, because this walk only ever consulted
+            # _IGNORE_DIRS. is_excluded() is the single source of truth every other
+            # tool (context.py, files.py) already calls; the bootstrap walk was the
+            # one path that bypassed it.
+            if is_excluded(rel):
                 continue
             # Full glob match — enforces directory prefix (e.g. "Client/**/*.ts"
             # must not match "signoz/foo.ts"). PurePosixPath.match() supports **.
