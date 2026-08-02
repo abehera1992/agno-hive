@@ -4,7 +4,7 @@
 
 **A model-agnostic agentic engineering swarm — 100% local, no cloud API calls.**
 
-Built on [Agno](https://github.com/agno-agi/agno). Runs on your own workstation, connects to any project over MCP, and coordinates a full engineering team of local Ollama-backed agents to read, plan, and write code for you.
+Built on [Agno](https://github.com/agno-agi/agno). Runs on your own workstation, connects to any project over MCP, and coordinates a full engineering team of local agents running on Ollama or vLLM, to read, plan, and write code for you.
 
 [![CI](https://github.com/abehera1992/agno-hive/actions/workflows/hive-mcp.yml/badge.svg)](https://github.com/abehera1992/agno-hive/actions/workflows/hive-mcp.yml)
 ![Python](https://img.shields.io/badge/python-3.12%2B-blue)
