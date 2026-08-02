@@ -20,6 +20,9 @@ docs/*
 # because it is machine-local scratch (workstation paths, Tailscale IPs, session notes).
 !docs/runbooks/
 !docs/runbooks/**
+# User-facing docs split out of the top-level README — must ship with the repo.
+!docs/guide/
+!docs/guide/**
 .claude/
 CLAUDE.md
 docs.md

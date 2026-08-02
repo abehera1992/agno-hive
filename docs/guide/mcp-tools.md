@@ -1,0 +1,62 @@
+← [Back to guide index](README.md) · [Main README](../../README.md)
+
+# 🔧 MCP Tools
+
+## Contents
+- [hive-mcp (primary)](#hive-mcp-primary--generic-works-with-any-project)
+- [Project MCP (supplementary)](#project-mcp-supplementary--app-specific-tools-only)
+- [Global memory](#global-memory)
+
+---
+
+## hive-mcp (primary — generic, works with any project)
+
+| Tool | Purpose |
+|---|---|
+| `find_files(pattern)` | Glob file discovery — uses ripgrep, respects .gitignore |
+| `search_files(pattern, glob)` | Regex content search — uses ripgrep, falls back to Python re |
+| `count_matches(pattern, glob_filter)` | Deterministic occurrence count (ripgrep) — returns `TOTAL: <n>`; use for any "how many / count / all" instead of reading + tallying |
+| `get_file_content(path)` | Read a file |
+| `list_directory_tree(depth)` | Full directory skeleton, dirs only, no cap |
+| `list_directory(path)` | Immediate children of a directory |
+| `get_project_context()` | Reads CLAUDE.md / AGENTS.md / README.md / DOCS.md if present |
+| `apply_diff(path, old_string, new_string)` | Surgical file edit (WRITE_REVIEW-aware) |
+| `write_file(path, content)` | Create a new file (WRITE_REVIEW-aware) |
+| `run_command(cmd)` | Read-only shell (tests, linters — writes blocked when WRITE_REVIEW=true) |
+| `run_shell(cmd)` | Full shell access (npm install, docker compose, etc.) |
+| `run_docker(cmd)` | Docker / docker compose commands |
+| `git_status/log/diff/blame` | Git operations |
+| `scan_project_context(force)` | Generate/update `hive.md` — full scan or incremental |
+| `index_project(project_id, lightrag_url, ...)` | Semantic bootstrap into LightRAG |
+| `web_search(query, max_results)` | DuckDuckGo search (requires `WEB_SEARCH_ENABLED=true`) |
+| `web_fetch(url, max_chars)` | Fetch a URL — GitHub repos return README + metadata via API (requires `WEB_SEARCH_ENABLED=true`) |
+| `db_schema(table)` | List `schema.table` or describe a table's columns (requires `HIVE_DB_URL`) |
+| `db_query(sql)` | Run one read-only `SELECT`/`WITH`/`EXPLAIN` — verify DB-backed facts against the live table, capped rows (requires `HIVE_DB_URL`) |
+
+## Project MCP (supplementary — app-specific tools only)
+
+| Tool | Purpose | Required |
+|---|---|---|
+| `memory_search(query)` | pgvector semantic search over project history | Optional |
+| `get_context_section(topic)` | Targeted DOCS.md section by keyword | Optional |
+| `search_knowledge_graph(query)` | Graph search (graphify) | Optional |
+| Any other project-specific tools | App workflows, custom context | Optional |
+
+> Agents use hive-mcp for all reads and writes. Project MCP is only consulted for tools not present in hive-mcp. If project MCP is unavailable, agents continue with hive-mcp alone. If hive-mcp is unavailable, agents fall back to project MCP for reads. If both are down, the run fails with a clear error.
+
+> **Transport:** All MCP servers must use **Streamable HTTP** (`/mcp` endpoint). The deprecated `/sse` transport is not used.
+
+---
+
+## Global memory
+
+| Namespace | Scope |
+|---|---|
+| `project_{id}` | Per-project code knowledge |
+| `global` | Shared across all projects |
+
+Every `lightrag_query` searches both namespaces and merges results automatically.
+
+---
+
+**Next:** [🔗 Integrations](integrations.md) · [🛠️ Development](development.md)
