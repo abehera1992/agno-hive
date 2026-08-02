@@ -72,6 +72,17 @@ def main() -> None:
     ap.add_argument("--config", required=True)
     ap.add_argument("--dry-run", action="store_true",
                     help="build the dataset + print the plan, load no weights")
+    ap.add_argument("--merge-out", default=None,
+                    help="if given, merge to BF16 into this path on the SAME live model "
+                         "immediately after training, instead of the normal separate "
+                         "training.export.merge step. Required for MoE bases where Unsloth "
+                         "auto-attaches LoRA to expert weights via target_parameters (not "
+                         "target_modules) — reloading such an adapter from disk to merge it "
+                         "crashes with 'Cannot copy out of meta tensor; no data!' because the "
+                         "save/reload round-trip does not correctly rematerialize those "
+                         "per-expert deltas. Merging on the live in-memory model sidesteps the "
+                         "round-trip entirely. Confirmed against qwen3_5_moe (Qwen3.6-35B-A3B) "
+                         "2026-08-01; harmless to leave unset for bases without this MoE shape.")
     a = ap.parse_args()
 
     cfg = yaml.safe_load(Path(a.config).read_text(encoding="utf-8"))
@@ -174,6 +185,14 @@ def main() -> None:
     model.save_pretrained(str(out))
     tokenizer.save_pretrained(str(out))
     print(f"[train] adapter -> {out}")
+
+    if a.merge_out:
+        t2 = time.time()
+        merged_out = Path(a.merge_out)
+        merged_out.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained_merged(str(merged_out), tokenizer, save_method="merged_16bit")
+        size = sum(f.stat().st_size for f in merged_out.rglob("*") if f.is_file()) / 1e9
+        print(f"[train] merged BF16 -> {merged_out}  ({size:.1f} GB, {time.time()-t2:.0f}s)")
 
 
 if __name__ == "__main__":
