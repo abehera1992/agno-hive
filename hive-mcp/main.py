@@ -106,16 +106,47 @@ def _traced(fn):
 
     Args are truncated hard — a write_file content payload or a large diff would
     otherwise dominate the log and bury the signal it exists to provide.
+
+    Dispatches on `inspect.iscoroutinefunction(fn)` (added 2026-08-02). `index_project`
+    is `async def`; the original single sync `wrapper` called it as `fn(*args, **kwargs)`
+    without `await`, which for a coroutine function only constructs a coroutine object —
+    the function body never runs inline. The log fired immediately with the coroutine's
+    repr as the "result" (~50 chars, ~0.00s) instead of the real outcome; FastMCP's own
+    tool-invocation layer happened to await the returned coroutine separately (indexing
+    still worked), but every trace line for an async tool was meaningless. Caught while
+    verifying `index_project` actually excluded the new EXCLUDE_GLOBS-listed training
+    data — the log claimed 0.00s/50 chars while the index state file kept growing for
+    minutes afterward.
     """
     import functools
+    import inspect
     import time as _t
 
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        shown = ", ".join(
+    def _shown(args, kwargs):
+        return ", ".join(
             [repr(a)[:60] for a in args]
             + [f"{k}={repr(v)[:60]}" for k, v in kwargs.items()]
         )[:180]
+
+    if inspect.iscoroutinefunction(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            shown = _shown(args, kwargs)
+            t0 = _t.time()
+            try:
+                result = await fn(*args, **kwargs)
+                print(f"[tool] {fn.__name__}({shown}) -> {len(str(result)):,} chars "
+                      f"in {_t.time() - t0:.2f}s", flush=True)
+                return result
+            except Exception as e:
+                print(f"[tool] {fn.__name__}({shown}) RAISED {type(e).__name__}: {e} "
+                      f"after {_t.time() - t0:.2f}s", flush=True)
+                raise
+        return wrapper
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        shown = _shown(args, kwargs)
         t0 = _t.time()
         try:
             result = fn(*args, **kwargs)
