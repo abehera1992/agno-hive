@@ -25,3 +25,8 @@ CLAUDE.md
 docs.md
 hive.md
 .hive-index-state/
+# LoRA adapter checkpoints (safetensors) are multi-GB binaries — git isn't the right
+# place for them. The merged/quantised servable checkpoints live under
+# /home/abehera1992/models/ on ZGX (also untracked), never in the repo checkout.
+checkpoints/
+unsloth_compiled_cache/
