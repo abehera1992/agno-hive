@@ -352,7 +352,21 @@ async def index_project(
     import time
     t_start = time.monotonic()
 
-    state     = {} if force else _load_state(project_id)
+    # prior_state is ALWAYS the real on-disk state, regardless of force — it is
+    # the only source of a file's previous chunk_count, needed to reconstruct
+    # and delete that file's OLD doc ids before re-inserting (see
+    # _chunk_doc_id / _delete_stale). `state` is what skip-detection reads, and
+    # THAT gets force-cleared so every file is treated as changed. Confirmed
+    # 2026-08-02: collapsing these into one variable (state = {} if force else
+    # _load_state(...)) made every `--force` re-run compute prev_chunk_count=0,
+    # so _delete_stale deleted nothing, and re-inserting under the same
+    # deterministic file_path/doc_id as the still-present prior doc got
+    # rejected by LightRAG as "filename already exists" — silently defeating
+    # the whole point of --force for any file already indexed once under the
+    # new scheme (harmless for genuinely-unchanged content, but would also
+    # have blocked a real content update from landing).
+    prior_state = _load_state(project_id)
+    state     = {} if force else prior_state
     new_state = dict(state)
 
     files_seen = files_skipped = chunks_sent = errors = files_indexed = 0
@@ -436,15 +450,19 @@ async def index_project(
                         new_state[rel] = f"{key}|{s_sha}{suffix}"
                         continue
             # Previous chunk count, used to reconstruct and delete this file's old
-            # doc ids before re-inserting (see _chunk_doc_id / _delete_stale). A
+            # doc ids before re-inserting (see _chunk_doc_id / _delete_stale).
+            # Read from prior_state (the real on-disk state), NEVER from `state`
+            # — on a force run `state` is {}, and using it here would silently
+            # skip deletion for every file (see prior_state comment above). A
             # legacy entry with no recorded count (pre-2026-08-02 state, or the
             # metadata-churn path above which doesn't touch it) means we can't
             # know what old ids to delete — those chunks live on under their
             # OLD basename-derived id until this file changes again, at which
             # point the count is known and cleanup resumes normally. One-time,
             # self-limiting gap; not worse than the status quo before this fix.
+            prior_parts = (prior_state.get(rel) or "").split("|")
             prev_chunk_count = (
-                int(s_parts[2]) if len(s_parts) > 2 and s_parts[2].isdigit() else 0
+                int(prior_parts[2]) if len(prior_parts) > 2 and prior_parts[2].isdigit() else 0
             )
             # was_indexed: file had a previous state entry -> stale docs may
             # exist in LightRAG and must be deleted before re-inserting.
