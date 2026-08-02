@@ -6,7 +6,10 @@ Everything needed to get ZGX and a client machine talking to each other.
 
 ## Contents
 - [ZGX prerequisites](#zgx-prerequisites)
-- [Ollama models](#ollama-models)
+- [Model serving: Ollama or vLLM](#-model-serving-ollama-or-vllm)
+  - [Option A — Ollama](#option-a--ollama-default)
+  - [Option B — vLLM + LiteLLM](#option-b--vllm--litellm)
+  - [Switching backends](#-switching-backends)
 - [Client machine prerequisites](#client-machine-prerequisites)
 - [Installation (ZGX)](#installation-zgx)
 - [Infrastructure setup (ZGX)](#infrastructure-setup-zgx)
@@ -19,11 +22,21 @@ Everything needed to get ZGX and a client machine talking to each other.
 
 - Ubuntu / Linux with Python 3.12+
 - Miniforge or standard venv
-- Ollama running natively (for GPU access)
-- Docker + Docker Compose (for Qdrant and PostgreSQL/AGE)
+- Docker + Docker Compose (for Qdrant, PostgreSQL/AGE, and optionally vLLM + LiteLLM)
 - Tailscale
+- **Either** Ollama running natively (for GPU access) **or** an NVIDIA GPU reachable via the Container Device Interface (CDI) for vLLM — see below
 
-## Ollama models
+## 🧠 Model serving: Ollama or vLLM
+
+AGNOHive supports **two interchangeable inference backends** — pick one, or set up both and switch per session. Both serve the same agent roster; which one is active is controlled by a single env var (see [Switching backends](#-switching-backends)).
+
+| | Ollama | vLLM + LiteLLM |
+|---|---|---|
+| **Best for** | Simplicity, diverse per-role models, no GPU sharing math | Higher throughput, longer context, continuous batching, one resident model serving the whole roster |
+| **Roster shape** | Diverse — a different model per agent role | Consolidated — the whole roster maps onto one resident coordinator model (`_VLLM_MODEL_MAP` in `swarm/agents.py`) |
+| **Setup** | `ollama pull ...` | `docker compose -f zgx-ai-setup/docker-compose.yml up -d` |
+
+### Option A — Ollama (default)
 
 Pull before first run:
 
@@ -53,6 +66,65 @@ All agents run local Ollama models. Set any model via env var (e.g. `CODER_MODEL
 > **MoE-on-GB10 segfaults FIXED on Ollama 0.30.6 (retested 2026-06-11):** `qwen3:30b-a3b` and `gemma4:26b-a4b` both ran warmup + sustained + 4-parallel inference with zero crashes — the old 0.24-era `cuda_v12` libs didn't list GB10's `cc=1210`; `cuda_v13` does. The MoE instability entries above are obsolete; the only reason those two aren't in the roster is their *thinking* behaviour, not stability. See [Ollama Upgrade & GB10 Compatibility](../../DOCS.md#ollama-upgrade--gb10-compatibility-20260607) in DOCS.md.
 
 </details>
+
+### Option B — vLLM + LiteLLM
+
+A GB10 (ARM64) serving stack: one resident vLLM coordinator handles the **entire** agent roster (continuous batching, no model-swap cost), a small embedding server backs LightRAG, and an on-demand extraction server is started only while indexing. [LiteLLM](https://github.com/BerriAI/litellm) fronts all three behind one OpenAI-compatible gateway so agno never needs to know which port a model lives on.
+
+**Prerequisites:** NVIDIA GB10 GPU reachable via CDI (`--device nvidia.com/gpu=all`, no sudo needed), and a [Hugging Face](https://huggingface.co/) **read token** (weights are pulled from the Hub on first start).
+
+```bash
+export HF_TOKEN=hf_xxxxxxxxxxxx     # read-token from huggingface.co/settings/tokens
+docker compose -f zgx-ai-setup/docker-compose.yml up -d
+
+# Verify
+curl http://localhost:4000/v1/models        # LiteLLM gateway
+docker logs vllm-coord --tail 20            # watch for "Uvicorn running"
+```
+
+| Service | Hugging Face model | Served as | Port | GPU mem | Always on? |
+|---|---|---|---|---|---|
+| `vllm-coord` | [`Qwen/Qwen3-30B-A3B-Instruct-2507-FP8`](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507-FP8) | `qwen3-coder-30b` | 8003 | 0.6 | ✅ yes — serves the whole roster |
+| `vllm-embed` | [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) | — | 8002 | 0.05 | ✅ yes — LightRAG query embeddings |
+| `vllm-extract` | [`RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8`](https://huggingface.co/RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8) | `llama3.1-8b` | 9100 | 0.1 | ❌ **indexing-only** — start before `hive --bootstrap`, stop after (`docker start/stop vllm-extract`) to free ~13 GB |
+| `litellm` | — (gateway, no weights) | — | 4000 | — | ✅ yes |
+
+<details>
+<summary><b>📋 Notes (click to expand)</b></summary>
+
+> **`vllm-coord`'s served name (`qwen3-coder-30b`) can be an alias for a fine-tuned checkpoint.** The compose file above serves the stock HF base directly; a production deployment may instead mount a locally fine-tuned/requantized checkpoint under the same served name (e.g. an Unsloth QLoRA+ORPO fine-tune merged and FP8-requantized) so `litellm-config.yaml` and `_VLLM_MODEL_MAP` need no change either way. Check `docker inspect vllm-coord` (or the `command:` line in `zgx-ai-setup/docker-compose.yml`) to see what's actually mounted on a given box — `serve <hf-repo-id>` means the stock base; `serve /path/to/local/checkpoint` means a fine-tune.
+>
+> **ALL-MoE consolidation:** unlike Ollama (which keeps a diverse roster warm — different models for different roles), the vLLM stack collapses the entire roster onto the one resident coordinator (`_VLLM_MODEL_MAP` in `swarm/agents.py`). This trades per-role model diversity for continuous-batching throughput and one large resident KV cache, since the dense 32B Ollama models measured 5–7× slower per token on GB10 with no measurable code-quality edge over the MoE coordinator.
+>
+> **`vllm-extract` is indexing-only.** A LightRAG *query* uses the coordinator (`qwen3-coder-30b`) for keyword extraction + synthesis, not `vllm-extract` — that server is only the entity-extraction LLM used while indexing (`hive --bootstrap`). Leaving it resident wastes ~13 GB of unified memory for zero benefit outside indexing runs.
+>
+> **Context window:** `vllm-coord --max-model-len` is tuned for the fixed per-run injection (`hive.md` + `patterns/**/*.md` ≈ 56K tokens) plus real multi-tool tasks — see `zgx-ai-setup/docker-compose.yml` for the current value and the reasoning in its comments.
+
+</details>
+
+### 🔀 Switching backends
+
+One env var controls which backend every agent uses — no code changes:
+
+```env
+INFERENCE_BACKEND=ollama   # default — OllamaToolFix, diverse per-role roster
+INFERENCE_BACKEND=vllm     # OpenAI-compatible client against the LiteLLM gateway
+
+# Only read when INFERENCE_BACKEND=vllm:
+VLLM_GATEWAY_URL=http://localhost:4000/v1   # default; override if LiteLLM runs elsewhere
+```
+
+Both stacks can be installed side by side — Ollama running natively and the vLLM containers stopped (or vice versa) — and you flip between them by restarting the AGNOHive API server with a different `INFERENCE_BACKEND` value:
+
+```bash
+# Switch to vLLM for this session
+INFERENCE_BACKEND=vllm python main.py --serve
+
+# Switch back to Ollama
+INFERENCE_BACKEND=ollama python main.py --serve
+```
+
+On ZGX (systemd), set `INFERENCE_BACKEND` in the service's environment file and `systemctl --user restart agno-api.service` — see [🚀 Running AGNOHive](running.md).
 
 ## Client machine prerequisites
 
@@ -139,8 +211,15 @@ cp .env.example .env
 Minimum required `.env` on ZGX:
 
 ```env
-# Ollama (running natively on ZGX)
+# Inference backend — see "Model serving: Ollama or vLLM" above
+INFERENCE_BACKEND=ollama                     # or "vllm"
+
+# Ollama (only read when INFERENCE_BACKEND=ollama)
 OLLAMA_HOST=http://<zgx-ip>:11434
+
+# vLLM + LiteLLM (only read when INFERENCE_BACKEND=vllm)
+VLLM_GATEWAY_URL=http://localhost:4000/v1
+HF_TOKEN=hf_xxxxxxxxxxxx                     # read-token, needed once to pull weights
 
 # Client project MCP server (Streamable HTTP, /mcp endpoint)
 MCP_URL=http://<project-host>:9000/mcp

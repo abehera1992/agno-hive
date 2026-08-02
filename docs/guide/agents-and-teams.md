@@ -24,6 +24,8 @@
 
 All models are configurable via `.env` or `teams/*.yaml`. Models are swappable without code changes — the YAML spec drives which model each agent uses.
 
+> **These model tags are the Ollama identifiers.** With `INFERENCE_BACKEND=vllm`, every id in this table is remapped through `_VLLM_MODEL_MAP` (`swarm/agents.py`) onto the single resident vLLM coordinator instead — the diverse per-role roster above becomes one consolidated model. See [⚙️ Setup → Model serving: Ollama or vLLM](setup.md#-model-serving-ollama-or-vllm) for both backends and how to switch between them.
+
 > **Coordinator model:** `qwen3-coder:30b` (non-thinking A3B MoE) — selected 2026-06-12 after a same-task A/B on the full pipeline: 84s with every service actually read, vs `ibm/granite4.1:30b` at 217s (purposes hallucinated from directory names) and `qwen3:30b-a3b` (thinking) at 318s. ~2.6× faster than granite with better grounding, and stable on GB10 ARM64 under Ollama 0.30.6. Granite is retained as a rollback option (deleted from Ollama; re-pull if needed). The qwen3-coder XML tool-call format is handled by `OllamaToolFix` format 6.
 
 ---

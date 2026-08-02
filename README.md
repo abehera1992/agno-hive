@@ -19,10 +19,11 @@ Built on [Agno](https://github.com/agno-agi/agno). Runs on your own workstation,
 
 AGNOHive is a swarm of specialized agents (Researcher, Planner, Coder, Reviewer, …) that connect to your codebase through MCP and get real engineering work done — reading files, planning changes, writing diffs, running commands — all orchestrated by a coordinator model, all running on hardware you control.
 
-- 🔒 **Nothing leaves your network** — every model call is local Ollama, every file access is via your own MCP server
+- 🔒 **Nothing leaves your network** — every model call is local (Ollama or vLLM), every file access is via your own MCP server
 - 🧠 **Grounded, not guessed** — agents read the actual codebase before answering; a `hive.md` snapshot + LightRAG semantic index keep them from hallucinating structure
 - ✅ **Human-in-the-loop by default** — every file write and every external-platform action is staged for your approval before it lands
 - 🔌 **Works with any project** — point it at any repo via MCP, no project-specific setup required beyond the connection
+- 🔀 **Pluggable inference backend** — Ollama or vLLM + LiteLLM, switchable with one env var, no code changes
 
 ## 🏗️ How it works
 
@@ -114,6 +115,8 @@ New here? Full walkthrough → **[⚙️ Setup Guide](docs/guide/setup.md)**
 | Coordinator | `qwen3-coder:30b` | Routes, delegates, synthesises |
 | Researcher / Planner / Coder / Reviewer | `qwen2.5-coder:32b` | Read, plan, implement, review |
 | ContextRouter / Executor | `llama3.1:8b` | Memory routing, command execution |
+
+Runs on **Ollama** or **vLLM + LiteLLM** — pick one, or set up both and switch with a single env var → **[⚙️ Model serving](docs/guide/setup.md#-model-serving-ollama-or-vllm)**
 
 Full roster, team modes, and the Sprint Master PM team → **[🤖 Agents & Teams](docs/guide/agents-and-teams.md)**
 
