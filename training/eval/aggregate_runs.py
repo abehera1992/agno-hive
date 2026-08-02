@@ -30,6 +30,7 @@ def main() -> None:
         raise SystemExit("usage: aggregate_runs.py <report1.json> <report2.json> [...]")
 
     passes: dict[str, int] = {}
+    obs: dict[str, int] = {}          # scored observations per case (errors excluded)
     order: list[str] = []
     for p in paths:
         rep = json.loads(p.read_text(encoding="utf-8"))
@@ -37,7 +38,13 @@ def main() -> None:
             cid = r["id"]
             if cid not in passes:
                 passes[cid] = 0
+                obs[cid] = 0
                 order.append(cid)
+            # A run that errored produced no measurement; it must not count as an
+            # observation in either direction.
+            if r.get("no_measurement"):
+                continue
+            obs[cid] += 1
             # Accept both report shapes. The harness originally wrote a boolean "ok" per
             # case; once it gained --repeats it writes "passes"/"repeats" instead. Reading
             # only "ok" silently scored every case 0 and produced a 0/40 aggregate from
@@ -48,18 +55,27 @@ def main() -> None:
             else:
                 passes[cid] += 1 if r.get("ok") else 0
 
-    n_runs, n = len(paths), len(order)
+    # Observations are counted PER CASE, not from len(paths). Reports may be chunked —
+    # a 40-case suite split into five files per pass means a given case appears in only
+    # one file per pass, so len(paths) would badly overstate its run count and make
+    # every case look flaky. Cases that never produced a measurement are excluded
+    # entirely rather than scored as failures.
+    n = len(order)
     best = [c for c in order if passes[c] >= 1]
-    major = [c for c in order if passes[c] * 2 > n_runs]
-    strict = [c for c in order if passes[c] == n_runs]
-    flaky = [c for c in order if 0 < passes[c] < n_runs]
-    never = [c for c in order if passes[c] == 0]
+    major = [c for c in order if passes[c] * 2 > obs[c]]
+    strict = [c for c in order if obs[c] and passes[c] == obs[c]]
+    flaky = [c for c in order if 0 < passes[c] < obs[c]]
+    never = [c for c in order if obs[c] and passes[c] == 0]
+    unmeasured = [c for c in order if obs[c] == 0]
+    if unmeasured:
+        print(f"  (excluded, never measured: {', '.join(unmeasured)})")
+    n_runs = max(obs.values()) if obs else 0
 
     print(f"aggregated {n_runs} pass(es) over {n} case(s)\n")
     for c in order:
         k = passes[c]
-        mark = "PASS " if k == n_runs else ("FLAKY" if k else "FAIL ")
-        print(f"  {mark} {c:34s} {k}/{n_runs}")
+        mark = "PASS " if obs[c] and k == obs[c] else ("FLAKY" if k else ("ERROR" if not obs[c] else "FAIL "))
+        print(f"  {mark} {c:34s} {k}/{obs[c]}")
     print("\n" + "=" * 72)
     for label, sel, note in (
         ("BEST    ", best,   "got it right at least once (capability)"),
