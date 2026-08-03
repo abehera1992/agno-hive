@@ -120,7 +120,20 @@ def _is_secret_file(filename: str) -> bool:
 # ── File chunking ─────────────────────────────────────────────────────────────
 
 def _py_chunks(path: Path) -> list[str]:
-    """Extract module docstring + each function/class as a separate chunk."""
+    """Extract module docstring + each function/class as a separate chunk.
+
+    Every chunk carries a `Lines: N-M` header from the AST node's own lineno/end_lineno.
+    Confirmed 2026-08-03 via a live groundedness test: asked to cite the line of a class
+    definition, the swarm answered from a LightRAG-retrieved chunk with no line info in
+    it at all and fabricated a plausible-looking number — off by a consistent ~155 lines
+    across three separate citations in the same answer, i.e. a confident guess, not a
+    read. The chunk text is the swarm's only view of this file when it answers from
+    retrieval instead of a live get_file_content() call; without a real anchor embedded
+    in that text, "cite the line" has no honest answer available and a wrong-but-plausible
+    one gets fabricated instead. verify_claims (tools/verify.py) checks file:line claims
+    it can already see, but can't check a number this chunk never gave the model in the
+    first place.
+    """
     try:
         source = path.read_text(encoding="utf-8", errors="replace")
         tree   = ast.parse(source)
@@ -131,8 +144,13 @@ def _py_chunks(path: Path) -> list[str]:
     rel = path.relative_to(PROJECT_ROOT).as_posix()
 
     # Module-level docstring
-    if (ast.get_docstring(tree) or "").strip():
-        chunks.append(f"File: {rel}\nType: module\n\n{ast.get_docstring(tree)}")
+    if (ast.get_docstring(tree) or "").strip() and tree.body:
+        doc_node = tree.body[0]
+        doc_end  = getattr(doc_node, "end_lineno", doc_node.lineno)
+        chunks.append(
+            f"File: {rel}\nType: module\nLines: {doc_node.lineno}-{doc_end}"
+            f"\n\n{ast.get_docstring(tree)}"
+        )
 
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -145,7 +163,8 @@ def _py_chunks(path: Path) -> list[str]:
             continue
         kind = "class" if isinstance(node, ast.ClassDef) else "function"
         doc  = ast.get_docstring(node) or ""
-        header = f"File: {rel}\nType: {kind}\nName: {node.name}"
+        end_line = getattr(node, "end_lineno", node.lineno)
+        header = f"File: {rel}\nType: {kind}\nName: {node.name}\nLines: {node.lineno}-{end_line}"
         if doc:
             header += f"\nDocstring: {doc}"
         chunks.append(f"{header}\n\n{segment[:_CHUNK_SIZE]}")
@@ -154,18 +173,26 @@ def _py_chunks(path: Path) -> list[str]:
 
 
 def _text_chunks(path: Path) -> list[str]:
-    """Split any text file into fixed-size chunks with a file/type header."""
+    """Split any text file into fixed-size chunks with a file/type header.
+
+    Each chunk carries a `Lines: N-M` header computed from its character offset (count
+    of '\\n' before the chunk start = start line; same count within the chunk, added to
+    start, approximates the end line — see _py_chunks' docstring for why this matters:
+    without it, a chunk-only answer has no real line to cite and fabricates one instead.
+    """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return []
     rel  = path.relative_to(PROJECT_ROOT).as_posix()
     ext  = path.suffix.lstrip(".") or "text"
-    header = f"File: {rel}\nType: {ext}\n\n"
     chunks = []
     for i in range(0, len(text), _CHUNK_SIZE):
         chunk = text[i : i + _CHUNK_SIZE]
         if chunk.strip():
+            start_line = text.count("\n", 0, i) + 1
+            end_line = start_line + chunk.count("\n")
+            header = f"File: {rel}\nType: {ext}\nLines: {start_line}-{end_line}\n\n"
             chunks.append(header + chunk)
     return chunks
 

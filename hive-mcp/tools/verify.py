@@ -38,6 +38,20 @@ from .exclusions import rg_args
 _BACKTICK_RE = re.compile(r"`([^`\n]{2,120})`")
 # path/to/file.ext:123  — the citation form the instructions ask for.
 _FILE_LINE_RE = re.compile(r"([A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6}):(\d{1,6})")
+# Labeled-prose line citations: "**Line:** 389", "line 389", "Line: 389". Measured
+# 2026-08-03: a real answer wrote "**File:** `models.py`, **Line:** 389" instead of
+# the compact "models.py:389" form -- _FILE_LINE_RE never matches that shape at all,
+# so a fabricated line number (off by ~155 lines from the real one) sailed through
+# unchecked. Paired with the nearest preceding backticked path below rather than
+# requiring one exact label phrasing, since models write this a dozen different ways
+# ("in `x` at line N", "File: `x`, Line: N", "`x`, line N") and enumerating every
+# phrasing is a losing game; proximity to a real path is the only reliable signal.
+_LABELED_LINE_RE = re.compile(r"\bline[:\s]*\**\s*(\d{1,6})\b", re.IGNORECASE)
+_BACKTICK_PATH_RE = re.compile(r"`([A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6})`")
+# How far back (chars) to look for the path a labeled line number belongs to. Wide
+# enough to span a markdown table cell or a short sentence, narrow enough that it
+# won't grab an unrelated path mentioned several claims earlier.
+_LABELED_LINE_WINDOW = 200
 # API routes, asserted constantly and invented almost as often. The prefixes come from
 # config.ROUTE_PREFIXES because "/api" is a convention, not a rule — a project routing
 # under /v1 or /graphql would otherwise have its routes silently skipped, and one routing
@@ -280,6 +294,26 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     file_lines: list[tuple[str, int]] = []
     for path, num in _FILE_LINE_RE.findall(answer):
         pair = (path, int(num))
+        if pair not in file_lines:
+            file_lines.append(pair)
+
+    # Labeled prose citations ("**File:** `x`, **Line:** 389") that never use the
+    # compact path:line form above, and so never matched _FILE_LINE_RE at all. Pair
+    # each labeled line number with the nearest preceding backticked path within a
+    # bounded window — see _LABELED_LINE_RE's comment for why proximity, not a fixed
+    # phrasing, is the matching strategy.
+    backtick_paths = list(_BACKTICK_PATH_RE.finditer(answer))
+    for m in _LABELED_LINE_RE.finditer(answer):
+        line_start = m.start()
+        nearest = None
+        for p in backtick_paths:
+            if p.start() >= line_start:
+                break  # only paths mentioned BEFORE this line-number claim count
+            if line_start - p.end() <= _LABELED_LINE_WINDOW:
+                nearest = p
+        if nearest is None:
+            continue
+        pair = (nearest.group(1), int(m.group(1)))
         if pair not in file_lines:
             file_lines.append(pair)
 

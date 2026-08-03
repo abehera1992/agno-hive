@@ -61,6 +61,7 @@ agents:
       - load_skill
     skills:
       - verification-discipline
+      - comparison-discipline
     instructions:
       - "SESSION CONTEXT: Before any other tool call, try get_file_content('hive.md') once — it has the full directory tree and per-module summaries. Use it as your starting point for structure and overview questions. Skip silently if not found."
       - If lightrag_query is available via MCP, call it with relevant keywords before starting.
@@ -203,6 +204,7 @@ agents:
     skills:
       - file-write-review
       - verification-discipline
+      - comparison-discipline
     instructions:
       - If lightrag_query is available via MCP, call it with relevant keywords before starting.
       - You are the code reviewer. Check for correctness, security, and consistency.
