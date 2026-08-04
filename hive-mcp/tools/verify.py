@@ -16,10 +16,20 @@ What it catches, honestly stated:
   * INVENTED SYMBOLS      — fully. A named function is either in the repo or it isn't.
   * WRONG LINE NUMBERS    — fully. Read the line, compare it to the claim.
   * INVENTED PATHS/ROUTES — fully, same as symbols.
-  * MISATTRIBUTED SYMBOLS — NOT caught. When a real single-item function is claimed to
-    handle a batch, the symbol exists and only the claim about it is false. Deciding that
-    needs to read intent, which is what a reviewer or a human is for. This tool marks the
-    symbol FOUND and says nothing about the claim.
+  * WRONG-LOCATION QUOTES — fully, when the answer quotes what it claims is AT a cited
+    line (a docstring, a literal). The line existing is not enough: content-checking
+    reads the real lines around the citation and confirms the quoted text is actually
+    there. Measured 2026-08-04: an answer cited `models.py` line 450-497 and quoted the
+    docstring "L1 -- Legal entity / PAN-based." (triple-quoted in source) right after
+    it -- a real docstring that genuinely exists in the file, just at line 236, not
+    450. The old citation check
+    passed this cleanly (450 <= 774 total lines, so the line "exists"); it never
+    compared what the answer quoted against what is actually on that line.
+  * MISATTRIBUTED SYMBOLS — NOT caught for claims with no quoted content. When a real
+    single-item function is claimed to handle a batch, the symbol exists and only the
+    claim about it is false. Deciding that needs to read intent, which is what a
+    reviewer or a human is for. This tool marks the symbol FOUND and says nothing
+    about the claim.
 Treat a clean report as "nothing provably invented", never as "the answer is correct".
 """
 
@@ -52,6 +62,19 @@ _BACKTICK_PATH_RE = re.compile(r"`([A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6})`")
 # enough to span a markdown table cell or a short sentence, narrow enough that it
 # won't grab an unrelated path mentioned several claims earlier.
 _LABELED_LINE_WINDOW = 200
+# How far FORWARD (chars) to look, after a citation, for the quoted content the
+# answer says lives there. Real answers write the citation then the quote right
+# after it ("models.py, line 450 -- `\"\"\"docstring\"\"\"`"); this has to be short
+# enough that it does not reach past this citation into the NEXT one's own quote.
+_CONTENT_QUOTE_WINDOW = 200
+# A cited line is considered to match if the quoted content appears within this many
+# REAL lines of it -- tolerates citing the class line vs. the docstring one line below
+# it, without tolerating the ~90-to-215-line misses actually observed.
+_LINE_TOLERANCE = 5
+# A bare path (`some/file.ext`) found in the quote-search window is very likely the
+# NEXT citation's own path, not content this citation is claiming -- exclude it or
+# every citation "quotes" the following one's filename.
+_PATHLIKE_RE = re.compile(r"^[A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6}$")
 # API routes, asserted constantly and invented almost as often. The prefixes come from
 # config.ROUTE_PREFIXES because "/api" is a convention, not a rule — a project routing
 # under /v1 or /graphql would otherwise have its routes silently skipped, and one routing
@@ -222,6 +245,36 @@ def _read_line(rel_path: str, lineno: int) -> str | None:
     return None
 
 
+def _find_nearby_quote(answer: str, pos: int) -> str | None:
+    """The quoted content, if any, that a file:line citation is claiming lives there.
+
+    Looks forward from the end of the citation match for the next backticked span --
+    the shape real answers use ("models.py, line 450 -- `\"\"\"docstring\"\"\"`"). Skips
+    bare paths (almost always the NEXT citation's own filename, not this one's content)
+    and anything too short/generic to mean a specific location.
+    """
+    window = answer[pos: pos + _CONTENT_QUOTE_WINDOW]
+    m = _BACKTICK_RE.search(window)
+    if not m:
+        return None
+    quoted = m.group(1).strip()
+    if len(quoted) < 4 or quoted.lower() in _NOISE or _PATHLIKE_RE.match(quoted):
+        return None
+    return quoted
+
+
+def _read_window(rel_path: str, center_line: int, span: int) -> str:
+    """Real file text within `span` lines of center_line, for a location check."""
+    p = PROJECT_ROOT / rel_path
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return ""
+    lo = max(0, center_line - 1 - span)
+    hi = min(len(lines), center_line - 1 + span)
+    return "\n".join(lines[lo:hi])
+
+
 # Detects a stuck retry loop: the exact same answer text checked twice in a row,
 # with nothing revised in between. Module-level and intentionally coarse, mirroring
 # hive-mcp/tools/files.py's _last_failed_call breaker for apply_diff. Measured
@@ -247,7 +300,9 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                      to search the whole project.
 
     Limits: proves EXISTENCE, not correctness. A symbol that exists but does not do what
-    the answer claims will pass — this cannot read intent.
+    the answer claims will pass — this cannot read intent. When a citation is quoted
+    ("`path`, line N -- `quoted text`"), the quoted text's actual location IS checked
+    against line N — but a bare, unquoted citation still only proves the line exists.
     """
     global _last_checked_answer, _repeat_count
     if not answer or not answer.strip():
@@ -292,10 +347,16 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             idents.append(tok)
 
     file_lines: list[tuple[str, int]] = []
-    for path, num in _FILE_LINE_RE.findall(answer):
-        pair = (path, int(num))
+    content_claims: dict[tuple[str, int], str] = {}
+    for m in _FILE_LINE_RE.finditer(answer):
+        path, num = m.group(1), int(m.group(2))
+        pair = (path, num)
         if pair not in file_lines:
             file_lines.append(pair)
+        if pair not in content_claims:
+            quoted = _find_nearby_quote(answer, m.end())
+            if quoted:
+                content_claims[pair] = quoted
 
     # Labeled prose citations ("**File:** `x`, **Line:** 389") that never use the
     # compact path:line form above, and so never matched _FILE_LINE_RE at all. Pair
@@ -316,6 +377,10 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
         pair = (nearest.group(1), int(m.group(1)))
         if pair not in file_lines:
             file_lines.append(pair)
+        if pair not in content_claims:
+            quoted = _find_nearby_quote(answer, m.end())
+            if quoted:
+                content_claims[pair] = quoted
 
     routes: list[str] = []
     if _ROUTE_RE is not None:
@@ -378,6 +443,17 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             else:
                 out.append(f"  LINE {num:<6} {resolved}")
                 out.append(f"             | {line.strip()[:100]}")
+                quoted = content_claims.get((path, num))
+                if quoted is not None:
+                    if quoted in _read_window(resolved, num, _LINE_TOLERANCE):
+                        out.append(f"             content verified within {_LINE_TOLERANCE} lines")
+                    else:
+                        problems += 1
+                        out.append(
+                            f"  MISMATCH   quoted {quoted[:60]!r} not found within "
+                            f"{_LINE_TOLERANCE} lines of {resolved}:{num} <-- the citation "
+                            f"and the quoted content do not point at the same place"
+                        )
         out.append("")
 
     # ── routes ────────────────────────────────────────────────────────────────
