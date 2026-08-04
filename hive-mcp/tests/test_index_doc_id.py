@@ -97,9 +97,17 @@ def test_chunk_citation_path_is_deterministic():
 
 
 def test_state_entry_round_trips_chunk_count_through_the_walk_parser(tmp_path, monkeypatch):
-    # A file untouched since a PRIOR run (recorded with key|sha|chunk_count)
-    # must be recognized as unchanged and skipped -- the new 3rd field must
-    # not break the existing fast-path comparison.
+    # A legacy 3-field entry (key|sha|chunk_count, no chunker_version -- written
+    # before _CHUNKER_VERSION existed) must parse without crashing, and the
+    # missing 4th field must NOT break the existing key/sha comparison logic.
+    #
+    # This test originally asserted the file gets SKIPPED here -- that was
+    # correct before _CHUNKER_VERSION existed, but is now the wrong expectation:
+    # a state entry with no recorded chunker version is exactly the case
+    # test_index_chunker_version.py's test_missing_version_field_forces_reprocessing
+    # covers, and must force reprocessing, not a skip (see that file's module
+    # docstring for why: a chunker upgrade needs to reach files whose CONTENT
+    # is unchanged too, and content-hash comparison alone can never know that).
     monkeypatch.setattr(index, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(index, "_STATE_DIR", tmp_path / ".hive-index-state")
     monkeypatch.setattr(index, "is_excluded", lambda rel: False)
@@ -116,7 +124,8 @@ def test_state_entry_round_trips_chunk_count_through_the_walk_parser(tmp_path, m
     )
 
     import asyncio
-    result = asyncio.run(index.index_project("proj", "http://unused:9002/mcp"))
+    result = asyncio.run(index.index_project("proj", "http://127.0.0.1:1/mcp"))
 
-    assert "Files skipped:   1" in result
-    assert "Files scanned:   1" in result
+    # Not skipped: no chunker_version in the stored entry -- reached the network
+    # attempt and failed there, proving the legacy entry was NOT trusted as current.
+    assert "Error connecting to LightRAG" in result

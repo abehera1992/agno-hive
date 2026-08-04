@@ -4,12 +4,15 @@ Connects to the LightRAG MCP server via Streamable HTTP and calls
 lightrag_insert for each chunk. Tracks per-file state for incremental
 re-indexing so unchanged files are skipped.
 
-State entry format: "<mtime_ns>:<size>|<sha256>|<chunk_count>". The mtime:size
-part is a fast pre-check (no file read); when it mismatches the content SHA-256
-decides. This makes the state immune to metadata-only churn (git checkout/reset,
-touch) that rewrites files without changing their content. Legacy entries
-missing "|<sha256>" or "|<chunk_count>" are upgraded in place on the next pass
-without re-indexing.
+State entry format: "<mtime_ns>:<size>|<sha256>|<chunk_count>|<chunker_version>".
+The mtime:size part is a fast pre-check (no file read); when it mismatches the
+content SHA-256 decides. This makes the state immune to metadata-only churn (git
+checkout/reset, touch) that rewrites files without changing their content. Legacy
+entries missing "|<sha256>" are upgraded in place on the next pass without
+re-indexing — but a missing or mismatched "|<chunker_version>" is NOT a safe skip:
+it means this file's already-indexed chunks were embedded by an older version of
+_get_chunks()/its dispatch targets and must be re-embedded even though the file's
+own content hasn't changed (see _CHUNKER_VERSION).
 
 chunk_count exists to make per-file deletion possible without querying LightRAG
 at all. Every chunk of a file is sent as its own separate LightRAG "document"
@@ -66,6 +69,24 @@ from config import PROJECT_ROOT
 
 _STATE_DIR  = Path(os.getenv("HIVE_INDEX_STATE_DIR", str(PROJECT_ROOT / ".hive-index-state")))
 _CHUNK_SIZE = 4000   # chars for non-Python files
+
+# Bump whenever _get_chunks()/its dispatch targets change what gets embedded in a
+# chunk's TEXT (header fields, chunking granularity, etc.) — anything that changes
+# the CONTENT sent to LightRAG for an otherwise-unchanged source file. A stored
+# state entry whose version doesn't match this is treated as stale and reprocessed
+# even though the file's own content is unchanged, since content-hash comparison
+# alone has no way to know the TOOL changed, not the file.
+#
+# Confirmed 2026-08-03/04: without this, a chunker upgrade (adding the "Lines:"
+# header — see _py_chunks/_text_chunks) never reached files a --force run's pass
+# cap didn't get to before returning Partial. The follow-up plain `hive --bootstrap`
+# correctly resumed and reported "Done", but "Done" there only meant every file was
+# either force-reprocessed or confirmed content-unchanged-and-skipped — content
+# that predated the chunker change stayed on the old format indefinitely, since
+# nothing ever told the skip-check the indexed FORM was stale. Verified live:
+# 730-file project, only ~255 files force-touched before the pass cap, the other
+# ~475 legitimately "skipped: unchanged" through commit and never re-embedded.
+_CHUNKER_VERSION = 1
 # Shared with search / read / write / scan — one list, configured per project via
 # EXCLUDE_DIRS / EXCLUDE_GLOBS. "backups" and ".hive-index-state" are fail-safe defaults
 # in that shared set: backups commonly holds DB dumps (which have held secrets), and
@@ -451,30 +472,37 @@ async def index_project(
             stored = state.get(rel) or ""
             s_parts = stored.split("|") if stored else []
             if not force and stored:
-                s_fast = s_parts[0]
-                s_sha = s_parts[1] if len(s_parts) > 1 else ""
-                if s_fast == key:
-                    # Fast path: mtime+size unchanged. Lazily upgrade legacy
-                    # entries (missing sha and/or chunk_count) — one read, no re-index.
+                s_fast  = s_parts[0]
+                s_sha   = s_parts[1] if len(s_parts) > 1 else ""
+                s_count = s_parts[2] if len(s_parts) > 2 else ""
+                s_ver   = s_parts[3] if len(s_parts) > 3 else ""
+                # A missing/mismatched version is NEVER a safe skip, in either
+                # branch below — it means the already-indexed chunks predate the
+                # current _get_chunks() output and must be re-embedded even
+                # though the file's own content is unchanged. See _CHUNKER_VERSION.
+                version_current = s_ver == str(_CHUNKER_VERSION)
+                if s_fast == key and version_current:
+                    # Fast path: mtime+size unchanged AND indexed under the
+                    # current chunker version. Lazily upgrade legacy entries
+                    # (missing sha) — one read, no re-index.
                     files_skipped += 1
                     if not s_sha:
                         try:
-                            new_state[rel] = f"{key}|{_sha256(p)}"
+                            new_state[rel] = f"{key}|{_sha256(p)}|{s_count}|{_CHUNKER_VERSION}"
                         except Exception:
                             pass
                     continue
-                if s_sha:
-                    # mtime/size changed — check whether content actually did.
+                if s_fast != key and s_sha and version_current:
+                    # mtime/size changed but chunker version is current — check
+                    # whether content actually did.
                     try:
                         cur_sha = _sha256(p)
                     except Exception:
                         continue
                     if cur_sha == s_sha:
                         # Metadata-only churn (git reset, touch): re-key, skip.
-                        # Preserve the chunk_count field if present.
                         files_skipped += 1
-                        suffix = f"|{s_parts[2]}" if len(s_parts) > 2 else ""
-                        new_state[rel] = f"{key}|{s_sha}{suffix}"
+                        new_state[rel] = f"{key}|{s_sha}|{s_count}|{_CHUNKER_VERSION}"
                         continue
             # Previous chunk count, used to reconstruct and delete this file's old
             # doc ids before re-inserting (see _chunk_doc_id / _delete_stale).
@@ -568,7 +596,7 @@ async def index_project(
                         ok = all(flags)
                         if ok:
                             try:
-                                new_state[rel] = f"{key}|{_sha256(p)}|{len(chunks)}"
+                                new_state[rel] = f"{key}|{_sha256(p)}|{len(chunks)}|{_CHUNKER_VERSION}"
                             except Exception:
                                 new_state[rel] = key
                         files_indexed += 1
