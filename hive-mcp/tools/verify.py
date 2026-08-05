@@ -128,12 +128,30 @@ _PROPOSED_SUFFIX = ".hive_proposed"
 # fully generic across every staged file, matching this tool's project-agnostic
 # design elsewhere.
 _COMPONENT_EXTS = (".tsx", ".jsx")
+# How recent a *.hive_proposed file's mtime has to be to count as "part of this
+# task". Generous enough for a genuinely long multi-step run, short enough to
+# exclude anything left over from a previous session. Measured live 2026-08-05:
+# an unscoped rglob across the whole project picked up a FOUR-DAY-OLD staged
+# file from an unrelated earlier session (a GST-compliance edit to
+# items_api.py). Its unrelated identifiers (GSTComplianceTask.category_id,
+# services.barcode_service, ...) filled essentially the entire _MAX_CLAIMS cap,
+# crowding out the actual identifiers from THIS task's own staged file, and the
+# resulting verify_claims call -- now checking ~25 mostly-irrelevant symbols
+# instead of a handful of relevant ones -- ballooned from the usual tens of
+# seconds to 1324s for the whole run. Scoping by recency fixes both the
+# correctness problem (wrong file's symbols reported as this task's claims)
+# and the performance regression it caused.
+_STAGED_FILE_MAX_AGE_SECONDS = 30 * 60
 
 
 def _staged_files() -> list:
-    """Every file currently staged for review (*.hive_proposed) under PROJECT_ROOT."""
+    """Files staged for review (*.hive_proposed) under PROJECT_ROOT, recently enough
+    to plausibly belong to the current task rather than a forgotten earlier session."""
+    import time
     try:
-        return list(PROJECT_ROOT.rglob(f"*{_PROPOSED_SUFFIX}"))
+        cutoff = time.time() - _STAGED_FILE_MAX_AGE_SECONDS
+        return [p for p in PROJECT_ROOT.rglob(f"*{_PROPOSED_SUFFIX}")
+                if p.stat().st_mtime >= cutoff]
     except Exception:
         return []
 

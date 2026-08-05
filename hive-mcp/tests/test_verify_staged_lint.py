@@ -20,6 +20,30 @@ def _stage(tmp_path, rel_path: str, content: str):
     return p
 
 
+def test_stale_staged_file_from_an_earlier_session_is_ignored(tmp_path, monkeypatch):
+    """Confirmed live 2026-08-05: an unscoped rglob across the whole project picked
+    up a FOUR-DAY-OLD staged file left over from an unrelated earlier session. Its
+    unrelated identifiers filled nearly the entire _MAX_CLAIMS cap, crowding out
+    the current task's own staged file and ballooning a single verify_claims call
+    from tens of seconds to over 1300s. A staged file old enough to be from a
+    forgotten prior session must not be treated as part of the current task."""
+    import os
+    monkeypatch.setattr(verify, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(verify.config, "CODE_LINT_FORBID", ['className="::use styles.x, not a bare className string'])
+    monkeypatch.setattr(verify.config, "CODE_LINT_REQUIRE", [])
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+    stale = _stage(tmp_path, "old_unrelated_file", 'x = <div className="stale-leftover">hi</div>')
+    import time
+    os.utime(stale, (time.time() - 4 * 24 * 60 * 60,) * 2)
+
+    answer = "I've added the new feature."
+
+    report = verify.verify_claims(answer)
+
+    assert "FORBIDDEN pattern" not in report
+    assert "stale-leftover" not in report
+
+
 def test_forbidden_pattern_in_staged_file_is_caught_with_no_fenced_code_in_answer(
     tmp_path, monkeypatch
 ):
