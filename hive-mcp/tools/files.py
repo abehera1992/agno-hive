@@ -26,6 +26,23 @@ _IN_DOCKER = Path("/.dockerenv").exists()
 # generic "old_string not found" message with no information about why.
 _last_failed_call: dict[str, tuple[str, str]] = {}
 
+# Catches the same failure spiral even when EVERY call is a DISTINCT old_string,
+# which the exact-repeat check above cannot see. Measured live 2026-08-05: a Coder
+# mistook get_file_content's "LINENUM<TAB>content" citation-numbering for real file
+# content and passed old_string values like '129\n}', '133\n}', '134\n}' -- a
+# different string on every single call, so _last_failed_call never once matched --
+# and ran past 90 consecutive failed apply_diff calls against the same file with
+# zero progress before a human intervened. However the failures vary, N in a row
+# against the same file means continuing to guess will not fix it.
+_MAX_CONSECUTIVE_FAILURES = 5
+_consecutive_failures: dict[str, int] = {}
+
+# A leading bare integer immediately followed by a newline, with nothing else on
+# that first line, is the strongest available signal that old_string was built by
+# copying a "LINENUM<TAB>content" read result wholesale instead of stripping the
+# line-number prefix get_file_content's own docstring already warns against.
+_BARE_LINE_NUMBER_RE = re.compile(r"^\s*\d+\s*\n")
+
 
 def _near_match_hint(content: str, old_string: str, context: int = 2) -> str:
     """Best-effort explanation of why old_string didn't match: the closest existing
@@ -151,6 +168,9 @@ def apply_diff(relative_path: str, old_string: str, new_string: str, preserve_in
     - Never omit content from new_string unless intentionally deleting it.
     - When adding a new symbol (class, function, variable): update the import
       line FIRST, then add the usage — both as separate apply_diff calls.
+    - get_file_content() output is numbered "LINENUM<TAB>content" so citations can
+      be copied exactly. That numbering is NOT part of the file — old_string must
+      contain only the real code after the tab, never the line number itself.
 
     Args:
         relative_path: Path relative to project root
@@ -184,6 +204,18 @@ def apply_diff(relative_path: str, old_string: str, new_string: str, preserve_in
 
         count = content.count(old_string)
         if count == 0:
+            fail_count = _consecutive_failures.get(relative_path, 0) + 1
+            _consecutive_failures[relative_path] = fail_count
+            if fail_count > _MAX_CONSECUTIVE_FAILURES:
+                return (
+                    f"apply_diff HARD STOP: {fail_count} consecutive apply_diff calls against "
+                    f"{relative_path} have all failed to find their old_string — even though "
+                    f"they were not all the same string, so varying the guess is not the fix. "
+                    f"Stop retrying against this file. Report to the coordinator that this file "
+                    f"needs a single fresh get_file_content('{relative_path}') read, and that "
+                    f"old_string must be an exact copy of the real code AFTER the line-number "
+                    f"tab — never the line number itself."
+                )
             prev = _last_failed_call.get(relative_path)
             if prev == (old_string, new_string):
                 _last_failed_call.pop(relative_path, None)  # reset — a later distinct retry isn't blocked
@@ -196,6 +228,14 @@ def apply_diff(relative_path: str, old_string: str, new_string: str, preserve_in
                 )
             _last_failed_call[relative_path] = (old_string, new_string)
             hint = _near_match_hint(content, old_string)
+            if _BARE_LINE_NUMBER_RE.match(old_string):
+                hint = (
+                    "\nold_string starts with a bare number followed by a newline, which "
+                    "looks like a copied 'LINENUM<TAB>content' prefix from get_file_content() "
+                    "output. That line number and the tab after it are NOT part of the file's "
+                    "real content — strip everything up to and including the tab, and match "
+                    "only the actual code that follows it."
+                ) + hint
             return (
                 f"apply_diff failed: old_string not found in {relative_path}. "
                 f"Call get_file_content('{relative_path}') to read the current exact text, "
@@ -231,6 +271,7 @@ def apply_diff(relative_path: str, old_string: str, new_string: str, preserve_in
                 )
 
         _last_failed_call.pop(relative_path, None)
+        _consecutive_failures.pop(relative_path, None)
 
         proposed_content = content.replace(old_string, new_string, 1)
 
