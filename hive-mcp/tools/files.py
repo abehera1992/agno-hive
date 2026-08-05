@@ -37,11 +37,15 @@ _last_failed_call: dict[str, tuple[str, str]] = {}
 _MAX_CONSECUTIVE_FAILURES = 5
 _consecutive_failures: dict[str, int] = {}
 
-# A leading bare integer immediately followed by a newline, with nothing else on
-# that first line, is the strongest available signal that old_string was built by
-# copying a "LINENUM<TAB>content" read result wholesale instead of stripping the
-# line-number prefix get_file_content's own docstring already warns against.
-_BARE_LINE_NUMBER_RE = re.compile(r"^\s*\d+\s*\n")
+# A leading bare integer immediately followed by either a newline OR whitespace-then-
+# content on the SAME line is the strongest available signal that old_string was built
+# by copying a "LINENUM<TAB>content" read result wholesale instead of stripping the
+# line-number prefix get_file_content's own docstring already warns against. Measured
+# live 2026-08-05: the original newline-only form of this regex caught 'old_string=
+# "192\n\n193\t.empty {..."' but missed 'old_string="495  }"' in the very same run --
+# same root-cause mistake, just rendered with the number and content on one line
+# (the tab collapsed to spaces) instead of two. Both shapes get the same hint now.
+_BARE_LINE_NUMBER_RE = re.compile(r"^\s*\d+(?:\s*\n|[ \t]+\S)")
 
 
 def _near_match_hint(content: str, old_string: str, context: int = 2) -> str:

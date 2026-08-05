@@ -98,6 +98,21 @@ def test_apply_diff_bare_line_number_old_string_gets_specific_hint(tmp_path, mon
     assert "LINENUM" in result or "line-number" in result or "line number" in result
 
 
+def test_apply_diff_same_line_bare_line_number_also_gets_specific_hint(tmp_path, monkeypatch):
+    """Confirmed live 2026-08-05, same run as the two-line case above: the FIRST
+    apply_diff call in that run used the two-line form ('192\\n\\n193\\t.empty {...')
+    and correctly got the hint, but the SECOND call rendered the same underlying
+    mistake on a single line ('495  }' -- line number, spaces where a tab collapsed,
+    then real content, no newline in between) and the original newline-only regex
+    missed it entirely, silently falling back to the generic hint-less message."""
+    _setup(tmp_path, monkeypatch, "def foo():\n    return 1\n")
+
+    result = files.apply_diff("sample.py", "495  }", "495  }\nmore")
+
+    assert "old_string not found" in result
+    assert "LINENUM" in result or "line-number" in result or "line number" in result
+
+
 def test_apply_diff_hard_stops_after_many_distinct_failures(tmp_path, monkeypatch):
     """The exact-repeat STOPPED check (above) only catches the SAME old_string
     tried twice in a row. Confirmed live 2026-08-05: a Coder varied its guess

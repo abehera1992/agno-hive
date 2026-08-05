@@ -1,0 +1,159 @@
+"""Regression tests: the orchestrator must not accept a "file was changed" claim
+unless a write tool call in that same run's trace actually succeeded.
+
+Confirmed live 2026-08-05: a Coder called apply_diff() twice against the same
+file, both failed with "old_string not found" (a malformed old_string built by
+copying get_file_content's line-number prefix), then reported "The change has
+been applied via apply_diff to parties.module.scss" anyway -- no .hive_proposed
+file existed anywhere on disk, confirmed directly against the container
+filesystem. The existing citation/fact groundedness checks in _verified_answer
+had no way to catch this: the claim contained no fabricated file path or
+symbol, just a false report of a successful write.
+"""
+from types import SimpleNamespace
+
+import pytest
+
+from swarm import team
+
+
+def _msgs(*items):
+    return SimpleNamespace(messages=list(items))
+
+
+def _tool_msg(name: str, content: str):
+    return SimpleNamespace(role="tool", tool_name=name, content=content)
+
+
+class _FakeTeam:
+    def __init__(self, retry_result):
+        self._retry_result = retry_result
+        self.prompts = []
+
+    async def arun(self, prompt):
+        self.prompts.append(prompt)
+        return self._retry_result
+
+
+# ---- _count_successful_write_calls -----------------------------------------
+
+def test_count_successful_write_calls_returns_minus_one_with_no_messages():
+    result = SimpleNamespace(messages=[])
+    assert team._count_successful_write_calls(result) == -1
+
+
+def test_count_successful_write_calls_returns_minus_one_when_nothing_inspectable():
+    result = _msgs(SimpleNamespace(role="assistant", content="hello"))
+    assert team._count_successful_write_calls(result) == -1
+
+
+def test_count_successful_write_calls_returns_zero_when_write_call_failed():
+    result = _msgs(_tool_msg("apply_diff", "apply_diff failed: old_string not found in x.scss."))
+    assert team._count_successful_write_calls(result) == 0
+
+
+def test_count_successful_write_calls_counts_a_genuine_success():
+    result = _msgs(_tool_msg("apply_diff", "review_pending: x.scss — this change is now staged."))
+    assert team._count_successful_write_calls(result) == 1
+
+
+def test_count_successful_write_calls_ignores_unrelated_read_tool_but_stays_determinable():
+    result = _msgs(
+        _tool_msg("get_file_content", "# x.scss — lines 0..10 of 10\n1\tfoo"),
+        _tool_msg("apply_diff", "apply_diff failed: old_string not found in x.scss."),
+    )
+    assert team._count_successful_write_calls(result) == 0  # determinable, zero successes
+
+
+# ---- _verified_answer's write-claim guard -----------------------------------
+
+@pytest.mark.asyncio
+async def test_verified_answer_appends_disclaimer_when_retry_still_falsely_claims_success():
+    original_result = _msgs(_tool_msg("apply_diff", "apply_diff failed: old_string not found in x.scss."))
+    content = "The change has been applied via apply_diff to x.scss."
+
+    retry_result = SimpleNamespace(
+        content="The change has been successfully applied to x.scss.",  # retried, but STILL fabricated
+        messages=[_tool_msg("apply_diff", "apply_diff failed: old_string not found in x.scss.")],
+    )
+    fake_team = _FakeTeam(retry_result)
+
+    out = await team._verified_answer(content, "add a badge class", fake_team, None, result=original_result)
+
+    assert len(fake_team.prompts) == 1  # it actually retried
+    assert "apply_diff() or write_file()" in fake_team.prompts[0]
+    assert "NOT applied" in out  # bounded at one retry -- surfaced, not hidden
+
+
+@pytest.mark.asyncio
+async def test_verified_answer_accepts_retry_that_honestly_reports_failure():
+    """An honest 'it failed' retry is not a fabrication and must not be flagged --
+    only a retry that STILL claims success without a successful write earns the
+    disclaimer."""
+    original_result = _msgs(_tool_msg("apply_diff", "apply_diff failed: old_string not found in x.scss."))
+    content = "The change has been applied via apply_diff to x.scss."
+
+    retry_result = SimpleNamespace(
+        content="Reported the exact apply_diff failure instead of claiming success.",
+        messages=[_tool_msg("apply_diff", "apply_diff failed: old_string not found in x.scss.")],
+    )
+    fake_team = _FakeTeam(retry_result)
+
+    out = await team._verified_answer(content, "add a badge class", fake_team, None, result=original_result)
+
+    assert len(fake_team.prompts) == 1
+    assert out == "Reported the exact apply_diff failure instead of claiming success."
+    assert "NOT applied" not in out
+
+
+@pytest.mark.asyncio
+async def test_verified_answer_accepts_retry_that_actually_succeeds():
+    original_result = _msgs(_tool_msg("apply_diff", "apply_diff failed: old_string not found in x.scss."))
+    content = "The change has been applied via apply_diff to x.scss."
+
+    retry_result = SimpleNamespace(
+        content="The statusBadge class has been added to x.scss.",
+        messages=[_tool_msg("apply_diff", "review_pending: x.scss — this change is now staged.")],
+    )
+    fake_team = _FakeTeam(retry_result)
+
+    out = await team._verified_answer(content, "add a badge class", fake_team, None, result=original_result)
+
+    assert out == "The statusBadge class has been added to x.scss."
+    assert "NOT applied" not in out
+
+
+@pytest.mark.asyncio
+async def test_verified_answer_does_not_retry_when_write_already_succeeded():
+    original_result = _msgs(_tool_msg("apply_diff", "review_pending: x.scss — this change is now staged."))
+    content = "The change has been applied via apply_diff to x.scss."
+    fake_team = _FakeTeam(retry_result=None)
+
+    out = await team._verified_answer(content, "add a badge class", fake_team, None, result=original_result)
+
+    assert fake_team.prompts == []  # no retry needed
+    assert out == content
+
+
+@pytest.mark.asyncio
+async def test_verified_answer_does_not_retry_when_writes_undeterminable():
+    original_result = _msgs(SimpleNamespace(role="assistant", content="hello"))
+    content = "The change has been applied via apply_diff to x.scss."
+    fake_team = _FakeTeam(retry_result=None)
+
+    out = await team._verified_answer(content, "add a badge class", fake_team, None, result=original_result)
+
+    assert fake_team.prompts == []  # -1 (undeterminable) must not force a retry
+    assert out == content
+
+
+@pytest.mark.asyncio
+async def test_verified_answer_ignores_content_with_no_write_claim():
+    original_result = _msgs(_tool_msg("apply_diff", "apply_diff failed: old_string not found in x.scss."))
+    content = "I could not find a suitable place to add this class."
+    fake_team = _FakeTeam(retry_result=None)
+
+    out = await team._verified_answer(content, "add a badge class", fake_team, None, result=original_result)
+
+    assert fake_team.prompts == []  # nothing claimed, nothing to retry
+    assert out == content

@@ -466,6 +466,61 @@ def _count_read_calls(result) -> int:
     return n if recognised else -1
 
 
+# Tools that WRITE to the project. A "done" claim resting on one of these needs the
+# tool's OWN response to actually say so -- a FAILED apply_diff call is still a tool
+# call by name, and _count_read_calls-style presence checking cannot tell the two apart.
+_WRITE_TOOLS = {"apply_diff", "write_file"}
+_WRITE_SUCCESS_RE = re.compile(r"^(review_pending|written|applied):", re.IGNORECASE)
+
+# Phrases a model uses to report a file was actually changed. Deliberately broad: this
+# only gates a retry when NO write tool call succeeded (see _count_successful_write_calls
+# below), so a false-positive match here just means "checked for evidence when it
+# turned out fine" -- cheap. A false NEGATIVE means a fabricated "done" claim ships
+# unretried, which is the exact failure this guard exists to catch.
+_CLAIMED_WRITE_RE = re.compile(
+    r"\bhas been (applied|added|staged|created|updated|modified|proposed)"
+    r"|\bi(?:'ve| have) (added|created|updated|modified|applied|staged)"
+    r"|\bsuccessfully (applied|added|staged|proposed|created)"
+    r"|\b(?:is|are) now staged"
+    r"|\bstaged for review"
+    r"|\bchange(?:s)? (?:has|have) been (?:applied|staged|made)\b",
+    re.IGNORECASE,
+)
+
+
+def _count_successful_write_calls(result) -> int:
+    """Count WRITE tool calls (apply_diff/write_file) whose OWN response text confirms
+    success -- not just that the tool was invoked. A failed apply_diff ('old_string not
+    found', 'HARD STOP', 'REFUSED') is still a tool call by name; only a response
+    starting with 'review_pending:', 'written:', or 'applied:' means anything actually
+    landed on disk (staged or otherwise). -1 (not 0) when the message shape is
+    unrecognised, mirroring _count_read_calls: "we could not tell" must never be
+    treated as "nothing succeeded" -- that would force retries on runs this function
+    simply cannot introspect, which is a different problem from a genuine fabrication.
+
+    Measured live 2026-08-05: a Coder called apply_diff() twice against the same file,
+    both failed with "old_string not found" (a malformed old_string built by copying
+    get_file_content's line-number prefix), then reported "The change has been applied
+    via apply_diff to parties.module.scss" anyway -- no .hive_proposed file existed
+    anywhere on disk, confirmed directly against the container filesystem.
+    """
+    msgs = getattr(result, "messages", None)
+    if not msgs:
+        return -1
+    n, recognised = 0, False
+    for m in msgs:
+        for tc in (getattr(m, "tool_calls", None) or []):
+            recognised = True
+        if getattr(m, "role", None) == "tool":
+            recognised = True
+            name = getattr(m, "tool_name", None) or getattr(m, "name", None)
+            if name in _WRITE_TOOLS:
+                text = getattr(m, "content", None)
+                if isinstance(text, str) and _WRITE_SUCCESS_RE.match(text.strip()):
+                    n += 1
+    return n if recognised else -1
+
+
 async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | None,
                            result=None) -> str:
     """Check the draft's claims and, if any are unverifiable, give the team ONE chance
@@ -482,6 +537,43 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     claims, the correction is not converging and looping burns tokens; the verifier's
     findings are surfaced instead so a human sees exactly which claims are unsupported.
     """
+    # Claimed-write check, FIRST — a fabricated "file changed" claim means the rest of
+    # the answer's factual content is moot, so this runs before the fact-groundedness
+    # checks below rather than after. Only fires when writes are DETERMINABLE and zero
+    # succeeded; -1 (undeterminable) is deliberately excluded, matching the read-evidence
+    # check's own reasoning: "we could not tell" must never be treated as "nothing
+    # succeeded". See _count_successful_write_calls for the live incident this fixes.
+    writes = _count_successful_write_calls(result)
+    if writes == 0 and _CLAIMED_WRITE_RE.search(content or ""):
+        print("[team] answer claims a file was written but no write tool call succeeded — retrying with a mandatory write")
+        try:
+            retry = await team.arun(
+                f"{task}\n\n"
+                f"IMPORTANT: a previous attempt claimed a file was created, modified, "
+                f"applied, or staged for review, but no apply_diff() or write_file() call "
+                f"in that attempt actually succeeded (a successful call's response starts "
+                f"with 'review_pending:', 'written:', or 'applied:' — a failed one does "
+                f"not, even though it is still a real tool call). Do not repeat that "
+                f"mistake: call apply_diff() (for an existing file) or write_file() (for a "
+                f"brand-new file), confirm its response actually indicates success, and "
+                f"only THEN report the change as made. If the write tool keeps failing, "
+                f"report the exact failure message instead of claiming success."
+            )
+            retried = retry.content if hasattr(retry, "content") else str(retry)
+            if retried:
+                retry_writes = _count_successful_write_calls(retry)
+                if retry_writes == 0 and _CLAIMED_WRITE_RE.search(retried):
+                    # Bounded at one retry, same as the citation path below — surface
+                    # rather than hide so a human doesn't act on a phantom change.
+                    return (
+                        f"{retried}\n\n---\n**This answer claims a file was changed, but "
+                        f"no apply_diff()/write_file() call in either attempt actually "
+                        f"succeeded — treat this as NOT applied.**"
+                    )
+                content, result = retried, retry
+        except Exception as exc:
+            print(f"[team] write-claim retry failed: {exc}")
+
     # No-evidence check, BEFORE the grep-based one. Measured 2026-07-31 on the same case
     # in the same configuration: a failing run made ONE tool call (verify_claims) and no
     # reads, answering `pendingBadge` from context in 23s; a passing run made four reads
