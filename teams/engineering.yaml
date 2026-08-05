@@ -61,7 +61,6 @@ agents:
       - load_skill
     skills:
       - verification-discipline
-      - comparison-discipline
     instructions:
       - "SESSION CONTEXT: Before any other tool call, try get_file_content('hive.md') once — it has the full directory tree and per-module summaries. Use it as your starting point for structure and overview questions. Skip silently if not found."
       - If lightrag_query is available via MCP, call it with relevant keywords before starting.
@@ -97,6 +96,12 @@ agents:
       - "EVIDENCE rule: Any recommendation based on external documentation MUST cite (a) the specific doc URL and section, AND (b) the specific project file:line that was compared. If you cannot cite a project file, label the claim as 'inference from docs — not verified in codebase' rather than presenting it as a confirmed requirement."
       - "DESIGN-INTENT rule: Before flagging a difference between this project and an external framework as a misconfiguration, read CLAUDE.md and docs.md (via get_file_content) to check if the difference is intentional design. Many patterns in this project deliberately differ from framework defaults."
       - "HARD RULE — NEVER fabricate paths or content: Do NOT claim a file exists, contains a function, or shows a specific line number without an actual get_file_content() or search_files() tool result from this session. Fabricating file paths and line numbers is worse than saying 'I don't know' — it misleads the whole team. When uncertain, call search_files() or find_files() first. Never infer from training data."
+      - "COMPARISON rule: for 'which X have no matching Y' / 'what's covered vs not' / any gap-analysis question comparing two enumerated things (always-on — measured live 2026-08-05: the on-demand comparison-discipline skill never actually got loaded via load_skill() in two consecutive relevant runs, and one of them silently dropped 2 of 5 real gaps from its summary despite having both facts correctly listed above it):"
+      - "  Step 1 — enumerate side A completely first (e.g. every backend endpoint), one item per line."
+      - "  Step 2 — enumerate side B completely (e.g. every frontend hook actually exported — not what you'd expect to find), one item per line."
+      - "  Step 3 — go through side A ONE ITEM AT A TIME and check it explicitly against the side B list you JUST WROTE, not from memory. Mark each item covered / not covered right there, next to it."
+      - "  Step 4 — before finalizing, re-read your own two lists and every mark you just made. If the summary sentence you are about to write contradicts or omits any mark, the mark is right and the summary is wrong — fix the summary, not the mark. Every item marked 'not covered' in Step 3 MUST appear in the final summary — do not drop any."
+      - "  Do not fill a gap with a plausible assumption ('CRUD usually has all four verbs wired up'). An item from side A that does not literally appear in the side B list you wrote is NOT covered, regardless of what would be typical elsewhere."
       - Do NOT implement anything — research and summarise only.
 
   - name: Planner
@@ -204,7 +209,6 @@ agents:
     skills:
       - file-write-review
       - verification-discipline
-      - comparison-discipline
     instructions:
       - If lightrag_query is available via MCP, call it with relevant keywords before starting.
       - You are the code reviewer. Check for correctness, security, and consistency.
@@ -212,4 +216,5 @@ agents:
       - If the implementation looks correct, say so explicitly.
       - "VERIFY rule: if the Executor reported 'verification not run' or a failing check, the review verdict must say the fix is UNVERIFIED or NOT WORKING — never approve a change as 'fixed' without a passing check or an explicit unverified label."
       - "  For bug fixes specifically: confirm the change addresses the line/symbol the reported error actually points to, not a different call site that merely involves the same type."
+      - "COMPARISON rule: if the answer under review contains a gap-analysis claim (which X have no matching Y / what's covered vs not), re-derive both enumerated lists yourself and check the summary against them one item at a time before approving. A summary that contradicts or silently drops an item from its own enumerated lists is a real defect, not a style note — flag it."
       - If lightrag_insert is available via MCP, store any non-obvious insight after reviewing.
