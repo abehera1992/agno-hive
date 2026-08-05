@@ -199,3 +199,35 @@ def test_quote_across_a_markdown_heading_is_not_paired_with_the_citation(tmp_pat
 
     assert "MISMATCH" not in report
     assert "LINE 293" in report
+
+
+def test_self_backtick_wrapped_citation_does_not_pair_with_later_unrelated_quote(
+    tmp_path, monkeypatch
+):
+    """Confirmed live 2026-08-05: a real answer wrote
+
+        No existing symbol named `useGetPartyByIdQuery`, `getPartyById`, or
+        `inventoryApi.ts:101` exists in the codebase -- the `getParty` endpoint...
+
+    _FILE_LINE_RE matches "inventoryApi.ts:101" INSIDE its own backticks; pos then
+    lands right before that citation's own closing backtick. The old quote search
+    started there anyway, treated that closing backtick as an OPENING one, and
+    paired it with the next real backtick (before `getParty`) -- capturing the
+    plain prose "exists in the codebase -- the" as if it were the citation's
+    quoted content, then correctly-but-uselessly reporting that prose fragment
+    as not found near line 101. Nothing about this citation was quoting anything.
+    """
+    monkeypatch.setattr(verify, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: ["x:1:x"])
+    lines = ["x = 1"] * 100 + ["export interface Party {"] + ["x = 1"] * 5
+    (tmp_path / "inventoryApi.ts").write_text("\n".join(lines), encoding="utf-8")
+
+    answer = (
+        "No existing symbol named `useGetPartyByIdQuery`, `getPartyById`, or "
+        "`inventoryApi.ts:101` exists in the codebase -- the `getParty` endpoint "
+        "is the only one for parties."
+    )
+
+    report = verify.verify_claims(answer)
+
+    assert "MISMATCH" not in report

@@ -280,7 +280,18 @@ def _find_nearby_quote(answer: str, pos: int) -> str | None:
     got paired with the PartyLocation citation and reported a MISMATCH against file
     content for a claim the citation was never making. A heading is section-changed
     prose; a quote past one belongs to whatever comes after it, not to this citation.
+
+    Also skips when the citation itself was written as a single backtick-wrapped
+    token ("`inventoryApi.ts:101`"). Measured live 2026-08-05: pos lands right before
+    that citation's OWN closing backtick, which the search below would treat as an
+    OPENING delimiter and pair with the next unrelated backtick further along,
+    capturing plain prose between them as a bogus "quote" -- a real answer's "...or
+    `inventoryApi.ts:101` exists in the codebase -- the `getParty` endpoint..." had
+    the prose "exists in the codebase -- the" reported as MISMATCH content, when
+    nothing about that citation was ever quoting anything.
     """
+    if answer[pos:pos + 1] == "`":
+        return None
     window = answer[pos: pos + _CONTENT_QUOTE_WINDOW]
     m = _BACKTICK_RE.search(window)
     if not m:
