@@ -200,7 +200,7 @@ def _lint_code(answer: str) -> list[str]:
 
 def _code_idents(answer: str) -> list[str]:
     """Dotted attribute-access tokens (item.stock_quantity, Model.field) found INSIDE
-    fenced code blocks — not the prose summary around them.
+    fenced code blocks or currently-staged files — not the prose summary around them.
 
     verify_claims previously only read backticked spans in prose (see the "no
     checkable claims found" message below), so a fabricated attribute that only
@@ -209,15 +209,33 @@ def _code_idents(answer: str) -> list[str]:
     `item.stock_quantity` / `Item.stock_quantity`, a field that does not exist
     anywhere in the project, and neither was caught, because the fabricated name
     never appeared outside the ```python block.
+
+    Staged-file scanning added 2026-08-05, same reasoning and same fix shape as
+    _lint_code below: a write_file() task referenced `styles.card`, `styles.fieldRow`,
+    and `styles.value` in a brand-new page.tsx, none of which exist in the .module.scss
+    it imported (only `.label` and `.badge` are real classes there) -- all three would
+    resolve to `undefined` at runtime, rendering completely unstyled. The final answer
+    was pure narrative with no code pasted in, so this check had nothing to scan and
+    missed all three.
     """
     idents: list[str] = []
-    for block in _FENCE_RE.findall(answer or ""):
-        for tok in _CODE_DOTTED_RE.findall(block):
+
+    def _collect(text: str) -> None:
+        for tok in _CODE_DOTTED_RE.findall(text):
             left = tok.split(".", 1)[0].lower()
             if left in _STDLIB_PREFIXES or left in _NOISE:
                 continue
             if tok not in idents:
                 idents.append(tok)
+
+    for block in _FENCE_RE.findall(answer or ""):
+        _collect(block)
+    for path in _staged_files():
+        try:
+            _collect(path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+
     return idents
 
 

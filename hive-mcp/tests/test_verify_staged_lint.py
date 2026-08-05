@@ -71,6 +71,28 @@ def test_require_rule_not_applied_to_non_component_staged_file(tmp_path, monkeyp
     assert "MISSING required pattern" not in report
 
 
+def test_dotted_identifier_in_staged_file_is_checked_with_no_fenced_code_in_answer(
+    tmp_path, monkeypatch
+):
+    """Confirmed live 2026-08-05: a write_file() task referenced styles.card,
+    styles.fieldRow, and styles.value in a brand-new page.tsx, none of which exist
+    in the .module.scss it imported -- all three would resolve to `undefined` at
+    runtime. The answer never pasted the code back into its own text, so
+    _code_idents (same fenced-code-only limitation as _lint_code) never saw these
+    tokens and the SYMBOLS check reported nothing to verify.
+    """
+    monkeypatch.setattr(verify, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])  # nothing found anywhere
+    _stage(tmp_path, "page.tsx", "import styles from './x.module.scss';\nconst x = styles.card;")
+
+    answer = "I've created the party detail page."
+
+    report = verify.verify_claims(answer)
+
+    assert "styles.card" in report
+    assert "NOT FOUND" in report
+
+
 def test_forbidden_rule_still_applies_to_non_component_staged_file(tmp_path, monkeypatch):
     """FORBID rules have no false-positive risk for unrelated file types (a
     forbidden JSX pattern simply won't appear in a real .py file), so unlike
