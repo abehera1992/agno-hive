@@ -119,35 +119,82 @@ _STDLIB_PREFIXES = {
 _CODE_DOTTED_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\b")
 
 _FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*\s*?\n(.*?)```", re.S)
+_PROPOSED_SUFFIX = ".hive_proposed"
+# REQUIRE rules (e.g. "components must reference styles.x") only make sense for
+# actual component files — applying them to every staged file regardless of type
+# would flag a staged .py or .scss file for "missing" a React/JSX convention it
+# was never going to have. FORBID rules have no such false-positive risk (a
+# forbidden JSX pattern simply won't appear in an unrelated file) so those stay
+# fully generic across every staged file, matching this tool's project-agnostic
+# design elsewhere.
+_COMPONENT_EXTS = (".tsx", ".jsx")
+
+
+def _staged_files() -> list:
+    """Every file currently staged for review (*.hive_proposed) under PROJECT_ROOT."""
+    try:
+        return list(PROJECT_ROOT.rglob(f"*{_PROPOSED_SUFFIX}"))
+    except Exception:
+        return []
+
+
+def _lint_text(text: str, label: str, check_require: bool) -> list[str]:
+    out = []
+    for rule in config.CODE_LINT_FORBID:
+        pat, _, msg = rule.partition("::")
+        try:
+            if re.search(pat, text):
+                out.append(f"FORBIDDEN pattern {pat!r} in {label} — {msg or 'violates project convention'}")
+        except re.error:
+            continue
+    if check_require:
+        for rule in config.CODE_LINT_REQUIRE:
+            pat, _, msg = rule.partition("::")
+            try:
+                if not re.search(pat, text):
+                    out.append(f"MISSING required pattern {pat!r} in {label} — {msg or 'required by project convention'}")
+            except re.error:
+                continue
+    return out
 
 
 def _lint_code(answer: str) -> list[str]:
-    """Check fenced code blocks against project convention rules. Returns violations.
+    """Check fenced code blocks AND currently-staged files against project convention
+    rules. Returns violations.
 
     Existence checking cannot catch a convention breach: emitted Tailwind classes are not
     a nonexistent symbol, they are the wrong system for this repo, and grep has nothing to
     flag. Measured 2026-07-31: a component answer using bare className strings passed
     verification cleanly while being unusable in the project.
+
+    Staged-file scanning added 2026-08-05: the fenced-code-block check above only sees
+    code the model chooses to echo back in its prose answer. A write_file() call that
+    creates a brand-new file and then summarizes in plain narrative ("I've created the
+    party detail page...") never puts the actual code in front of this check at all --
+    confirmed live: a new page.tsx used bare Tailwind classNames and shadcn/ui components
+    instead of this project's mandatory SCSS-module convention, and verify_claims reported
+    zero conventions violations, not because the code was clean but because there was no
+    fenced block to scan. Scanning *.hive_proposed directly closes that gap regardless of
+    whether the model narrates or pastes the code.
     """
+    out: list[str] = []
+
     blocks = _FENCE_RE.findall(answer or "")
-    if not blocks:
-        return []
-    code = "\n".join(blocks)
-    out = []
-    for rule in config.CODE_LINT_FORBID:
-        pat, _, msg = rule.partition("::")
+    if blocks:
+        out += _lint_text("\n".join(blocks), "the answer's code block(s)", check_require=True)
+
+    for path in _staged_files():
         try:
-            if re.search(pat, code):
-                out.append(f"FORBIDDEN pattern {pat!r} present — {msg or 'violates project convention'}")
-        except re.error:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
             continue
-    for rule in config.CODE_LINT_REQUIRE:
-        pat, _, msg = rule.partition("::")
         try:
-            if not re.search(pat, code):
-                out.append(f"MISSING required pattern {pat!r} — {msg or 'required by project convention'}")
-        except re.error:
-            continue
+            rel = path.relative_to(PROJECT_ROOT).as_posix()
+        except ValueError:
+            rel = str(path)
+        is_component = path.name.removesuffix(_PROPOSED_SUFFIX).endswith(_COMPONENT_EXTS)
+        out += _lint_text(text, rel, check_require=is_component)
+
     return out
 
 
