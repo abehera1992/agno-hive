@@ -35,14 +35,16 @@ Treat a clean report as "nothing provably invented", never as "the answer is cor
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+from pathlib import Path
 
 import config
 from config import PROJECT_ROOT
 
-from .exclusions import rg_args
+from .exclusions import rg_args, is_excluded, EXCLUDE_DIRS
 
 # Backticked code spans are where models put symbols they are asserting exist.
 _BACKTICK_RE = re.compile(r"`([^`\n]{2,120})`")
@@ -146,12 +148,40 @@ _STAGED_FILE_MAX_AGE_SECONDS = 30 * 60
 
 def _staged_files() -> list:
     """Files staged for review (*.hive_proposed) under PROJECT_ROOT, recently enough
-    to plausibly belong to the current task rather than a forgotten earlier session."""
+    to plausibly belong to the current task rather than a forgotten earlier session.
+
+    Walks with in-place dir pruning (same pattern as index.py's bootstrap walk)
+    instead of Path.rglob(), which visits every directory before any filtering
+    can happen. Confirmed live 2026-08-05: an unpruned rglob on EkamApp walked
+    node_modules (27,405 files) and .venv (14,790 files) on every single
+    verify_claims call, since a *.hive_proposed glob still has to inspect every
+    file name in every directory to know none of them match. Three calls during
+    one test took 183s/205s/233s -- an order of magnitude past the typical
+    sub-30s -- with no staged-file pollution to blame (recency scoping below was
+    already correctly excluding the one stale leftover file present at the time).
+    """
     import time
     try:
         cutoff = time.time() - _STAGED_FILE_MAX_AGE_SECONDS
-        return [p for p in PROJECT_ROOT.rglob(f"*{_PROPOSED_SUFFIX}")
-                if p.stat().st_mtime >= cutoff]
+        out: list = []
+        for dirpath, dirnames, filenames in os.walk(PROJECT_ROOT, topdown=True):
+            dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS and not d.startswith(".")]
+            for filename in filenames:
+                if not filename.endswith(_PROPOSED_SUFFIX):
+                    continue
+                p = Path(dirpath) / filename
+                try:
+                    rel = p.relative_to(PROJECT_ROOT).as_posix()
+                except ValueError:
+                    continue
+                if is_excluded(rel):
+                    continue
+                try:
+                    if p.stat().st_mtime >= cutoff:
+                        out.append(p)
+                except OSError:
+                    continue
+        return out
     except Exception:
         return []
 

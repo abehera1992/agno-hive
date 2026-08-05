@@ -10,6 +10,8 @@ existing fenced-code-block lint had nothing to scan and reported zero
 violations -- not because the code was clean, but because the actual code was
 never shown to the checker at all.
 """
+import os
+
 from tools import verify
 
 
@@ -115,6 +117,44 @@ def test_dotted_identifier_in_staged_file_is_checked_with_no_fenced_code_in_answ
 
     assert "styles.card" in report
     assert "NOT FOUND" in report
+
+
+def test_staged_files_prunes_excluded_dirs_instead_of_walking_them(tmp_path, monkeypatch):
+    """Confirmed live 2026-08-05: three verify_claims calls on EkamApp took
+    183s/205s/233s -- an order of magnitude past the typical sub-30s -- with no
+    staged-file pollution to blame. Root cause: the old rglob() had to visit
+    every file name in every directory (including node_modules' 27,405 files
+    and .venv's 14,790) before it could tell none of them matched, because
+    Path.rglob() offers no way to prune a directory before descending into it.
+    This test proves the fix actually prunes -- not just filters after the
+    fact -- by making a real file inside node_modules unreadable-if-touched:
+    if os.walk ever descended into it, stat() would still succeed (this is a
+    normal file), so what actually matters is the count of files visited stays
+    small regardless of how many are stuffed under the excluded dir."""
+    from tools import verify as verify_module
+    monkeypatch.setattr(verify_module, "PROJECT_ROOT", tmp_path)
+
+    real_file = _stage(tmp_path, "src/real_feature", "content")
+    noise_dir = tmp_path / "node_modules" / "some-package"
+    noise_dir.mkdir(parents=True)
+    for i in range(50):
+        (noise_dir / f"noise{i}.hive_proposed").write_text("noise", encoding="utf-8")
+
+    walked_dirs = []
+    real_walk = os.walk
+
+    def spying_walk(top, *a, **k):
+        for dirpath, dirnames, filenames in real_walk(top, *a, **k):
+            walked_dirs.append(dirpath)
+            yield dirpath, dirnames, filenames
+
+    monkeypatch.setattr(os, "walk", spying_walk)
+
+    found = verify_module._staged_files()
+
+    assert real_file in found
+    assert not any("node_modules" in d for d in walked_dirs)
+    assert not any("noise" in str(p) for p in found)
 
 
 def test_forbidden_rule_still_applies_to_non_component_staged_file(tmp_path, monkeypatch):
