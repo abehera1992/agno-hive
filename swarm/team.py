@@ -15,24 +15,23 @@ _tracer = trace.get_tracer("agno-hive.team")
 
 _MCP_TIMEOUT = 300  # lightrag_query synthesis ~90-120s; large file reads over Docker bind mounts can be slow — headroom so multi-read tasks don't die mid-read
 
-# hive-mcp/tools/context.py duplicates these six tool names from EkamApp's own
-# mcp-server/tools/context.py (get_file_content, find_files, search_files,
-# list_directory_tree, list_directory, get_project_context) -- both servers are
-# connected to every run, hive-mcp first. CLAUDE.md's own documented design says
-# "hive-mcp is primary... project MCP is supplementary for memory_search /
-# get_context_section only", but nothing enforced that: agno aggregates functions
-# from all connected MCPTools, and which same-named tool actually answers a call
-# was undefined. Confirmed live 2026-08-04: a line-numbering fix landed in the
-# project MCP's get_file_content and was verified directly, but the swarm kept
-# citing fabricated line numbers on every subsequent run anyway -- consistent with
-# calls landing on hive-mcp's (until-now unfixed) duplicate instead. Excluding
-# these from the project MCP connection removes the ambiguity outright rather than
-# requiring every future fix to be kept in sync across both copies.
-_PROJECT_MCP_EXCLUDE_TOOLS = [
-    "agno_run", "agno_list_teams",
-    "get_file_content", "find_files", "search_files",
-    "list_directory_tree", "list_directory", "get_project_context",
-]
+# agno_run/agno_list_teams only make sense triggered from the Claude-Code side (the
+# project MCP); passing them to the coordinator would let it recurse back into this
+# same swarm and deadlock, so they're excluded from the project MCP connection only.
+#
+# 2026-08-04/05: briefly widened this to also exclude get_file_content, find_files,
+# search_files, list_directory_tree, list_directory, get_project_context, after
+# finding those six duplicated on BOTH connected servers -- hive-mcp's copies (the
+# ones the swarm is meant to use) AND stale leftovers still registered on the
+# project MCP from before those tools were deliberately migrated to hive-mcp. That
+# duplication was the actual bug: a line-numbering fix landed on hive-mcp's copy but
+# calls may have kept landing on the project MCP's unfixed duplicate. The exclusion
+# list was a workaround; the real fix was removing the stale duplicates from the
+# project MCP's own registration (mcp-server/main.py in EkamApp) so they only exist
+# in one place. With that done, excluding names the project MCP no longer serves
+# would break its whole tool list (see the comment at the call site below) -- so
+# this reverts back to its original, narrower scope.
+_PROJECT_MCP_EXCLUDE_TOOLS = ["agno_run", "agno_list_teams"]
 
 _COORDINATOR_INSTRUCTIONS = [
     "── Tool restrictions ────────────────────────────────────────────",
