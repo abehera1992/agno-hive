@@ -107,3 +107,69 @@ def test_quoted_content_absent_from_file_entirely_is_flagged(tmp_path, monkeypat
     report = verify.verify_claims(answer)
 
     assert "MISMATCH" in report
+
+
+class _FakeRgFiles:
+    """Stand-in for `subprocess.run(["rg", "--files", ...])` -- _resolve_path's
+    multi-candidate search shells out to real ripgrep, which this dev machine does
+    not have on PATH (confirmed: shutil.which("rg") is None here locally, even
+    though the Docker image installs it). Real ripgrep is exercised in the deployed
+    container; these tests only need to prove _resolve_path's OWN disambiguation
+    logic once handed a candidate list, which is what this fakes.
+    """
+    def __init__(self, paths: list[str]):
+        self.stdout = "\n".join(paths)
+
+
+def _mock_rg_files(monkeypatch, paths: list[str]):
+    monkeypatch.setattr(verify.shutil, "which", lambda name: "rg")
+    monkeypatch.setattr(verify.subprocess, "run", lambda *a, **k: _FakeRgFiles(paths))
+
+
+def test_bare_filename_disambiguated_by_full_path_named_earlier(tmp_path, monkeypatch):
+    """Confirmed live 2026-08-04: EkamApp has 8 files named models.py, one per
+    service. An answer that states the full path ONCE up front ("as defined in
+    `API/inventory-service/models.py`") and then cites the bare filename for every
+    individual claim ("models.py:236") was reported AMBIGUOUS on every single one --
+    never reaching the content-location check at all, because the answer's own
+    disambiguating context was thrown away. It should use that context instead of
+    giving up as soon as more than one file shares the basename.
+    """
+    monkeypatch.setattr(verify, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: ["x:1:x"])
+    (tmp_path / "inventory-service").mkdir()
+    (tmp_path / "billing-service").mkdir()
+    inv = tmp_path / "inventory-service" / "models.py"
+    inv.write_text("\n".join(["x = 1"] * 234 + ["class Party(Base):", '    """L1."""']),
+                    encoding="utf-8")
+    (tmp_path / "billing-service" / "models.py").write_text("x = 1\n", encoding="utf-8")
+    _mock_rg_files(monkeypatch, ["inventory-service/models.py", "billing-service/models.py"])
+
+    answer = (
+        "As defined in `inventory-service/models.py`, the Party model is at:\n"
+        '**File:** `models.py`, **Line:** 236  \n> `"""L1."""`'
+    )
+
+    report = verify.verify_claims(answer)
+
+    assert "AMBIGUOUS" not in report
+    assert "MISMATCH" not in report
+    assert "content verified" in report
+
+
+def test_bare_filename_with_no_disambiguating_hint_stays_ambiguous(tmp_path, monkeypatch):
+    # Regression guard: without the answer ever naming a full path for this
+    # basename, ambiguity must still be reported rather than guessed at.
+    monkeypatch.setattr(verify, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: ["x:1:x"])
+    (tmp_path / "inventory-service").mkdir()
+    (tmp_path / "billing-service").mkdir()
+    (tmp_path / "inventory-service" / "models.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "billing-service" / "models.py").write_text("x = 1\n", encoding="utf-8")
+    _mock_rg_files(monkeypatch, ["inventory-service/models.py", "billing-service/models.py"])
+
+    answer = "**File:** `models.py`, **Line:** 1"
+
+    report = verify.verify_claims(answer)
+
+    assert "AMBIGUOUS" in report

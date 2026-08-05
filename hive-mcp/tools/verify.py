@@ -201,7 +201,7 @@ def _rg(pattern: str, fixed: bool = True, glob_filter: str = "",
         return []
 
 
-def _resolve_path(rel_path: str) -> tuple[str | None, int]:
+def _resolve_path(rel_path: str, hint_paths: list[str] | None = None) -> tuple[str | None, int]:
     """Resolve a cited path to a real repo file. Returns (resolved_path, n_candidates).
 
     Agents cite bare filenames ("someModule.ts:468") far more often than full
@@ -209,6 +209,16 @@ def _resolve_path(rel_path: str) -> tuple[str | None, int]:
     citation was being reported BAD. A false positive is the worst failure this tool can
     have: it teaches agents that the checker is noise, and then the real fabrications get
     ignored too. Resolve by suffix before declaring anything bad.
+
+    hint_paths: other full repo-relative paths already named in the SAME answer (e.g. an
+    intro sentence says "defined in `API/inventory-service/models.py`" and every citation
+    after it just says "models.py:258"). Measured live 2026-08-04: EkamApp has 8 files
+    named models.py, one per service, so a bare "models.py" citation was ALWAYS reported
+    AMBIGUOUS even when the answer had already stated, in the same breath, exactly which
+    one it meant — and being stuck at AMBIGUOUS meant the citation never even reached the
+    line-content check below, so a wrong line number sailed through unverified. If exactly
+    one candidate matches a hint the answer already gave for this basename, that is a
+    stronger signal than "ambiguous, give up".
     """
     p = PROJECT_ROOT / rel_path
     if p.is_file():
@@ -228,6 +238,13 @@ def _resolve_path(rel_path: str) -> tuple[str | None, int]:
              if l.replace("\\", "/").endswith("/" + want) or l.replace("\\", "/") == want]
     if len(cands) == 1:
         return cands[0], 1
+    if len(cands) > 1 and hint_paths:
+        basename = want.rsplit("/", 1)[-1]
+        hinted = {h.replace("\\", "/").lstrip("./") for h in hint_paths
+                  if h.replace("\\", "/").endswith("/" + basename)}
+        exact = [c for c in cands if c in hinted]
+        if len(exact) == 1:
+            return exact[0], 1
     return (None, len(cands))
 
 
@@ -425,8 +442,9 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     # ── file:line citations ───────────────────────────────────────────────────
     if file_lines:
         out.append(f"CITATIONS ({len(file_lines[:_MAX_CLAIMS])} checked):")
+        all_paths_in_answer = [m.group(1) for m in _BACKTICK_PATH_RE.finditer(answer)]
         for path, num in file_lines[:_MAX_CLAIMS]:
-            resolved, n_cands = _resolve_path(path)
+            resolved, n_cands = _resolve_path(path, hint_paths=all_paths_in_answer)
             if resolved is None:
                 problems += 1
                 if n_cands > 1:
@@ -449,10 +467,15 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                         out.append(f"             content verified within {_LINE_TOLERANCE} lines")
                     else:
                         problems += 1
+                        # {resolved}:{num} as the SECOND token, matching BAD/AMBIGUOUS's
+                        # shape — swarm/team.py's retry-prompt builder extracts
+                        # line.split()[1] as "the unsupported thing" by that convention;
+                        # putting the word "quoted" there instead (an earlier version of
+                        # this line did) made every MISMATCH invisible to the retry loop.
                         out.append(
-                            f"  MISMATCH   quoted {quoted[:60]!r} not found within "
-                            f"{_LINE_TOLERANCE} lines of {resolved}:{num} <-- the citation "
-                            f"and the quoted content do not point at the same place"
+                            f"  MISMATCH   {resolved}:{num} <-- quoted {quoted[:60]!r} not "
+                            f"found within {_LINE_TOLERANCE} lines; citation and quoted "
+                            f"content do not point at the same place"
                         )
         out.append("")
 

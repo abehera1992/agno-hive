@@ -503,19 +503,60 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # code-bearing prompts), producing output containing the prompt AND the report twice
     # — strictly worse than the fabrication it was fixing. Keep it short and re-ask the
     # ORIGINAL question rather than asking for an edit of the draft.
-    missing = [ln.split()[1] for ln in report.splitlines()
-               if ln.strip().startswith(("NOT FOUND", "DOC ONLY", "BAD")) and len(ln.split()) > 1]
-    if not missing:
+    #
+    # Two distinct categories, not one. Originally only NOT FOUND/DOC ONLY/BAD were
+    # read here — AMBIGUOUS and MISMATCH (added 2026-08-04 for citations whose quoted
+    # content lands nowhere near the cited line) were silently invisible to this retry:
+    # `bad` came back True from _verify_claims (its "could NOT be found" text is
+    # category-agnostic), but `missing` stayed empty for a report containing ONLY
+    # AMBIGUOUS/MISMATCH findings, so `if not missing: return content` shipped the
+    # unfixed, undisclosed answer with no retry AND no failure disclaimer attached.
+    # Separately, "does not exist" is the wrong thing to tell the model about a citation
+    # problem — the FILE exists, only the line number or path form is wrong — so a
+    # citation-shaped miss gets its own, accurate instruction.
+    #
+    # Extract by stripping the matched PREFIX and taking what follows — not a fixed
+    # split()[1] index. "NOT FOUND" and "DOC ONLY" are two words; split()[1] on a "NOT
+    # FOUND parties_api.py" line silently grabbed the literal word "FOUND", not
+    # "parties_api.py" — a real, live-observed bug (confirmed 2026-08-04): a retry
+    # prompt built this way told the model "a previous attempt referred to FOUND...
+    # do not mention it again", and the model dutifully wrote back "There is no `FOUND`
+    # model or symbol in this codebase" in its corrected answer. One-word prefixes
+    # (BAD, AMBIGUOUS, MISMATCH) happened to work with the fixed index by coincidence;
+    # this makes every prefix length correct instead of relying on that coincidence.
+    def _claim_token(line: str, prefixes: tuple[str, ...]) -> str | None:
+        s = line.strip()
+        for p in prefixes:
+            if s.startswith(p):
+                rest = s[len(p):].strip().split(None, 1)
+                return rest[0] if rest else None
+        return None
+
+    missing_symbols = [t for ln in report.splitlines()
+                        if (t := _claim_token(ln, ("NOT FOUND", "DOC ONLY")))]
+    bad_citations = [t for ln in report.splitlines()
+                      if (t := _claim_token(ln, ("BAD", "AMBIGUOUS", "MISMATCH")))]
+    if not missing_symbols and not bad_citations:
         return content
-    named = ", ".join(missing[:6])
-    retry_prompt = (
-        f"{task}\n\n"
-        f"IMPORTANT: a previous attempt at this question referred to {named}, which "
-        f"a repository-wide grep shows does not exist here. Do not mention those again. "
-        f"Read the relevant file and answer from what is actually there. If the thing "
-        f"being asked about does not exist in this codebase, say that plainly and name "
-        f"what does exist instead — do not offer a similarly-named symbol as a substitute."
-    )
+    instructions = []
+    if missing_symbols:
+        named = ", ".join(missing_symbols[:6])
+        instructions.append(
+            f"a previous attempt referred to {named}, which a repository-wide grep shows "
+            f"does not exist here. Do not mention those again — if the thing being asked "
+            f"about does not exist in this codebase, say that plainly and name what does "
+            f"exist instead, rather than offering a similarly-named symbol as a substitute."
+        )
+    if bad_citations:
+        named = ", ".join(bad_citations[:6])
+        instructions.append(
+            f"these file:line citations were wrong or unresolvable: {named}. Re-read the "
+            f"file with get_file_content and copy the EXACT line number shown in its "
+            f"numbered output — do not recall or estimate a line number from memory. If a "
+            f"filename is shared by more than one file in the project, cite the full "
+            f"repo-relative path instead of the bare filename."
+        )
+    retry_prompt = f"{task}\n\nIMPORTANT: " + " Also, ".join(instructions)
     try:
         retry = await team.arun(retry_prompt)
         corrected = retry.content if hasattr(retry, "content") else str(retry)
