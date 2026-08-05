@@ -15,6 +15,25 @@ _tracer = trace.get_tracer("agno-hive.team")
 
 _MCP_TIMEOUT = 300  # lightrag_query synthesis ~90-120s; large file reads over Docker bind mounts can be slow — headroom so multi-read tasks don't die mid-read
 
+# hive-mcp/tools/context.py duplicates these six tool names from EkamApp's own
+# mcp-server/tools/context.py (get_file_content, find_files, search_files,
+# list_directory_tree, list_directory, get_project_context) -- both servers are
+# connected to every run, hive-mcp first. CLAUDE.md's own documented design says
+# "hive-mcp is primary... project MCP is supplementary for memory_search /
+# get_context_section only", but nothing enforced that: agno aggregates functions
+# from all connected MCPTools, and which same-named tool actually answers a call
+# was undefined. Confirmed live 2026-08-04: a line-numbering fix landed in the
+# project MCP's get_file_content and was verified directly, but the swarm kept
+# citing fabricated line numbers on every subsequent run anyway -- consistent with
+# calls landing on hive-mcp's (until-now unfixed) duplicate instead. Excluding
+# these from the project MCP connection removes the ambiguity outright rather than
+# requiring every future fix to be kept in sync across both copies.
+_PROJECT_MCP_EXCLUDE_TOOLS = [
+    "agno_run", "agno_list_teams",
+    "get_file_content", "find_files", "search_files",
+    "list_directory_tree", "list_directory", "get_project_context",
+]
+
 _COORDINATOR_INSTRUCTIONS = [
     "── Tool restrictions ────────────────────────────────────────────",
     "  NEVER call the `agno_run` tool — you are the top-level coordinator;",
@@ -549,12 +568,23 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         )
     if bad_citations:
         named = ", ".join(bad_citations[:6])
+        # Imperative FIRST/THEN, mirroring the reads==0 branch above (proven wording,
+        # not a new pattern). A prior version phrased this as one soft "re-read the
+        # file and copy the exact line number" sentence — measured live 2026-08-04,
+        # the model did NOT reliably comply: a citation retry came back citing a
+        # DIFFERENT wrong line than before rather than the verified-correct one,
+        # meaning it answered from memory/estimation again instead of actually
+        # reissuing a read. Making the read step syntactically first and separate
+        # from the answering step is a cheaper lever than trusting prose compliance.
         instructions.append(
-            f"these file:line citations were wrong or unresolvable: {named}. Re-read the "
-            f"file with get_file_content and copy the EXACT line number shown in its "
-            f"numbered output — do not recall or estimate a line number from memory. If a "
-            f"filename is shared by more than one file in the project, cite the full "
-            f"repo-relative path instead of the bare filename."
+            f"these file:line citations were wrong or unresolvable: {named}. FIRST call "
+            f"get_file_content on the exact file(s) involved — do not rely on a read from "
+            f"earlier in this conversation, the file may have scrolled out of context or "
+            f"your memory of its line numbers may be wrong. THEN answer using the line "
+            f"number exactly as printed in that tool's own numbered output — never a "
+            f"recalled, estimated, or rounded number. If a filename is shared by more "
+            f"than one file in the project, cite the full repo-relative path instead of "
+            f"the bare filename."
         )
     retry_prompt = f"{task}\n\nIMPORTANT: " + " Also, ".join(instructions)
     try:
@@ -565,6 +595,15 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         return content
     if not corrected:
         return content
+
+    # Diagnostic visibility, not a hard gate — going back for a SECOND retry would
+    # break the "bounded at ONE retry" design below. Confirmed live 2026-08-04 that
+    # a citation-correction retry can silently skip re-reading; this makes that
+    # visible in logs immediately instead of requiring hours of manual log
+    # archaeology (which is what it took to first notice it).
+    if bad_citations and _count_read_calls(retry) == 0:
+        print("[team] citation-correction retry made ZERO read calls — "
+              "it answered from memory/estimation again instead of re-reading")
 
     report2, still_bad = await _verify_claims(corrected, hive_mcp_url)
     if still_bad:
@@ -732,11 +771,14 @@ async def run_task_stream(
 
     async with AsyncExitStack() as stack:
         mcp_list = []
-        # exclude_tools only for project-mcp (which exposes agno_run/agno_list_teams)
-        # hive-mcp does not have these tools — passing exclude_tools causes agno to return 0 tools
+        # exclude_tools only for project-mcp — it exposes agno_run/agno_list_teams (which
+        # would recurse) and duplicates six hive-mcp tool names (see
+        # _PROJECT_MCP_EXCLUDE_TOOLS above). hive-mcp does not have any of these names —
+        # passing exclude_tools naming a tool a server doesn't have causes agno to return
+        # 0 tools for that server, so this must stay project-mcp-only.
         _project_mcp_url = effective_mcp_url
         for url in all_mcp_urls:
-            _exclude = ["agno_run", "agno_list_teams"] if url == _project_mcp_url else None
+            _exclude = _PROJECT_MCP_EXCLUDE_TOOLS if url == _project_mcp_url else None
             try:
                 mcp = await stack.enter_async_context(
                     MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=_exclude)
@@ -876,11 +918,14 @@ async def run_task_async(
 
     async with AsyncExitStack() as stack:
         mcp_list = []
-        # exclude_tools only for project-mcp (which exposes agno_run/agno_list_teams)
-        # hive-mcp does not have these tools — passing exclude_tools causes agno to return 0 tools
+        # exclude_tools only for project-mcp — it exposes agno_run/agno_list_teams (which
+        # would recurse) and duplicates six hive-mcp tool names (see
+        # _PROJECT_MCP_EXCLUDE_TOOLS above). hive-mcp does not have any of these names —
+        # passing exclude_tools naming a tool a server doesn't have causes agno to return
+        # 0 tools for that server, so this must stay project-mcp-only.
         _project_mcp_url = effective_mcp_url
         for url in all_mcp_urls:
-            _exclude = ["agno_run", "agno_list_teams"] if url == _project_mcp_url else None
+            _exclude = _PROJECT_MCP_EXCLUDE_TOOLS if url == _project_mcp_url else None
             try:
                 mcp = await stack.enter_async_context(
                     MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=_exclude)

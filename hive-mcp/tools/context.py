@@ -171,6 +171,18 @@ def _regex_skeleton(src: str):
     return "\n".join(keep) if keep else None
 
 
+def _numbered_lines(lines: list[str], start: int) -> str:
+    """Prefix each line with its 1-based file line number (cat -n style).
+
+    Callers cite `path:line` from what they read here — without a real number on
+    every line, a model has to count instead of copy, and silently miscounts.
+    Measured live 2026-08-04: without this, an answer citing a docstring's location
+    was off by 90-215 lines despite reading the real file content correctly — the
+    content was right, there was just nothing to read a line number FROM.
+    """
+    return "\n".join(f"{i:>6}\t{line}" for i, line in enumerate(lines, start=start))
+
+
 def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str:
     """
     Read a file from the project by its path relative to the project root.
@@ -179,6 +191,11 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
     Large files are NOT dumped whole (that overflows the model context): a file over
     ~200KB returns a structural SKELETON (signatures + docstrings, bodies elided) for code,
     or HEAD+TAIL for data files. Pass offset/limit to read an exact line range of any file.
+
+    Output uses cat -n style line numbers ("   123\tactual content") so file:line
+    citations can be copied exactly instead of counted/guessed. Never include the
+    line-number prefix itself when passing old_string/new_string to apply_diff —
+    match only the actual file content after the tab.
 
     Args:
         relative_path: e.g. 'src/api/routes.py', 'package.json', 'docker-compose.yml'
@@ -200,11 +217,11 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
         lines = data.splitlines()
         start = max(offset, 0)
         end = start + limit if limit > 0 else len(lines)
-        body = "\n".join(lines[start:end])
+        body = _numbered_lines(lines[start:end], start + 1)
         return f"# {relative_path} — lines {start}..{min(end, len(lines))} of {len(lines)}\n{body}"
 
     if len(data) <= _MAX_FULL_BYTES:
-        return data
+        return _numbered_lines(data.splitlines(), 1)
 
     # Oversized file — reduce it so it can't blow the context window.
     ext = target.suffix.lower()
