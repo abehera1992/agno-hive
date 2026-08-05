@@ -173,3 +173,29 @@ def test_bare_filename_with_no_disambiguating_hint_stays_ambiguous(tmp_path, mon
     report = verify.verify_claims(answer)
 
     assert "AMBIGUOUS" in report
+
+
+def test_quote_across_a_markdown_heading_is_not_paired_with_the_citation(tmp_path, monkeypatch):
+    """Confirmed live 2026-08-05: a fully CORRECT citation --
+    `API/inventory-service/models.py:293` -- was immediately followed by a new
+    markdown section ("## Introduction History") introducing an unrelated commit
+    hash in backticks. The quote-pairing window doesn't stop at section boundaries,
+    so the commit hash got treated as this citation's claimed content and reported
+    a MISMATCH the citation never actually made -- a false positive on an answer
+    that was, for this citation, entirely correct.
+    """
+    monkeypatch.setattr(verify, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: ["x:1:x"])
+    lines = ["x = 1"] * 292 + ["class PartyLocation(Base):"] + ["x = 1"] * 5
+    (tmp_path / "models.py").write_text("\n".join(lines), encoding="utf-8")
+
+    answer = (
+        "- **File citation**: `models.py:293`\n\n"
+        "## Introduction History\n"
+        "The Parties module was introduced in commit `af635cc`."
+    )
+
+    report = verify.verify_claims(answer)
+
+    assert "MISMATCH" not in report
+    assert "LINE 293" in report

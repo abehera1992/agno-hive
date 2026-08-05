@@ -262,6 +262,9 @@ def _read_line(rel_path: str, lineno: int) -> str | None:
     return None
 
 
+_MD_HEADING_RE = re.compile(r"(?:^|\n)[ \t]{0,3}#{1,6}[ \t]")
+
+
 def _find_nearby_quote(answer: str, pos: int) -> str | None:
     """The quoted content, if any, that a file:line citation is claiming lives there.
 
@@ -269,10 +272,20 @@ def _find_nearby_quote(answer: str, pos: int) -> str | None:
     the shape real answers use ("models.py, line 450 -- `\"\"\"docstring\"\"\"`"). Skips
     bare paths (almost always the NEXT citation's own filename, not this one's content)
     and anything too short/generic to mean a specific location.
+
+    Also skips across a markdown heading. Measured live 2026-08-05: a correct citation
+    ("...models.py:293`") was immediately followed by "\n\n## Introduction History\n
+    ...introduced in commit `af635cc`" -- the heading starts a new section about
+    something else entirely, but fell inside the search window, so the commit hash
+    got paired with the PartyLocation citation and reported a MISMATCH against file
+    content for a claim the citation was never making. A heading is section-changed
+    prose; a quote past one belongs to whatever comes after it, not to this citation.
     """
     window = answer[pos: pos + _CONTENT_QUOTE_WINDOW]
     m = _BACKTICK_RE.search(window)
     if not m:
+        return None
+    if _MD_HEADING_RE.search(window[:m.start()]):
         return None
     quoted = m.group(1).strip()
     if len(quoted) < 4 or quoted.lower() in _NOISE or _PATHLIKE_RE.match(quoted):
