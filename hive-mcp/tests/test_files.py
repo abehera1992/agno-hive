@@ -58,3 +58,43 @@ def test_apply_diff_different_failure_after_first_is_not_treated_as_repeat(tmp_p
     second = files.apply_diff("sample.py", "also does not exist", "other replacement")
 
     assert "STOPPED" not in second
+
+
+def test_apply_diff_repeated_append_via_untouched_anchor_is_refused(tmp_path, monkeypatch):
+    """Confirmed live 2026-08-05: a model appending a new mutation after an
+    EXISTING, untouched sibling (updateParty) reused that same anchor across 5
+    separate apply_diff calls -- each one succeeded (the anchor's own text never
+    changes, so count==1 every time) and each one prepended another copy of the
+    same block right after the anchor. 5 duplicate insertions landed before a
+    human ever saw the file. The count>1 duplicate guard cannot catch this: it
+    only looks at how many times old_string appears BEFORE this call, and the
+    anchor here is deliberately something the insertion itself never touches.
+    """
+    anchor = "updateParty: builder.mutation(...),"
+    _setup(tmp_path, monkeypatch, f"const api = {{\n  {anchor}\n\n  // next symbol\n}}\n")
+
+    addition = "\n\n  deleteParty: builder.mutation(...),"
+    first = files.apply_diff("sample.py", anchor, anchor + addition)
+    second = files.apply_diff("sample.py", anchor, anchor + addition)  # same anchor, same call again
+
+    assert "applied" in first
+    assert "REFUSED" in second
+    content = (tmp_path / "sample.py").read_text(encoding="utf-8")
+    assert content.count("deleteParty") == 1  # only the first insertion landed
+
+
+def test_apply_diff_genuinely_new_content_after_same_anchor_is_allowed(tmp_path, monkeypatch):
+    """The refusal must be specific to REPEATING the same net addition -- appending
+    a second, DIFFERENT thing after the same anchor is a legitimate, common pattern
+    (e.g. two separate apply_diff calls each adding a different new mutation right
+    after the same reference point) and must not be blocked."""
+    anchor = "updateParty: builder.mutation(...),"
+    _setup(tmp_path, monkeypatch, f"const api = {{\n  {anchor}\n\n  // next symbol\n}}\n")
+
+    first = files.apply_diff("sample.py", anchor, anchor + "\n\n  deleteParty: builder.mutation(...),")
+    second = files.apply_diff("sample.py", anchor, anchor + "\n\n  archiveParty: builder.mutation(...),")
+
+    assert "REFUSED" not in second
+    content = (tmp_path / "sample.py").read_text(encoding="utf-8")
+    assert "deleteParty" in content
+    assert "archiveParty" in content

@@ -203,6 +203,33 @@ def apply_diff(relative_path: str, old_string: str, new_string: str, preserve_in
             )
         if count > 1:
             return f"apply_diff failed: old_string appears {count} times — be more specific"
+
+        # Detect a likely-duplicate APPEND before applying it. The append convention
+        # (documented above) is old_string = anchor, new_string = anchor + new content
+        # -- so when old_string is an UNTOUCHED neighboring symbol (e.g. appending
+        # after updateParty's own block, which the insertion never modifies), that
+        # anchor still matches exactly once even after a successful insertion. The
+        # count>1 check above cannot catch this: the anchor's own count never
+        # changes. Measured live 2026-08-05: a model reused the same untouched
+        # anchor across 5 separate apply_diff calls, each one succeeding and each
+        # one prepending another copy of the same block -- 5 duplicate insertions,
+        # 2 of them with mismatched braces from where the model's own wording
+        # drifted slightly between calls. Checking whether the NET addition already
+        # exists in the file catches this before it lands, regardless of whether
+        # the model rechecks get_file_content first.
+        if old_string and new_string.startswith(old_string) and new_string != old_string:
+            net_addition = new_string[len(old_string):].strip()
+            if net_addition and net_addition in content:
+                return (
+                    f"apply_diff REFUSED: the content you are about to append to "
+                    f"{relative_path} already appears in the file — this looks like a "
+                    f"repeat of an already-successful insertion, not a new distinct "
+                    f"change. Call get_file_content('{relative_path}"
+                    f"{_PROPOSED_SUFFIX if (WRITE_REVIEW and proposed.exists()) else ''}') "
+                    f"to see the current state. If you genuinely need to insert this "
+                    f"again elsewhere, anchor old_string somewhere else."
+                )
+
         _last_failed_call.pop(relative_path, None)
 
         proposed_content = content.replace(old_string, new_string, 1)
