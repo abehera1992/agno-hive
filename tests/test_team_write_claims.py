@@ -35,6 +35,40 @@ class _FakeTeam:
         return self._retry_result
 
 
+# ---- _summarize_actual_writes -----------------------------------------------
+
+def test_summarize_actual_writes_returns_empty_for_no_write_activity():
+    result = _msgs(_tool_msg("get_file_content", "some file content"))
+    assert team._summarize_actual_writes(result) == ""
+
+
+def test_summarize_actual_writes_returns_empty_for_a_failed_write():
+    result = _msgs(_tool_msg("apply_diff", "apply_diff failed: old_string not found in x.scss."))
+    assert team._summarize_actual_writes(result) == ""
+
+
+def test_summarize_actual_writes_lists_a_successful_staged_change():
+    result = _msgs(_tool_msg("apply_diff", "review_pending: x.scss — this change is now staged."))
+    out = team._summarize_actual_writes(result)
+    assert "Actual file changes this run" in out
+    assert "x.scss — review_pending" in out
+
+
+def test_summarize_actual_writes_lists_a_new_file_write():
+    result = _msgs(_tool_msg("write_file", "written: newpage.tsx"))
+    out = team._summarize_actual_writes(result)
+    assert "newpage.tsx — written" in out
+
+
+def test_summarize_actual_writes_deduplicates_the_same_file():
+    result = _msgs(
+        _tool_msg("apply_diff", "review_pending: x.scss — this change is now staged."),
+        _tool_msg("apply_diff", "review_pending: x.scss — this change is now staged."),
+    )
+    out = team._summarize_actual_writes(result)
+    assert out.count("x.scss") == 1
+
+
 # ---- _count_successful_write_calls -----------------------------------------
 
 def test_count_successful_write_calls_returns_minus_one_with_no_messages():
@@ -119,8 +153,10 @@ async def test_verified_answer_accepts_retry_that_actually_succeeds():
 
     out = await team._verified_answer(content, "add a badge class", fake_team, None, result=original_result)
 
-    assert out == "The statusBadge class has been added to x.scss."
+    assert out.startswith("The statusBadge class has been added to x.scss.")
     assert "NOT applied" not in out
+    assert "Actual file changes this run" in out  # ground-truth appendix, from the retry's own trace
+    assert "x.scss — review_pending" in out
 
 
 @pytest.mark.asyncio
@@ -132,7 +168,9 @@ async def test_verified_answer_does_not_retry_when_write_already_succeeded():
     out = await team._verified_answer(content, "add a badge class", fake_team, None, result=original_result)
 
     assert fake_team.prompts == []  # no retry needed
-    assert out == content
+    assert out.startswith(content)
+    assert "Actual file changes this run" in out
+    assert "x.scss — review_pending" in out
 
 
 @pytest.mark.asyncio
@@ -157,3 +195,24 @@ async def test_verified_answer_ignores_content_with_no_write_claim():
 
     assert fake_team.prompts == []  # nothing claimed, nothing to retry
     assert out == content
+
+
+@pytest.mark.asyncio
+async def test_verified_answer_surfaces_a_real_write_the_narrative_never_mentions():
+    """Confirmed live 2026-08-05: a Coder staged a genuinely correct .statusBadge
+    insertion early in a run, then did a SECOND research pass, reconsidered its
+    approach, and reported "No new statusBadge class is needed... the existing
+    .badge class is sufficient" -- never mentioning or withdrawing the still-staged
+    change. _CLAIMED_WRITE_RE has nothing to match here (the narrative doesn't claim
+    a write happened, so the existing fabrication guard never fires) -- only the
+    unconditional ground-truth appendix catches this direction."""
+    original_result = _msgs(_tool_msg("apply_diff", "review_pending: parties.module.scss — this change is now staged."))
+    content = "No new statusBadge class is needed. The existing .badge class is sufficient."
+    fake_team = _FakeTeam(retry_result=None)
+
+    out = await team._verified_answer(content, "add a status badge", fake_team, None, result=original_result)
+
+    assert fake_team.prompts == []  # no write claimed, so no retry -- this isn't that guard
+    assert out.startswith(content)
+    assert "Actual file changes this run" in out
+    assert "parties.module.scss — review_pending" in out
