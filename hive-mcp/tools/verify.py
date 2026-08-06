@@ -118,6 +118,37 @@ _STDLIB_PREFIXES = {
     "pathlib", "datetime", "typing", "asyncio", "functools", "itertools",
     "collections",
 }
+
+# A backtick immediately preceded by a negation cue, or immediately followed by an
+# explicit non-existence disclaimer, is the model correctly asserting the symbol is
+# NOT real -- not claiming it is. verify_claims exists to catch fabricated EXISTENCE
+# claims; flagging a correct "X does not exist" disclaimer as a NOT FOUND fabrication
+# punishes honesty and can trigger an unnecessary correction retry. Measured live
+# 2026-08-05: "Is named `statusBadge` (not `statusBadge.success`, etc., as those do
+# not exist)" is a correct, hedged disclaimer that should never have been checked as
+# a positive claim in the first place.
+_NEGATION_BEFORE_RE = re.compile(
+    r"\b(not|isn't|aren't|never|unlike|instead of|rather than|as opposed to)\s*[:,]?\s*$",
+    re.IGNORECASE,
+)
+_NEGATION_AFTER_RE = re.compile(
+    r"^\s*[,)]?\s*(does not|doesn't|do not|don't|isn't|aren't)\s+exist\b",
+    re.IGNORECASE,
+)
+_NEGATION_WINDOW = 20
+
+
+def _is_negated_claim(answer: str, start: int, end: int) -> bool:
+    """True if the backticked span answer[start:end] (including the backticks) is
+    being asserted NOT to exist, rather than asserted to exist. Checks a short window
+    on both sides -- a negation word right before the opening backtick ("not `X`") or
+    an explicit non-existence disclaimer right after the closing one ("`X` does not
+    exist")."""
+    before = answer[max(0, start - _NEGATION_WINDOW):start]
+    if _NEGATION_BEFORE_RE.search(before):
+        return True
+    after = answer[end:end + _NEGATION_WINDOW + 20]
+    return bool(_NEGATION_AFTER_RE.match(after))
 _CODE_DOTTED_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\b")
 
 _FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*\s*?\n(.*?)```", re.S)
@@ -269,7 +300,19 @@ def _code_idents(answer: str) -> list[str]:
     idents: list[str] = []
 
     def _collect(text: str) -> None:
-        for tok in _CODE_DOTTED_RE.findall(text):
+        for m in _CODE_DOTTED_RE.finditer(text):
+            # A dotted-looking match immediately preceded by ANOTHER "." is a chained
+            # CSS/SCSS class selector (".foo.bar" -- "element needs both classes"),
+            # not a dotted member-access expression. Measured live 2026-08-05: staged
+            # CSS ".statusBadge.success { ... }" produced a "statusBadge.success"
+            # match indistinguishable from a real dotted identifier, and since that
+            # exact compound-selector text can never appear anywhere BUT the file
+            # currently being staged (it's brand new), it always reports NOT FOUND --
+            # flagging correct, newly-introduced CSS as fabrication and triggering an
+            # unnecessary correction retry.
+            if m.start() > 0 and text[m.start() - 1] == ".":
+                continue
+            tok = m.group(0)
             left = tok.split(".", 1)[0].lower()
             if left in _STDLIB_PREFIXES or left in _NOISE:
                 continue
@@ -491,9 +534,12 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
 
     # ── collect candidate claims ──────────────────────────────────────────────
     idents: list[str] = []
-    for span in _BACKTICK_RE.findall(answer):
+    for m in _BACKTICK_RE.finditer(answer):
+        span = m.group(1)
         tok = span.strip().rstrip("()").strip()
         if (_IDENT_RE.match(tok) or _DOTTED_RE.match(tok)) and tok.lower() not in _NOISE:
+            if _is_negated_claim(answer, m.start(), m.end()):
+                continue
             if tok not in idents:
                 idents.append(tok)
     for tok in _code_idents(answer):
