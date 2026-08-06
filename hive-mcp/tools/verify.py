@@ -217,6 +217,46 @@ def _staged_files() -> list:
         return []
 
 
+# A module alias from "@use '...' as alias;" -- the name every shared symbol in this
+# file is supposed to be referenced through (e.g. "index" in "@use '@/styles/_index'
+# as index;").
+_SCSS_USE_ALIAS_RE = re.compile(r'@use\s+["\'][^"\']+["\']\s+as\s+([A-Za-z_][A-Za-z0-9_]*)')
+
+
+def _lint_scss_namespace(rel: str, text: str) -> list[str]:
+    """Flag a bare $variable that this SAME file also references through a namespace
+    alias elsewhere -- almost always a missed prefix, not a local variable (a file
+    that genuinely defines its own local $foo would never ALSO reference the
+    identical name via alias.$foo).
+
+    A prose "match the file's own convention" instruction was tried first (2026-08-05)
+    and measured inconsistent live: correct on one run, wrong again on the very next
+    run of the identical task. verify_claims' existing CODE_LINT_FORBID/REQUIRE rules
+    are project-configured regexes and can't express "consistent with THIS file's own
+    usage" -- that needs the file's own content as the reference, which only a
+    per-file structural check like this one can do.
+    """
+    if not rel.endswith((".scss", ".sass")):
+        return []
+    aliases = set(_SCSS_USE_ALIAS_RE.findall(text))
+    if not aliases:
+        return []
+    out: list[str] = []
+    for alias in aliases:
+        prefixed_re = re.compile(rf'\b{re.escape(alias)}\.(\$[A-Za-z_][A-Za-z0-9_-]*)')
+        prefixed_vars = sorted(set(m.group(1) for m in prefixed_re.finditer(text)))
+        for var in prefixed_vars:
+            bare_re = re.compile(rf'(?<!{re.escape(alias)}\.){re.escape(var)}\b')
+            if bare_re.search(text):
+                out.append(
+                    f"NAMESPACE MISMATCH in {rel}: bare {var} used, but this file "
+                    f"already references it as {alias}.{var} elsewhere — add the "
+                    f"'{alias}.' prefix here too (a bare reference is likely undefined "
+                    f"in this file's own scope and will fail to compile)."
+                )
+    return out
+
+
 def _lint_text(text: str, label: str, check_require: bool) -> list[str]:
     out = []
     for rule in config.CODE_LINT_FORBID:
@@ -273,6 +313,7 @@ def _lint_code(answer: str) -> list[str]:
             rel = str(path)
         is_component = path.name.removesuffix(_PROPOSED_SUFFIX).endswith(_COMPONENT_EXTS)
         out += _lint_text(text, rel, check_require=is_component)
+        out += _lint_scss_namespace(rel.removesuffix(_PROPOSED_SUFFIX), text)
 
     return out
 
