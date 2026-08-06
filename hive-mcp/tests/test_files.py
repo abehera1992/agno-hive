@@ -188,6 +188,29 @@ def test_apply_diff_hard_stops_after_many_distinct_failures(tmp_path, monkeypatc
     assert "HARD STOP" in results[5]
 
 
+def test_apply_diff_consecutive_failure_streak_decays_after_a_time_gap(tmp_path, monkeypatch):
+    """Confirmed live 2026-08-06: this counter correctly HARD STOPped a genuine
+    6-failure runaway in one team.arun() call -- then, having no decay, silently
+    HARD STOPped EVERY attempt in the team's own next TWO automatic retries too,
+    including a well-formed one preceded by a correct search_files() existence
+    check. A fresh retry minutes later deserves a fair shot, not to inherit an
+    exhausted budget from an unrelated earlier attempt against the same file."""
+    import time as time_module
+    _setup(tmp_path, monkeypatch, "def foo():\n    return 1\n")
+
+    fake_now = [1_000_000.0]
+    monkeypatch.setattr(time_module, "time", lambda: fake_now[0])
+
+    results = [files.apply_diff("sample.py", f"guess{i}", f"guess{i}\nmore") for i in range(6)]
+    assert "HARD STOP" in results[5]
+
+    fake_now[0] += 10 * 60  # 10 minutes later -- well past the 5-minute decay window
+    later = files.apply_diff("sample.py", "a fresh distinct guess", "a fresh distinct guess\nmore")
+
+    assert "HARD STOP" not in later
+    assert "old_string not found" in later
+
+
 def test_apply_diff_genuinely_new_content_after_same_anchor_is_allowed(tmp_path, monkeypatch):
     """The refusal must be specific to REPEATING the same net addition -- appending
     a second, DIFFERENT thing after the same anchor is a legitimate, common pattern

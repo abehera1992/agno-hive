@@ -34,8 +34,19 @@ _last_failed_call: dict[str, tuple[str, str]] = {}
 # and ran past 90 consecutive failed apply_diff calls against the same file with
 # zero progress before a human intervened. However the failures vary, N in a row
 # against the same file means continuing to guess will not fix it.
+#
+# Stores (count, last_failure_timestamp) rather than a bare count. Measured live
+# 2026-08-06: this counter correctly HARD STOPped a genuine 6-failure runaway in
+# one team.arun() call -- then, because it has no decay, silently HARD STOPped
+# EVERY attempt in the team's own next TWO automatic retries too, including a
+# well-formed one preceded by a correct search_files() existence check. The
+# counter has no way to tell "still spiraling in the same breath" from "a brand
+# new attempt, minutes later, following corrective guidance" -- a fresh
+# team.arun() retry deserves a fair shot, not to inherit an exhausted budget from
+# an unrelated earlier attempt in the same file's history.
 _MAX_CONSECUTIVE_FAILURES = 5
-_consecutive_failures: dict[str, int] = {}
+_CONSECUTIVE_FAILURE_DECAY_SECONDS = 5 * 60
+_consecutive_failures: dict[str, tuple[int, float]] = {}
 
 # A leading bare integer immediately followed by either a newline OR whitespace-then-
 # content on the SAME line is the strongest available signal that old_string was built
@@ -227,8 +238,13 @@ def apply_diff(relative_path: str, old_string: str, new_string: str, preserve_in
 
         count = content.count(old_string)
         if count == 0:
-            fail_count = _consecutive_failures.get(relative_path, 0) + 1
-            _consecutive_failures[relative_path] = fail_count
+            import time
+            now = time.time()
+            prev_count, prev_ts = _consecutive_failures.get(relative_path, (0, 0.0))
+            if now - prev_ts > _CONSECUTIVE_FAILURE_DECAY_SECONDS:
+                prev_count = 0  # stale streak from an earlier, unrelated attempt -- start over
+            fail_count = prev_count + 1
+            _consecutive_failures[relative_path] = (fail_count, now)
             if fail_count > _MAX_CONSECUTIVE_FAILURES:
                 return (
                     f"apply_diff HARD STOP: {fail_count} consecutive apply_diff calls against "
