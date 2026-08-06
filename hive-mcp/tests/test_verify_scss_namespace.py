@@ -104,11 +104,15 @@ def test_non_scss_staged_file_is_not_checked(tmp_path, monkeypatch):
     assert "NAMESPACE MISMATCH" not in report
 
 
-def test_a_variable_never_used_with_the_alias_anywhere_is_not_flagged(tmp_path, monkeypatch):
-    """The check only fires for a variable that THIS file demonstrably already
-    prefixes elsewhere -- a bare $totally-unrelated-var (never referenced via the
-    alias in this file at all) is out of scope for this specific check; other
-    existence/lint checks are responsible for that, not this one."""
+def test_a_bare_variable_with_no_elsewhere_evidence_is_still_flagged(tmp_path, monkeypatch):
+    """Confirmed live 2026-08-06: a Coder used bare $info-bg/$info-dark for the
+    FIRST time anywhere in a file whose only prior variable usages were the
+    $success family -- the original, narrower version of this check required
+    "already prefixed elsewhere in this file" as proof, so it had no evidence for
+    $info-* to compare against and stayed silent on a real compile error. The
+    check was generalised: a file with only named (non-wildcard) @use imports and
+    no local declaration for a bare variable cannot resolve it, elsewhere-evidence
+    or not."""
     monkeypatch.setattr(verify, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(verify.config, "CODE_LINT_FORBID", [])
     monkeypatch.setattr(verify.config, "CODE_LINT_REQUIRE", [])
@@ -116,6 +120,47 @@ def test_a_variable_never_used_with_the_alias_anywhere_is_not_flagged(tmp_path, 
     _stage(
         tmp_path, "x.module.scss",
         _FILE_HEADER + ".statusBadge {\n  background: $totally-unrelated-var;\n}\n",
+    )
+
+    answer = "I've added the statusBadge class."
+
+    report = verify.verify_claims(answer)
+
+    assert "NAMESPACE MISMATCH" in report
+    assert "$totally-unrelated-var" in report
+    assert "whichever of index" in report  # the general-tier message, no false "elsewhere" claim
+
+
+def test_a_locally_declared_variable_is_never_flagged(tmp_path, monkeypatch):
+    """A file may legitimately define its OWN local $variable alongside named
+    imports -- that must stay bare, not get an alias prefix forced onto it."""
+    monkeypatch.setattr(verify, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(verify.config, "CODE_LINT_FORBID", [])
+    monkeypatch.setattr(verify.config, "CODE_LINT_REQUIRE", [])
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+    _stage(
+        tmp_path, "x.module.scss",
+        _FILE_HEADER + "$local-radius: 9999px;\n.statusBadge {\n  border-radius: $local-radius;\n}\n",
+    )
+
+    answer = "I've added the statusBadge class."
+
+    report = verify.verify_claims(answer)
+
+    assert "NAMESPACE MISMATCH" not in report
+
+
+def test_a_wildcard_import_disables_the_check_entirely(tmp_path, monkeypatch):
+    """@use '...' as *; legitimises bare $variable references from that module --
+    a file with one gets none of these checks, specific or general."""
+    monkeypatch.setattr(verify, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(verify.config, "CODE_LINT_FORBID", [])
+    monkeypatch.setattr(verify.config, "CODE_LINT_REQUIRE", [])
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+    _stage(
+        tmp_path, "x.module.scss",
+        '@use "@/styles/_variables" as *;\n\n'
+        ".statusBadge {\n  background: $success-bg;\n  color: $info-dark;\n}\n",
     )
 
     answer = "I've added the statusBadge class."

@@ -221,13 +221,31 @@ def _staged_files() -> list:
 # file is supposed to be referenced through (e.g. "index" in "@use '@/styles/_index'
 # as index;").
 _SCSS_USE_ALIAS_RE = re.compile(r'@use\s+["\'][^"\']+["\']\s+as\s+([A-Za-z_][A-Za-z0-9_]*)')
+# "@use '...' as *;" -- a wildcard import legitimises bare $variable references from
+# that module, so a file with one gets none of the checks below.
+_SCSS_WILDCARD_USE_RE = re.compile(r'@use\s+["\'][^"\']+["\']\s+as\s+\*')
+_SCSS_VAR_TOKEN_RE = re.compile(r'\$[A-Za-z_][A-Za-z0-9_-]*')
+# "$foo:" -- a variable's OWN declaration, not a usage. Also collects the set of
+# names this file legitimately owns and may reference bare.
+_SCSS_VAR_DECL_RE = re.compile(r'(\$[A-Za-z_][A-Za-z0-9_-]*)\s*:')
 
 
 def _lint_scss_namespace(rel: str, text: str) -> list[str]:
-    """Flag a bare $variable that this SAME file also references through a namespace
-    alias elsewhere -- almost always a missed prefix, not a local variable (a file
-    that genuinely defines its own local $foo would never ALSO reference the
-    identical name via alias.$foo).
+    """Flag a bare $variable in a file whose ONLY imports are named aliases (no
+    wildcard) when that variable is not locally declared in the same file -- it
+    cannot resolve to anything else.
+
+    Two tiers of confidence, both reported the same way (a compile-time error is a
+    compile-time error regardless of which tier caught it):
+    - SPECIFIC: the same variable name already appears correctly prefixed
+      elsewhere in this file (alias.$var) -- direct proof of the missed prefix.
+    - GENERAL: no such evidence exists (the variable is used bare for the first
+      time anywhere in the file), but the file still has no wildcard import and no
+      local declaration for it, so a bare reference cannot resolve regardless.
+      Measured live 2026-08-06: a Coder used bare $info-bg/$info-dark for the FIRST
+      time in a file whose only prior variable usages were $success-family names --
+      the SPECIFIC check had no "elsewhere" evidence for $info-* to compare
+      against, so it stayed silent on a real compile error.
 
     A prose "match the file's own convention" instruction was tried first (2026-08-05)
     and measured inconsistent live: correct on one run, wrong again on the very next
@@ -238,22 +256,48 @@ def _lint_scss_namespace(rel: str, text: str) -> list[str]:
     """
     if not rel.endswith((".scss", ".sass")):
         return []
-    aliases = set(_SCSS_USE_ALIAS_RE.findall(text))
-    if not aliases:
+    aliases = sorted(set(_SCSS_USE_ALIAS_RE.findall(text)))
+    if not aliases or _SCSS_WILDCARD_USE_RE.search(text):
         return []
-    out: list[str] = []
+
+    # SPECIFIC evidence: variable name -> alias it's already seen prefixed with.
+    known_alias_for: dict[str, str] = {}
     for alias in aliases:
         prefixed_re = re.compile(rf'\b{re.escape(alias)}\.(\$[A-Za-z_][A-Za-z0-9_-]*)')
-        prefixed_vars = sorted(set(m.group(1) for m in prefixed_re.finditer(text)))
-        for var in prefixed_vars:
-            bare_re = re.compile(rf'(?<!{re.escape(alias)}\.){re.escape(var)}\b')
-            if bare_re.search(text):
-                out.append(
-                    f"NAMESPACE MISMATCH in {rel}: bare {var} used, but this file "
-                    f"already references it as {alias}.{var} elsewhere — add the "
-                    f"'{alias}.' prefix here too (a bare reference is likely undefined "
-                    f"in this file's own scope and will fail to compile)."
-                )
+        for m in prefixed_re.finditer(text):
+            known_alias_for.setdefault(m.group(1), alias)
+
+    locally_declared = set(m.group(1) for m in _SCSS_VAR_DECL_RE.finditer(text))
+
+    flagged: dict[str, str | None] = {}
+    for m in _SCSS_VAR_TOKEN_RE.finditer(text):
+        var = m.group(0)
+        if re.match(r"\s*:", text[m.end():m.end() + 3]):
+            continue  # this occurrence IS the declaration, not a usage
+        if any(text[:m.start()].endswith(a + ".") for a in aliases):
+            continue  # already correctly prefixed right here
+        if var in locally_declared:
+            continue  # this file legitimately owns it
+        if var not in flagged:
+            flagged[var] = known_alias_for.get(var)
+
+    out: list[str] = []
+    for var, alias in sorted(flagged.items()):
+        if alias:
+            out.append(
+                f"NAMESPACE MISMATCH in {rel}: bare {var} used, but this file "
+                f"already references it as {alias}.{var} elsewhere — add the "
+                f"'{alias}.' prefix here too (a bare reference is likely undefined "
+                f"in this file's own scope and will fail to compile)."
+            )
+        else:
+            out.append(
+                f"NAMESPACE MISMATCH in {rel}: bare {var} used, but this file only "
+                f"imports named modules ({', '.join(aliases)}) with no wildcard "
+                f"import and {var} is not declared locally in this file — a bare "
+                f"reference cannot resolve and will fail to compile. Prefix it with "
+                f"whichever of {', '.join(aliases)} actually exports it."
+            )
     return out
 
 
