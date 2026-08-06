@@ -78,6 +78,25 @@ _HALLUCINATED_PLACEHOLDER_RE = re.compile(
 _SCSS_SELECTOR_RE = re.compile(r"^\s*(\.[A-Za-z_][\w.\-]*)\s*\{", re.MULTILINE)
 
 
+def _scss_rule_body(text: str, selector: str) -> str | None:
+    """The full '{ ... }' body of selector's FIRST occurrence in text, via brace-
+    depth matching. None if the selector never opens a rule in text at all."""
+    m = re.search(rf"^\s*{re.escape(selector)}\s*\{{", text, re.MULTILINE)
+    if not m:
+        return None
+    depth, i = 0, text.find("{", m.start())
+    start = i
+    while i < len(text):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+        i += 1
+    return None
+
+
 def _near_match_hint(content: str, old_string: str, context: int = 2) -> str:
     """Best-effort explanation of why old_string didn't match: the closest existing
     line in the file, so the model can see the actual mismatch (usually whitespace,
@@ -352,13 +371,24 @@ def apply_diff(relative_path: str, old_string: str, new_string: str, preserve_in
         # mismatch on .statusBadge, ALSO injected five unrelated properties into an
         # existing, already-correct .badgeBoth rule the task never named -- and
         # narrated it as "fixed namespace mismatches in .badgeBoth", which was
-        # false (that rule never had one). Every selector touched by an edit is
-        # reported here regardless of what the model later claims changed, so
-        # scope creep is visible even when the narrative omits or misdescribes it.
+        # false (that rule never had one). Every selector whose BODY actually
+        # changed is reported here regardless of what the model later claims it
+        # did, so scope creep is visible even when the narrative omits or
+        # misdescribes it.
+        #
+        # Compares each candidate selector's full body between old_string and
+        # new_string rather than just checking whether its NAME appears in both --
+        # confirmed live 2026-08-06 (same day, next test run) that the name-only
+        # version produced its own false positive: inserting .statusBadge right
+        # after an untouched .badgeBoth (using .badgeBoth's own unchanged body as
+        # the anchor) reported ".badgeBoth, .statusBadge" as both "touched" even
+        # though .badgeBoth's content never changed at all.
         selectors_line = ""
         if relative_path.endswith((".scss", ".sass")):
-            touched = sorted(set(_SCSS_SELECTOR_RE.findall(old_string))
-                              | set(_SCSS_SELECTOR_RE.findall(new_string)))
+            candidates = sorted(set(_SCSS_SELECTOR_RE.findall(old_string))
+                                 | set(_SCSS_SELECTOR_RE.findall(new_string)))
+            touched = [s for s in candidates
+                       if _scss_rule_body(old_string, s) != _scss_rule_body(new_string, s)]
             if touched:
                 selectors_line = f"\nSelectors touched: {', '.join(touched)}"
 

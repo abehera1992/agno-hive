@@ -312,6 +312,28 @@ def test_apply_diff_success_reports_the_new_selector_touched(tmp_path, monkeypat
     assert ".statusBadge" in result
 
 
+def test_apply_diff_unchanged_anchor_selector_is_not_reported_as_touched(tmp_path, monkeypatch):
+    """Confirmed live 2026-08-06, same day as the scope-creep fix above: inserting
+    .statusBadge right after an UNTOUCHED .badgeBoth (using .badgeBoth's own
+    unchanged body as the anchor -- a normal, legitimate technique) reported
+    '.badgeBoth, .statusBadge' as both touched, even though .badgeBoth's content
+    never changed at all -- a false positive from checking whether a selector's
+    NAME appears in both strings instead of whether its BODY actually differs."""
+    _setup_scss(
+        tmp_path, monkeypatch,
+        ".badgeBoth {\n  background: index.$success-bg;\n  color: index.$success;\n}\n",
+    )
+
+    result = files.apply_diff(
+        "sample.module.scss",
+        ".badgeBoth {\n  background: index.$success-bg;\n  color: index.$success;\n}",
+        ".badgeBoth {\n  background: index.$success-bg;\n  color: index.$success;\n}"
+        "\n\n.statusBadge {\n  color: red;\n}",
+    )
+
+    assert "Selectors touched: .statusBadge" in result  # .badgeBoth correctly excluded
+
+
 def test_apply_diff_success_reports_an_edited_existing_selector(tmp_path, monkeypatch):
     _setup_scss(tmp_path, monkeypatch, ".badge {\n  display: flex;\n}\n")
 
