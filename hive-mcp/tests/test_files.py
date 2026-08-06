@@ -141,6 +141,22 @@ def test_apply_diff_hallucinated_placeholder_comment_gets_specific_hint(tmp_path
     assert "invented placeholder comment" in result
 
 
+def test_apply_diff_hallucinated_end_of_file_marker_also_gets_hint(tmp_path, monkeypatch):
+    """Confirmed live 2026-08-06, a THIRD variant across a later test run of the
+    SAME task: old_string='/* end of file */' -- a structural/meta comment shape
+    distinct from the imperative "Add X here" shape the original regex covered."""
+    _setup(tmp_path, monkeypatch, ".badge {\n  display: flex;\n}\n")
+
+    result = files.apply_diff(
+        "sample.py",
+        "/* end of file */",
+        "/* end of file */\n.statusBadge {}",
+    )
+
+    assert "old_string not found" in result
+    assert "invented placeholder comment" in result
+
+
 def test_apply_diff_hallucinated_line_comment_placeholder_also_gets_hint(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch, ".badge {\n  display: flex;\n}\n")
 

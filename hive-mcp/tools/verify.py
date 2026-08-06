@@ -228,6 +228,23 @@ _SCSS_VAR_TOKEN_RE = re.compile(r'\$[A-Za-z_][A-Za-z0-9_-]*')
 # "$foo:" -- a variable's OWN declaration, not a usage. Also collects the set of
 # names this file legitimately owns and may reference bare.
 _SCSS_VAR_DECL_RE = re.compile(r'(\$[A-Za-z_][A-Za-z0-9_-]*)\s*:')
+_SCSS_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_SCSS_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
+
+
+def _strip_scss_comments(text: str) -> str:
+    """Blank out comment content with same-length whitespace (preserving every
+    other character's position, in case anything downstream ever needs offsets)
+    so a $variable merely MENTIONED in a comment -- documenting a hypothetical
+    future variant, describing what NOT to do, anything -- is never treated as a
+    real usage needing a namespace prefix. Measured live 2026-08-06: a Coder left
+    a genuinely reasonable comment listing hypothetical future .statusBadge
+    variants ("* .statusBadge.info { background: $info-bg; color: $info; }"), and
+    the bare-variable scan, which does not understand SCSS comment syntax, flagged
+    every variable name mentioned inside it as a real compile error alongside the
+    one genuine mismatch in the actual, live rule body."""
+    text = _SCSS_BLOCK_COMMENT_RE.sub(lambda m: " " * len(m.group(0)), text)
+    return _SCSS_LINE_COMMENT_RE.sub(lambda m: " " * len(m.group(0)), text)
 
 
 def _lint_scss_namespace(rel: str, text: str) -> list[str]:
@@ -259,6 +276,8 @@ def _lint_scss_namespace(rel: str, text: str) -> list[str]:
     aliases = sorted(set(_SCSS_USE_ALIAS_RE.findall(text)))
     if not aliases or _SCSS_WILDCARD_USE_RE.search(text):
         return []
+
+    text = _strip_scss_comments(text)  # a variable merely MENTIONED in a comment is not a real usage
 
     # SPECIFIC evidence: variable name -> alias it's already seen prefixed with.
     known_alias_for: dict[str, str] = {}

@@ -168,3 +168,81 @@ def test_a_wildcard_import_disables_the_check_entirely(tmp_path, monkeypatch):
     report = verify.verify_claims(answer)
 
     assert "NAMESPACE MISMATCH" not in report
+
+
+def test_variable_mentioned_only_in_a_block_comment_is_not_flagged(tmp_path, monkeypatch):
+    """Confirmed live 2026-08-06: a Coder left a genuinely reasonable comment
+    documenting hypothetical future .statusBadge variants:
+        /*
+         * Status badge variants (if needed in future)
+         * .statusBadge.info { background: $info-bg; color: $info; }
+         */
+    The bare-variable scan, which does not understand SCSS comment syntax, flagged
+    every variable name mentioned inside the comment as a real compile error,
+    alongside the one genuine mismatch in the actual, live .statusBadge body."""
+    monkeypatch.setattr(verify, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(verify.config, "CODE_LINT_FORBID", [])
+    monkeypatch.setattr(verify.config, "CODE_LINT_REQUIRE", [])
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+    _stage(
+        tmp_path, "x.module.scss",
+        _FILE_HEADER
+        + ".statusBadge {\n  background: index.$success-bg;\n  color: index.$success;\n}\n\n"
+        "/*\n"
+        " * Status badge variants (if needed in future)\n"
+        " * .statusBadge.info { background: $info-bg; color: $info; }\n"
+        " * .statusBadge.warning { background: $warning-bg; color: $warning; }\n"
+        " */\n",
+    )
+
+    answer = "I've added the statusBadge class."
+
+    report = verify.verify_claims(answer)
+
+    assert "NAMESPACE MISMATCH" not in report
+    assert "$info-bg" not in report
+    assert "$warning-bg" not in report
+
+
+def test_variable_bare_in_real_code_is_still_flagged_alongside_a_comment(tmp_path, monkeypatch):
+    """The comment fix must not swallow a GENUINE mismatch that also happens to sit
+    near a comment -- only the commented-out mentions are exempt, not the live code."""
+    monkeypatch.setattr(verify, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(verify.config, "CODE_LINT_FORBID", [])
+    monkeypatch.setattr(verify.config, "CODE_LINT_REQUIRE", [])
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+    _stage(
+        tmp_path, "x.module.scss",
+        _FILE_HEADER
+        + ".statusBadge {\n  background: $success-bg;\n  color: $success;\n}\n\n"
+        "/*\n"
+        " * .statusBadge.info { background: $info-bg; color: $info; }\n"
+        " */\n",
+    )
+
+    answer = "I've added the statusBadge class."
+
+    report = verify.verify_claims(answer)
+
+    assert "NAMESPACE MISMATCH" in report
+    assert "$success-bg" in report
+    assert "$info-bg" not in report
+
+
+def test_variable_mentioned_only_in_a_line_comment_is_not_flagged(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(verify.config, "CODE_LINT_FORBID", [])
+    monkeypatch.setattr(verify.config, "CODE_LINT_REQUIRE", [])
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+    _stage(
+        tmp_path, "x.module.scss",
+        _FILE_HEADER
+        + ".statusBadge {\n  background: index.$success-bg;\n  color: index.$success;\n"
+        "  // TODO: consider $info-bg for the info variant\n}\n",
+    )
+
+    answer = "I've added the statusBadge class."
+
+    report = verify.verify_claims(answer)
+
+    assert "NAMESPACE MISMATCH" not in report

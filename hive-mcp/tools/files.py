@@ -58,16 +58,19 @@ _consecutive_failures: dict[str, tuple[int, float]] = {}
 # (the tab collapsed to spaces) instead of two. Both shapes get the same hint now.
 _BARE_LINE_NUMBER_RE = re.compile(r"^\s*\d+(?:\s*\n|[ \t]+\S)")
 
-# An instructional-sounding comment ("Add X here", "// TODO: implement Y") is a
-# strong signal old_string was IMAGINED as a convenient marker rather than copied
-# from the real file. Measured live 2026-08-06: two separate failed apply_diff
-# attempts used old_string='/* Add statusBadge class here */' and, in a later retry
-# against the SAME task, old_string='// Add status badge style here' -- neither
-# comment exists anywhere in the real file; both were invented as a plausible-
-# sounding place to anchor, not read.
+# An instructional-sounding comment ("Add X here", "// TODO: implement Y", "/* end
+# of file */") is a strong signal old_string was IMAGINED as a convenient marker
+# rather than copied from the real file. Measured live 2026-08-06, THREE separate
+# failed apply_diff attempts across two different test runs of the SAME task: old_
+# string='/* Add statusBadge class here */', old_string='// Add status badge style
+# here', and old_string='/* end of file */' -- none of these comments exist
+# anywhere in the real file; all three were invented as a plausible-sounding place
+# to anchor, not read. "end" added after the third variant surfaced a structural/
+# meta comment shape ("end of file", "end of section") distinct from the
+# instructional-imperative shape the first two matched.
 _HALLUCINATED_PLACEHOLDER_RE = re.compile(
-    r"(?:/\*\s*(?:add|insert|todo|fixme|placeholder|implement|your)\b[^*]*\*/"
-    r"|//\s*(?:add|insert|todo|fixme|placeholder|implement|your)\b.*)",
+    r"(?:/\*\s*(?:add|insert|todo|fixme|placeholder|implement|your|end)\b[^*]*\*/"
+    r"|//\s*(?:add|insert|todo|fixme|placeholder|implement|your|end)\b.*)",
     re.IGNORECASE,
 )
 
