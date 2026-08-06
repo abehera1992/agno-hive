@@ -216,3 +216,46 @@ async def test_verified_answer_surfaces_a_real_write_the_narrative_never_mention
     assert out.startswith(content)
     assert "Actual file changes this run" in out
     assert "parties.module.scss — review_pending" in out
+
+
+@pytest.mark.asyncio
+async def test_verified_answer_retries_on_a_lint_violation_report(monkeypatch):
+    """Confirmed live 2026-08-06: verify_claims' CONVENTIONS section (CODE_LINT_FORBID/
+    REQUIRE, and the SCSS namespace-consistency check) uses its own "VIOLATION" prefix,
+    which _claim_token was never taught to recognise. A report containing ONLY a
+    NAMESPACE MISMATCH violation set bad=True correctly (verify_claims' own problem
+    count includes lint findings), but missing_symbols and bad_citations both came back
+    empty, so the function fell through to "not missing_symbols and not bad_citations"
+    and shipped the unfixed staged file with no retry and no disclaimer -- exactly the
+    category of bug the 2026-08-04 AMBIGUOUS/MISMATCH fix closed for citations, just
+    never extended to CONVENTIONS."""
+    canned_report = (
+        "CONVENTIONS (1 violation(s)):\n"
+        "  VIOLATION  NAMESPACE MISMATCH in x.module.scss: bare $gray-200 used, but "
+        "this file already references it as index.$gray-200 elsewhere\n\n"
+        "VERDICT: 1 claim(s) could NOT be found in the project."
+    )
+    call_count = {"n": 0}
+
+    async def fake_verify_claims(content, hive_mcp_url):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return canned_report, True
+        return "VERDICT: every checked claim exists in the project.", False
+
+    monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
+
+    original_result = _msgs(_tool_msg("apply_diff", "review_pending: x.module.scss — this change is now staged."))
+    content = "Added the statusBadge class."
+    retry_result = SimpleNamespace(
+        content="Fixed the namespace prefix in the statusBadge class.",
+        messages=[_tool_msg("apply_diff", "review_pending: x.module.scss — this change is now staged.")],
+    )
+    fake_team = _FakeTeam(retry_result)
+
+    out = await team._verified_answer(content, "add a badge class", fake_team, "http://fake/mcp", result=original_result)
+
+    assert len(fake_team.prompts) == 1  # it actually retried instead of silently shipping
+    assert "apply_diff() again" in fake_team.prompts[0]
+    assert "$gray-200" in fake_team.prompts[0]
+    assert out.startswith("Fixed the namespace prefix")

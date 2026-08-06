@@ -697,7 +697,21 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                         if (t := _claim_token(ln, ("NOT FOUND", "DOC ONLY")))]
     bad_citations = [t for ln in report.splitlines()
                       if (t := _claim_token(ln, ("BAD", "AMBIGUOUS", "MISMATCH")))]
-    if not missing_symbols and not bad_citations:
+    # verify_claims' CONVENTIONS section (CODE_LINT_FORBID/REQUIRE, and the SCSS
+    # namespace-consistency check) uses its own "VIOLATION" prefix, which
+    # _claim_token above was never taught to recognise -- confirmed live
+    # 2026-08-06: a report containing ONLY a NAMESPACE MISMATCH violation set
+    # `bad=True` correctly (verify_claims' own problem-count includes lint findings),
+    # but missing_symbols and bad_citations both came back empty, so this function
+    # fell straight to "not missing_symbols and not bad_citations" and returned the
+    # unfixed answer with no retry and no disclaimer -- the exact same category of
+    # bug the AMBIGUOUS/MISMATCH fix (2026-08-04, see the comment below) closed for
+    # citations, just never extended to the CONVENTIONS category the whole session.
+    # A lint VIOLATION line is a full sentence, not a bare symbol name, so it takes
+    # the whole remainder of the line rather than _claim_token's first-word split.
+    lint_violations = [ln.strip()[len("VIOLATION"):].strip()
+                        for ln in report.splitlines() if ln.strip().startswith("VIOLATION")]
+    if not missing_symbols and not bad_citations and not lint_violations:
         return content + _summarize_actual_writes(result)
     instructions = []
     if missing_symbols:
@@ -727,6 +741,16 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"recalled, estimated, or rounded number. If a filename is shared by more "
             f"than one file in the project, cite the full repo-relative path instead of "
             f"the bare filename."
+        )
+    if lint_violations:
+        named = "; ".join(lint_violations[:4])
+        instructions.append(
+            f"the code you staged has real convention violations: {named}. Call "
+            f"apply_diff() again against the SAME staged file to fix these EXACT "
+            f"issues in the code itself — rewording the prose answer does not fix "
+            f"them, the file on disk is still wrong until a new apply_diff() call "
+            f"corrects it. Read the current staged state first via "
+            f"get_file_content('<path>.hive_proposed') if unsure what changed."
         )
     retry_prompt = f"{task}\n\nIMPORTANT: " + " Also, ".join(instructions)
     try:
