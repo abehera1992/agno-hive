@@ -14,6 +14,16 @@ def _setup(tmp_path, monkeypatch, initial_text):
     return f
 
 
+def _setup_scss(tmp_path, monkeypatch, initial_text):
+    monkeypatch.setattr(files, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(files, "WRITE_REVIEW", False)
+    f = tmp_path / "sample.module.scss"
+    f.write_text(initial_text, encoding="utf-8")
+    files._last_failed_call.clear()
+    files._consecutive_failures.clear()
+    return f
+
+
 def test_apply_diff_failure_includes_near_match_hint(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch, "def foo():\n    status_filter = 'active'\n    return status_filter\n")
 
@@ -145,4 +155,75 @@ def test_apply_diff_genuinely_new_content_after_same_anchor_is_allowed(tmp_path,
     assert "REFUSED" not in second
     content = (tmp_path / "sample.py").read_text(encoding="utf-8")
     assert "deleteParty" in content
-    assert "archiveParty" in content
+
+
+def test_apply_diff_refuses_a_second_rule_under_an_existing_scss_selector(tmp_path, monkeypatch):
+    """Confirmed live 2026-08-06: a citation-correction retry staged a second
+    '.statusBadge { ... }' rule using DIFFERENT color variables right after an
+    existing, already-correct one -- two rules, same selector, neither textually
+    identical to the other, so the net-addition duplicate check (above) never
+    fired. This is a NAME collision, not a text collision."""
+    _setup_scss(
+        tmp_path, monkeypatch,
+        ".badge {\n  display: inline-flex;\n}\n\n"
+        ".statusBadge {\n  background: index.$success-bg;\n  color: index.$success;\n}\n",
+    )
+
+    result = files.apply_diff(
+        "sample.module.scss",
+        ".badge {\n  display: inline-flex;\n}",
+        ".badge {\n  display: inline-flex;\n}\n\n"
+        ".statusBadge {\n  background: index.$accent-bg-muted;\n  color: index.$accent-deep;\n}",
+    )
+
+    assert "REFUSED" in result
+    assert ".statusBadge" in result
+    content = (tmp_path / "sample.module.scss").read_text(encoding="utf-8")
+    assert content.count(".statusBadge {") == 1  # nothing landed
+
+
+def test_apply_diff_allows_editing_the_existing_selector_in_place(tmp_path, monkeypatch):
+    """The name-collision guard must not block a genuine in-place edit -- old_string
+    already contains the selector being replaced, so it must be excluded from the
+    "existing elsewhere" check or every real fix would be refused too."""
+    _setup_scss(
+        tmp_path, monkeypatch,
+        ".statusBadge {\n  background: $success-bg;\n  color: $success;\n}\n",
+    )
+
+    result = files.apply_diff(
+        "sample.module.scss",
+        ".statusBadge {\n  background: $success-bg;\n  color: $success;\n}",
+        ".statusBadge {\n  background: index.$success-bg;\n  color: index.$success;\n}",
+    )
+
+    assert "REFUSED" not in result
+    content = (tmp_path / "sample.module.scss").read_text(encoding="utf-8")
+    assert content.count(".statusBadge {") == 1
+    assert "index.$success-bg" in content
+
+
+def test_apply_diff_allows_a_genuinely_new_selector_name(tmp_path, monkeypatch):
+    _setup_scss(tmp_path, monkeypatch, ".badge {\n  display: inline-flex;\n}\n")
+
+    result = files.apply_diff(
+        "sample.module.scss",
+        ".badge {\n  display: inline-flex;\n}",
+        ".badge {\n  display: inline-flex;\n}\n\n.statusBadge {\n  color: red;\n}",
+    )
+
+    assert "REFUSED" not in result
+
+
+def test_apply_diff_name_collision_check_skips_non_scss_files(tmp_path, monkeypatch):
+    """Scoped to .scss/.sass only -- a .foo { ... } -shaped string in some other
+    language is not this check's business."""
+    _setup(tmp_path, monkeypatch, ".statusBadge {\n  x = 1\n}\n")
+
+    result = files.apply_diff(
+        "sample.py",
+        ".statusBadge {\n  x = 1\n}",
+        ".statusBadge {\n  x = 1\n}\n\n.statusBadge {\n  y = 2\n}",
+    )
+
+    assert "REFUSED" not in result

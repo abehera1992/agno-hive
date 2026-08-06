@@ -47,6 +47,12 @@ _consecutive_failures: dict[str, int] = {}
 # (the tab collapsed to spaces) instead of two. Both shapes get the same hint now.
 _BARE_LINE_NUMBER_RE = re.compile(r"^\s*\d+(?:\s*\n|[ \t]+\S)")
 
+# A top-level class selector opening a rule, e.g. ".statusBadge {" or
+# ".statusBadge--warning {". Deliberately narrow -- line-anchored, no nested "&"
+# selectors, no media queries -- this targets exactly one failure mode (see
+# apply_diff's NAME-collision check below), not a general CSS parser.
+_SCSS_SELECTOR_RE = re.compile(r"^\s*(\.[A-Za-z_][\w.\-]*)\s*\{", re.MULTILINE)
+
 
 def _near_match_hint(content: str, old_string: str, context: int = 2) -> str:
     """Best-effort explanation of why old_string didn't match: the closest existing
@@ -272,6 +278,31 @@ def apply_diff(relative_path: str, old_string: str, new_string: str, preserve_in
                     f"{_PROPOSED_SUFFIX if (WRITE_REVIEW and proposed.exists()) else ''}') "
                     f"to see the current state. If you genuinely need to insert this "
                     f"again elsewhere, anchor old_string somewhere else."
+                )
+
+        # A NAME collision, not a TEXT collision. The check above only catches
+        # re-appending BYTE-IDENTICAL content after an untouched anchor; it does
+        # nothing when new_string defines a DIFFERENT rule under the SAME selector.
+        # Measured live 2026-08-06: a citation-correction retry staged a second
+        # ".statusBadge { ... }" using different color variables (index.$accent-bg-
+        # muted instead of the first, already-correct index.$success-bg) right after
+        # an existing one -- two rules, same selector, neither textually identical to
+        # the other so the check above never fired. Compares against content with
+        # old_string removed first, so a genuine "replace this exact block with an
+        # edited version of itself" edit (old_string already contains the selector
+        # being replaced) is never mistaken for a collision.
+        if relative_path.endswith((".scss", ".sass")):
+            content_without_old = content.replace(old_string, "", 1) if old_string else content
+            existing_selectors = set(_SCSS_SELECTOR_RE.findall(content_without_old))
+            collisions = [s for s in _SCSS_SELECTOR_RE.findall(new_string) if s in existing_selectors]
+            if collisions:
+                return (
+                    f"apply_diff REFUSED: {', '.join(collisions)} already exists as a "
+                    f"rule in {relative_path} — a selector cannot be defined twice. If "
+                    f"you meant to modify the existing rule, call get_file_content("
+                    f"'{relative_path}{_PROPOSED_SUFFIX if (WRITE_REVIEW and proposed.exists()) else ''}') "
+                    f"to see its current content and target THAT block with old_string, "
+                    f"instead of appending a new one."
                 )
 
         _last_failed_call.pop(relative_path, None)
