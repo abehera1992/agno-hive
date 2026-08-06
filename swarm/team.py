@@ -521,7 +521,7 @@ def _count_successful_write_calls(result) -> int:
     return n if recognised else -1
 
 
-def _summarize_actual_writes(result) -> str:
+def _summarize_actual_writes(*results) -> str:
     """Deterministic, tool-trace-only summary of which files a write tool call
     actually staged or wrote successfully this run -- independent of whatever the
     model's own prose claims. Appended to every answer, regardless of what the
@@ -537,31 +537,40 @@ def _summarize_actual_writes(result) -> str:
     no model call, no risk of the "correction" itself duplicating content the way an
     actual retry did earlier in that same incident.
 
-    Returns "" (nothing appended) when the trace shows no successful write-tool call
-    -- most runs are answer-only, and a permanent "no files changed" footer on every
-    conversational reply would be noise, not signal.
+    Accepts MULTIPLE result objects (the original attempt plus every retry) and
+    unions their write evidence. Confirmed live 2026-08-06: a Coder staged a real
+    (if namespace-wrong) .statusBadge in its FIRST attempt, then a citation-retry's
+    OWN trace made no further successful write and the retry gave up honestly --
+    "has not been successfully modified". Checking only the LAST result's trace at
+    that return point produced an empty appendix next to a claim that was, in fact,
+    also wrong: a write really had happened, just not in the attempt being inspected.
+
+    Returns "" (nothing appended) when NONE of the traces show a successful
+    write-tool call -- most runs are answer-only, and a permanent "no files changed"
+    footer on every conversational reply would be noise, not signal.
     """
-    msgs = getattr(result, "messages", None) or []
     changed: list[str] = []
-    for m in msgs:
-        if getattr(m, "role", None) != "tool":
-            continue
-        name = getattr(m, "tool_name", None) or getattr(m, "name", None)
-        if name not in _WRITE_TOOLS:
-            continue
-        text = getattr(m, "content", None)
-        if not isinstance(text, str):
-            continue
-        match = _WRITE_SUCCESS_RE.match(text.strip())
-        if not match:
-            continue
-        # The path follows the "kind:" prefix, e.g. "review_pending: src/x.scss
-        # (changes)" or "written: src/new.py" -- first whitespace-delimited token.
-        rest = text.strip()[match.end():].strip()
-        path = rest.split()[0] if rest else "(unknown path)"
-        entry = f"{path} — {match.group(1).lower()}"
-        if entry not in changed:
-            changed.append(entry)
+    for result in results:
+        msgs = getattr(result, "messages", None) or []
+        for m in msgs:
+            if getattr(m, "role", None) != "tool":
+                continue
+            name = getattr(m, "tool_name", None) or getattr(m, "name", None)
+            if name not in _WRITE_TOOLS:
+                continue
+            text = getattr(m, "content", None)
+            if not isinstance(text, str):
+                continue
+            match = _WRITE_SUCCESS_RE.match(text.strip())
+            if not match:
+                continue
+            # The path follows the "kind:" prefix, e.g. "review_pending: src/x.scss
+            # (changes)" or "written: src/new.py" -- first whitespace-delimited token.
+            rest = text.strip()[match.end():].strip()
+            path = rest.split()[0] if rest else "(unknown path)"
+            entry = f"{path} — {match.group(1).lower()}"
+            if entry not in changed:
+                changed.append(entry)
     if not changed:
         return ""
     lines = "\n".join(f"- {c}" for c in changed)
@@ -587,6 +596,13 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     claims, the correction is not converging and looping burns tokens; the verifier's
     findings are surfaced instead so a human sees exactly which claims are unsupported.
     """
+    # Every result object seen this call, original attempt first -- fed to
+    # _summarize_actual_writes(*all_results) at every return point so a write that
+    # happened in an EARLIER attempt is never lost just because a LATER retry's own
+    # trace made no further successful write call. See _summarize_actual_writes'
+    # docstring for the live incident this closes.
+    all_results = [result]
+
     # Claimed-write check, FIRST — a fabricated "file changed" claim means the rest of
     # the answer's factual content is moot, so this runs before the fact-groundedness
     # checks below rather than after. Only fires when writes are DETERMINABLE and zero
@@ -609,6 +625,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"only THEN report the change as made. If the write tool keeps failing, "
                 f"report the exact failure message instead of claiming success."
             )
+            all_results.append(retry)
             retried = retry.content if hasattr(retry, "content") else str(retry)
             if retried:
                 retry_writes = _count_successful_write_calls(retry)
@@ -619,7 +636,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                         f"{retried}\n\n---\n**This answer claims a file was changed, but "
                         f"no apply_diff()/write_file() call in either attempt actually "
                         f"succeeded — treat this as NOT applied.**"
-                        + _summarize_actual_writes(retry)
+                        + _summarize_actual_writes(*all_results)
                     )
                 content, result = retried, retry
         except Exception as exc:
@@ -648,6 +665,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"actually read this run, and if the thing asked about does not exist, say "
                 f"so plainly."
             )
+            all_results.append(retry)
             retried = retry.content if hasattr(retry, "content") else str(retry)
             if retried:
                 content, result = retried, retry
@@ -656,7 +674,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
 
     report, bad = await _verify_claims(content, hive_mcp_url)
     if not bad:
-        return content + _summarize_actual_writes(result)
+        return content + _summarize_actual_writes(*all_results)
 
     # Name ONLY the unsupported items, in prose. The first version of this prompt
     # embedded the whole draft and the whole verification report; the coordinator echoed
@@ -712,7 +730,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     lint_violations = [ln.strip()[len("VIOLATION"):].strip()
                         for ln in report.splitlines() if ln.strip().startswith("VIOLATION")]
     if not missing_symbols and not bad_citations and not lint_violations:
-        return content + _summarize_actual_writes(result)
+        return content + _summarize_actual_writes(*all_results)
     instructions = []
     if missing_symbols:
         named = ", ".join(missing_symbols[:6])
@@ -755,12 +773,13 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     retry_prompt = f"{task}\n\nIMPORTANT: " + " Also, ".join(instructions)
     try:
         retry = await team.arun(retry_prompt)
+        all_results.append(retry)
         corrected = retry.content if hasattr(retry, "content") else str(retry)
     except Exception as exc:
         print(f"[team] verify retry failed: {exc}")
-        return content + _summarize_actual_writes(result)
+        return content + _summarize_actual_writes(*all_results)
     if not corrected:
-        return content + _summarize_actual_writes(result)
+        return content + _summarize_actual_writes(*all_results)
 
     # Diagnostic visibility, not a hard gate — going back for a SECOND retry would
     # break the "bounded at ONE retry" design below. Confirmed live 2026-08-04 that
@@ -776,8 +795,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         # Surface rather than hide: the reader needs to know which claims are unsupported.
         return (f"{corrected}\n\n---\n**Unverified claims flagged automatically "
                 f"(these could not be found in the repository):**\n```\n{report2}\n```"
-                + _summarize_actual_writes(retry))
-    return corrected + _summarize_actual_writes(retry)
+                + _summarize_actual_writes(*all_results))
+    return corrected + _summarize_actual_writes(*all_results)
 
 
 async def _fill_count_markers(content: str, hive_mcp_url: str | None) -> str:

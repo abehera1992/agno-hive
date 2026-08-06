@@ -259,3 +259,41 @@ async def test_verified_answer_retries_on_a_lint_violation_report(monkeypatch):
     assert "apply_diff() again" in fake_team.prompts[0]
     assert "$gray-200" in fake_team.prompts[0]
     assert out.startswith("Fixed the namespace prefix")
+
+
+@pytest.mark.asyncio
+async def test_verified_answer_ground_truth_survives_a_retry_that_makes_no_new_write(monkeypatch):
+    """Confirmed live 2026-08-06: a Coder staged a real (if namespace-wrong)
+    .statusBadge in its FIRST attempt. A lint-violation retry then gave up honestly
+    ("has not been successfully modified due to repeated apply_diff failures") --
+    true of THAT retry's own trace, but the ground-truth appendix at the time only
+    inspected the LAST result object, so it produced an empty appendix next to a
+    claim that was, in fact, also wrong: a write really had happened earlier in the
+    same run. The appendix must union write evidence across every attempt, not just
+    the final one."""
+    canned_report = (
+        "CONVENTIONS (1 violation(s)):\n"
+        "  VIOLATION  NAMESPACE MISMATCH in parties.module.scss: bare $accent-deep used, "
+        "but this file already references it as index.$accent-deep elsewhere\n\n"
+        "VERDICT: 1 claim(s) could NOT be found in the project."
+    )
+
+    async def fake_verify_claims(content, hive_mcp_url):
+        return canned_report, True  # still bad after the retry too -- it gave up
+
+    monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
+
+    original_result = _msgs(_tool_msg("apply_diff", "review_pending: parties.module.scss — this change is now staged."))
+    content = "Added the statusBadge class using $accent-deep."
+
+    # The retry's OWN trace has NO write tool calls at all -- it just gave up.
+    retry_result = SimpleNamespace(
+        content="This file has not been successfully modified due to repeated apply_diff failures.",
+        messages=[_tool_msg("get_file_content", "# parties.module.scss\n...")],
+    )
+    fake_team = _FakeTeam(retry_result)
+
+    out = await team._verified_answer(content, "add a badge class", fake_team, "http://fake/mcp", result=original_result)
+
+    assert "Actual file changes this run" in out  # not silently dropped
+    assert "parties.module.scss — review_pending" in out
