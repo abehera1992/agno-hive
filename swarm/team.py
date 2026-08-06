@@ -491,6 +491,26 @@ _CLAIMED_WRITE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Tools that SEARCH the project by a literal pattern. A "NOT FOUND, I searched for
+# X" claim needs an actual search_files()/find_files() call for X somewhere in the
+# trace -- the read-tool presence check (_count_read_calls) can't tell "searched
+# broadly" from "searched for THIS specific term", and citation-checking
+# (_verify_claims) has nothing to grep for in a claim with no fabricated symbol.
+_SEARCH_TOOLS = {"search_files", "find_files"}
+
+# "NOT FOUND (searched for expiry_date, valid_until, expires_at ... in all files)" --
+# the comma-separated terms after "searched for", up to the closing paren/period.
+# Confirmed live 2026-08-06: a Coder claimed exactly this phrasing for "valid_until"
+# and reported NOT FOUND, but a real field named ewb_valid_until exists directly on
+# the vouchers table -- "valid_until" as a literal ripgrep pattern would have matched
+# it trivially as a substring, meaning the claimed search either never ran, or ran
+# scoped to the wrong file/glob and the negative result was over-generalized to
+# "doesn't exist anywhere".
+_CLAIMED_SEARCH_RE = re.compile(
+    r"searched\s+for\s+([^)\n.]+?)(?:\s+in\s+all\s+files)?[)\.]",
+    re.IGNORECASE,
+)
+
 
 def _count_successful_write_calls(result) -> int:
     """Count WRITE tool calls (apply_diff/write_file) whose OWN response text confirms
@@ -523,6 +543,71 @@ def _count_successful_write_calls(result) -> int:
                 if isinstance(text, str) and _WRITE_SUCCESS_RE.match(text.strip()):
                     n += 1
     return n if recognised else -1
+
+
+def _extract_searched_patterns(*results) -> set[str]:
+    """Every literal pattern/glob argument actually passed to search_files() or
+    find_files() across all `results` this run, lowercased for case-insensitive
+    comparison against claimed search terms. Reads tool_calls off assistant
+    messages (agno's request-side tool_calls, not the tool's own response text --
+    the pattern lives in the CALL, not the reply), same access pattern as
+    _count_read_calls."""
+    import json
+    patterns: set[str] = set()
+    for result in results:
+        msgs = getattr(result, "messages", None) or []
+        for m in msgs:
+            for tc in (getattr(m, "tool_calls", None) or []):
+                fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", None)
+                name = (fn or {}).get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+                if name not in _SEARCH_TOOLS:
+                    continue
+                args_raw = (fn or {}).get("arguments") if isinstance(fn, dict) else getattr(fn, "arguments", None)
+                if not args_raw:
+                    continue
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except Exception:
+                    continue
+                if not isinstance(args, dict):
+                    continue
+                for key in ("pattern", "glob_pattern", "glob_filter"):
+                    val = args.get(key)
+                    if isinstance(val, str) and val:
+                        patterns.add(val.lower())
+    return patterns
+
+
+def _claimed_search_terms(content: str) -> list[str]:
+    """Every comma-separated term the answer claims to have searched for, from
+    phrasing like 'NOT FOUND (searched for expiry_date, valid_until, expires_at
+    ... in all files)'."""
+    terms: list[str] = []
+    for m in _CLAIMED_SEARCH_RE.finditer(content or ""):
+        for part in m.group(1).split(","):
+            term = part.strip().strip("'\"").lower()
+            if term and " " not in term and term not in terms:
+                terms.append(term)
+    return terms
+
+
+def _unverified_claimed_searches(content: str, *results) -> list[str]:
+    """Claimed search terms (see _claimed_search_terms) with no matching actual
+    search_files()/find_files() call anywhere in `results`. Matching is loose --
+    exact, or a substring either direction -- since a claim of "valid_until" should
+    count as verified against an actual search for "ewb_valid_until" or vice versa;
+    the point is confirming SOME real search touched this term, not exact wording.
+    """
+    claimed = _claimed_search_terms(content)
+    if not claimed:
+        return []
+    actual = _extract_searched_patterns(*results)
+    if not actual:
+        return claimed
+    return [
+        term for term in claimed
+        if not any(term in pat or pat in term for pat in actual)
+    ]
 
 
 def _summarize_actual_writes(*results) -> str:
@@ -664,6 +749,50 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 content, result = retried, retry
         except Exception as exc:
             print(f"[team] write-claim retry failed: {exc}")
+
+    # Claimed-search check -- the read-side counterpart to the write-claim guard
+    # above. Measured live 2026-08-06: a Coder answered "expiry handling: NOT FOUND
+    # (searched for expiry_date, valid_until, expires_at ... in all files)", but a
+    # real field named ewb_valid_until exists directly on the vouchers table --
+    # "valid_until" as a literal pattern would have matched it trivially as a
+    # substring, meaning the claimed search either never ran, or ran scoped to the
+    # wrong file and the negative result was over-generalized. Neither
+    # _verify_claims (nothing fabricated to grep for -- the claim names no symbol)
+    # nor _count_read_calls (some reading DID happen, just not of the claimed term)
+    # can catch this; only comparing the claimed term against the actual tool_calls
+    # arguments can.
+    unverified_searches = _unverified_claimed_searches(content, result)
+    if unverified_searches:
+        print(f"[team] answer claims searches that never ran: {unverified_searches} — retrying with a mandatory search")
+        try:
+            named = ", ".join(unverified_searches[:6])
+            retry = await team.arun(
+                f"{task}\n\n"
+                f"IMPORTANT: a previous attempt claimed to have searched for these "
+                f"terms, but no search_files() or find_files() call in that attempt "
+                f"actually used them: {named}. A 'NOT FOUND' conclusion is only true "
+                f"if you actually ran that exact search -- call search_files() for "
+                f"EACH of these terms now, across the whole relevant directory (not "
+                f"just one file), and report what you genuinely find, even if it "
+                f"changes your earlier answer."
+            )
+            all_results.append(retry)
+            retried = retry.content if hasattr(retry, "content") else str(retry)
+            if retried:
+                retry_unverified = _unverified_claimed_searches(retried, retry)
+                if retry_unverified:
+                    # Bounded at one retry, same philosophy as the write-claim and
+                    # citation paths -- surface rather than hide.
+                    return (
+                        f"{retried}\n\n---\n**This answer claims searches that were "
+                        f"never actually run ({', '.join(retry_unverified[:6])}) — "
+                        f"treat any 'NOT FOUND' conclusion resting on them as "
+                        f"UNVERIFIED, not confirmed absent.**"
+                        + _summarize_actual_writes(*all_results)
+                    )
+                content, result = retried, retry
+        except Exception as exc:
+            print(f"[team] search-claim retry failed: {exc}")
 
     # No-evidence check, BEFORE the grep-based one. Measured 2026-07-31 on the same case
     # in the same configuration: a failing run made ONE tool call (verify_claims) and no
