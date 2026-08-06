@@ -498,18 +498,25 @@ _CLAIMED_WRITE_RE = re.compile(
 # (_verify_claims) has nothing to grep for in a claim with no fabricated symbol.
 _SEARCH_TOOLS = {"search_files", "find_files"}
 
-# "NOT FOUND (searched for expiry_date, valid_until, expires_at ... in all files)" --
-# the comma-separated terms after "searched for", up to the closing paren/period.
-# Confirmed live 2026-08-06: a Coder claimed exactly this phrasing for "valid_until"
-# and reported NOT FOUND, but a real field named ewb_valid_until exists directly on
-# the vouchers table -- "valid_until" as a literal ripgrep pattern would have matched
-# it trivially as a substring, meaning the claimed search either never ran, or ran
-# scoped to the wrong file/glob and the negative result was over-generalized to
-# "doesn't exist anywhere".
-_CLAIMED_SEARCH_RE = re.compile(
-    r"searched\s+for\s+([^)\n.]+?)(?:\s+in\s+all\s+files)?[)\.]",
-    re.IGNORECASE,
-)
+# Proximity-based, not phrase-based: extract identifier-shaped tokens from a
+# window AFTER every "NOT FOUND" mention, rather than matching one fixed grammar
+# like "searched for X". Measured live 2026-08-06, TWO answers in the same test
+# session: "NOT FOUND (searched for expiry_date, valid_until ... in all files)"
+# and, on the very next retry of the identical question, "NOT FOUND: no
+# `expiry_date` or `valid_until` field in any voucher-related model" -- same
+# underlying claim, different connecting grammar, and a fixed "searched for X"
+# regex only caught the first. Same "match by proximity, not by exact phrasing"
+# principle already used elsewhere in this codebase for citation-quote matching
+# (verify.py's _LABELED_LINE_WINDOW/_CONTENT_QUOTE_WINDOW).
+_NOT_FOUND_RE = re.compile(r"\bnot\s+found\b", re.IGNORECASE)
+_CLAIMED_ABSENCE_WINDOW = 200
+# Backtick-wrapped tokens are accepted liberally (backticks are already this
+# codebase's own convention for "this is code", per verify.py's _BACKTICK_RE).
+# Bare (non-backtick) tokens are required to contain an underscore -- snake_case
+# identifiers ("expiry_date") clear this bar without needing a stopword list to
+# filter ordinary English prose ("endpoint", "similar", "codebase") out; none of
+# those contain an underscore, so they never match the bare-token alternative.
+_CLAIMED_ABSENCE_TOKEN_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)`|\b([a-z_][a-z0-9]*_[a-z0-9_]*)\b")
 
 
 def _count_successful_write_calls(result) -> int:
@@ -579,14 +586,19 @@ def _extract_searched_patterns(*results) -> set[str]:
 
 
 def _claimed_search_terms(content: str) -> list[str]:
-    """Every comma-separated term the answer claims to have searched for, from
-    phrasing like 'NOT FOUND (searched for expiry_date, valid_until, expires_at
-    ... in all files)'."""
+    """Every identifier-shaped term the answer implies it checked for and did not
+    find, extracted from a window of text after each 'NOT FOUND' mention --
+    regardless of the exact connecting grammar ('searched for X', 'no X field',
+    'no X, Y, or similar endpoint'). Stops at the first '.' or newline so the
+    window doesn't bleed into an unrelated LATER sentence or claim."""
     terms: list[str] = []
-    for m in _CLAIMED_SEARCH_RE.finditer(content or ""):
-        for part in m.group(1).split(","):
-            term = part.strip().strip("'\"").lower()
-            if term and " " not in term and term not in terms:
+    text = content or ""
+    for m in _NOT_FOUND_RE.finditer(text):
+        window = text[m.end():m.end() + _CLAIMED_ABSENCE_WINDOW]
+        window = re.split(r"[.\n]", window, maxsplit=1)[0]
+        for tm in _CLAIMED_ABSENCE_TOKEN_RE.finditer(window):
+            term = (tm.group(1) or tm.group(2) or "").strip().lower()
+            if term and term not in terms:
                 terms.append(term)
     return terms
 

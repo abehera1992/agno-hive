@@ -56,9 +56,25 @@ def test_claimed_search_terms_extracts_comma_separated_list():
 
 
 def test_claimed_search_terms_dedupes():
-    content = "NOT FOUND (searched for bulk, batch, bulk in all files)"
+    content = "NOT FOUND (searched for bulk_generate, create_vouchers, bulk_generate in all files)"
     terms = team._claimed_search_terms(content)
-    assert terms == ["bulk", "batch"]
+    assert terms == ["bulk_generate", "create_vouchers"]
+
+
+def test_claimed_search_terms_matches_a_rephrased_claim_not_using_searched_for():
+    """Confirmed live 2026-08-06: the SAME underlying claim, re-asked via a
+    session-chained retry, came back as "no `bulk_generate`, `create_vouchers`, or
+    similar endpoint/function" -- a completely different connecting grammar from
+    "searched for X" that the old fixed-phrase regex missed entirely."""
+    content = (
+        "Bulk voucher creation — NOT FOUND: there is no `bulk_generate`, "
+        "`create_vouchers`, or similar endpoint/function in the vouchers router."
+    )
+    terms = team._claimed_search_terms(content)
+    assert "bulk_generate" in terms
+    assert "create_vouchers" in terms
+    assert "similar" not in terms
+    assert "endpoint" not in terms
 
 
 def test_claimed_search_terms_empty_when_no_claim_present():
@@ -116,10 +132,10 @@ def test_unverified_claimed_searches_accepts_a_substring_match():
 
 
 def test_unverified_claimed_searches_accepts_an_exact_match():
-    content = "NOT FOUND (searched for bulk, batch in all files)"
+    content = "NOT FOUND (searched for bulk_generate, create_vouchers in all files)"
     result = _msgs(
-        _search_call("search_files", pattern="bulk"),
-        _search_call("search_files", pattern="batch"),
+        _search_call("search_files", pattern="bulk_generate"),
+        _search_call("search_files", pattern="create_vouchers"),
     )
 
     unverified = team._unverified_claimed_searches(content, result)
@@ -128,12 +144,12 @@ def test_unverified_claimed_searches_accepts_an_exact_match():
 
 
 def test_unverified_claimed_searches_flags_only_the_missing_terms():
-    content = "NOT FOUND (searched for bulk, batch, generate_multiple in all files)"
-    result = _msgs(_search_call("search_files", pattern="bulk"))  # only one of three ran
+    content = "NOT FOUND (searched for bulk_generate, create_vouchers, generate_multiple in all files)"
+    result = _msgs(_search_call("search_files", pattern="bulk_generate"))  # only one of three ran
 
     unverified = team._unverified_claimed_searches(content, result)
 
-    assert unverified == ["batch", "generate_multiple"]
+    assert unverified == ["create_vouchers", "generate_multiple"]
 
 
 def test_unverified_claimed_searches_empty_when_no_claim_present():
