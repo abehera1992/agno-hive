@@ -347,12 +347,27 @@ def apply_diff(relative_path: str, old_string: str, new_string: str, preserve_in
 
         proposed_content = content.replace(old_string, new_string, 1)
 
+        # Ground truth for scope, independent of what the model reports doing.
+        # Measured live 2026-08-06: a lint-fix retry, asked to correct a namespace
+        # mismatch on .statusBadge, ALSO injected five unrelated properties into an
+        # existing, already-correct .badgeBoth rule the task never named -- and
+        # narrated it as "fixed namespace mismatches in .badgeBoth", which was
+        # false (that rule never had one). Every selector touched by an edit is
+        # reported here regardless of what the model later claims changed, so
+        # scope creep is visible even when the narrative omits or misdescribes it.
+        selectors_line = ""
+        if relative_path.endswith((".scss", ".sass")):
+            touched = sorted(set(_SCSS_SELECTOR_RE.findall(old_string))
+                              | set(_SCSS_SELECTOR_RE.findall(new_string)))
+            if touched:
+                selectors_line = f"\nSelectors touched: {', '.join(touched)}"
+
         if WRITE_REVIEW:
             proposed.write_text(proposed_content, encoding="utf-8")
             diff = _inline_diff(target, proposed) if _IN_DOCKER else ""
             diff_section = f"\n\nProposed diff:\n```diff\n{diff}\n```" if diff else ""
             return (
-                f"review_pending: {relative_path} — this change is now staged.{diff_section}\n"
+                f"review_pending: {relative_path} — this change is now staged.{selectors_line}{diff_section}\n"
                 f"If you have MORE changes for this file: call get_file_content('{relative_path}.hive_proposed') "
                 f"to see the current staged state, then apply ONLY the NEXT distinct change not yet staged.\n"
                 f"DO NOT re-apply a change that is already in the staged file.\n"
@@ -360,7 +375,7 @@ def apply_diff(relative_path: str, old_string: str, new_string: str, preserve_in
             )
 
         target.write_text(proposed_content, encoding="utf-8")
-        return f"applied: {relative_path}"
+        return f"applied: {relative_path}{selectors_line}"
     except Exception as e:
         return f"apply_diff failed: {e}"
 

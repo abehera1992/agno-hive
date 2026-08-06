@@ -69,6 +69,42 @@ def test_summarize_actual_writes_deduplicates_the_same_file():
     assert out.count("x.scss") == 1
 
 
+def test_summarize_actual_writes_surfaces_selectors_touched():
+    result = _msgs(_tool_msg(
+        "apply_diff",
+        "review_pending: x.module.scss — this change is now staged.\n"
+        "Selectors touched: .statusBadge",
+    ))
+    out = team._summarize_actual_writes(result)
+    assert "selectors: .statusBadge" in out
+
+
+def test_summarize_actual_writes_surfaces_scope_creep_across_two_calls():
+    """Confirmed live 2026-08-06: a lint-fix retry, asked to correct a namespace
+    mismatch on .statusBadge, ALSO injected unrelated properties into an existing,
+    already-correct .badgeBoth rule the task never named -- narrated as a fix that
+    never actually applied to .badgeBoth. Two separate apply_diff calls to the SAME
+    file, each touching a different selector, must both surface in the aggregate --
+    a human must be able to see the full scope of what changed, not just the last
+    call's slice of it."""
+    result = _msgs(
+        _tool_msg(
+            "apply_diff",
+            "review_pending: parties.module.scss — this change is now staged.\n"
+            "Selectors touched: .badgeBoth",
+        ),
+        _tool_msg(
+            "apply_diff",
+            "review_pending: parties.module.scss — this change is now staged.\n"
+            "Selectors touched: .statusBadge",
+        ),
+    )
+    out = team._summarize_actual_writes(result)
+    assert "selectors:" in out
+    assert ".badgeBoth" in out
+    assert ".statusBadge" in out
+
+
 # ---- _count_successful_write_calls -----------------------------------------
 
 def test_count_successful_write_calls_returns_minus_one_with_no_messages():

@@ -471,6 +471,10 @@ def _count_read_calls(result) -> int:
 # call by name, and _count_read_calls-style presence checking cannot tell the two apart.
 _WRITE_TOOLS = {"apply_diff", "write_file"}
 _WRITE_SUCCESS_RE = re.compile(r"^(review_pending|written|applied):", re.IGNORECASE)
+# apply_diff (hive-mcp/tools/files.py) reports every selector its own old_string/
+# new_string touched, independent of what the model later claims it changed. See
+# _summarize_actual_writes for the live incident this closes.
+_SELECTORS_TOUCHED_RE = re.compile(r"Selectors touched:\s*([^\n]+)")
 
 # Phrases a model uses to report a file was actually changed. Deliberately broad: this
 # only gates a retry when NO write tool call succeeded (see _count_successful_write_calls
@@ -548,8 +552,18 @@ def _summarize_actual_writes(*results) -> str:
     Returns "" (nothing appended) when NONE of the traces show a successful
     write-tool call -- most runs are answer-only, and a permanent "no files changed"
     footer on every conversational reply would be noise, not signal.
+
+    Also surfaces WHICH SELECTORS were touched within an SCSS file, not just which
+    file -- a scope-creep guard, not just a write-happened guard. Confirmed live
+    2026-08-06: a lint-fix retry, asked to correct a namespace mismatch on
+    .statusBadge, ALSO injected unrelated properties into an existing, already-
+    correct .badgeBoth rule the task never named, then narrated the change as a fix
+    that never actually applied to .badgeBoth. The file-level appendix alone
+    ("parties.module.scss — review_pending") would not have shown this; the
+    selector list does, regardless of what the narrative claims changed.
     """
-    changed: list[str] = []
+    kind_by_path: dict[str, str] = {}
+    selectors_by_path: dict[str, list[str]] = {}
     for result in results:
         msgs = getattr(result, "messages", None) or []
         for m in msgs:
@@ -568,15 +582,24 @@ def _summarize_actual_writes(*results) -> str:
             # (changes)" or "written: src/new.py" -- first whitespace-delimited token.
             rest = text.strip()[match.end():].strip()
             path = rest.split()[0] if rest else "(unknown path)"
-            entry = f"{path} — {match.group(1).lower()}"
-            if entry not in changed:
-                changed.append(entry)
-    if not changed:
+            if path not in kind_by_path:
+                kind_by_path[path] = match.group(1).lower()
+            sel_match = _SELECTORS_TOUCHED_RE.search(text)
+            if sel_match:
+                bucket = selectors_by_path.setdefault(path, [])
+                for name_ in (s.strip() for s in sel_match.group(1).split(",")):
+                    if name_ and name_ not in bucket:
+                        bucket.append(name_)
+    if not kind_by_path:
         return ""
-    lines = "\n".join(f"- {c}" for c in changed)
+    lines = []
+    for path, kind in kind_by_path.items():
+        selectors = selectors_by_path.get(path)
+        suffix = f" (selectors: {', '.join(selectors)})" if selectors else ""
+        lines.append(f"- {path} — {kind}{suffix}")
     return (
         f"\n\n---\n**Actual file changes this run (from the tool trace, not the "
-        f"narrative above):**\n{lines}"
+        f"narrative above):**\n" + "\n".join(lines)
     )
 
 
@@ -762,13 +785,27 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         )
     if lint_violations:
         named = "; ".join(lint_violations[:4])
+        # SCOPE line added 2026-08-06 after a live incident: asked to fix a
+        # NAMESPACE MISMATCH on .statusBadge, a retry ALSO injected unrelated
+        # properties into an existing, already-correct .badgeBoth rule the task
+        # never named, then narrated it as a fix that never actually applied to
+        # .badgeBoth. Re-handing the model the full original task text (below) is
+        # an open invitation to "improve" anything it notices along the way; this
+        # sentence exists specifically to close that door. Not trusted alone --
+        # apply_diff's own "Selectors touched" report (hive-mcp/tools/files.py) is
+        # the mechanical backstop that makes a violation of this instruction
+        # visible in the ground-truth appendix even if the model ignores it.
         instructions.append(
             f"the code you staged has real convention violations: {named}. Call "
-            f"apply_diff() again against the SAME staged file to fix these EXACT "
-            f"issues in the code itself — rewording the prose answer does not fix "
-            f"them, the file on disk is still wrong until a new apply_diff() call "
-            f"corrects it. Read the current staged state first via "
-            f"get_file_content('<path>.hive_proposed') if unsure what changed."
+            f"apply_diff() again against the SAME staged file to fix ONLY these "
+            f"EXACT issues — rewording the prose answer does not fix them, the "
+            f"file on disk is still wrong until a new apply_diff() call corrects "
+            f"it. Read the current staged state first via "
+            f"get_file_content('<path>.hive_proposed') if unsure what changed. Do "
+            f"NOT modify, add properties to, or otherwise touch any OTHER rule or "
+            f"selector in this file, even if it looks related or you notice "
+            f"something else that could be improved — fix only the exact "
+            f"violation named above and nothing else."
         )
     retry_prompt = f"{task}\n\nIMPORTANT: " + " Also, ".join(instructions)
     try:

@@ -297,3 +297,60 @@ def test_apply_diff_name_collision_check_skips_non_scss_files(tmp_path, monkeypa
     )
 
     assert "REFUSED" not in result
+
+
+def test_apply_diff_success_reports_the_new_selector_touched(tmp_path, monkeypatch):
+    _setup_scss(tmp_path, monkeypatch, ".badge {\n  display: flex;\n}\n")
+
+    result = files.apply_diff(
+        "sample.module.scss",
+        ".badge {\n  display: flex;\n}",
+        ".badge {\n  display: flex;\n}\n\n.statusBadge {\n  color: red;\n}",
+    )
+
+    assert "Selectors touched:" in result
+    assert ".statusBadge" in result
+
+
+def test_apply_diff_success_reports_an_edited_existing_selector(tmp_path, monkeypatch):
+    _setup_scss(tmp_path, monkeypatch, ".badge {\n  display: flex;\n}\n")
+
+    result = files.apply_diff(
+        "sample.module.scss",
+        ".badge {\n  display: flex;\n}",
+        ".badge {\n  display: flex;\n  color: red;\n}",
+    )
+
+    assert "Selectors touched: .badge" in result
+
+
+def test_apply_diff_success_reports_scope_creep_into_an_unrelated_selector(tmp_path, monkeypatch):
+    """Confirmed live 2026-08-06: a lint-fix retry, asked to correct a namespace
+    mismatch on .statusBadge, ALSO injected unrelated properties into an existing,
+    already-correct .badgeBoth rule the task never named -- and narrated it as a
+    fix that never actually applied to that rule. The tool-reported selector list
+    must show BOTH names whenever an edit's old_string/new_string spans both, so
+    this is visible in the ground-truth trace regardless of the narrative."""
+    _setup_scss(
+        tmp_path, monkeypatch,
+        ".badgeBoth {\n  background: index.$success-bg;\n  color: index.$success;\n}\n",
+    )
+
+    result = files.apply_diff(
+        "sample.module.scss",
+        ".badgeBoth {\n  background: index.$success-bg;\n  color: index.$success;\n}",
+        ".badgeBoth {\n  background: index.$success-bg;\n  color: index.$success;\n  "
+        "border: 1px solid index.$success-border;\n}\n\n.statusBadge {\n  color: red;\n}",
+    )
+
+    assert "Selectors touched:" in result
+    assert ".badgeBoth" in result
+    assert ".statusBadge" in result
+
+
+def test_apply_diff_non_scss_success_has_no_selectors_line(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch, "def foo():\n    return 1\n")
+
+    result = files.apply_diff("sample.py", "return 1", "return 2")
+
+    assert "Selectors touched:" not in result
