@@ -961,7 +961,7 @@ async def run_task_stream(
 
     failure_context, (session_summary, session_messages), skill_catalog = (
         await asyncio.gather(
-            load_failure_context(project_id),
+            load_failure_context(project_id, current_task=task),
             _load_session_context(),
             _fetch_skill_catalog(all_mcp_urls[0] if all_mcp_urls else None),
         )
@@ -1106,7 +1106,7 @@ async def run_task_async(
 
     failure_context, (session_summary, session_messages), skill_catalog = (
         await asyncio.gather(
-            load_failure_context(project_id),
+            load_failure_context(project_id, current_task=task),
             _load_session_context(),
             _fetch_skill_catalog(all_mcp_urls[0] if all_mcp_urls else None),
         )

@@ -9,7 +9,55 @@ Failure path  → structured record in PostgreSQL failure_log table
 Context load  → queries failure_log before each task, injected into coordinator instructions
 """
 import asyncio
+import re
 from datetime import datetime
+
+# Generic dev-speak that would make every task look related to every other task
+# if treated as a relevance signal ("add", "file", "class", "correct"...). Kept
+# deliberately short -- this only needs to strip words common enough to appear in
+# nearly every task/correction pair regardless of topic; anything more specific
+# than this list is exactly the kind of signal _significant_tokens wants to keep.
+_STOPWORDS = {
+    "the", "a", "an", "to", "for", "and", "or", "of", "in", "on", "with", "this",
+    "that", "is", "are", "was", "were", "add", "added", "adding", "class", "file",
+    "update", "updated", "create", "created", "new", "code", "change", "changed",
+    "fix", "fixed", "task", "read", "check", "propose", "using", "used", "use",
+    "here", "elsewhere", "correct", "rule", "existing", "not", "does", "real",
+    "already", "value", "values", "name", "names", "content", "line", "call",
+    "calls", "called", "make", "made", "need", "needs", "needed", "also",
+}
+_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_./-]{2,}")
+
+
+def _significant_tokens(text: str) -> set[str]:
+    """Path-like/module-like tokens worth matching a past failure against a new
+    task on: filenames, module names, identifiers -- not generic English words.
+    A token counts as significant if it contains a path separator, a dot
+    (extension or module-ish), an underscore, or is simply long enough (>=6
+    chars) to plausibly be a real identifier rather than common vocabulary this
+    short stopword list happened to miss.
+
+    Also adds the BASENAME of any path-like token (the part after the last "/")
+    as its own entry -- a full path mentioned in one text ("API/inventory-
+    service/router/vouchers_api.py") and a bare filename mentioned in another
+    ("vouchers_api.py") clearly refer to the same file, but would never overlap
+    as exact set members without this: the greedy token regex swallows the whole
+    path into ONE token, distinct from the bare filename string. Confirmed live
+    2026-08-06: this exact mismatch made a genuinely relevant failure (a wrong-
+    file citation for vouchers_api.py) invisible to a task that named the file by
+    its full repo-relative path."""
+    out: set[str] = set()
+    for m in _TOKEN_RE.finditer(text.lower()):
+        tok = m.group(0).strip(".-/")
+        if not tok or tok in _STOPWORDS:
+            continue
+        if "/" in tok:
+            basename = tok.rsplit("/", 1)[-1]
+            if basename and basename not in _STOPWORDS:
+                out.add(basename)
+        if "/" in tok or "." in tok or "_" in tok or len(tok) >= 6:
+            out.add(tok)
+    return out
 
 
 # Suffix for the isolated experience-replay namespace. Task outcomes live here
@@ -128,10 +176,64 @@ async def record_failure(
         print(f"[feedback] record_failure warning: {exc}")
 
 
+def _filter_relevant_failures(
+    current_task: str,
+    failures: list[tuple[str, str, str]],
+    limit: int,
+) -> list[tuple[str, str, str]]:
+    """Rank `failures` (task, error_type, error_message rows, already ordered
+    newest-first) by shared significant tokens with `current_task`, keep only
+    ones with at least one shared token, and return the top `limit`.
+
+    Ties broken by recency (the row's original position in `failures`) since
+    the DB query that produced it is already newest-first. When `current_task`
+    is empty, returns the first `limit` rows unfiltered -- the pre-existing
+    recency-only behaviour, kept as the fallback when there's no task text to
+    score against rather than silently returning nothing.
+
+    Pulled out of load_failure_context as a pure function (no DB access) so the
+    relevance logic itself -- the part that actually changed, and the part a
+    regression would be silent and hard to notice in -- can be unit tested
+    without mocking psycopg.
+    """
+    if not current_task:
+        return failures[:limit]
+    task_tokens = _significant_tokens(current_task)
+    scored = []
+    for i, (task_text, err_type, err_msg) in enumerate(failures):
+        overlap = task_tokens & _significant_tokens(f"{task_text} {err_msg}")
+        if overlap:
+            scored.append((len(overlap), -i, task_text, err_type, err_msg))
+    scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return [(t, et, em) for _, _, t, et, em in scored[:limit]]
+
+
 # ── Context loader ────────────────────────────────────────────────────────────
 
-async def load_failure_context(project_id: str, limit: int | None = None) -> str:
-    """Return a formatted string of recent failures to inject into coordinator instructions.
+async def load_failure_context(project_id: str, limit: int | None = None, current_task: str = "") -> str:
+    """Return a formatted string of recent, RELEVANT failures to inject into
+    coordinator instructions.
+
+    Confirmed live 2026-08-06: this used to return the N most recent failures for
+    the project with NO relevance filtering at all -- a day spent correcting one
+    specific SCSS namespace bug on the parties module posted several /feedback
+    corrections mentioning "statusBadge" and "parties.module.scss", and those
+    corrections were then injected VERBATIM into a completely unrelated vouchers-
+    module research task's coordinator instructions (labeled "read every point
+    before writing code"). The coordinator, dutifully following that instruction,
+    searched for "statusBadge" -- a term the vouchers task never mentioned -- found
+    an unrelated real occurrence in a different module's stylesheet, and
+    misattributed it to vouchers in its final answer.
+
+    Scores each candidate failure's relevance against `current_task` by shared
+    PATH-LIKE tokens (filenames, module names, identifiers) via
+    _significant_tokens -- not generic English words, which would make every task
+    look related to every other task. Only failures sharing at least one such
+    token are injected; if none do, returns "" rather than falling back to
+    "most recent regardless of topic", which is the exact behaviour that caused
+    the incident above. When `current_task` is empty (no task text available to
+    score against), falls back to the old recency-only behaviour instead of
+    silently injecting nothing.
 
     `limit` defaults to config.failure_context_limit (env AGNO_FAILURE_CONTEXT_LIMIT,
     default 10). Pass an explicit int to override per call.
@@ -143,6 +245,12 @@ async def load_failure_context(project_id: str, limit: int | None = None) -> str
         if limit is None:
             limit = config.failure_context_limit
 
+        # Pool wider than `limit` so relevance-ranking has something to rank --
+        # fetching only `limit` rows up front (recency-first, like before) would
+        # mean a genuinely relevant failure just outside the top N never gets a
+        # chance to surface once irrelevant, merely-recent ones are filtered out.
+        pool_size = max(limit * 5, 50)
+
         async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
             await _ensure_table(conn)
             rows = await conn.execute(
@@ -153,10 +261,14 @@ async def load_failure_context(project_id: str, limit: int | None = None) -> str
                 ORDER BY created_at DESC
                 LIMIT %s
                 """,
-                (project_id, limit),
+                (project_id, pool_size),
             )
             failures = await rows.fetchall()
 
+        if not failures:
+            return ""
+
+        failures = _filter_relevant_failures(current_task, failures, limit)
         if not failures:
             return ""
 
