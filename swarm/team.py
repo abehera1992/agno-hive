@@ -603,6 +603,18 @@ def _claimed_search_terms(content: str) -> list[str]:
     return terms
 
 
+def _has_bare_absence_claim(content: str) -> bool:
+    """True when the answer asserts something was NOT FOUND but names no specific
+    term for _claimed_search_terms to extract -- e.g. a terse "Not found." with no
+    citation of what was searched. Confirmed live 2026-08-06: this slips past
+    _unverified_claimed_searches entirely (an empty claimed-terms list has nothing
+    to compare against the trace), even when the underlying trace shows the model
+    reading/globbing an entirely wrong, hallucinated directory and never running a
+    real content search for anything."""
+    text = content or ""
+    return bool(_NOT_FOUND_RE.search(text)) and not _claimed_search_terms(text)
+
+
 def _unverified_claimed_searches(content: str, *results) -> list[str]:
     """Claimed search terms (see _claimed_search_terms) with no matching actual
     search_files()/find_files() call anywhere in `results`. Matching is loose --
@@ -774,32 +786,47 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # can catch this; only comparing the claimed term against the actual tool_calls
     # arguments can.
     unverified_searches = _unverified_claimed_searches(content, result)
-    if unverified_searches:
-        print(f"[team] answer claims searches that never ran: {unverified_searches} — retrying with a mandatory search")
-        try:
-            named = ", ".join(unverified_searches[:6])
-            retry = await team.arun(
-                f"{task}\n\n"
+    bare_absence = not unverified_searches and _has_bare_absence_claim(content) and not _extract_searched_patterns(result)
+    if unverified_searches or bare_absence:
+        if unverified_searches:
+            print(f"[team] answer claims searches that never ran: {unverified_searches} — retrying with a mandatory search")
+            claim_note = (
                 f"IMPORTANT: a previous attempt claimed to have searched for these "
                 f"terms, but no search_files() or find_files() call in that attempt "
-                f"actually used them: {named}. A 'NOT FOUND' conclusion is only true "
-                f"if you actually ran that exact search -- call search_files() for "
-                f"EACH of these terms now, across the whole relevant directory (not "
-                f"just one file), and report what you genuinely find, even if it "
-                f"changes your earlier answer."
+                f"actually used them: {', '.join(unverified_searches[:6])}. A 'NOT "
+                f"FOUND' conclusion is only true if you actually ran that exact "
+                f"search -- call search_files() for EACH of these terms now, across "
+                f"the whole relevant directory (not just one file), and report what "
+                f"you genuinely find, even if it changes your earlier answer."
             )
+        else:
+            print("[team] answer concludes 'not found' with no search_files()/find_files() call at all — retrying with a mandatory search")
+            claim_note = (
+                f"IMPORTANT: a previous attempt concluded something was 'not found' "
+                f"without ever calling search_files() or find_files() for the actual "
+                f"term(s) in question -- reading a file, or guessing at a directory "
+                f"path that turned out empty, does not count as a real search. Name "
+                f"the specific term(s) you are concluding are absent, call "
+                f"search_files() for EACH of them now across the whole relevant "
+                f"directory, and report what you genuinely find, even if it changes "
+                f"your earlier answer."
+            )
+        try:
+            retry = await team.arun(f"{task}\n\n{claim_note}")
             all_results.append(retry)
             retried = retry.content if hasattr(retry, "content") else str(retry)
             if retried:
                 retry_unverified = _unverified_claimed_searches(retried, retry)
-                if retry_unverified:
+                retry_bare = not retry_unverified and _has_bare_absence_claim(retried) and not _extract_searched_patterns(retry)
+                if retry_unverified or retry_bare:
                     # Bounded at one retry, same philosophy as the write-claim and
                     # citation paths -- surface rather than hide.
+                    named = ', '.join(retry_unverified[:6]) if retry_unverified else "the claimed absence"
                     return (
                         f"{retried}\n\n---\n**This answer claims searches that were "
-                        f"never actually run ({', '.join(retry_unverified[:6])}) — "
-                        f"treat any 'NOT FOUND' conclusion resting on them as "
-                        f"UNVERIFIED, not confirmed absent.**"
+                        f"never actually run ({named}) — treat any 'NOT FOUND' "
+                        f"conclusion resting on them as UNVERIFIED, not confirmed "
+                        f"absent.**"
                         + _summarize_actual_writes(*all_results)
                     )
                 content, result = retried, retry

@@ -81,6 +81,28 @@ def test_claimed_search_terms_empty_when_no_claim_present():
     assert team._claimed_search_terms("The Vouchers module supports CRUD operations.") == []
 
 
+# ── _has_bare_absence_claim ───────────────────────────────────────────────────
+
+def test_bare_absence_claim_detects_a_terse_not_found():
+    """Confirmed live 2026-08-06: the model read a wrong, hallucinated directory
+    (API/voucher-service/ instead of the real API/inventory-service/), got empty
+    glob results, and answered just "Not found." with no term citation at all --
+    _claimed_search_terms extracts nothing from that, so _unverified_claimed_searches
+    has nothing to flag even though no real content search ever ran."""
+    assert team._has_bare_absence_claim("Not found.") is True
+
+
+def test_bare_absence_claim_false_when_terms_are_named():
+    """A cited claim is handled by _unverified_claimed_searches instead -- this
+    predicate only covers the case where NOTHING was named."""
+    content = "NOT FOUND (searched for bulk_generate in all files)"
+    assert team._has_bare_absence_claim(content) is False
+
+
+def test_bare_absence_claim_false_when_no_not_found_at_all():
+    assert team._has_bare_absence_claim("The Vouchers module supports CRUD operations.") is False
+
+
 # ── _extract_searched_patterns ────────────────────────────────────────────────
 
 def test_extract_searched_patterns_reads_the_pattern_argument():
@@ -208,4 +230,59 @@ async def test_verified_answer_does_not_retry_when_the_claimed_search_actually_r
     out = await team._verified_answer(content, "research vouchers", fake_team, None, result=original_result)
 
     assert fake_team.prompts == []  # no retry needed
+    assert out == content
+
+
+@pytest.mark.asyncio
+async def test_verified_answer_retries_a_bare_not_found_with_zero_search_calls():
+    """Confirmed live 2026-08-06: a terse "Not found." answer, with a trace showing
+    only get_file_content()/find_files() calls against a hallucinated wrong
+    directory and NO search_files() call for any real term, sailed through
+    unchecked because _unverified_claimed_searches has nothing named to compare."""
+    original_result = _msgs(
+        _tool_msg("get_file_content", "58 chars"),  # wrong, hallucinated path
+    )
+    content = "Not found."
+
+    retry_result = SimpleNamespace(
+        content="FOUND: bulk_generate at vouchers_api.py:210.",
+        messages=[_search_call("search_files", pattern="bulk_generate")],
+    )
+    fake_team = _FakeTeam(retry_result)
+
+    out = await team._verified_answer(content, "is there a bulk-create endpoint", fake_team, None, result=original_result)
+
+    assert len(fake_team.prompts) == 1
+    assert out.startswith("FOUND: bulk_generate")
+
+
+@pytest.mark.asyncio
+async def test_verified_answer_disclaims_when_bare_not_found_retry_still_has_no_search():
+    original_result = _msgs(_tool_msg("get_file_content", "58 chars"))
+    content = "Not found."
+
+    retry_result = SimpleNamespace(
+        content="Still not found.",
+        messages=[_tool_msg("find_files", "empty")],  # still no real search_files/find_files w/ a term
+    )
+    fake_team = _FakeTeam(retry_result)
+
+    out = await team._verified_answer(content, "is there a bulk-create endpoint", fake_team, None, result=original_result)
+
+    assert len(fake_team.prompts) == 1
+    assert "UNVERIFIED" in out
+
+
+@pytest.mark.asyncio
+async def test_verified_answer_does_not_retry_a_not_found_that_already_ran_a_search():
+    """Even with no term named in the final prose, a real search_files() call
+    somewhere in the trace is enough -- this is the "no search at all" gap, not a
+    requirement that every answer narrate its own search."""
+    original_result = _msgs(_search_call("search_files", pattern="bulk_generate"))
+    content = "Not found."
+    fake_team = _FakeTeam(retry_result=None)
+
+    out = await team._verified_answer(content, "is there a bulk-create endpoint", fake_team, None, result=original_result)
+
+    assert fake_team.prompts == []
     assert out == content
