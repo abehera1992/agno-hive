@@ -862,6 +862,7 @@ def _build_team(
         add_member_tools_to_context=True,
         markdown=True,
         max_iterations=config.max_iterations,
+        tool_call_limit=config.tool_call_limit,
     )
 
 

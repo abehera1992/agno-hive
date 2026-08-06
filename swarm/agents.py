@@ -99,10 +99,11 @@ def make_agent_from_spec(spec, *mcps: MCPTools, skill_catalog: list[dict] | None
         description=spec.description,
         markdown=True,
         add_name_to_context=True,
+        tool_call_limit=config.tool_call_limit,
     )
 
 
-_COMMON_AGENT_KWARGS = dict(markdown=True, add_name_to_context=True)
+_COMMON_AGENT_KWARGS = dict(markdown=True, add_name_to_context=True, tool_call_limit=config.tool_call_limit)
 
 
 def make_coder(*mcps: MCPTools) -> Agent:

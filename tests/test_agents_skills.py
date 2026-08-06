@@ -1,5 +1,5 @@
 from api.models import AgentSpec
-from swarm.agents import format_skill_catalog, make_agent_from_spec
+from swarm.agents import format_skill_catalog, make_agent_from_spec, make_coder
 
 
 _CATALOG = [
@@ -55,3 +55,28 @@ def test_make_agent_from_spec_without_skill_catalog_is_unchanged(monkeypatch):
     agent = make_agent_from_spec(spec)
 
     assert agent.instructions == ["base instruction"]
+
+
+def test_make_agent_from_spec_sets_tool_call_limit(monkeypatch):
+    """Confirmed live 2026-08-06: a Coder made 18+ consecutive apply_diff calls with
+    an identical, hallucinated old_string, each refused, each refusal ignored -- 36+
+    total tool calls in what the coordinator's own max_iterations never saw as more
+    than one of its own iterations, because no Agent construction in this codebase
+    set agno's own tool_call_limit (framework-enforced at the model-call layer, not
+    just an advisory text response)."""
+    monkeypatch.setattr("swarm.agents.config.inference_backend", "ollama")
+    monkeypatch.setattr("swarm.agents.config.tool_call_limit", 25)
+    spec = AgentSpec(name="Coder", role="engineer", model="qwen2.5-coder:32b", instructions=["x"])
+
+    agent = make_agent_from_spec(spec)
+
+    assert agent.tool_call_limit == 25
+
+
+def test_make_coder_sets_tool_call_limit(monkeypatch):
+    monkeypatch.setattr("swarm.agents.config.inference_backend", "ollama")
+    monkeypatch.setattr("swarm.agents.config.tool_call_limit", 25)
+
+    agent = make_coder()
+
+    assert agent.tool_call_limit == 25

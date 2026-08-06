@@ -71,6 +71,17 @@ class Config:
     # Swarm behaviour
     stream: bool = os.getenv("STREAM", "false").lower() == "true"
     max_iterations: int = int(os.getenv("MAX_ITERATIONS", "25"))
+    # Caps total tool calls within ONE agent/team run, enforced by agno itself at the
+    # model-call layer (Agent/Team's own tool_call_limit kwarg) -- NOT the same thing
+    # as max_iterations above. max_iterations bounds the COORDINATOR's own decision
+    # loop (how many times it delegates and re-decides); it does nothing for tool
+    # calls made INSIDE a single delegation to a member agent (Coder, Reviewer, ...).
+    # Measured live 2026-08-06: a Coder made 18+ consecutive apply_diff calls with an
+    # identical, hallucinated old_string, each one correctly refused, each refusal
+    # ignored -- 36+ total tool calls in what the coordinator still counted as ONE of
+    # its own iterations, because tool_call_limit was never set on any Agent/Team
+    # construction in this codebase (agno's own default is None -- unbounded).
+    tool_call_limit: int = int(os.getenv("TOOL_CALL_LIMIT", "25"))
 
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))

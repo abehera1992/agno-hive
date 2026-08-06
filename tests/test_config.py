@@ -49,3 +49,16 @@ def test_session_window_from_env(monkeypatch):
     mod = _reload_config()
     cfg = mod.Config()
     assert cfg.session_window == 12
+
+
+def test_tool_call_limit_default():
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.tool_call_limit == 25
+
+
+def test_tool_call_limit_from_env(monkeypatch):
+    monkeypatch.setenv("TOOL_CALL_LIMIT", "40")
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.tool_call_limit == 40
