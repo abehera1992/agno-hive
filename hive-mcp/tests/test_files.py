@@ -123,6 +123,53 @@ def test_apply_diff_same_line_bare_line_number_also_gets_specific_hint(tmp_path,
     assert "LINENUM" in result or "line-number" in result or "line number" in result
 
 
+def test_apply_diff_hallucinated_placeholder_comment_gets_specific_hint(tmp_path, monkeypatch):
+    """Confirmed live 2026-08-06: two separate failed apply_diff attempts, in two
+    different retries of the SAME task, used old_string='/* Add statusBadge class
+    here */' and later old_string='// Add status badge style here' -- neither
+    comment exists anywhere in the real file; both were invented as a plausible
+    anchor rather than read."""
+    _setup(tmp_path, monkeypatch, ".badge {\n  display: flex;\n}\n")
+
+    result = files.apply_diff(
+        "sample.py",
+        "/* Add statusBadge class here */",
+        "/* Add statusBadge class here */\n.statusBadge {}",
+    )
+
+    assert "old_string not found" in result
+    assert "invented placeholder comment" in result
+
+
+def test_apply_diff_hallucinated_line_comment_placeholder_also_gets_hint(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch, ".badge {\n  display: flex;\n}\n")
+
+    result = files.apply_diff(
+        "sample.py",
+        "// Add status badge style here",
+        "// Add status badge style here\n.statusBadge {}",
+    )
+
+    assert "old_string not found" in result
+    assert "invented placeholder comment" in result
+
+
+def test_apply_diff_real_comment_does_not_trigger_placeholder_hint(tmp_path, monkeypatch):
+    """The regex must not flag ordinary, real comments -- only instructional-sounding
+    ones ("add X here", "TODO: implement") that this project's files never actually
+    contain."""
+    _setup(tmp_path, monkeypatch, ".badge {\n  display: flex;\n}\n")
+
+    result = files.apply_diff(
+        "sample.py",
+        "// eslint-disable-next-line no-unused-vars",
+        "// eslint-disable-next-line no-unused-vars\nx = 1",
+    )
+
+    assert "old_string not found" in result
+    assert "invented placeholder comment" not in result
+
+
 def test_apply_diff_hard_stops_after_many_distinct_failures(tmp_path, monkeypatch):
     """The exact-repeat STOPPED check (above) only catches the SAME old_string
     tried twice in a row. Confirmed live 2026-08-05: a Coder varied its guess

@@ -47,6 +47,19 @@ _consecutive_failures: dict[str, int] = {}
 # (the tab collapsed to spaces) instead of two. Both shapes get the same hint now.
 _BARE_LINE_NUMBER_RE = re.compile(r"^\s*\d+(?:\s*\n|[ \t]+\S)")
 
+# An instructional-sounding comment ("Add X here", "// TODO: implement Y") is a
+# strong signal old_string was IMAGINED as a convenient marker rather than copied
+# from the real file. Measured live 2026-08-06: two separate failed apply_diff
+# attempts used old_string='/* Add statusBadge class here */' and, in a later retry
+# against the SAME task, old_string='// Add status badge style here' -- neither
+# comment exists anywhere in the real file; both were invented as a plausible-
+# sounding place to anchor, not read.
+_HALLUCINATED_PLACEHOLDER_RE = re.compile(
+    r"(?:/\*\s*(?:add|insert|todo|fixme|placeholder|implement|your)\b[^*]*\*/"
+    r"|//\s*(?:add|insert|todo|fixme|placeholder|implement|your)\b.*)",
+    re.IGNORECASE,
+)
+
 # A top-level class selector opening a rule, e.g. ".statusBadge {" or
 # ".statusBadge--warning {". Deliberately narrow -- line-anchored, no nested "&"
 # selectors, no media queries -- this targets exactly one failure mode (see
@@ -245,6 +258,14 @@ def apply_diff(relative_path: str, old_string: str, new_string: str, preserve_in
                     "output. That line number and the tab after it are NOT part of the file's "
                     "real content — strip everything up to and including the tab, and match "
                     "only the actual code that follows it."
+                ) + hint
+            elif _HALLUCINATED_PLACEHOLDER_RE.search(old_string):
+                hint = (
+                    "\nold_string looks like an invented placeholder comment ('Add X here', "
+                    "'// TODO: implement...') rather than text copied from the real file — "
+                    "this project's files do not contain marker comments like this one. Call "
+                    f"get_file_content('{relative_path}') and anchor old_string on ACTUAL "
+                    "existing code near where the change belongs, not an imagined comment."
                 ) + hint
             return (
                 f"apply_diff failed: old_string not found in {relative_path}. "
