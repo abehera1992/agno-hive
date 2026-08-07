@@ -24,8 +24,10 @@ import config
 from tools.context import (
     get_project_context,
     get_file_content,
+    get_files_batch,
     find_files,
     search_files,
+    search_files_batch,
     count_matches,
     list_directory,
     list_directory_tree,
@@ -168,8 +170,10 @@ def _tool(fn):
 # ── Context + file reading ────────────────────────────────────────────────────
 _tool(get_project_context)
 _tool(get_file_content)
+_tool(get_files_batch)
 _tool(find_files)
 _tool(search_files)
+_tool(search_files_batch)
 _tool(count_matches)
 _tool(verify_claims)
 _tool(list_skills)
