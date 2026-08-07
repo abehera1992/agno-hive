@@ -1090,6 +1090,42 @@ def _build_team(
     )
 
 
+def _stream_event_to_chunk(event) -> str | dict | None:
+    """Classify one raw agno team.arun(stream=True) event into what run_task_stream
+    yields downstream. Duck-typed via getattr since agno event objects vary by type.
+
+    Returns:
+      str  — a TeamRunContent text delta (existing behavior, unchanged)
+      dict — a tool-call sentinel: {"__tool_event__": "start", "name": str, "args": dict}
+             or {"__tool_event__": "end", "name": str, "result_preview": str | None}
+      None — every other event type (dropped, same as the previous hard filter)
+    """
+    event_type = getattr(event, "event", "")
+    if event_type == "TeamRunContent":
+        chunk = getattr(event, "content", None)
+        return chunk if isinstance(chunk, str) and chunk else None
+    if event_type == "TeamToolCallStarted":
+        tool = getattr(event, "tool", None)
+        if tool is None:
+            return None
+        return {
+            "__tool_event__": "start",
+            "name": tool.tool_name,
+            "args": tool.tool_args or {},
+        }
+    if event_type == "TeamToolCallCompleted":
+        tool = getattr(event, "tool", None)
+        if tool is None:
+            return None
+        result = tool.result
+        return {
+            "__tool_event__": "end",
+            "name": tool.tool_name,
+            "result_preview": result[:200] if isinstance(result, str) else None,
+        }
+    return None
+
+
 async def run_task_stream(
     task: str,
     agent_specs: list | None = None,
@@ -1106,7 +1142,9 @@ async def run_task_stream(
 
     Yields:
       str  — content chunks from the coordinator as they arrive
-      dict — final sentinel {"__done__": True, "content": str, "tokens": dict}
+      dict — a tool-call sentinel {"__tool_event__": "start"|"end", ...} (see
+             _stream_event_to_chunk), or the final sentinel
+             {"__done__": True, "content": str, "tokens": dict}
     """
     effective_mcp_url = mcp_url or config.mcp_url
     effective_coordinator = coordinator_model or config.leader_model
@@ -1205,11 +1243,12 @@ async def run_task_stream(
             try:
                 async for event in team.arun(task, stream=True):
                     last_event = event
-                    event_type = getattr(event, "event", "")
-                    chunk = getattr(event, "content", None)
-                    if isinstance(chunk, str) and chunk and event_type == "TeamRunContent":
-                        full_content.append(chunk)
-                        yield chunk
+                    out = _stream_event_to_chunk(event)
+                    if isinstance(out, str):
+                        full_content.append(out)
+                        yield out
+                    elif isinstance(out, dict):
+                        yield out
                 combined = "".join(full_content) or "(no response)"
                 # Tier-3 guard: fill [[COUNT ...]] markers in the final content (streamed
                 # chunks above are pre-substitution; the done-sentinel content is corrected).
