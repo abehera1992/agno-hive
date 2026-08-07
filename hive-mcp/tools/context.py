@@ -270,6 +270,30 @@ async def get_files_batch(paths: list[str]) -> str:
     return _cap("\n\n".join(sections))
 
 
+async def search_files_batch(pattern: str, glob_filters: list[str], max_results: int = 80) -> str:
+    """
+    Search the SAME pattern across multiple glob scopes in ONE tool call, in parallel --
+    use this instead of several separate search_files() calls when checking a term
+    across file types (e.g. '**/*.py' and '**/*.ts') or across multiple directories.
+
+    Args:
+        pattern:      Regex or literal string to search for (same as search_files)
+        glob_filters: e.g. ['**/*.py', '**/*.ts'] -- one search per glob, in parallel
+        max_results:  Max matching lines PER GLOB (default 80, same as search_files)
+    """
+    async def _search_one(g: str) -> str:
+        return await asyncio.to_thread(search_files, pattern, g, max_results)
+
+    outcomes = await asyncio.gather(*(_search_one(g) for g in glob_filters), return_exceptions=True)
+    sections = []
+    for g, outcome in zip(glob_filters, outcomes):
+        if isinstance(outcome, BaseException):
+            sections.append(f"=== glob: {g} ===\nERROR: {outcome}")
+        else:
+            sections.append(f"=== glob: {g} ===\n{outcome}")
+    return _cap("\n\n".join(sections))
+
+
 # When PROJECT_ROOT is a monorepo, short paths like "src/lib/**" are often relative to a
 # subdirectory (e.g. a frontend root), not PROJECT_ROOT itself. Try these prefixes in
 # order before giving up.
