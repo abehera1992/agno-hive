@@ -36,7 +36,10 @@ from tools.context import (
 )
 from tools.files import write_file, apply_diff, run_command
 from tools import bash as _bash_tools
-from tools.bash import bash_session_start, bash_run, bash_session_close
+from tools.bash import (
+    bash_session_start, bash_run, bash_session_close,
+    bash_job_status, bash_job_kill,
+)
 from tools.verify import verify_claims
 from tools.skills import list_skills, load_skill
 from tools.shell import run_shell, run_docker, get_env_info, check_port, list_processes
@@ -197,12 +200,13 @@ _tool(get_env_info)
 _tool(check_port)
 _tool(list_processes)
 
-# ── Persistent bash sessions (cwd persistence + background jobs, Phase 1: ────
-# ── blocking only -- see tools/bash.py) ───────────────────────────────────────
+# ── Persistent bash sessions + background jobs (see tools/bash.py) ───────────
 if config.HIVE_BASH_TOOL_ENABLED:
     _tool(bash_session_start)
     _tool(bash_run)
     _tool(bash_session_close)
+    _tool(bash_job_status)
+    _tool(bash_job_kill)
 
 # ── Git ───────────────────────────────────────────────────────────────────────
 _tool(git_status)

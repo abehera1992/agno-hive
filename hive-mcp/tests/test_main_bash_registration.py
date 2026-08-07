@@ -62,12 +62,18 @@ def _load_main(monkeypatch, recorded: list, bash_tool_enabled: bool):
     return module
 
 
+_BASH_TOOL_NAMES = {
+    "bash_session_start", "bash_run", "bash_session_close",
+    "bash_job_status", "bash_job_kill",
+}
+
+
 def test_bash_tools_registered_when_enabled(monkeypatch):
     recorded = []
     _load_main(monkeypatch, recorded, bash_tool_enabled=True)
 
     names = {getattr(fn, "__name__", None) for fn in recorded}
-    assert {"bash_session_start", "bash_run", "bash_session_close"} <= names
+    assert _BASH_TOOL_NAMES <= names
 
 
 def test_bash_tools_not_registered_when_disabled(monkeypatch):
@@ -75,4 +81,4 @@ def test_bash_tools_not_registered_when_disabled(monkeypatch):
     _load_main(monkeypatch, recorded, bash_tool_enabled=False)
 
     names = {getattr(fn, "__name__", None) for fn in recorded}
-    assert not ({"bash_session_start", "bash_run", "bash_session_close"} & names)
+    assert not (_BASH_TOOL_NAMES & names)

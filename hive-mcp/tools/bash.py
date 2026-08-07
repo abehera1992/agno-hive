@@ -6,9 +6,12 @@ State lives in module-level dicts, matching tools/files.py's _last_failed_call /
 _consecutive_failures pattern; it does not survive a container restart, and isn't
 meant to.
 
-Phase 1 (this file, current): bash_session_start, bash_run (blocking only --
-background=True is rejected with a clear message), bash_session_close.
-Phase 2 (follow-up): bash_run's background=True path, bash_job_status, bash_job_kill.
+Phase 1: bash_session_start, bash_run (blocking mode), bash_session_close.
+Phase 2 (this file, current): bash_run's background=True path, bash_job_status,
+bash_job_kill -- a background job is a plain subprocess.Popen with a daemon reader
+thread pumping merged stdout/stderr into a capped in-memory buffer; polled later via
+bash_job_status, never streamed (no push/streaming channel exists in this
+request/response MCP server).
 
 Why session-scoped state, not a global mutable cwd: hive-mcp is one long-lived
 process shared by every concurrent tool call across every swarm agent run. A global
@@ -34,6 +37,7 @@ from config import (
     HIVE_BASH_DEFAULT_TIMEOUT_SECONDS,
     HIVE_BASH_MAX_TIMEOUT_SECONDS,
     HIVE_BASH_MAX_SESSIONS,
+    HIVE_BASH_MAX_BACKGROUND_JOBS,
     HIVE_BASH_SESSION_TTL_SECONDS,
     HIVE_BASH_REAP_INTERVAL_SECONDS,
 )
@@ -62,7 +66,23 @@ class _Session:
     jobs: set = field(default_factory=set)
 
 
+@dataclass
+class _Job:
+    id: str
+    session_id: str
+    command: str
+    proc: subprocess.Popen
+    started_at: float
+    last_used_at: float
+    timeout: int                       # hard max-runtime cap, not a wait
+    status: str = "running"            # "running" | "exited" | "timed_out" | "killed"
+    exit_code: "int | None" = None
+    output: str = ""
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
 _sessions: dict = {}
+_jobs: dict = {}
 _state_lock = threading.Lock()
 _REAPER_STARTED = False
 
@@ -146,13 +166,19 @@ def bash_run(session_id: str, command: str, timeout: "int | None" = None,
     runs in that command's own subshell and does not leak out -- same as real shell
     scoping, since each call is its own subprocess.
 
-    background=True: not available yet in this phase -- use blocking mode.
+    background=True: starts the command detached and returns a job_id immediately
+    instead of waiting. Poll bash_job_status(job_id) LATER to check on it -- do not
+    sleep-poll-retry in a tight loop, there is no push notification here. `timeout`
+    becomes the job's max runtime, not a wait -- it is killed and marked timed_out
+    if it runs past that. A `cd` in a background command does NOT update the
+    session's persisted cwd (cwd tracking is a blocking-mode-only convenience).
 
     Args:
         session_id: id returned by bash_session_start()
         command: shell command string
-        timeout: seconds to wait, default 120 (clamped to HIVE_BASH_MAX_TIMEOUT_SECONDS)
-        background: run detached and return a job_id immediately (Phase 2, not yet available)
+        timeout: seconds to wait (blocking) or max runtime (background), default
+                 120 (clamped to HIVE_BASH_MAX_TIMEOUT_SECONDS)
+        background: run detached and return a job_id immediately instead of blocking
     """
     if not HIVE_BASH_TOOL_ENABLED:
         return "bash sessions are disabled on this server (HIVE_BASH_TOOL_ENABLED=false)"
@@ -161,10 +187,6 @@ def bash_run(session_id: str, command: str, timeout: "int | None" = None,
         session = _sessions.get(session_id)
     if session is None:
         return f"unknown session_id: {session_id!r} (expired, closed, or never created)"
-
-    if background:
-        return ("background execution is not available yet -- this server only supports "
-                 "blocking mode (background=False) at this time.")
 
     if WRITE_REVIEW and _WRITE_CMD_RE.search(command):
         return (
@@ -176,6 +198,12 @@ def bash_run(session_id: str, command: str, timeout: "int | None" = None,
         timeout = HIVE_BASH_DEFAULT_TIMEOUT_SECONDS
     timeout = max(1, min(timeout, HIVE_BASH_MAX_TIMEOUT_SECONDS))
 
+    with _state_lock:
+        session.last_used_at = time.time()
+
+    if background:
+        return _start_background_job(session, command, timeout)
+
     try:
         r = subprocess.run(
             command,
@@ -186,16 +214,11 @@ def bash_run(session_id: str, command: str, timeout: "int | None" = None,
             cwd=session.cwd,
         )
     except subprocess.TimeoutExpired:
-        with _state_lock:
-            session.last_used_at = time.time()
         return f"timed out after {timeout}s"
     except Exception as e:
-        with _state_lock:
-            session.last_used_at = time.time()
         return f"bash_run failed: {e}"
 
     with _state_lock:
-        session.last_used_at = time.time()
         m = _BARE_CD_RE.match(command)
         if m and r.returncode == 0:
             new_cwd = _resolve_cwd(m.group(1), session.cwd)
@@ -211,30 +234,204 @@ def bash_run(session_id: str, command: str, timeout: "int | None" = None,
     return _cap("\n".join(parts))
 
 
+def _append_job_output(job: "_Job", text: str) -> None:
+    """Append to a job's output buffer under its own lock, keeping the TAIL once
+    the buffer exceeds HIVE_BASH_MAX_OUTPUT_CHARS (most-recent output is more
+    useful than the earliest for a long-running job) -- read at call time so a
+    later monkeypatch/config change is honored, not snapshotted at import time."""
+    if not text:
+        return
+    with job.lock:
+        combined = job.output + text
+        if len(combined) > HIVE_BASH_MAX_OUTPUT_CHARS:
+            combined = (
+                f"... EARLIER OUTPUT DROPPED (job buffer capped at "
+                f"{HIVE_BASH_MAX_OUTPUT_CHARS} chars) ...\n"
+                + combined[-HIVE_BASH_MAX_OUTPUT_CHARS:]
+            )
+        job.output = combined
+
+
+def _pump_job_output(job: "_Job") -> None:
+    """Daemon-thread target: reads a background job's merged stdout/stderr until
+    EOF, then waits for the process to actually exit and records the outcome --
+    unless something else (bash_job_kill, the reaper's timeout sweep) already set
+    a terminal status first, in which case that status wins."""
+    try:
+        stream = job.proc.stdout
+        if stream is not None:
+            for line in stream:
+                _append_job_output(job, line)
+    except Exception as e:
+        _append_job_output(job, f"\n[bash] output reader failed: {e}\n")
+    finally:
+        job.proc.wait()
+        with job.lock:
+            if job.status == "running":
+                job.status = "exited"
+                job.exit_code = job.proc.returncode
+
+
+def _start_background_job(session: "_Session", command: str, timeout: int) -> str:
+    """Spawn a detached command and register it as a job. Holds _state_lock across
+    the cap-check + Popen() + registration so two concurrent callers can't both
+    slip past the concurrency cap (Popen() itself returns immediately -- it starts
+    the process without waiting for it, so holding the lock across it is cheap,
+    unlike subprocess.run which would block for the command's whole runtime)."""
+    with _state_lock:
+        if len(_jobs) >= HIVE_BASH_MAX_BACKGROUND_JOBS:
+            return (f"cannot start background job: at the limit of "
+                     f"{HIVE_BASH_MAX_BACKGROUND_JOBS} concurrent jobs. "
+                     f"Poll and let one finish, or bash_job_kill() one first.")
+        jid = uuid.uuid4().hex[:12]
+        try:
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                cwd=session.cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as e:
+            return f"bash_run failed to start background job: {e}"
+        now = time.time()
+        job = _Job(id=jid, session_id=session.id, command=command, proc=proc,
+                   started_at=now, last_used_at=now, timeout=timeout)
+        _jobs[jid] = job
+        session.jobs.add(jid)
+
+    threading.Thread(target=_pump_job_output, args=(job,), daemon=True).start()
+    return f"job_id: {jid}\nstatus: running"
+
+
+def bash_job_status(job_id: str, tail_chars: int = 4000) -> str:
+    """
+    Poll a background job started via bash_run(..., background=True). Returns
+    status (running/exited/timed_out/killed), exit code once finished, and the
+    last tail_chars of accumulated output (the job's whole stored buffer is
+    itself capped at HIVE_BASH_MAX_OUTPUT_CHARS -- a very verbose long-running
+    job should redirect output to a file and be read via get_file_content
+    instead of relying on this buffer). Safe to call repeatedly.
+
+    Args:
+        job_id: id returned by bash_run(..., background=True)
+        tail_chars: how much of the accumulated output to return (most recent)
+    """
+    with _state_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        return f"unknown job_id: {job_id!r} (finished and reaped, or never created)"
+
+    with job.lock:
+        job.last_used_at = time.time()
+        status = job.status
+        exit_code = job.exit_code
+        output = job.output
+
+    parts = [f"status: {status}"]
+    if exit_code is not None:
+        parts.append(f"exit_code: {exit_code}")
+    if output:
+        tail = output[-tail_chars:] if tail_chars and len(output) > tail_chars else output
+        parts.append(tail)
+    return "\n".join(parts)
+
+
+def bash_job_kill(job_id: str) -> str:
+    """
+    Terminate a running background job. No-op with a clear message if the job
+    already finished (exited/timed_out) or was already killed.
+    """
+    with _state_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        return f"unknown job_id: {job_id!r} (finished and reaped, or never created)"
+
+    with job.lock:
+        if job.status != "running":
+            return f"job {job_id} is not running (status: {job.status})"
+        job.status = "killed"
+
+    try:
+        job.proc.kill()
+    except Exception:
+        pass
+    return f"job killed: {job_id}"
+
+
 def bash_session_close(session_id: str) -> str:
     """
     Close a session, freeing its slot immediately instead of waiting for TTL expiry.
-    Call this when done with a multi-step shell workflow, especially if several
-    sessions were opened in one task.
+    Also kills and removes any background jobs still attached to it (running or
+    not) -- a session's jobs shouldn't outlive the session itself. Call this when
+    done with a multi-step shell workflow, especially if several sessions were
+    opened in one task.
     """
     with _state_lock:
-        existed = _sessions.pop(session_id, None) is not None
-    if not existed:
-        return f"unknown session_id: {session_id!r} (already closed, expired, or never created)"
-    return f"session closed: {session_id}"
+        session = _sessions.pop(session_id, None)
+        if session is None:
+            return f"unknown session_id: {session_id!r} (already closed, expired, or never created)"
+        popped_jobs = [_jobs.pop(jid, None) for jid in session.jobs]
+
+    killed = 0
+    for job in popped_jobs:
+        if job is None:
+            continue
+        with job.lock:
+            was_running = job.status == "running"
+            if was_running:
+                job.status = "killed"
+        if was_running:
+            try:
+                job.proc.kill()
+            except Exception:
+                pass
+            killed += 1
+
+    suffix = f" ({len(popped_jobs)} background job(s) closed, {killed} killed)" if popped_jobs else ""
+    return f"session closed: {session_id}{suffix}"
 
 
 def _reap_once(now: "float | None" = None) -> int:
-    """Close sessions idle past HIVE_BASH_SESSION_TTL_SECONDS. Returns count closed.
-    Callable directly (tests, with an explicit `now`) or from the background reaper
-    thread (real time)."""
+    """Close sessions idle past HIVE_BASH_SESSION_TTL_SECONDS. For background jobs:
+    a RUNNING job is only ever reaped by its OWN timeout (hard max-runtime cap,
+    checked and killed here if exceeded) -- never by idle/no-output alone, since a
+    legitimately slow job may go quiet for a while without being stuck. A job that
+    just reached "timed_out" stays in _jobs for one more sweep so a caller can still
+    poll its final status/output via bash_job_status before it's actually removed.
+    A FINISHED job (exited/timed_out/killed) is removed once idle past the same TTL,
+    to free its dict slot once nobody's collecting the result. Returns the total
+    count of sessions + jobs reaped. Callable directly (tests, with an explicit
+    `now`) or from the background reaper thread (real time)."""
     now = now if now is not None else time.time()
+
     with _state_lock:
-        expired = [sid for sid, s in _sessions.items()
-                   if now - s.last_used_at > HIVE_BASH_SESSION_TTL_SECONDS]
-        for sid in expired:
+        expired_sessions = [sid for sid, s in _sessions.items()
+                             if now - s.last_used_at > HIVE_BASH_SESSION_TTL_SECONDS]
+        jobs_snapshot = list(_jobs.items())
+
+    jobs_to_remove = []
+    for jid, job in jobs_snapshot:
+        with job.lock:
+            if job.status == "running":
+                if now - job.started_at > job.timeout:
+                    job.status = "timed_out"
+                    try:
+                        job.proc.kill()
+                    except Exception:
+                        pass
+            elif now - job.last_used_at > HIVE_BASH_SESSION_TTL_SECONDS:
+                jobs_to_remove.append(jid)
+
+    with _state_lock:
+        for sid in expired_sessions:
             del _sessions[sid]
-    return len(expired)
+        for jid in jobs_to_remove:
+            _jobs.pop(jid, None)
+
+    return len(expired_sessions) + len(jobs_to_remove)
 
 
 def _reap_loop() -> None:
@@ -255,12 +452,23 @@ def _ensure_reaper_started() -> None:
 
 
 def cleanup_all() -> int:
-    """Close every live session. Called on server shutdown (atexit/SIGTERM in
-    main.py) so a restart doesn't need to wait out the TTL reaper. Phase 1 has no
-    live subprocesses to kill (blocking calls complete before returning) -- Phase 2
-    extends this to also terminate live background job processes. Returns count
-    closed."""
+    """Close every live session and kill every live background job. Called on
+    server shutdown (atexit/SIGTERM in main.py) so a restart doesn't leave orphaned
+    child processes behind waiting out their own timeout. Returns the total count
+    of sessions + jobs cleared."""
     with _state_lock:
-        count = len(_sessions)
+        session_count = len(_sessions)
         _sessions.clear()
-    return count
+        jobs_snapshot = list(_jobs.values())
+        _jobs.clear()
+
+    for job in jobs_snapshot:
+        with job.lock:
+            was_running = job.status == "running"
+        if was_running:
+            try:
+                job.proc.kill()
+            except Exception:
+                pass
+
+    return session_count + len(jobs_snapshot)

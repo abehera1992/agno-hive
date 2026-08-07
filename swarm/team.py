@@ -232,10 +232,11 @@ _MUTATING_TOOLS = {
     "write_file", "apply_diff", "run_command", "run_shell", "run_docker",
     "confirm_action", "reject_action", "index_project", "scan_project_context",
     "lightrag_insert", "run_migration",
-    # Persistent bash sessions (hive-mcp/tools/bash.py) -- bash_job_status is
-    # deliberately NOT here: it's a read-only poll, and a read-only team can never
-    # obtain a job_id anyway since bash_run itself is stripped for them.
-    "bash_session_start", "bash_run", "bash_session_close",
+    # Persistent bash sessions + background jobs (hive-mcp/tools/bash.py) --
+    # bash_job_status is deliberately NOT here: it's a read-only poll, and a
+    # read-only team can never obtain a job_id anyway since bash_run itself is
+    # stripped for them.
+    "bash_session_start", "bash_run", "bash_session_close", "bash_job_kill",
 }
 _MUTATING_PREFIXES = (
     "notion_create", "notion_update", "notion_append", "notion_replace",

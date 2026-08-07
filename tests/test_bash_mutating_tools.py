@@ -7,7 +7,7 @@ from swarm.team import _MUTATING_TOOLS, _is_mutating
 
 
 def test_bash_mutating_tools_are_registered():
-    assert {"bash_session_start", "bash_run", "bash_session_close"} <= _MUTATING_TOOLS
+    assert {"bash_session_start", "bash_run", "bash_session_close", "bash_job_kill"} <= _MUTATING_TOOLS
 
 
 def test_bash_job_status_is_not_mutating():
@@ -21,3 +21,4 @@ def test_bash_run_and_session_tools_are_mutating():
     assert _is_mutating("bash_session_start")
     assert _is_mutating("bash_run")
     assert _is_mutating("bash_session_close")
+    assert _is_mutating("bash_job_kill")

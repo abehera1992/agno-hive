@@ -183,6 +183,8 @@ agents:
       - bash_session_start
       - bash_run
       - bash_session_close
+      - bash_job_status
+      - bash_job_kill
       - get_file_content
       - git_status
       - git_log
