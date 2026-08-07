@@ -65,7 +65,9 @@ def format_skill_catalog(catalog: list[dict], names: list[str] | None) -> str:
     return "\n".join(lines)
 
 
-def make_agent_from_spec(spec, *mcps: MCPTools, skill_catalog: list[dict] | None = None) -> Agent:
+def make_agent_from_spec(
+    spec, *mcps: MCPTools, skill_catalog: list[dict] | None = None, tool_hooks: list | None = None
+) -> Agent:
     """Build an Agent from a dynamic spec.
 
     If spec.tools lists tool names, only those Function objects are passed to the
@@ -75,6 +77,11 @@ def make_agent_from_spec(spec, *mcps: MCPTools, skill_catalog: list[dict] | None
     skill_catalog (already fetched once per run by swarm/team.py) is filtered to
     spec.skills and appended as one more instruction entry — the always-on L1
     index this agent sees. Omitted or empty catalog leaves instructions unchanged.
+
+    tool_hooks (default None) is forwarded straight to agno's Agent constructor —
+    swarm/team.py's _build_team passes the SAME hook instance to every member agent
+    (plus the coordinator's own Team(...)) so a read-cache hook can share one dict
+    across the whole run, not one per agent.
     """
     if spec.tools:
         all_funcs: dict = {}
@@ -100,17 +107,19 @@ def make_agent_from_spec(spec, *mcps: MCPTools, skill_catalog: list[dict] | None
         markdown=True,
         add_name_to_context=True,
         tool_call_limit=config.tool_call_limit,
+        tool_hooks=tool_hooks,
     )
 
 
 _COMMON_AGENT_KWARGS = dict(markdown=True, add_name_to_context=True, tool_call_limit=config.tool_call_limit)
 
 
-def make_coder(*mcps: MCPTools) -> Agent:
+def make_coder(*mcps: MCPTools, tool_hooks: list | None = None) -> Agent:
     return Agent(
         name="Coder",
         model=get_model(config.coder_model, config.ollama_host),
         tools=list(mcps),
+        tool_hooks=tool_hooks,
         description="Implementation specialist. Write clean, idiomatic code following existing patterns. Use apply_diff() for existing files, write_file() only for new ones.",
         instructions=[
             *_BASE_PREAMBLE,
@@ -127,11 +136,12 @@ def make_coder(*mcps: MCPTools) -> Agent:
     )
 
 
-def make_reviewer(*mcps: MCPTools) -> Agent:
+def make_reviewer(*mcps: MCPTools, tool_hooks: list | None = None) -> Agent:
     return Agent(
         name="Reviewer",
         model=get_model(config.reviewer_model, config.ollama_host),
         tools=list(mcps),
+        tool_hooks=tool_hooks,
         description="Code review specialist. Check correctness, security, and consistency. Flag real problems only — never style preferences.",
         instructions=[
             *_BASE_PREAMBLE,

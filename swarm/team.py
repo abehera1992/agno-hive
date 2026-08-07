@@ -1067,6 +1067,64 @@ async def _fill_count_markers(content: str, hive_mcp_url: str | None) -> str:
     return _COUNT_MARKER_ANY.sub("[count unavailable]", out)  # strip any malformed leftovers
 
 
+_CACHEABLE_READ_TOOLS = {
+    "get_file_content", "get_files_batch", "search_files", "search_files_batch",
+    "find_files", "list_directory", "list_directory_tree", "count_matches",
+}
+
+
+def _make_read_cache_tool_hook():
+    """Build a fresh, run-scoped cache for read-only tool calls -- a new dict per
+    _build_team() call means the cache lives exactly as long as one run and can
+    never leak stale data across sessions/tasks.
+
+    Only intercepts the tools in _CACHEABLE_READ_TOOLS (read-only, side-effect-free,
+    deterministic within one run) -- never a write/mutating tool. Does not weaken
+    verify_claims' guarantee that a claim is backed by a real tool call: a cache hit
+    still returns data from a genuine earlier fetch THIS SAME RUN, not a guess or a
+    stale value -- it only skips a duplicate network round-trip to hive-mcp for the
+    identical (tool, arguments) pair. Confirmed live 2026-08-07: get_files_batch was
+    called 21-29 times for the SAME 2 files across one 6-agent coordinate-mode run,
+    since agno's share_member_interactions only forwards a teammate's final TEXT
+    answer, never the raw tool result -- a companion prompt-level fix (telling the
+    coordinator/Researcher/Coder to forward and trust citations) did not measurably
+    reduce this on its own, since it depends on model instruction-following rather
+    than a mechanical guarantee.
+
+    Must be async and must be registered on EVERY team member, not just the
+    coordinator's own Team(...) -- two things confirmed by direct source reading
+    and a live check, not assumed:
+      1. Every MCP-server-backed tool call (all of hive-mcp's tools, since it's a
+         remote server) is async on the client side unconditionally, regardless of
+         whether the underlying tool function itself is sync or async -- confirmed
+         via agno.utils.mcp.get_entrypoint_for_tool, whose call_tool wrapper is
+         `async def` with no sync variant. A sync hook that does `function(**args)`
+         against that gets back an unawaited coroutine object, not the real result.
+      2. In mode="coordinate", the coordinator mostly delegates work to team
+         members rather than calling tools itself -- a hook registered only on
+         Team(tool_hooks=[...]) would never see the member agents' own tool calls,
+         which is where the measured redundant reads actually happen. Confirmed by
+         checking ZGX's agno-api.service journal after live test runs that made
+         dozens of get_files_batch calls: a coordinator-only hook logged nothing.
+    """
+    cache: dict[tuple, object] = {}
+
+    async def _read_cache_tool_hook(function_name, function, args, agent=None, team=None):
+        if function_name not in _CACHEABLE_READ_TOOLS:
+            return await function(**args)
+        try:
+            key = (function_name, json.dumps(args or {}, sort_keys=True))
+        except TypeError:
+            return await function(**args)  # non-JSON-serializable args -- skip caching, call through
+        if key in cache:
+            return cache[key]
+        result = await function(**args)
+        cache[key] = result
+        return result
+
+    return _read_cache_tool_hook
+
+
 def _build_team(
     agent_specs: list | None,
     coordinator_model: str,
@@ -1088,10 +1146,20 @@ def _build_team(
     `skill_catalog` (default None) is forwarded to each agent's spec-based construction so its
     L1 catalog can be filtered per agent role — the default Coder+Reviewer fallback path (used
     only when agent_specs is empty) does not take a catalog; that path predates team YAMLs."""
+    # One cache per run, shared by the coordinator AND every member agent (not just
+    # the coordinator) -- see _make_read_cache_tool_hook's docstring for why both of
+    # those are load-bearing, not incidental.
+    read_cache_hook = _make_read_cache_tool_hook()
     if agent_specs:
-        members = [make_agent_from_spec(spec, *mcp_list, skill_catalog=skill_catalog) for spec in agent_specs]
+        members = [
+            make_agent_from_spec(spec, *mcp_list, skill_catalog=skill_catalog, tool_hooks=[read_cache_hook])
+            for spec in agent_specs
+        ]
     else:
-        members = [make_coder(*mcp_list), make_reviewer(*mcp_list)]
+        members = [
+            make_coder(*mcp_list, tool_hooks=[read_cache_hook]),
+            make_reviewer(*mcp_list, tool_hooks=[read_cache_hook]),
+        ]
     return Team(
         name=name,
         description=description,
@@ -1106,6 +1174,7 @@ def _build_team(
         markdown=True,
         max_iterations=config.max_iterations,
         tool_call_limit=config.tool_call_limit,
+        tool_hooks=[read_cache_hook],
     )
 
 
