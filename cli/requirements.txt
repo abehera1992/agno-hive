@@ -1,0 +1,5 @@
+# Optional. cli/hive runs with ZERO installed dependencies without this --
+# see the "TUI" section of cli/hive's own docstring. Installing rich upgrades
+# tool-call rendering from plain [tool] name(args) lines to a collapsed,
+# live-updating panel. `pip install -r cli/requirements.txt` to opt in.
+rich>=13.0.0
