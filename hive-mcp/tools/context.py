@@ -4,6 +4,7 @@ Generic — works with any project layout. Discovers context files
 (CLAUDE.md, AGENTS.md, README.md, DOCS.md) automatically from PROJECT_ROOT.
 """
 import ast
+import asyncio
 import os
 import re
 import sys
@@ -241,6 +242,32 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
         f"# or get_file_content('{relative_path}', offset=<line>, limit=<n>) for a line range.\n\n"
         f"===== HEAD =====\n{head}\n\n===== TAIL =====\n{tail}"
     )
+
+
+async def get_files_batch(paths: list[str]) -> str:
+    """
+    Read multiple files in ONE tool call, in parallel -- use this instead of several
+    separate get_file_content() calls when you already know which files you need
+    (e.g. a pattern file + the file you're about to edit + a related test file).
+
+    Each file is read with get_file_content()'s exact same behavior (line numbers,
+    skeleton-on-oversized, not-found message) -- this only parallelizes the I/O,
+    it does not change what comes back for any individual file.
+
+    Args:
+        paths: relative paths, e.g. ['src/api/routes.py', 'src/api/models.py']
+    """
+    async def _read_one(p: str) -> str:
+        return await asyncio.to_thread(get_file_content, p)
+
+    outcomes = await asyncio.gather(*(_read_one(p) for p in paths), return_exceptions=True)
+    sections = []
+    for p, outcome in zip(paths, outcomes):
+        if isinstance(outcome, BaseException):
+            sections.append(f"=== {p} ===\nERROR: {outcome}")
+        else:
+            sections.append(f"=== {p} ===\n{outcome}")
+    return _cap("\n\n".join(sections))
 
 
 # When PROJECT_ROOT is a monorepo, short paths like "src/lib/**" are often relative to a
