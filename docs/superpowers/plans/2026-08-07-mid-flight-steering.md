@@ -47,6 +47,7 @@
   ```python
   import importlib.util
   import sys
+  from importlib.machinery import SourceFileLoader
   from pathlib import Path
 
 
@@ -57,7 +58,14 @@
       module-level functions without polluting sys.modules across tests."""
       def _load():
           path = Path(__file__).resolve().parent.parent / "cli" / "hive"
-          spec = importlib.util.spec_from_file_location("cli_hive_under_test", path)
+          # cli/hive has no .py suffix, so spec_from_file_location can't infer a
+          # loader on its own (it returns None) -- pass SourceFileLoader explicitly.
+          # Confirmed live 2026-08-07 (SSE Tool-Call Event Pipe plan, Task 3): the
+          # literal version without an explicit loader crashes at module_from_spec
+          # with spec=None -- standard CPython importlib behavior (PEP 451) for an
+          # extensionless filename, not platform-specific.
+          loader = SourceFileLoader("cli_hive_under_test", str(path))
+          spec = importlib.util.spec_from_file_location("cli_hive_under_test", path, loader=loader)
           module = importlib.util.module_from_spec(spec)
           sys.modules["cli_hive_under_test"] = module
           spec.loader.exec_module(module)

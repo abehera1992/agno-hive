@@ -386,6 +386,7 @@
   ```python
   import importlib.util
   import sys
+  from importlib.machinery import SourceFileLoader
   from pathlib import Path
 
 
@@ -396,7 +397,10 @@
       module-level functions without polluting sys.modules across tests."""
       def _load():
           path = Path(__file__).resolve().parent.parent / "cli" / "hive"
-          spec = importlib.util.spec_from_file_location("cli_hive_under_test", path)
+          # cli/hive has no .py suffix, so spec_from_file_location can't infer a
+          # loader on its own (it returns None) -- pass SourceFileLoader explicitly.
+          loader = SourceFileLoader("cli_hive_under_test", str(path))
+          spec = importlib.util.spec_from_file_location("cli_hive_under_test", path, loader=loader)
           module = importlib.util.module_from_spec(spec)
           sys.modules["cli_hive_under_test"] = module
           spec.loader.exec_module(module)
