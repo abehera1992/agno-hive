@@ -104,6 +104,15 @@ class SessionDetail(BaseModel):
     messages: list[SessionMessage]
 
 
+class BranchRequest(BaseModel):
+    message_id: int
+
+
+class ForkRequest(BaseModel):
+    title: str
+    project_id: str
+
+
 class FeedbackRequest(BaseModel):
     session_id: str = ""
     task: str

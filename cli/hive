@@ -1136,6 +1136,69 @@ def _cmd_delete(args: str) -> None:
         print(red(f"  error: {e}"))
 
 
+def _cmd_branch(session_id: str | None, message_id: int) -> str | None:
+    """Rewind the session's leaf to `message_id`'s parent; return that message's
+    content so the caller can prefill it in the input buffer for edit-and-resubmit."""
+    if not session_id:
+        print(yellow("  no active session"))
+        return None
+    try:
+        data = call_api(f"/sessions/{session_id}/branch", {"message_id": message_id})
+        return data.get("editable_content")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print(yellow(f"  message {message_id} not found in this session"))
+        else:
+            print(red(f"  error {e.code}: {e.read().decode()}"))
+        return None
+    except Exception as e:
+        print(red(f"  error: {e}"))
+        return None
+
+
+def _cmd_tree(session_id: str | None) -> str | None:
+    """Interactive branch-point picker (MVP: a flat depth-indented list, not a
+    rendered diagram). Returns the picked message's content for edit-and-resubmit,
+    or None if cancelled/empty."""
+    if not session_id:
+        print(yellow("  no active session"))
+        return None
+    try:
+        data = call_get(f"/sessions/{session_id}/tree")
+    except Exception as e:
+        print(red(f"  error fetching tree: {e}"))
+        return None
+
+    messages = data.get("messages", [])
+    if not messages:
+        print(dim("  no messages in this session yet"))
+        return None
+
+    options = [f"{'  ' * m['depth']}[{m['id']}] {m['content'][:60]}" for m in messages]
+    hints   = [m["role"] for m in messages]
+    idx = _arrow_select(options, hints)
+    if idx < 0:
+        return None
+    return _cmd_branch(session_id, messages[idx]["id"])
+
+
+def _cmd_fork_oneshot(session_id: str, title: str, project_id: str) -> None:
+    """--fork <session>: copy the session's current branch into a new,
+    independent session and print its id."""
+    try:
+        data = call_api(f"/sessions/{session_id}/fork", {"title": title, "project_id": project_id})
+        new_id = data.get("session_id", "")
+        print(green(f"  forked: {new_id}"))
+        print(dim(f"  resume: hive --session {new_id}"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print(yellow(f"  session {session_id[:8]} has no messages to fork"))
+        else:
+            print(red(f"  error {e.code}: {e.read().decode()}"))
+    except Exception as e:
+        print(red(f"  error: {e}"))
+
+
 def _cmd_list_sessions_oneshot(project_id: str) -> None:
     """Tabular listing for --list-sessions flag."""
     try:
@@ -1521,7 +1584,7 @@ def repl(
     if review:
         print(dim("  review mode: plan shown before every task  ·  prefix with ! to skip"))
 
-    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff  /cleanup  /plan  /review  /mcp  /exit  ·  Ctrl+C to interrupt\n"))
+    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff  /cleanup  /plan  /review  /mcp  /tree  /branch <id>  /exit  ·  Ctrl+C to interrupt\n"))
 
     try:
         while True:
@@ -1540,6 +1603,7 @@ def repl(
                 cmd   = parts[0].lower()
                 args  = parts[1] if len(parts) > 1 else ""
 
+                fall_through_with_new_task = False  # set True by /tree, /branch on success -- see below
                 if cmd == "/exit":
                     break
                 elif cmd == "/new":
@@ -1549,6 +1613,19 @@ def repl(
                     _cmd_sessions(project_id)
                 elif cmd == "/history":
                     _cmd_history(session_id)
+                elif cmd == "/tree":
+                    editable = _cmd_tree(session_id)
+                    if editable is not None:
+                        task = editable
+                        fall_through_with_new_task = True
+                elif cmd == "/branch":
+                    if not args.strip().isdigit():
+                        print(dim("  usage: /branch <message-id>"))
+                    else:
+                        editable = _cmd_branch(session_id, int(args.strip()))
+                        if editable is not None:
+                            task = editable
+                            fall_through_with_new_task = True
                 elif cmd == "/persist":
                     _cmd_persist_current(session_id)
                 elif cmd == "/delete":
@@ -1596,8 +1673,9 @@ def repl(
                     if proposed:
                         _confirm_locally(proposed) if cmd == "/confirm" else _reject_locally(proposed)
                 else:
-                    print(dim(f"  unknown command: {cmd}  ·  /new /sessions /history /persist /delete /diff /cleanup /plan /review /mcp /confirm /reject /exit"))
-                continue
+                    print(dim(f"  unknown command: {cmd}  ·  /new /sessions /history /persist /delete /diff /cleanup /plan /review /mcp /confirm /reject /tree /branch /exit"))
+                if not fall_through_with_new_task:
+                    continue
 
             # ── Bare confirm / reject (no slash) ───────────────────────────
             lower = task.lower()
@@ -1667,6 +1745,8 @@ def main() -> None:
                         help="mark session as permanent (never auto-deleted)")
     parser.add_argument("--list-sessions",    action="store_true",
                         help="list recent sessions for this project and exit")
+    parser.add_argument("--fork",     metavar="SESSION_ID",
+                        help="copy a session's current branch into a new, independent session and exit")
     parser.add_argument("--delete-all-sessions", action="store_true",
                         help="delete all sessions for this project (prompts for confirmation)")
     parser.add_argument("--mcp-url",           metavar="URL",
@@ -1735,6 +1815,11 @@ def main() -> None:
 
     if args.list_sessions:
         _cmd_list_sessions_oneshot(project_id)
+        return
+
+    if args.fork:
+        title = " ".join(args.task) if args.task else f"forked from {args.fork[:8]}"
+        _cmd_fork_oneshot(args.fork, title, project_id)
         return
 
     if args.delete_all_sessions:

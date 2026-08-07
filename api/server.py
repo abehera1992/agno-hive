@@ -7,7 +7,7 @@ from pathlib import Path
 import yaml
 from fastapi import FastAPI, HTTPException, Request
 
-from api.models import AgentSpec, RunRequest, RunResponse, PlanResponse, ScanRequest, ScanResponse, FeedbackRequest, FeedbackResponse
+from api.models import AgentSpec, RunRequest, RunResponse, PlanResponse, ScanRequest, ScanResponse, FeedbackRequest, FeedbackResponse, BranchRequest, ForkRequest
 from fastapi.responses import StreamingResponse
 from swarm.ollama import ensure_models
 from swarm.team import run_task_async, run_task_stream
@@ -20,7 +20,7 @@ from swarm.sessions import (
     delete_session as _delete_session,
     persist_session as _persist_session,
     compact_session, _cleanup_expired,
-    get_context,
+    get_context, list_session_tree, set_current_leaf, fork_session,
 )
 
 setup_telemetry()
@@ -565,6 +565,31 @@ async def persist_session_endpoint(session_id: str):
     if not updated:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"persisted": session_id}
+
+
+@app.get("/sessions/{session_id}/tree")
+async def get_session_tree_endpoint(session_id: str):
+    messages = await list_session_tree(session_id)
+    return {"messages": messages}
+
+
+@app.post("/sessions/{session_id}/branch")
+async def branch_session_endpoint(session_id: str, request: BranchRequest):
+    messages = await list_session_tree(session_id)
+    target = next((m for m in messages if m["id"] == request.message_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="message not found in this session")
+    new_leaf_id = target["parent_message_id"]  # rewind to the SELECTED message's PARENT
+    await set_current_leaf(session_id, new_leaf_id)
+    return {"new_leaf_id": new_leaf_id, "editable_content": target["content"]}
+
+
+@app.post("/sessions/{session_id}/fork")
+async def fork_session_endpoint(session_id: str, request: ForkRequest):
+    new_session_id = await fork_session(session_id, request.project_id, request.title)
+    if new_session_id is None:
+        raise HTTPException(status_code=404, detail="source session has no messages to fork")
+    return {"session_id": new_session_id}
 
 
 @app.post("/feedback", response_model=FeedbackResponse)
