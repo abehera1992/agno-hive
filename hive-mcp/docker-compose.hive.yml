@@ -10,10 +10,13 @@
 #   - Tailscale installed (ZGX reaches this machine via Tailscale IP)
 #
 # Environment variables (set in shell or .env before running):
-#   PROJECT_PATH        Path to the primary project (default: current directory)
-#   HIVE_MCP_PORT       Host port for primary instance (default: 9003)
-#   WRITE_REVIEW        Stage all writes for human review (default: true)
-#   WEB_SEARCH_ENABLED  Enable web_search and web_fetch tools (default: false)
+#   PROJECT_PATH          Path to the primary project (default: current directory)
+#   HIVE_MCP_PORT         Host port for primary instance (default: 9003)
+#   WRITE_REVIEW          Stage all writes for human review (default: true)
+#   WEB_SEARCH_ENABLED    Enable web_search and web_fetch tools (default: false)
+#   HIVE_BASH_TOOL_ENABLED  Enable persistent bash sessions + background jobs
+#                           (bash_session_start/bash_run/bash_job_status/bash_job_kill,
+#                           default: true) -- set false to disable
 #
 # External integrations (optional — leave unset to disable):
 #   NOTION_API_KEY                Notion integration token (notion.so/my-integrations)
@@ -46,6 +49,7 @@ services:
       # Read-only SQL grounding (db_schema/db_query) — set to a read-only role DSN to enable.
       # On Docker Desktop the host DB is reachable at host.docker.internal:<published-port>.
       - HIVE_DB_URL=${HIVE_DB_URL:-}
+      - HIVE_BASH_TOOL_ENABLED=${HIVE_BASH_TOOL_ENABLED:-true}
 
   # ── agno-hive instance — points at the agno-hive repo itself ─────────────────
   # Start with: docker compose -f docker-compose.hive.yml --profile agno up -d

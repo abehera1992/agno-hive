@@ -32,7 +32,7 @@ AGNOHive is a swarm of specialized agents (Researcher, Planner, Coder, Reviewer,
 ```mermaid
 flowchart LR
     subgraph Client["💻 Client Machine"]
-        HM["🐳 hive-mcp<br/>apply_diff · write_file<br/>run_shell · run_docker<br/>git_* · index_project<br/>scan_project_context → hive.md<br/>web_search / web_fetch"]
+        HM["🐳 hive-mcp<br/>apply_diff · write_file<br/>run_shell · run_docker<br/>bash_session_start · bash_run · bash_job_status<br/>git_* · index_project<br/>scan_project_context → hive.md<br/>web_search / web_fetch"]
         PM["🔌 Project MCP<br/>get_file_content · find_files<br/>search_files · memory_search"]
     end
 

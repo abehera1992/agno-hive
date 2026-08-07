@@ -25,6 +25,11 @@
 | `run_command(cmd)` | Read-only shell (tests, linters — writes blocked when WRITE_REVIEW=true) |
 | `run_shell(cmd)` | Full shell access (npm install, docker compose, etc.) |
 | `run_docker(cmd)` | Docker / docker compose commands |
+| `bash_session_start(cwd)` | Create a persistent-cwd session — `cd` persists across `bash_run` calls in the same session (no env vars) |
+| `bash_run(session_id, command, timeout, background)` | Run in a session's persisted cwd; blocking or `background=True` (returns a `job_id` immediately, `timeout` becomes max runtime) |
+| `bash_job_status(job_id)` | Poll a background job — status/exit code/recent output |
+| `bash_job_kill(job_id)` | Terminate a running background job |
+| `bash_session_close(session_id)` | Close a session, killing any attached background jobs |
 | `git_status/log/diff/blame` | Git operations |
 | `scan_project_context(force)` | Generate/update `hive.md` — full scan or incremental |
 | `index_project(project_id, lightrag_url, ...)` | Semantic bootstrap into LightRAG |

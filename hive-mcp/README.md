@@ -13,6 +13,8 @@ ZGX (AGNOHive)
   │
   ├── project MCP  →  read context, memory, app-specific workflows
   └── hive-mcp     →  apply_diff, write_file, run_shell, run_docker, git_*
+                        bash_session_start/bash_run/bash_job_status (persistent
+                          cwd + background jobs)
                         index_project (bootstrap into LightRAG)
                         web_search, web_fetch
                         db_schema, db_query (read-only SQL grounding)
@@ -52,6 +54,33 @@ Agents choose which MCP to use based on operation type. The coordinator instruct
 | `get_env_info()` | OS, Python, Node, Docker versions |
 | `check_port(port)` | Check if a port is open |
 | `list_processes()` | Running processes |
+
+### Persistent bash sessions + background jobs
+`run_command`/`run_shell` are stateless — every call is a fresh `subprocess.run(cwd=PROJECT_ROOT)`
+with no `cd` persistence, no background execution, and no output cap. This is the more powerful
+alternative: a session-scoped working directory that persists across calls, plus long-running
+commands that run detached and get polled later instead of blocking the call. Modeled on Claude
+Code's own Bash tool semantics (cwd persists between commands; background + later status checks
+instead of blocking) — **not** a PTY, and no persisted environment variables (only cwd persists).
+
+| Tool | Description |
+|---|---|
+| `bash_session_start(cwd="")` | Create a session, returns a `session_id`. `cwd` (optional) is resolved against `PROJECT_ROOT`; empty defaults to the project root. |
+| `bash_run(session_id, command, timeout=120, background=False)` | Run a command in the session's persisted cwd. **Blocking** (default): waits, returns stdout+stderr+exit code. A bare `cd <path>` (the whole command) updates the session's cwd for future calls, only if it succeeds; a `cd` chained inside a larger command runs in that command's own subshell and does not leak out. **Background** (`background=True`): starts detached, returns a `job_id` immediately — `timeout` becomes the job's max runtime, not a wait. |
+| `bash_job_status(job_id, tail_chars=4000)` | Poll a background job — status (`running`/`exited`/`timed_out`/`killed`), exit code once finished, and the most recent output. Safe to call repeatedly. |
+| `bash_job_kill(job_id)` | Terminate a running background job. No-op with a clear message if it already finished. |
+| `bash_session_close(session_id)` | Close a session, killing and removing any background jobs still attached to it. |
+
+Session/job state is in-memory only (does not survive a container restart, and isn't meant to) — a
+session-scoped id rather than a global mutable cwd, since hive-mcp is one long-lived process shared
+by every concurrent tool call across every swarm run; a global cwd would let one task's `cd` bleed
+into an unrelated concurrent task. Guardrails: output capped at `HIVE_BASH_MAX_OUTPUT_CHARS`
+(`run_command`/`run_shell` have no cap today), the same `WRITE_REVIEW`-gated write-command blocklist
+as `run_shell`/`run_command`, a concurrency cap on live sessions/jobs, and an idle-TTL reaper — a
+**running** job is only ever reaped by its own timeout (never by idle/no-poll alone, since a
+legitimately slow job going quiet isn't the same as a stuck one); a **finished** job is freed once
+idle past the TTL. Exposed only to the Executor agent by default (`teams/engineering.yaml`) —
+the agent already most privileged for command execution.
 
 ### Git
 | Tool | Description |
@@ -215,6 +244,14 @@ docker run -d \
 | `HIVE_DB_URL` | _(unset)_ | Read-only DSN — activates `db_schema` / `db_query` grounding tools |
 | `HIVE_DB_MAX_ROWS` | `1000` | Max rows returned by `db_query` |
 | `HIVE_DB_TIMEOUT_MS` | `5000` | Per-query `statement_timeout` |
+| `HIVE_BASH_TOOL_ENABLED` | `true` | Master gate for `bash_session_start`/`bash_run`/`bash_job_status`/`bash_job_kill`/`bash_session_close` |
+| `HIVE_BASH_MAX_OUTPUT_CHARS` | `20000` | Output cap per `bash_run` call and per background job's whole buffer |
+| `HIVE_BASH_DEFAULT_TIMEOUT_SECONDS` | `120` | Default `bash_run` timeout when not specified |
+| `HIVE_BASH_MAX_TIMEOUT_SECONDS` | `600` | Hard ceiling any caller-supplied timeout is clamped to (also a background job's max runtime) |
+| `HIVE_BASH_MAX_SESSIONS` | `10` | Concurrency cap on live sessions |
+| `HIVE_BASH_MAX_BACKGROUND_JOBS` | `5` | Concurrency cap on live background jobs |
+| `HIVE_BASH_SESSION_TTL_SECONDS` | `1800` | Idle timeout for sessions and finished jobs |
+| `HIVE_BASH_REAP_INTERVAL_SECONDS` | `60` | How often the background reaper sweeps for expired sessions/jobs |
 
 ---
 
@@ -241,6 +278,7 @@ services:
       - NOTION_API_KEY=${NOTION_API_KEY:-}
       - GOOGLE_SERVICE_ACCOUNT_JSON=${GOOGLE_SERVICE_ACCOUNT_JSON:-}
       - HIVE_DB_URL=${HIVE_DB_URL:-}   # read-only DSN → db_schema / db_query
+      - HIVE_BASH_TOOL_ENABLED=${HIVE_BASH_TOOL_ENABLED:-true}   # bash_session_start / bash_run / bash_job_status / bash_job_kill
 ```
 
 Env vars you can set in `.env` (same directory as the compose file) or in your shell:
@@ -249,6 +287,7 @@ Env vars you can set in `.env` (same directory as the compose file) or in your s
 - `WRITE_REVIEW` — `true` or `false`
 - `WEB_SEARCH_ENABLED` — `true` to enable web tools
 - `NOTION_API_KEY` — Notion internal integration token
+- `HIVE_BASH_TOOL_ENABLED` — `false` to disable persistent bash sessions/background jobs (default: `true`)
 
 ---
 
@@ -264,7 +303,7 @@ When `WRITE_REVIEW=true` (the default), all writes — both file edits and exter
 4. The user confirms or rejects — the CLI applies or discards the file directly on the local filesystem
 5. Agents **cannot** confirm or reject — `confirm_write`/`reject_write` are not registered as tools
 
-`run_command` is also guarded: commands that write files (`>`, `>>`, `sed -i`, `tee`, `perl -i`, `truncate`, `dd of=`) are blocked. Agents must use `apply_diff` or `write_file` for all file changes.
+`run_command` is also guarded: commands that write files (`>`, `>>`, `sed -i`, `tee`, `perl -i`, `truncate`, `dd of=`) are blocked. Agents must use `apply_diff` or `write_file` for all file changes. `bash_run` (both blocking and `background=True`) is guarded by the same blocklist.
 
 ### External platform writes (action staging)
 
