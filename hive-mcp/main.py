@@ -10,6 +10,8 @@ Start:
 ZGX connects via:
     http://<tailscale-ip>:9000/mcp
 """
+import atexit
+import signal
 import sys
 import os
 from pathlib import Path
@@ -33,6 +35,8 @@ from tools.context import (
     list_directory_tree,
 )
 from tools.files import write_file, apply_diff, run_command
+from tools import bash as _bash_tools
+from tools.bash import bash_session_start, bash_run, bash_session_close
 from tools.verify import verify_claims
 from tools.skills import list_skills, load_skill
 from tools.shell import run_shell, run_docker, get_env_info, check_port, list_processes
@@ -193,6 +197,13 @@ _tool(get_env_info)
 _tool(check_port)
 _tool(list_processes)
 
+# ── Persistent bash sessions (cwd persistence + background jobs, Phase 1: ────
+# ── blocking only -- see tools/bash.py) ───────────────────────────────────────
+if config.HIVE_BASH_TOOL_ENABLED:
+    _tool(bash_session_start)
+    _tool(bash_run)
+    _tool(bash_session_close)
+
 # ── Git ───────────────────────────────────────────────────────────────────────
 _tool(git_status)
 _tool(git_log)
@@ -232,6 +243,23 @@ def _register_integration_tools(tools: list) -> None:
 
 
 _register_integration_tools(_INTEGRATION_TOOLS)
+
+# ── Shutdown cleanup for tools/bash.py's live sessions/jobs ───────────────────
+# Dockerfile uses exec-form CMD ["python", "main.py"], so this process is PID 1
+# and receives SIGTERM directly from `docker stop` -- no shell wrapper swallows
+# it. atexit alone would not fire on a signal-based exit (Python only runs atexit
+# handlers on a normal interpreter shutdown, e.g. sys.exit()), hence the explicit
+# SIGTERM handler below that calls sys.exit() itself. A SIGKILL or a `docker stop`
+# past its grace period skips both -- no pure-Python fix for that case.
+atexit.register(_bash_tools.cleanup_all)
+
+
+def _handle_sigterm(signum, frame):
+    _bash_tools.cleanup_all()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
 
 # ── HTTP routes for CLI confirm/reject (bypasses agent pipeline) ──────────────
 # The hive CLI calls these directly: POST /actions/confirm  {"action_id": "..."}

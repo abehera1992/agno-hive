@@ -65,6 +65,19 @@ HIVE_DB_URL        = os.getenv("HIVE_DB_URL", "")
 HIVE_DB_MAX_ROWS   = int(os.getenv("HIVE_DB_MAX_ROWS", "1000"))
 HIVE_DB_TIMEOUT_MS = int(os.getenv("HIVE_DB_TIMEOUT_MS", "5000"))
 
+# ── Persistent bash sessions + background jobs (bash_* tools) ───────────────────
+# Session-scoped cwd persistence + background execution over plain subprocess
+# management — NOT a PTY, no persisted env vars. Tools register only when this
+# is set (rollback lever independent of a redeploy).
+HIVE_BASH_TOOL_ENABLED            = os.getenv("HIVE_BASH_TOOL_ENABLED", "true").lower() == "true"
+HIVE_BASH_MAX_OUTPUT_CHARS        = int(os.getenv("HIVE_BASH_MAX_OUTPUT_CHARS", "20000"))
+HIVE_BASH_DEFAULT_TIMEOUT_SECONDS = int(os.getenv("HIVE_BASH_DEFAULT_TIMEOUT_SECONDS", "120"))
+HIVE_BASH_MAX_TIMEOUT_SECONDS     = int(os.getenv("HIVE_BASH_MAX_TIMEOUT_SECONDS", "600"))
+HIVE_BASH_MAX_SESSIONS            = int(os.getenv("HIVE_BASH_MAX_SESSIONS", "10"))
+HIVE_BASH_MAX_BACKGROUND_JOBS     = int(os.getenv("HIVE_BASH_MAX_BACKGROUND_JOBS", "5"))
+HIVE_BASH_SESSION_TTL_SECONDS     = int(os.getenv("HIVE_BASH_SESSION_TTL_SECONDS", "1800"))
+HIVE_BASH_REAP_INTERVAL_SECONDS   = int(os.getenv("HIVE_BASH_REAP_INTERVAL_SECONDS", "60"))
+
 # ── Migration runner (optional, review-gated — activate with MIGRATIONS_ENABLED=true) ─
 # Lets hive APPLY Alembic migrations as the DB owner via the mounted docker socket.
 # The owner password is read from the db container at run time (never stored here).

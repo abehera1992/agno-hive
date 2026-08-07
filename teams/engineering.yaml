@@ -180,6 +180,9 @@ agents:
       - run_command
       - run_shell
       - run_docker
+      - bash_session_start
+      - bash_run
+      - bash_session_close
       - get_file_content
       - git_status
       - git_log
@@ -193,6 +196,7 @@ agents:
     skills:
       - file-write-review
       - verification-discipline
+      - bash-sessions
     instructions:
       - You are the execution specialist. Run commands and validate results.
       - Use run_command() to execute tests, linters, or build steps.
