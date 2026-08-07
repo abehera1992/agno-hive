@@ -25,6 +25,7 @@ Usage:
 import difflib
 import json
 import os
+import queue
 try:
     import readline
     _READLINE = True
@@ -493,22 +494,53 @@ def _prompt_confirm_action(action_file: Path) -> None:
     print()
 
 
-# ── ESC interrupt ─────────────────────────────────────────────────────────────
+# ── ESC interrupt + mid-flight steering ─────────────────────────────────────────
+#
+# Both concerns share ONE background thread reading msvcrt keystrokes -- a second,
+# separate thread also calling msvcrt.getch() would race the existing ESC-cancel
+# thread for the same keyboard buffer, since whichever thread's getch() call wins
+# consumes the keystroke non-deterministically. So steering-line capture extends
+# this same watcher instead of adding a parallel one.
 
 _cancel_event = threading.Event()
+_steering_queue: "queue.Queue[str]" = queue.Queue()
 
 def _start_escape_watcher() -> bool:
-    """Start a daemon thread that sets _cancel_event when ESC is pressed.
-    Returns True on Windows (msvcrt available), False otherwise."""
+    """Start a daemon thread that watches keystrokes while a stream is active:
+    - Esc with NO partially-typed steering text sets _cancel_event (unchanged
+      existing behavior -- cancels the run).
+    - Esc WITH partially-typed steering text clears just that in-progress text
+      (does not cancel the run).
+    - A full line of text terminated by Enter is queued to _steering_queue,
+      delivered as the next chained turn once the current run's `done` event
+      arrives (see _drain_steering_queue) -- pi's Alt+Enter tier, not the
+      finer-grained mid-tool-batch Enter tier (agno's own tool-dispatch loop
+      isn't reachable from this client process to inject a message mid-run).
+    Returns True on Windows (msvcrt available), False otherwise (POSIX --
+    Ctrl+C only, same limitation this watcher already had before steering)."""
     _cancel_event.clear()
     try:
         import msvcrt
         def _watch():
+            buf: list[str] = []
             while not _cancel_event.is_set():
                 if msvcrt.kbhit():
-                    if msvcrt.getch() == b'\x1b':
-                        _cancel_event.set()
-                        return
+                    ch = msvcrt.getch()
+                    if ch == b'\x1b':
+                        if buf:
+                            buf.clear()
+                        else:
+                            _cancel_event.set()
+                            return
+                    elif ch in (b'\r', b'\n'):
+                        if buf:
+                            _steering_queue.put("".join(buf))
+                            buf.clear()
+                    elif ch not in (b'\x00', b'\xe0'):   # skip extended-key prefix bytes
+                        try:
+                            buf.append(ch.decode("utf-8", errors="ignore"))
+                        except Exception:
+                            pass
                 time.sleep(0.05)
         threading.Thread(target=_watch, daemon=True).start()
         return True
@@ -540,6 +572,23 @@ def _run_in_thread(fn, *args, **kwargs):
         return None, "interrupted"
     _cancel_event.set()  # stop watcher
     return result_box[0], error_box[0]
+
+
+def _drain_steering_queue(project_id: str, session_id: str | None, persist: bool) -> str | None:
+    """After a run completes, fire any messages queued during it (via the
+    extended escape watcher above) as immediate chained follow-up turns.
+    This is pi's Alt+Enter tier: delivered once the CURRENT run finishes,
+    not mid-tool-batch. Returns the latest session_id."""
+    while not _steering_queue.empty():
+        try:
+            queued_text = _steering_queue.get_nowait()
+        except queue.Empty:
+            break
+        print(dim(f"  » delivering queued message: {queued_text[:60]}"))
+        returned = run_task(queued_text, project_id, session_id=session_id, persist=persist)
+        if returned:
+            session_id = returned
+    return session_id
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -819,7 +868,7 @@ def run_task(
     before_actions = set(_find_pending_actions(_root))
 
     has_esc = _start_escape_watcher()
-    esc_hint = dim("  Ctrl+C to interrupt") + (dim(" / ESC") if has_esc else "")
+    esc_hint = dim("  Ctrl+C to interrupt") + (dim(" / ESC to cancel / type + Enter to queue") if has_esc else "")
 
     payload = {
         "task":       task,
@@ -1711,6 +1760,7 @@ def repl(
 
             if returned_id:
                 session_id = returned_id
+            session_id = _drain_steering_queue(project_id, session_id, persist)
 
     except KeyboardInterrupt:
         print()
@@ -1844,11 +1894,12 @@ def main() -> None:
         if args.review:
             review_task(task, project_id, session_id=args.session, persist=args.persist)
         else:
-            run_task(
+            returned_id = run_task(
                 task, project_id,
                 session_id=args.session, persist=args.persist,
                 show_resume=True,
             )
+            _drain_steering_queue(project_id, returned_id or args.session, args.persist)
     else:
         repl(
             project_id,
