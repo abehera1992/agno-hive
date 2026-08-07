@@ -24,7 +24,8 @@ async def _ensure_tables(conn) -> None:
             expires_at      TIMESTAMPTZ,
             persist         BOOLEAN     NOT NULL DEFAULT FALSE,
             summary         TEXT,
-            summary_through INT         NOT NULL DEFAULT 0
+            summary_through INT         NOT NULL DEFAULT 0,
+            current_leaf_id INT
         )
     """)
     await conn.execute("""
@@ -33,17 +34,31 @@ async def _ensure_tables(conn) -> None:
     """)
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS session_messages (
-            id          SERIAL PRIMARY KEY,
-            session_id  UUID        NOT NULL
-                            REFERENCES chat_sessions(id) ON DELETE CASCADE,
-            role        TEXT        NOT NULL,
-            content     TEXT        NOT NULL,
-            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            id                SERIAL PRIMARY KEY,
+            session_id        UUID        NOT NULL
+                                  REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            role              TEXT        NOT NULL,
+            content           TEXT        NOT NULL,
+            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            parent_message_id INT         REFERENCES session_messages(id) ON DELETE SET NULL
         )
     """)
     await conn.execute("""
         CREATE INDEX IF NOT EXISTS session_messages_session_idx
             ON session_messages (session_id, created_at ASC)
+    """)
+    await conn.execute("""
+        CREATE INDEX IF NOT EXISTS session_messages_parent_idx
+            ON session_messages (parent_message_id)
+    """)
+    # Additive columns for pre-existing deployments where the tables above already
+    # existed before this change (CREATE TABLE IF NOT EXISTS is a no-op there).
+    await conn.execute("""
+        ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS current_leaf_id INT
+    """)
+    await conn.execute("""
+        ALTER TABLE session_messages ADD COLUMN IF NOT EXISTS parent_message_id INT
+            REFERENCES session_messages(id) ON DELETE SET NULL
     """)
     await conn.commit()
 
@@ -76,22 +91,43 @@ async def create_session(
     return session_id
 
 
-async def append_message(session_id: str, role: str, content: str) -> None:
-    """Append a message and bump updated_at on the session."""
+async def append_message(
+    session_id: str, role: str, content: str, parent_message_id: int | None = None
+) -> int | None:
+    """Append a message, chaining it onto the tree, and advance the session's
+    current leaf. Returns the new message's id, or None on failure.
+
+    If parent_message_id is omitted, chains onto the session's current
+    current_leaf_id (NULL for a brand-new session, becoming a root message) --
+    this reproduces the previous linear behavior exactly when branching is never
+    invoked, since the leaf always trails the most recent append.
+    """
     try:
         async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
-            await conn.execute(
-                "INSERT INTO session_messages (session_id, role, content)"
-                " VALUES (%s, %s, %s)",
-                (session_id, role, content),
+            if parent_message_id is None:
+                leaf_row = await conn.execute(
+                    "SELECT current_leaf_id FROM chat_sessions WHERE id = %s", (session_id,)
+                )
+                row = await leaf_row.fetchone()
+                parent_message_id = row[0] if row else None
+
+            insert_result = await conn.execute(
+                "INSERT INTO session_messages (session_id, role, content, parent_message_id)"
+                " VALUES (%s, %s, %s, %s) RETURNING id",
+                (session_id, role, content, parent_message_id),
             )
+            new_row = await insert_result.fetchone()
+            new_id = new_row[0] if new_row else None
+
             await conn.execute(
-                "UPDATE chat_sessions SET updated_at = NOW() WHERE id = %s",
-                (session_id,),
+                "UPDATE chat_sessions SET updated_at = NOW(), current_leaf_id = %s WHERE id = %s",
+                (new_id, session_id),
             )
             await conn.commit()
+            return new_id
     except Exception as exc:
         print(f"[sessions] append_message warning: {exc}")
+        return None
 
 
 async def get_history(session_id: str, limit: int | None = None) -> list[dict]:
@@ -116,6 +152,118 @@ async def get_history(session_id: str, limit: int | None = None) -> list[dict]:
     except Exception as exc:
         print(f"[sessions] get_history warning: {exc}")
         return []
+
+
+async def get_branch_history(
+    session_id: str, leaf_id: int | None = None, limit: int | None = None
+) -> list[dict]:
+    """Walk from `leaf_id` (default: the session's current_leaf_id) to the root
+    via parent_message_id, returning the `limit` most recent messages oldest-first
+    -- same external shape as get_history, tree-aware instead of flat."""
+    if limit is None:
+        limit = config.session_window
+    try:
+        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
+            if leaf_id is None:
+                leaf_row = await conn.execute(
+                    "SELECT current_leaf_id FROM chat_sessions WHERE id = %s", (session_id,)
+                )
+                row = await leaf_row.fetchone()
+                leaf_id = row[0] if row else None
+                if leaf_id is None:
+                    return []
+
+            rows = await conn.execute(
+                """
+                WITH RECURSIVE branch AS (
+                    SELECT id, role, content, parent_message_id, 0 AS depth
+                    FROM session_messages WHERE id = %(leaf_id)s
+                    UNION ALL
+                    SELECT sm.id, sm.role, sm.content, sm.parent_message_id, b.depth + 1
+                    FROM session_messages sm
+                    JOIN branch b ON sm.id = b.parent_message_id
+                )
+                SELECT role, content FROM branch ORDER BY depth ASC LIMIT %(limit)s
+                """,
+                {"leaf_id": leaf_id, "limit": limit},
+            )
+            newest_first = [{"role": r[0], "content": r[1]} for r in await rows.fetchall()]
+            return list(reversed(newest_first))
+    except Exception as exc:
+        print(f"[sessions] get_branch_history warning: {exc}")
+        return []
+
+
+async def set_current_leaf(session_id: str, message_id: int) -> bool:
+    """Rewind/advance the session's active branch tip. Used by /branch to rewind
+    to an earlier message's parent before the user resubmits a sibling branch."""
+    try:
+        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
+            result = await conn.execute(
+                "UPDATE chat_sessions SET current_leaf_id = %s, updated_at = NOW() WHERE id = %s",
+                (message_id, session_id),
+            )
+            await conn.commit()
+            return result.rowcount > 0
+    except Exception as exc:
+        print(f"[sessions] set_current_leaf warning: {exc}")
+        return False
+
+
+async def list_session_tree(session_id: str) -> list[dict]:
+    """Every message in the session, depth-from-root computed server-side, for
+    a /tree picker's flat depth-indented display (not every branch's exact
+    diagram shape -- an MVP, not a rendered tree)."""
+    try:
+        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
+            rows = await conn.execute(
+                """
+                WITH RECURSIVE tree AS (
+                    SELECT id, parent_message_id, role, content, created_at, 0 AS depth
+                    FROM session_messages
+                    WHERE session_id = %(session_id)s AND parent_message_id IS NULL
+                    UNION ALL
+                    SELECT sm.id, sm.parent_message_id, sm.role, sm.content, sm.created_at, t.depth + 1
+                    FROM session_messages sm
+                    JOIN tree t ON sm.parent_message_id = t.id
+                    WHERE sm.session_id = %(session_id)s
+                )
+                SELECT id, parent_message_id, role, content, created_at, depth
+                FROM tree ORDER BY created_at ASC
+                """,
+                {"session_id": session_id},
+            )
+            return [
+                {
+                    "id": r[0], "parent_message_id": r[1], "role": r[2],
+                    "content": r[3], "created_at": r[4], "depth": r[5],
+                }
+                for r in await rows.fetchall()
+            ]
+    except Exception as exc:
+        print(f"[sessions] list_session_tree warning: {exc}")
+        return []
+
+
+async def fork_session(source_session_id: str, project_id: str, title: str) -> str | None:
+    """Copy the source session's CURRENT branch (leaf to root) into a brand-new,
+    independent session -- distinct from in-place /tree branching, which stays in
+    the same session and only diverges from a point. Returns the new session id,
+    or None on failure."""
+    try:
+        branch = await get_branch_history(source_session_id, limit=10_000)  # effectively "whole branch"
+        if not branch:
+            return None
+        new_session_id = await create_session(project_id, title, persist=False)
+        parent_id: int | None = None
+        for msg in branch:  # oldest-first, matching get_branch_history's contract
+            parent_id = await append_message(
+                new_session_id, msg["role"], msg["content"], parent_message_id=parent_id
+            )
+        return new_session_id
+    except Exception as exc:
+        print(f"[sessions] fork_session warning: {exc}")
+        return None
 
 
 async def get_session(session_id: str) -> dict | None:
@@ -241,11 +389,13 @@ async def _cleanup_expired() -> int:
 # ── Context for coordinator ───────────────────────────────────────────────────
 
 async def get_context(session_id: str) -> tuple[str, list[dict]]:
-    """Return (summary_or_empty, recent_messages) for coordinator injection."""
+    """Return (summary_or_empty, recent_messages) for coordinator injection.
+    Branch-aware: walks from the session's current_leaf_id, not a flat
+    ORDER BY created_at scan -- see get_branch_history."""
     session = await get_session(session_id)
     if not session:
         return "", []
-    messages = await get_history(session_id, limit=config.session_window)
+    messages = await get_branch_history(session_id, limit=config.session_window)
     summary = session.get("summary") or ""
     return summary, messages
 
