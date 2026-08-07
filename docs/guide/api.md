@@ -10,6 +10,7 @@ The AGNOHive API server (`python main.py --serve`, port 9001) is the HTTP surfac
 - [Get a plan only (HITL)](#get-a-plan-only-hitl)
 - [Session chaining](#session-chaining--carry-context-across-api-calls)
 - [Session management endpoints](#session-management-endpoints)
+- [Session tree endpoints](#session-tree-endpoints)
 - [Feedback (self-improving loop)](#submit-output-feedback-self-improving-loop)
 
 ---
@@ -68,6 +69,33 @@ curl "http://localhost:9001/sessions?project_id=EkamApp"
 curl "http://localhost:9001/sessions/<id>"
 curl -X DELETE "http://localhost:9001/sessions/<id>"
 curl -X PATCH "http://localhost:9001/sessions/<id>/persist"
+```
+
+---
+
+## Session tree endpoints
+
+Every session is a tree (`parent_message_id` chain per message, `current_leaf_id` per session), not a flat log — these three endpoints are what the `hive` CLI's `/tree`, `/branch`, and `--fork` commands call. See [🖥️ CLI Client → Session tree branching](cli.md#session-tree-branching) for the interactive walkthrough.
+
+```bash
+# List the full tree — every message, with a server-computed depth for rendering
+curl "http://localhost:9001/sessions/<id>/tree"
+# {"messages": [{"id": 1, "parent_message_id": null, "role": "user", "content": "...", "created_at": "...", "depth": 0}, ...]}
+
+# Rewind to a message's PARENT and get its content back for edit-and-resubmit
+curl -X POST "http://localhost:9001/sessions/<id>/branch" \
+  -H "Content-Type: application/json" \
+  -d '{"message_id": 5}'
+# {"new_leaf_id": 4, "editable_content": "text of message 5"}
+# 404 if message_id isn't in this session's tree.
+# Branching from a root message (no parent) returns new_leaf_id: null — a valid rewind-to-empty, not an error.
+
+# Copy the session's CURRENT branch into a new, independent session (original untouched)
+curl -X POST "http://localhost:9001/sessions/<id>/fork" \
+  -H "Content-Type: application/json" \
+  -d '{"title": "exploring an alternate approach", "project_id": "EkamApp"}'
+# {"session_id": "<new-uuid>"}
+# 404 if the source session has no messages to fork.
 ```
 
 ---

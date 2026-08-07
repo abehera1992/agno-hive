@@ -2,7 +2,7 @@
 
 # 🖥️ CLI Client (`hive`)
 
-AGNOHive ships a zero-dependency CLI client (`cli/hive`) that lets you use the swarm from any terminal. Every run is backed by a **persistent chat session** stored server-side in PostgreSQL. The CLI auto-detects your Tailscale IP to connect to both your project MCP and hive-mcp.
+AGNOHive ships a CLI client (`cli/hive`) that lets you use the swarm from any terminal — zero required dependencies (pure Python 3 stdlib), with an optional `rich` upgrade for nicer tool-call rendering. Every run is backed by a **persistent chat session** stored server-side in PostgreSQL, structured as a branchable tree rather than a flat log. The CLI auto-detects your Tailscale IP to connect to both your project MCP and hive-mcp.
 
 ## Contents
 - [Installation](#installation)
@@ -25,6 +25,20 @@ chmod +x ~/.local/bin/hive          # Linux/Mac
 ```
 
 On Windows, the `hive` file is a Python script — either add it to your PATH or run it with `python cli/hive`.
+
+> **The installed copy does not auto-update.** `~/.local/bin/hive` is a plain file copy, not a symlink — pulling `agno-hive` or editing `cli/hive` in the repo has no effect on the `hive` command in your terminal until you re-run the `cp` above. If `hive --help` or a REPL banner looks like it's missing a feature you know is in the repo, this is almost always why.
+
+### Optional: Rich collapsible tool-call panel
+
+```bash
+pip install -r cli/requirements.txt   # installs rich>=13.0.0
+```
+
+`cli/hive` has zero required dependencies — this is a pure upgrade. With `rich` installed (and a TTY), tool-call activity during a run renders as a collapsed, live-updating panel (`…` pending → `✓`/`✗` on completion) instead of plain `[tool] name(args)` lines, finalizing as static text the moment the answer starts streaming. Without it, or with `rich` uninstalled, `hive` falls back to the plain-text lines automatically — no flag needed, no error.
+
+- `hive --verbose-tools "task"` — always show full, untruncated args instead of the collapsed one-liner
+- `HIVE_VERBOSE_TOOLS=1` — same, via env var
+- Expand/collapse is a **pre-run** choice, not a live in-run toggle (no `Ctrl+O`-equivalent keystroke yet) — see [Features](#features)
 
 ## Configuration
 
@@ -63,7 +77,9 @@ MCP URLs are auto-detected via `tailscale ip -4` — no manual configuration nee
 | `hive --mcp-url <url> "task"` | Override project MCP URL |
 | `hive --mcp-port <port> "task"` | Override Tailscale auto-detect port for project MCP |
 | `hive --list-sessions` | Print recent sessions for this project and exit |
+| `hive --fork <session-id> "title"` | Copy a session's current branch into a new, independent session and exit; `"title"` (optional) names the fork, default: `forked from <id[:8]>` |
 | `hive --delete-all-sessions` | Delete all sessions for this project (prompts for confirmation) |
+| `hive --verbose-tools "task"` | Show full, untruncated tool-call args/results instead of the collapsed Rich panel (see [Rich collapsible tool-call panel](#optional-rich-collapsible-tool-call-panel)) |
 | `hive --mcp-status` | Show connection status of both MCPs and exit |
 | `hive --scan` | Generate or update `hive.md` project context file (incremental) |
 | `hive --scan --force` | Rebuild `hive.md` from scratch (full rescan) |
@@ -93,6 +109,8 @@ hive --persist            # start REPL with a permanent session
 | `/persist` | Mark the current session as permanent |
 | `/delete <id>` | Delete a session by ID |
 | `/delete-all` | Delete all sessions for this project (prompts) |
+| `/tree` | Show the current session's message tree (depth-indented picker); pick a message to rewind the branch there and place its text back in the input buffer for edit-and-resubmit |
+| `/branch <message-id>` | Same as picking that ID directly from `/tree`, without the picker |
 | `/plan <question>` | Research and plan without executing — uses planning team (600s timeout) |
 | `/review <task>` | HITL: generate plan, approve, then execute |
 | `/diff` | Open VS Code diff for all pending `.hive_proposed` files |
@@ -135,12 +153,37 @@ hive
 #   project:   http://100.87.159.1:9000/mcp   + 12ms
 #   hive-mcp:  http://100.87.159.1:9003/mcp   + 8ms
 #   resuming session a3f7c2d1  (last used this project)
-#   /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff  /cleanup  /mcp  /confirm  /reject  /exit  ·  ESC to interrupt
+#   /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff  /cleanup  /plan  /review  /mcp  /tree  /branch <id>  /exit  ·  Ctrl+C to interrupt
 
 > explain the write_file function
 > now add type hints to it
 > /history
 > /exit
+```
+
+While a run is streaming, type a follow-up and press Enter — it's queued and delivered automatically as a chained turn the moment the current run finishes (no need to wait). Press Esc with no text buffered to cancel the run outright; Esc with partially-typed text just clears that text. See [Features](#features) for the exact scope of this (Alt+Enter tier — queued after the current run, not injected mid-run).
+
+### Session tree branching
+
+Every message is stored as a node in a tree (`parent_message_id` chain), not just a flat list — branching from an earlier point in the conversation creates a new path instead of overwriting history.
+
+```bash
+> /tree
+  [1] user: explain the seller registration flow
+    [2] assistant: The registration flow starts in...
+      [3] user: now add unit tests for that flow
+        [4] assistant: Here are the tests...
+# pick [2] to rewind there — its text is placed back in the input buffer,
+# edit and resubmit to create a new branch alongside [3]/[4]
+
+> /branch 2        # same rewind, no picker, if you already know the message id
+```
+
+`--fork` is the other axis: independent-session forking rather than in-place rewind. It walks the *current* branch of an existing session and copies it into a brand-new, separate session — the original session is untouched.
+
+```bash
+hive --fork a3f7c2d1-8b3e-4f2a-9c1d-000000000000 "exploring an alternate approach"
+# forked session: <new-uuid>
 ```
 
 ### Plan review (HITL)
@@ -309,7 +352,10 @@ Sessions expire after **30 days** unless marked persistent.
 - **MCP status** (`--mcp-status`) — connectivity check for both MCPs with latency
 - **Readline history** — arrow keys, Ctrl+R search, persisted in `~/.agno_history`
 - **Auto-detects project** from `git remote get-url origin`
-- **Zero dependencies** — pure Python 3 stdlib, works on any machine with Python installed
+- **Zero required dependencies** — pure Python 3 stdlib by default, works on any machine with Python installed; `rich` (see [Rich collapsible tool-call panel](#optional-rich-collapsible-tool-call-panel)) is an opt-in upgrade only, never required
+- **Session tree branching** (`/tree`, `/branch <id>`) — every message is a node with a `parent_message_id`, not a flat log; rewind to any earlier point and continue down a new branch without losing the original path. `--fork <session-id>` copies the current branch of an existing session into a new, fully independent one
+- **Mid-flight steering** (Alt+Enter tier) — type a follow-up while a run is still streaming and press Enter; it's queued and fired as a chained turn automatically the instant the current run's `done` event arrives, no need to wait or interrupt. This is the coarser of two possible steering tiers — delivered *after* the current run completes, not injected mid-tool-call; the finer-grained tier is tracked as a known limitation — see [🛠️ Development → Internals: tool-call hooks](development.md#internals-tool-call-hooks) for why
+- **Collapsed live tool-call panel** (optional, needs `rich`) — tool-call activity renders as a collapsed, live-updating panel during the "gathering" phase of a run, finalized as static text once the answer starts streaming; `--verbose-tools` / `HIVE_VERBOSE_TOOLS=1` shows full untruncated args instead
 
 ---
 

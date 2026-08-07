@@ -24,6 +24,8 @@ AGNOHive is a swarm of specialized agents (Researcher, Planner, Coder, Reviewer,
 - ✅ **Human-in-the-loop by default** — every file write and every external-platform action is staged for your approval before it lands
 - 🔌 **Works with any project** — point it at any repo via MCP, no project-specific setup required beyond the connection
 - 🔀 **Pluggable inference backend** — Ollama or vLLM + LiteLLM, switchable with one env var, no code changes
+- 🌳 **Branchable sessions** — every conversation is a tree, not a flat log; rewind and branch with `/tree`, `/branch`, or fork a whole new session with `--fork`
+- ⌨️ **Mid-flight steering** — type a follow-up while a run is still streaming; it queues and fires automatically the moment the current run finishes
 
 ## 🏗️ How it works
 
@@ -65,7 +67,7 @@ AGNOHive  project EkamApp  mode engineering  http://100.96.86.82:9001
   project:   http://100.87.159.1:9000/mcp   + 12ms
   hive-mcp:  http://100.87.159.1:9003/mcp   + 8ms
   resuming session a3f7c2d1  (last used this project)
-  /new  /sessions  /history  /persist  /delete <id>  /diff  /cleanup  /mcp  /confirm  /reject  /exit
+  /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff  /cleanup  /plan  /review  /mcp  /tree  /branch <id>  /exit  ·  Ctrl+C to interrupt
 
 > add rate limiting to the login endpoint
   Planning... (ContextRouter → Researcher → Planner)
