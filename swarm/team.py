@@ -1125,6 +1125,68 @@ def _make_read_cache_tool_hook():
     return _read_cache_tool_hook
 
 
+class ToolCallAborted(Exception):
+    """Raised by _make_tool_interception_hook when a tool call is skipped
+    because its abort_event was set before the call ran."""
+
+
+def _make_tool_interception_hook(abort_event: "asyncio.Event | None" = None):
+    """Build a tool_hooks callable giving a real per-tool-call checkpoint:
+    log every call (name, args, duration, success/failure), and -- if an
+    abort_event is supplied and set -- skip the call entirely instead of
+    running it. This is AGNOHive 2.3.1's Phase 9a ("interception: pause /
+    abort / serialize between tool calls").
+
+    Async + must be shared across the coordinator AND every member agent,
+    for the same two reasons _make_read_cache_tool_hook's docstring
+    documents (re-confirmed here, not re-derived): every MCP-server-backed
+    tool call is async on the client side unconditionally (a sync hook
+    calling `function(**args)` gets back an unawaited coroutine, not the
+    real result), and in mode="coordinate" the coordinator mostly delegates
+    to team members rather than calling tools itself -- a hook registered
+    only on the coordinator's own Team(tool_hooks=[...]) never sees the
+    member agents' own tool calls, which is most of them.
+
+    Honest scope: this is the INTERCEPTION checkpoint only -- pause/abort
+    immediately BEFORE a tool call would execute. `abort_event` is a plain
+    asyncio.Event supplied by whatever caller wants to signal an abort;
+    nothing in this repo currently sets one, and _build_team's default
+    wiring passes abort_event=None, making this hook a pure audit-log
+    pass-through with zero behavior change (matching the confirmed
+    middleware contract: `function(**args)` must be awaited for the tool
+    call to actually happen).
+
+    This is deliberately NOT wired to Phase 7's client-side `_steering_queue`
+    (cli/hive). That queue lives in the user's own machine's CLI process;
+    this hook runs server-side in swarm/team.py, inside ZGX's
+    agno-api.service process. There is no existing mid-run client<->server
+    communication channel connecting the two -- building one (e.g. a
+    side-channel endpoint this hook polls, keyed by session/run id) is a
+    separate, larger effort explicitly out of scope here, the same kind of
+    scoping decision already recorded for Phase 9b (context injection) on
+    the AGNOHive 2.3.1 Notion page. Treat `abort_event` as a reusable
+    building block a future caller can wire up, not as something already
+    connected to steering.
+    """
+
+    async def _tool_interception_hook(function_name, function, args, agent=None, team=None):
+        if abort_event is not None and abort_event.is_set():
+            print(f"[team] tool_hook: {function_name}({args}) ABORTED before execution")
+            raise ToolCallAborted(function_name)
+        started = time.monotonic()
+        try:
+            result = await function(**args)
+            elapsed = time.monotonic() - started
+            print(f"[team] tool_hook: {function_name}({args}) -> {elapsed:.2f}s")
+            return result
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            print(f"[team] tool_hook: {function_name}({args}) RAISED {type(exc).__name__}: {exc} after {elapsed:.2f}s")
+            raise
+
+    return _tool_interception_hook
+
+
 def _build_team(
     agent_specs: list | None,
     coordinator_model: str,
@@ -1148,17 +1210,21 @@ def _build_team(
     only when agent_specs is empty) does not take a catalog; that path predates team YAMLs."""
     # One cache per run, shared by the coordinator AND every member agent (not just
     # the coordinator) -- see _make_read_cache_tool_hook's docstring for why both of
-    # those are load-bearing, not incidental.
+    # those are load-bearing, not incidental. The interception hook (Phase 9a) is
+    # built with abort_event=None here -- see its own docstring for why that keeps
+    # this a no-op audit-log pass-through today rather than a live abort switch.
     read_cache_hook = _make_read_cache_tool_hook()
+    interception_hook = _make_tool_interception_hook()
+    tool_hooks = [read_cache_hook, interception_hook]
     if agent_specs:
         members = [
-            make_agent_from_spec(spec, *mcp_list, skill_catalog=skill_catalog, tool_hooks=[read_cache_hook])
+            make_agent_from_spec(spec, *mcp_list, skill_catalog=skill_catalog, tool_hooks=tool_hooks)
             for spec in agent_specs
         ]
     else:
         members = [
-            make_coder(*mcp_list, tool_hooks=[read_cache_hook]),
-            make_reviewer(*mcp_list, tool_hooks=[read_cache_hook]),
+            make_coder(*mcp_list, tool_hooks=tool_hooks),
+            make_reviewer(*mcp_list, tool_hooks=tool_hooks),
         ]
     return Team(
         name=name,
@@ -1174,7 +1240,7 @@ def _build_team(
         markdown=True,
         max_iterations=config.max_iterations,
         tool_call_limit=config.tool_call_limit,
-        tool_hooks=[read_cache_hook],
+        tool_hooks=tool_hooks,
     )
 
 

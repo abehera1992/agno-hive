@@ -167,8 +167,9 @@ def test_build_team_registers_a_tool_hook_on_the_coordinator(monkeypatch):
         instructions=[],
     )
 
+    # read-cache hook (Detour fix) + interception hook (Phase 9a) -- both shared
     assert result.tool_hooks is not None
-    assert len(result.tool_hooks) == 1
+    assert len(result.tool_hooks) == 2
 
 
 def test_build_team_shares_the_same_hook_instance_between_coordinator_and_fallback_members(monkeypatch):
@@ -186,10 +187,9 @@ def test_build_team_shares_the_same_hook_instance_between_coordinator_and_fallba
         instructions=[],
     )
 
-    coordinator_hook = result.tool_hooks[0]
     for member in result.members:
         assert member.tool_hooks is not None
-        assert member.tool_hooks[0] is coordinator_hook  # same object, not just equal
+        assert member.tool_hooks == result.tool_hooks  # same objects, not just equal
 
 
 def test_build_team_shares_the_same_hook_instance_with_spec_based_members(monkeypatch):
@@ -215,6 +215,5 @@ def test_build_team_shares_the_same_hook_instance_with_spec_based_members(monkey
         instructions=[],
     )
 
-    coordinator_hook = result.tool_hooks[0]
     assert len(result.members) == 1
-    assert result.members[0].tool_hooks[0] is coordinator_hook
+    assert result.members[0].tool_hooks == result.tool_hooks
