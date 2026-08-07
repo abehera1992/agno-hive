@@ -799,6 +799,13 @@ def _print_footer(data: dict, show_resume: bool = False) -> None:
 
 # ── Task runners ──────────────────────────────────────────────────────────────
 
+def _short_repr(value, limit: int = 40) -> str:
+    """One-line, length-capped representation of a tool-call argument value
+    for the [tool] name(args) preview line."""
+    s = value if isinstance(value, str) else repr(value)
+    return s if len(s) <= limit else s[:limit] + "..."
+
+
 def run_task(
     task: str,
     project_id: str,
@@ -851,6 +858,20 @@ def run_task(
                         print()
                         first_chunk = False
                     print(chunk, end="", flush=True)
+
+            elif etype == "tool_start":
+                if first_chunk:
+                    if _COLOUR:
+                        print(" " * 54, end="\r")
+                    print()
+                    first_chunk = False
+                name = event.get("name", "?")
+                args = event.get("args", {}) or {}
+                args_str = ", ".join(f"{k}={_short_repr(v)}" for k, v in args.items())
+                print(dim(f"  [tool] {name}({args_str})"))
+
+            elif etype == "tool_end":
+                pass  # plain-text mode has nothing more to show here; see the Rich TUI plan
 
             elif etype == "done":
                 done_data = event
