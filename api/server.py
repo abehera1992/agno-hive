@@ -1,5 +1,6 @@
 """AgnoHive FastAPI server — accepts task requests from remote clients over Tailscale."""
 import asyncio
+import json
 import time
 from pathlib import Path
 
@@ -332,14 +333,29 @@ async def plan(request: RunRequest):
     )
 
 
+def _tool_event_to_sse(chunk: dict) -> str | None:
+    """Turn a run_task_stream tool-event dict (see swarm.team._stream_event_to_chunk)
+    into an SSE data line, or None if `chunk` isn't a recognized tool-event shape."""
+    kind = chunk.get("__tool_event__")
+    if kind == "start":
+        payload = {"type": "tool_start", "name": chunk["name"], "args": chunk["args"]}
+    elif kind == "end":
+        payload = {"type": "tool_end", "name": chunk["name"], "result_preview": chunk["result_preview"]}
+    else:
+        return None
+    return f"data: {json.dumps(payload)}\n\n"
+
+
 @app.post("/stream")
 async def stream_endpoint(request: RunRequest):
     """Stream coordinator output as Server-Sent Events.
 
     Events:
-      data: {"type": "chunk",  "content": "<text>"}
-      data: {"type": "done",   "session": {...}, "input_tokens": N, ...}
-      data: {"type": "error",  "content": "<message>"}
+      data: {"type": "chunk",      "content": "<text>"}
+      data: {"type": "tool_start", "name": "<tool>", "args": {...}}
+      data: {"type": "tool_end",   "name": "<tool>", "result_preview": "<text>" | null}
+      data: {"type": "done",       "session": {...}, "input_tokens": N, ...}
+      data: {"type": "error",      "content": "<message>"}
 
     Keeps the HTTP connection alive the whole time — no 300s timeout risk.
     """
@@ -390,6 +406,11 @@ async def stream_endpoint(request: RunRequest):
             ):
                 if isinstance(chunk, str):
                     yield f"data: {_json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
+
+                elif isinstance(chunk, dict) and "__tool_event__" in chunk:
+                    sse_line = _tool_event_to_sse(chunk)
+                    if sse_line:
+                        yield sse_line
 
                 elif isinstance(chunk, dict) and chunk.get("__done__"):
                     await append_message(session_id, "user", request.task)
