@@ -6,6 +6,12 @@ from pydantic import BaseModel
 class AgentSpec(BaseModel):
     name: str
     role: str
+    # Required here (this is also the shape a caller can POST directly via
+    # RunRequest.agents, with no team YAML / DB context to fall back to). A team
+    # YAML MAY omit model: and let api/server.py's _load_team() resolve it from
+    # model_routing.get_default_model(team_name, role_name) BEFORE constructing
+    # this AgentSpec (AGNOHive 2.3.2 addendum, 2026-08-08) — by the time an
+    # AgentSpec exists, model is always populated one way or the other.
     model: str
     instructions: list[str]
     description: str | None = None
@@ -129,3 +135,35 @@ class FeedbackRequest(BaseModel):
 class FeedbackResponse(BaseModel):
     recorded: bool
     message: str
+
+
+# ── Admin: DB-backed model routing (AGNOHive 2.3.2 addendum, 2026-08-08) ──────
+# swarm/model_routing.py / swarm/db.py's model_catalog + team_role_models tables.
+
+class ModelCatalogEntry(BaseModel):
+    model_id: str
+    kind: str                          # "local" | "cloud"
+    provider: str
+    vllm_served_as: str | None = None
+    requires_cloud_gate: bool = False
+    active: bool = True
+
+
+class ModelCatalogPatch(BaseModel):
+    # Every field optional — PATCH applies only the fields actually supplied.
+    kind: str | None = None
+    provider: str | None = None
+    vllm_served_as: str | None = None
+    requires_cloud_gate: bool | None = None
+    active: bool | None = None
+
+
+class TeamRoleModelEntry(BaseModel):
+    team_name: str
+    role_name: str
+    model_id: str
+
+
+class ModelRoutesReloadResponse(BaseModel):
+    model_catalog: dict[str, list[str]]      # {"added": [...], "removed": [...], "changed": [...]}
+    team_role_models: dict[str, list[str]]

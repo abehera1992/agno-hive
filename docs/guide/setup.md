@@ -33,7 +33,7 @@ AGNOHive supports **two interchangeable inference backends** — pick one, or se
 | | Ollama | vLLM + LiteLLM |
 |---|---|---|
 | **Best for** | Simplicity, diverse per-role models, no GPU sharing math | Higher throughput, longer context, continuous batching, one resident model serving the whole roster |
-| **Roster shape** | Diverse — a different model per agent role | Consolidated — the whole roster maps onto one resident coordinator model (`_VLLM_MODEL_MAP` in `swarm/agents.py`) |
+| **Roster shape** | Diverse — a different model per agent role | Consolidated — the whole roster maps onto one resident coordinator model (`vllm_served_as` in the `model_catalog` DB table, see [☁️ Cloud Model Providers](cloud-models.md#how-it-works)) |
 | **Setup** | `ollama pull ...` | `docker compose -f zgx-ai-setup/docker-compose.yml up -d` |
 
 ### Option A — Ollama (default)
@@ -92,9 +92,9 @@ docker logs vllm-coord --tail 20            # watch for "Uvicorn running"
 <details>
 <summary><b>📋 Notes (click to expand)</b></summary>
 
-> **`vllm-coord`'s served name (`qwen3-coder-30b`) can be an alias for a fine-tuned checkpoint.** The compose file above serves the stock HF base directly; a production deployment may instead mount a locally fine-tuned/requantized checkpoint under the same served name (e.g. an Unsloth QLoRA+ORPO fine-tune merged and FP8-requantized) so `litellm-config.yaml` and `_VLLM_MODEL_MAP` need no change either way. Check `docker inspect vllm-coord` (or the `command:` line in `zgx-ai-setup/docker-compose.yml`) to see what's actually mounted on a given box — `serve <hf-repo-id>` means the stock base; `serve /path/to/local/checkpoint` means a fine-tune.
+> **`vllm-coord`'s served name (`qwen3-coder-30b`) can be an alias for a fine-tuned checkpoint.** The compose file above serves the stock HF base directly; a production deployment may instead mount a locally fine-tuned/requantized checkpoint under the same served name (e.g. an Unsloth QLoRA+ORPO fine-tune merged and FP8-requantized) so `litellm-config.yaml` and the `model_catalog` DB table's `vllm_served_as` column need no change either way. Check `docker inspect vllm-coord` (or the `command:` line in `zgx-ai-setup/docker-compose.yml`) to see what's actually mounted on a given box — `serve <hf-repo-id>` means the stock base; `serve /path/to/local/checkpoint` means a fine-tune.
 >
-> **ALL-MoE consolidation:** unlike Ollama (which keeps a diverse roster warm — different models for different roles), the vLLM stack collapses the entire roster onto the one resident coordinator (`_VLLM_MODEL_MAP` in `swarm/agents.py`). This trades per-role model diversity for continuous-batching throughput and one large resident KV cache, since the dense 32B Ollama models measured 5–7× slower per token on GB10 with no measurable code-quality edge over the MoE coordinator.
+> **ALL-MoE consolidation:** unlike Ollama (which keeps a diverse roster warm — different models for different roles), the vLLM stack collapses the entire roster onto the one resident coordinator (`vllm_served_as` in the `model_catalog` DB table — AGNOHive 2.3.2 addendum, 2026-08-08; was a hardcoded `_VLLM_MODEL_MAP` dict in `swarm/agents.py` before this). This trades per-role model diversity for continuous-batching throughput and one large resident KV cache, since the dense 32B Ollama models measured 5–7× slower per token on GB10 with no measurable code-quality edge over the MoE coordinator.
 >
 > **`vllm-extract` is indexing-only.** A LightRAG *query* uses the coordinator (`qwen3-coder-30b`) for keyword extraction + synthesis, not `vllm-extract` — that server is only the entity-extraction LLM used while indexing (`hive --bootstrap`). Leaving it resident wastes ~13 GB of unified memory for zero benefit outside indexing runs.
 >
@@ -234,6 +234,17 @@ POSTGRES_PASSWORD=agno
 POSTGRES_DATABASE=agno_graph
 POSTGRES_HOST=localhost
 POSTGRES_PORT=5432
+
+# App storage — sessions, the feedback log, model routing (AGNOHive 2.3.2 addendum).
+# A DIFFERENT concern from POSTGRES_URI above (that one's for LightRAG's graph
+# storage). Unset by default: without it, agno-hive uses a local SQLite file
+# (data/agnohive.db) — zero setup, works the moment you clone the repo. Set this
+# to point the app's own storage at Postgres/MySQL/anything SQLAlchemy supports
+# instead — e.g. reusing the same Postgres instance as above:
+# DATABASE_URL=postgresql+psycopg://agno:agno@localhost:5432/agno_graph
+# If DATABASE_URL is unset but POSTGRES_URI (above) IS set, that value is reused
+# automatically — an existing ZGX deployment needs no .env change on upgrade.
+# DATABASE_URL=
 
 # LightRAG MCP (Streamable HTTP, port 9002)
 LIGHTRAG_MCP_PORT=9002

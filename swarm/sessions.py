@@ -1,66 +1,20 @@
-"""Session persistence — chat history stored in PostgreSQL on ZGX.
+"""Session persistence — chat history stored via SQLAlchemy (swarm/db.py), SQLite
+by default or Postgres/anything else per config.database_url (AGNOHive 2.3.2
+addendum, 2026-08-08 — was raw psycopg/Postgres-only before this).
 
 Tables are auto-created on first use (same pattern as feedback.py).
-All functions fail silently so a PostgreSQL outage never blocks task runs.
+All functions fail silently so a DB outage never blocks task runs.
 """
 import uuid
 from datetime import datetime, timedelta, timezone
 
-import psycopg
+from sqlalchemy import delete, func, literal, select, update
 
 from config.config import config
+from swarm import db
 
-
-# ── Schema ────────────────────────────────────────────────────────────────────
-
-async def _ensure_tables(conn) -> None:
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS chat_sessions (
-            id              UUID PRIMARY KEY,
-            project_id      TEXT        NOT NULL,
-            title           TEXT        NOT NULL,
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            expires_at      TIMESTAMPTZ,
-            persist         BOOLEAN     NOT NULL DEFAULT FALSE,
-            summary         TEXT,
-            summary_through INT         NOT NULL DEFAULT 0,
-            current_leaf_id INT
-        )
-    """)
-    await conn.execute("""
-        CREATE INDEX IF NOT EXISTS chat_sessions_project_idx
-            ON chat_sessions (project_id, created_at DESC)
-    """)
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS session_messages (
-            id                SERIAL PRIMARY KEY,
-            session_id        UUID        NOT NULL
-                                  REFERENCES chat_sessions(id) ON DELETE CASCADE,
-            role              TEXT        NOT NULL,
-            content           TEXT        NOT NULL,
-            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            parent_message_id INT         REFERENCES session_messages(id) ON DELETE SET NULL
-        )
-    """)
-    await conn.execute("""
-        CREATE INDEX IF NOT EXISTS session_messages_session_idx
-            ON session_messages (session_id, created_at ASC)
-    """)
-    await conn.execute("""
-        CREATE INDEX IF NOT EXISTS session_messages_parent_idx
-            ON session_messages (parent_message_id)
-    """)
-    # Additive columns for pre-existing deployments where the tables above already
-    # existed before this change (CREATE TABLE IF NOT EXISTS is a no-op there).
-    await conn.execute("""
-        ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS current_leaf_id INT
-    """)
-    await conn.execute("""
-        ALTER TABLE session_messages ADD COLUMN IF NOT EXISTS parent_message_id INT
-            REFERENCES session_messages(id) ON DELETE SET NULL
-    """)
-    await conn.commit()
+chat_sessions = db.chat_sessions
+session_messages = db.session_messages
 
 
 # ── Core CRUD ─────────────────────────────────────────────────────────────────
@@ -76,16 +30,14 @@ async def create_session(
         else datetime.now(timezone.utc) + timedelta(days=config.session_ttl_days)
     )
     try:
-        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
-            await _ensure_tables(conn)
+        await db.ensure_schema()
+        async with db.get_engine().begin() as conn:
             await conn.execute(
-                """
-                INSERT INTO chat_sessions (id, project_id, title, expires_at, persist)
-                VALUES (%s, %s, %s, %s, %s)
-                """,
-                (session_id, project_id, title[:80], expires_at, persist),
+                chat_sessions.insert().values(
+                    id=session_id, project_id=project_id, title=title[:80],
+                    expires_at=expires_at, persist=persist,
+                )
             )
-            await conn.commit()
     except Exception as exc:
         print(f"[sessions] create_session warning: {exc}")
     return session_id
@@ -103,27 +55,28 @@ async def append_message(
     invoked, since the leaf always trails the most recent append.
     """
     try:
-        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
+        async with db.get_engine().begin() as conn:
             if parent_message_id is None:
-                leaf_row = await conn.execute(
-                    "SELECT current_leaf_id FROM chat_sessions WHERE id = %s", (session_id,)
-                )
-                row = await leaf_row.fetchone()
+                row = (
+                    await conn.execute(
+                        select(chat_sessions.c.current_leaf_id).where(chat_sessions.c.id == session_id)
+                    )
+                ).first()
                 parent_message_id = row[0] if row else None
 
-            insert_result = await conn.execute(
-                "INSERT INTO session_messages (session_id, role, content, parent_message_id)"
-                " VALUES (%s, %s, %s, %s) RETURNING id",
-                (session_id, role, content, parent_message_id),
+            result = await conn.execute(
+                session_messages.insert().values(
+                    session_id=session_id, role=role, content=content,
+                    parent_message_id=parent_message_id,
+                )
             )
-            new_row = await insert_result.fetchone()
-            new_id = new_row[0] if new_row else None
+            new_id = result.inserted_primary_key[0] if result.inserted_primary_key else None
 
             await conn.execute(
-                "UPDATE chat_sessions SET updated_at = NOW(), current_leaf_id = %s WHERE id = %s",
-                (new_id, session_id),
+                update(chat_sessions)
+                .where(chat_sessions.c.id == session_id)
+                .values(updated_at=func.now(), current_leaf_id=new_id)
             )
-            await conn.commit()
             return new_id
     except Exception as exc:
         print(f"[sessions] append_message warning: {exc}")
@@ -135,20 +88,26 @@ async def get_history(session_id: str, limit: int | None = None) -> list[dict]:
     if limit is None:
         limit = config.session_window
     try:
-        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
-            rows = await conn.execute(
-                """
-                SELECT role, content FROM (
-                    SELECT role, content, created_at
-                    FROM session_messages
-                    WHERE session_id = %s
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                ) sub ORDER BY created_at ASC
-                """,
-                (session_id, limit),
+        async with db.get_engine().begin() as conn:
+            # id is a secondary sort key, not just created_at -- SQLite's
+            # CURRENT_TIMESTAMP (what func.now() compiles to there) only has
+            # second resolution, so two messages appended within the same second
+            # would otherwise sort in an unstable/arbitrary order. id (an
+            # autoincrement PK) always reflects true insertion order as a tiebreak,
+            # on both SQLite and Postgres.
+            sub = (
+                select(
+                    session_messages.c.id, session_messages.c.role,
+                    session_messages.c.content, session_messages.c.created_at,
+                )
+                .where(session_messages.c.session_id == session_id)
+                .order_by(session_messages.c.created_at.desc(), session_messages.c.id.desc())
+                .limit(limit)
+                .subquery()
             )
-            return [{"role": r[0], "content": r[1]} for r in await rows.fetchall()]
+            stmt = select(sub.c.role, sub.c.content).order_by(sub.c.created_at.asc(), sub.c.id.asc())
+            rows = (await conn.execute(stmt)).mappings().all()
+            return [{"role": r["role"], "content": r["content"]} for r in rows]
     except Exception as exc:
         print(f"[sessions] get_history warning: {exc}")
         return []
@@ -163,31 +122,32 @@ async def get_branch_history(
     if limit is None:
         limit = config.session_window
     try:
-        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
+        async with db.get_engine().begin() as conn:
             if leaf_id is None:
-                leaf_row = await conn.execute(
-                    "SELECT current_leaf_id FROM chat_sessions WHERE id = %s", (session_id,)
-                )
-                row = await leaf_row.fetchone()
+                row = (
+                    await conn.execute(
+                        select(chat_sessions.c.current_leaf_id).where(chat_sessions.c.id == session_id)
+                    )
+                ).first()
                 leaf_id = row[0] if row else None
                 if leaf_id is None:
                     return []
 
-            rows = await conn.execute(
-                """
-                WITH RECURSIVE branch AS (
-                    SELECT id, role, content, parent_message_id, 0 AS depth
-                    FROM session_messages WHERE id = %(leaf_id)s
-                    UNION ALL
-                    SELECT sm.id, sm.role, sm.content, sm.parent_message_id, b.depth + 1
-                    FROM session_messages sm
-                    JOIN branch b ON sm.id = b.parent_message_id
-                )
-                SELECT role, content FROM branch ORDER BY depth ASC LIMIT %(limit)s
-                """,
-                {"leaf_id": leaf_id, "limit": limit},
+            sm = session_messages
+            base = (
+                select(sm.c.id, sm.c.role, sm.c.content, sm.c.parent_message_id, literal(0).label("depth"))
+                .where(sm.c.id == leaf_id)
+                .cte(name="branch", recursive=True)
             )
-            newest_first = [{"role": r[0], "content": r[1]} for r in await rows.fetchall()]
+            sm2 = sm.alias("sm2")
+            recursive = select(
+                sm2.c.id, sm2.c.role, sm2.c.content, sm2.c.parent_message_id, (base.c.depth + 1).label("depth"),
+            ).select_from(sm2.join(base, sm2.c.id == base.c.parent_message_id))
+            branch_cte = base.union_all(recursive)
+
+            stmt = select(branch_cte.c.role, branch_cte.c.content).order_by(branch_cte.c.depth.asc()).limit(limit)
+            rows = (await conn.execute(stmt)).mappings().all()
+            newest_first = [{"role": r["role"], "content": r["content"]} for r in rows]
             return list(reversed(newest_first))
     except Exception as exc:
         print(f"[sessions] get_branch_history warning: {exc}")
@@ -198,12 +158,12 @@ async def set_current_leaf(session_id: str, message_id: int) -> bool:
     """Rewind/advance the session's active branch tip. Used by /branch to rewind
     to an earlier message's parent before the user resubmits a sibling branch."""
     try:
-        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
+        async with db.get_engine().begin() as conn:
             result = await conn.execute(
-                "UPDATE chat_sessions SET current_leaf_id = %s, updated_at = NOW() WHERE id = %s",
-                (message_id, session_id),
+                update(chat_sessions)
+                .where(chat_sessions.c.id == session_id)
+                .values(current_leaf_id=message_id, updated_at=func.now())
             )
-            await conn.commit()
             return result.rowcount > 0
     except Exception as exc:
         print(f"[sessions] set_current_leaf warning: {exc}")
@@ -215,30 +175,40 @@ async def list_session_tree(session_id: str) -> list[dict]:
     a /tree picker's flat depth-indented display (not every branch's exact
     diagram shape -- an MVP, not a rendered tree)."""
     try:
-        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
-            rows = await conn.execute(
-                """
-                WITH RECURSIVE tree AS (
-                    SELECT id, parent_message_id, role, content, created_at, 0 AS depth
-                    FROM session_messages
-                    WHERE session_id = %(session_id)s AND parent_message_id IS NULL
-                    UNION ALL
-                    SELECT sm.id, sm.parent_message_id, sm.role, sm.content, sm.created_at, t.depth + 1
-                    FROM session_messages sm
-                    JOIN tree t ON sm.parent_message_id = t.id
-                    WHERE sm.session_id = %(session_id)s
+        async with db.get_engine().begin() as conn:
+            sm = session_messages
+            base = (
+                select(
+                    sm.c.id, sm.c.parent_message_id, sm.c.role, sm.c.content, sm.c.created_at,
+                    literal(0).label("depth"),
                 )
-                SELECT id, parent_message_id, role, content, created_at, depth
-                FROM tree ORDER BY created_at ASC
-                """,
-                {"session_id": session_id},
+                .where(sm.c.session_id == session_id, sm.c.parent_message_id.is_(None))
+                .cte(name="tree", recursive=True)
             )
+            sm2 = sm.alias("sm2")
+            recursive = (
+                select(
+                    sm2.c.id, sm2.c.parent_message_id, sm2.c.role, sm2.c.content, sm2.c.created_at,
+                    (base.c.depth + 1).label("depth"),
+                )
+                .select_from(sm2.join(base, sm2.c.parent_message_id == base.c.id))
+                .where(sm2.c.session_id == session_id)
+            )
+            tree_cte = base.union_all(recursive)
+
+            # id as a secondary sort key -- see get_history's comment on why
+            # created_at alone is not a reliable tiebreak on SQLite.
+            stmt = select(
+                tree_cte.c.id, tree_cte.c.parent_message_id, tree_cte.c.role,
+                tree_cte.c.content, tree_cte.c.created_at, tree_cte.c.depth,
+            ).order_by(tree_cte.c.created_at.asc(), tree_cte.c.id.asc())
+            rows = (await conn.execute(stmt)).mappings().all()
             return [
                 {
-                    "id": r[0], "parent_message_id": r[1], "role": r[2],
-                    "content": r[3], "created_at": r[4], "depth": r[5],
+                    "id": r["id"], "parent_message_id": r["parent_message_id"], "role": r["role"],
+                    "content": r["content"], "created_at": r["created_at"], "depth": r["depth"],
                 }
-                for r in await rows.fetchall()
+                for r in rows
             ]
     except Exception as exc:
         print(f"[sessions] list_session_tree warning: {exc}")
@@ -269,34 +239,36 @@ async def fork_session(source_session_id: str, project_id: str, title: str) -> s
 async def get_session(session_id: str) -> dict | None:
     """Return session metadata + message count, or None if not found."""
     try:
-        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
-            await _ensure_tables(conn)
-            rows = await conn.execute(
-                """
-                SELECT s.id, s.project_id, s.title, s.created_at, s.updated_at,
-                       s.expires_at, s.persist, s.summary, s.summary_through,
-                       COUNT(m.id) AS message_count
-                FROM chat_sessions s
-                LEFT JOIN session_messages m ON m.session_id = s.id
-                WHERE s.id = %s
-                GROUP BY s.id
-                """,
-                (session_id,),
+        await db.ensure_schema()
+        async with db.get_engine().begin() as conn:
+            cs, sm = chat_sessions, session_messages
+            stmt = (
+                select(
+                    cs.c.id, cs.c.project_id, cs.c.title, cs.c.created_at, cs.c.updated_at,
+                    cs.c.expires_at, cs.c.persist, cs.c.summary, cs.c.summary_through,
+                    func.count(sm.c.id).label("message_count"),
+                )
+                .select_from(cs.outerjoin(sm, sm.c.session_id == cs.c.id))
+                .where(cs.c.id == session_id)
+                .group_by(
+                    cs.c.id, cs.c.project_id, cs.c.title, cs.c.created_at, cs.c.updated_at,
+                    cs.c.expires_at, cs.c.persist, cs.c.summary, cs.c.summary_through,
+                )
             )
-            row = await rows.fetchone()
+            row = (await conn.execute(stmt)).mappings().first()
             if not row:
                 return None
             return {
-                "id": str(row[0]),
-                "project_id": row[1],
-                "title": row[2],
-                "created_at": row[3],
-                "updated_at": row[4],
-                "expires_at": row[5],
-                "persist": row[6],
-                "summary": row[7],
-                "summary_through": row[8],
-                "message_count": row[9],
+                "id": str(row["id"]),
+                "project_id": row["project_id"],
+                "title": row["title"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "expires_at": row["expires_at"],
+                "persist": row["persist"],
+                "summary": row["summary"],
+                "summary_through": row["summary_through"],
+                "message_count": row["message_count"],
             }
     except Exception as exc:
         print(f"[sessions] get_session warning: {exc}")
@@ -306,32 +278,33 @@ async def get_session(session_id: str) -> dict | None:
 async def list_sessions(project_id: str, limit: int = 20) -> list[dict]:
     """Return session summaries for a project, most-recently-updated first."""
     try:
-        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
-            await _ensure_tables(conn)
-            rows = await conn.execute(
-                """
-                SELECT s.id, s.title, s.created_at, s.updated_at,
-                       s.expires_at, s.persist, COUNT(m.id) AS message_count
-                FROM chat_sessions s
-                LEFT JOIN session_messages m ON m.session_id = s.id
-                WHERE s.project_id = %s
-                GROUP BY s.id
-                ORDER BY s.updated_at DESC
-                LIMIT %s
-                """,
-                (project_id, limit),
+        await db.ensure_schema()
+        async with db.get_engine().begin() as conn:
+            cs, sm = chat_sessions, session_messages
+            stmt = (
+                select(
+                    cs.c.id, cs.c.title, cs.c.created_at, cs.c.updated_at,
+                    cs.c.expires_at, cs.c.persist,
+                    func.count(sm.c.id).label("message_count"),
+                )
+                .select_from(cs.outerjoin(sm, sm.c.session_id == cs.c.id))
+                .where(cs.c.project_id == project_id)
+                .group_by(cs.c.id, cs.c.title, cs.c.created_at, cs.c.updated_at, cs.c.expires_at, cs.c.persist)
+                .order_by(cs.c.updated_at.desc())
+                .limit(limit)
             )
+            rows = (await conn.execute(stmt)).mappings().all()
             return [
                 {
-                    "id": str(r[0]),
-                    "title": r[1],
-                    "created_at": r[2],
-                    "updated_at": r[3],
-                    "expires_at": r[4],
-                    "persist": r[5],
-                    "message_count": r[6],
+                    "id": str(r["id"]),
+                    "title": r["title"],
+                    "created_at": r["created_at"],
+                    "updated_at": r["updated_at"],
+                    "expires_at": r["expires_at"],
+                    "persist": r["persist"],
+                    "message_count": r["message_count"],
                 }
-                for r in await rows.fetchall()
+                for r in rows
             ]
     except Exception as exc:
         print(f"[sessions] list_sessions warning: {exc}")
@@ -341,11 +314,8 @@ async def list_sessions(project_id: str, limit: int = 20) -> list[dict]:
 async def delete_session(session_id: str) -> bool:
     """Hard-delete a session and its messages. Returns True if a row was deleted."""
     try:
-        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
-            result = await conn.execute(
-                "DELETE FROM chat_sessions WHERE id = %s", (session_id,)
-            )
-            await conn.commit()
+        async with db.get_engine().begin() as conn:
+            result = await conn.execute(delete(chat_sessions).where(chat_sessions.c.id == session_id))
             return result.rowcount > 0
     except Exception as exc:
         print(f"[sessions] delete_session warning: {exc}")
@@ -355,16 +325,12 @@ async def delete_session(session_id: str) -> bool:
 async def persist_session(session_id: str) -> bool:
     """Mark a session as permanent (clears expires_at). Returns True if updated."""
     try:
-        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
+        async with db.get_engine().begin() as conn:
             result = await conn.execute(
-                """
-                UPDATE chat_sessions
-                SET persist = TRUE, expires_at = NULL, updated_at = NOW()
-                WHERE id = %s
-                """,
-                (session_id,),
+                update(chat_sessions)
+                .where(chat_sessions.c.id == session_id)
+                .values(persist=True, expires_at=None, updated_at=func.now())
             )
-            await conn.commit()
             return result.rowcount > 0
     except Exception as exc:
         print(f"[sessions] persist_session warning: {exc}")
@@ -374,12 +340,11 @@ async def persist_session(session_id: str) -> bool:
 async def _cleanup_expired() -> int:
     """Delete expired non-persisted sessions. Returns count deleted."""
     try:
-        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
-            await _ensure_tables(conn)
+        await db.ensure_schema()
+        async with db.get_engine().begin() as conn:
             result = await conn.execute(
-                "DELETE FROM chat_sessions WHERE expires_at < NOW() AND persist = FALSE"
+                delete(chat_sessions).where(chat_sessions.c.expires_at < func.now(), chat_sessions.c.persist.is_(False))
             )
-            await conn.commit()
             return result.rowcount
     except Exception as exc:
         print(f"[sessions] cleanup warning: {exc}")
@@ -407,17 +372,13 @@ async def save_handoff_summary(session_id: str, summary: str) -> None:
     receives a compact structured digest instead of full message history.
     """
     try:
-        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
-            await _ensure_tables(conn)
+        await db.ensure_schema()
+        async with db.get_engine().begin() as conn:
             await conn.execute(
-                """
-                UPDATE chat_sessions
-                SET summary = %s, updated_at = NOW()
-                WHERE id = %s
-                """,
-                (summary, session_id),
+                update(chat_sessions)
+                .where(chat_sessions.c.id == session_id)
+                .values(summary=summary, updated_at=func.now())
             )
-            await conn.commit()
     except Exception as exc:
         print(f"[sessions] save_handoff_summary warning: {exc}")
 
@@ -435,15 +396,13 @@ async def compact_session(session_id: str) -> None:
         if not session:
             return
 
-        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
-            rows = await conn.execute(
-                """
-                SELECT id, role, content FROM session_messages
-                WHERE session_id = %s ORDER BY created_at ASC
-                """,
-                (session_id,),
+        async with db.get_engine().begin() as conn:
+            stmt = (
+                select(session_messages.c.id, session_messages.c.role, session_messages.c.content)
+                .where(session_messages.c.session_id == session_id)
+                .order_by(session_messages.c.created_at.asc())
             )
-            all_messages = [(r[0], r[1], r[2]) for r in await rows.fetchall()]
+            all_messages = [(r[0], r[1], r[2]) for r in (await conn.execute(stmt)).all()]
 
         window = config.session_window
         if len(all_messages) <= window:
@@ -474,15 +433,11 @@ async def compact_session(session_id: str) -> None:
             resp.raise_for_status()
             summary = resp.json().get("response", "").strip()
 
-        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
+        async with db.get_engine().begin() as conn:
             await conn.execute(
-                """
-                UPDATE chat_sessions
-                SET summary = %s, summary_through = %s, updated_at = NOW()
-                WHERE id = %s
-                """,
-                (summary, last_id_covered, session_id),
+                update(chat_sessions)
+                .where(chat_sessions.c.id == session_id)
+                .values(summary=summary, summary_through=last_id_covered, updated_at=func.now())
             )
-            await conn.commit()
     except Exception as exc:
         print(f"[sessions] compact_session warning: {exc}")

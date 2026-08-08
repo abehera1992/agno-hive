@@ -1,301 +1,122 @@
-"""Unit tests for swarm/sessions.py — all psycopg I/O is mocked."""
+"""Tests for swarm/sessions.py -- runs against a real in-memory SQLite DB via
+swarm/db.py (AGNOHive 2.3.2 addendum, 2026-08-08 — was psycopg-mock-based before
+this, since sessions.py talked to Postgres directly; SQLAlchemy makes a real,
+fast, dependency-free DB available in tests instead of mocking raw SQL strings)."""
 import pytest
-from unittest.mock import AsyncMock, patch
+
+from config.config import config
+from swarm import db, sessions
 
 
-# ── Mock helpers ──────────────────────────────────────────────────────────────
-
-def _make_cursor(rows=None, rowcount=0):
-    cursor = AsyncMock()
-    cursor.fetchall = AsyncMock(return_value=rows or [])
-    cursor.fetchone = AsyncMock(return_value=None)
-    cursor.rowcount = rowcount
-    return cursor
-
-
-def _make_conn(cursor=None):
-    if cursor is None:
-        cursor = _make_cursor()
-    conn = AsyncMock()
-    conn.execute = AsyncMock(return_value=cursor)
-    conn.commit = AsyncMock()
-    conn.__aenter__ = AsyncMock(return_value=conn)
-    conn.__aexit__ = AsyncMock(return_value=False)
-    return conn
-
-
-def _patch_connect(conn):
-    """Patch psycopg.AsyncConnection.connect to return mock conn."""
-    async def _connect(*args, **kwargs):
-        return conn
-    return patch("swarm.sessions.psycopg.AsyncConnection.connect", side_effect=_connect)
+@pytest.fixture(autouse=True)
+async def _fresh_db(monkeypatch):
+    monkeypatch.setattr(config, "database_url", "sqlite+aiosqlite:///:memory:")
+    monkeypatch.setattr(config, "postgres_uri", "")
+    await db.reset_engine_for_tests()
+    yield
 
 
 # ── create_session ────────────────────────────────────────────────────────────
 
-@pytest.mark.asyncio
 async def test_create_session_returns_uuid():
-    from swarm.sessions import create_session
-    conn = _make_conn()
-    with _patch_connect(conn):
-        sid = await create_session("myproject", "test task", persist=False)
+    sid = await sessions.create_session("myproject", "test task", persist=False)
     assert len(sid) == 36
     assert sid.count("-") == 4
 
 
-@pytest.mark.asyncio
 async def test_create_session_persist_sets_no_expiry():
-    from swarm.sessions import create_session
-    conn = _make_conn()
-    with _patch_connect(conn):
-        await create_session("myproject", "persist task", persist=True)
-    insert_call = next(c for c in conn.execute.call_args_list
-                       if "INSERT INTO chat_sessions" in str(c))
-    args = insert_call.args[1]  # (session_id, project_id, title, expires_at, persist)
-    assert args[3] is None      # expires_at
-    assert args[4] is True      # persist
+    sid = await sessions.create_session("myproject", "persist task", persist=True)
+    row = await sessions.get_session(sid)
+    assert row["expires_at"] is None
+    assert row["persist"] is True
 
 
-@pytest.mark.asyncio
+async def test_create_session_non_persist_sets_expiry():
+    sid = await sessions.create_session("myproject", "task", persist=False)
+    row = await sessions.get_session(sid)
+    assert row["expires_at"] is not None
+    assert row["persist"] is False
+
+
 async def test_create_session_title_truncated():
-    from swarm.sessions import create_session
-    conn = _make_conn()
-    long_title = "x" * 200
-    with _patch_connect(conn):
-        await create_session("myproject", long_title)
-    insert_call = next(c for c in conn.execute.call_args_list
-                       if "INSERT INTO chat_sessions" in str(c))
-    title_stored = insert_call.args[1][2]
-    assert len(title_stored) == 80
+    sid = await sessions.create_session("myproject", "x" * 200)
+    row = await sessions.get_session(sid)
+    assert len(row["title"]) == 80
 
 
 # ── append_message ────────────────────────────────────────────────────────────
 
-@pytest.mark.asyncio
-async def test_append_message_calls_insert_and_update():
-    from swarm.sessions import append_message
-    conn = _make_conn()
-    with _patch_connect(conn):
-        await append_message("session-uuid", "user", "hello")
-    execute_calls = [str(c) for c in conn.execute.call_args_list]
-    assert any("INSERT INTO session_messages" in c for c in execute_calls)
-    assert any("UPDATE chat_sessions" in c for c in execute_calls)
-    conn.commit.assert_called_once()
+async def test_append_message_returns_new_message_id():
+    sid = await sessions.create_session("p", "t")
+    new_id = await sessions.append_message(sid, "user", "hello")
+    assert isinstance(new_id, int)
+
+
+async def test_append_message_defaults_parent_to_current_leaf():
+    sid = await sessions.create_session("p", "t")
+    m1 = await sessions.append_message(sid, "user", "hello")
+    m2 = await sessions.append_message(sid, "assistant", "reply")  # parent_message_id omitted
+    tree = await sessions.list_session_tree(sid)
+    m2_row = next(r for r in tree if r["id"] == m2)
+    assert m2_row["parent_message_id"] == m1
+
+
+async def test_append_message_explicit_parent_skips_leaf_lookup():
+    sid = await sessions.create_session("p", "t")
+    m1 = await sessions.append_message(sid, "user", "hello")
+    m2 = await sessions.append_message(sid, "assistant", "reply")
+    m3 = await sessions.append_message(sid, "user", "branch from m1", parent_message_id=m1)
+    tree = await sessions.list_session_tree(sid)
+    m3_row = next(r for r in tree if r["id"] == m3)
+    assert m3_row["parent_message_id"] == m1
+    assert m3 != m2
+
+
+async def test_append_message_advances_current_leaf():
+    sid = await sessions.create_session("p", "t")
+    m1 = await sessions.append_message(sid, "user", "hello")
+    row = await sessions.get_session(sid)
+    branch = await sessions.get_branch_history(sid)
+    assert branch == [{"role": "user", "content": "hello"}]
+
+
+async def test_append_message_returns_none_on_error(monkeypatch):
+    def _broken_engine():
+        raise RuntimeError("db down")
+    monkeypatch.setattr(db, "get_engine", _broken_engine)
+    result = await sessions.append_message("session-uuid", "user", "hi")
+    assert result is None
 
 
 # ── get_history ───────────────────────────────────────────────────────────────
 
-@pytest.mark.asyncio
-async def test_get_history_returns_messages():
-    from swarm.sessions import get_history
-    cursor = _make_cursor(rows=[("user", "hi"), ("assistant", "hello")])
-    conn = _make_conn(cursor)
-    with _patch_connect(conn):
-        result = await get_history("session-uuid", limit=6)
+async def test_get_history_returns_messages_oldest_first():
+    sid = await sessions.create_session("p", "t")
+    await sessions.append_message(sid, "user", "hi")
+    await sessions.append_message(sid, "assistant", "hello")
+    result = await sessions.get_history(sid, limit=6)
     assert result == [
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "hello"},
     ]
 
 
-@pytest.mark.asyncio
-async def test_get_history_returns_empty_on_error():
-    from swarm.sessions import get_history
-    async def _bad_connect(*args, **kwargs):
+async def test_get_history_returns_empty_on_error(monkeypatch):
+    def _broken_engine():
         raise RuntimeError("db down")
-    with patch("swarm.sessions.psycopg.AsyncConnection.connect", side_effect=_bad_connect):
-        result = await get_history("session-uuid")
+    monkeypatch.setattr(db, "get_engine", _broken_engine)
+    result = await sessions.get_history("session-uuid")
     assert result == []
-
-
-# ── delete_session ────────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_delete_session_returns_true_when_deleted():
-    from swarm.sessions import delete_session
-    cursor = _make_cursor(rowcount=1)
-    conn = _make_conn(cursor)
-    with _patch_connect(conn):
-        result = await delete_session("session-uuid")
-    assert result is True
-
-
-@pytest.mark.asyncio
-async def test_delete_session_returns_false_when_not_found():
-    from swarm.sessions import delete_session
-    cursor = _make_cursor(rowcount=0)
-    conn = _make_conn(cursor)
-    with _patch_connect(conn):
-        result = await delete_session("nonexistent")
-    assert result is False
-
-
-# ── persist_session ───────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_persist_session_returns_true_when_updated():
-    from swarm.sessions import persist_session
-    cursor = _make_cursor(rowcount=1)
-    conn = _make_conn(cursor)
-    with _patch_connect(conn):
-        result = await persist_session("session-uuid")
-    assert result is True
-    update_call = next(c for c in conn.execute.call_args_list
-                       if "UPDATE chat_sessions" in str(c))
-    assert "persist = TRUE" in str(update_call)
-    assert "expires_at = NULL" in str(update_call)
-
-
-# ── _cleanup_expired ──────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_cleanup_expired_returns_count():
-    from swarm.sessions import _cleanup_expired
-    cursor = _make_cursor(rowcount=3)
-    conn = _make_conn(cursor)
-    with _patch_connect(conn):
-        count = await _cleanup_expired()
-    assert count == 3
-    delete_call = next(c for c in conn.execute.call_args_list
-                       if "DELETE FROM chat_sessions" in str(c))
-    assert "expires_at < NOW()" in str(delete_call)
-
-
-# ── get_context ───────────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_get_context_returns_summary_and_messages():
-    """get_context now walks the tree via get_branch_history, not a flat scan --
-    2 connections: get_session's own lookup, then get_branch_history's SINGLE
-    connection, which reuses the same cursor for both its current_leaf_id lookup
-    (fetchone) and its recursive CTE walk (fetchall, newest-first -- reversed by
-    the function itself before returning)."""
-    from swarm.sessions import get_context
-    session_row = (
-        "uuid", "proj", "title",
-        None, None,          # created_at, updated_at
-        None, False,         # expires_at, persist
-        "Prior summary",     # summary
-        5,                   # summary_through
-        4,                   # message_count
-    )
-    leaf_row = (42,)
-    branch_rows_newest_first = [("assistant", "a1"), ("user", "q1")]
-
-    call_count = 0
-
-    def _make_dynamic_conn():
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            cursor = _make_cursor()
-            cursor.fetchone = AsyncMock(return_value=session_row)
-            return _make_conn(cursor)
-        else:
-            cursor = _make_cursor(rows=branch_rows_newest_first)
-            cursor.fetchone = AsyncMock(return_value=leaf_row)
-            return _make_conn(cursor)
-
-    async def _connect(*args, **kwargs):
-        return _make_dynamic_conn()
-
-    with patch("swarm.sessions.psycopg.AsyncConnection.connect", side_effect=_connect):
-        summary, messages = await get_context("session-uuid")
-
-    assert summary == "Prior summary"
-    assert messages == [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
-
-
-@pytest.mark.asyncio
-async def test_get_context_now_calls_get_branch_history_not_get_history():
-    from swarm import sessions
-    session_row = ("uuid", "proj", "title", None, None, None, False, "summary", 0, 4)
-    cursor = _make_cursor()
-    cursor.fetchone = AsyncMock(return_value=session_row)
-    conn = _make_conn(cursor)
-    with _patch_connect(conn), \
-         patch("swarm.sessions.get_branch_history", new=AsyncMock(return_value=[{"role": "user", "content": "hi"}])) as mocked, \
-         patch("swarm.sessions.get_history", new=AsyncMock(return_value=[])) as unused:
-        summary, messages = await sessions.get_context("session-uuid")
-    mocked.assert_awaited_once()
-    unused.assert_not_awaited()
-    assert messages == [{"role": "user", "content": "hi"}]
-
-
-# ── append_message (tree-aware) ────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_append_message_returns_new_message_id():
-    from swarm.sessions import append_message
-    cursor = _make_cursor()
-    cursor.fetchone = AsyncMock(return_value=(42,))
-    conn = _make_conn(cursor)
-    with _patch_connect(conn):
-        new_id = await append_message("session-uuid", "user", "hello")
-    assert new_id == 42
-
-
-@pytest.mark.asyncio
-async def test_append_message_defaults_parent_to_current_leaf():
-    from swarm.sessions import append_message
-    cursor = _make_cursor()
-    cursor.fetchone = AsyncMock(side_effect=[(7,), (99,)])  # leaf lookup, then INSERT...RETURNING id
-    conn = _make_conn(cursor)
-    with _patch_connect(conn):
-        await append_message("session-uuid", "assistant", "reply")
-    insert_call = next(c for c in conn.execute.call_args_list
-                       if "INSERT INTO session_messages" in str(c))
-    assert insert_call.args[1][3] == 7  # parent_message_id positional arg
-
-
-@pytest.mark.asyncio
-async def test_append_message_explicit_parent_skips_leaf_lookup():
-    from swarm.sessions import append_message
-    cursor = _make_cursor()
-    cursor.fetchone = AsyncMock(return_value=(55,))
-    conn = _make_conn(cursor)
-    with _patch_connect(conn):
-        await append_message("session-uuid", "user", "hi", parent_message_id=3)
-    insert_call = next(c for c in conn.execute.call_args_list
-                       if "INSERT INTO session_messages" in str(c))
-    assert insert_call.args[1][3] == 3
-
-
-@pytest.mark.asyncio
-async def test_append_message_advances_current_leaf():
-    from swarm.sessions import append_message
-    cursor = _make_cursor()
-    cursor.fetchone = AsyncMock(return_value=(101,))
-    conn = _make_conn(cursor)
-    with _patch_connect(conn):
-        await append_message("session-uuid", "user", "hi", parent_message_id=None)
-    leaf_update = next(c for c in conn.execute.call_args_list
-                       if "current_leaf_id" in str(c) and "UPDATE chat_sessions" in str(c))
-    assert 101 in leaf_update.args[1]
-
-
-@pytest.mark.asyncio
-async def test_append_message_returns_none_on_error():
-    from swarm.sessions import append_message
-    async def _bad_connect(*args, **kwargs):
-        raise RuntimeError("db down")
-    with patch("swarm.sessions.psycopg.AsyncConnection.connect", side_effect=_bad_connect):
-        result = await append_message("session-uuid", "user", "hi")
-    assert result is None
 
 
 # ── get_branch_history ───────────────────────────────────────────────────────
 
-@pytest.mark.asyncio
 async def test_get_branch_history_walks_from_current_leaf_and_reverses_to_oldest_first():
-    from swarm.sessions import get_branch_history
-    # Recursive CTE returns newest-first (depth 0 = leaf); function must reverse it.
-    rows = [("user", "second"), ("assistant", "first-reply"), ("user", "first")]
-    cursor = _make_cursor(rows=rows)
-    cursor.fetchone = AsyncMock(return_value=(5,))  # current_leaf_id lookup
-    conn = _make_conn(cursor)
-    with _patch_connect(conn):
-        result = await get_branch_history("session-uuid")
+    sid = await sessions.create_session("p", "t")
+    await sessions.append_message(sid, "user", "first")
+    await sessions.append_message(sid, "assistant", "first-reply")
+    await sessions.append_message(sid, "user", "second")
+    result = await sessions.get_branch_history(sid)
     assert result == [
         {"role": "user", "content": "first"},
         {"role": "assistant", "content": "first-reply"},
@@ -303,123 +124,231 @@ async def test_get_branch_history_walks_from_current_leaf_and_reverses_to_oldest
     ]
 
 
-@pytest.mark.asyncio
 async def test_get_branch_history_uses_explicit_leaf_id_when_given():
-    from swarm.sessions import get_branch_history
-    cursor = _make_cursor(rows=[("user", "x")])
-    conn = _make_conn(cursor)
-    with _patch_connect(conn):
-        await get_branch_history("session-uuid", leaf_id=42)
-    walk_call = next(c for c in conn.execute.call_args_list if "WITH RECURSIVE" in str(c))
-    assert walk_call.args[1]["leaf_id"] == 42
+    sid = await sessions.create_session("p", "t")
+    m1 = await sessions.append_message(sid, "user", "root")
+    await sessions.append_message(sid, "assistant", "child")  # advances current_leaf_id past m1
+    result = await sessions.get_branch_history(sid, leaf_id=m1)
+    assert result == [{"role": "user", "content": "root"}]
 
 
-@pytest.mark.asyncio
 async def test_get_branch_history_returns_empty_when_session_has_no_leaf():
-    from swarm.sessions import get_branch_history
-    cursor = _make_cursor()
-    cursor.fetchone = AsyncMock(return_value=None)  # no current_leaf_id row
-    conn = _make_conn(cursor)
-    with _patch_connect(conn):
-        result = await get_branch_history("session-uuid")
+    sid = await sessions.create_session("p", "t")  # no messages appended
+    result = await sessions.get_branch_history(sid)
     assert result == []
 
 
-@pytest.mark.asyncio
-async def test_get_branch_history_returns_empty_on_error():
-    from swarm.sessions import get_branch_history
-    async def _bad_connect(*args, **kwargs):
+async def test_get_branch_history_returns_empty_on_error(monkeypatch):
+    def _broken_engine():
         raise RuntimeError("db down")
-    with patch("swarm.sessions.psycopg.AsyncConnection.connect", side_effect=_bad_connect):
-        result = await get_branch_history("session-uuid")
+    monkeypatch.setattr(db, "get_engine", _broken_engine)
+    result = await sessions.get_branch_history("session-uuid")
     assert result == []
 
 
 # ── set_current_leaf ─────────────────────────────────────────────────────────
 
-@pytest.mark.asyncio
-async def test_set_current_leaf_returns_true_when_updated():
-    from swarm.sessions import set_current_leaf
-    cursor = _make_cursor(rowcount=1)
-    conn = _make_conn(cursor)
-    with _patch_connect(conn):
-        result = await set_current_leaf("session-uuid", 17)
+async def test_set_current_leaf_returns_true_when_updated_and_rewinds_branch():
+    sid = await sessions.create_session("p", "t")
+    m1 = await sessions.append_message(sid, "user", "root")
+    await sessions.append_message(sid, "assistant", "child")
+    result = await sessions.set_current_leaf(sid, m1)
     assert result is True
-    update_call = next(c for c in conn.execute.call_args_list
-                       if "UPDATE chat_sessions" in str(c) and "current_leaf_id" in str(c))
-    assert 17 in update_call.args[1]
+    assert await sessions.get_branch_history(sid) == [{"role": "user", "content": "root"}]
 
 
-@pytest.mark.asyncio
 async def test_set_current_leaf_returns_false_when_session_not_found():
-    from swarm.sessions import set_current_leaf
-    cursor = _make_cursor(rowcount=0)
-    conn = _make_conn(cursor)
-    with _patch_connect(conn):
-        result = await set_current_leaf("nonexistent", 17)
+    result = await sessions.set_current_leaf("00000000-0000-0000-0000-000000000000", 17)
     assert result is False
 
 
 # ── list_session_tree ────────────────────────────────────────────────────────
 
-@pytest.mark.asyncio
 async def test_list_session_tree_returns_all_messages_with_depth():
-    from swarm.sessions import list_session_tree
-    rows = [(1, None, "user", "root", "2026-01-01", 0), (2, 1, "assistant", "reply", "2026-01-01", 1)]
-    cursor = _make_cursor(rows=rows)
-    conn = _make_conn(cursor)
-    with _patch_connect(conn):
-        result = await list_session_tree("session-uuid")
-    assert result == [
-        {"id": 1, "parent_message_id": None, "role": "user", "content": "root", "created_at": "2026-01-01", "depth": 0},
-        {"id": 2, "parent_message_id": 1, "role": "assistant", "content": "reply", "created_at": "2026-01-01", "depth": 1},
-    ]
+    sid = await sessions.create_session("p", "t")
+    m1 = await sessions.append_message(sid, "user", "root")
+    m2 = await sessions.append_message(sid, "assistant", "reply")
+    result = await sessions.list_session_tree(sid)
+    assert [r["id"] for r in result] == [m1, m2]
+    assert result[0]["depth"] == 0
+    assert result[1]["depth"] == 1
+    assert result[1]["parent_message_id"] == m1
 
 
-@pytest.mark.asyncio
-async def test_list_session_tree_returns_empty_on_error():
-    from swarm.sessions import list_session_tree
-    async def _bad_connect(*args, **kwargs):
+async def test_list_session_tree_returns_empty_on_error(monkeypatch):
+    def _broken_engine():
         raise RuntimeError("db down")
-    with patch("swarm.sessions.psycopg.AsyncConnection.connect", side_effect=_bad_connect):
-        result = await list_session_tree("session-uuid")
+    monkeypatch.setattr(db, "get_engine", _broken_engine)
+    result = await sessions.list_session_tree("session-uuid")
     assert result == []
 
 
 # ── fork_session ─────────────────────────────────────────────────────────────
 
-@pytest.mark.asyncio
 async def test_fork_session_copies_the_branch_into_a_new_session():
-    from swarm import sessions
-    branch = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
-    with patch("swarm.sessions.get_branch_history", new=AsyncMock(return_value=branch)), \
-         patch("swarm.sessions.create_session", new=AsyncMock(return_value="new-session-id")) as mock_create, \
-         patch("swarm.sessions.append_message", new=AsyncMock(side_effect=[10, 11])) as mock_append:
-        new_id = await sessions.fork_session("source-session-id", "ekam", "forked task")
+    sid = await sessions.create_session("ekam", "source task")
+    await sessions.append_message(sid, "user", "q1")
+    await sessions.append_message(sid, "assistant", "a1")
 
-    assert new_id == "new-session-id"
-    mock_create.assert_awaited_once_with("ekam", "forked task", persist=False)
-    assert mock_append.await_count == 2
-    # second append's parent_message_id is the first append's returned id (10) -- chained, not orphaned
-    second_call_kwargs = mock_append.await_args_list[1].kwargs
-    assert second_call_kwargs["parent_message_id"] == 10
+    new_id = await sessions.fork_session(sid, "ekam", "forked task")
+
+    assert new_id is not None
+    assert new_id != sid
+    assert await sessions.get_branch_history(new_id) == [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    ]
+    # original untouched
+    assert await sessions.get_branch_history(sid) == [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    ]
 
 
-@pytest.mark.asyncio
 async def test_fork_session_returns_none_when_source_has_no_messages():
-    from swarm import sessions
-    with patch("swarm.sessions.get_branch_history", new=AsyncMock(return_value=[])):
-        result = await sessions.fork_session("source-session-id", "ekam", "forked task")
+    sid = await sessions.create_session("ekam", "empty source")
+    result = await sessions.fork_session(sid, "ekam", "forked task")
     assert result is None
 
 
-@pytest.mark.asyncio
+# ── delete_session ────────────────────────────────────────────────────────────
+
+async def test_delete_session_returns_true_when_deleted():
+    sid = await sessions.create_session("p", "t")
+    result = await sessions.delete_session(sid)
+    assert result is True
+    assert await sessions.get_session(sid) is None
+
+
+async def test_delete_session_returns_false_when_not_found():
+    result = await sessions.delete_session("00000000-0000-0000-0000-000000000000")
+    assert result is False
+
+
+async def test_delete_session_cascades_to_messages():
+    """FK ON DELETE CASCADE must actually fire on SQLite (PRAGMA foreign_keys=ON,
+    see swarm/db.py's connect listener) -- without it this would leave orphaned
+    session_messages rows, a silent divergence from Postgres's default-enforced FKs."""
+    sid = await sessions.create_session("p", "t")
+    await sessions.append_message(sid, "user", "hi")
+    await sessions.delete_session(sid)
+    assert await sessions.list_session_tree(sid) == []
+
+
+# ── persist_session ───────────────────────────────────────────────────────────
+
+async def test_persist_session_returns_true_when_updated():
+    sid = await sessions.create_session("p", "t", persist=False)
+    result = await sessions.persist_session(sid)
+    assert result is True
+    row = await sessions.get_session(sid)
+    assert row["persist"] is True
+    assert row["expires_at"] is None
+
+
+async def test_persist_session_returns_false_when_not_found():
+    result = await sessions.persist_session("00000000-0000-0000-0000-000000000000")
+    assert result is False
+
+
+# ── list_sessions ─────────────────────────────────────────────────────────────
+
+async def test_list_sessions_filters_by_project_and_orders_by_recency():
+    s1 = await sessions.create_session("proj-a", "first")
+    s2 = await sessions.create_session("proj-a", "second")
+    await sessions.create_session("proj-b", "other project")
+
+    result = await sessions.list_sessions("proj-a")
+
+    assert {r["id"] for r in result} == {s1, s2}
+
+
+# ── _cleanup_expired ──────────────────────────────────────────────────────────
+
+async def test_cleanup_expired_returns_zero_when_nothing_expired():
+    await sessions.create_session("p", "t", persist=False)  # expires 30 days out, not yet expired
+    count = await sessions._cleanup_expired()
+    assert count == 0
+
+
+async def test_cleanup_expired_deletes_non_persisted_expired_sessions():
+    import sqlalchemy as sa
+    from datetime import datetime, timedelta, timezone
+
+    sid = await sessions.create_session("p", "t", persist=False)
+    async with db.get_engine().begin() as conn:
+        await conn.execute(
+            sa.update(db.chat_sessions)
+            .where(db.chat_sessions.c.id == sid)
+            .values(expires_at=datetime.now(timezone.utc) - timedelta(days=1))
+        )
+
+    count = await sessions._cleanup_expired()
+
+    assert count == 1
+    assert await sessions.get_session(sid) is None
+
+
+async def test_cleanup_expired_never_deletes_persisted_sessions():
+    import sqlalchemy as sa
+    from datetime import datetime, timedelta, timezone
+
+    sid = await sessions.create_session("p", "t", persist=True)
+    async with db.get_engine().begin() as conn:
+        # persist=True normally clears expires_at, but force one to prove the
+        # WHERE clause's persist=FALSE guard, not just "expires_at IS NULL", is
+        # what protects a persisted session.
+        await conn.execute(
+            sa.update(db.chat_sessions)
+            .where(db.chat_sessions.c.id == sid)
+            .values(expires_at=datetime.now(timezone.utc) - timedelta(days=1))
+        )
+
+    count = await sessions._cleanup_expired()
+
+    assert count == 0
+    assert await sessions.get_session(sid) is not None
+
+
+# ── get_context ───────────────────────────────────────────────────────────────
+
+async def test_get_context_returns_summary_and_branch_messages():
+    sid = await sessions.create_session("p", "t")
+    await sessions.append_message(sid, "user", "q1")
+    await sessions.append_message(sid, "assistant", "a1")
+    await sessions.save_handoff_summary(sid, "Prior summary")
+
+    summary, messages = await sessions.get_context(sid)
+
+    assert summary == "Prior summary"
+    assert messages == [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    ]
+
+
 async def test_get_context_returns_empty_for_unknown_session():
-    from swarm.sessions import get_context
-    cursor = _make_cursor()
-    cursor.fetchone = AsyncMock(return_value=None)
-    conn = _make_conn(cursor)
-    with _patch_connect(conn):
-        summary, messages = await get_context("nonexistent")
+    summary, messages = await sessions.get_context("00000000-0000-0000-0000-000000000000")
     assert summary == ""
     assert messages == []
+
+
+async def test_get_context_no_summary_returns_empty_string():
+    sid = await sessions.create_session("p", "t")
+    summary, _ = await sessions.get_context(sid)
+    assert summary == ""
+
+
+# ── get_session / message_count ──────────────────────────────────────────────
+
+async def test_get_session_message_count_reflects_appended_messages():
+    sid = await sessions.create_session("p", "t")
+    await sessions.append_message(sid, "user", "hi")
+    await sessions.append_message(sid, "assistant", "hello")
+    row = await sessions.get_session(sid)
+    assert row["message_count"] == 2
+
+
+async def test_get_session_returns_none_for_unknown_id():
+    row = await sessions.get_session("00000000-0000-0000-0000-000000000000")
+    assert row is None

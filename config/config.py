@@ -30,7 +30,20 @@ class Config:
 
     # Storage — ZGX-local services (docker/docker-compose.zgx.yml)
     qdrant_url: str = os.getenv("QDRANT_URL", "http://localhost:6333")
+    # Legacy Postgres-only DSN (psycopg style, e.g. "postgresql://user:pass@host:5432/db").
+    # Superseded by database_url below; kept only as its fallback so an existing ZGX
+    # deployment's .env needs no change on upgrade.
     postgres_uri: str = os.getenv("POSTGRES_URI", "")
+
+    # App storage DB (sessions, feedback log, model routing) — SQLAlchemy URL, engine-
+    # agnostic by design so agno-hive ships runnable out of the box. Default is a local
+    # SQLite file (zero provisioning: no server, no credentials, works the moment the
+    # repo is cloned). Set DATABASE_URL to point at Postgres/MySQL/anything SQLAlchemy
+    # has a dialect for instead — e.g. "postgresql+psycopg://user:pass@host:5432/db".
+    # If DATABASE_URL is unset but the legacy POSTGRES_URI IS set, that value is reused
+    # (translated to the "postgresql+psycopg://" dialect prefix SQLAlchemy expects) so
+    # existing ZGX deployments keep working without touching their .env.
+    database_url: str = os.getenv("DATABASE_URL", "")
 
     # LightRAG MCP server
     lightrag_mcp_port: int = int(os.getenv("LIGHTRAG_MCP_PORT", "9002"))
@@ -60,6 +73,16 @@ class Config:
     # (Meta-Llama-3.1-8B-Instruct-FP8). Port 9100 must be running before this takes effect.
     vllm_extract_base_url: str = os.getenv("VLLM_EXTRACT_BASE_URL", "http://localhost:4000/v1")
     vllm_extract_model: str = os.getenv("VLLM_EXTRACT_MODEL", "llama3.1-8b")
+
+    # Cloud model providers (AGNOHive 2.3.2) — OpenAI/Anthropic/Gemini/Perplexity/
+    # HuggingFace, routed through the same LiteLLM gateway as vLLM (see
+    # zgx-ai-setup/litellm-config.yaml's "Cloud providers" section). This is an
+    # explicit opt-in gate, not a default — get_model() (swarm/agents.py) raises if a
+    # cloud-aliased model is requested while this is false, so a YAML/config mistake
+    # can never silently send a request (and whatever source code that agent has read
+    # via MCP tools) to a third-party API. Default false: local-only behavior for
+    # EkamApp and any other existing deployment is completely unaffected.
+    allow_cloud_models: bool = os.getenv("ALLOW_CLOUD_MODELS", "false").lower() == "true"
 
     # Observability — OTLP endpoint for any OTel-compatible backend
     # e.g. existing SigNoz: http://<ekam-host>:4318

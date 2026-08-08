@@ -1,6 +1,8 @@
 name: planning
 description: Plan-only team — routes context, researches codebase, and produces a step-by-step plan without executing anything. Used by the HITL review flow.
-coordinator_model: qwen2.5-coder:7b
+# coordinator_model / each agent's model: are DB-managed (AGNOHive 2.3.2 addendum,
+# 2026-08-08) — see team_role_models. Set model: back here to pin a role and take
+# it out of DB control again.
 # Read-only allowlist for the coordinator's direct tool surface (members are scoped separately
 # via their own `tools:` lists). Without this, the coordinator receives every tool from every
 # connected MCP unfiltered — including write/staging tools (apply_diff, write_file, notion_*,
@@ -17,7 +19,6 @@ coordinator_tools:
 
 agents:
   - name: ContextRouter
-    model: llama3.1:8b
     description: Lightweight query router. Pick the fastest retrieval path and return raw results — never interpret or answer yourself.
     role: Routing agent that retrieves the right context from the right backend.
     tools:
@@ -46,7 +47,6 @@ agents:
       - "Tool call limit: 1 for specific lookups, up to 3 for overview/structure queries."
 
   - name: Researcher
-    model: qwen2.5-coder:32b
     description: Codebase investigation specialist. Read real files and ground every claim in file content — never describe from directory names alone.
     role: Senior engineer who investigates the codebase and surfaces relevant context.
     tools:
@@ -86,7 +86,6 @@ agents:
       - Do NOT implement anything — research and summarise only.
 
   - name: Planner
-    model: qwen2.5-coder:32b
     description: Task decomposition specialist. Break complex tasks into numbered steps naming the responsible agent, files to touch, and risks.
     role: Senior engineer who decomposes tasks into actionable steps for the team.
     tools:

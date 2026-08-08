@@ -2,7 +2,7 @@
 
 # 🐝 AGNOHive
 
-**A model-agnostic agentic engineering swarm — 100% local, no cloud API calls.**
+**A model-agnostic agentic engineering swarm — 100% local by default, cloud providers available as an explicit opt-in.**
 
 Built on [Agno](https://github.com/agno-agi/agno). Runs on your own workstation, connects to any project over MCP, and coordinates a full engineering team of local agents running on Ollama or vLLM, to read, plan, and write code for you.
 
@@ -19,11 +19,12 @@ Built on [Agno](https://github.com/agno-agi/agno). Runs on your own workstation,
 
 AGNOHive is a swarm of specialized agents (Researcher, Planner, Coder, Reviewer, …) that connect to your codebase through MCP and get real engineering work done — reading files, planning changes, writing diffs, running commands — all orchestrated by a coordinator model, all running on hardware you control.
 
-- 🔒 **Nothing leaves your network** — every model call is local (Ollama or vLLM), every file access is via your own MCP server
+- 🔒 **Nothing leaves your network by default** — every model call is local (Ollama or vLLM), every file access is via your own MCP server; cloud providers (OpenAI, Anthropic, Gemini, Perplexity, HuggingFace) are available per-agent behind an explicit `ALLOW_CLOUD_MODELS` opt-in gate, never silently — see [Cloud Model Providers](docs/guide/cloud-models.md)
 - 🧠 **Grounded, not guessed** — agents read the actual codebase before answering; a `hive.md` snapshot + LightRAG semantic index keep them from hallucinating structure
 - ✅ **Human-in-the-loop by default** — every file write and every external-platform action is staged for your approval before it lands
 - 🔌 **Works with any project** — point it at any repo via MCP, no project-specific setup required beyond the connection
 - 🔀 **Pluggable inference backend** — Ollama or vLLM + LiteLLM, switchable with one env var, no code changes
+- 🗄️ **Ships ready to run** — app storage (sessions, feedback log, model routing) is a local SQLite file by default, zero setup; point `DATABASE_URL` at Postgres/MySQL/anything else if you already run one — see [Cloud Model Providers](docs/guide/cloud-models.md#engine-agnostic-storage-sqlite-by-default)
 - 🌳 **Branchable sessions** — every conversation is a tree, not a flat log; rewind and branch with `/tree`, `/branch`, or fork a whole new session with `--fork`
 - ⌨️ **Mid-flight steering** — type a follow-up while a run is still streaming; it queues and fires automatically the moment the current run finishes
 

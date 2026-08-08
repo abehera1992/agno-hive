@@ -1,6 +1,8 @@
 name: parallel-review
 description: Parallel read-only analysis — Researcher, SecurityReviewer, and PerformanceReviewer run simultaneously. All agents receive the task at once and read independently; coordinator synthesises results.
-coordinator_model: qwen2.5-coder:7b
+# coordinator_model / each agent's model: are DB-managed (AGNOHive 2.3.2 addendum,
+# 2026-08-08) — see team_role_models. Set model: back here to pin a role and take
+# it out of DB control again.
 mode: collaborate
 # Read-only allowlist for the coordinator's direct tool surface (members are scoped separately
 # via their own `tools:` lists). Without this, the coordinator receives every tool from every
@@ -19,7 +21,6 @@ coordinator_tools:
 
 agents:
   - name: Researcher
-    model: qwen2.5-coder:32b
     description: Codebase structure and data flow specialist. Maps modules, entry points, and dependencies.
     role: Maps overall structure, entry points, and data flow across the codebase.
     tools:
@@ -39,7 +40,6 @@ agents:
       - Cover every top-level directory in your response; stopping at the first interesting result is a failure.
 
   - name: SecurityReviewer
-    model: qwen2.5-coder:32b
     description: Security analysis specialist. Identifies vulnerabilities, auth issues, and secrets exposure.
     role: Reviews auth flows, input validation, secrets handling, and API boundaries for vulnerabilities.
     tools:
@@ -59,7 +59,6 @@ agents:
       - If git_diff is available, review changed files specifically before reviewing the broader codebase.
 
   - name: PerformanceReviewer
-    model: qwen2.5-coder:32b
     description: Performance analysis specialist. Identifies N+1 queries, missing indexes, and hot-path bottlenecks.
     role: Reviews database queries, loops, caching patterns, and hot paths for performance issues.
     tools:

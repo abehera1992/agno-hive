@@ -9,6 +9,7 @@ from agno.team import Team
 from agno.tools.mcp import MCPTools
 from .agents import make_coder, make_reviewer, make_agent_from_spec, get_model, format_skill_catalog
 from .feedback import record_success, record_success_bg, record_failure, load_failure_context
+from . import model_routing
 from config.config import config
 
 _tracer = trace.get_tracer("agno-hive.team")
@@ -321,6 +322,33 @@ def _extract_tokens(result) -> dict:
         }
     except Exception:
         return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
+def _cloud_provider_error_message(exc: Exception) -> "str | None":
+    """AGNOHive 2.3.2: graceful degradation when a cloud-routed agent's model call is
+    rate-limited or over quota. agno-hive talks to LiteLLM over the OpenAI protocol
+    (agno's OpenAILike is built on the `openai` package), so this surfaces client-side
+    as `openai.RateLimitError` (HTTP 429) -- NOT a `litellm.*` exception, since that
+    type only exists inside the separately-running LiteLLM proxy process, not in this
+    one. LiteLLM's own job is normalizing every provider's distinct error shape into
+    this one common form before it ever reaches agno-hive, so this single check covers
+    OpenAI/Anthropic/Gemini/Perplexity/HuggingFace alike -- one catch, not five
+    provider-specific parsers. Also fires for local vLLM/Ollama backends that happen
+    to raise the same exception type (harmless -- the message is generic enough to
+    still be accurate, and the distinction is not worth a second branch).
+
+    Returns a clear, actionable message if this looks like a rate-limit/quota
+    rejection, else None (caller re-raises the original exception unchanged)."""
+    try:
+        import openai
+    except ImportError:
+        return None
+    if isinstance(exc, openai.RateLimitError):
+        return (
+            "Cloud model provider hit its rate limit or quota — retry shortly, "
+            f"or switch this agent to another provider/local model. (original error: {exc})"
+        )
+    return None
 
 
 def _extract_handoff_summary(task: str, content: str) -> str:
@@ -1383,6 +1411,12 @@ async def run_task_stream(
         # read-only run cannot write regardless of what the model decides to do.
         _specs, _ctools = (_strip_mutating(agent_specs, coordinator_tools) if read_only
                            else (agent_specs, coordinator_tools))
+        # DB-backed model routing (AGNOHive 2.3.2 addendum) — get_model() (called
+        # inside _build_team, below) only ever reads model_routing's in-process
+        # cache, never the DB directly. This covers BOTH the FastAPI server path
+        # (already loaded at startup, so this is a fast no-op) AND main.py's plain
+        # CLI one-shot path, which never runs the FastAPI startup event.
+        await model_routing.ensure_cache_loaded()
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
             read_only=read_only, skill_catalog=skill_catalog,
@@ -1432,6 +1466,9 @@ async def run_task_stream(
                     await record_failure(task, str(exc), project_id)
                 except Exception:
                     pass  # LightRAG indexing is best-effort; never crash the run
+                cloud_msg = _cloud_provider_error_message(exc)
+                if cloud_msg:
+                    raise RuntimeError(cloud_msg) from exc
                 raise
             finally:
                 task_duration.record(time.perf_counter() - t0, {"project_id": project_id})
@@ -1531,6 +1568,12 @@ async def run_task_async(
         # read-only run cannot write regardless of what the model decides to do.
         _specs, _ctools = (_strip_mutating(agent_specs, coordinator_tools) if read_only
                            else (agent_specs, coordinator_tools))
+        # DB-backed model routing (AGNOHive 2.3.2 addendum) — get_model() (called
+        # inside _build_team, below) only ever reads model_routing's in-process
+        # cache, never the DB directly. This covers BOTH the FastAPI server path
+        # (already loaded at startup, so this is a fast no-op) AND main.py's plain
+        # CLI one-shot path, which never runs the FastAPI startup event.
+        await model_routing.ensure_cache_loaded()
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
             read_only=read_only, skill_catalog=skill_catalog,
@@ -1592,6 +1635,9 @@ async def run_task_async(
                     await record_failure(task, str(exc), project_id)
                 except Exception:
                     pass  # LightRAG indexing is best-effort; never crash the run
+                cloud_msg = _cloud_provider_error_message(exc)
+                if cloud_msg:
+                    raise RuntimeError(cloud_msg) from exc
                 raise  # callers receive (content, tokens) on success; exception on failure
             finally:
                 task_duration.record(

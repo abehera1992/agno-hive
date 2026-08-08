@@ -29,7 +29,9 @@ Ollama   :11434                          (fallback backend — see Reversibility
 
 The dense `qwen2.5-coder:32b` was dropped after an A/B showed it ~5–7× slower per token
 than the 30B A3B MoE on the GB10 with no quality edge, so the entire roster collapses onto
-the single resident 30B (`swarm/agents.py _VLLM_MODEL_MAP` maps every tag → `qwen3-coder-30b`).
+the single resident 30B (the `model_catalog` DB table's `vllm_served_as` column maps every
+tag → `qwen3-coder-30b` — AGNOHive 2.3.2 addendum, 2026-08-08; was a hardcoded
+`swarm/agents.py _VLLM_MODEL_MAP` dict before this — see `docs/guide/cloud-models.md`).
 vLLM continuous-batching serves the concurrent agent + LightRAG load on the one model
 (measured: 8 concurrent requests in ~17 s, no queueing).
 

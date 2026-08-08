@@ -6,11 +6,12 @@ description: Full engineering team — routes context, researches codebase, plan
 #   qwen3-coder:30b       84s — accurate, grounded (read every service), 0 thinking
 # No GB10 ARM64 segfaults on either MoE — the Ollama 0.24 instability is fixed.
 # Revert to ibm/granite4.1:30b if delegation quality degrades on complex tasks.
-coordinator_model: qwen3-coder:30b
+# coordinator_model / each agent's model: are DB-managed (AGNOHive 2.3.2 addendum,
+# 2026-08-08) — see team_role_models, seeded with the values the comment above
+# describes. Set model: back here to pin a role and take it out of DB control again.
 
 agents:
   - name: ContextRouter
-    model: llama3.1:8b
     description: Lightweight query router. Pick the fastest retrieval path and return raw results — never interpret or answer yourself.
     role: Routing agent that retrieves the right context from the right backend.
     tools:
@@ -45,7 +46,6 @@ agents:
       - "Tool call limit: 1 for specific lookups. Up to 3 for overview/structure queries to ensure complete coverage."
 
   - name: Researcher
-    model: qwen2.5-coder:32b
     description: Codebase investigation specialist. Read real files and ground every claim in file content — never describe from directory names alone.
     role: Senior engineer who investigates the codebase and surfaces relevant context.
     tools:
@@ -107,7 +107,6 @@ agents:
       - Do NOT implement anything — research and summarise only.
 
   - name: Planner
-    model: qwen2.5-coder:32b
     description: Task decomposition specialist. Break complex tasks into numbered steps naming the responsible agent, files to touch, and risks.
     role: Senior engineer who decomposes tasks into actionable steps for the team.
     tools:
@@ -128,7 +127,6 @@ agents:
       - If the task is simple enough for a single agent, say so and recommend skipping the plan.
 
   - name: Coder
-    model: qwen2.5-coder:32b
     description: Implementation specialist. Write clean, idiomatic code following existing patterns. Use apply_diff() for existing files, write_file() only for new ones.
     role: Senior software engineer who implements features and fixes bugs.
     tools:
@@ -173,7 +171,6 @@ agents:
       - If lightrag_insert is available via MCP, call it with a descriptive key after completing.
 
   - name: Executor
-    model: llama3.1:8b
     description: Execution and validation specialist. Run commands and report exact stdout/stderr — never paraphrase errors.
     role: Engineer who runs commands, executes tests, and reports results.
     tools:
@@ -210,7 +207,6 @@ agents:
       - "  - If the change is STAGED for human review (apply_diff returned review_pending / a .hive_proposed file), you cannot check the staged state: say exactly 'verification not run — change is staged for review' in your report. Never imply a staged change was verified."
 
   - name: Reviewer
-    model: qwen2.5-coder:32b
     description: Code review specialist. Check correctness, security, and consistency. Flag real problems only — never style preferences.
     role: Senior engineer who reviews code for correctness and security.
     tools:

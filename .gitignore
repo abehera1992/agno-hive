@@ -33,3 +33,7 @@ hive.md
 # /home/abehera1992/models/ on ZGX (also untracked), never in the repo checkout.
 checkpoints/
 unsloth_compiled_cache/
+# Default local SQLite app storage (AGNOHive 2.3.2 addendum) — sessions, feedback
+# log, model routing. Machine-local generated state, not source; a deployment
+# pointing DATABASE_URL at Postgres/etc instead never creates this at all.
+data/

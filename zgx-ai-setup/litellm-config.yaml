@@ -3,18 +3,27 @@
 # via swarm/agents.py _VLLM_MODEL_MAP). The 32b/7b/8b routes are kept for the optional
 # "diverse roster" variant (dedicated 32B on :8004 + llama-swap pool on :9100) — harmless
 # when unused. api_key is a dummy; vLLM ignores it.
+#
+# api_base values (since 2026-08-08): litellm no longer runs on network_mode: host (see
+# docker-compose.yml), so `localhost` inside the litellm container no longer reaches the
+# host machine. Containers defined in the SAME docker-compose.yml (vllm-coord, vllm-embed,
+# vllm-extract) are reached by service name on the shared compose network. Containers NOT
+# in this compose file (the :8004 diverse-roster box, the :8005 ad-hoc candidate slot) are
+# reached via `host.docker.internal` (resolvable via the `extra_hosts` entry on the litellm
+# service) since they still run directly on the host, published on a host port.
 model_list:
   - model_name: qwen3-coder-30b
-    litellm_params: {model: openai/qwen3-coder-30b, api_base: http://localhost:8003/v1, api_key: "dummy"}
+    litellm_params: {model: openai/qwen3-coder-30b, api_base: http://vllm-coord:8000/v1, api_key: "dummy"}
 
   # --- Phase 3 candidate registry (2026-07-30) ---------------------------------
-  # `qwen3-30b-instruct` is an ALIAS for the live baseline on :8003 — the same served
+  # `qwen3-30b-instruct` is an ALIAS for the live baseline on vllm-coord — the same served
   # process as qwen3-coder-30b, exposed under the agreed baseline identifier so eval
   # reports name it consistently. Adds no memory.
   - model_name: qwen3-30b-instruct
-    litellm_params: {model: openai/qwen3-coder-30b, api_base: http://localhost:8003/v1, api_key: "dummy"}
-  # `qwen3-30b-hive-v1` routes to :8005, where the MERGED BF16 candidate is served
-  # DURING the maintenance window only. This is a registry entry, NOT concurrent A/B:
+    litellm_params: {model: openai/qwen3-coder-30b, api_base: http://vllm-coord:8000/v1, api_key: "dummy"}
+  # `qwen3-30b-hive-v1` routes to :8005 (host.docker.internal, not a compose service --
+  # see the api_base note above), where the MERGED BF16 candidate is served DURING the
+  # maintenance window only. This is a registry entry, NOT concurrent A/B:
   #   * Stage D proved vLLM cannot serve a LoRA over an FP8 base (Triton `dot` rejects
   #     fp8e4nv), so the candidate must be a separately merged checkpoint; and
   #   * BF16 candidate (~61 GB) + FP8 baseline (~30 GB) + embed/extract does not fit a
@@ -22,14 +31,38 @@ model_list:
   # Requests to this route 502 whenever the candidate container is not up. That is the
   # intended behaviour: it fails loudly rather than silently answering from the baseline.
   - model_name: qwen3-30b-hive-v1
-    litellm_params: {model: openai/candidate, api_base: http://localhost:8005/v1, api_key: "dummy"}
+    litellm_params: {model: openai/candidate, api_base: http://host.docker.internal:8005/v1, api_key: "dummy"}
 
   # --- optional (diverse-roster variant; not started by the all-MoE compose) ---
   - model_name: qwen2.5-coder-32b
-    litellm_params: {model: openai/qwen2.5-coder-32b, api_base: http://localhost:8004/v1, api_key: "dummy"}
+    litellm_params: {model: openai/qwen2.5-coder-32b, api_base: http://host.docker.internal:8004/v1, api_key: "dummy"}
   - model_name: qwen2.5-coder-7b
-    litellm_params: {model: openai/qwen2.5-coder-7b, api_base: http://localhost:9100/v1, api_key: "dummy"}
+    litellm_params: {model: openai/qwen2.5-coder-7b, api_base: http://vllm-extract:8000/v1, api_key: "dummy"}
   - model_name: llama3.1-8b
-    litellm_params: {model: openai/llama3.1-8b, api_base: http://localhost:9100/v1, api_key: "dummy"}
+    litellm_params: {model: openai/llama3.1-8b, api_base: http://vllm-extract:8000/v1, api_key: "dummy"}
+
+  # --- Cloud providers (AGNOHive 2.3.2 -- opt-in, gated by ALLOW_CLOUD_MODELS in
+  # agno-hive itself, see swarm/agents.py _CLOUD_ALIASES). Aliases are deliberately
+  # named with NO colon so swarm/agents.py's get_model() routes them without mangling.
+  # Model ids/versions below are examples -- verify against each provider's current
+  # docs before real use, and prune any provider you don't intend to use (an unused
+  # route with no key set just 401s at call time, it doesn't block startup).
+  - model_name: claude-sonnet-cloud
+    litellm_params: {model: anthropic/claude-sonnet-4-5-20250929, api_key: os.environ/ANTHROPIC_API_KEY}
+  - model_name: gpt-4o-cloud
+    litellm_params: {model: openai/gpt-4o, api_key: os.environ/OPENAI_API_KEY}
+  - model_name: gemini-flash-cloud
+    litellm_params: {model: gemini/gemini-2.0-flash, api_key: os.environ/GEMINI_API_KEY}
+  - model_name: sonar-pro-cloud
+    litellm_params: {model: perplexity/sonar-pro, api_key: os.environ/PERPLEXITYAI_API_KEY}
+  # HuggingFace Inference has no single sensible default model -- point this at whichever
+  # HF-hosted model you actually want before enabling it.
+  - model_name: hf-inference-cloud
+    litellm_params: {model: huggingface/meta-llama/Llama-3.3-70B-Instruct, api_key: os.environ/HUGGINGFACE_API_KEY}
+  # Cloud-hosted Ollama (e.g. Ollama Cloud, or any remote Ollama instance you operate) --
+  # commented out since there's no default endpoint; uncomment and point api_base at
+  # your instance to enable.
+  # - model_name: ollama-remote-cloud
+  #   litellm_params: {model: ollama/qwen2.5-coder:32b, api_base: https://your-cloud-ollama-host}
 litellm_settings:
   request_timeout: 600

@@ -84,12 +84,36 @@ services:
       - nvidia.com/gpu=all
 
   # OpenAI-compatible gateway. agno + LightRAG talk to this (:4000); it routes model
-  # names to the vLLM servers. Host network so the localhost:800x api_bases resolve.
+  # names to the vLLM servers, and (AGNOHive 2.3.2) to cloud providers.
+  #
+  # On the default compose bridge network (NOT host, since 2026-08-08) -- litellm now
+  # also holds real cloud provider API keys and makes outbound internet calls, which
+  # doesn't need host-level network access and is unnecessary exposure for a service
+  # holding credentials. Local vLLM containers (vllm-coord/vllm-embed/vllm-extract) are
+  # reachable by service name on this same compose network (see litellm-config.yaml's
+  # api_base values); a container NOT defined in this compose file (the :8004/:8005
+  # ad-hoc/candidate slots) is reached via `host.docker.internal`, which the
+  # `extra_hosts` entry below makes resolvable on native Linux Docker Engine (this is
+  # NOT automatic outside Docker Desktop, unlike on Mac/Windows).
   litellm:
     image: ghcr.io/berriai/litellm:main-latest
     container_name: litellm
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "4000:4000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./litellm-config.yaml:/app/config.yaml:ro
     command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      # Cloud provider keys (AGNOHive 2.3.2) -- each litellm-config.yaml route names
+      # its own os.environ/<VAR> explicitly, so these names just need to match those
+      # entries, not any provider "auto-detected" convention. Empty/unset is fine --
+      # a route with no key configured simply fails at call time, it doesn't block
+      # startup or affect the local vLLM routes above.
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - PERPLEXITYAI_API_KEY=${PERPLEXITYAI_API_KEY:-}
+      - HUGGINGFACE_API_KEY=${HUGGINGFACE_API_KEY:-}

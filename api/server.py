@@ -7,11 +7,16 @@ from pathlib import Path
 import yaml
 from fastapi import FastAPI, HTTPException, Request
 
-from api.models import AgentSpec, RunRequest, RunResponse, PlanResponse, ScanRequest, ScanResponse, FeedbackRequest, FeedbackResponse, BranchRequest, ForkRequest
+from api.models import (
+    AgentSpec, RunRequest, RunResponse, PlanResponse, ScanRequest, ScanResponse,
+    FeedbackRequest, FeedbackResponse, BranchRequest, ForkRequest,
+    ModelCatalogEntry, ModelCatalogPatch, TeamRoleModelEntry, ModelRoutesReloadResponse,
+)
 from fastapi.responses import StreamingResponse
 from swarm.ollama import ensure_models
 from swarm.team import run_task_async, run_task_stream
 from swarm.feedback import record_failure, record_success, drain_background_tasks
+from swarm import db, model_routing
 from config.config import config
 from observability.setup import setup_telemetry
 from swarm.sessions import (
@@ -54,8 +59,29 @@ def _load_team(name: str) -> tuple[list[AgentSpec], str, str, list[str] | None]:
             detail=f"Team '{name}' not found. Available: {available}",
         )
     data = yaml.safe_load(path.read_text())
-    agents = [AgentSpec(**a) for a in data["agents"]]
-    coordinator = data.get("coordinator_model", config.leader_model)
+    # AGNOHive 2.3.2 addendum (2026-08-08): a team YAML MAY omit an agent's model:
+    # field and let model_routing's DB-backed default (team_role_models) fill it in
+    # — the YAML value always wins when present. Resolved here, before AgentSpec
+    # construction, so AgentSpec.model stays a required str for every other caller
+    # (e.g. RunRequest.agents posted directly with no team/DB context to fall back
+    # to). Raises the same "fail loudly" way a missing YAML value always has if
+    # NEITHER the YAML nor the DB has a value for this role.
+    agents = []
+    for a in data["agents"]:
+        a = dict(a)
+        if not a.get("model"):
+            default = model_routing.get_default_model(name, a["name"])
+            if not default:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"Team '{name}' agent '{a['name']}' has no model: in the YAML and "
+                        f"no default in team_role_models — set one via /admin/model-routes."
+                    ),
+                )
+            a["model"] = default
+        agents.append(AgentSpec(**a))
+    coordinator = data.get("coordinator_model") or model_routing.get_default_model(name, "Coordinator") or config.leader_model
     mode = data.get("mode", "coordinate")
     # Optional read-only allowlist scoping the coordinator's direct MCP tool surface
     # (mirrors per-agent `tools:` scoping). None means "no scoping — full surface" —
@@ -115,6 +141,16 @@ async def _route_to_team(task: str, choices: dict, model: str, ollama_host: str)
         if name.lower() in answer:
             return name
     return next(iter(choices))  # fallback: first team (engineering)
+
+
+@app.on_event("startup")
+async def _load_model_routing_cache():
+    # Guarantees the cache is populated before ANY request handler runs (Uvicorn
+    # doesn't route requests until startup events complete) — in particular before
+    # _load_team() below can consult model_routing.get_default_model() for a team
+    # YAML that omits a role's model: field.
+    await db.ensure_schema()
+    await model_routing.ensure_cache_loaded()
 
 
 @app.on_event("startup")
@@ -617,3 +653,130 @@ async def feedback(request: FeedbackRequest):
     else:
         await record_success(request.task, request.notes or "user marked as correct", request.project_id)
         return FeedbackResponse(recorded=True, message="Success pattern recorded to memory")
+
+
+# ── Admin: DB-backed model routing (AGNOHive 2.3.2 addendum, 2026-08-08) ──────
+# CRUD on model_catalog/team_role_models (swarm/db.py) — reuses THIS app rather
+# than a dedicated service (see docs/guide/cloud-models.md's "Admin CRUD path"
+# section for the reasoning: same unauthenticated-over-Tailscale trust boundary
+# every other endpoint above already relies on). Deliberately stricter than this
+# app's other writes: a bad row here breaks every future task that resolves to
+# that model, not just one task/session — PATCH/DELETE validate against
+# model_catalog (the FK on team_role_models.model_id already enforces "can't
+# delete a model still in use" at the DB layer) and /reload returns the actual
+# diff instead of a bare 200, so a mistake is visible immediately. Writes here
+# do NOT take effect for already-running agents until /admin/model-routes/reload
+# is called (or the process restarts) — see swarm/model_routing.py's
+# ensure_cache_loaded()/reload() docstrings for why get_model() only ever reads
+# the in-process cache, never the DB directly.
+
+import sqlalchemy as sa
+
+
+@app.get("/admin/model-routes")
+async def list_model_routes():
+    async with db.get_engine().begin() as conn:
+        rows = (await conn.execute(sa.select(db.model_catalog))).mappings().all()
+    return {"models": [dict(r) for r in rows]}
+
+
+@app.post("/admin/model-routes", status_code=201)
+async def create_model_route(entry: ModelCatalogEntry):
+    try:
+        async with db.get_engine().begin() as conn:
+            await conn.execute(db.model_catalog.insert().values(**entry.model_dump()))
+    except sa.exc.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail=f"model_id '{entry.model_id}' already exists: {exc}")
+    return entry
+
+
+@app.patch("/admin/model-routes/{model_id}")
+async def update_model_route(model_id: str, patch: ModelCatalogPatch):
+    values = {k: v for k, v in patch.model_dump().items() if v is not None}
+    if not values:
+        raise HTTPException(status_code=400, detail="no fields supplied to update")
+    async with db.get_engine().begin() as conn:
+        result = await conn.execute(
+            sa.update(db.model_catalog).where(db.model_catalog.c.model_id == model_id).values(**values)
+        )
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail=f"model_id '{model_id}' not found")
+        row = (
+            await conn.execute(sa.select(db.model_catalog).where(db.model_catalog.c.model_id == model_id))
+        ).mappings().first()
+    return dict(row)
+
+
+@app.delete("/admin/model-routes/{model_id}")
+async def delete_model_route(model_id: str):
+    try:
+        async with db.get_engine().begin() as conn:
+            result = await conn.execute(sa.delete(db.model_catalog).where(db.model_catalog.c.model_id == model_id))
+    except sa.exc.IntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{model_id}' is still referenced by one or more team_role_models rows — remove those first: {exc}",
+        )
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail=f"model_id '{model_id}' not found")
+    return {"deleted": model_id}
+
+
+@app.get("/admin/model-routes/teams")
+async def list_team_role_models():
+    async with db.get_engine().begin() as conn:
+        rows = (await conn.execute(sa.select(db.team_role_models))).mappings().all()
+    return {"defaults": [dict(r) for r in rows]}
+
+
+@app.post("/admin/model-routes/teams", status_code=201)
+async def upsert_team_role_model(entry: TeamRoleModelEntry):
+    """Create or replace the DEFAULT model for one (team, role) pair — see
+    swarm/model_routing.py's get_default_model(): a team YAML's own model: field,
+    when present, always overrides this."""
+    async with db.get_engine().begin() as conn:
+        existing = (
+            await conn.execute(
+                sa.select(db.team_role_models.c.team_name).where(
+                    db.team_role_models.c.team_name == entry.team_name,
+                    db.team_role_models.c.role_name == entry.role_name,
+                )
+            )
+        ).first()
+        try:
+            if existing:
+                await conn.execute(
+                    sa.update(db.team_role_models)
+                    .where(
+                        db.team_role_models.c.team_name == entry.team_name,
+                        db.team_role_models.c.role_name == entry.role_name,
+                    )
+                    .values(model_id=entry.model_id)
+                )
+            else:
+                await conn.execute(db.team_role_models.insert().values(**entry.model_dump()))
+        except sa.exc.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail=f"model_id '{entry.model_id}' not in model_catalog: {exc}")
+    return entry
+
+
+@app.delete("/admin/model-routes/teams/{team_name}/{role_name}")
+async def delete_team_role_model(team_name: str, role_name: str):
+    async with db.get_engine().begin() as conn:
+        result = await conn.execute(
+            sa.delete(db.team_role_models).where(
+                db.team_role_models.c.team_name == team_name, db.team_role_models.c.role_name == role_name,
+            )
+        )
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail=f"no default for {team_name}/{role_name}")
+    return {"deleted": f"{team_name}/{role_name}"}
+
+
+@app.post("/admin/model-routes/reload", response_model=ModelRoutesReloadResponse)
+async def reload_model_routes():
+    """Re-read model_catalog/team_role_models into get_model()'s in-process cache
+    and return what actually changed — the ONLY way an admin edit above takes
+    effect for already-running agents (see swarm/model_routing.reload())."""
+    diff = await model_routing.reload()
+    return ModelRoutesReloadResponse(**diff)

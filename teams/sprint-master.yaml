@@ -1,11 +1,13 @@
 name: sprint-master
 description: Generic, platform-agnostic PM team — reads and writes backlog/sprint work items (epics, features, stories, tasks, bugs) on the connected work-tracking platform. Never edits code, runs shell, or touches files — board CRUD only.
-coordinator_model: qwen3-coder:30b
 # Escalated from qwen2.5-coder:7b after smoke test 2026-06-19: the 7b coordinator emitted
 # delegate_task_to_member as malformed single-quoted JSON in content (OllamaToolFix could not
 # parse it), so delegation silently no-op'd and no write was staged. qwen3-coder:30b is the
 # non-thinking MoE used by the engineering team — best tool-call grounding, handles the XML
 # tool-call format via OllamaToolFix format 6. Already resident on ZGX (no new download).
+# coordinator_model / each agent's model: are DB-managed (AGNOHive 2.3.2 addendum,
+# 2026-08-08) — see team_role_models. Set model: back here to pin a role and take
+# it out of DB control again.
 #
 # coordinator_tools scopes the coordinator to BOARD CRUD + reads: it can create/update/nest
 # work items DIRECTLY (writes are still gated by WRITE_REVIEW) or delegate to a worker. We
@@ -36,7 +38,6 @@ coordinator_tools:
 
 agents:
   - name: BacklogResearcher
-    model: qwen2.5-coder:32b
     description: Delivery-board reader. Gathers current sprint/backlog state and the exact field + option names before any write.
     role: Project coordinator who reads the board state and confirms the valid field and option values for the writer.
     tools:
@@ -66,7 +67,6 @@ agents:
       - "REPORT to the writer: the database / data-source id, the exact field names and option values to use, the parent item id (when nesting), the sprint page id (when attaching), and the target row's page_id (when updating/trashing an existing item). Do not create or modify anything."
 
   - name: StoryWriter
-    model: qwen2.5-coder:32b
     description: Delivery-board writer. Creates, updates, and nests work items using simple values; stops at the review gate.
     role: Project coordinator who creates and updates backlog/sprint work items on the connected platform.
     tools:

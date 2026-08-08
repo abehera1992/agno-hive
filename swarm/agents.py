@@ -2,26 +2,34 @@ from agno.agent import Agent
 from agno.tools.mcp import MCPTools
 from .tool_fix import OllamaToolFix
 from config.config import config
-
-
-# Ollama model tag -> served name on the vLLM gateway. Default rule is ':' -> '-'.
-# vLLM ALL-MoE CONSOLIDATION (2026-06-26): the entire vLLM roster collapses onto the single
-# resident MoE coordinator (qwen3-coder:30b, A3B ~3B active/token). On the GB10 the dense
-# qwen2.5-coder:32b is ~5-7x slower per token with no measurable code-quality edge (worker A/B),
-# so there is no reason to keep it. vLLM continuous-batching serves the coordinator + every
-# agent's grounding lightrag_query + all worker calls concurrently on the one fast model, which
-# is run at high gpu-mem-util for a large KV pool. No model swaps, no dense-model latency.
-# (Ollama path is untouched — it keeps the diverse 30B/32B/8B roster warm with no swap cost.)
-_VLLM_MODEL_MAP = {
-    "qwen3-coder:30b": "qwen3-coder-30b",
-    "qwen2.5-coder:32b": "qwen3-coder-30b",
-    "qwen2.5-coder:7b": "qwen3-coder-30b",
-    "llama3.1:8b": "qwen3-coder-30b",
-}
+from swarm import model_routing
 
 
 def get_model(model_id: str, host: str):
     """Build the model object for an agent, honoring INFERENCE_BACKEND.
+
+    Routing lives in a DB-backed registry (AGNOHive 2.3.2 addendum, 2026-08-08),
+    NOT hardcoded here — swarm/model_routing.py's in-process cache (populated from
+    the model_catalog/team_role_models tables, swarm/db.py) replaces what used to
+    be a hardcoded _VLLM_MODEL_MAP dict (local vLLM consolidation) + _CLOUD_ALIASES
+    set (cloud gate check). This function stays synchronous and never touches the
+    DB itself — model_routing.ensure_cache_loaded() (awaited once per process, at
+    FastAPI startup and defensively before every _build_team() call in
+    swarm/team.py) must have run first for DB-seeded routing to apply.
+
+    An id with no model_catalog row (or a row marked inactive) falls back to
+    today's pre-DB-routing behavior below — treated as local, INFERENCE_BACKEND-
+    driven, no consolidation override — so a custom/unregistered model id never
+    breaks silently.
+
+    requires_cloud_gate is checked BEFORE INFERENCE_BACKEND dispatch — cloud
+    routing is a per-agent choice (which model_id a team YAML names), not a global
+    backend switch, so it resolves the same way regardless of whether the rest of
+    the swarm is running INFERENCE_BACKEND=ollama or =vllm. Raises if
+    ALLOW_CLOUD_MODELS is not set, rather than silently falling back to local or
+    silently succeeding — a team YAML mistake (e.g. copy-pasting a cloud alias
+    into a local-only team) must fail loudly, never send a request off-network by
+    accident.
 
     vllm   -> llama-swap OpenAI gateway. vLLM serves native tool-calls via its
               per-model parsers (--tool-call-parser), so stock OpenAILike works with
@@ -29,9 +37,28 @@ def get_model(model_id: str, host: str):
     ollama -> OllamaToolFix, which extracts tool calls from Ollama's text formats
               (native tool_calls, <tool_call> tags, <|python_tag|>, bare JSON, qwen3 XML).
     """
+    route = model_routing.get_route(model_id)
+    if route is None:
+        route = model_routing.ModelRoute(
+            model_id=model_id, kind="local", provider="local",
+            vllm_served_as=None, requires_cloud_gate=False, active=True,
+        )
+
+    if route.requires_cloud_gate and not config.allow_cloud_models:
+        raise RuntimeError(
+            f"cloud model '{model_id}' requested but ALLOW_CLOUD_MODELS is not set — "
+            f"see docs/guide/cloud-models.md before enabling cloud inference. This is a "
+            f"deliberate safety gate: enabling it means this agent's requests (and any "
+            f"file content it has read via MCP tools) are sent to a third-party API."
+        )
+
+    if route.kind == "cloud":
+        from agno.models.openai.like import OpenAILike
+        return OpenAILike(id=model_id, base_url=config.vllm_gateway_url, api_key="EMPTY")
+
     if config.inference_backend == "vllm":
         from agno.models.openai.like import OpenAILike
-        served = _VLLM_MODEL_MAP.get(model_id) or model_id.replace(":", "-")
+        served = route.vllm_served_as or model_id.replace(":", "-")
         return OpenAILike(id=served, base_url=config.vllm_gateway_url, api_key="EMPTY")
     return OllamaToolFix(id=model_id, host=host)
 

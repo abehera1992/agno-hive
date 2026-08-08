@@ -5,7 +5,10 @@ Success path  → task outcome inserted into an ISOLATED LightRAG "experience"
                 namespace. This prevents past task Q&A (which can contain
                 draft/incorrect specifics) from being retrieved by, and
                 poisoning, code-grounding queries on the project namespace.
-Failure path  → structured record in PostgreSQL failure_log table
+Failure path  → structured record in the failure_log table, via SQLAlchemy
+                (swarm/db.py) — SQLite by default or Postgres/anything else per
+                config.database_url (AGNOHive 2.3.2 addendum, was raw
+                psycopg/Postgres-only before this).
 Context load  → queries failure_log before each task, injected into coordinator instructions
 """
 import asyncio
@@ -151,27 +154,21 @@ async def record_failure(
     the full text on both sides to be usable.
     """
     try:
-        import psycopg
-        from config.config import config
+        from swarm import db
 
         error_type = type(error).__name__ if not isinstance(error, str) else "RuntimeError"
         error_msg = str(error)[:500]
 
-        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
-            await _ensure_table(conn)
+        await db.ensure_schema()
+        async with db.get_engine().begin() as conn:
             await conn.execute(
-                """
-                INSERT INTO failure_log
-                    (project_id, task, error_type, error_message, agent,
-                     rejected_output, corrected_output)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    project_id, task[:300], error_type, error_msg, agent,
-                    (rejected_output or None), (corrected_output or None),
-                ),
+                db.failure_log.insert().values(
+                    project_id=project_id, task=task[:300], error_type=error_type,
+                    error_message=error_msg, agent=agent,
+                    rejected_output=(rejected_output or None),
+                    corrected_output=(corrected_output or None),
+                )
             )
-            await conn.commit()
     except Exception as exc:
         print(f"[feedback] record_failure warning: {exc}")
 
@@ -239,8 +236,10 @@ async def load_failure_context(project_id: str, limit: int | None = None, curren
     default 10). Pass an explicit int to override per call.
     """
     try:
-        import psycopg
+        from sqlalchemy import select
+
         from config.config import config
+        from swarm import db
 
         if limit is None:
             limit = config.failure_context_limit
@@ -251,19 +250,15 @@ async def load_failure_context(project_id: str, limit: int | None = None, curren
         # chance to surface once irrelevant, merely-recent ones are filtered out.
         pool_size = max(limit * 5, 50)
 
-        async with await psycopg.AsyncConnection.connect(config.postgres_uri) as conn:
-            await _ensure_table(conn)
-            rows = await conn.execute(
-                """
-                SELECT task, error_type, error_message
-                FROM failure_log
-                WHERE project_id = %s
-                ORDER BY created_at DESC
-                LIMIT %s
-                """,
-                (project_id, pool_size),
+        await db.ensure_schema()
+        async with db.get_engine().begin() as conn:
+            stmt = (
+                select(db.failure_log.c.task, db.failure_log.c.error_type, db.failure_log.c.error_message)
+                .where(db.failure_log.c.project_id == project_id)
+                .order_by(db.failure_log.c.created_at.desc())
+                .limit(pool_size)
             )
-            failures = await rows.fetchall()
+            failures = (await conn.execute(stmt)).all()
 
         if not failures:
             return ""
@@ -283,34 +278,6 @@ async def load_failure_context(project_id: str, limit: int | None = None, curren
         return ""
 
 
-# ── Schema bootstrap ──────────────────────────────────────────────────────────
-
-async def _ensure_table(conn) -> None:
-    await conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS failure_log (
-            id          SERIAL PRIMARY KEY,
-            project_id  TEXT        NOT NULL,
-            task        TEXT        NOT NULL,
-            error_type  TEXT        NOT NULL DEFAULT 'unknown',
-            error_message TEXT      NOT NULL DEFAULT '',
-            agent       TEXT        NOT NULL DEFAULT 'unknown',
-            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """
-    )
-    await conn.execute(
-        "CREATE INDEX IF NOT EXISTS failure_log_project_idx ON failure_log (project_id, created_at DESC)"
-    )
-    # Preference-pair capture (training Phase 1). DPO/ORPO needs a
-    # (prompt, rejected, chosen) triple; `task` is the prompt and `error_message`
-    # is the human explanation, but the model's ACTUAL bad output was never stored
-    # — without it a correction cannot be turned into a training pair.
-    # Added as nullable columns so every existing row stays valid.
-    await conn.execute(
-        "ALTER TABLE failure_log ADD COLUMN IF NOT EXISTS rejected_output TEXT"
-    )
-    await conn.execute(
-        "ALTER TABLE failure_log ADD COLUMN IF NOT EXISTS corrected_output TEXT"
-    )
-    await conn.commit()
+# Schema bootstrap: swarm/db.py's failure_log Table + ensure_schema() (called
+# above in record_failure/load_failure_context) replaces this module's old
+# hand-written CREATE TABLE/ALTER TABLE bootstrap.
