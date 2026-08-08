@@ -16,7 +16,7 @@
 | `find_files(pattern)` | Glob file discovery — uses ripgrep, respects .gitignore |
 | `search_files(pattern, glob)` | Regex content search — uses ripgrep, falls back to Python re |
 | `count_matches(pattern, glob_filter)` | Deterministic occurrence count (ripgrep) — returns `TOTAL: <n>`; use for any "how many / count / all" instead of reading + tallying |
-| `get_file_content(path)` | Read a file |
+| `get_file_content(path)` | Read a file — a wrong-but-plausible directory guess self-heals: a unique filename match elsewhere in the project is read automatically (prefixed with a correction note); multiple matches are listed instead of a bare "not found" |
 | `list_directory_tree(depth)` | Full directory skeleton, dirs only, no cap |
 | `list_directory(path)` | Immediate children of a directory |
 | `get_project_context()` | Reads CLAUDE.md / AGENTS.md / README.md / DOCS.md if present |
