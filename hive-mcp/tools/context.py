@@ -184,6 +184,35 @@ def _numbered_lines(lines: list[str], start: int) -> str:
     return "\n".join(f"{i:>6}\t{line}" for i, line in enumerate(lines, start=start))
 
 
+def _find_by_basename(basename: str, max_results: int = 6) -> list[str]:
+    """Locate every file in the project with this exact filename, regardless of
+    directory. Used by get_file_content()'s not-found fallback below -- a guessed
+    path commonly has the right filename but a wrong internal subdirectory (e.g.
+    'src/components/user-management/Foo.tsx' guessed vs the real
+    'Client/EcommClient-Web/ekamweb/src/components/portal/admin/users/Foo.tsx').
+    That's a different failure than find_files()'s GLOB_FALLBACK_PREFIXES handles
+    (a missing ROOT prefix on an otherwise-correct relative pattern) -- a basename
+    search recovers regardless of how wrong the guessed directory structure is,
+    as long as the filename itself is right, which it usually is."""
+    import shutil
+    rg = shutil.which("rg")
+    pattern = f"**/{basename}"
+    if rg:
+        try:
+            return _rg_glob(rg, pattern, max_results)
+        except Exception:
+            pass
+    matches = []
+    for p in sorted(PROJECT_ROOT.glob(pattern)):
+        rel = p.relative_to(PROJECT_ROOT).as_posix()
+        if _is_ignored(rel) or not p.is_file():
+            continue
+        matches.append(rel)
+        if len(matches) >= max_results:
+            break
+    return matches
+
+
 def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str:
     """
     Read a file from the project by its path relative to the project root.
@@ -198,6 +227,12 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
     line-number prefix itself when passing old_string/new_string to apply_diff —
     match only the actual file content after the tab.
 
+    A guessed path that doesn't exist is NOT a dead end: if exactly one file in the
+    project has that same filename elsewhere, it is read automatically (prefixed with
+    a NOTE stating the correction — use the corrected path from then on). If several
+    files share that filename, their paths are listed so the next call can go straight
+    to the right one, instead of falling back to a separate find_files/search_files call.
+
     Args:
         relative_path: e.g. 'src/api/routes.py', 'package.json', 'docker-compose.yml'
         offset: 0-based first line for a ranged read (default 0 = start of file)
@@ -205,6 +240,21 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
     """
     target = PROJECT_ROOT / relative_path
     if not target.exists():
+        basename = Path(relative_path).name
+        candidates = _find_by_basename(basename)
+        if len(candidates) == 1 and candidates[0] != relative_path:
+            corrected = candidates[0]
+            note = (
+                f"# NOTE: '{relative_path}' not found — '{corrected}' is the only file named "
+                f"'{basename}' in the project; reading that instead. Use this exact path from now on.\n"
+            )
+            return note + get_file_content(corrected, offset, limit)
+        if len(candidates) > 1:
+            return (
+                f"File not found: {relative_path}\n"
+                f"{len(candidates)} files named '{basename}' exist — call get_file_content with the exact path:\n"
+                + "\n".join(candidates)
+            )
         return f"File not found: {relative_path}"
     if not target.is_file():
         return f"Not a file: {relative_path}"
