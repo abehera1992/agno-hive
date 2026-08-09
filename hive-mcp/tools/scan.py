@@ -34,7 +34,11 @@ _META_RE = re.compile(r"<!--\s*hive-scan:\s*commit=(\S+)\s+timestamp=\S+\s*-->")
 # tree, but that is a fact about one repo, not about every repo.
 from .exclusions import EXCLUDE_DIRS as _SKIP_DIRS
 _SKIP_EXTENSIONS = {".pyc", ".pyo", ".class", ".so", ".dll", ".exe", ".bin", ".lock"}
-_ROOT_DOCS = ["CLAUDE.md", "README.md", "docs.md", "AGENTS.md", ".env.example"]
+# CLAUDE.md deliberately excluded — an assistant-instruction file, not a project doc.
+# See hive-mcp/tools/context.py's module docstring for why. hive.md is grounding
+# context for swarm agents, so it should never embed CLAUDE.md's own instructions to
+# a DIFFERENT model as if it were project documentation.
+_ROOT_DOCS = ["README.md", "docs.md", "AGENTS.md", ".env.example"]
 _DIR_CANDIDATES = ["README.md", "__init__.py", "main.py", "config.py",
                    "index.ts", "index.js", "server.py", "app.py"]
 
@@ -242,7 +246,7 @@ def _build_content(head: str, uncommitted: str) -> str:
     ]
 
     for doc in _ROOT_DOCS:
-        cap = 3000 if doc in ("CLAUDE.md", "docs.md", "AGENTS.md") else 1500
+        cap = 3000 if doc in ("docs.md", "AGENTS.md") else 1500
         content = _read_file(doc, max_chars=cap)
         if content:
             parts += [f"## {doc}", content, ""]

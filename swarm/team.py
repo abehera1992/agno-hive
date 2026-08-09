@@ -205,7 +205,7 @@ _COORDINATOR_INSTRUCTIONS = [
     "     - Every claim about what this project does     → cite file:line",
     "     - Every claim about what the external docs say → cite URL + section heading",
     "  4. If an external pattern conflicts with how this project works:",
-    "     a. Read CLAUDE.md / docs.md (via get_file_content) to check if the",
+    "     a. Read DOCS.md / docs.md (via get_file_content) to check if the",
     "        difference is intentional design — many patterns here deliberately",
     "        differ from framework defaults.",
     "     b. State the conflict explicitly: 'Docs say X; this project does Y because Z.'",

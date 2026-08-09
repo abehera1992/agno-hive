@@ -96,3 +96,57 @@ def test_auto_corrected_read_preserves_offset_and_limit(tmp_path, monkeypatch):
     assert "   101\tline100" in result
     assert "   102\tline101" in result
     assert "line299" not in result
+
+
+# ── CLAUDE.md is excluded from every content-serving path ───────────────────────
+# Confirmed live 2026-08-09: a cloud model (gemini-3.1-flash-lite) skipped the
+# documented hive.md/get_project_context flow and called get_file_content('CLAUDE.md')
+# directly, then answered a codebase question by pattern-matching against instruction
+# text instead of real source. CLAUDE.md tells an assistant how to BEHAVE in this
+# repo -- it is not project documentation, and must never reach a swarm agent as if
+# it were. AGENTS.md/GEMINI.md are NOT excluded -- no observed problem with them yet;
+# scope is deliberately narrow to the one file with a confirmed live failure.
+
+def test_get_file_content_refuses_claude_md_at_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(context, "PROJECT_ROOT", tmp_path)
+    (tmp_path / "CLAUDE.md").write_text("secret agent instructions", encoding="utf-8")
+
+    result = context.get_file_content("CLAUDE.md")
+
+    assert "excluded from tool access" in result
+    assert "secret agent instructions" not in result
+
+
+def test_get_file_content_still_serves_agents_and_gemini_md(tmp_path, monkeypatch):
+    monkeypatch.setattr(context, "PROJECT_ROOT", tmp_path)
+    (tmp_path / "AGENTS.md").write_text("codex instructions", encoding="utf-8")
+    (tmp_path / "GEMINI.md").write_text("gemini cli instructions", encoding="utf-8")
+
+    assert "codex instructions" in context.get_file_content("AGENTS.md")
+    assert "gemini cli instructions" in context.get_file_content("GEMINI.md")
+
+
+def test_get_file_content_refuses_nested_claude_md_by_basename(tmp_path, monkeypatch):
+    monkeypatch.setattr(context, "PROJECT_ROOT", tmp_path)
+    sub = tmp_path / "some" / "subdir"
+    sub.mkdir(parents=True)
+    (sub / "CLAUDE.md").write_text("directory-scoped instructions", encoding="utf-8")
+
+    result = context.get_file_content("some/subdir/CLAUDE.md")
+
+    assert "excluded from tool access" in result
+    assert "directory-scoped instructions" not in result
+
+
+def test_get_project_context_excludes_claude_md_but_includes_docs_and_readme(tmp_path, monkeypatch):
+    monkeypatch.setattr(context, "PROJECT_ROOT", tmp_path)
+    (tmp_path / "CLAUDE.md").write_text("secret agent instructions", encoding="utf-8")
+    (tmp_path / "DOCS.md").write_text("real architecture docs", encoding="utf-8")
+    (tmp_path / "README.md").write_text("real readme", encoding="utf-8")
+
+    result = context.get_project_context()
+
+    assert "secret agent instructions" not in result
+    assert "CLAUDE.md" not in result
+    assert "real architecture docs" in result
+    assert "real readme" in result

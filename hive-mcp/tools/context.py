@@ -1,7 +1,20 @@
 """Project context and file-reading tools.
 
 Generic — works with any project layout. Discovers context files
-(CLAUDE.md, AGENTS.md, README.md, DOCS.md) automatically from PROJECT_ROOT.
+(DOCS.md, README.md, CONTRIBUTING.md) automatically
+from PROJECT_ROOT.
+
+CLAUDE.md specifically is excluded from every content-serving path here
+(get_project_context, get_file_content, and hive.md's generator in scan.py) — see
+_EXCLUDED_ASSISTANT_FILES below. It tells a coding assistant HOW TO BEHAVE in this
+repo (workflow rules, delegation policy, tool-usage conventions) — it is not project
+documentation, and a swarm agent reading it as if it were project context produces
+confused, off-task behavior. Confirmed live 2026-08-09: a cloud model skipped the
+documented hive.md/get_project_context flow entirely and called
+get_file_content('CLAUDE.md') directly on its own initiative, then answered a "what
+shipped" question by pattern-matching against instruction text instead of reading real
+source. AGENTS.md/GEMINI.md are NOT excluded (no observed problem with them; don't
+extend scope speculatively — add them here only if the same failure mode shows up).
 """
 import ast
 import asyncio
@@ -35,9 +48,13 @@ def _cap(text: str) -> str:
               f"`glob_filter` such as '**/*.tsx'.")
 
 _CONTEXT_FILES = [
-    "CLAUDE.md", "AGENTS.md", "GEMINI.md",
     "DOCS.md", "README.md", "CONTRIBUTING.md",
 ]
+
+# Basenames refused by get_file_content() and skipped by get_project_context() — see the
+# module docstring above for why. Matched by basename (Path(...).name), not full path, so
+# a nested per-directory CLAUDE.md is caught the same as one at the project root.
+_EXCLUDED_ASSISTANT_FILES = {"CLAUDE.md"}
 
 
 def _is_ignored(rel: str) -> bool:
@@ -71,11 +88,14 @@ def _matches_glob(rel: str, pattern: str) -> bool:
 
 def get_project_context() -> str:
     """
-    Return project context by reading CLAUDE.md, AGENTS.md, DOCS.md, README.md,
-    and CONTRIBUTING.md if they exist at the project root.
+    Return project context by reading DOCS.md, README.md, and
+    CONTRIBUTING.md if they exist at the project root.
     Always call this at the start of any task to understand the project conventions.
+
+    Deliberately does NOT include CLAUDE.md — an assistant-instruction file, not
+    project documentation. See this module's docstring for why.
     """
-    _CAP = 40_000  # per-file cap so a huge CLAUDE.md/DOCS.md can't dominate the context
+    _CAP = 40_000  # per-file cap so a huge DOCS.md can't dominate the context
     parts = []
     for name in _CONTEXT_FILES:
         path = PROJECT_ROOT / name
@@ -88,7 +108,7 @@ def get_project_context() -> str:
                 )
             parts.append(f"# {name}\n\n{content}")
     if not parts:
-        return "No context files found (CLAUDE.md, AGENTS.md, README.md, DOCS.md)."
+        return "No context files found (DOCS.md, README.md, CONTRIBUTING.md)."
     return "\n\n---\n\n".join(parts)
 
 
@@ -218,6 +238,10 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
     Read a file from the project by its path relative to the project root.
     Always read a file before editing it — get the exact content to use as old_string in apply_diff.
 
+    CLAUDE.md is refused (matched by basename, any directory) — it is an
+    assistant-instruction file, not project documentation. Use DOCS.md, README.md,
+    or get_project_context() for project context instead.
+
     Large files are NOT dumped whole (that overflows the model context): a file over
     ~200KB returns a structural SKELETON (signatures + docstrings, bodies elided) for code,
     or HEAD+TAIL for data files. Pass offset/limit to read an exact line range of any file.
@@ -238,9 +262,16 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
         offset: 0-based first line for a ranged read (default 0 = start of file)
         limit:  number of lines to return from offset (default 0 = to end / whole file)
     """
+    basename = Path(relative_path).name
+    if basename in _EXCLUDED_ASSISTANT_FILES:
+        return (
+            f"{basename} is an assistant-instruction file (workflow rules, delegation "
+            f"policy, tool-usage conventions for a coding assistant), not project "
+            f"documentation — it is excluded from tool access. Use DOCS.md, README.md, "
+            f"or get_project_context() for project context instead."
+        )
     target = PROJECT_ROOT / relative_path
     if not target.exists():
-        basename = Path(relative_path).name
         candidates = _find_by_basename(basename)
         if len(candidates) == 1 and candidates[0] != relative_path:
             corrected = candidates[0]
