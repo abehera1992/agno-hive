@@ -48,7 +48,7 @@ model_list:
   # docs before real use, and prune any provider you don't intend to use (an unused
   # route with no key set just 401s at call time, it doesn't block startup).
   - model_name: claude-sonnet-cloud
-    litellm_params: {model: anthropic/claude-sonnet-4-5-20250929, api_key: os.environ/ANTHROPIC_API_KEY}
+    litellm_params: {model: anthropic/claude-sonnet-5, api_key: os.environ/ANTHROPIC_API_KEY}
   - model_name: gpt-4o-cloud
     litellm_params: {model: openai/gpt-4o, api_key: os.environ/OPENAI_API_KEY}
   - model_name: gemini-flash-cloud
