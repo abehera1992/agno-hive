@@ -149,9 +149,9 @@ hive --session a3f7c2d1-8b3e-4f2a-9c1d-000000000000 "now add unit tests for that
 
 ```bash
 hive
-# AGNOHive  project EkamApp  mode engineering  http://100.96.86.82:9001
-#   project:   http://100.87.159.1:9000/mcp   + 12ms
-#   hive-mcp:  http://100.87.159.1:9003/mcp   + 8ms
+# AGNOHive  project EkamApp  mode engineering  http://<inference-host>:9001
+#   project:   http://<inference-host>:9000/mcp   + 12ms
+#   hive-mcp:  http://<inference-host>:9003/mcp   + 8ms
 #   resuming session a3f7c2d1  (last used this project)
 #   /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff  /cleanup  /plan  /review  /mcp  /tree  /branch <id>  /exit  ·  Ctrl+C to interrupt
 
@@ -281,10 +281,10 @@ Full indexing details (state file format, throughput tuning, document-identity f
 
 ```bash
 hive --mcp-status
-#   project MCP           +  12ms  http://100.87.159.1:9000/mcp
+#   project MCP           +  12ms  http://<inference-host>:9000/mcp
 #     source: Tailscale auto-detect (port 9000)
 #
-#   hive-mcp (system)     +  8ms   http://100.87.159.1:9003/mcp
+#   hive-mcp (system)     +  8ms   http://<inference-host>:9003/mcp
 #     source: Tailscale auto-detect (port 9003)
 ```
 
