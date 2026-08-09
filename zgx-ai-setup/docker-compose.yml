@@ -106,14 +106,23 @@ services:
     volumes:
       - ./litellm-config.yaml:/app/config.yaml:ro
     command: ["--config", "/app/config.yaml", "--port", "4000"]
-    environment:
-      # Cloud provider keys (AGNOHive 2.3.2) -- each litellm-config.yaml route names
-      # its own os.environ/<VAR> explicitly, so these names just need to match those
-      # entries, not any provider "auto-detected" convention. Empty/unset is fine --
-      # a route with no key configured simply fails at call time, it doesn't block
-      # startup or affect the local vLLM routes above.
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - PERPLEXITYAI_API_KEY=${PERPLEXITYAI_API_KEY:-}
-      - HUGGINGFACE_API_KEY=${HUGGINGFACE_API_KEY:-}
+    # Single source of truth for cloud provider keys (2026-08-09): the repo-root .env
+    # (the same one agno-api's config.py reads via load_dotenv()) -- NOT a separate
+    # zgx-ai-setup/.env. Two live incidents (ANTHROPIC_API_KEY, then GEMINI_API_KEY)
+    # where the key was added to the repo root and litellm never saw it, because
+    # Compose's ${VAR} substitution only ever reads a .env next to THIS file by
+    # default -- it has no reason to know the repo-root one exists.
+    #
+    # env_file: (below) injects each KEY=value line from ../.env directly into the
+    # container's environment -- this is a DIFFERENT mechanism from ${VAR} substitution
+    # in the YAML (which still only sees zgx-ai-setup/.env or the invoking shell, and
+    # is resolved before env_file is ever read). Do NOT also list these same keys
+    # under `environment:` with ${VAR:-} syntax -- Compose gives an explicit
+    # `environment:` entry precedence over `env_file:` for the same name, so an
+    # unresolved ${ANTHROPIC_API_KEY:-} (empty, since YAML substitution doesn't see
+    # this file either) would silently override the real value env_file just set.
+    # litellm-config.yaml's routes reference os.environ/<VAR> by these exact names,
+    # so having them land in the container's env via env_file is sufficient on its
+    # own -- no environment: block needed for these five keys.
+    env_file:
+      - ../.env
