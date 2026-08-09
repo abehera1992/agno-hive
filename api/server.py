@@ -11,6 +11,7 @@ from api.models import (
     AgentSpec, RunRequest, RunResponse, PlanResponse, ScanRequest, ScanResponse,
     FeedbackRequest, FeedbackResponse, BranchRequest, ForkRequest,
     ModelCatalogEntry, ModelCatalogPatch, TeamRoleModelEntry, ModelRoutesReloadResponse,
+    ClarificationRequest,
 )
 from fastapi.responses import StreamingResponse
 from swarm.ollama import ensure_models
@@ -287,7 +288,7 @@ async def run(request: RunRequest, http_request: Request):
     # history — report 0 injected context rather than the (unenforced) message count.
     context_size = 0 if is_chain_handoff else len(prior_messages)
 
-    result, tokens = await _run_cancel_on_disconnect(
+    result, tokens, clarification = await _run_cancel_on_disconnect(
         http_request,
         run_task_async(
             task=request.task,
@@ -339,6 +340,7 @@ async def run(request: RunRequest, http_request: Request):
         input_tokens=tokens.get("input_tokens", 0),
         output_tokens=tokens.get("output_tokens", 0),
         total_tokens=tokens.get("total_tokens", 0),
+        needs_clarification=ClarificationRequest(**clarification) if clarification else None,
     )
 
 
@@ -354,7 +356,7 @@ async def plan(request: RunRequest):
     all_models = list({coordinator_model} | {a.model for a in agent_specs})
     await ensure_models(all_models, config.ollama_host)
 
-    plan_text, _ = await run_task_async(
+    plan_text, _, clarification = await run_task_async(
         task=request.task,
         agent_specs=agent_specs,
         coordinator_model=coordinator_model,
@@ -366,6 +368,7 @@ async def plan(request: RunRequest):
     return PlanResponse(
         plan=plan_text,
         duration_seconds=round(time.perf_counter() - start, 2),
+        needs_clarification=ClarificationRequest(**clarification) if clarification else None,
     )
 
 
@@ -390,7 +393,8 @@ async def stream_endpoint(request: RunRequest):
       data: {"type": "chunk",      "content": "<text>"}
       data: {"type": "tool_start", "name": "<tool>", "args": {...}}
       data: {"type": "tool_end",   "name": "<tool>", "result_preview": "<text>" | null}
-      data: {"type": "done",       "session": {...}, "input_tokens": N, ...}
+      data: {"type": "done",       "session": {...}, "input_tokens": N, ...,
+             "needs_clarification": {"question": str, "options": [...]} | absent}
       data: {"type": "error",      "content": "<message>"}
 
     Keeps the HTTP connection alive the whole time — no 300s timeout risk.
@@ -477,6 +481,9 @@ async def stream_endpoint(request: RunRequest):
                         "output_tokens": tokens.get("output_tokens", 0),
                         "total_tokens": tokens.get("total_tokens", 0),
                     }
+                    clarification = chunk.get("clarification")
+                    if clarification:
+                        done_event["needs_clarification"] = clarification
                     yield f"data: {_json.dumps(done_event)}\n\n"
 
         except Exception as exc:

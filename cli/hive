@@ -1054,6 +1054,28 @@ def run_task(
     if done_data:
         _print_footer(done_data, show_resume=show_resume)
 
+    clarification = done_data.get("needs_clarification") if done_data else None
+    if clarification:
+        # The coordinator hit a genuine decision point — no write tools should have
+        # run this turn (see the coordinator instruction in swarm/team.py), so there's
+        # nothing to check for proposed/pending files here; render the choice and
+        # chain the answer as the next task on the same session instead.
+        print()
+        print(bold(clarification.get("question", "Which would you like?")))
+        options = clarification.get("options", [])
+        labels = [o.get("label", "?") for o in options]
+        hints = [o.get("description") or "" for o in options]
+        idx = _arrow_select(labels, hints)
+        if idx < 0:
+            print(dim("  cancelled — nothing was done, ask again or rephrase the task."))
+            return returned_session_id
+        chosen = labels[idx]
+        print(dim(f"  → {chosen}"))
+        return run_task(
+            chosen, project_id, session_id=returned_session_id,
+            persist=persist, show_resume=show_resume,
+        )
+
     after = set(_root.rglob(f"*{_PROPOSED_SUFFIX}"))
     for p in after - before:
         _prompt_confirm_reject(p)

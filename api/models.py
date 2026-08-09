@@ -52,6 +52,22 @@ class SessionMeta(BaseModel):
     expires_at: str | None  # ISO 8601 or None when persist=True
 
 
+class ClarificationOption(BaseModel):
+    label: str
+    description: str | None = None
+
+
+class ClarificationRequest(BaseModel):
+    """A genuine fork-in-the-road the coordinator cannot resolve on its own — not
+    something a tool call could look up. See swarm/team.py's `_extract_clarification`
+    for how this is parsed out of the coordinator's raw text, and the coordinator
+    instruction (`_COORDINATOR_INSTRUCTIONS`) for when it's allowed to emit one.
+    2-4 options, matching the same constraint Claude Code's own AskUserQuestion uses —
+    this is the same mechanism, carried over HTTP instead of in-process."""
+    question: str
+    options: list[ClarificationOption]
+
+
 class RunResponse(BaseModel):
     result: str
     team: str
@@ -62,11 +78,19 @@ class RunResponse(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    # Present only when the coordinator hit a genuine decision point it can't resolve
+    # itself — the run otherwise completed normally (result/session/tokens are all
+    # still meaningful) but `result` had its clarification block stripped out. The
+    # caller (hive CLI, agno_run) should present `question`/`options` to the human,
+    # then re-call /run with the same session_id and the chosen option folded into
+    # the next task text to continue.
+    needs_clarification: ClarificationRequest | None = None
 
 
 class PlanResponse(BaseModel):
     plan: str
     duration_seconds: float
+    needs_clarification: ClarificationRequest | None = None
 
 
 class ScanRequest(BaseModel):

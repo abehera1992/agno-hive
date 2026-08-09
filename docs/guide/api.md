@@ -8,6 +8,7 @@ The AGNOHive API server (`python main.py --serve`, port 9001) is the HTTP surfac
 - [Health check](#health-check)
 - [Run a task](#run-a-task)
 - [Get a plan only (HITL)](#get-a-plan-only-hitl)
+- [Clarification requests](#clarification-requests)
 - [Session chaining](#session-chaining--carry-context-across-api-calls)
 - [Session management endpoints](#session-management-endpoints)
 - [Session tree endpoints](#session-tree-endpoints)
@@ -40,6 +41,54 @@ curl -X POST http://localhost:9001/plan \
   -H "Content-Type: application/json" \
   -d '{"task": "Add rate limiting to login", "project_id": "EkamApp"}'
 ```
+
+---
+
+## Clarification requests
+
+`/run`, `/plan`, and `/stream` can all return a **clarification request** instead of
+(or on `/stream`, in addition to reporting through) the usual completed answer — a
+structured signal that the coordinator hit a genuine fork in the road it can't
+resolve on its own (a real design choice with more than one valid approach, or a
+request that could reasonably mean two different concrete things), as opposed to
+something a tool call could have looked up. This is deliberately narrow: most tasks
+never trigger it, and it is not used for "I don't know which file to edit" — that's
+what the coordinator's own `find_files`/`search_files` tools are for.
+
+`/run` and `/plan` responses gain an optional field:
+```json
+{
+  "result": "...",
+  "needs_clarification": {
+    "question": "Which caching layer should this use?",
+    "options": [
+      {"label": "Redis", "description": "Shared across instances, needs infra"},
+      {"label": "In-process LRU", "description": "Simpler, per-instance only"}
+    ]
+  },
+  "...": "the rest of RunResponse/PlanResponse is populated as normal"
+}
+```
+2-4 options, each a short label plus one clarifying sentence — the same shape and
+constraint as Claude Code's own `AskUserQuestion` tool; this is the same mechanism,
+carried over HTTP instead of in-process. `result`/`plan` has the raw block already
+stripped out — you'll never see the fenced JSON in the visible text.
+
+`/stream`'s `done` event gains the same field when present:
+```
+data: {"type": "done", "session": {...}, "needs_clarification": {...} | absent, ...}
+```
+On `/stream` specifically, the raw fenced block is *not* hidden from the streamed
+`chunk` events before the `done` event arrives — only `/run`/`/plan` get a fully
+clean strip. The `hive` CLI still renders an interactive picker once the stream
+completes; it's a rougher experience on that path, not a broken one.
+
+**Continuing after a clarification**: whatever's calling the API presents
+`question`/`options` to the human, then re-calls `/run` (or the next `hive`
+prompt) with the chosen option as the task text and the same `session_id` — the
+same [session chaining](#session-chaining--carry-context-across-api-calls)
+mechanism used everywhere else. The `hive` CLI does this automatically with an
+arrow-key picker; a custom client should do the equivalent.
 
 ---
 

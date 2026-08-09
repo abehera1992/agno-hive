@@ -62,6 +62,26 @@ _COORDINATOR_INSTRUCTIONS = [
     "  were not staged), state that explicitly instead of inventing changes. A partial or staged",
     "  result is NOT 'done' — report it as staged/pending awaiting approval.",
     "",
+    "── Asking for clarification (rare — most tasks do NOT need this) ─",
+    "  Only when a task genuinely cannot proceed without a decision only the human can make —",
+    "  NOT something a tool call could resolve by reading a file or searching the codebase —",
+    "  stop and ask instead of guessing. Genuine cases: a real design choice with more than one",
+    "  valid approach ('add caching' — which layer, which invalidation strategy), a request that",
+    "  could reasonably mean two different concrete things, or an action with a real blast radius",
+    "  where guessing wrong is costly. NOT a case for this: not knowing which file to edit (that's",
+    "  what find_files/search_files are for — research it, don't ask), or a task that's merely",
+    "  open-ended but has one obvious reasonable interpretation — just do that one.",
+    "  When you do need to ask: end your ENTIRE response with this fenced block and NOTHING",
+    "  after it — no further prose, no attempted answer alongside it:",
+    "    ```needs_clarification",
+    "    {\"question\": \"...\", \"options\": [{\"label\": \"...\", \"description\": \"...\"}, ...]}",
+    "    ```",
+    "  2-4 options, each with a short label and one clarifying sentence in description.",
+    "  Do NOT proceed to delegate or write anything in the same turn you ask — the run stops",
+    "  here, the human answers, and the chosen option arrives as the next task on this same",
+    "  session. Overusing this is also a failure: a task with one reasonable reading does not",
+    "  need a question — asking too often is as much a defect as guessing wrong.",
+    "",
     "── Skills — on-demand instruction detail (CRITICAL) ─────────────",
     "  Call load_skill(name) for the full text of a skill BEFORE acting on a task",
     "  it covers — available skills are listed above/below in this prompt. Do NOT",
@@ -395,6 +415,66 @@ def _extract_handoff_summary(task: str, content: str) -> str:
     lines.append("──────────────────────────────────────────────────────────────────")
 
     return "\n".join(lines)
+
+
+# ── Clarification requests (structured "I need a decision from the user") ──────
+# The coordinator is an LLM producing free text — it cannot literally return a
+# structured object mid-generation. Matching how _verify_claims/_summarize_actual_
+# writes already solve this class of problem, it is instructed to emit a fenced
+# ```needs_clarification block (see _COORDINATOR_INSTRUCTIONS) only when a task
+# genuinely cannot proceed without a decision only the user can make — not
+# something a tool call could resolve. This is parsed out of the final answer text
+# here, then surfaced as RunResponse.needs_clarification (api/models.py) so the
+# caller (hive CLI, agno_run) can present it as a real choice instead of the
+# coordinator guessing. Confirmed live 2026-08-09: an open-ended "add an endpoint,
+# figure out the pattern yourself" task caused the Coder to narrate intent in a
+# loop without ever calling a write tool — a case this mechanism does NOT fix
+# (there was no genuine ambiguity, just an unfinished task), but the same session
+# motivated building this for the real ambiguous-task case it targets.
+_CLARIFICATION_RE = re.compile(
+    r"```needs_clarification\s*\n(.*?)\n```", re.DOTALL
+)
+
+
+def _extract_clarification(content: str) -> tuple[str, dict | None]:
+    """Pull a ```needs_clarification fenced JSON block out of the coordinator's
+    final answer, if present. Returns (content_with_block_removed, clarification)
+    where clarification is None if no block was found OR the block was malformed
+    (fail-safe: a bad block is treated as "no clarification requested", never a
+    crash — same posture as every other post-run guard in this file).
+
+    Expected shape inside the fence:
+        {"question": "...", "options": [{"label": "...", "description": "..."}, ...]}
+    2-4 options, matching the same constraint Claude Code's own AskUserQuestion
+    tool uses for the human-facing analog of this mechanism.
+    """
+    match = _CLARIFICATION_RE.search(content)
+    if not match:
+        return content, None
+
+    stripped = (content[:match.start()] + content[match.end():]).strip()
+    try:
+        payload = json.loads(match.group(1))
+        question = payload["question"]
+        options = payload["options"]
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError("question must be a non-empty string")
+        if not isinstance(options, list) or not (2 <= len(options) <= 4):
+            raise ValueError("options must be a list of 2-4 items")
+        cleaned_options = []
+        for opt in options:
+            label = opt["label"]
+            if not isinstance(label, str) or not label.strip():
+                raise ValueError("each option needs a non-empty label")
+            cleaned_options.append({
+                "label": label,
+                "description": opt.get("description"),
+            })
+    except Exception as exc:
+        print(f"[team] malformed needs_clarification block, ignoring: {exc}")
+        return stripped, None
+
+    return stripped, {"question": question, "options": cleaned_options}
 
 
 # ── Count-marker verification guard (Tier 3) ───────────────────────────────────
@@ -1459,7 +1539,15 @@ async def run_task_stream(
                     from swarm.sessions import save_handoff_summary
                     handoff = _extract_handoff_summary(task, combined)
                     asyncio.ensure_future(save_handoff_summary(session_id, handoff))
-                yield {"__done__": True, "content": combined, "tokens": tokens}
+                # A needs_clarification block, if the coordinator emitted one, was already
+                # streamed to the caller character-by-character as ordinary chunks above —
+                # extracting it here can only strip it from `combined` (the done-sentinel's
+                # content), not un-stream the raw fenced JSON the client already saw scroll
+                # by. Functional end to end (the caller gets a real needs_clarification
+                # payload to act on), but a rougher experience than /run's clean strip.
+                # Improving that needs stream-side lookahead buffering, not attempted here.
+                combined, clarification = _extract_clarification(combined)
+                yield {"__done__": True, "content": combined, "tokens": tokens, "clarification": clarification}
             except Exception as exc:
                 task_counter.add(1, {"project_id": project_id, "outcome": "failure"})
                 try:
@@ -1485,8 +1573,14 @@ async def run_task_async(
     session_id: str | None = None,
     mode: str = "coordinate",
     read_only: bool = False,
-) -> str:
-    """Run a task with the given team spec, or fall back to default Coder+Reviewer."""
+) -> tuple[str, dict, dict | None]:
+    """Run a task with the given team spec, or fall back to default Coder+Reviewer.
+
+    Returns (content, tokens, clarification). clarification is None on a normal
+    completed answer; when the coordinator emitted a needs_clarification block
+    (see _extract_clarification), it's {"question": str, "options": [...]} and
+    content has had that block stripped out.
+    """
     effective_mcp_url = mcp_url or config.mcp_url
     effective_coordinator = coordinator_model or config.leader_model
 
@@ -1601,6 +1695,16 @@ async def run_task_async(
                             content = msg_content
                             break
                 content = content or "(no response)"
+                # Clarification check runs BEFORE the claim-verification/count-marker
+                # guards below, and short-circuits past both when found: those guards
+                # validate a completed factual answer, and a clarification block is
+                # neither — it's a pending question, not a claim to fact-check.
+                content, clarification = _extract_clarification(content)
+                if clarification is not None:
+                    tokens = _extract_tokens(result)
+                    span.set_status(trace.StatusCode.OK)
+                    task_counter.add(1, {"project_id": project_id, "outcome": "clarification"})
+                    return content, tokens, clarification
                 # Tier-3 guard: fill any [[COUNT ...]] markers with deterministic counts.
                 try:
                     content = await _fill_count_markers(content, all_mcp_urls[0] if all_mcp_urls else None)
@@ -1626,7 +1730,7 @@ async def run_task_async(
                     from swarm.sessions import save_handoff_summary
                     handoff = _extract_handoff_summary(task, content)
                     asyncio.ensure_future(save_handoff_summary(session_id, handoff))
-                return content, tokens
+                return content, tokens, None
             except Exception as exc:
                 span.record_exception(exc)
                 span.set_status(trace.StatusCode.ERROR, str(exc))
@@ -1638,7 +1742,7 @@ async def run_task_async(
                 cloud_msg = _cloud_provider_error_message(exc)
                 if cloud_msg:
                     raise RuntimeError(cloud_msg) from exc
-                raise  # callers receive (content, tokens) on success; exception on failure
+                raise  # callers receive (content, tokens, clarification) on success; exception on failure
             finally:
                 task_duration.record(
                     time.perf_counter() - t0,
