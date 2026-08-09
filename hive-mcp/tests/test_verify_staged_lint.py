@@ -172,3 +172,100 @@ def test_forbidden_rule_still_applies_to_non_component_staged_file(tmp_path, mon
     report = verify.verify_claims(answer)
 
     assert "FORBIDDEN pattern" in report
+
+
+# ── Fenced-code-block REQUIRE scoping (same false positive, the other code path) ──
+# _lint_code() has TWO ways to see code: staged *.hive_proposed files (tests above)
+# and fenced code blocks pasted into the answer's own prose. The staged-file path
+# was already scoped to component extensions (_COMPONENT_EXTS) above; the fenced-
+# block path never got the same treatment. Confirmed live 2026-08-09: a pure-
+# backend Python answer with zero frontend code was flagged "MISSING required
+# pattern styles\." because every fenced block, regardless of language, was joined
+# into one blob and checked against REQUIRE rules unconditionally.
+
+def test_require_rule_not_applied_to_python_fenced_block(monkeypatch):
+    monkeypatch.setattr(verify.config, "CODE_LINT_FORBID", [])
+    monkeypatch.setattr(verify.config, "CODE_LINT_REQUIRE", [r"styles\.::components must reference SCSS module classes"])
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+    monkeypatch.setattr(verify, "_staged_files", lambda: [])
+    answer = (
+        "Here's the caching implementation:\n\n"
+        "```python\n"
+        "def get_cached(key: str):\n"
+        "    return cache.get(key)\n"
+        "```\n"
+    )
+
+    report = verify.verify_claims(answer)
+
+    assert "MISSING required pattern" not in report
+
+
+def test_require_rule_still_applies_to_tsx_fenced_block(monkeypatch):
+    monkeypatch.setattr(verify.config, "CODE_LINT_FORBID", [])
+    monkeypatch.setattr(verify.config, "CODE_LINT_REQUIRE", [r"styles\.::components must reference SCSS module classes"])
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+    monkeypatch.setattr(verify, "_staged_files", lambda: [])
+    answer = (
+        "Here's the new component:\n\n"
+        "```tsx\n"
+        "export function Badge() { return <div className=\"badge\">hi</div>; }\n"
+        "```\n"
+    )
+
+    report = verify.verify_claims(answer)
+
+    assert "MISSING required pattern" in report
+
+
+def test_require_rule_not_applied_to_untagged_fenced_block(monkeypatch):
+    """No language tag at all -- degrades to non-component treatment, same as an
+    unrecognized extension would for a staged file."""
+    monkeypatch.setattr(verify.config, "CODE_LINT_FORBID", [])
+    monkeypatch.setattr(verify.config, "CODE_LINT_REQUIRE", [r"styles\.::components must reference SCSS module classes"])
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+    monkeypatch.setattr(verify, "_staged_files", lambda: [])
+    answer = "Config:\n\n```\nCACHE_TTL=300\n```\n"
+
+    report = verify.verify_claims(answer)
+
+    assert "MISSING required pattern" not in report
+
+
+def test_forbid_rule_still_applies_to_python_fenced_block(monkeypatch):
+    """FORBID has no false-positive risk across languages -- confirm the fix didn't
+    also narrow FORBID scope down to component blocks, only REQUIRE."""
+    monkeypatch.setattr(verify.config, "CODE_LINT_FORBID", [r"TODO::no leftover TODO markers"])
+    monkeypatch.setattr(verify.config, "CODE_LINT_REQUIRE", [])
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+    monkeypatch.setattr(verify, "_staged_files", lambda: [])
+    answer = "```python\n# TODO: add auth check\ndef get_party(id): ...\n```\n"
+
+    report = verify.verify_claims(answer)
+
+    assert "FORBIDDEN pattern" in report
+
+
+def test_mixed_python_and_tsx_blocks_only_flags_the_tsx_one(monkeypatch):
+    """A real mixed-language answer (e.g. a backend endpoint + a frontend hook to
+    call it) must not let the compliant Python block's absence of `styles.` mask
+    OR get blamed for a genuinely missing pattern in the tsx block -- and must not
+    duplicate the FORBID check's findings by running it twice on overlapping text."""
+    monkeypatch.setattr(verify.config, "CODE_LINT_FORBID", [r"TODO::no leftover TODO markers"])
+    monkeypatch.setattr(verify.config, "CODE_LINT_REQUIRE", [r"styles\.::components must reference SCSS module classes"])
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+    monkeypatch.setattr(verify, "_staged_files", lambda: [])
+    answer = (
+        "```python\n"
+        "# TODO: add auth check\n"
+        "def get_party(id): ...\n"
+        "```\n"
+        "```tsx\n"
+        "export function PartyView() { return <div className=\"card\">hi</div>; }\n"
+        "```\n"
+    )
+
+    report = verify.verify_claims(answer)
+
+    assert "MISSING required pattern" in report
+    assert report.count("FORBIDDEN pattern") == 1  # not duplicated by the second lint pass

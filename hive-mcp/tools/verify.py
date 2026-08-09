@@ -152,6 +152,12 @@ def _is_negated_claim(answer: str, start: int, end: int) -> bool:
 _CODE_DOTTED_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\b")
 
 _FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*\s*?\n(.*?)```", re.S)
+# Same fences as _FENCE_RE, but also captures the language tag (group 1) so
+# _lint_code can tell a ```python block from a ```tsx one — see _COMPONENT_LANGS
+# below. A separate regex rather than changing _FENCE_RE itself: _FENCE_RE's
+# other caller (_code_idents) expects findall() to return bare code strings, not
+# (lang, code) tuples, and there is no reason to touch that path for this fix.
+_FENCE_WITH_LANG_RE = re.compile(r"```([a-zA-Z0-9_+-]*)\s*?\n(.*?)```", re.S)
 _PROPOSED_SUFFIX = ".hive_proposed"
 # REQUIRE rules (e.g. "components must reference styles.x") only make sense for
 # actual component files — applying them to every staged file regardless of type
@@ -161,6 +167,13 @@ _PROPOSED_SUFFIX = ".hive_proposed"
 # fully generic across every staged file, matching this tool's project-agnostic
 # design elsewhere.
 _COMPONENT_EXTS = (".tsx", ".jsx")
+# Fenced-code-block language tags treated as "component code" for REQUIRE rules —
+# kept narrow to match _COMPONENT_EXTS exactly (a bare ```ts/```js/```typescript/
+# ```javascript block is not necessarily a React component, so it stays out,
+# same as .ts/.js are excluded from _COMPONENT_EXTS above). An untagged fence
+# (```\n...) also stays out — no language info to go on, so it degrades to the
+# same non-component treatment.
+_COMPONENT_LANGS = ("tsx", "jsx")
 # How recent a *.hive_proposed file's mtime has to be to count as "part of this
 # task". Generous enough for a genuinely long multi-step run, short enough to
 # exclude anything left over from a previous session. Measured live 2026-08-05:
@@ -361,9 +374,28 @@ def _lint_code(answer: str) -> list[str]:
     """
     out: list[str] = []
 
-    blocks = _FENCE_RE.findall(answer or "")
+    # FORBID rules apply to every fenced block regardless of language (same reasoning
+    # as _staged_files() below: no false-positive risk). REQUIRE rules (e.g. "components
+    # must reference styles.x") are scoped to component-language blocks only — confirmed
+    # live 2026-08-09: a pure-backend Python answer with zero frontend code was flagged
+    # "MISSING required pattern styles\." because the old check joined every fenced
+    # block regardless of language and ran REQUIRE against the lot unconditionally, the
+    # exact false positive _staged_files() below was already built to avoid for staged
+    # files (see test_require_rule_not_applied_to_non_component_staged_file) — this
+    # fence-block path just never got the same treatment.
+    blocks = _FENCE_WITH_LANG_RE.findall(answer or "")
     if blocks:
-        out += _lint_text("\n".join(blocks), "the answer's code block(s)", check_require=True)
+        all_code = "\n".join(code for _lang, code in blocks)
+        out += _lint_text(all_code, "the answer's code block(s)", check_require=False)
+        component_code = "\n".join(code for lang, code in blocks if lang.lower() in _COMPONENT_LANGS)
+        if component_code:
+            # check_require=True also re-runs the FORBID rules on this subset, which
+            # would duplicate whatever the all_code pass above already reported — keep
+            # only the REQUIRE ("MISSING required pattern") violations from this call.
+            out += [
+                v for v in _lint_text(component_code, "the answer's code block(s)", check_require=True)
+                if v.startswith("MISSING required pattern")
+            ]
 
     for path in _staged_files():
         try:
