@@ -145,9 +145,22 @@ class Config:
     # the first place. frequency_penalty penalizes a token proportionally to how many
     # times it has already appeared in this response -- the standard, targeted lever for
     # exactly this failure mode, unlike temperature (general randomness, not specifically
-    # repetition). 0.4 is a moderate starting value. Coordinator only, same scoping
-    # rationale as coordinator_temperature/coordinator_max_tokens above.
-    coordinator_frequency_penalty: float = float(os.getenv("COORDINATOR_FREQUENCY_PENALTY", "0.4"))
+    # repetition). Coordinator only, same scoping rationale as
+    # coordinator_temperature/coordinator_max_tokens above.
+    #
+    # Lowered 0.4 -> 0.15 same day: a live re-test at 0.4 showed a DIFFERENT failure --
+    # ~192 consecutive TeamRunContent stream events over 5+ minutes with BOTH .content
+    # and .reasoning_content genuinely empty every single time, zero tool calls
+    # dispatched. Working hypothesis, not confirmed (the raw pre-parse token stream
+    # isn't visible to us): frequency_penalty penalizes ANY repeated token, including
+    # the structural tokens valid JSON needs (repeated quotes, braces, commas) -- a
+    # value strong enough to suppress prose repetition may be strong enough to also
+    # interfere with the model completing a well-formed tool call, trading "repeats
+    # itself in prose" for "never finishes forming a parseable tool call at all," which
+    # is arguably worse (the prior failure at least sometimes escaped via max_tokens
+    # forcing a fresh attempt). 0.15 is a gentler starting point to test whether it
+    # still discourages prose repetition without visibly breaking tool-call formation.
+    coordinator_frequency_penalty: float = float(os.getenv("COORDINATOR_FREQUENCY_PENALTY", "0.15"))
 
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))
