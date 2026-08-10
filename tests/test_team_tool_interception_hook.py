@@ -150,6 +150,49 @@ def test_build_team_shares_the_same_interception_hook_instance_with_fallback_mem
         assert member.tool_hooks[1] is interception_hook
 
 
+# ── _make_tool_interception_hook: shared activity tracker (wander-then-go-quiet diagnostics) ──
+
+@pytest.mark.asyncio
+async def test_hook_updates_activity_dict_on_success():
+    activity = {"last_call_name": None, "last_call_at": 0.0}
+    hook = _make_tool_interception_hook(activity=activity)
+
+    async def fake_tool(**kwargs):
+        return "ok"
+
+    await hook("my_tool", fake_tool, {})
+
+    assert activity["last_call_name"] == "my_tool"
+    assert activity["last_call_at"] > 0.0
+
+
+@pytest.mark.asyncio
+async def test_hook_updates_activity_dict_on_failure_too():
+    activity = {"last_call_name": None, "last_call_at": 0.0}
+    hook = _make_tool_interception_hook(activity=activity)
+
+    async def failing_tool(**kwargs):
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        await hook("bad_tool", failing_tool, {})
+
+    assert activity["last_call_name"] == "bad_tool"
+    assert activity["last_call_at"] > 0.0
+
+
+@pytest.mark.asyncio
+async def test_hook_works_fine_when_no_activity_dict_supplied():
+    hook = _make_tool_interception_hook()  # activity=None default, unchanged behavior
+
+    async def fake_tool(**kwargs):
+        return "ok"
+
+    result = await hook("my_tool", fake_tool, {})
+
+    assert result == "ok"
+
+
 def test_build_team_shares_the_same_interception_hook_instance_with_spec_based_members(monkeypatch):
     monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
 

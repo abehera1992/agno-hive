@@ -2,7 +2,7 @@ import asyncio
 import json
 import re
 import time
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 
 from opentelemetry import trace
 from agno.team import Team
@@ -1251,12 +1251,28 @@ class ToolCallAborted(Exception):
     because its abort_event was set before the call ran."""
 
 
-def _make_tool_interception_hook(abort_event: "asyncio.Event | None" = None):
+def _make_tool_interception_hook(
+    abort_event: "asyncio.Event | None" = None,
+    activity: dict | None = None,
+):
     """Build a tool_hooks callable giving a real per-tool-call checkpoint:
     log every call (name, args, duration, success/failure), and -- if an
     abort_event is supplied and set -- skip the call entirely instead of
     running it. This is AGNOHive 2.3.1's Phase 9a ("interception: pause /
     abort / serialize between tool calls").
+
+    Every print here uses flush=True. Confirmed live 2026-08-09/10 that
+    agno-api.service's stdout is fully block-buffered under systemd --
+    these lines sat unflushed for 30+ minutes of a genuinely running task
+    and were still invisible in journalctl after the client disconnected.
+    Without flush=True this hook's log is theoretical, not actually usable
+    for live debugging.
+
+    `activity`, if supplied, is a plain dict this hook mutates in place on
+    every call (`last_call_name`, `last_call_at` -- time.monotonic()) so a
+    caller running team.arun() concurrently with a heartbeat task (see
+    run_task_async) can report "Ns since the last tool call" during a
+    stretch where the coordinator is generating text and calling nothing.
 
     Async + must be shared across the coordinator AND every member agent,
     for the same two reasons _make_read_cache_tool_hook's docstring
@@ -1292,17 +1308,24 @@ def _make_tool_interception_hook(abort_event: "asyncio.Event | None" = None):
 
     async def _tool_interception_hook(function_name, function, args, agent=None, team=None):
         if abort_event is not None and abort_event.is_set():
-            print(f"[team] tool_hook: {function_name}({args}) ABORTED before execution")
+            print(f"[team] tool_hook: {function_name}({args}) ABORTED before execution", flush=True)
             raise ToolCallAborted(function_name)
         started = time.monotonic()
+        if activity is not None:
+            activity["last_call_name"] = function_name
+            activity["last_call_at"] = started
         try:
             result = await function(**args)
             elapsed = time.monotonic() - started
-            print(f"[team] tool_hook: {function_name}({args}) -> {elapsed:.2f}s")
+            print(f"[team] tool_hook: {function_name}({args}) -> {elapsed:.2f}s", flush=True)
+            if activity is not None:
+                activity["last_call_at"] = time.monotonic()
             return result
         except Exception as exc:
             elapsed = time.monotonic() - started
-            print(f"[team] tool_hook: {function_name}({args}) RAISED {type(exc).__name__}: {exc} after {elapsed:.2f}s")
+            print(f"[team] tool_hook: {function_name}({args}) RAISED {type(exc).__name__}: {exc} after {elapsed:.2f}s", flush=True)
+            if activity is not None:
+                activity["last_call_at"] = time.monotonic()
             raise
 
     return _tool_interception_hook
@@ -1320,6 +1343,7 @@ def _build_team(
     description: str | None = None,
     read_only: bool = False,
     skill_catalog: list[dict] | None = None,
+    activity: dict | None = None,
 ) -> Team:
     """Build a coordinator Team from agent specs (or the default Coder+Reviewer), sharing the
     already-connected `mcp_list`. Factored out of run_task_async / run_task_stream so the same
@@ -1328,14 +1352,16 @@ def _build_team(
     this team. Behaviour is identical to the previous inline Team(...) construction when omitted.
     `skill_catalog` (default None) is forwarded to each agent's spec-based construction so its
     L1 catalog can be filtered per agent role — the default Coder+Reviewer fallback path (used
-    only when agent_specs is empty) does not take a catalog; that path predates team YAMLs."""
+    only when agent_specs is empty) does not take a catalog; that path predates team YAMLs.
+    `activity` (default None = previous behaviour) is forwarded to the interception hook so a
+    caller can run a heartbeat alongside team.arun() -- see _make_tool_interception_hook."""
     # One cache per run, shared by the coordinator AND every member agent (not just
     # the coordinator) -- see _make_read_cache_tool_hook's docstring for why both of
     # those are load-bearing, not incidental. The interception hook (Phase 9a) is
     # built with abort_event=None here -- see its own docstring for why that keeps
     # this a no-op audit-log pass-through today rather than a live abort switch.
     read_cache_hook = _make_read_cache_tool_hook()
-    interception_hook = _make_tool_interception_hook()
+    interception_hook = _make_tool_interception_hook(activity=activity)
     tool_hooks = [read_cache_hook, interception_hook]
     if agent_specs:
         members = [
@@ -1570,6 +1596,27 @@ async def run_task_stream(
                 task_duration.record(time.perf_counter() - t0, {"project_id": project_id})
 
 
+async def _run_heartbeat(activity: dict, run_started: float, interval: float = 30.0) -> None:
+    """Prints a periodic status line while team.arun() is one opaque blocking
+    await, so a long stretch with zero tool calls -- the coordinator generating
+    a long answer, or genuinely stalled -- is visible as a trail of log lines
+    instead of indistinguishable silence. Diagnostic only: never cancels or
+    times out the run itself. The caller creates this as a background task
+    alongside team.arun() and cancels it once that call returns; the
+    CancelledError this raises inside asyncio.sleep is expected there."""
+    while True:
+        await asyncio.sleep(interval)
+        now = time.monotonic()
+        since_last_tool = now - activity["last_call_at"]
+        last_name = activity["last_call_name"] or "(none yet)"
+        print(
+            f"[team] heartbeat: {now - run_started:.0f}s since task start, "
+            f"{since_last_tool:.0f}s since last tool call (last: {last_name}), "
+            "coordinator still running",
+            flush=True,
+        )
+
+
 async def run_task_async(
     task: str,
     agent_specs: list | None = None,
@@ -1676,9 +1723,15 @@ async def run_task_async(
         # (already loaded at startup, so this is a fast no-op) AND main.py's plain
         # CLI one-shot path, which never runs the FastAPI startup event.
         await model_routing.ensure_cache_loaded()
+        # Fed by the interception hook on every tool call (coordinator or member);
+        # the heartbeat task below reads it to report time-since-last-tool-call
+        # during the stretch team.arun() is a single opaque blocking await with no
+        # other visibility into whether the coordinator is generating a long answer
+        # or has effectively stalled. See _make_tool_interception_hook's docstring.
+        activity = {"last_call_name": None, "last_call_at": time.monotonic()}
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
-            read_only=read_only, skill_catalog=skill_catalog,
+            read_only=read_only, skill_catalog=skill_catalog, activity=activity,
         )
 
         span_attrs = {
@@ -1693,7 +1746,13 @@ async def run_task_async(
             t0 = time.perf_counter()
             try:
                 with _tracer.start_as_current_span("agno.team.run"):
-                    result = await team.arun(task)
+                    heartbeat_task = asyncio.create_task(_run_heartbeat(activity, time.monotonic()))
+                    try:
+                        result = await team.arun(task)
+                    finally:
+                        heartbeat_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await heartbeat_task
                 content = result.content if hasattr(result, "content") else str(result)
                 # Fallback: if content is empty, pull from the last message in the run
                 if not content and hasattr(result, "messages") and result.messages:
