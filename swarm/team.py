@@ -1893,7 +1893,7 @@ async def run_task_async(
                         # query mid-run on a stateless call). run_task_stream already had this
                         # exact mechanism for the /stream endpoint -- this brings /run onto the
                         # same one, permanently, not just for this investigation.
-                        seen_unrecognized_event_types: set[str] = set()
+                        unrecognized_event_counts: dict[str, int] = {}
                         async for event in team.arun(task, stream=True):
                             last_event = event
                             activity["stream_event_count"] += 1
@@ -1914,20 +1914,27 @@ async def run_task_async(
                             elif isinstance(out, dict):
                                 print(f"[team] stream tool event: {out}", flush=True)
                             else:
-                                # Diagnostic (2026-08-10): _stream_event_to_chunk's recognized
-                                # event-type set was widened once already (team vs. member-agent
-                                # names) and STILL produced zero content/tool-event lines on a
-                                # live run with genuine, ongoing generation -- meaning either a
-                                # third event-type family exists, or content is arriving under a
-                                # field/shape this classifier doesn't check. Logging each unique
-                                # unrecognized type ONCE (not per-occurrence, to stay readable)
-                                # answers that directly instead of guessing a third time.
+                                # Diagnostic (2026-08-10, revised): the first version of this
+                                # logged each unique event.event TYPE once -- but a live run
+                                # showed activity["stream_event_count"] climbing steadily (proving
+                                # events WERE arriving) while zero content/tool lines ever printed,
+                                # meaning many events of the SAME type were all failing
+                                # classification and the log-once design couldn't tell "seen once,
+                                # harmless" apart from "seen 100+ times, something's genuinely
+                                # wrong" -- both looked identical: one line. Now counts occurrences
+                                # per type and logs the 1st, 2nd, and every 20th after that,
+                                # showing the actual .content/.reasoning_content values (not just
+                                # the type name) so a consistently-empty field is visible directly
+                                # instead of inferred from silence.
                                 event_type = getattr(event, "event", "") or "(no .event attr)"
-                                if event_type not in seen_unrecognized_event_types:
-                                    seen_unrecognized_event_types.add(event_type)
+                                unrecognized_event_counts[event_type] = unrecognized_event_counts.get(event_type, 0) + 1
+                                count = unrecognized_event_counts[event_type]
+                                if count in (1, 2) or count % 20 == 0:
+                                    content_val = getattr(event, "content", "<no .content attr>")
+                                    reasoning_val = getattr(event, "reasoning_content", "<no .reasoning_content attr>")
                                     print(
-                                        f"[team] unrecognized stream event type: {event_type!r} "
-                                        f"(attrs: {[a for a in vars(event).keys() if not a.startswith('_')] if hasattr(event, '__dict__') else 'n/a'})",
+                                        f"[team] unrecognized stream event #{count} of type {event_type!r}: "
+                                        f"content={content_val!r}, reasoning_content={reasoning_val!r}",
                                         flush=True,
                                     )
                     finally:
