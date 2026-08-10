@@ -1810,10 +1810,11 @@ async def run_task_async(
         # CLI one-shot path, which never runs the FastAPI startup event.
         await model_routing.ensure_cache_loaded()
         # Fed by the interception hook on every tool call (coordinator or member);
-        # the heartbeat task below reads it to report time-since-last-tool-call
-        # during the stretch team.arun() is a single opaque blocking await with no
-        # other visibility into whether the coordinator is generating a long answer
-        # or has effectively stalled. See _make_tool_interception_hook's docstring.
+        # the heartbeat task below reads it to report time-since-last-tool-call as a
+        # backstop signal independent of the content-chunk logging below (2026-08-10) --
+        # the heartbeat still fires even during a stretch with zero stream events of any
+        # kind, which the content logging alone would not catch. See
+        # _make_tool_interception_hook's docstring for the hook itself.
         activity = {"last_call_name": None, "last_call_at": time.monotonic()}
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
@@ -1833,21 +1834,45 @@ async def run_task_async(
             try:
                 with _tracer.start_as_current_span("agno.team.run"):
                     heartbeat_task = asyncio.create_task(_run_heartbeat(activity, time.monotonic()))
+                    full_content: list[str] = []
+                    last_event = None
+                    last_logged_len = 0
+                    last_logged_at = time.monotonic()
                     try:
-                        result = await team.arun(task)
+                        # Consuming the stream internally (2026-08-10) instead of one opaque
+                        # blocking team.arun(task) -- external behavior (return type, downstream
+                        # guards) is unchanged, this only adds visibility into what the
+                        # coordinator is generating along the way. Motivated by three live
+                        # investigations that day all hitting the same wall: vLLM showing real,
+                        # ongoing token throughput for 10-30+ minutes with zero new tool calls,
+                        # and no way to tell WHAT was being generated the whole time (py-spy only
+                        # shows Python call-stack, not model output; there was no session_id to
+                        # query mid-run on a stateless call). run_task_stream already had this
+                        # exact mechanism for the /stream endpoint -- this brings /run onto the
+                        # same one, permanently, not just for this investigation.
+                        async for event in team.arun(task, stream=True):
+                            last_event = event
+                            out = _stream_event_to_chunk(event)
+                            if isinstance(out, str):
+                                full_content.append(out)
+                                now = time.monotonic()
+                                if now - last_logged_at >= 10:
+                                    joined = "".join(full_content)
+                                    preview = joined[last_logged_len:][-300:]
+                                    print(
+                                        f"[team] content: +{len(joined) - last_logged_len} chars "
+                                        f"({len(joined)} total) -- ...{preview!r}",
+                                        flush=True,
+                                    )
+                                    last_logged_at = now
+                                    last_logged_len = len(joined)
+                            elif isinstance(out, dict):
+                                print(f"[team] stream tool event: {out}", flush=True)
                     finally:
                         heartbeat_task.cancel()
                         with suppress(asyncio.CancelledError):
                             await heartbeat_task
-                content = result.content if hasattr(result, "content") else str(result)
-                # Fallback: if content is empty, pull from the last message in the run
-                if not content and hasattr(result, "messages") and result.messages:
-                    for msg in reversed(result.messages):
-                        msg_content = getattr(msg, "content", None)
-                        if msg_content and isinstance(msg_content, str):
-                            content = msg_content
-                            break
-                content = content or "(no response)"
+                content = "".join(full_content) or "(no response)"
                 # Clarification check runs BEFORE the claim-verification/count-marker
                 # guards below, and short-circuits past both when found: those guards
                 # validate a completed factual answer, and a clarification block is
@@ -1857,13 +1882,13 @@ async def run_task_async(
                 # the original text-convention approach as the default. Falls back to
                 # the original fenced-block regex only if no tool call is found, for the
                 # rare case the model reverts to that old habit instead of calling the tool.
-                clarification = _extract_clarification_from_tools(result)
+                clarification = _extract_clarification_from_tools(last_event)
                 if clarification is None:
                     content, clarification = _extract_clarification(content)
                 else:
                     content = ""
                 if clarification is not None:
-                    tokens = _extract_tokens(result)
+                    tokens = _extract_tokens(last_event)
                     span.set_status(trace.StatusCode.OK)
                     task_counter.add(1, {"project_id": project_id, "outcome": "clarification"})
                     return content, tokens, clarification
@@ -1878,10 +1903,10 @@ async def run_task_async(
                 try:
                     content = await _verified_answer(
                         content, task, team, all_mcp_urls[0] if all_mcp_urls else None,
-                        result)
+                        last_event)
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
-                tokens = _extract_tokens(result)
+                tokens = _extract_tokens(last_event)
                 span.set_status(trace.StatusCode.OK)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
                 # Fire-and-forget: don't block the response on post-run experience indexing.
