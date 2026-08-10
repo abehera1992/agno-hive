@@ -1474,21 +1474,47 @@ def _build_team(
     )
 
 
+_CONTENT_EVENT_TYPES = {"TeamRunContent", "RunContent"}
+_TOOL_START_EVENT_TYPES = {"TeamToolCallStarted", "ToolCallStarted"}
+_TOOL_END_EVENT_TYPES = {"TeamToolCallCompleted", "ToolCallCompleted"}
+
+
 def _stream_event_to_chunk(event) -> str | dict | None:
     """Classify one raw agno team.arun(stream=True) event into what run_task_stream
-    yields downstream. Duck-typed via getattr since agno event objects vary by type.
+    yields downstream (and, since 2026-08-10, what run_task_async logs for content
+    visibility). Duck-typed via getattr since agno event objects vary by type.
+
+    Recognizes BOTH the coordinator's own Team-level event types (TeamRunContent,
+    TeamToolCallStarted, TeamToolCallCompleted) AND a delegated member agent's
+    Agent-level equivalents (RunContent, ToolCallStarted, ToolCallCompleted --
+    confirmed via agno.run.agent.RunEvent, no "Team" prefix). This was a real gap
+    until 2026-08-10, not a deliberate scope choice: in mode="coordinate" the
+    coordinator mostly delegates to team members rather than generating content or
+    calling tools itself (same fact _make_read_cache_tool_hook's and
+    _make_tool_interception_hook's docstrings document for tool_hooks), so the
+    original team-only filter silently dropped most of what actually happens during
+    a run -- a live investigation that day found run_task_async's new content-preview
+    logging producing nothing for 4+ minutes of genuine, ongoing generation, entirely
+    because the coordinator had delegated and every event from the member agent doing
+    the work used the unprefixed event names. This also changes run_task_stream's
+    /stream endpoint: a client consuming `chunk` events now sees a member agent's
+    content too, not just the coordinator's -- a fix, not a new behavior to opt into,
+    since that content was always part of the real answer being generated.
 
     Returns:
-      str  — a TeamRunContent text delta (existing behavior, unchanged)
-      dict — a tool-call sentinel: {"__tool_event__": "start", "name": str, "args": dict}
-             or {"__tool_event__": "end", "name": str, "result_preview": str | None}
+      str  — a text delta from the coordinator OR a delegated member agent
+      dict — a tool-call sentinel: {"__tool_event__": "start", "name": str, "args": dict,
+             "agent_name": str} or {"__tool_event__": "end", "name": str,
+             "result_preview": str | None, "agent_name": str}. agent_name is "" for
+             the coordinator's own calls (BaseAgentRunEvent's own default) and the
+             member's name (e.g. "Researcher") for a delegated call.
       None — every other event type (dropped, same as the previous hard filter)
     """
     event_type = getattr(event, "event", "")
-    if event_type == "TeamRunContent":
+    if event_type in _CONTENT_EVENT_TYPES:
         chunk = getattr(event, "content", None)
         return chunk if isinstance(chunk, str) and chunk else None
-    if event_type == "TeamToolCallStarted":
+    if event_type in _TOOL_START_EVENT_TYPES:
         tool = getattr(event, "tool", None)
         if tool is None:
             return None
@@ -1496,8 +1522,9 @@ def _stream_event_to_chunk(event) -> str | dict | None:
             "__tool_event__": "start",
             "name": tool.tool_name,
             "args": tool.tool_args or {},
+            "agent_name": getattr(event, "agent_name", "") or "",
         }
-    if event_type == "TeamToolCallCompleted":
+    if event_type in _TOOL_END_EVENT_TYPES:
         tool = getattr(event, "tool", None)
         if tool is None:
             return None
@@ -1506,6 +1533,7 @@ def _stream_event_to_chunk(event) -> str | dict | None:
             "__tool_event__": "end",
             "name": tool.tool_name,
             "result_preview": result[:200] if isinstance(result, str) else None,
+            "agent_name": getattr(event, "agent_name", "") or "",
         }
     return None
 
