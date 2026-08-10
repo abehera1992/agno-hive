@@ -1878,6 +1878,7 @@ async def run_task_async(
                         # query mid-run on a stateless call). run_task_stream already had this
                         # exact mechanism for the /stream endpoint -- this brings /run onto the
                         # same one, permanently, not just for this investigation.
+                        seen_unrecognized_event_types: set[str] = set()
                         async for event in team.arun(task, stream=True):
                             last_event = event
                             out = _stream_event_to_chunk(event)
@@ -1896,6 +1897,23 @@ async def run_task_async(
                                     last_logged_len = len(joined)
                             elif isinstance(out, dict):
                                 print(f"[team] stream tool event: {out}", flush=True)
+                            else:
+                                # Diagnostic (2026-08-10): _stream_event_to_chunk's recognized
+                                # event-type set was widened once already (team vs. member-agent
+                                # names) and STILL produced zero content/tool-event lines on a
+                                # live run with genuine, ongoing generation -- meaning either a
+                                # third event-type family exists, or content is arriving under a
+                                # field/shape this classifier doesn't check. Logging each unique
+                                # unrecognized type ONCE (not per-occurrence, to stay readable)
+                                # answers that directly instead of guessing a third time.
+                                event_type = getattr(event, "event", "") or "(no .event attr)"
+                                if event_type not in seen_unrecognized_event_types:
+                                    seen_unrecognized_event_types.add(event_type)
+                                    print(
+                                        f"[team] unrecognized stream event type: {event_type!r} "
+                                        f"(attrs: {[a for a in vars(event).keys() if not a.startswith('_')] if hasattr(event, '__dict__') else 'n/a'})",
+                                        flush=True,
+                                    )
                     finally:
                         heartbeat_task.cancel()
                         with suppress(asyncio.CancelledError):
