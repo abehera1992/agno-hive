@@ -1450,7 +1450,15 @@ def _build_team(
     # request_clarification is always available, regardless of read_only/allowlist scoping --
     # it's a local tool (not MCP-derived, so name-based allowlisting doesn't apply to it) with
     # no side effects, safe for every team including read-only ones (planning, parallel-review).
-    coordinator_tools_list = list(_scope_coordinator_tools(coordinator_tools, mcp_list, read_only)) + [
+    #
+    # coordinator_no_direct_writes (2026-08-10 experiment, see config.py's docstring) forces
+    # the SAME "strip mutating tools" scoping _scope_coordinator_tools already does for
+    # read_only=True, applied to the coordinator ONLY -- `read_only` itself (the caller's
+    # request-level flag) is untouched here, so member agents are governed purely by that as
+    # before; this doesn't change their behavior at all, only whether the coordinator's own
+    # surface additionally excludes write tools regardless of the request's read_only value.
+    _coordinator_tool_scope = read_only or config.coordinator_no_direct_writes
+    coordinator_tools_list = list(_scope_coordinator_tools(coordinator_tools, mcp_list, _coordinator_tool_scope)) + [
         request_clarification
     ]
     return Team(

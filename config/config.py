@@ -161,6 +161,23 @@ class Config:
     # forcing a fresh attempt). 0.15 is a gentler starting point to test whether it
     # still discourages prose repetition without visibly breaking tool-call formation.
     coordinator_frequency_penalty: float = float(os.getenv("COORDINATOR_FREQUENCY_PENALTY", "0.15"))
+    # Experiment (2026-08-10): every repetition-loop/empty-content stall diagnosed that day
+    # showed ONLY TeamRunContent stream events (the coordinator's own output) -- never once a
+    # RunContent event (what a delegated member agent emits). The coordinator's own
+    # instructions explicitly permit and encourage it to call apply_diff/write_file directly
+    # for implementation tasks rather than delegate ("You have DIRECT access to all MCP
+    # tools... call MCP tools DIRECTLY"), and since the ALL-MoE consolidation means Coordinator
+    # and Coder are the literal same model weights, every stall observed was plausibly the
+    # coordinator itself attempting the write, never a genuinely separate Coder turn.
+    # When True, strips every mutating tool (apply_diff, write_file, run_command, ...) from
+    # the COORDINATOR's own tool surface only -- member agents (Coder especially) are
+    # completely unaffected and keep their normal write tools -- forcing delegation instead
+    # of leaving it optional, to test whether a fresh Coder turn (different instructions, no
+    # "I have direct tool access" framing, even though same underlying weights) is more
+    # reliable at actually executing than the coordinator attempting it inline. Off by
+    # default -- this changes real behavior (forces delegation on every write-shaped task),
+    # not a passive diagnostic like the logging added earlier that day.
+    coordinator_no_direct_writes: bool = os.getenv("COORDINATOR_NO_DIRECT_WRITES", "false").lower() == "true"
 
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))

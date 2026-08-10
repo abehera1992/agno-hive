@@ -15,10 +15,17 @@ caller can wire up, not something already connected to steering. See
 _make_tool_interception_hook's docstring for the full scoping note.
 """
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
 from swarm.team import _make_tool_interception_hook, _build_team, ToolCallAborted
+
+
+def _fake_mcp(functions: dict):
+    """A minimal stand-in for a connected MCPTools server -- _scope_coordinator_tools
+    only ever reads `.functions` (a dict of name -> Function-like object) off it."""
+    return SimpleNamespace(functions=functions)
 
 
 # ── _make_tool_interception_hook: pass-through / audit behavior (abort_event=None) ──
@@ -333,3 +340,79 @@ def test_build_team_shares_the_same_interception_hook_instance_with_spec_based_m
 
     interception_hook = result.tool_hooks[1]
     assert result.members[0].tool_hooks[1] is interception_hook
+
+
+# ── _build_team wiring: coordinator_no_direct_writes (2026-08-10 experiment) ───────
+# Forces the coordinator to delegate implementation instead of writing directly --
+# see config.py's coordinator_no_direct_writes docstring for the live evidence
+# motivating this (every repetition-loop/stall diagnosed that day showed ONLY the
+# coordinator's own TeamRunContent events, never a delegated member's RunContent).
+
+def test_coordinator_no_direct_writes_strips_mutating_tools_from_coordinator(monkeypatch):
+    monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
+    monkeypatch.setattr("swarm.team.config.coordinator_no_direct_writes", True)
+    mcp_list = [_fake_mcp({"apply_diff": "apply_diff", "get_file_content": "get_file_content"})]
+
+    result = _build_team(
+        agent_specs=None,
+        coordinator_model="qwen2.5-coder:32b",
+        coordinator_tools=None,
+        mode="coordinate",
+        mcp_list=mcp_list,
+        instructions=[],
+    )
+
+    assert "apply_diff" not in result.tools
+    assert "get_file_content" in result.tools
+
+
+def test_coordinator_keeps_write_tools_by_default(monkeypatch):
+    """Backward compat: coordinator_no_direct_writes defaults to False, so an
+    unmodified deployment's coordinator keeps its existing direct write access --
+    _scope_coordinator_tools' no-restriction branch returns the raw connected MCP
+    server object(s) unfiltered (agno expands those into individual tools
+    internally), so the assertion is "nothing was stripped," not a name lookup."""
+    monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
+    monkeypatch.setattr("swarm.team.config.coordinator_no_direct_writes", False)
+    mcp_list = [_fake_mcp({"apply_diff": "apply_diff", "get_file_content": "get_file_content"})]
+
+    result = _build_team(
+        agent_specs=None,
+        coordinator_model="qwen2.5-coder:32b",
+        coordinator_tools=None,
+        mode="coordinate",
+        mcp_list=mcp_list,
+        instructions=[],
+    )
+
+    assert mcp_list[0] in result.tools
+
+
+def test_coordinator_no_direct_writes_does_not_affect_member_tools(monkeypatch):
+    """The flag scopes ONLY the coordinator's own tools -- make_agent_from_spec
+    resolves a member's tools independently (from spec.tools), never touching
+    _scope_coordinator_tools/coordinator_no_direct_writes at all."""
+    monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
+    monkeypatch.setattr("swarm.team.config.coordinator_no_direct_writes", True)
+    mcp_list = [_fake_mcp({"apply_diff": "apply_diff", "get_file_content": "get_file_content"})]
+
+    class _FakeCoderSpec:
+        name = "Coder"
+        model = "qwen2.5-coder:32b"
+        tools = ["apply_diff", "get_file_content"]
+        instructions = ["Implement the change."]
+        role = "Coder"
+        description = "Implementation specialist."
+        skills = None
+
+    result = _build_team(
+        agent_specs=[_FakeCoderSpec()],
+        coordinator_model="qwen2.5-coder:32b",
+        coordinator_tools=None,
+        mode="coordinate",
+        mcp_list=mcp_list,
+        instructions=[],
+    )
+
+    assert "apply_diff" not in result.tools  # coordinator: stripped
+    assert "apply_diff" in result.members[0].tools  # Coder: unaffected
