@@ -5,7 +5,9 @@ import time
 from contextlib import AsyncExitStack, suppress
 
 from opentelemetry import trace
+from pydantic import BaseModel, Field
 from agno.team import Team
+from agno.tools import tool as agno_tool
 from agno.tools.mcp import MCPTools
 from .agents import make_coder, make_reviewer, make_agent_from_spec, get_model, format_skill_catalog
 from .feedback import record_success, record_success_bg, record_failure, load_failure_context
@@ -58,24 +60,22 @@ _COORDINATOR_INSTRUCTIONS = [
     "  real blast radius where guessing wrong is costly. NOT a case for this: not knowing which",
     "  file to edit (that's what find_files/search_files are for — research it, don't ask), or a",
     "  task that's merely open-ended but has one obvious reasonable interpretation — just do that one.",
-    "  MANDATORY FORMAT — this is not optional phrasing, it is the ONLY way a question reaches",
-    "  the human at all: end your ENTIRE response with this fenced block and NOTHING after it —",
-    "  no further prose, no attempted answer alongside it, no plain-English question anywhere",
-    "  else in the response:",
-    "    ```needs_clarification",
-    "    {\"question\": \"...\", \"options\": [{\"label\": \"...\", \"description\": \"...\"}, ...]}",
-    "    ```",
-    "  2-4 options, each with a short label and one clarifying sentence in description.",
+    "  MANDATORY MECHANISM — this is not optional phrasing, it is the ONLY way a question reaches",
+    "  the human at all: call the `request_clarification` tool with `question` (a string ending",
+    "  in '?') and `options` (2-4 items, each `{\"label\": \"...\", \"description\": \"...\"}`). This is",
+    "  a REAL tool call, exactly like calling get_file_content or search_files — not text for you",
+    "  to write out. Do NOT describe the question in your own prose instead of calling the tool,",
+    "  and do NOT call the tool AND also write a prose version of the same question — the tool",
+    "  call alone is the complete action.",
     "  SELF-CHECK before you finish any answer: if the text you are about to send ends with a",
     "  question mark asking the user to confirm, choose, or say whether to proceed (\"Would you",
     "  like me to...?\", \"Should I use X or Y?\", \"Which do you prefer?\") — that IS this case, and",
-    "  a plain-prose question is NOT how it reaches the human; the caller only ever looks at the",
-    "  fenced block, and a prose-only question is simply lost. Rewrite it as the fenced block",
-    "  before sending, every time, no exceptions.",
-    "  Do NOT proceed to delegate or write anything in the same turn you ask — the run stops",
-    "  here, the human answers, and the chosen option arrives as the next task on this same",
-    "  session. Overusing this is also a failure: a task with one reasonable reading does not",
-    "  need a question — asking too often is as much a defect as guessing wrong.",
+    "  writing it as prose does not reach the human; only the request_clarification tool call",
+    "  does. Call the tool instead of writing that sentence, every time, no exceptions.",
+    "  Do NOT call any other tool in the same turn you call request_clarification — calling it",
+    "  ends the run immediately, the human answers, and the chosen option arrives as the next",
+    "  task on this same session. Overusing this is also a failure: a task with one reasonable",
+    "  reading does not need a question — asking too often is as much a defect as guessing wrong.",
     "",
     "── Honesty & execution — NEVER fabricate work (read this) ─────",
     "  NEVER claim you created, updated, moved, deleted, or marked anything unless the actual",
@@ -426,22 +426,96 @@ def _extract_handoff_summary(task: str, content: str) -> str:
 
 
 # ── Clarification requests (structured "I need a decision from the user") ──────
-# The coordinator is an LLM producing free text — it cannot literally return a
-# structured object mid-generation. Matching how _verify_claims/_summarize_actual_
-# writes already solve this class of problem, it is instructed to emit a fenced
-# ```needs_clarification block (see _COORDINATOR_INSTRUCTIONS) only when a task
-# genuinely cannot proceed without a decision only the user can make — not
-# something a tool call could resolve. This is parsed out of the final answer text
-# here, then surfaced as RunResponse.needs_clarification (api/models.py) so the
-# caller (hive CLI, agno_run) can present it as a real choice instead of the
-# coordinator guessing. Confirmed live 2026-08-09: an open-ended "add an endpoint,
-# figure out the pattern yourself" task caused the Coder to narrate intent in a
-# loop without ever calling a write tool — a case this mechanism does NOT fix
-# (there was no genuine ambiguity, just an unfinished task), but the same session
-# motivated building this for the real ambiguous-task case it targets.
+# Original design (2026-08-09): the coordinator is an LLM producing free text, so
+# it was instructed to emit a fenced ```needs_clarification block and the block
+# was regex-extracted from the final answer text. Live testing that same day
+# showed this fails intermittently -- the model sometimes expresses the exact
+# right judgment (a genuine decision point) but ends its answer with a plain
+# prose question instead of remembering the fenced-block convention, and the
+# question is then silently lost since nothing else looks at raw prose for it.
+#
+# 2026-08-10: replaced with a REAL tool call. request_clarification (below) is a
+# genuine tool on the coordinator's own tool list -- calling it is a first-class
+# action the model is already reliably trained to decide on (it calls MCP tools
+# correctly dozens of times per run), not a text formatting convention it has to
+# remember on top of everything else it's generating. stop_after_tool_call=True
+# halts the run the instant it's called, and the tool's own (Pydantic-validated)
+# arguments ARE the question/options -- no text parsing involved. See
+# _extract_clarification_from_tools, the new primary extraction path.
+#
+# _extract_clarification (the original regex-over-text approach) stays below as
+# a fallback for the rare case the model reverts to the old fenced-block habit
+# from training data instead of calling the tool -- cheap insurance, no cost if
+# never hit. Confirmed live 2026-08-09: this whole mechanism does NOT fix a
+# separate failure mode where an open-ended "add an endpoint, figure out the
+# pattern yourself" task caused the Coder to narrate intent in a loop without
+# ever calling a write tool (there was no genuine ambiguity there, just an
+# unfinished task) -- that's out of scope for this mechanism either way.
 _CLARIFICATION_RE = re.compile(
     r"```needs_clarification\s*\n(.*?)\n```", re.DOTALL
 )
+
+
+class ClarificationOption(BaseModel):
+    """One option the coordinator can offer via the request_clarification tool."""
+
+    label: str = Field(..., description="Short display text for this option (1-5 words).")
+    description: str | None = Field(None, description="One clarifying sentence about this option.")
+
+
+@agno_tool(stop_after_tool_call=True)
+async def request_clarification(question: str, options: list[ClarificationOption]) -> str:
+    """Ask the human a structured question with 2-4 predefined options, for a genuine decision
+    point only the human can resolve -- not something a tool call could look up. Calling this
+    ends the run immediately; do not call any other tool or write anything else in this turn.
+
+    Args:
+        question: The question to ask. Must end with a question mark.
+        options: 2-4 options, each a short label plus one clarifying sentence.
+    """
+    return "Question presented to the user; the run has ended to wait for their choice."
+
+
+def _extract_clarification_from_tools(result) -> dict | None:
+    """Pull a request_clarification tool call's own arguments off a completed agno run --
+    the primary clarification-extraction path since 2026-08-10 (see the block comment
+    above). `result` is whatever team.arun() returned (or the final stream event, which
+    carries the same `.tools` shape) -- duck-typed via getattr since both TeamRunOutput
+    and streaming's last event expose `.tools: list[ToolExecution]`.
+
+    Validates the same shape _extract_clarification enforces (non-empty question, 2-4
+    options each with a non-empty label) so a malformed call degrades to "no clarification
+    requested" rather than crashing or forwarding garbage -- same fail-safe posture as
+    every other post-run guard in this file. Returns the first valid match if the
+    coordinator somehow called it more than once (should not happen given
+    stop_after_tool_call halts the run on the first call).
+    """
+    tools = getattr(result, "tools", None) or []
+    for t in tools:
+        if getattr(t, "tool_name", None) != "request_clarification":
+            continue
+        args = getattr(t, "tool_args", None) or {}
+        question = args.get("question")
+        options = args.get("options")
+        if not isinstance(question, str) or not question.strip():
+            continue
+        if not isinstance(options, list) or not (2 <= len(options) <= 4):
+            continue
+        cleaned_options = []
+        valid = True
+        for opt in options:
+            if not isinstance(opt, dict):
+                valid = False
+                break
+            label = opt.get("label")
+            if not isinstance(label, str) or not label.strip():
+                valid = False
+                break
+            cleaned_options.append({"label": label, "description": opt.get("description")})
+        if not valid:
+            continue
+        return {"question": question, "options": cleaned_options}
+    return None
 
 
 def _extract_clarification(content: str) -> tuple[str, dict | None]:
@@ -1373,13 +1447,19 @@ def _build_team(
             make_coder(*mcp_list, tool_hooks=tool_hooks),
             make_reviewer(*mcp_list, tool_hooks=tool_hooks),
         ]
+    # request_clarification is always available, regardless of read_only/allowlist scoping --
+    # it's a local tool (not MCP-derived, so name-based allowlisting doesn't apply to it) with
+    # no side effects, safe for every team including read-only ones (planning, parallel-review).
+    coordinator_tools_list = list(_scope_coordinator_tools(coordinator_tools, mcp_list, read_only)) + [
+        request_clarification
+    ]
     return Team(
         name=name,
         description=description,
         mode=mode,
         model=get_model(coordinator_model, config.ollama_host),
         members=members,
-        tools=_scope_coordinator_tools(coordinator_tools, mcp_list, read_only),
+        tools=coordinator_tools_list,
         instructions=instructions,
         show_members_responses=True,
         share_member_interactions=True,
@@ -1573,14 +1653,17 @@ async def run_task_stream(
                     from swarm.sessions import save_handoff_summary
                     handoff = _extract_handoff_summary(task, combined)
                     asyncio.ensure_future(save_handoff_summary(session_id, handoff))
-                # A needs_clarification block, if the coordinator emitted one, was already
-                # streamed to the caller character-by-character as ordinary chunks above —
-                # extracting it here can only strip it from `combined` (the done-sentinel's
-                # content), not un-stream the raw fenced JSON the client already saw scroll
-                # by. Functional end to end (the caller gets a real needs_clarification
-                # payload to act on), but a rougher experience than /run's clean strip.
-                # Improving that needs stream-side lookahead buffering, not attempted here.
-                combined, clarification = _extract_clarification(combined)
+                # Primary path (2026-08-10): a real request_clarification tool call. Unlike
+                # the old fenced-text convention, a caller consuming stream events already
+                # sees this as a structured {"__tool_event__": ...} sentinel mid-stream (see
+                # _stream_event_to_chunk) rather than raw JSON scrolling by as text chunks --
+                # a strictly better streaming experience, not just parity with /run. last_event
+                # carries the same `.tools` shape _extract_clarification_from_tools expects.
+                clarification = _extract_clarification_from_tools(last_event)
+                if clarification is None:
+                    combined, clarification = _extract_clarification(combined)
+                else:
+                    combined = ""
                 yield {"__done__": True, "content": combined, "tokens": tokens, "clarification": clarification}
             except Exception as exc:
                 task_counter.add(1, {"project_id": project_id, "outcome": "failure"})
@@ -1766,7 +1849,16 @@ async def run_task_async(
                 # guards below, and short-circuits past both when found: those guards
                 # validate a completed factual answer, and a clarification block is
                 # neither — it's a pending question, not a claim to fact-check.
-                content, clarification = _extract_clarification(content)
+                # Primary path: a real request_clarification tool call (2026-08-10) --
+                # see _extract_clarification_from_tools' docstring for why this replaced
+                # the original text-convention approach as the default. Falls back to
+                # the original fenced-block regex only if no tool call is found, for the
+                # rare case the model reverts to that old habit instead of calling the tool.
+                clarification = _extract_clarification_from_tools(result)
+                if clarification is None:
+                    content, clarification = _extract_clarification(content)
+                else:
+                    content = ""
                 if clarification is not None:
                     tokens = _extract_tokens(result)
                     span.set_status(trace.StatusCode.OK)
