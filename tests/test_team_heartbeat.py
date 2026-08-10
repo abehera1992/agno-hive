@@ -65,3 +65,56 @@ async def test_heartbeat_never_prints_before_the_first_interval_elapses(capsys):
 
     out = capsys.readouterr().out
     assert out == ""
+
+
+# ── stream_event_count (2026-08-10): distinguishes "no events arriving from ────
+# team.arun(stream=True) at all" from "events arriving but the classifier isn't
+# recognizing them" -- a live 17-minute run with confirmed ongoing generation
+# produced zero content/tool-event log lines, and there was no way to tell
+# which of those two, very differently-fixed, problems it was.
+
+@pytest.mark.asyncio
+async def test_heartbeat_reports_the_stream_event_count_when_present(capsys):
+    activity = {"last_call_name": None, "last_call_at": time.monotonic(), "stream_event_count": 42}
+    task = asyncio.create_task(_run_heartbeat(activity, time.monotonic(), interval=0.05))
+    await asyncio.sleep(0.12)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    out = capsys.readouterr().out
+    assert "42 stream events received so far" in out
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_reflects_a_live_updated_event_count(capsys):
+    """The heartbeat reads activity fresh each tick, so a caller mutating the
+    same dict (as run_task_async's stream loop does) sees each new count."""
+    activity = {"last_call_name": None, "last_call_at": time.monotonic(), "stream_event_count": 0}
+    task = asyncio.create_task(_run_heartbeat(activity, time.monotonic(), interval=0.05))
+    await asyncio.sleep(0.06)
+    activity["stream_event_count"] = 7
+    await asyncio.sleep(0.06)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    out = capsys.readouterr().out
+    assert "0 stream events received so far" in out
+    assert "7 stream events received so far" in out
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_omits_event_count_when_key_absent(capsys):
+    """Backward compat: an activity dict without stream_event_count (e.g. an
+    older test, or any future caller that doesn't track it) must not crash
+    and must not print a stray "None stream events" line."""
+    activity = {"last_call_name": None, "last_call_at": time.monotonic()}
+    task = asyncio.create_task(_run_heartbeat(activity, time.monotonic(), interval=0.05))
+    await asyncio.sleep(0.12)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    out = capsys.readouterr().out
+    assert "stream events" not in out

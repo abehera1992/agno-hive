@@ -1718,16 +1718,30 @@ async def _run_heartbeat(activity: dict, run_started: float, interval: float = 3
     instead of indistinguishable silence. Diagnostic only: never cancels or
     times out the run itself. The caller creates this as a background task
     alongside team.arun() and cancels it once that call returns; the
-    CancelledError this raises inside asyncio.sleep is expected there."""
+    CancelledError this raises inside asyncio.sleep is expected there.
+
+    `activity["stream_event_count"]` (2026-08-10, optional -- .get() with a
+    None default so a caller that never sets it, e.g. an older/other test,
+    doesn't crash) answers a question the tool-call timing alone can't: a
+    live 17-minute run showed real, ongoing vLLM generation throughput the
+    whole time but produced ZERO content-preview or tool-event log lines --
+    with no event count, there was no way to tell "the stream is delivering
+    events run_task_async's classifier just isn't recognizing" apart from
+    "no events are arriving from team.arun(stream=True) at all," two very
+    different problems needing different fixes. A count that keeps climbing
+    each heartbeat means the former; one stuck at the same number means the
+    latter."""
     while True:
         await asyncio.sleep(interval)
         now = time.monotonic()
         since_last_tool = now - activity["last_call_at"]
         last_name = activity["last_call_name"] or "(none yet)"
+        event_count = activity.get("stream_event_count")
+        event_count_str = f", {event_count} stream events received so far" if event_count is not None else ""
         print(
             f"[team] heartbeat: {now - run_started:.0f}s since task start, "
-            f"{since_last_tool:.0f}s since last tool call (last: {last_name}), "
-            "coordinator still running",
+            f"{since_last_tool:.0f}s since last tool call (last: {last_name})"
+            f"{event_count_str}, coordinator still running",
             flush=True,
         )
 
@@ -1844,7 +1858,7 @@ async def run_task_async(
         # the heartbeat still fires even during a stretch with zero stream events of any
         # kind, which the content logging alone would not catch. See
         # _make_tool_interception_hook's docstring for the hook itself.
-        activity = {"last_call_name": None, "last_call_at": time.monotonic()}
+        activity = {"last_call_name": None, "last_call_at": time.monotonic(), "stream_event_count": 0}
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
             read_only=read_only, skill_catalog=skill_catalog, activity=activity,
@@ -1882,6 +1896,7 @@ async def run_task_async(
                         seen_unrecognized_event_types: set[str] = set()
                         async for event in team.arun(task, stream=True):
                             last_event = event
+                            activity["stream_event_count"] += 1
                             out = _stream_event_to_chunk(event)
                             if isinstance(out, str):
                                 full_content.append(out)
