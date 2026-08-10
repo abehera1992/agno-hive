@@ -1460,6 +1460,7 @@ def _build_team(
         model=get_model(
             coordinator_model, config.ollama_host,
             temperature=config.coordinator_temperature, max_tokens=config.coordinator_max_tokens,
+            frequency_penalty=config.coordinator_frequency_penalty,
         ),
         members=members,
         tools=coordinator_tools_list,

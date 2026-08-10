@@ -132,6 +132,22 @@ class Config:
     # scoping rationale as coordinator_temperature above -- member agents (Coder
     # especially) can legitimately need longer completions for large diffs.
     coordinator_max_tokens: int = int(os.getenv("COORDINATOR_MAX_TOKENS", "4096"))
+    # Repetition penalty on the coordinator's completions -- unset anywhere else in this
+    # stack (agno's OpenAIChat.frequency_penalty defaults to None -- omitted from the
+    # request). Confirmed live 2026-08-10 with real content visibility (not inferred):
+    # the coordinator decided on an approach, announced "Let me implement this change
+    # now", then never called apply_diff -- it kept re-generating the same three-step
+    # plan ("I'll implement the caching by: 1. Importing the AICache class... 2.
+    # Creating a cache instance... 3. Adding cache lookup...") verbatim across multiple
+    # content chunks, a genuine repetition loop, until coordinator_max_tokens cut it off.
+    # max_tokens only bounds the blast radius of that loop (chops it into repeated
+    # capped segments); it does nothing to stop the model wanting to repeat itself in
+    # the first place. frequency_penalty penalizes a token proportionally to how many
+    # times it has already appeared in this response -- the standard, targeted lever for
+    # exactly this failure mode, unlike temperature (general randomness, not specifically
+    # repetition). 0.4 is a moderate starting value. Coordinator only, same scoping
+    # rationale as coordinator_temperature/coordinator_max_tokens above.
+    coordinator_frequency_penalty: float = float(os.getenv("COORDINATOR_FREQUENCY_PENALTY", "0.4"))
 
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))

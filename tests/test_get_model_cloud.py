@@ -213,3 +213,51 @@ async def test_temperature_and_max_tokens_both_pass_through_together(monkeypatch
 
     assert model.temperature == 0.2
     assert model.max_tokens == 4096
+
+
+# ── frequency_penalty (2026-08-10): repetition penalty on the coordinator, to ────
+# discourage the exact failure mode confirmed live that day -- the model deciding
+# on a plan and then re-generating it verbatim instead of calling a tool. See
+# config.py's coordinator_frequency_penalty docstring for the live evidence.
+
+async def test_frequency_penalty_defaults_to_none_when_not_passed(monkeypatch):
+    """Same backward-compat guarantee as temperature/max_tokens -- member agents
+    don't pass frequency_penalty and must see the exact previous behavior."""
+    monkeypatch.setattr(config, "inference_backend", "vllm")
+    monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
+
+    model = get_model("qwen2.5-coder:32b", "http://ollama-host")
+
+    assert model.frequency_penalty is None
+
+
+async def test_frequency_penalty_is_passed_through_on_vllm_backend(monkeypatch):
+    monkeypatch.setattr(config, "inference_backend", "vllm")
+    monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
+
+    model = get_model("qwen2.5-coder:32b", "http://ollama-host", frequency_penalty=0.4)
+
+    assert model.frequency_penalty == 0.4
+
+
+async def test_frequency_penalty_is_passed_through_on_cloud_route(monkeypatch):
+    monkeypatch.setattr(config, "allow_cloud_models", True)
+    monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
+
+    model = get_model("claude-sonnet-cloud", "http://ollama-host", frequency_penalty=0.4)
+
+    assert model.frequency_penalty == 0.4
+
+
+async def test_temperature_max_tokens_and_frequency_penalty_all_pass_through_together(monkeypatch):
+    monkeypatch.setattr(config, "inference_backend", "vllm")
+    monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
+
+    model = get_model(
+        "qwen2.5-coder:32b", "http://ollama-host",
+        temperature=0.2, max_tokens=4096, frequency_penalty=0.4,
+    )
+
+    assert model.temperature == 0.2
+    assert model.max_tokens == 4096
+    assert model.frequency_penalty == 0.4

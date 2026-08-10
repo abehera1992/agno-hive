@@ -5,18 +5,23 @@ from config.config import config
 from swarm import model_routing
 
 
-def get_model(model_id: str, host: str, temperature: float | None = None, max_tokens: int | None = None):
+def get_model(
+    model_id: str, host: str,
+    temperature: float | None = None, max_tokens: int | None = None,
+    frequency_penalty: float | None = None,
+):
     """Build the model object for an agent, honoring INFERENCE_BACKEND.
 
-    `temperature` and `max_tokens` (default None = previous behaviour, i.e. omitted
-    from the request -- the OpenAI-API-spec default of temperature=1.0 applies, and
-    vLLM lets a completion run up to its own context-length ceiling with no client-
-    side cap) are only wired into the OpenAILike/vLLM and cloud paths below -- agno's
-    Ollama model class takes sampling params via a nested `options` dict rather than
-    top-level fields, a different enough shape that it's out of scope here while
-    Ollama is a fallback backend, not the production path (see CLAUDE.md: ZGX runs
-    vLLM+LiteLLM). Callers that want either pinned must pass it explicitly per call;
-    the defaults stay unset so every other caller of get_model() is unaffected.
+    `temperature`, `max_tokens`, and `frequency_penalty` (default None = previous
+    behaviour, i.e. omitted from the request -- the OpenAI-API-spec default of
+    temperature=1.0 applies, vLLM lets a completion run up to its own context-length
+    ceiling with no client-side cap, and no repetition penalty is applied) are only
+    wired into the OpenAILike/vLLM and cloud paths below -- agno's Ollama model class
+    takes sampling params via a nested `options` dict rather than top-level fields, a
+    different enough shape that it's out of scope here while Ollama is a fallback
+    backend, not the production path (see CLAUDE.md: ZGX runs vLLM+LiteLLM). Callers
+    that want any of these pinned must pass it explicitly per call; the defaults stay
+    unset so every other caller of get_model() is unaffected.
 
     Routing lives in a DB-backed registry (AGNOHive 2.3.2 addendum, 2026-08-08),
     NOT hardcoded here — swarm/model_routing.py's in-process cache (populated from
@@ -66,7 +71,7 @@ def get_model(model_id: str, host: str, temperature: float | None = None, max_to
         from agno.models.openai.like import OpenAILike
         return OpenAILike(
             id=model_id, base_url=config.vllm_gateway_url, api_key="EMPTY",
-            temperature=temperature, max_tokens=max_tokens,
+            temperature=temperature, max_tokens=max_tokens, frequency_penalty=frequency_penalty,
         )
 
     if config.inference_backend == "vllm":
@@ -74,7 +79,7 @@ def get_model(model_id: str, host: str, temperature: float | None = None, max_to
         served = route.vllm_served_as or model_id.replace(":", "-")
         return OpenAILike(
             id=served, base_url=config.vllm_gateway_url, api_key="EMPTY",
-            temperature=temperature, max_tokens=max_tokens,
+            temperature=temperature, max_tokens=max_tokens, frequency_penalty=frequency_penalty,
         )
     return OllamaToolFix(id=model_id, host=host)
 
