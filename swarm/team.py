@@ -1457,7 +1457,10 @@ def _build_team(
         name=name,
         description=description,
         mode=mode,
-        model=get_model(coordinator_model, config.ollama_host, temperature=config.coordinator_temperature),
+        model=get_model(
+            coordinator_model, config.ollama_host,
+            temperature=config.coordinator_temperature, max_tokens=config.coordinator_max_tokens,
+        ),
         members=members,
         tools=coordinator_tools_list,
         instructions=instructions,

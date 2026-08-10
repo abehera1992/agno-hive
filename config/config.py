@@ -117,6 +117,21 @@ class Config:
     # Researcher/Coder plausibly benefit from more sampling variance; this is scoped to
     # the coordinator's own decision-making role specifically.
     coordinator_temperature: float = float(os.getenv("COORDINATOR_TEMPERATURE", "0.2"))
+    # Output-length cap on the coordinator's own completions -- unset anywhere else in
+    # this stack (agno's OpenAIChat.max_tokens defaults to None, meaning omitted from
+    # the request, so vLLM lets the model generate up to its own context-length ceiling
+    # with NO client-side bound). py-spy'd a live 30+ minute run 2026-08-10: the process
+    # was genuinely idle in the asyncio event loop the whole time -- not a code bug, not
+    # a retry loop, just waiting on network I/O for vLLM to keep sending tokens, while
+    # vLLM's own logs showed continuous non-zero generation throughput and a growing GPU
+    # KV cache the entire time. The standard explanation for that exact signature is an
+    # unbounded single completion (most commonly a repetition loop that never emits a
+    # stop token) with nothing to cap it. 4096 is generous for a coordinator answer or
+    # tool call (a normal full-pipeline answer that same day used ~946 output tokens)
+    # but bounds worst case to a few minutes instead of tens. Coordinator only, same
+    # scoping rationale as coordinator_temperature above -- member agents (Coder
+    # especially) can legitimately need longer completions for large diffs.
+    coordinator_max_tokens: int = int(os.getenv("COORDINATOR_MAX_TOKENS", "4096"))
 
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))
