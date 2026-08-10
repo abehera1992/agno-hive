@@ -1650,6 +1650,7 @@ async def run_task_stream(
 
         full_content: list[str] = []
         last_event = None
+        last_metrics_event = None
 
         with _tracer.start_as_current_span("agno.task.stream", attributes={
             "project_id": project_id,
@@ -1662,6 +1663,14 @@ async def run_task_stream(
             try:
                 async for event in team.arun(task, stream=True):
                     last_event = event
+                    # 2026-08-10: the final event in the stream isn't reliably the
+                    # metrics-bearing completion event (a live /run test came back with
+                    # input_tokens/output_tokens/total_tokens all 0) -- tracked separately
+                    # so token extraction below uses whichever event actually carried
+                    # populated metrics, not whatever happened to be last. See
+                    # run_task_async's identical fix for the full explanation.
+                    if getattr(event, "metrics", None) is not None:
+                        last_metrics_event = event
                     out = _stream_event_to_chunk(event)
                     if isinstance(out, str):
                         full_content.append(out)
@@ -1675,7 +1684,7 @@ async def run_task_stream(
                     combined = await _fill_count_markers(combined, all_mcp_urls[0] if all_mcp_urls else None)
                 except Exception as exc:
                     print(f"[team] count-marker guard warning: {exc}")
-                tokens = _extract_tokens(last_event)
+                tokens = _extract_tokens(last_metrics_event or last_event)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
                 # Fire-and-forget: don't block the response on post-run experience indexing.
                 record_success_bg(task, combined, project_id)
@@ -1879,6 +1888,16 @@ async def run_task_async(
                     heartbeat_task = asyncio.create_task(_run_heartbeat(activity, time.monotonic()))
                     full_content: list[str] = []
                     last_event = None
+                    # 2026-08-10: a live groundedness test came back with input_tokens/
+                    # output_tokens/total_tokens all 0 despite a genuinely long, real run --
+                    # the final event in team.arun(stream=True) isn't reliably the
+                    # metrics-bearing completion event (RunCompletedEvent/TeamRunCompleted),
+                    # so blindly trusting `last_event` for _extract_tokens() silently returned
+                    # zeros whenever something else came after it in the stream. Tracked
+                    # separately: whichever event actually carried populated .metrics, kept
+                    # updated across the whole loop (not just the first one seen), since a
+                    # long run can have more than one).
+                    last_metrics_event = None
                     last_logged_len = 0
                     last_logged_at = time.monotonic()
                     try:
@@ -1896,6 +1915,8 @@ async def run_task_async(
                         unrecognized_event_counts: dict[str, int] = {}
                         async for event in team.arun(task, stream=True):
                             last_event = event
+                            if getattr(event, "metrics", None) is not None:
+                                last_metrics_event = event
                             activity["stream_event_count"] += 1
                             out = _stream_event_to_chunk(event)
                             if isinstance(out, str):
@@ -1957,7 +1978,7 @@ async def run_task_async(
                 else:
                     content = ""
                 if clarification is not None:
-                    tokens = _extract_tokens(last_event)
+                    tokens = _extract_tokens(last_metrics_event or last_event)
                     span.set_status(trace.StatusCode.OK)
                     task_counter.add(1, {"project_id": project_id, "outcome": "clarification"})
                     return content, tokens, clarification
@@ -1975,7 +1996,7 @@ async def run_task_async(
                         last_event)
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
-                tokens = _extract_tokens(last_event)
+                tokens = _extract_tokens(last_metrics_event or last_event)
                 span.set_status(trace.StatusCode.OK)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
                 # Fire-and-forget: don't block the response on post-run experience indexing.
