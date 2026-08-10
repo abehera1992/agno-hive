@@ -105,6 +105,18 @@ class Config:
     # its own iterations, because tool_call_limit was never set on any Agent/Team
     # construction in this codebase (agno's own default is None -- unbounded).
     tool_call_limit: int = int(os.getenv("TOOL_CALL_LIMIT", "25"))
+    # The coordinator's model temperature -- unset anywhere else in this stack (agno's
+    # OpenAIChat.temperature defaults to None, meaning omitted from the request entirely,
+    # so vLLM/LiteLLM fall back to the OpenAI API spec default of 1.0). Confirmed live
+    # 2026-08-10: the SAME task produced wildly different coordinator behavior across
+    # back-to-back runs -- ask immediately (3.89s), full research then a prose question
+    # instead of the clarification tool (140s), and a run that wandered into unrelated
+    # files then generated for 18+ minutes without resolving. A low, pinned temperature
+    # targets exactly this run-to-run inconsistency in which path the coordinator takes.
+    # Applied only to the coordinator (swarm/team.py's _build_team), not member agents --
+    # Researcher/Coder plausibly benefit from more sampling variance; this is scoped to
+    # the coordinator's own decision-making role specifically.
+    coordinator_temperature: float = float(os.getenv("COORDINATOR_TEMPERATURE", "0.2"))
 
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))

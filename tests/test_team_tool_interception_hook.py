@@ -114,6 +114,45 @@ async def test_hook_prints_an_aborted_trace_line(capsys):
     assert "ABORTED" in out
 
 
+# ── _build_team wiring: coordinator_temperature reaches the coordinator's model ────
+# (2026-08-10) -- only the coordinator, never member agents; see config.py's
+# coordinator_temperature docstring for why this is scoped that narrowly.
+
+def test_build_team_passes_coordinator_temperature_to_the_coordinator_model(monkeypatch):
+    monkeypatch.setattr("swarm.team.config.inference_backend", "vllm")
+    monkeypatch.setattr("swarm.team.config.vllm_gateway_url", "http://litellm-host:4000/v1")
+    monkeypatch.setattr("swarm.team.config.coordinator_temperature", 0.3)
+
+    result = _build_team(
+        agent_specs=None,
+        coordinator_model="qwen2.5-coder:32b",
+        coordinator_tools=None,
+        mode="coordinate",
+        mcp_list=[],
+        instructions=[],
+    )
+
+    assert result.model.temperature == 0.3
+
+
+def test_build_team_does_not_apply_coordinator_temperature_to_member_agents(monkeypatch):
+    monkeypatch.setattr("swarm.team.config.inference_backend", "vllm")
+    monkeypatch.setattr("swarm.team.config.vllm_gateway_url", "http://litellm-host:4000/v1")
+    monkeypatch.setattr("swarm.team.config.coordinator_temperature", 0.3)
+
+    result = _build_team(
+        agent_specs=None,
+        coordinator_model="qwen2.5-coder:32b",
+        coordinator_tools=None,
+        mode="coordinate",
+        mcp_list=[],
+        instructions=[],
+    )
+
+    for member in result.members:
+        assert member.model.temperature is None
+
+
 # ── _build_team wiring: interception hook shared across coordinator AND every member ──
 
 def test_build_team_registers_the_interception_hook_alongside_the_cache_hook(monkeypatch):

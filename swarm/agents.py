@@ -5,8 +5,17 @@ from config.config import config
 from swarm import model_routing
 
 
-def get_model(model_id: str, host: str):
+def get_model(model_id: str, host: str, temperature: float | None = None):
     """Build the model object for an agent, honoring INFERENCE_BACKEND.
+
+    `temperature` (default None = previous behaviour, i.e. omitted from the request,
+    which means the OpenAI-API-spec default of 1.0 applies) is only wired into the
+    OpenAILike/vLLM and cloud paths below -- agno's Ollama model class takes sampling
+    params via a nested `options` dict rather than a top-level `temperature` field, a
+    different enough shape that it's out of scope here while Ollama is a fallback
+    backend, not the production path (see CLAUDE.md: ZGX runs vLLM+LiteLLM). Callers
+    that want a pinned temperature must pass it explicitly per call; the default stays
+    unset so every other caller of get_model() is unaffected.
 
     Routing lives in a DB-backed registry (AGNOHive 2.3.2 addendum, 2026-08-08),
     NOT hardcoded here — swarm/model_routing.py's in-process cache (populated from
@@ -54,12 +63,12 @@ def get_model(model_id: str, host: str):
 
     if route.kind == "cloud":
         from agno.models.openai.like import OpenAILike
-        return OpenAILike(id=model_id, base_url=config.vllm_gateway_url, api_key="EMPTY")
+        return OpenAILike(id=model_id, base_url=config.vllm_gateway_url, api_key="EMPTY", temperature=temperature)
 
     if config.inference_backend == "vllm":
         from agno.models.openai.like import OpenAILike
         served = route.vllm_served_as or model_id.replace(":", "-")
-        return OpenAILike(id=served, base_url=config.vllm_gateway_url, api_key="EMPTY")
+        return OpenAILike(id=served, base_url=config.vllm_gateway_url, api_key="EMPTY", temperature=temperature)
     return OllamaToolFix(id=model_id, host=host)
 
 

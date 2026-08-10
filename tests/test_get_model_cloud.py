@@ -136,3 +136,37 @@ async def test_ollama_backend_returns_ollama_tool_fix(monkeypatch):
 
     assert type(model).__name__ == "OllamaToolFix"
     assert model.id == "qwen2.5-coder:32b"
+
+
+# ── temperature (2026-08-10): pinned on the coordinator to reduce run-to-run ────
+# inconsistency in which decision path it takes -- see config.py's
+# coordinator_temperature docstring for the live evidence motivating this.
+
+async def test_temperature_defaults_to_none_when_not_passed(monkeypatch):
+    """Every existing caller of get_model() that doesn't pass temperature must be
+    completely unaffected -- this is the backward-compat guarantee for member
+    agents (make_coder, make_researcher, etc.), which intentionally do NOT pass it."""
+    monkeypatch.setattr(config, "inference_backend", "vllm")
+    monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
+
+    model = get_model("qwen2.5-coder:32b", "http://ollama-host")
+
+    assert model.temperature is None
+
+
+async def test_temperature_is_passed_through_on_vllm_backend(monkeypatch):
+    monkeypatch.setattr(config, "inference_backend", "vllm")
+    monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
+
+    model = get_model("qwen2.5-coder:32b", "http://ollama-host", temperature=0.2)
+
+    assert model.temperature == 0.2
+
+
+async def test_temperature_is_passed_through_on_cloud_route(monkeypatch):
+    monkeypatch.setattr(config, "allow_cloud_models", True)
+    monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
+
+    model = get_model("claude-sonnet-cloud", "http://ollama-host", temperature=0.2)
+
+    assert model.temperature == 0.2
