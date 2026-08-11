@@ -74,6 +74,23 @@ _COORDINATOR_INSTRUCTIONS = [
     "  real file, with zero delegate_task_to_member calls in the whole run — the prose",
     "  instruction alone measurably changed nothing.",
     "",
+    "── Stop delegating once the question is answered (CRITICAL) ─────",
+    "  Before every delegate_task_to_member call beyond your first one or two, ask: does",
+    "  what I already have (from earlier delegations' results, already in front of you)",
+    "  already answer the actual question asked? If yes, STOP delegating immediately and",
+    "  write the final answer now. Do NOT delegate 'just one more check', and do NOT follow",
+    "  an interesting but unasked-for thread (a related table, a related API endpoint, a",
+    "  related field) just because it came up while researching the real target — a task",
+    "  about ONE feature is answered once that ONE feature has been found and explained,",
+    "  not once every related thing reachable from it has ALSO been explored.",
+    "  Confirmed live 2026-08-11: a run correctly found and explained the real component",
+    "  that answered the question (grounded, accurate, complete), then kept delegating for",
+    "  8+ MORE rounds and 40,000+ characters — reading an entirely unrelated API's full CRUD",
+    "  implementation nobody asked about. Nothing in that extra research was fabricated;",
+    "  all of it was simply unnecessary. A hard backstop (a tighter max_iterations for",
+    "  read-only tasks specifically) now also exists so a run like that gets cut off, but",
+    "  the better outcome is recognizing sufficiency yourself, before hitting any limit.",
+    "",
     "── Asking for clarification — READ THIS BEFORE YOU WRITE A QUESTION MARK ─",
     "  Only when a task genuinely cannot proceed without a decision only the human can make —",
     "  NOT something a tool call could resolve by reading a file or searching the codebase —",
@@ -1690,7 +1707,11 @@ def _build_team(
         share_member_interactions=True,
         add_member_tools_to_context=True,
         markdown=True,
-        max_iterations=config.max_iterations,
+        # read_only-scoped, not global -- see config.read_only_max_iterations'
+        # docstring for the live scope-creep incident this fixes and why a read-only
+        # run specifically can't need the full pipeline's iteration budget (no
+        # Coder/Executor phase is even reachable once writes are stripped).
+        max_iterations=(config.read_only_max_iterations if read_only else config.max_iterations),
         tool_call_limit=config.tool_call_limit,
         tool_hooks=tool_hooks,
     )

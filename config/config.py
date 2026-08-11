@@ -105,6 +105,24 @@ class Config:
     # its own iterations, because tool_call_limit was never set on any Agent/Team
     # construction in this codebase (agno's own default is None -- unbounded).
     tool_call_limit: int = int(os.getenv("TOOL_CALL_LIMIT", "25"))
+    # A tighter max_iterations ceiling applied ONLY to read_only requests (see
+    # _build_team's read_only-conditional wiring). Confirmed live 2026-08-11: a
+    # read-only research task reached a fully correct, complete answer by roughly its
+    # 6th delegate_task_to_member round, then kept delegating for 8+ MORE rounds and
+    # 40,000+ characters -- reading an entirely unrelated API's full CRUD
+    # implementation nobody asked about. Grounded the whole time (no fabrication),
+    # just no sense of "the question is answered, stop." The default max_iterations=25
+    # never came close to catching this -- generous enough for a full write pipeline
+    # (Coordinator -> ContextRouter -> Researcher -> Planner -> Coder -> Executor ->
+    # Reviewer, each a real delegation round) but far too loose for a read-only task,
+    # which structurally can't need that many rounds: writes are stripped from every
+    # agent's tool surface for a read_only run, so there is no Coder/Executor
+    # implementation phase to budget rounds for in the first place. 10 is a judgment
+    # call based on this one observed timeline (room for one self-correction round
+    # past the ~6 it took to reach correctness here), not an exhaustively tuned
+    # number -- revisit if it turns out too tight for a legitimately harder research
+    # question.
+    read_only_max_iterations: int = int(os.getenv("READ_ONLY_MAX_ITERATIONS", "10"))
     # The coordinator's model temperature -- unset anywhere else in this stack (agno's
     # OpenAIChat.temperature defaults to None, meaning omitted from the request entirely,
     # so vLLM/LiteLLM fall back to the OpenAI API spec default of 1.0). Confirmed live

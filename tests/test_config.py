@@ -62,3 +62,24 @@ def test_tool_call_limit_from_env(monkeypatch):
     mod = _reload_config()
     cfg = mod.Config()
     assert cfg.tool_call_limit == 40
+
+
+def test_read_only_max_iterations_default():
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.read_only_max_iterations == 10
+
+
+def test_read_only_max_iterations_from_env(monkeypatch):
+    monkeypatch.setenv("READ_ONLY_MAX_ITERATIONS", "6")
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.read_only_max_iterations == 6
+
+
+def test_read_only_max_iterations_is_tighter_than_the_default_max_iterations():
+    """The whole point of this value: it must be meaningfully lower than the
+    default max_iterations, or scoping it to read_only requests achieves nothing."""
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.read_only_max_iterations < cfg.max_iterations
