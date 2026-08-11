@@ -253,8 +253,13 @@ def test_build_team_registers_the_interception_hook_alongside_the_cache_hook(mon
     )
 
     assert len(result.tool_hooks) == 2
-    # second hook is the interception hook -- an async closure named accordingly
-    assert result.tool_hooks[1].__name__ == "_tool_interception_hook"
+    # interception hook is listed FIRST (2026-08-11: order changed deliberately so it
+    # is the OUTERMOST wrapper -- agno reduces hooks from the innermost outward, so
+    # hooks[0] wraps everything else. This makes it always run and always log, even
+    # when read_cache_hook returns early on a cache hit or duplicate-read stub. See
+    # _build_team's own comment at the tool_hooks assignment for the live incident
+    # this fixes -- test_team_read_cache_hook.py has the fuller regression test).
+    assert result.tool_hooks[0].__name__ == "_tool_interception_hook"
 
 
 def test_build_team_shares_the_same_interception_hook_instance_with_fallback_members(monkeypatch):
@@ -269,9 +274,9 @@ def test_build_team_shares_the_same_interception_hook_instance_with_fallback_mem
         instructions=[],
     )
 
-    interception_hook = result.tool_hooks[1]
+    interception_hook = result.tool_hooks[0]
     for member in result.members:
-        assert member.tool_hooks[1] is interception_hook
+        assert member.tool_hooks[0] is interception_hook
 
 
 # ── _make_tool_interception_hook: shared activity tracker (wander-then-go-quiet diagnostics) ──
@@ -338,8 +343,8 @@ def test_build_team_shares_the_same_interception_hook_instance_with_spec_based_m
         instructions=[],
     )
 
-    interception_hook = result.tool_hooks[1]
-    assert result.members[0].tool_hooks[1] is interception_hook
+    interception_hook = result.tool_hooks[0]
+    assert result.members[0].tool_hooks[0] is interception_hook
 
 
 # ── _build_team wiring: coordinator_no_direct_writes (2026-08-10 experiment) ───────

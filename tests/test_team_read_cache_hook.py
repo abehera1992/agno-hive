@@ -153,6 +153,139 @@ def test_cacheable_read_tools_excludes_every_mutating_tool():
     assert _CACHEABLE_READ_TOOLS.isdisjoint(_MUTATING_TOOLS)
 
 
+# ── per-agent duplicate-serve stubbing (2026-08-11) ─────────────────────────────
+# Confirmed live: the network-only cache above was not enough on its own -- a
+# Researcher cycled the SAME 4 files for 4+ minutes, each re-serve appending another
+# full copy into its own context (a self-reinforcing bloat spiral, not just wasted
+# hive-mcp round-trips). Serves 1-2 of an identical (agent, tool, args) triple still
+# get the real content; serve 3+ gets a short stub instead.
+
+class _FakeAgent:
+    def __init__(self, name):
+        self.name = name
+
+
+@pytest.mark.asyncio
+async def test_third_identical_call_from_the_same_agent_gets_a_stub_not_real_content():
+    hook = _make_read_cache_tool_hook()
+    calls = []
+
+    async def fake_get_file_content(**kwargs):
+        calls.append(kwargs)
+        return "x" * 500  # stand-in for a real ~500-char file
+
+    researcher = _FakeAgent("Researcher")
+    first = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+    second = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+    third = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+
+    assert first == "x" * 500
+    assert second == "x" * 500  # still real content -- serve 2 is within budget
+    assert third != "x" * 500  # serve 3 is over budget -- stubbed
+    assert "x" * 500 not in third  # the stub must not leak the real content either
+    assert len(calls) == 1  # the underlying tool was only ever actually called once
+
+
+@pytest.mark.asyncio
+async def test_duplicate_read_stub_names_the_tool_and_repeat_count():
+    hook = _make_read_cache_tool_hook()
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    researcher = _FakeAgent("Researcher")
+    for _ in range(2):
+        await hook("get_file_content", fake_get_file_content, {"relative_path": "models.py"}, agent=researcher)
+    stub = await hook("get_file_content", fake_get_file_content, {"relative_path": "models.py"}, agent=researcher)
+
+    assert "get_file_content" in stub
+    assert "models.py" in stub
+    assert "Researcher" in stub
+    assert "do not call this again" in stub.lower()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_read_stub_escalates_wording_from_the_fifth_serve():
+    hook = _make_read_cache_tool_hook()
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    researcher = _FakeAgent("Researcher")
+    stubs = []
+    for _ in range(6):
+        stubs.append(
+            await hook("get_file_content", fake_get_file_content, {"relative_path": "models.py"}, agent=researcher)
+        )
+
+    # Serves 1-2 are real content ("file body"); 3-4 are the moderate stub;
+    # 5-6 are the escalated stub.
+    assert stubs[0] == "file body"
+    assert stubs[1] == "file body"
+    assert "STOP calling" not in stubs[2]
+    assert "STOP calling" not in stubs[3]
+    assert "STOP calling" in stubs[4]
+    assert "STOP calling" in stubs[5]
+
+
+@pytest.mark.asyncio
+async def test_different_agents_each_get_their_own_full_serve_budget():
+    """Per-agent counting, not global: the Coder's first read of a file the
+    Researcher already read repeatedly must still return real content -- only a
+    SINGLE agent repeating the SAME call gets stubbed."""
+    hook = _make_read_cache_tool_hook()
+    calls = []
+
+    async def fake_get_file_content(**kwargs):
+        calls.append(kwargs)
+        return "shared file content"
+
+    researcher = _FakeAgent("Researcher")
+    coder = _FakeAgent("Coder")
+
+    for _ in range(4):
+        await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+    coder_first_read = await hook(
+        "get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=coder
+    )
+
+    assert coder_first_read == "shared file content"  # Coder's own budget is untouched
+    assert len(calls) == 1  # still only one real underlying fetch -- the network cache is shared
+
+
+@pytest.mark.asyncio
+async def test_coordinators_own_direct_calls_are_tracked_and_stubbed_too():
+    """agent=None (agno's own convention for the coordinator's direct, undelegated
+    tool calls) must resolve to a stable agent_key and be subject to the same
+    duplicate-serve budget as any named member."""
+    hook = _make_read_cache_tool_hook()
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    for _ in range(2):
+        await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=None)
+    stub = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=None)
+
+    assert stub != "file body"
+    assert "the coordinator" in stub
+
+
+@pytest.mark.asyncio
+async def test_hook_still_works_when_agent_parameter_is_omitted_entirely():
+    """agno only passes `agent` when it's a declared parameter name on the hook
+    (confirmed via Function._build_hook_args's signature introspection) -- but a
+    caller that omits it (like this hook's own default) must not crash."""
+    hook = _make_read_cache_tool_hook()
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    result = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"})
+
+    assert result == "file body"
+
+
 # ── _build_team wiring: shared hook across coordinator AND every member ────────
 
 def test_build_team_registers_a_tool_hook_on_the_coordinator(monkeypatch):
@@ -170,6 +303,30 @@ def test_build_team_registers_a_tool_hook_on_the_coordinator(monkeypatch):
     # read-cache hook (Detour fix) + interception hook (Phase 9a) -- both shared
     assert result.tool_hooks is not None
     assert len(result.tool_hooks) == 2
+
+
+def test_interception_hook_is_listed_first_so_it_is_outermost(monkeypatch):
+    """agno makes the FIRST hook in tool_hooks the OUTERMOST wrapper (hooks are
+    reversed and reduced from the innermost outward -- confirmed via
+    agno.tools.function.Function's nested-chain builders). interception_hook must be
+    first so it always runs and always logs, including when read_cache_hook returns
+    early on a cache hit or a duplicate-read stub -- confirmed live 2026-08-11: with
+    the old order a heartbeat reported "194s since last tool call" while cached reads
+    were visibly still streaming, because interception_hook was skipped entirely on
+    every cache hit."""
+    monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
+
+    result = _build_team(
+        agent_specs=None,
+        coordinator_model="qwen2.5-coder:32b",
+        coordinator_tools=None,
+        mode="coordinate",
+        mcp_list=[],
+        instructions=[],
+    )
+
+    assert result.tool_hooks[0].__name__ == "_tool_interception_hook"
+    assert result.tool_hooks[1].__name__ == "_read_cache_tool_hook"
 
 
 def test_build_team_shares_the_same_hook_instance_between_coordinator_and_fallback_members(monkeypatch):

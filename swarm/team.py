@@ -1399,6 +1399,45 @@ _CACHEABLE_READ_TOOLS = {
     "find_files", "list_directory", "list_directory_tree", "count_matches",
 }
 
+# The network-only cache below (skip the hive-mcp round-trip, still hand back the
+# full result every time) was not enough on its own -- confirmed live 2026-08-11: a
+# Researcher cycled the SAME 4 files (774+965-line reads) for 4+ minutes, each
+# re-serve appending another full copy into its own context. That's a self-reinforcing
+# spiral, not just wasted network calls: more context -> the model loses track of
+# what it already has -> it "re-verifies" by reading again -> more context. Serves 1-2
+# of an identical (agent, tool, args) triple still get the real content -- the 2nd
+# tolerated because a second delegate_task_to_member call to the same role may start
+# with fresh context and legitimately need it again. Serve 3+ gets a short stub
+# instead of the real content: this removes the payoff for repeating the call (the
+# model cannot get the content again by asking again) and stops the bloat at its
+# source, rather than hoping an instruction talks the model out of it -- the same
+# tool-surface-over-instruction lesson this module already has on record elsewhere
+# (_strip_mutating's docstring, 2026-07-31; _COORDINATOR_DISCOVERY_TOOLS, 2026-08-11).
+_MAX_FULL_SERVES_PER_AGENT = 2
+# From serve 5 onward the stub escalates to a stronger, more directive wording -- a
+# model that already ignored two stubs for the identical call needs a harder nudge,
+# not the same sentence a third time.
+_STUB_ESCALATION_SERVE = 5
+
+
+def _duplicate_read_stub(function_name: str, args: dict, agent_key: str, serve_count: int, result_len: int) -> str:
+    who = agent_key or "the coordinator"
+    if serve_count < _STUB_ESCALATION_SERVE:
+        return (
+            f"Already returned this exact {function_name}({args}) result to {who} "
+            f"{serve_count - 1} time(s) already this run ({result_len} chars, unchanged). "
+            f"It is already in your context — use it, do not call this again. For a "
+            f"different part of the same file, pass a different offset/limit."
+        )
+    return (
+        f"STOP calling {function_name}({args}) — this is repeat #{serve_count} of the "
+        f"IDENTICAL call for {who} this run, and the result ({result_len} chars) has not "
+        f"changed and will not change. Repeating it again will not give you new "
+        f"information. You already have everything this call can return. If you are "
+        f"stuck, answer with what you have now, or say what you could not determine — "
+        f"do not call this again."
+    )
+
 
 def _make_read_cache_tool_hook():
     """Build a fresh, run-scoped cache for read-only tool calls -- a new dict per
@@ -1418,6 +1457,17 @@ def _make_read_cache_tool_hook():
     reduce this on its own, since it depends on model instruction-following rather
     than a mechanical guarantee.
 
+    Beyond the network-level cache, ALSO tracks how many times each AGENT has been
+    served an identical (tool, args) result -- see _MAX_FULL_SERVES_PER_AGENT's
+    comment above for why this is a second, distinct problem from the network cache
+    (context-bloat spiral, not just redundant hive-mcp round-trips) and
+    _duplicate_read_stub for what a repeat call gets instead of the real content past
+    that budget. Counted PER AGENT, not globally: the underlying `cache` dict is
+    shared (the fetched data is the same regardless of who asks), but the serve-count
+    is keyed by agent name too, so the Coder's first read of a file the Researcher
+    already read five times still gets the real content -- only a SINGLE agent
+    repeating the SAME call gets stubbed.
+
     Must be async and must be registered on EVERY team member, not just the
     coordinator's own Team(...) -- two things confirmed by direct source reading
     and a live check, not assumed:
@@ -1433,20 +1483,40 @@ def _make_read_cache_tool_hook():
          which is where the measured redundant reads actually happen. Confirmed by
          checking ZGX's agno-api.service journal after live test runs that made
          dozens of get_files_batch calls: a coordinator-only hook logged nothing.
+
+    `agent` is only populated by agno when it's literally a parameter name in this
+    hook's signature (confirmed via agno.tools.function.Function._build_hook_args,
+    which introspects the hook's signature before deciding what to pass) -- an Agent
+    object for a delegated member's own call, or None for the coordinator's own
+    direct call (no `team` param needed here to detect that: `getattr(None, "name",
+    None) or ""` already resolves to "", the same "coordinator" sentinel
+    _stream_event_to_chunk's own agent_name convention already uses).
     """
     cache: dict[tuple, object] = {}
+    serve_counts: dict[tuple, int] = {}
 
-    async def _read_cache_tool_hook(function_name, function, args, agent=None, team=None):
+    async def _read_cache_tool_hook(function_name, function, args, agent=None):
         if function_name not in _CACHEABLE_READ_TOOLS:
             return await function(**args)
         try:
-            key = (function_name, json.dumps(args or {}, sort_keys=True))
+            args_key = json.dumps(args or {}, sort_keys=True)
         except TypeError:
             return await function(**args)  # non-JSON-serializable args -- skip caching, call through
-        if key in cache:
-            return cache[key]
-        result = await function(**args)
-        cache[key] = result
+
+        agent_key = getattr(agent, "name", None) or ""
+        cache_key = (function_name, args_key)
+        serve_key = (agent_key, function_name, args_key)
+
+        if cache_key in cache:
+            result = cache[cache_key]
+        else:
+            result = await function(**args)
+            cache[cache_key] = result
+
+        serve_counts[serve_key] = serve_counts.get(serve_key, 0) + 1
+        count = serve_counts[serve_key]
+        if count > _MAX_FULL_SERVES_PER_AGENT:
+            return _duplicate_read_stub(function_name, args, agent_key, count, len(str(result)))
         return result
 
     return _read_cache_tool_hook
@@ -1568,7 +1638,18 @@ def _build_team(
     # this a no-op audit-log pass-through today rather than a live abort switch.
     read_cache_hook = _make_read_cache_tool_hook()
     interception_hook = _make_tool_interception_hook(activity=activity)
-    tool_hooks = [read_cache_hook, interception_hook]
+    # Order matters: agno makes the FIRST hook in this list the OUTERMOST wrapper
+    # (confirmed via agno.tools.function.Function._build_nested_execution_chain /
+    # aexecute's nested-chain builder -- hooks are reversed and reduced from the
+    # innermost outward, so hooks[0] ends up wrapping everything else). With
+    # interception_hook listed first, it always runs and always logs -- including on
+    # a read_cache_hook cache-hit or duplicate-read stub, which otherwise returned
+    # before interception_hook ever ran. Confirmed live 2026-08-11: with the old
+    # [read_cache_hook, interception_hook] order, a heartbeat during a run of
+    # nothing-but-cache-hits reported "194s since last tool call" while reads were
+    # visibly still streaming in -- interception_hook's activity["last_call_at"]
+    # update was simply never reached for those calls.
+    tool_hooks = [interception_hook, read_cache_hook]
     if agent_specs:
         members = [
             make_agent_from_spec(spec, *mcp_list, skill_catalog=skill_catalog, tool_hooks=tool_hooks)
