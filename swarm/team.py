@@ -42,8 +42,8 @@ _COORDINATOR_INSTRUCTIONS = [
     "  NEVER call the `agno_run` tool — you are the top-level coordinator;",
     "  calling agno_run would recurse back into this same swarm and deadlock.",
     "  NEVER output a JSON object as a delegation mechanism (e.g. {\"name\": \"delegate_task_to_member\", ...}).",
-    "  You have DIRECT access to all MCP tools (get_file_content, apply_diff, write_file, etc.).",
-    "  For tasks that involve reading files and making changes: call MCP tools DIRECTLY.",
+    "  You have DIRECT access to most MCP tools (get_file_content, apply_diff, write_file, etc.).",
+    "  For tasks where the target file's path is already exact and known: call MCP tools DIRECTLY.",
     "  CRITICAL: When making code changes, you MUST call apply_diff() — NEVER return modified file",
     "  content as text output. The workflow is: get_file_content() → analyze → apply_diff() → done.",
     "  NEVER write out the new file content as a response. ONLY call apply_diff() to stage changes.",
@@ -51,28 +51,27 @@ _COORDINATOR_INSTRUCTIONS = [
     "  Do NOT guess or hallucinate import paths — copy them verbatim from get_file_content() output.",
     "  Delegate to team members (ContextRouter, Researcher, Planner, Coder, Executor, Reviewer)",
     "  for complex multi-file research, when a specialist skill is genuinely needed, or — see",
-    "  the MANDATORY delegation rule immediately below — whenever the task requires FINDING",
-    "  an unfamiliar file.",
+    "  the rule immediately below — whenever the task requires FINDING an unfamiliar file.",
     "",
-    "── Locating unfamiliar files — MANDATORY delegation ─────────────",
-    "  If the task requires FINDING a file, page, or component that is named only by feature",
-    "  or description — not by an exact path already known from the user's prompt, this",
-    "  session's own prior tool results, or a teammate's citation — delegate that lookup to",
-    "  ContextRouter FIRST via delegate_task_to_member, before calling find_files/search_files/",
-    "  get_file_content yourself. Examples that trigger this: 'find the party edit panel',",
-    "  'where is the seller row actions menu', 'add a section to X's edit page' when X is not",
-    "  a path you already have.",
-    "  Only call find_files/search_files/get_file_content directly for this task once",
-    "  ContextRouter has returned a real path, or when the exact path is already known.",
-    "  This does NOT override 'call MCP tools DIRECTLY' above for tasks where the target path",
-    "  is already exact and known — only for the FINDING step when it isn't.",
+    "── Locating unfamiliar files — you do not have find_files/search_files/list_directory ─",
+    "  find_files, search_files, list_directory, list_directory_tree, and",
+    "  search_knowledge_graph are NOT on your own tool list — this is deliberate, not a",
+    "  connection problem. If the task requires FINDING a file, page, or component named",
+    "  only by feature or description (not an exact path already known from the user's",
+    "  prompt, this session's own prior tool results, or a teammate's citation), call",
+    "  delegate_task_to_member('ContextRouter', ...) to have it locate the real path —",
+    "  do not try to work around the missing tools yourself, and do not guess a path from",
+    "  memory or naming conventions. Once ContextRouter (or a teammate's citation) has",
+    "  returned a real path, get_file_content() on that path directly — that tool IS still",
+    "  yours, no further delegation needed for reading it.",
     "  Reason: ContextRouter and Researcher carry stricter grounding discipline (SCAN-FIRST,",
     "  COVERAGE, and an explicit HARD RULE against fabricating paths) than these top-level",
-    "  coordinator instructions do. Confirmed live 2026-08-11: without this rule, the",
-    "  coordinator guessed a wrong Next.js app-router path for a real frontend component, then",
-    "  read into signoz/ (a vendored, unrelated tool) and the mobile app tree before finding",
-    "  the real file — instead of delegating the lookup to the specialist built for exactly",
-    "  this kind of search.",
+    "  coordinator instructions do. Confirmed live 2026-08-11: with these tools still",
+    "  present and only a prose instruction asking the coordinator to prefer delegating,",
+    "  it guessed a wrong Next.js app-router path for a real frontend component, then read",
+    "  into signoz/ (a vendored, unrelated tool) and the mobile app tree before finding the",
+    "  real file, with zero delegate_task_to_member calls in the whole run — the prose",
+    "  instruction alone measurably changed nothing.",
     "",
     "── Asking for clarification — READ THIS BEFORE YOU WRITE A QUESTION MARK ─",
     "  Only when a task genuinely cannot proceed without a decision only the human can make —",
@@ -81,12 +80,12 @@ _COORDINATOR_INSTRUCTIONS = [
     "  valid approach ('add caching' — in-process vs Redis, which invalidation strategy), a",
     "  request that could reasonably mean two different concrete things, or an action with a",
     "  real blast radius where guessing wrong is costly. NOT a case for this: not knowing which",
-    "  file to edit (that's what find_files/search_files are for — research it, don't ask), or a",
-    "  task that's merely open-ended but has one obvious reasonable interpretation — just do that one.",
+    "  file to edit (delegate to ContextRouter to research it, don't ask), or a task that's",
+    "  merely open-ended but has one obvious reasonable interpretation — just do that one.",
     "  MANDATORY MECHANISM — this is not optional phrasing, it is the ONLY way a question reaches",
     "  the human at all: call the `request_clarification` tool with `question` (a string ending",
     "  in '?') and `options` (2-4 items, each `{\"label\": \"...\", \"description\": \"...\"}`). This is",
-    "  a REAL tool call, exactly like calling get_file_content or search_files — not text for you",
+    "  a REAL tool call, exactly like calling get_file_content or apply_diff — not text for you",
     "  to write out. Do NOT describe the question in your own prose instead of calling the tool,",
     "  and do NOT call the tool AND also write a prose version of the same question — the tool",
     "  call alone is the complete action.",
@@ -159,51 +158,52 @@ _COORDINATOR_INSTRUCTIONS = [
     "",
     "── Scan-first rule (tasks only) ────────────────────────────────",
     "  User prompts are often short and vague. Do not infer — discover.",
-    "  If the question is about LOCATING an unfamiliar file/component rather than describing",
-    "  overall structure, the MANDATORY delegation rule above applies instead — delegate to",
-    "  ContextRouter rather than running the steps below yourself.",
-    "  Before answering any question about structure, features, or behaviour, ONCE:",
-    "    1. find_files('**/*') — get the full file tree",
-    "    2. search_files(keyword, '**/*') — find all occurrences of the topic",
-    "    3. get_file_content(path) — read specific files to verify details",
+    "  You do NOT have find_files/search_files/list_directory/list_directory_tree/",
+    "  search_knowledge_graph directly (see the rule above) — every 'discover the structure",
+    "  or find the right file' step below means delegate_task_to_member('ContextRouter', ...),",
+    "  not calling those tools yourself. get_file_content() on a path you already have (from",
+    "  the user, this session, or ContextRouter's result) IS still yours to call directly.",
     "  Never describe a directory or module from its name alone.",
     "  Never stop at the first interesting result for overview questions — cover everything.",
-    "  Do NOT repeat this same scan again later in the same response (after a retry, a correction",
-    "  round, or any continuation) just because you are starting a new turn — you already have",
-    "  its results; act on them instead of scanning again.",
+    "  Do NOT repeat the same delegation again later in the same response (after a retry, a",
+    "  correction round, or any continuation) just because you are starting a new turn — you",
+    "  already have its results; act on them instead of asking again.",
     "  If the user includes a URL in their message, call web_fetch(url) immediately — before any other tool.",
     "  If asked about an external library, tool, GitHub repo, or technology, call web_search() then web_fetch()",
     "  on the best result — do not answer from training data alone for external topics.",
     "",
-    "Choose the FASTEST path to answer — do not call tools you don't need:",
+    "Choose the FASTEST path to answer — do not delegate more than the task needs:",
     "",
     "For overview / structure questions ('list directories', 'what does X do', 'show me the project'):",
-    "  1. list_directory_tree() if available — returns the full directory skeleton with no result cap",
-    "     OR find_files('**/*') if list_directory_tree is not available",
-    "  2. For each top-level directory: read one entry file (README, main.py, __init__.py, config)",
+    "  1. delegate_task_to_member('ContextRouter', 'call list_directory_tree() and return the full",
+    "     directory structure') — ContextRouter picks the right tool for this on the connected MCP.",
+    "  2. For each top-level directory it returns: read one entry file yourself with get_file_content()",
+    "     (README, main.py, __init__.py, config).",
     "  3. Return a grounded summary covering ALL directories — not just the first one found.",
     "  → Do not use get_project_context() as a shortcut — it may be stale or incomplete.",
     "",
     "For 'how does X work' / feature questions:",
-    "  1. search_files(X, '**/*') — find every file that references X",
-    "  2. get_file_content() on the 2-3 most relevant files",
+    "  1. delegate_task_to_member('ContextRouter', 'search_files for \"X\" across the whole codebase",
+    "     and return every matching file:line') — find every file that references X.",
+    "  2. get_file_content() yourself on the 2-3 most relevant files it returns.",
     "  3. If the project MCP exposes a documentation section tool (e.g. get_context_section),",
     "     call it with the topic keyword — do not assume the tool name or the doc file name.",
-    "  → Search before you read — searching tells you which files are worth reading.",
     "",
     "For code pattern / convention questions ('how do we do X', 'what style do we use'):",
-    "  1. find_files('**/<extension>') to discover real paths",
-    "  2. search_files(pattern, glob) to verify the pattern across files",
-    "  3. get_file_content(path) on 1-2 files if you need more detail",
-    "  → Skip broad context tools for these queries — go straight to the files.",
+    "  1. delegate_task_to_member('ContextRouter', 'find_files for <extension> and search_files for",
+    "     <pattern>, return real paths') to discover and verify real paths.",
+    "  2. get_file_content(path) yourself on 1-2 files if you need more detail.",
+    "  → Skip broad context tools for these queries — go straight to the files once you have paths.",
     "",
     "For implementation tasks (write code, fix a bug):",
     "  1. If a documentation/context tool is available (check connected MCP tools), call it ONCE",
     "     to load architecture context — do not assume the tool or doc file name. If you already",
     "     called it earlier in this same response (including after a retry or correction round),",
     "     do NOT call it again — you already have its output, use that.",
-    "  2. ALWAYS read at least one existing reference file of the same type before writing.",
-    "     NEVER skip this step — guessing conventions produces broken code.",
+    "  2. ALWAYS read at least one existing reference file of the same type before writing. If you",
+    "     don't already know its exact path, delegate_task_to_member('ContextRouter', ...) to find",
+    "     it first, then get_file_content() it yourself. NEVER skip this step — guessing conventions",
+    "     produces broken code.",
     "  3. Delegate writing to Coder, review to Reviewer",
     "",
     "── Project context (fetch on demand — NOT pre-loaded) ───────────",
@@ -345,26 +345,64 @@ def _strip_mutating(specs: list, tool_names: list[str] | None) -> tuple[list, li
     return out, None   # resolved against the live MCP surface in _scope_coordinator_tools
 
 
+# Discovery tools the coordinator must never call directly -- always resolved out of
+# its own tool surface by _scope_coordinator_tools below, regardless of allowlist or
+# read_only. get_file_content is deliberately NOT in this set: an already-known exact
+# path (from the user's prompt, a prior citation this session, or ContextRouter's own
+# delegated result) should still be read directly, no wasted round-trip through
+# delegation for that case -- only the DISCOVERY step (finding a path you don't have
+# yet) is forced through ContextRouter.
+#
+# Confirmed live 2026-08-11 that a prose-only instruction was not sufficient here: a
+# _COORDINATOR_INSTRUCTIONS block telling the coordinator to prefer
+# delegate_task_to_member for "find this unfamiliar file" tasks had ZERO measured
+# effect on a live retest -- identical direct-tool-call pattern (35 direct calls, 0
+# delegate_task_to_member) as the run before the instruction existed. This module
+# already has the relevant lesson on record from a different incident
+# (_strip_mutating's docstring, 2026-07-31): "Instructions shape what a model says;
+# only the tool surface constrains what it does." This is the tool-surface version of
+# the same fix, applied to discovery instead of writes.
+_COORDINATOR_DISCOVERY_TOOLS = {
+    "find_files", "search_files", "list_directory", "list_directory_tree",
+    "search_knowledge_graph",
+}
+
+
 def _scope_coordinator_tools(tool_names: list[str] | None, mcp_list: list, read_only: bool = False):
-    """Scope the coordinator's direct MCP tool surface to an explicit allowlist.
+    """Scope the coordinator's direct MCP tool surface to an explicit allowlist, and
+    always exclude _COORDINATOR_DISCOVERY_TOOLS (see its own docstring above).
 
     Mirrors make_agent_from_spec's per-agent scoping (swarm/agents.py) — without this,
     the coordinator receives every tool from every connected MCP unfiltered, including
     write/staging tools (apply_diff, write_file, notion_*, confirm_action/reject_action)
     that read-only teams (planning, parallel-review) must never call. Falls back to the
-    full mcp_list when no allowlist is given (preserves existing engineering-team behavior)
-    or when none of the named tools are found on the connected MCPs.
+    full mcp_list when no allowlist is given and none of _COORDINATOR_DISCOVERY_TOOLS
+    filtering leaves anything left (should not happen in practice — every connected MCP
+    exposes far more than these 5 tools).
+
+    Every branch resolves to individual functions (via mcp.functions) rather than
+    returning raw toolkit objects, so the discovery-tool filter can apply uniformly —
+    this previously differed for the "no allowlist, not read_only" branch, which
+    returned mcp_list unfiltered; confirmed via mcp.functions already being reliably
+    populated by the time this runs (the read_only and explicit-allowlist branches have
+    depended on it since 2026-07-31 with no reported gap).
     """
-    if not tool_names and not read_only:
-        return mcp_list
     all_funcs: dict = {}
     for mcp in mcp_list:
         all_funcs.update(mcp.functions)
+
+    def _keep(name: str) -> bool:
+        return name not in _COORDINATOR_DISCOVERY_TOOLS
+
+    if not tool_names and not read_only:
+        scoped = [f for n, f in all_funcs.items() if _keep(n)]
+        return scoped or mcp_list
     if not tool_names:
         # read_only with no allowlist: everything the MCPs expose, minus mutating tools.
-        return [f for n, f in all_funcs.items() if not _is_mutating(n)] or mcp_list
+        scoped = [f for n, f in all_funcs.items() if not _is_mutating(n) and _keep(n)]
+        return scoped or mcp_list
     scoped = [all_funcs[t] for t in tool_names
-              if t in all_funcs and not (read_only and _is_mutating(t))]
+              if t in all_funcs and not (read_only and _is_mutating(t)) and _keep(t)]
     return scoped if scoped else mcp_list
 
 

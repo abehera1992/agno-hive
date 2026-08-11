@@ -368,10 +368,13 @@ def test_coordinator_no_direct_writes_strips_mutating_tools_from_coordinator(mon
 
 def test_coordinator_keeps_write_tools_by_default(monkeypatch):
     """Backward compat: coordinator_no_direct_writes defaults to False, so an
-    unmodified deployment's coordinator keeps its existing direct write access --
-    _scope_coordinator_tools' no-restriction branch returns the raw connected MCP
-    server object(s) unfiltered (agno expands those into individual tools
-    internally), so the assertion is "nothing was stripped," not a name lookup."""
+    unmodified deployment's coordinator keeps its existing direct write access.
+
+    _scope_coordinator_tools' no-restriction branch now always resolves individual
+    functions (rather than returning the raw MCP toolkit object unfiltered) so the
+    discovery-tool exclusion (_COORDINATOR_DISCOVERY_TOOLS) can apply uniformly across
+    every branch -- see that constant's docstring for why. Non-discovery tools like
+    apply_diff/get_file_content are unaffected by this resolution change."""
     monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
     monkeypatch.setattr("swarm.team.config.coordinator_no_direct_writes", False)
     mcp_list = [_fake_mcp({"apply_diff": "apply_diff", "get_file_content": "get_file_content"})]
@@ -385,7 +388,8 @@ def test_coordinator_keeps_write_tools_by_default(monkeypatch):
         instructions=[],
     )
 
-    assert mcp_list[0] in result.tools
+    assert "apply_diff" in result.tools
+    assert "get_file_content" in result.tools
 
 
 def test_coordinator_no_direct_writes_does_not_affect_member_tools(monkeypatch):
@@ -416,3 +420,116 @@ def test_coordinator_no_direct_writes_does_not_affect_member_tools(monkeypatch):
 
     assert "apply_diff" not in result.tools  # coordinator: stripped
     assert "apply_diff" in result.members[0].tools  # Coder: unaffected
+
+
+# ── _build_team wiring: discovery-tool exclusion (2026-08-11) ──────────────────────
+# Confirmed live: a prose-only "prefer delegating to ContextRouter" instruction had
+# zero effect on the coordinator's actual tool-call behavior. This enforces the same
+# outcome at the tool surface instead -- see _COORDINATOR_DISCOVERY_TOOLS' docstring.
+
+def _mcp_with_discovery_and_other_tools():
+    return [_fake_mcp({
+        "find_files": "find_files",
+        "search_files": "search_files",
+        "list_directory": "list_directory",
+        "list_directory_tree": "list_directory_tree",
+        "search_knowledge_graph": "search_knowledge_graph",
+        "get_file_content": "get_file_content",
+        "apply_diff": "apply_diff",
+    })]
+
+
+def test_coordinator_discovery_tools_stripped_by_default(monkeypatch):
+    """No allowlist, not read_only -- the 'preserve existing engineering-team
+    behavior' branch. Discovery tools must still be excluded even here."""
+    monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
+    monkeypatch.setattr("swarm.team.config.coordinator_no_direct_writes", False)
+    mcp_list = _mcp_with_discovery_and_other_tools()
+
+    result = _build_team(
+        agent_specs=None,
+        coordinator_model="qwen2.5-coder:32b",
+        coordinator_tools=None,
+        mode="coordinate",
+        mcp_list=mcp_list,
+        instructions=[],
+    )
+
+    for name in ("find_files", "search_files", "list_directory",
+                 "list_directory_tree", "search_knowledge_graph"):
+        assert name not in result.tools
+    assert "get_file_content" in result.tools
+    assert "apply_diff" in result.tools
+
+
+def test_coordinator_discovery_tools_stripped_when_read_only(monkeypatch):
+    monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
+    monkeypatch.setattr("swarm.team.config.coordinator_no_direct_writes", False)
+    mcp_list = _mcp_with_discovery_and_other_tools()
+
+    result = _build_team(
+        agent_specs=None,
+        coordinator_model="qwen2.5-coder:32b",
+        coordinator_tools=None,
+        mode="coordinate",
+        mcp_list=mcp_list,
+        instructions=[],
+        read_only=True,
+    )
+
+    for name in ("find_files", "search_files", "list_directory",
+                 "list_directory_tree", "search_knowledge_graph"):
+        assert name not in result.tools
+    assert "get_file_content" in result.tools
+    assert "apply_diff" not in result.tools  # read_only still strips mutating tools too
+
+
+def test_coordinator_discovery_tools_stripped_even_from_an_explicit_allowlist(monkeypatch):
+    """A team YAML naming find_files in coordinator_tools should not be able to
+    re-grant it -- the exclusion is unconditional, not allowlist-overridable."""
+    monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
+    monkeypatch.setattr("swarm.team.config.coordinator_no_direct_writes", False)
+    mcp_list = _mcp_with_discovery_and_other_tools()
+
+    result = _build_team(
+        agent_specs=None,
+        coordinator_model="qwen2.5-coder:32b",
+        coordinator_tools=["find_files", "get_file_content"],
+        mode="coordinate",
+        mcp_list=mcp_list,
+        instructions=[],
+    )
+
+    assert "find_files" not in result.tools
+    assert "get_file_content" in result.tools
+
+
+def test_discovery_tool_exclusion_does_not_affect_member_agents(monkeypatch):
+    """Member agents resolve tools independently from their own spec.tools --
+    ContextRouter/Researcher must keep full discovery access; only the coordinator's
+    own direct surface is scoped."""
+    monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
+    monkeypatch.setattr("swarm.team.config.coordinator_no_direct_writes", False)
+    mcp_list = _mcp_with_discovery_and_other_tools()
+
+    class _FakeContextRouterSpec:
+        name = "ContextRouter"
+        model = "llama3.1:8b"
+        tools = ["find_files", "search_files", "list_directory", "get_file_content"]
+        instructions = ["Route to the right context."]
+        role = "Routing agent"
+        description = "Lightweight query router."
+        skills = None
+
+    result = _build_team(
+        agent_specs=[_FakeContextRouterSpec()],
+        coordinator_model="qwen2.5-coder:32b",
+        coordinator_tools=None,
+        mode="coordinate",
+        mcp_list=mcp_list,
+        instructions=[],
+    )
+
+    assert "find_files" not in result.tools  # coordinator: stripped
+    assert "find_files" in result.members[0].tools  # ContextRouter: unaffected
+    assert "search_files" in result.members[0].tools
