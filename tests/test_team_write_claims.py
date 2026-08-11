@@ -333,3 +333,72 @@ async def test_verified_answer_ground_truth_survives_a_retry_that_makes_no_new_w
 
     assert "Actual file changes this run" in out  # not silently dropped
     assert "parties.module.scss — review_pending" in out
+
+
+# ---- Aggregate retry budget across all four guards (2026-08-10) ------------
+# Each guard was individually bounded at one retry, but until this fix that
+# boundedness was never enforced IN AGGREGATE: a draft tripping the write-claim
+# guard, then having ITS retry's own content trip the verify_claims guard, could
+# still trigger a SECOND full team.arun() -- confirmed live as 20+ minutes of
+# activity after a caching-implementation answer's apply_diff() calls had already
+# succeeded. len(all_results) > 1 (something already appended beyond the
+# original) is the shared signal every guard now checks before attempting its
+# own retry.
+
+@pytest.mark.asyncio
+async def test_verified_answer_does_not_stack_a_second_retry_after_write_claim_guard_used_the_budget(monkeypatch):
+    canned_report = (
+        "CONVENTIONS (1 violation(s)):\n"
+        "  VIOLATION  NAMESPACE MISMATCH in plan_limits_api.py: bare REDIS_TTL used\n\n"
+        "VERDICT: 1 claim(s) could NOT be found in the project."
+    )
+
+    async def fake_verify_claims(content, hive_mcp_url):
+        return canned_report, True
+
+    monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
+
+    # Original: claims success but the write failed -- trips the write-claim guard (Block 1).
+    original_result = _msgs(_tool_msg("apply_diff", "apply_diff failed: old_string not found in plan_limits_api.py."))
+    content = "Redis caching has been added to plan_limits_api.py."
+
+    # The write-claim guard's retry SUCCEEDS (a real write happened) -- Block 1 accepts it
+    # and moves on with this as the new content/result, rather than returning immediately.
+    # But verify_claims (mocked above) reports a lint violation on THIS retried content,
+    # which would normally trigger Block 4's own retry -- the aggregate budget must stop it.
+    retry_result = SimpleNamespace(
+        content="Redis caching has been added to plan_limits_api.py using REDIS_TTL.",
+        messages=[_tool_msg("apply_diff", "review_pending: plan_limits_api.py — this change is now staged.")],
+    )
+    fake_team = _FakeTeam(retry_result)
+
+    out = await team._verified_answer(content, "add caching", fake_team, "http://fake/mcp", result=original_result)
+
+    assert len(fake_team.prompts) == 1  # only the write-claim guard's retry ran -- no second one
+    assert "already used by an earlier check" in out
+    assert "NAMESPACE MISMATCH" in out  # the lint problem is still surfaced, not silently dropped
+    assert "plan_limits_api.py — review_pending" in out  # ground-truth appendix still present
+
+
+@pytest.mark.asyncio
+async def test_verified_answer_single_guard_still_retries_normally_when_budget_available(monkeypatch):
+    """Regression guard for the fix above: a run that trips exactly ONE guard must
+    still retry as before -- the aggregate budget must not turn into a blanket
+    no-retry-ever regression."""
+    async def fake_verify_claims(content, hive_mcp_url):
+        return "VERDICT: every checked claim exists in the project.", False
+
+    monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
+
+    original_result = _msgs(_tool_msg("apply_diff", "apply_diff failed: old_string not found in x.scss."))
+    content = "The change has been applied via apply_diff to x.scss."
+    retry_result = SimpleNamespace(
+        content="The statusBadge class has been added to x.scss.",
+        messages=[_tool_msg("apply_diff", "review_pending: x.scss — this change is now staged.")],
+    )
+    fake_team = _FakeTeam(retry_result)
+
+    out = await team._verified_answer(content, "add a badge class", fake_team, "http://fake/mcp", result=original_result)
+
+    assert len(fake_team.prompts) == 1  # the one guard that fired did retry
+    assert out.startswith("The statusBadge class has been added to x.scss.")

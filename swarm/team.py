@@ -955,9 +955,21 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     metric without fixing the answer. Re-running costs one model round, but only on
     drafts that actually failed, which measured as a minority of runs.
 
-    Bounded at ONE retry on purpose. If the second attempt still cannot support its
-    claims, the correction is not converging and looping burns tokens; the verifier's
-    findings are surfaced instead so a human sees exactly which claims are unsupported.
+    Bounded at ONE retry TOTAL across this whole call, not one-per-check -- there are
+    four separate guards below (claimed-write, claimed-search, no-evidence, verify_claims
+    citations/lint), each individually written as "if the retry also fails, surface it,
+    don't loop again", but until 2026-08-10 that boundedness was only ever enforced PER
+    GUARD, not in aggregate: a draft that tripped multiple guards in sequence could
+    trigger up to 4 separate retries in one _verified_answer() call. Confirmed live that
+    day: a caching-implementation answer took 20+ minutes AFTER its apply_diff() calls
+    had already succeeded, because each retry re-sends the ENTIRE original task text
+    (see retry_prompt below), re-triggering the full agent pipeline (ContextRouter
+    through Reviewer) from scratch, not a small scoped fix. `len(all_results) == 1`
+    (nothing appended yet) is the shared budget check every guard below now uses --
+    reusing `all_results` itself as the counter rather than adding a parallel variable,
+    since it already exists for `_summarize_actual_writes`. Once ANY guard has spent
+    the one retry, every later guard that finds its own problem surfaces a disclaimer
+    immediately instead of attempting another full pipeline re-run.
     """
     # Every result object seen this call, original attempt first -- fed to
     # _summarize_actual_writes(*all_results) at every return point so a write that
@@ -974,6 +986,17 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # succeeded". See _count_successful_write_calls for the live incident this fixes.
     writes = _count_successful_write_calls(result)
     if writes == 0 and _CLAIMED_WRITE_RE.search(content or ""):
+        if len(all_results) > 1:
+            # Aggregate retry budget already spent by an earlier guard this call --
+            # surface rather than attempt a second full pipeline re-run. See this
+            # function's docstring for why the budget is shared across all four guards.
+            return (
+                f"{content}\n\n---\n**This answer claims a file was changed, but no "
+                f"apply_diff()/write_file() call actually succeeded — treat this as "
+                f"NOT applied. (Not retried: this run's one correction retry was "
+                f"already used by an earlier check.)**"
+                + _summarize_actual_writes(*all_results)
+            )
         print("[team] answer claims a file was written but no write tool call succeeded — retrying with a mandatory write")
         try:
             retry = await team.arun(
@@ -1018,6 +1041,16 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # arguments can.
     unverified_searches = _unverified_claimed_searches(content, result)
     bare_absence = not unverified_searches and _has_bare_absence_claim(content) and not _extract_searched_patterns(result)
+    if (unverified_searches or bare_absence) and len(all_results) > 1:
+        # Aggregate retry budget already spent -- surface rather than re-run again.
+        named = ', '.join(unverified_searches[:6]) if unverified_searches else "the claimed absence"
+        return (
+            f"{content}\n\n---\n**This answer claims searches that were never "
+            f"actually run ({named}) — treat any 'NOT FOUND' conclusion resting on "
+            f"them as UNVERIFIED, not confirmed absent. (Not retried: this run's "
+            f"one correction retry was already used by an earlier check.)**"
+            + _summarize_actual_writes(*all_results)
+        )
     if unverified_searches or bare_absence:
         if unverified_searches:
             print(f"[team] answer claims searches that never ran: {unverified_searches} — retrying with a mandatory search")
@@ -1075,6 +1108,14 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # a path:line). Conversational replies and "I could not determine" answers legitimately
     # need no reads and must not be retried.
     reads = _count_read_calls(result)
+    if reads == 0 and _CLAIMY_RE.search(content or "") and len(all_results) > 1:
+        # Aggregate retry budget already spent -- surface rather than re-run again.
+        return (
+            f"{content}\n\n---\n**This answer states code facts without reading any "
+            f"file this run — treat it as UNVERIFIED. (Not retried: this run's one "
+            f"correction retry was already used by an earlier check.)**"
+            + _summarize_actual_writes(*all_results)
+        )
     if reads == 0 and _CLAIMY_RE.search(content or ""):
         print("[team] answer asserts code facts with ZERO read calls — retrying with evidence required")
         try:
@@ -1153,6 +1194,15 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                         for ln in report.splitlines() if ln.strip().startswith("VIOLATION")]
     if not missing_symbols and not bad_citations and not lint_violations:
         return content + _summarize_actual_writes(*all_results)
+    if len(all_results) > 1:
+        # Aggregate retry budget already spent by an earlier guard this call --
+        # surface the verify_claims report rather than attempt a second full
+        # pipeline re-run.
+        return (f"{content}\n\n---\n**Unverified claims flagged automatically "
+                f"(these could not be found in the repository, and this run's one "
+                f"correction retry was already used by an earlier check):**\n"
+                f"```\n{report}\n```"
+                + _summarize_actual_writes(*all_results))
     instructions = []
     if missing_symbols:
         named = ", ".join(missing_symbols[:6])
