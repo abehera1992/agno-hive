@@ -90,3 +90,134 @@ async def test_stream_team_run_does_not_raise_cancelled_when_no_cancellation_eve
 
     assert content == "the real answer"
     assert run_output is not None
+
+
+# ── _make_disconnect_checker ────────────────────────────────────────────────────
+# The more targeted fix: agno's own native cancellation API (agno.run.cancel.
+# acancel_run) is checked via araise_if_cancelled(run_id) on EVERY event during
+# model/tool-call streaming (confirmed by direct source reading of agno/team/_run.py's
+# _arun_tasks_stream) -- far more reliable than hoping generic asyncio task
+# cancellation lands at the right internal await point. Confirmed live 2026-08-11 a
+# SECOND time: a run cancelled while an MCP tool call (web_search) was in flight kept
+# running -- new tool calls, a brand-new LiteLLM connection -- 11+ seconds after
+# task.cancel() was called and awaited, with no TeamRunCancelled event ever logged at
+# all (unlike the first, LLM-streaming-cancelled case _is_cancelled_event fixes).
+
+from types import SimpleNamespace
+
+
+def _event(run_id=None, **kwargs):
+    return SimpleNamespace(run_id=run_id, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_disconnect_checker_does_nothing_when_is_disconnected_is_none():
+    check = team._make_disconnect_checker(None)
+    # Must not raise, must not require is_disconnected to be callable at all.
+    await check(_event(run_id="abc-123", event="TeamRunContent", content="x"))
+
+
+@pytest.mark.asyncio
+async def test_disconnect_checker_cancels_via_agno_native_api(monkeypatch):
+    monkeypatch.setattr(team, "_DISCONNECT_POLL_S", 0)  # no throttle wait in the test
+    cancelled_run_ids = []
+
+    async def fake_acancel_run(run_id):
+        cancelled_run_ids.append(run_id)
+        return True
+
+    monkeypatch.setattr(team, "acancel_run", fake_acancel_run)
+
+    async def always_disconnected():
+        return True
+
+    check = team._make_disconnect_checker(always_disconnected)
+    # run_id capture happens before the disconnect check within the same call (no
+    # throttle window here), so a single call both captures it and triggers cancel.
+    with pytest.raises(asyncio.CancelledError):
+        await check(_event(run_id="run-xyz", event="TeamRunContent", content="x"))
+
+    assert cancelled_run_ids == ["run-xyz"]
+
+
+@pytest.mark.asyncio
+async def test_disconnect_checker_throttles_is_disconnected_calls(monkeypatch):
+    monkeypatch.setattr(team, "_DISCONNECT_POLL_S", 999)  # never elapses in this test
+    call_count = 0
+
+    async def counting_is_disconnected():
+        nonlocal call_count
+        call_count += 1
+        return True
+
+    check = team._make_disconnect_checker(counting_is_disconnected)
+    for _ in range(5):
+        await check(_event(run_id="run-1", event="TeamRunContent", content="x"))
+
+    # First call sets last_check to "now" without checking (throttle window not yet
+    # elapsed relative to itself) -- none of the 5 calls should have triggered
+    # is_disconnected given the huge poll interval.
+    assert call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_disconnect_checker_does_not_call_acancel_run_when_run_id_never_captured(monkeypatch):
+    """Edge case: disconnect detected before any event carried a run_id (e.g. the
+    very first event itself has none, which shouldn't happen in practice but must not
+    crash if it does)."""
+    monkeypatch.setattr(team, "_DISCONNECT_POLL_S", 0)
+    acancel_calls = []
+
+    async def fake_acancel_run(run_id):
+        acancel_calls.append(run_id)
+
+    monkeypatch.setattr(team, "acancel_run", fake_acancel_run)
+
+    async def always_disconnected():
+        return True
+
+    check = team._make_disconnect_checker(always_disconnected)
+
+    with pytest.raises(asyncio.CancelledError):
+        await check(_event(run_id=None, event="TeamRunContent", content="x"))
+
+    assert acancel_calls == []
+
+
+@pytest.mark.asyncio
+async def test_stream_team_run_cancels_via_disconnect_checker_mid_stream(monkeypatch):
+    """End-to-end: a team that never yields a cancelled-run event on its own (unlike
+    _FakeTeamThatGetsCancelledMidStream above) still gets stopped, because
+    is_disconnected() reports True partway through -- this is the case a swallowed
+    CancelledError from a mid-tool-call disconnect could never trigger via
+    _is_cancelled_event alone, since no such event is ever yielded in that failure
+    mode."""
+    monkeypatch.setattr(team, "_DISCONNECT_POLL_S", 0)
+    cancelled_run_ids = []
+
+    async def fake_acancel_run(run_id):
+        cancelled_run_ids.append(run_id)
+
+    monkeypatch.setattr(team, "acancel_run", fake_acancel_run)
+
+    class _LongRunningFakeTeam:
+        def arun(self, prompt, stream=False, yield_run_output=False):
+            return self._stream()
+
+        async def _stream(self):
+            yield SimpleNamespace(run_id="run-abc", event="TeamRunContent", content="first chunk")
+            yield SimpleNamespace(run_id="run-abc", event="TeamRunContent", content="second chunk")
+            yield SimpleNamespace(run_id="run-abc", event="TeamRunContent", content="third chunk")
+
+    calls = {"n": 0}
+
+    async def disconnected_after_first_event():
+        calls["n"] += 1
+        return calls["n"] > 1  # connected for the first check, disconnected after
+
+    with pytest.raises(asyncio.CancelledError):
+        await team._stream_team_run(
+            _LongRunningFakeTeam(), "prompt", is_disconnected=disconnected_after_first_event
+        )
+
+    assert cancelled_run_ids == ["run-abc"]

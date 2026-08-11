@@ -6,6 +6,7 @@ from contextlib import AsyncExitStack, suppress
 
 from opentelemetry import trace
 from pydantic import BaseModel, Field
+from agno.run.cancel import acancel_run
 from agno.run.team import TeamRunOutput
 from agno.team import Team
 from agno.tools import tool as agno_tool
@@ -1008,7 +1009,7 @@ def _summarize_actual_writes(*results) -> str:
 
 
 async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | None,
-                           result=None) -> str:
+                           result=None, is_disconnected=None) -> str:
     """Check the draft's claims and, if any are unverifiable, give the team ONE chance
     to correct itself against the evidence.
 
@@ -1074,7 +1075,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"mistake: call apply_diff() (for an existing file) or write_file() (for a "
                 f"brand-new file), confirm its response actually indicates success, and "
                 f"only THEN report the change as made. If the write tool keeps failing, "
-                f"report the exact failure message instead of claiming success."
+                f"report the exact failure message instead of claiming success.",
+                is_disconnected=is_disconnected,
             )
             all_results.append(retry)
             if retried:
@@ -1140,7 +1142,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"your earlier answer."
             )
         try:
-            retried, retry = await _stream_team_run(team, f"{task}\n\n{claim_note}")
+            retried, retry = await _stream_team_run(team, f"{task}\n\n{claim_note}", is_disconnected=is_disconnected)
             all_results.append(retry)
             if retried:
                 retry_unverified = _unverified_claimed_searches(retried, retry)
@@ -1190,7 +1192,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"opening anything and named a symbol that exists elsewhere in the "
                 f"codebase but does not apply here. Base every statement on text you have "
                 f"actually read this run, and if the thing asked about does not exist, say "
-                f"so plainly."
+                f"so plainly.",
+                is_disconnected=is_disconnected,
             )
             all_results.append(retry)
             if retried:
@@ -1321,7 +1324,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         )
     retry_prompt = f"{task}\n\nIMPORTANT: " + " Also, ".join(instructions)
     try:
-        corrected, retry = await _stream_team_run(team, retry_prompt)
+        corrected, retry = await _stream_team_run(team, retry_prompt, is_disconnected=is_disconnected)
         all_results.append(retry)
     except Exception as exc:
         print(f"[team] verify retry failed: {exc}")
@@ -1638,6 +1641,68 @@ def _is_cancelled_event(event) -> bool:
     return (getattr(event, "event", "") or "") in _CANCELLED_EVENT_TYPES
 
 
+# Matches api/server.py's own _DISCONNECT_POLL_S -- duplicated rather than imported
+# since team.py is the lower-level module (api/server.py imports FROM it, never the
+# reverse).
+_DISCONNECT_POLL_S = 2.0
+
+
+def _make_disconnect_checker(is_disconnected):
+    """Returns an async `check(event)` to call once per stream event inside a
+    `async for event in team.arun(...)` loop.
+
+    Captures agno's own run_id from the first event that carries one (every event
+    class in the stream has a `.run_id` field, confirmed via agno/run/team.py), and --
+    throttled to _DISCONNECT_POLL_S so this isn't an `await` on every single event --
+    calls `is_disconnected()`. On a detected disconnect it calls agno's OWN native
+    `acancel_run(run_id)` before raising asyncio.CancelledError itself.
+
+    Why this exists, not just task.cancel() (api/server.py's _run_cancel_on_disconnect):
+    confirmed live 2026-08-11 (twice) that asyncio-level task cancellation does not
+    reliably interrupt a run currently awaiting inside agno's own tool-call/model-
+    streaming internals -- cancellation can be silently absorbed somewhere in agno's
+    or the underlying `mcp` package's internals without ever reaching our code as a
+    raised exception, no matter how long the caller waits (agno-api's own process was
+    observed still holding an ESTABLISHED connection to LiteLLM, with new tool calls
+    still firing, 11+ seconds after task.cancel() was called and awaited). agno's own
+    native cancellation API (agno.run.cancel.acancel_run) is checked via
+    araise_if_cancelled(run_id) on EVERY SINGLE EVENT during model/tool-call streaming
+    (agno/team/_run.py's _arun_tasks_stream -- confirmed by direct source reading,
+    not assumed) -- far more frequent and reliable than hoping generic asyncio
+    cancellation lands at the right internal await point across multiple layers of
+    third-party wrapping (agno -> the `mcp` package -> its transport). The outer
+    task.cancel() in api/server.py stays in place unchanged as a backstop for what
+    this can't cover -- e.g. a disconnect before any event (and thus run_id) has
+    arrived yet.
+
+    `is_disconnected` is an async callable returning bool (typically
+    `http_request.is_disconnected`), or None to disable disconnect checking entirely
+    (e.g. _verified_answer's retries when no request context is available) -- the
+    run_id capture still happens either way, harmlessly, in case a future caller wants
+    it.
+    """
+    state = {"run_id": None, "last_check": time.monotonic()}
+
+    async def check(event) -> None:
+        if state["run_id"] is None:
+            state["run_id"] = getattr(event, "run_id", None)
+        if is_disconnected is None:
+            return
+        now = time.monotonic()
+        if now - state["last_check"] < _DISCONNECT_POLL_S:
+            return
+        state["last_check"] = now
+        if await is_disconnected():
+            if state["run_id"]:
+                await acancel_run(state["run_id"])
+            raise asyncio.CancelledError(
+                "client disconnected -- cancelled via agno's own run-cancellation API "
+                "(acancel_run), not just asyncio task cancellation"
+            )
+
+    return check
+
+
 def _stream_event_to_chunk(event) -> str | dict | None:
     """Classify one raw agno team.arun(stream=True) event into what run_task_stream
     yields downstream (and, since 2026-08-10, what run_task_async logs for content
@@ -1708,8 +1773,12 @@ async def run_task_stream(
     session_id: str | None = None,
     mode: str = "coordinate",
     read_only: bool = False,
+    is_disconnected=None,
 ):
     """Same setup as run_task_async but yields text chunks as the coordinator generates them.
+
+    `is_disconnected`: see run_task_async's docstring -- same _make_disconnect_checker
+    mechanism, wired into this function's own team.arun() loop.
 
     Yields:
       str  — content chunks from the coordinator as they arrive
@@ -1828,7 +1897,9 @@ async def run_task_stream(
                 # chunk (it has no .event attribute so _stream_event_to_chunk would return
                 # None for it anyway; the explicit check just avoids relying on that
                 # incidentally).
+                check_disconnect = _make_disconnect_checker(is_disconnected)
                 async for event in team.arun(task, stream=True, yield_run_output=True):
+                    await check_disconnect(event)
                     if _is_cancelled_event(event):
                         # See _CANCELLED_EVENT_TYPES' docstring: agno swallowed a real
                         # CancelledError internally and yielded this instead of
@@ -1934,7 +2005,8 @@ async def _run_heartbeat(activity: dict, run_started: float, interval: float = 3
         )
 
 
-async def _stream_team_run(team, prompt: str, *, log_label: str = "verify-retry") -> tuple[str, "TeamRunOutput | None"]:
+async def _stream_team_run(team, prompt: str, *, log_label: str = "verify-retry",
+                            is_disconnected=None) -> tuple[str, "TeamRunOutput | None"]:
     """Run team.arun(prompt, stream=True, yield_run_output=True) with the same
     content-preview/tool-event/heartbeat visibility run_task_async's outer call has,
     for callers that used to make a single opaque `await team.arun(prompt)` -- today,
@@ -1974,8 +2046,10 @@ async def _stream_team_run(team, prompt: str, *, log_label: str = "verify-retry"
     last_logged_len = 0
     last_logged_at = time.monotonic()
     unrecognized_event_counts: dict[str, int] = {}
+    check_disconnect = _make_disconnect_checker(is_disconnected)
     try:
         async for event in team.arun(prompt, stream=True, yield_run_output=True):
+            await check_disconnect(event)
             if _is_cancelled_event(event):
                 # See _CANCELLED_EVENT_TYPES' docstring. Without this, a run cancelled
                 # mid-retry looks like a normal completed retry to _verified_answer's
@@ -2036,6 +2110,7 @@ async def run_task_async(
     session_id: str | None = None,
     mode: str = "coordinate",
     read_only: bool = False,
+    is_disconnected=None,
 ) -> tuple[str, dict, dict | None]:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer.
 
@@ -2043,6 +2118,13 @@ async def run_task_async(
     completed answer; when the coordinator emitted a needs_clarification block
     (see _extract_clarification), it's {"question": str, "options": [...]} and
     content has had that block stripped out.
+
+    `is_disconnected`: optional async callable returning bool (typically
+    `http_request.is_disconnected` from api/server.py's /run handler). Passed to
+    _make_disconnect_checker (see its docstring) for a more reliable, agno-native
+    cancellation path than the outer task.cancel()-based _run_cancel_on_disconnect
+    alone. None disables it (e.g. main.py's CLI one-shot path, which has no HTTP
+    request to poll).
     """
     effective_mcp_url = mcp_url or config.mcp_url
     effective_coordinator = coordinator_model or config.leader_model
@@ -2185,7 +2267,9 @@ async def run_task_async(
                         # exact mechanism for the /stream endpoint -- this brings /run onto the
                         # same one, permanently, not just for this investigation.
                         unrecognized_event_counts: dict[str, int] = {}
+                        check_disconnect = _make_disconnect_checker(is_disconnected)
                         async for event in team.arun(task, stream=True, yield_run_output=True):
+                            await check_disconnect(event)
                             if _is_cancelled_event(event):
                                 # See _CANCELLED_EVENT_TYPES' docstring: this is the exact
                                 # site that was silently absorbing a disconnected client's
@@ -2283,7 +2367,7 @@ async def run_task_async(
                 try:
                     content = await _verified_answer(
                         content, task, team, all_mcp_urls[0] if all_mcp_urls else None,
-                        final_run_output)
+                        final_run_output, is_disconnected=is_disconnected)
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
                 tokens = _extract_tokens(final_run_output)

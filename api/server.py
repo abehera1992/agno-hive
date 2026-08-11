@@ -301,6 +301,7 @@ async def run(request: RunRequest, http_request: Request):
             session_id=session_id,
             mode=team_mode,
             read_only=request.read_only,
+            is_disconnected=http_request.is_disconnected,
         ),
     )
 
@@ -386,7 +387,7 @@ def _tool_event_to_sse(chunk: dict) -> str | None:
 
 
 @app.post("/stream")
-async def stream_endpoint(request: RunRequest):
+async def stream_endpoint(request: RunRequest, http_request: Request):
     """Stream coordinator output as Server-Sent Events.
 
     Events:
@@ -443,6 +444,7 @@ async def stream_endpoint(request: RunRequest):
                 project_id=request.project_id,
                 session_id=session_id,
                 mode=stream_mode,
+                is_disconnected=http_request.is_disconnected,
             ):
                 if isinstance(chunk, str):
                     yield f"data: {_json.dumps({'type': 'chunk', 'content': chunk})}\n\n"

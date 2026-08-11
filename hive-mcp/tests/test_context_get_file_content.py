@@ -75,6 +75,25 @@ def test_wrong_directory_guess_lists_candidates_when_basename_is_ambiguous(tmp_p
     assert "B" not in result.split("\n")
 
 
+def test_ambiguous_candidates_message_explicitly_warns_against_retrying_the_same_path(tmp_path, monkeypatch):
+    """Confirmed live 2026-08-11: a run called get_file_content() with the same wrong
+    truncated path 4 times in a row, each time receiving this exact disambiguation
+    message and each time ignoring it, before giving up and pivoting to irrelevant web
+    searches. The message itself must explicitly say not to retry the same path --
+    complementary reinforcement to the teams/engineering.yaml PATH-CORRECTION rule,
+    not a substitute for it (a model can still ignore either one in isolation)."""
+    monkeypatch.setattr(context, "PROJECT_ROOT", tmp_path)
+    (tmp_path / "admin").mkdir()
+    (tmp_path / "admin" / "Row.tsx").write_text("A", encoding="utf-8")
+    (tmp_path / "seller").mkdir()
+    (tmp_path / "seller" / "Row.tsx").write_text("B", encoding="utf-8")
+
+    result = context.get_file_content("wrong/path/Row.tsx")
+
+    assert "do NOT retry 'wrong/path/Row.tsx' again" in result
+    assert "copied verbatim" in result
+
+
 def test_no_matching_basename_anywhere_returns_plain_not_found(tmp_path, monkeypatch):
     monkeypatch.setattr(context, "PROJECT_ROOT", tmp_path)
     (tmp_path / "unrelated.py").write_text("x = 1", encoding="utf-8")

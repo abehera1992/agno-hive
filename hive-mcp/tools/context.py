@@ -289,7 +289,9 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
         if len(candidates) > 1:
             return (
                 f"File not found: {relative_path}\n"
-                f"{len(candidates)} files named '{basename}' exist — call get_file_content with the exact path:\n"
+                f"{len(candidates)} files named '{basename}' exist. Call get_file_content() "
+                f"AGAIN right now with ONE of these exact paths, copied verbatim — do NOT "
+                f"retry '{relative_path}' again, it will keep failing the same way:\n"
                 + "\n".join(candidates)
             )
         return f"File not found: {relative_path}"
