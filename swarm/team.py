@@ -1616,6 +1616,27 @@ _CONTENT_EVENT_TYPES = {"TeamRunContent", "RunContent"}
 _TOOL_START_EVENT_TYPES = {"TeamToolCallStarted", "ToolCallStarted"}
 _TOOL_END_EVENT_TYPES = {"TeamToolCallCompleted", "ToolCallCompleted"}
 
+# Confirmed live 2026-08-11: agno's own _arun_tasks_stream (agno/team/_run.py, the
+# function backing team.arun(stream=True, ...)) catches (KeyboardInterrupt,
+# asyncio.CancelledError) internally and does NOT re-raise -- it yields one of these
+# events instead and lets its generator reach a normal end. That breaks cooperative
+# cancellation at the library boundary: a real CancelledError delivered by
+# _run_cancel_on_disconnect's task.cancel() never reaches our own call stack as an
+# exception, so the "cancelled" run looks like an ordinary completed one to
+# _verified_answer's guards -- which can then kick off a genuine, uncancelled retry,
+# explaining sustained GPU/LiteLLM activity for minutes after a client disconnected
+# with nobody listening. _is_cancelled_event() lets every consumer of team.arun()'s
+# stream (run_task_async, run_task_stream, _stream_team_run) detect this and raise a
+# real asyncio.CancelledError of our own -- restoring the propagation agno's own
+# internals suppressed, so _run_cancel_on_disconnect (and any guard's bare
+# `except Exception`, which never catches CancelledError) behaves as originally
+# intended instead of treating a cancelled run as a completed one.
+_CANCELLED_EVENT_TYPES = {"TeamRunCancelled", "RunCancelled"}
+
+
+def _is_cancelled_event(event) -> bool:
+    return (getattr(event, "event", "") or "") in _CANCELLED_EVENT_TYPES
+
 
 def _stream_event_to_chunk(event) -> str | dict | None:
     """Classify one raw agno team.arun(stream=True) event into what run_task_stream
@@ -1808,6 +1829,15 @@ async def run_task_stream(
                 # None for it anyway; the explicit check just avoids relying on that
                 # incidentally).
                 async for event in team.arun(task, stream=True, yield_run_output=True):
+                    if _is_cancelled_event(event):
+                        # See _CANCELLED_EVENT_TYPES' docstring: agno swallowed a real
+                        # CancelledError internally and yielded this instead of
+                        # re-raising. Raise our own to restore propagation rather than
+                        # let the run fall through as if it had completed normally.
+                        raise asyncio.CancelledError(
+                            "agno yielded a cancelled-run event instead of propagating "
+                            "CancelledError -- treating this as the real cancellation"
+                        )
                     if not getattr(event, "event", None):
                         # Duck-typed rather than isinstance(event, TeamRunOutput): every
                         # real agno Event class (BaseTeamRunEvent/BaseAgentRunEvent and
@@ -1946,6 +1976,14 @@ async def _stream_team_run(team, prompt: str, *, log_label: str = "verify-retry"
     unrecognized_event_counts: dict[str, int] = {}
     try:
         async for event in team.arun(prompt, stream=True, yield_run_output=True):
+            if _is_cancelled_event(event):
+                # See _CANCELLED_EVENT_TYPES' docstring. Without this, a run cancelled
+                # mid-retry looks like a normal completed retry to _verified_answer's
+                # callers -- restore real CancelledError propagation instead.
+                raise asyncio.CancelledError(
+                    "agno yielded a cancelled-run event instead of propagating "
+                    "CancelledError -- treating this as the real cancellation"
+                )
             if not getattr(event, "event", None):
                 final_run_output = event
                 continue
@@ -2148,6 +2186,21 @@ async def run_task_async(
                         # same one, permanently, not just for this investigation.
                         unrecognized_event_counts: dict[str, int] = {}
                         async for event in team.arun(task, stream=True, yield_run_output=True):
+                            if _is_cancelled_event(event):
+                                # See _CANCELLED_EVENT_TYPES' docstring: this is the exact
+                                # site that was silently absorbing a disconnected client's
+                                # cancellation and letting the run continue to completion
+                                # (confirmed live 2026-08-11 -- agno-api held an ESTABLISHED
+                                # connection to LiteLLM for minutes after the HTTP client
+                                # had fully disconnected, with _run_cancel_on_disconnect's
+                                # task.cancel() never actually raising here). Restore real
+                                # CancelledError propagation instead of falling through to
+                                # the post-loop success path below.
+                                raise asyncio.CancelledError(
+                                    "agno yielded a cancelled-run event instead of "
+                                    "propagating CancelledError -- treating this as the "
+                                    "real cancellation"
+                                )
                             if not getattr(event, "event", None):
                                 final_run_output = event
                                 continue
