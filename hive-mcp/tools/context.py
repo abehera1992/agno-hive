@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import config
 from config import PROJECT_ROOT
 
-from .exclusions import EXCLUDE_DIRS, rg_args
+from .exclusions import EXCLUDE_DIRS, is_excluded, rg_args
 
 # Exclusions live in one place and apply to search, read, write, scan and index alike.
 # Project-specific entries come from EXCLUDE_DIRS / EXCLUDE_GLOBS in the project env.
@@ -270,6 +270,12 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
             f"documentation — it is excluded from tool access. Use DOCS.md, README.md, "
             f"or get_project_context() for project context instead."
         )
+    if is_excluded(relative_path):
+        return (
+            f"get_file_content blocked: '{relative_path}' is in an excluded path "
+            f"(dependency tree, build output, or a project EXCLUDE_DIRS/EXCLUDE_GLOBS "
+            f"entry). It is vendored/generated, not part of this project's own source."
+        )
     target = PROJECT_ROOT / relative_path
     if not target.exists():
         candidates = _find_by_basename(basename)
@@ -388,8 +394,9 @@ _GLOB_FALLBACK_PREFIXES = config.GLOB_FALLBACK_PREFIXES + ["**"]
 
 def _rg_glob(rg: str, glob_pattern: str, max_results: int) -> list[str]:
     import subprocess
+    cmd = [rg, "--files", "--glob", glob_pattern] + _RG_EXCLUDES
     result = subprocess.run(
-        [rg, "--files", "--glob", glob_pattern],
+        cmd,
         capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=30,
     )
     if not result.stdout and result.returncode not in (0, 1):
@@ -571,7 +578,7 @@ def count_matches(pattern: str, glob_filter: str = "**/*",
     rg = shutil.which("rg")
     if not rg:
         return "count_matches unavailable: ripgrep (rg) not installed in this environment"
-    args = [rg, "--count-matches", "--glob", glob_filter]
+    args = [rg, "--count-matches", "--glob", glob_filter] + _RG_EXCLUDES
     if fixed_string:
         args.append("-F")
     if ignore_case:
@@ -653,6 +660,12 @@ def list_directory(relative_path: str = "") -> str:
         relative_path: Path relative to project root (default: project root).
                        e.g. 'src/components', 'API/auth-service'
     """
+    if relative_path and is_excluded(relative_path):
+        return (
+            f"list_directory blocked: '{relative_path}' is in an excluded path "
+            f"(dependency tree, build output, or a project EXCLUDE_DIRS/EXCLUDE_GLOBS "
+            f"entry). It is vendored/generated, not part of this project's own source."
+        )
     target = PROJECT_ROOT / relative_path if relative_path else PROJECT_ROOT
     if not target.exists():
         return f"Not found: {relative_path}"
