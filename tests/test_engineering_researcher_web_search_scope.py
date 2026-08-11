@@ -45,7 +45,21 @@ def test_path_correction_rule_exists_and_names_the_concrete_behavior():
     text = _researcher_instructions()
     assert "PATH-CORRECTION rule" in text
     assert "verbatim" in text
-    assert "never retry the same guessed/truncated path again" in text.replace("\n", " ")
+    assert "retry the same guessed/truncated path again" in text.replace("\n", " ")
+
+
+def test_path_correction_rule_directs_to_the_ranked_first_candidate():
+    """Confirmed live 2026-08-11: a second incident, distinct from simple path
+    repetition -- an AMBIGUOUS basename (e.g. 'index.tsx', legitimately present in
+    several unrelated parts of the monorepo) got tried mechanically in whatever order
+    was listed, including an unrelated file. The disambiguation list is now ranked by
+    relevance to the original guess (see hive-mcp's _rank_candidates_by_relevance),
+    so the instruction must tell the model to trust that ranking rather than pick
+    arbitrarily."""
+    text = _researcher_instructions()
+    joined = text.replace("\n", " ")
+    assert "FIRST listed candidate" in joined
+    assert "ranked by relevance" in joined
 
 
 def test_web_search_rule_still_covers_genuine_external_topics():

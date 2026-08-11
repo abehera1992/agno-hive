@@ -64,8 +64,23 @@ ALLOW_GLOBS: list[str] = list(config.EXCLUDE_ALLOW)
 
 
 def rg_args() -> list[str]:
-    """Negative --glob arguments for a ripgrep invocation."""
+    """Negative --glob arguments for a ripgrep invocation.
+
+    Must cover BOTH EXCLUDE_DIRS and EXCLUDE_GLOBS -- confirmed live 2026-08-11 this
+    previously covered only EXCLUDE_GLOBS, so a project excluding a vendored
+    directory the documented way (EXCLUDE_DIRS=signoz, per this module's own
+    docstring) got zero ripgrep-level protection: is_excluded() correctly refused a
+    DIRECT get_file_content('signoz/...') call, but find_files()/_find_by_basename()/
+    search_files()/count_matches() -- every ripgrep-backed tool sharing this function
+    -- still freely listed and searched signoz's own files, because rg_args() itself
+    never translated EXCLUDE_DIRS into a ripgrep exclusion at all. That's how a
+    disambiguation candidate list for an ambiguous basename like 'index.tsx' ended up
+    offering signoz/frontend/src/hooks/useDarkMode/index.tsx as if it were a real
+    candidate in the project.
+    """
     out: list[str] = []
+    for d in EXCLUDE_DIRS:
+        out += ["--glob", f"!**/{d}/**"]
     for g in EXCLUDE_GLOBS:
         out += ["--glob", g if g.startswith("!") else f"!{g}"]
     return out

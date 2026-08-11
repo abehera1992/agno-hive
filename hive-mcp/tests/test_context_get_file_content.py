@@ -169,3 +169,65 @@ def test_get_project_context_excludes_claude_md_but_includes_docs_and_readme(tmp
     assert "CLAUDE.md" not in result
     assert "real architecture docs" in result
     assert "real readme" in result
+
+
+# ── ambiguous-candidate ranking (2026-08-11) ────────────────────────────────────
+# Confirmed live: an ambiguous basename ('index.tsx', legitimately present in several
+# unrelated parts of a monorepo) produced a disambiguation list the model then worked
+# through mechanically top-to-bottom -- including an unrelated app's own file --
+# instead of recognizing which candidate actually matched the task. Ranking by shared
+# leading directory segments with the ORIGINAL (wrong) guess surfaces the
+# almost-certainly-correct candidate first, deterministically.
+
+def test_shared_leading_segments_counts_common_directories_before_divergence():
+    a = "Client/EcommClient-Web/ekamweb/src/components/business/index.tsx"
+    b = "Client/EcommClient-Web/ekamweb/src/app/(portal)/business/index.tsx"
+    # Shared: Client, EcommClient-Web, ekamweb, src -- diverges at components vs app
+    assert context._shared_leading_segments(a, b) == 4
+
+
+def test_shared_leading_segments_is_low_for_an_unrelated_app():
+    a = "Client/EcommClient-Web/ekamweb/src/components/business/index.tsx"
+    b = "Client/EcommClient-Mobile/app/(tabs)/index.tsx"
+    # Shared: Client only -- diverges immediately at EcommClient-Web vs EcommClient-Mobile
+    assert context._shared_leading_segments(a, b) == 1
+
+
+def test_shared_leading_segments_ignores_the_filename_itself():
+    # Same directory, different filename -- must not count the filename as a segment
+    a = "src/components/Foo.tsx"
+    b = "src/components/Bar.tsx"
+    assert context._shared_leading_segments(a, b) == 2
+
+
+def test_rank_candidates_by_relevance_puts_the_closest_directory_match_first():
+    guessed = "Client/EcommClient-Web/ekamweb/src/components/business/index.tsx"
+    candidates = [
+        "Client/EcommClient-Mobile/app/(tabs)/index.tsx",
+        "Client/EcommClient-Web/ekamweb/src/app/(portal)/business/index.tsx",
+        "signoz/frontend/src/hooks/useDarkMode/index.tsx",
+    ]
+
+    ranked = context._rank_candidates_by_relevance(guessed, candidates)
+
+    assert ranked[0] == "Client/EcommClient-Web/ekamweb/src/app/(portal)/business/index.tsx"
+
+
+def test_get_file_content_ambiguous_candidates_are_ranked_in_the_response(tmp_path, monkeypatch):
+    monkeypatch.setattr(context, "PROJECT_ROOT", tmp_path)
+    mobile = tmp_path / "Client" / "EcommClient-Mobile" / "app" / "(tabs)"
+    mobile.mkdir(parents=True)
+    (mobile / "index.tsx").write_text("mobile", encoding="utf-8")
+    web = tmp_path / "Client" / "EcommClient-Web" / "ekamweb" / "src" / "app" / "business"
+    web.mkdir(parents=True)
+    (web / "index.tsx").write_text("web", encoding="utf-8")
+
+    result = context.get_file_content("Client/EcommClient-Web/ekamweb/src/components/business/index.tsx")
+
+    # The web candidate (closer directory match to the guess) must be listed before
+    # the mobile candidate, not just in whatever order _find_by_basename returned.
+    web_pos = result.index("Client/EcommClient-Web/ekamweb/src/app/business/index.tsx")
+    mobile_pos = result.index("Client/EcommClient-Mobile/app/(tabs)/index.tsx")
+    assert web_pos < mobile_pos
+    assert "sorted by how closely their directory matches your guess" in result
+    assert "most likely match FIRST" in result

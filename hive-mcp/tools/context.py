@@ -233,6 +233,41 @@ def _find_by_basename(basename: str, max_results: int = 6) -> list[str]:
     return matches
 
 
+def _shared_leading_segments(a: str, b: str) -> int:
+    """How many leading directory segments two paths share before diverging --
+    e.g. 'Client/EcommClient-Web/ekamweb/src/components/x.tsx' vs
+    'Client/EcommClient-Web/ekamweb/src/app/x.tsx' share 4 (Client, EcommClient-Web,
+    ekamweb, src) before 'components' vs 'app' diverges. Excludes the filename
+    itself from both sides -- only directory structure counts."""
+    a_dirs = a.replace("\\", "/").split("/")[:-1]
+    b_dirs = b.replace("\\", "/").split("/")[:-1]
+    shared = 0
+    for x, y in zip(a_dirs, b_dirs):
+        if x != y:
+            break
+        shared += 1
+    return shared
+
+
+def _rank_candidates_by_relevance(guessed_path: str, candidates: list[str]) -> list[str]:
+    """Sort get_file_content()'s disambiguation candidates so the one whose directory
+    structure most resembles the ORIGINAL (wrong) guess is listed first, not just in
+    whatever order _find_by_basename happened to return.
+
+    Confirmed live 2026-08-11: a guess for a real EkamApp web-frontend file, once
+    ambiguous across a generic basename (e.g. 'index.tsx', which legitimately exists
+    in many unrelated parts of this monorepo), produced a candidate list the model
+    then worked through mechanically top-to-bottom -- including the mobile app's own
+    unrelated index.tsx -- instead of recognizing which candidate actually matched
+    the web-frontend task it was doing. Ranking by shared leading directory segments
+    with the original guess (a real project signal already available -- the guess
+    itself usually has the RIGHT top-level app/service, just the wrong subdirectory
+    beneath it) surfaces the almost-certainly-correct candidate first, deterministically,
+    without needing the model to reason about it at all. Ties keep _find_by_basename's
+    existing alphabetical order (Python's sort is stable)."""
+    return sorted(candidates, key=lambda c: -_shared_leading_segments(guessed_path, c))
+
+
 def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str:
     """
     Read a file from the project by its path relative to the project root.
@@ -287,12 +322,16 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
             )
             return note + get_file_content(corrected, offset, limit)
         if len(candidates) > 1:
+            ranked = _rank_candidates_by_relevance(relative_path, candidates)
             return (
                 f"File not found: {relative_path}\n"
-                f"{len(candidates)} files named '{basename}' exist. Call get_file_content() "
-                f"AGAIN right now with ONE of these exact paths, copied verbatim — do NOT "
-                f"retry '{relative_path}' again, it will keep failing the same way:\n"
-                + "\n".join(candidates)
+                f"{len(ranked)} files named '{basename}' exist, sorted by how closely their "
+                f"directory matches your guess (most likely match FIRST). Call "
+                f"get_file_content() AGAIN right now with the FIRST path below unless you "
+                f"have a specific reason to believe a different one is right — copied "
+                f"verbatim, do NOT retry '{relative_path}' again, it will keep failing the "
+                f"same way:\n"
+                + "\n".join(ranked)
             )
         return f"File not found: {relative_path}"
     if not target.is_file():
