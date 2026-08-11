@@ -38,13 +38,30 @@ def _search_call(name: str, **kwargs):
 
 
 class _FakeTeam:
+    """Mirrors agno's real calling convention (2026-08-10): `team.arun(prompt,
+    stream=True, yield_run_output=True)` is called WITHOUT awaiting first -- `arun`
+    itself must return an async generator directly, not a coroutine, matching how
+    _stream_team_run consumes a real Team. The streamed generator yields the retry
+    result as its one item, duck-typed by _stream_team_run as "the final run output"
+    since it has no `.event` attribute (see swarm/team.py for why that's the real
+    distinguishing signal, not isinstance)."""
+
     def __init__(self, retry_result):
         self._retry_result = retry_result
         self.prompts = []
 
-    async def arun(self, prompt):
+    def arun(self, prompt, stream=False, yield_run_output=False):
         self.prompts.append(prompt)
+        if stream:
+            return self._stream()
+        return self._direct()
+
+    async def _direct(self):
         return self._retry_result
+
+    async def _stream(self):
+        if self._retry_result is not None:
+            yield self._retry_result
 
 
 # ── _claimed_search_terms ─────────────────────────────────────────────────────

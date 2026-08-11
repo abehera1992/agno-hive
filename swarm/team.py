@@ -6,6 +6,7 @@ from contextlib import AsyncExitStack, suppress
 
 from opentelemetry import trace
 from pydantic import BaseModel, Field
+from agno.run.team import TeamRunOutput
 from agno.team import Team
 from agno.tools import tool as agno_tool
 from agno.tools.mcp import MCPTools
@@ -999,7 +1000,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             )
         print("[team] answer claims a file was written but no write tool call succeeded — retrying with a mandatory write")
         try:
-            retry = await team.arun(
+            retried, retry = await _stream_team_run(
+                team,
                 f"{task}\n\n"
                 f"IMPORTANT: a previous attempt claimed a file was created, modified, "
                 f"applied, or staged for review, but no apply_diff() or write_file() call "
@@ -1012,7 +1014,6 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"report the exact failure message instead of claiming success."
             )
             all_results.append(retry)
-            retried = retry.content if hasattr(retry, "content") else str(retry)
             if retried:
                 retry_writes = _count_successful_write_calls(retry)
                 if retry_writes == 0 and _CLAIMED_WRITE_RE.search(retried):
@@ -1076,9 +1077,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"your earlier answer."
             )
         try:
-            retry = await team.arun(f"{task}\n\n{claim_note}")
+            retried, retry = await _stream_team_run(team, f"{task}\n\n{claim_note}")
             all_results.append(retry)
-            retried = retry.content if hasattr(retry, "content") else str(retry)
             if retried:
                 retry_unverified = _unverified_claimed_searches(retried, retry)
                 retry_bare = not retry_unverified and _has_bare_absence_claim(retried) and not _extract_searched_patterns(retry)
@@ -1119,7 +1119,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     if reads == 0 and _CLAIMY_RE.search(content or ""):
         print("[team] answer asserts code facts with ZERO read calls — retrying with evidence required")
         try:
-            retry = await team.arun(
+            retried, retry = await _stream_team_run(
+                team,
                 f"{task}\n\n"
                 f"IMPORTANT: answer this by READING the relevant file(s) first — use "
                 f"get_file_content or search_files. A previous attempt answered without "
@@ -1129,7 +1130,6 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"so plainly."
             )
             all_results.append(retry)
-            retried = retry.content if hasattr(retry, "content") else str(retry)
             if retried:
                 content, result = retried, retry
         except Exception as exc:
@@ -1258,9 +1258,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         )
     retry_prompt = f"{task}\n\nIMPORTANT: " + " Also, ".join(instructions)
     try:
-        retry = await team.arun(retry_prompt)
+        corrected, retry = await _stream_team_run(team, retry_prompt)
         all_results.append(retry)
-        corrected = retry.content if hasattr(retry, "content") else str(retry)
     except Exception as exc:
         print(f"[team] verify retry failed: {exc}")
         return content + _summarize_actual_writes(*all_results)
@@ -1724,8 +1723,7 @@ async def run_task_stream(
         )
 
         full_content: list[str] = []
-        last_event = None
-        last_metrics_event = None
+        final_run_output: "TeamRunOutput | None" = None
 
         with _tracer.start_as_current_span("agno.task.stream", attributes={
             "project_id": project_id,
@@ -1736,30 +1734,42 @@ async def run_task_stream(
             from observability.metrics import task_duration, task_counter
             t0 = time.perf_counter()
             try:
-                async for event in team.arun(task, stream=True):
-                    last_event = event
-                    # 2026-08-10: the final event in the stream isn't reliably the
-                    # metrics-bearing completion event (a live /run test came back with
-                    # input_tokens/output_tokens/total_tokens all 0) -- tracked separately
-                    # so token extraction below uses whichever event actually carried
-                    # populated metrics, not whatever happened to be last. See
-                    # run_task_async's identical fix for the full explanation.
-                    if getattr(event, "metrics", None) is not None:
-                        last_metrics_event = event
+                # yield_run_output=True (2026-08-10, correctness fix, not optional): without
+                # it agno's streaming generator never yields the actual TeamRunOutput object,
+                # only lightweight Event objects with no .messages/.tools -- confirmed via
+                # agno's own source (team/_run.py: `if yield_run_output: yield run_response`,
+                # gated off by default). Every event before that final yield is unaffected --
+                # this only ADDS one extra item at the very end of the stream, which the
+                # check below captures and does not forward to the external caller as a
+                # chunk (it has no .event attribute so _stream_event_to_chunk would return
+                # None for it anyway; the explicit check just avoids relying on that
+                # incidentally).
+                async for event in team.arun(task, stream=True, yield_run_output=True):
+                    if not getattr(event, "event", None):
+                        # Duck-typed rather than isinstance(event, TeamRunOutput): every
+                        # real agno Event class (BaseTeamRunEvent/BaseAgentRunEvent and
+                        # all their subclasses) carries a non-empty `.event` type-
+                        # discriminator string; TeamRunOutput never does. This also
+                        # matches lightweight test fakes that only set the attributes a
+                        # given test needs, without requiring every test to construct a
+                        # real TeamRunOutput instance just to satisfy an isinstance check.
+                        final_run_output = event
+                        continue
                     out = _stream_event_to_chunk(event)
                     if isinstance(out, str):
                         full_content.append(out)
                         yield out
                     elif isinstance(out, dict):
                         yield out
-                combined = "".join(full_content) or "(no response)"
+                accumulated = "".join(full_content) or "(no response)"
+                combined = final_run_output.content if final_run_output and final_run_output.content else accumulated
                 # Tier-3 guard: fill [[COUNT ...]] markers in the final content (streamed
                 # chunks above are pre-substitution; the done-sentinel content is corrected).
                 try:
                     combined = await _fill_count_markers(combined, all_mcp_urls[0] if all_mcp_urls else None)
                 except Exception as exc:
                     print(f"[team] count-marker guard warning: {exc}")
-                tokens = _extract_tokens(last_metrics_event or last_event)
+                tokens = _extract_tokens(final_run_output)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
                 # Fire-and-forget: don't block the response on post-run experience indexing.
                 record_success_bg(task, combined, project_id)
@@ -1773,9 +1783,10 @@ async def run_task_stream(
                 # the old fenced-text convention, a caller consuming stream events already
                 # sees this as a structured {"__tool_event__": ...} sentinel mid-stream (see
                 # _stream_event_to_chunk) rather than raw JSON scrolling by as text chunks --
-                # a strictly better streaming experience, not just parity with /run. last_event
-                # carries the same `.tools` shape _extract_clarification_from_tools expects.
-                clarification = _extract_clarification_from_tools(last_event)
+                # a strictly better streaming experience, not just parity with /run.
+                # final_run_output is the real TeamRunOutput (see yield_run_output note
+                # above) -- the only object in this whole function that actually has .tools.
+                clarification = _extract_clarification_from_tools(final_run_output)
                 if clarification is None:
                     combined, clarification = _extract_clarification(combined)
                 else:
@@ -1828,6 +1839,89 @@ async def _run_heartbeat(activity: dict, run_started: float, interval: float = 3
             f"{event_count_str}, coordinator still running",
             flush=True,
         )
+
+
+async def _stream_team_run(team, prompt: str, *, log_label: str = "verify-retry") -> tuple[str, "TeamRunOutput | None"]:
+    """Run team.arun(prompt, stream=True, yield_run_output=True) with the same
+    content-preview/tool-event/heartbeat visibility run_task_async's outer call has,
+    for callers that used to make a single opaque `await team.arun(prompt)` -- today,
+    that means every retry inside _verified_answer. Confirmed live 2026-08-10: a
+    _verified_answer retry ran 17+ minutes with ZERO visibility (real, genuine vLLM
+    activity the whole time, but no way to see it), because retries predate and were
+    never covered by that day's earlier streaming fix to the OUTER call.
+
+    yield_run_output=True is required, not optional -- without it agno's streaming
+    generator never yields the actual TeamRunOutput object (only lightweight Event
+    objects with no .messages), a real correctness bug discovered the same day: every
+    caller of the old non-streaming `retry = await team.arun(prompt)` needs `.messages`
+    (via _count_successful_write_calls / _count_read_calls / _extract_searched_patterns),
+    and an Event object silently has none. The `not getattr(event, "event", None)` check
+    below captures the real object once agno yields it: every real Event class carries a
+    non-empty `.event` type-discriminator string, TeamRunOutput never does, so this is a
+    reliable duck-typed distinction (and, unlike isinstance, also matches lightweight
+    test fakes that don't construct a real TeamRunOutput).
+
+    Returns (content, run_output) -- content prefers the real TeamRunOutput's own
+    .content when available, falling back to the accumulated stream text only if the
+    run never reached that final yield (e.g. it was cancelled mid-stream). run_output
+    is None in that same edge case -- callers already null-check every helper that
+    reads it (_count_read_calls etc. all return -1/"undeterminable" for a bare
+    getattr(None, ...) miss, the same fail-safe posture used everywhere else in this
+    module), so this degrades the same way a non-streaming call raising would have.
+
+    Runs its own heartbeat with its OWN fresh activity dict, not the original run's --
+    it has no access to the tool_hook closure the original team was built with, so
+    "last tool call name" reporting is not meaningful here (always "(none yet)"); the
+    stream_event_count and elapsed-time fields are still accurate and are the signal
+    that actually mattered in the 17-minute incident this exists to fix."""
+    activity = {"last_call_name": None, "last_call_at": time.monotonic(), "stream_event_count": 0}
+    heartbeat_task = asyncio.create_task(_run_heartbeat(activity, time.monotonic()))
+    full_content: list[str] = []
+    final_run_output: "TeamRunOutput | None" = None
+    last_logged_len = 0
+    last_logged_at = time.monotonic()
+    unrecognized_event_counts: dict[str, int] = {}
+    try:
+        async for event in team.arun(prompt, stream=True, yield_run_output=True):
+            if not getattr(event, "event", None):
+                final_run_output = event
+                continue
+            activity["stream_event_count"] += 1
+            out = _stream_event_to_chunk(event)
+            if isinstance(out, str):
+                full_content.append(out)
+                now = time.monotonic()
+                if now - last_logged_at >= 10:
+                    joined = "".join(full_content)
+                    preview = joined[last_logged_len:][-300:]
+                    print(
+                        f"[{log_label}] content: +{len(joined) - last_logged_len} chars "
+                        f"({len(joined)} total) -- ...{preview!r}",
+                        flush=True,
+                    )
+                    last_logged_at = now
+                    last_logged_len = len(joined)
+            elif isinstance(out, dict):
+                print(f"[{log_label}] stream tool event: {out}", flush=True)
+            else:
+                event_type = getattr(event, "event", "") or "(no .event attr)"
+                unrecognized_event_counts[event_type] = unrecognized_event_counts.get(event_type, 0) + 1
+                count = unrecognized_event_counts[event_type]
+                if count in (1, 2) or count % 20 == 0:
+                    content_val = getattr(event, "content", "<no .content attr>")
+                    reasoning_val = getattr(event, "reasoning_content", "<no .reasoning_content attr>")
+                    print(
+                        f"[{log_label}] unrecognized stream event #{count} of type {event_type!r}: "
+                        f"content={content_val!r}, reasoning_content={reasoning_val!r}",
+                        flush=True,
+                    )
+    finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+    accumulated = "".join(full_content) or "(no response)"
+    content = final_run_output.content if final_run_output and final_run_output.content else accumulated
+    return content, final_run_output
 
 
 async def run_task_async(
@@ -1962,17 +2056,19 @@ async def run_task_async(
                 with _tracer.start_as_current_span("agno.team.run"):
                     heartbeat_task = asyncio.create_task(_run_heartbeat(activity, time.monotonic()))
                     full_content: list[str] = []
-                    last_event = None
-                    # 2026-08-10: a live groundedness test came back with input_tokens/
-                    # output_tokens/total_tokens all 0 despite a genuinely long, real run --
-                    # the final event in team.arun(stream=True) isn't reliably the
-                    # metrics-bearing completion event (RunCompletedEvent/TeamRunCompleted),
-                    # so blindly trusting `last_event` for _extract_tokens() silently returned
-                    # zeros whenever something else came after it in the stream. Tracked
-                    # separately: whichever event actually carried populated .metrics, kept
-                    # updated across the whole loop (not just the first one seen), since a
-                    # long run can have more than one).
-                    last_metrics_event = None
+                    # 2026-08-10, corrected same day: originally tracked "last_event" (whatever
+                    # happened to be the final stream item) for token/clarification extraction,
+                    # then "last_metrics_event" (whichever event had non-None .metrics) after a
+                    # live test came back with all-zero token counts. Both were still wrong at
+                    # the root: agno's streaming generator never yields the real TeamRunOutput
+                    # object at all unless yield_run_output=True is passed (confirmed via
+                    # agno's own source, team/_run.py) -- every Event object in the stream
+                    # (including the completion event) has no .messages, and RunCompletedEvent
+                    # specifically has no .tools either, so _extract_clarification_from_tools
+                    # and every _verified_answer guard reading .messages had been silently
+                    # getting nothing since the streaming conversion. final_run_output below is
+                    # the actual TeamRunOutput, captured once agno yields it.
+                    final_run_output: "TeamRunOutput | None" = None
                     last_logged_len = 0
                     last_logged_at = time.monotonic()
                     try:
@@ -1988,10 +2084,10 @@ async def run_task_async(
                         # exact mechanism for the /stream endpoint -- this brings /run onto the
                         # same one, permanently, not just for this investigation.
                         unrecognized_event_counts: dict[str, int] = {}
-                        async for event in team.arun(task, stream=True):
-                            last_event = event
-                            if getattr(event, "metrics", None) is not None:
-                                last_metrics_event = event
+                        async for event in team.arun(task, stream=True, yield_run_output=True):
+                            if not getattr(event, "event", None):
+                                final_run_output = event
+                                continue
                             activity["stream_event_count"] += 1
                             out = _stream_event_to_chunk(event)
                             if isinstance(out, str):
@@ -2037,7 +2133,8 @@ async def run_task_async(
                         heartbeat_task.cancel()
                         with suppress(asyncio.CancelledError):
                             await heartbeat_task
-                content = "".join(full_content) or "(no response)"
+                accumulated = "".join(full_content) or "(no response)"
+                content = final_run_output.content if final_run_output and final_run_output.content else accumulated
                 # Clarification check runs BEFORE the claim-verification/count-marker
                 # guards below, and short-circuits past both when found: those guards
                 # validate a completed factual answer, and a clarification block is
@@ -2047,13 +2144,15 @@ async def run_task_async(
                 # the original text-convention approach as the default. Falls back to
                 # the original fenced-block regex only if no tool call is found, for the
                 # rare case the model reverts to that old habit instead of calling the tool.
-                clarification = _extract_clarification_from_tools(last_event)
+                # final_run_output is the real TeamRunOutput (see the yield_run_output note
+                # above) -- the only object here that actually has .tools populated.
+                clarification = _extract_clarification_from_tools(final_run_output)
                 if clarification is None:
                     content, clarification = _extract_clarification(content)
                 else:
                     content = ""
                 if clarification is not None:
-                    tokens = _extract_tokens(last_metrics_event or last_event)
+                    tokens = _extract_tokens(final_run_output)
                     span.set_status(trace.StatusCode.OK)
                     task_counter.add(1, {"project_id": project_id, "outcome": "clarification"})
                     return content, tokens, clarification
@@ -2068,10 +2167,10 @@ async def run_task_async(
                 try:
                     content = await _verified_answer(
                         content, task, team, all_mcp_urls[0] if all_mcp_urls else None,
-                        last_event)
+                        final_run_output)
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
-                tokens = _extract_tokens(last_metrics_event or last_event)
+                tokens = _extract_tokens(final_run_output)
                 span.set_status(trace.StatusCode.OK)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
                 # Fire-and-forget: don't block the response on post-run experience indexing.
