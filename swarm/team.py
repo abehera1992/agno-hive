@@ -55,24 +55,31 @@ _COORDINATOR_INSTRUCTIONS = [
     "  the rule immediately below — whenever the task requires FINDING an unfamiliar file.",
     "",
     "── Locating unfamiliar files — you do not have find_files/search_files/list_directory ─",
-    "  find_files, search_files, list_directory, list_directory_tree, and",
-    "  search_knowledge_graph are NOT on your own tool list — this is deliberate, not a",
-    "  connection problem. If the task requires FINDING a file, page, or component named",
-    "  only by feature or description (not an exact path already known from the user's",
-    "  prompt, this session's own prior tool results, or a teammate's citation), call",
-    "  delegate_task_to_member('ContextRouter', ...) to have it locate the real path —",
-    "  do not try to work around the missing tools yourself, and do not guess a path from",
-    "  memory or naming conventions. Once ContextRouter (or a teammate's citation) has",
-    "  returned a real path, get_file_content() on that path directly — that tool IS still",
-    "  yours, no further delegation needed for reading it.",
+    "  find_files, search_files, list_directory, list_directory_tree,",
+    "  search_knowledge_graph, web_search, and web_fetch are NOT on your own tool list —",
+    "  this is deliberate, not a connection problem. If the task requires FINDING a file,",
+    "  page, or component named only by feature or description (not an exact path already",
+    "  known from the user's prompt, this session's own prior tool results, or a teammate's",
+    "  citation), call delegate_task_to_member('ContextRouter', ...) to have it locate the",
+    "  real path — do not try to work around the missing tools yourself, do not guess a",
+    "  path from memory or naming conventions, and NEVER search the public web to learn an",
+    "  INTERNAL, private codebase's own structure — the web has no way to know it and never",
+    "  will. Once ContextRouter (or a teammate's citation) has returned a real path,",
+    "  get_file_content() on that path directly — that tool IS still yours, no further",
+    "  delegation needed for reading it, but it is for READING a path you already have, not",
+    "  for discovering one — do not call it repeatedly on guessed paths hoping one lands.",
     "  Reason: ContextRouter and Researcher carry stricter grounding discipline (SCAN-FIRST,",
     "  COVERAGE, and an explicit HARD RULE against fabricating paths) than these top-level",
-    "  coordinator instructions do. Confirmed live 2026-08-11: with these tools still",
-    "  present and only a prose instruction asking the coordinator to prefer delegating,",
-    "  it guessed a wrong Next.js app-router path for a real frontend component, then read",
-    "  into signoz/ (a vendored, unrelated tool) and the mobile app tree before finding the",
-    "  real file, with zero delegate_task_to_member calls in the whole run — the prose",
-    "  instruction alone measurably changed nothing.",
+    "  coordinator instructions do. Confirmed live 2026-08-11, twice, on the SAME class of",
+    "  gap: (1) with find_files/search_files/etc. still present and only a prose instruction",
+    "  asking the coordinator to prefer delegating, it guessed a wrong Next.js app-router",
+    "  path, then read into signoz/ (a vendored, unrelated tool) and the mobile app tree,",
+    "  zero delegate_task_to_member calls the whole run; (2) AFTER those tools were removed,",
+    "  a later run still made zero delegate_task_to_member calls — instead opening a NEW",
+    "  escape hatch, web_search('EkamApp frontend codebase GitHub repo') (a private",
+    "  codebase has no public GitHub presence to find), then blind get_file_content() path",
+    "  guesses. Removing the tool closes ONE hole; the underlying pull toward acting",
+    "  directly instead of delegating finds another one if any are left open.",
     "",
     "── Stop delegating once the question is answered (CRITICAL) ─────",
     "  Before every delegate_task_to_member call beyond your first one or two, ask: does",
@@ -380,9 +387,21 @@ def _strip_mutating(specs: list, tool_names: list[str] | None) -> tuple[list, li
 # (_strip_mutating's docstring, 2026-07-31): "Instructions shape what a model says;
 # only the tool surface constrains what it does." This is the tool-surface version of
 # the same fix, applied to discovery instead of writes.
+#
+# web_search/web_fetch added the same day, same incident class: after find_files/
+# search_files/etc. were removed, a later retest (still zero delegate_task_to_member
+# calls -- confirmed via journalctl grep, not assumed) had the coordinator open a
+# NEW escape hatch instead of delegating: web_search('EkamApp frontend codebase
+# GitHub repo') and web_fetch -- searching the PUBLIC web for a private, internal
+# codebase's own structure, which can never return anything useful, before falling
+# back to blind get_file_content() path-guessing. web_search/web_fetch are genuinely
+# needed for EXTERNAL research (verifying a library name, checking docs) -- but that
+# capability isn't lost by removing them here, only moved: ContextRouter and
+# Researcher both carry the same tools in teams/engineering.yaml, so external
+# research still happens, just delegated like discovery already is.
 _COORDINATOR_DISCOVERY_TOOLS = {
     "find_files", "search_files", "list_directory", "list_directory_tree",
-    "search_knowledge_graph",
+    "search_knowledge_graph", "web_search", "web_fetch",
 }
 
 

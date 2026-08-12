@@ -439,9 +439,17 @@ def _mcp_with_discovery_and_other_tools():
         "list_directory": "list_directory",
         "list_directory_tree": "list_directory_tree",
         "search_knowledge_graph": "search_knowledge_graph",
+        "web_search": "web_search",
+        "web_fetch": "web_fetch",
         "get_file_content": "get_file_content",
         "apply_diff": "apply_diff",
     })]
+
+
+_DISCOVERY_TOOL_NAMES = (
+    "find_files", "search_files", "list_directory", "list_directory_tree",
+    "search_knowledge_graph", "web_search", "web_fetch",
+)
 
 
 def test_coordinator_discovery_tools_stripped_by_default(monkeypatch):
@@ -460,8 +468,7 @@ def test_coordinator_discovery_tools_stripped_by_default(monkeypatch):
         instructions=[],
     )
 
-    for name in ("find_files", "search_files", "list_directory",
-                 "list_directory_tree", "search_knowledge_graph"):
+    for name in _DISCOVERY_TOOL_NAMES:
         assert name not in result.tools
     assert "get_file_content" in result.tools
     assert "apply_diff" in result.tools
@@ -482,11 +489,67 @@ def test_coordinator_discovery_tools_stripped_when_read_only(monkeypatch):
         read_only=True,
     )
 
-    for name in ("find_files", "search_files", "list_directory",
-                 "list_directory_tree", "search_knowledge_graph"):
+    for name in _DISCOVERY_TOOL_NAMES:
         assert name not in result.tools
     assert "get_file_content" in result.tools
     assert "apply_diff" not in result.tools  # read_only still strips mutating tools too
+
+
+def test_web_search_and_web_fetch_specifically_are_stripped_from_the_coordinator(monkeypatch):
+    """Confirmed live 2026-08-11: AFTER find_files/search_files/etc. were removed
+    from the coordinator's own tool surface, a later retest still made ZERO
+    delegate_task_to_member calls -- it opened a NEW escape hatch instead,
+    web_search('EkamApp frontend codebase GitHub repo') (searching the public web
+    for a private, internal codebase's own structure), before falling back to blind
+    get_file_content() path guesses. Locked in as its own explicit test, not just
+    folded into the generic discovery-tools loop above, since this was a distinct,
+    separately-discovered gap in the original fix."""
+    monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
+    monkeypatch.setattr("swarm.team.config.coordinator_no_direct_writes", False)
+    mcp_list = _mcp_with_discovery_and_other_tools()
+
+    result = _build_team(
+        agent_specs=None,
+        coordinator_model="qwen2.5-coder:32b",
+        coordinator_tools=None,
+        mode="coordinate",
+        mcp_list=mcp_list,
+        instructions=[],
+    )
+
+    assert "web_search" not in result.tools
+    assert "web_fetch" not in result.tools
+
+
+def test_web_search_and_web_fetch_stay_available_to_delegated_members(monkeypatch):
+    """The capability isn't lost, only moved: ContextRouter/Researcher both carry
+    web_search/web_fetch in teams/engineering.yaml for legitimate EXTERNAL research
+    (verifying a library name, checking docs) -- removing them from the coordinator
+    must not remove them from the team's actual research capability."""
+    monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
+    monkeypatch.setattr("swarm.team.config.coordinator_no_direct_writes", False)
+    mcp_list = _mcp_with_discovery_and_other_tools()
+
+    class _FakeResearcherSpec:
+        name = "Researcher"
+        model = "qwen2.5-coder:32b"
+        tools = ["web_search", "web_fetch", "get_file_content"]
+        instructions = ["Research the codebase."]
+        role = "Researcher"
+        description = "Research specialist."
+        skills = None
+
+    result = _build_team(
+        agent_specs=[_FakeResearcherSpec()],
+        coordinator_model="qwen2.5-coder:32b",
+        coordinator_tools=None,
+        mode="coordinate",
+        mcp_list=mcp_list,
+        instructions=[],
+    )
+
+    assert "web_search" in result.members[0].tools
+    assert "web_fetch" in result.members[0].tools
 
 
 def test_coordinator_discovery_tools_stripped_even_from_an_explicit_allowlist(monkeypatch):
