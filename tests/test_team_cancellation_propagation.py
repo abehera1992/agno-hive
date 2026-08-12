@@ -318,3 +318,110 @@ async def test_disconnect_checker_still_raises_for_a_bare_callable_without_claim
     check = team._make_disconnect_checker(always_disconnected)
     with pytest.raises(asyncio.CancelledError):
         await check(_event(run_id="run-bare-callable", event="TeamRunContent", content="x"))
+
+
+# ── Multi-run_id tracking (FOURTH incident) ───────────────────────────────────────
+# Confirmed live 2026-08-12, root-caused via direct agno source reading: this checker
+# used to capture run_id from only the FIRST event of the whole run and never update
+# it again. The first event is always the team's own -- but every
+# delegate_task_to_member call runs the member agent under a BRAND NEW run_id (agno's
+# `run_id = run_id or str(uuid4())`, never inherited from the team). So acancel_run
+# was always cancelling the team's run, a no-op for whichever member was actually
+# mid-delegation -- reproduced live twice as a redundant-read loop, then 100+ empty
+# model-request cycles, surviving a detected disconnect for 30-60+ seconds of real
+# vLLM throughput. Fix: track every DISTINCT run_id seen across the whole event
+# stream (team's + every member's) and cancel all of them, not just the first.
+
+
+def _disconnect_after(n):
+    """is_disconnected() stand-in that reports "connected" for the first n-1 calls,
+    then "disconnected" from call n onward -- lets a test seed run_ids across several
+    check() calls (each of which invokes is_disconnected() once, since
+    _DISCONNECT_POLL_S=0 removes throttling) before the one that actually raises."""
+    calls = {"n": 0}
+
+    async def is_disconnected():
+        calls["n"] += 1
+        return calls["n"] >= n
+
+    return is_disconnected
+
+
+@pytest.mark.asyncio
+async def test_disconnect_checker_cancels_every_distinct_run_id_seen_not_just_the_first(monkeypatch):
+    monkeypatch.setattr(team, "_DISCONNECT_POLL_S", 0)
+    cancelled_run_ids = []
+
+    async def fake_acancel_run(run_id):
+        cancelled_run_ids.append(run_id)
+
+    monkeypatch.setattr(team, "acancel_run", fake_acancel_run)
+
+    check = team._make_disconnect_checker(_disconnect_after(2))
+
+    # Simulates: team's own first event (still "connected"), then a delegated
+    # member's event arriving under a completely different run_id (exactly what
+    # delegate_task_to_member produces -- member events flow through this same
+    # check(event) call) on the check that actually detects the disconnect.
+    await check(_event(run_id="team-run-1", event="TeamRunContent", content="x"))
+    with pytest.raises(asyncio.CancelledError):
+        await check(_event(run_id="member-run-2", event="RunContent", content="y"))
+
+    assert set(cancelled_run_ids) == {"team-run-1", "member-run-2"}
+
+
+@pytest.mark.asyncio
+async def test_disconnect_checker_tracks_run_ids_across_calls_before_any_disconnect(monkeypatch):
+    """The set must accumulate across multiple check() calls while still connected --
+    not just within a single call -- since real events arrive one at a time over the
+    life of the run."""
+    monkeypatch.setattr(team, "_DISCONNECT_POLL_S", 0)
+    cancelled_run_ids = []
+
+    async def fake_acancel_run(run_id):
+        cancelled_run_ids.append(run_id)
+
+    monkeypatch.setattr(team, "acancel_run", fake_acancel_run)
+
+    check = team._make_disconnect_checker(_disconnect_after(3))
+
+    await check(_event(run_id="run-a", event="TeamRunContent", content="1"))
+    await check(_event(run_id="run-b", event="RunContent", content="2"))
+    with pytest.raises(asyncio.CancelledError):
+        await check(_event(run_id="run-c", event="RunContent", content="3"))
+
+    assert set(cancelled_run_ids) == {"run-a", "run-b", "run-c"}
+
+
+@pytest.mark.asyncio
+async def test_disconnect_checker_calls_acancel_run_once_per_distinct_id_not_per_event(monkeypatch):
+    """Many events from the same member (the normal case -- a delegated agent yields
+    dozens of stream events under one run_id) must not turn into dozens of redundant
+    acancel_run calls for the identical id."""
+    monkeypatch.setattr(team, "_DISCONNECT_POLL_S", 0)
+    cancelled_run_ids = []
+
+    async def fake_acancel_run(run_id):
+        cancelled_run_ids.append(run_id)
+
+    monkeypatch.setattr(team, "acancel_run", fake_acancel_run)
+
+    check = team._make_disconnect_checker(_disconnect_after(4))
+
+    await check(_event(run_id="team-run", event="TeamRunContent", content="x"))
+    await check(_event(run_id="member-run", event="RunContent", content="a"))
+    await check(_event(run_id="member-run", event="RunContent", content="b"))
+    with pytest.raises(asyncio.CancelledError):
+        await check(_event(run_id="member-run", event="RunContent", content="c"))
+
+    assert cancelled_run_ids.count("member-run") == 1
+    assert cancelled_run_ids.count("team-run") == 1
+
+
+@pytest.mark.asyncio
+async def test_disconnect_checker_ignores_events_with_no_run_id_when_tracking():
+    check = team._make_disconnect_checker(None)  # is_disconnected=None never raises
+    # Must not crash on an event with no run_id at all -- same edge case the original
+    # single-id capture already handled, now exercised through the accumulating set.
+    await check(_event(run_id=None, event="TeamRunContent", content="x"))
+    await check(_event(event="SomeEventWithNoRunIdField"))

@@ -1819,12 +1819,56 @@ def _make_disconnect_checker(is_disconnected):
     api.server.DisconnectSignal's own docstring for the full mechanism. A bare
     callable without a `.claimed` attribute (e.g. a raw lambda in a test) is treated
     the same as "nobody else is coordinating" and this still raises normally.
+
+    FOURTH incident, confirmed live 2026-08-12, root-caused via direct agno source
+    reading rather than assumed: this function used to capture run_id from only the
+    FIRST event of the whole run and never update it again. The first event is always
+    the team's OWN TeamRunContent -- but every delegate_task_to_member call runs the
+    member agent (ContextRouter, Researcher, ...) under a BRAND NEW run_id, minted via
+    `run_id = run_id or str(uuid4())` in agno/agent/_run.py, never inherited from the
+    team. So acancel_run(state["run_id"]) was always cancelling the TEAM's run --
+    correct when the team itself is the thing generating, but a no-op for whichever
+    MEMBER is actually mid-delegation, since that member's own araise_if_cancelled(
+    member_run_id) checks (20+ call sites in agent/_run.py, checked on every stream
+    event -- a genuinely reliable mechanism once pointed at the right id) never find
+    a match. Reproduced twice live: a redundant-read loop (agent re-calling an
+    identical tool despite the duplicate-read stub's escalating "STOP" text) followed
+    by 100+ empty ModelRequestStarted/RunContent/ModelRequestCompleted cycles with no
+    tool calls and no content -- in both cases disconnecting mid-loop logged "client
+    disconnected -- run cancelled" from OUR side, but vLLM kept generating (confirmed
+    via real throughput in vLLM's own logs, and NEW POST /v1/chat/completions requests
+    still arriving) for 30-60+ seconds afterward, resolved only by restarting agno-api.
+
+    Fix: track every DISTINCT run_id observed across this run's own event stream (the
+    team's plus every delegated member's -- member events already flow through this
+    same check(event) call, confirmed via agent_name-attributed stream tool events in
+    production logs) instead of only the first, and cancel all of them on disconnect.
+    Deliberately NOT using agno's own `aget_active_runs()` (which would return every
+    run_id registered process-wide, including any OTHER concurrent request's) --
+    scoping to only run_ids this run's own loop has actually observed avoids ever
+    cancelling a different, unrelated in-flight request.
+
+    Verified via direct source reading, not assumed, that this is sufficient to
+    actually stop generation: agno's own `except RunCancelledException` handler in
+    agent/_run.py's async streaming path (the one araise_if_cancelled's raise reaches)
+    yields one final RunCancelledEvent then `break`s, ending that agent's generator
+    immediately -- no further model or tool calls. (Separately verified, NOT a
+    blocker: delegate_task_to_member's own check_if_run_cancelled -- called on that
+    final event before re-yielding it -- raises RunCancelledException again, and
+    models/base.py's run_function_call wraps generator-based tool consumption
+    (delegate_task_to_member's own shape) in a bare `except Exception`, which swallows
+    that second raise into an ordinary "tool call failed" result instead of a clean
+    cancellation event. This means the coordinator's final answer may read as a failed
+    delegation rather than a clean cancellation -- cosmetic, not a functional gap,
+    since the actual GPU work already stopped one layer down. Can't be fixed from
+    application code; it's inside the installed agno package.)
     """
-    state = {"run_id": None, "last_check": time.monotonic()}
+    state = {"run_ids": set(), "last_check": time.monotonic()}
 
     async def check(event) -> None:
-        if state["run_id"] is None:
-            state["run_id"] = getattr(event, "run_id", None)
+        run_id = getattr(event, "run_id", None)
+        if run_id:
+            state["run_ids"].add(run_id)
         if is_disconnected is None:
             return
         now = time.monotonic()
@@ -1832,8 +1876,8 @@ def _make_disconnect_checker(is_disconnected):
             return
         state["last_check"] = now
         if await is_disconnected():
-            if state["run_id"]:
-                await acancel_run(state["run_id"])
+            for run_id in state["run_ids"]:
+                await acancel_run(run_id)
             claimed = getattr(is_disconnected, "claimed", None)
             if claimed is not None:
                 if claimed.is_set():
