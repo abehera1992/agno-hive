@@ -12,11 +12,17 @@ Usage:
                                                                # writes one JSON result line to stdout). Not
                                                                # meant to be invoked by hand -- see
                                                                # api/server.py's _run_worker_subprocess().
+  python main.py --stream-worker                              # internal: same as --run-worker but for /stream --
+                                                               # reads a run_task_stream() payload from stdin,
+                                                               # writes one NDJSON line PER YIELDED CHUNK to
+                                                               # stdout as they arrive. Not meant to be invoked
+                                                               # by hand -- see api/server.py's
+                                                               # _stream_worker_subprocess().
 """
 import asyncio
 import json
 import sys
-from swarm.team import run_task_async
+from swarm.team import run_task_async, run_task_stream
 from observability.setup import setup_telemetry
 
 
@@ -105,9 +111,73 @@ def _run_worker_main() -> None:
     print(json.dumps(result), flush=True)
 
 
+async def _run_stream_worker(real_stdout) -> None:
+    """Worker-process entrypoint for /stream's process-boundary execution --
+    the incremental counterpart to _run_worker() above (Phase 3, see DOCS.md
+    "Process-Boundary Cancellation"). Reads the same shape of pre-resolved
+    kwargs payload from stdin, but for run_task_stream() instead of
+    run_task_async(), and writes ONE NDJSON line PER YIELDED CHUNK to stdout
+    as they arrive -- /stream needs incremental delivery, /run doesn't.
+
+    Each line is {"ok": true, "v": <chunk>} where <chunk> is exactly what
+    run_task_stream() itself yielded (a str content delta, or a dict tool-
+    event/done sentinel) -- json.dumps/json.loads round-trip str vs dict
+    without needing an explicit type tag, so the parent's existing per-chunk
+    SSE-formatting logic (api/server.py's /stream generate()) is reused
+    completely unchanged; only where the chunks come from moves. A failure
+    becomes {"ok": false, "error": "..."} as the last line instead of a
+    crash, mirroring _run_worker's except-Exception behavior.
+
+    real_stdout is threaded through explicitly (unlike _run_worker, which
+    returns once at the end) because chunks must be written AS THEY ARRIVE,
+    not accumulated and printed once -- __main__ redirects sys.stdout to
+    stderr for the whole run exactly as it does for --run-worker, so every
+    existing [team]/[api] print() call is unaffected, and this function
+    prints straight to the stashed real handle for every chunk instead.
+    """
+    from api.models import AgentSpec
+
+    payload = json.loads(sys.stdin.read())
+    agent_specs = (
+        [AgentSpec(**d) for d in payload["agent_specs"]]
+        if payload.get("agent_specs") else None
+    )
+    try:
+        async for chunk in run_task_stream(
+            task=payload["task"],
+            agent_specs=agent_specs,
+            coordinator_model=payload.get("coordinator_model"),
+            coordinator_tools=payload.get("coordinator_tools"),
+            mcp_url=payload.get("mcp_url"),
+            mcp_urls=payload.get("mcp_urls"),
+            project_id=payload.get("project_id", "default"),
+            session_id=payload.get("session_id"),
+            mode=payload.get("mode", "coordinate"),
+            read_only=payload.get("read_only", False),
+        ):
+            print(json.dumps({"ok": True, "v": chunk}), file=real_stdout, flush=True)
+    except Exception as exc:
+        print(
+            json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}),
+            file=real_stdout, flush=True,
+        )
+
+
+def _run_stream_worker_main() -> None:
+    """Same stdout->stderr discipline as _run_worker_main, but the real handle
+    is threaded into _run_stream_worker directly (see its docstring) instead
+    of being restored once at the end, since chunks print incrementally."""
+    real_stdout = sys.stdout
+    sys.stdout = sys.stderr
+    setup_telemetry()
+    asyncio.run(_run_stream_worker(real_stdout))
+
+
 if __name__ == "__main__":
     if "--run-worker" in sys.argv:
         _run_worker_main()
+    elif "--stream-worker" in sys.argv:
+        _run_stream_worker_main()
     elif "--serve" in sys.argv:
         setup_telemetry()
         import uvicorn

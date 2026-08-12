@@ -376,6 +376,74 @@ async def _run_worker_subprocess(
     return result["content"], result["tokens"], result["clarification"]
 
 
+async def _stream_worker_subprocess(http_request, payload: dict, argv: list[str] | None = None):
+    """Streaming counterpart to _run_worker_subprocess (Phase 3 of process-
+    boundary cancellation, see DOCS.md "Process-Boundary Cancellation") --
+    spawns `python main.py --stream-worker` (main.py's _run_stream_worker())
+    and yields each chunk as it arrives over NDJSON on stdout, instead of
+    waiting for one final result the way /run does. Uses the same
+    SIGKILL-on-disconnect approach Phase 1/2 already validated live for /run
+    (three clean kills, zero anyio errors, including one mid-write) — see
+    DOCS.md for the full validation record.
+
+    Each NDJSON line is {"ok": true, "v": <chunk>} (yielded as-is -- exactly
+    what run_task_stream() itself would have yielded, str or dict, since
+    json round-trips both without an explicit type tag) or {"ok": false,
+    "error": "..."} (raised as a RuntimeError, letting it propagate into
+    /stream's existing `except Exception` SSE-error handling unchanged).
+
+    Explicit is_disconnected() polling, not left to Starlette's own
+    StreamingResponse machinery alone: if Starlette merely stops calling
+    this generator's __anext__() on disconnect rather than actually
+    cancelling it, an abandoned subprocess would only get cleaned up
+    whenever Python's GC eventually collects the generator and sends it
+    GeneratorExit -- unbounded, and exactly the "orphaned worker keeps
+    running" failure this whole design exists to close. Polling explicitly
+    means the kill happens within one poll interval regardless of what
+    Starlette does with the generator itself; the `finally` block below is
+    the belt-and-suspenders backstop for the GeneratorExit path too.
+    """
+    argv = argv or [sys.executable, "main.py", "--stream-worker"]
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=None,  # inherit -- same rationale as _run_worker_subprocess
+        cwd=str(_REPO_ROOT),
+    )
+    proc.stdin.write(json.dumps(payload).encode())
+    proc.stdin.write_eof()
+    await proc.stdin.drain()
+
+    try:
+        while True:
+            readline_task = asyncio.ensure_future(proc.stdout.readline())
+            raw_line = None
+            while True:
+                done, _ = await asyncio.wait({readline_task}, timeout=_WORKER_POLL_S)
+                if done:
+                    raw_line = readline_task.result()
+                    break
+                if await http_request.is_disconnected():
+                    readline_task.cancel()
+                    proc.kill()
+                    await proc.wait()
+                    return
+            if not raw_line:
+                break  # EOF -- worker process finished
+            line = json.loads(raw_line.decode())
+            if not line["ok"]:
+                raise RuntimeError(line["error"])
+            yield line["v"]
+    except asyncio.CancelledError:
+        proc.kill()
+        raise
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+
+
 @app.post("/run", response_model=RunResponse)
 async def run(request: RunRequest, http_request: Request):
     from api.models import SessionMeta
@@ -595,26 +663,48 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
     is_chain_handoff = session_summary.startswith("── Chain handoff")
     context_size = 0 if is_chain_handoff else len(prior_messages)
 
+    resolved_mcp_urls = _resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url)
+
     async def generate():
         try:
-            # No outer _run_cancel_on_disconnect wraps /stream (Starlette's own
-            # StreamingResponse machinery stops calling generate() on disconnect
-            # instead), so there is no second, independent cancellation source to
-            # coordinate with here -- DisconnectSignal's .claimed flag is simply
-            # never contended in this path. Used anyway for a single consistent
-            # shape across both endpoints, matching /run's own wiring above.
-            async for chunk in run_task_stream(
-                task=request.task,
-                agent_specs=agent_specs,
-                coordinator_model=coordinator_model,
-                coordinator_tools=coordinator_tools,
-                mcp_url=mcp_url,
-                mcp_urls=_resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url),
-                project_id=request.project_id,
-                session_id=session_id,
-                mode=stream_mode,
-                is_disconnected=DisconnectSignal(http_request),
-            ):
+            if config.use_worker_process_isolation:
+                # Phase 3 of process-boundary cancellation (see DOCS.md) -- same
+                # SIGKILL-on-disconnect mechanism Phase 1/2 already validated live
+                # for /run, extended to /stream's incremental delivery via
+                # _stream_worker_subprocess's NDJSON-over-stdout protocol.
+                stream_source = _stream_worker_subprocess(http_request, {
+                    "task": request.task,
+                    "agent_specs": [a.model_dump() for a in agent_specs] if agent_specs else None,
+                    "coordinator_model": coordinator_model,
+                    "coordinator_tools": coordinator_tools,
+                    "mcp_url": mcp_url,
+                    "mcp_urls": resolved_mcp_urls,
+                    "project_id": request.project_id,
+                    "session_id": session_id,
+                    "mode": stream_mode,
+                    "read_only": request.read_only,
+                })
+            else:
+                # No outer _run_cancel_on_disconnect wraps /stream (Starlette's own
+                # StreamingResponse machinery stops calling generate() on disconnect
+                # instead), so there is no second, independent cancellation source to
+                # coordinate with here -- DisconnectSignal's .claimed flag is simply
+                # never contended in this path. Used anyway for a single consistent
+                # shape across both endpoints, matching /run's own wiring above.
+                stream_source = run_task_stream(
+                    task=request.task,
+                    agent_specs=agent_specs,
+                    coordinator_model=coordinator_model,
+                    coordinator_tools=coordinator_tools,
+                    mcp_url=mcp_url,
+                    mcp_urls=resolved_mcp_urls,
+                    project_id=request.project_id,
+                    session_id=session_id,
+                    mode=stream_mode,
+                    is_disconnected=DisconnectSignal(http_request),
+                )
+
+            async for chunk in stream_source:
                 if isinstance(chunk, str):
                     yield f"data: {_json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
 
