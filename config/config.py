@@ -197,6 +197,44 @@ class Config:
     # not a passive diagnostic like the logging added earlier that day.
     coordinator_no_direct_writes: bool = os.getenv("COORDINATOR_NO_DIRECT_WRITES", "false").lower() == "true"
 
+    # Member-agent sampling caps -- the SAME repetition-loop/unbounded-completion failure
+    # diagnosed for the coordinator above (2026-08-10) and fixed there via
+    # coordinator_temperature/coordinator_max_tokens/coordinator_frequency_penalty was, until
+    # now, deliberately left unset for every member agent (ContextRouter, Researcher, Planner,
+    # Coder, Executor, Reviewer) -- on the assumption "Researcher/Coder plausibly benefit from
+    # more sampling variance" (see coordinator_temperature's own docstring). Confirmed live
+    # 2026-08-12 that this assumption does not hold: a phase-1 retest stalled for 4+ minutes
+    # inside a Researcher turn with the IDENTICAL signature the coordinator fix targets --
+    # steady real generation throughput (~22 tok/s) and a steadily growing GPU KV cache the
+    # whole time (vLLM's own `docker logs` metrics, not inferred), zero surfaced content, only
+    # RunContent events (member-level; the 2026-08-10 diagnosis explicitly noted every stall
+    # that day was TeamRunContent, coordinator-level, never this shape). Root cause confirmed
+    # in swarm/agents.py: every get_model() call building a member agent (make_agent_from_spec,
+    # make_coder, make_reviewer, make_planner, make_researcher, make_executor,
+    # make_context_router) passes only (model_id, host) -- temperature/max_tokens/
+    # frequency_penalty all fall through to get_model()'s None defaults, i.e. the exact
+    # pre-2026-08-10-fix configuration (temperature=1.0, unbounded max_tokens, no repetition
+    # penalty), still live for every member agent.
+    #
+    # Reuses the coordinator's own tuned temperature/frequency_penalty values rather than
+    # introducing separately-tuned ones -- the failure mode being targeted is identical, and
+    # frequency_penalty=0.15 was already specifically chosen (2026-08-10) as gentle enough not
+    # to interfere with tool-call formation, a concern equally applicable to any tool-calling
+    # member agent, not just the coordinator.
+    member_temperature: float = float(os.getenv("MEMBER_TEMPERATURE", "0.2"))
+    member_frequency_penalty: float = float(os.getenv("MEMBER_FREQUENCY_PENALTY", "0.15"))
+    # Output-length cap for every member agent EXCEPT Coder (see coder_max_tokens below) --
+    # same rationale as coordinator_max_tokens: bounds a repetition loop's worst case to a few
+    # minutes instead of tens, while staying generous for a normal prose analysis, plan, or
+    # review (4096 tokens is roughly 12-16K characters of English text).
+    member_max_tokens: int = int(os.getenv("MEMBER_MAX_TOKENS", "4096"))
+    # Coder gets its own, larger ceiling -- a large multi-hundred-line diff is denser and can
+    # legitimately need more output tokens than member_max_tokens budgets for prose roles.
+    # Still bounded, not unbounded: the point of this whole cap is to keep a Coder-side
+    # repetition loop from running for tens of minutes, just with more headroom before that
+    # cap is reached than a Researcher/Planner/Reviewer turn needs.
+    coder_max_tokens: int = int(os.getenv("CODER_MAX_TOKENS", "8192"))
+
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))
     session_window: int = int(os.getenv("AGNO_SESSION_WINDOW", "6"))

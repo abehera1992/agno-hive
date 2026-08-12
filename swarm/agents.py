@@ -145,9 +145,19 @@ def make_agent_from_spec(
     if catalog_text:
         instructions.append(catalog_text)
 
+    # Coder gets more max_tokens headroom (large diffs) than every other member agent --
+    # see config.coder_max_tokens/member_max_tokens for the full rationale. Matched by name
+    # since spec is a plain data object (teams/engineering.yaml's "name: Coder" entry), not a
+    # type distinct from the other member specs.
+    max_tokens = config.coder_max_tokens if spec.name == "Coder" else config.member_max_tokens
+
     return Agent(
         name=spec.name,
-        model=get_model(spec.model, config.ollama_host),
+        model=get_model(
+            spec.model, config.ollama_host,
+            temperature=config.member_temperature, max_tokens=max_tokens,
+            frequency_penalty=config.member_frequency_penalty,
+        ),
         tools=agent_tools,
         instructions=instructions,
         role=spec.role,
@@ -165,7 +175,11 @@ _COMMON_AGENT_KWARGS = dict(markdown=True, add_name_to_context=True, tool_call_l
 def make_coder(*mcps: MCPTools, tool_hooks: list | None = None) -> Agent:
     return Agent(
         name="Coder",
-        model=get_model(config.coder_model, config.ollama_host),
+        model=get_model(
+            config.coder_model, config.ollama_host,
+            temperature=config.member_temperature, max_tokens=config.coder_max_tokens,
+            frequency_penalty=config.member_frequency_penalty,
+        ),
         tools=list(mcps),
         tool_hooks=tool_hooks,
         description="Implementation specialist. Write clean, idiomatic code following existing patterns. Use apply_diff() for existing files, write_file() only for new ones.",
@@ -187,7 +201,11 @@ def make_coder(*mcps: MCPTools, tool_hooks: list | None = None) -> Agent:
 def make_reviewer(*mcps: MCPTools, tool_hooks: list | None = None) -> Agent:
     return Agent(
         name="Reviewer",
-        model=get_model(config.reviewer_model, config.ollama_host),
+        model=get_model(
+            config.reviewer_model, config.ollama_host,
+            temperature=config.member_temperature, max_tokens=config.member_max_tokens,
+            frequency_penalty=config.member_frequency_penalty,
+        ),
         tools=list(mcps),
         tool_hooks=tool_hooks,
         description="Code review specialist. Check correctness, security, and consistency. Flag real problems only — never style preferences.",
@@ -206,7 +224,11 @@ def make_reviewer(*mcps: MCPTools, tool_hooks: list | None = None) -> Agent:
 def make_planner(*mcps: MCPTools) -> Agent:
     return Agent(
         name="Planner",
-        model=get_model(config.planner_model, config.ollama_host),
+        model=get_model(
+            config.planner_model, config.ollama_host,
+            temperature=config.member_temperature, max_tokens=config.member_max_tokens,
+            frequency_penalty=config.member_frequency_penalty,
+        ),
         tools=list(mcps),
         description="Task decomposition specialist. Break complex tasks into numbered steps naming the responsible agent, files to touch, and risks.",
         instructions=[
@@ -225,7 +247,11 @@ def make_planner(*mcps: MCPTools) -> Agent:
 def make_researcher(*mcps: MCPTools) -> Agent:
     return Agent(
         name="Researcher",
-        model=get_model(config.researcher_model, config.ollama_host),
+        model=get_model(
+            config.researcher_model, config.ollama_host,
+            temperature=config.member_temperature, max_tokens=config.member_max_tokens,
+            frequency_penalty=config.member_frequency_penalty,
+        ),
         tools=list(mcps),
         description="Codebase investigation specialist. Read real files and ground every claim in file content — never describe from directory names alone.",
         instructions=[
@@ -244,7 +270,11 @@ def make_researcher(*mcps: MCPTools) -> Agent:
 def make_executor(*mcps: MCPTools) -> Agent:
     return Agent(
         name="Executor",
-        model=get_model(config.executor_model, config.ollama_host),
+        model=get_model(
+            config.executor_model, config.ollama_host,
+            temperature=config.member_temperature, max_tokens=config.member_max_tokens,
+            frequency_penalty=config.member_frequency_penalty,
+        ),
         tools=list(mcps),
         description="Execution and validation specialist. Run commands and report exact stdout/stderr — never paraphrase errors.",
         instructions=[
@@ -262,7 +292,11 @@ def make_executor(*mcps: MCPTools) -> Agent:
 def make_context_router(*mcps: MCPTools) -> Agent:
     return Agent(
         name="ContextRouter",
-        model=get_model(config.router_model, config.ollama_host),
+        model=get_model(
+            config.router_model, config.ollama_host,
+            temperature=config.member_temperature, max_tokens=config.member_max_tokens,
+            frequency_penalty=config.member_frequency_penalty,
+        ),
         tools=list(mcps),
         description="Lightweight query router. Pick the fastest retrieval path and return raw results — never interpret or answer yourself.",
         instructions=[

@@ -122,8 +122,8 @@ async def test_hook_prints_an_aborted_trace_line(capsys):
 
 
 # ── _build_team wiring: coordinator_temperature reaches the coordinator's model ────
-# (2026-08-10) -- only the coordinator, never member agents; see config.py's
-# coordinator_temperature docstring for why this is scoped that narrowly.
+# (2026-08-10) -- the coordinator gets its OWN tuned value, coordinator_temperature,
+# never member_temperature; see config.py's coordinator_temperature docstring.
 
 def test_build_team_passes_coordinator_temperature_to_the_coordinator_model(monkeypatch):
     monkeypatch.setattr("swarm.team.config.inference_backend", "vllm")
@@ -142,10 +142,19 @@ def test_build_team_passes_coordinator_temperature_to_the_coordinator_model(monk
     assert result.model.temperature == 0.3
 
 
-def test_build_team_does_not_apply_coordinator_temperature_to_member_agents(monkeypatch):
+def test_build_team_applies_member_temperature_not_coordinator_temperature_to_member_agents(monkeypatch):
+    """Confirmed live 2026-08-12: member agents (the fallback path here is
+    make_coder + make_reviewer, per _build_team's agent_specs=None branch) were left
+    on get_model()'s raw temperature=1.0 default because the 2026-08-10 coordinator
+    fix was scoped coordinator-only -- a Researcher turn stalled 4+ minutes with the
+    exact repetition-loop signature that fix targets. Members now get their own
+    config.member_temperature, deliberately a SEPARATE field from
+    coordinator_temperature (set to a different value here) so a future
+    coordinator-specific retune can't silently also retune every member agent."""
     monkeypatch.setattr("swarm.team.config.inference_backend", "vllm")
     monkeypatch.setattr("swarm.team.config.vllm_gateway_url", "http://litellm-host:4000/v1")
     monkeypatch.setattr("swarm.team.config.coordinator_temperature", 0.3)
+    monkeypatch.setattr("swarm.team.config.member_temperature", 0.7)
 
     result = _build_team(
         agent_specs=None,
@@ -157,12 +166,13 @@ def test_build_team_does_not_apply_coordinator_temperature_to_member_agents(monk
     )
 
     for member in result.members:
-        assert member.model.temperature is None
+        assert member.model.temperature == 0.7
 
 
 # ── _build_team wiring: coordinator_max_tokens reaches the coordinator's model ─────
-# (2026-08-10) -- only the coordinator, never member agents; see config.py's
-# coordinator_max_tokens docstring for why this is scoped that narrowly.
+# (2026-08-10) -- the coordinator gets its OWN tuned value, coordinator_max_tokens,
+# never member_max_tokens/coder_max_tokens; see config.py's coordinator_max_tokens
+# docstring.
 
 def test_build_team_passes_coordinator_max_tokens_to_the_coordinator_model(monkeypatch):
     monkeypatch.setattr("swarm.team.config.inference_backend", "vllm")
@@ -181,10 +191,16 @@ def test_build_team_passes_coordinator_max_tokens_to_the_coordinator_model(monke
     assert result.model.max_tokens == 4096
 
 
-def test_build_team_does_not_apply_coordinator_max_tokens_to_member_agents(monkeypatch):
+def test_build_team_applies_member_or_coder_max_tokens_not_coordinator_max_tokens(monkeypatch):
+    """Same live incident as the temperature test above. member.max_tokens must be
+    config.member_max_tokens (Reviewer) or config.coder_max_tokens (Coder) -- never
+    coordinator_max_tokens and never None -- distinct, separately-tunable fields set
+    to three different values here specifically to prove none of them alias."""
     monkeypatch.setattr("swarm.team.config.inference_backend", "vllm")
     monkeypatch.setattr("swarm.team.config.vllm_gateway_url", "http://litellm-host:4000/v1")
     monkeypatch.setattr("swarm.team.config.coordinator_max_tokens", 4096)
+    monkeypatch.setattr("swarm.team.config.member_max_tokens", 2048)
+    monkeypatch.setattr("swarm.team.config.coder_max_tokens", 8192)
 
     result = _build_team(
         agent_specs=None,
@@ -195,13 +211,14 @@ def test_build_team_does_not_apply_coordinator_max_tokens_to_member_agents(monke
         instructions=[],
     )
 
-    for member in result.members:
-        assert member.model.max_tokens is None
+    by_name = {member.name: member for member in result.members}
+    assert by_name["Coder"].model.max_tokens == 8192
+    assert by_name["Reviewer"].model.max_tokens == 2048
 
 
 # ── _build_team wiring: coordinator_frequency_penalty reaches the coordinator's model ──
-# (2026-08-10) -- only the coordinator, never member agents; see config.py's
-# coordinator_frequency_penalty docstring for why this is scoped that narrowly.
+# (2026-08-10) -- the coordinator gets its OWN tuned value, coordinator_frequency_penalty,
+# never member_frequency_penalty; see config.py's coordinator_frequency_penalty docstring.
 
 def test_build_team_passes_coordinator_frequency_penalty_to_the_coordinator_model(monkeypatch):
     monkeypatch.setattr("swarm.team.config.inference_backend", "vllm")
@@ -220,10 +237,12 @@ def test_build_team_passes_coordinator_frequency_penalty_to_the_coordinator_mode
     assert result.model.frequency_penalty == 0.4
 
 
-def test_build_team_does_not_apply_coordinator_frequency_penalty_to_member_agents(monkeypatch):
+def test_build_team_applies_member_frequency_penalty_not_coordinator_frequency_penalty(monkeypatch):
+    """Same live incident as the two tests above."""
     monkeypatch.setattr("swarm.team.config.inference_backend", "vllm")
     monkeypatch.setattr("swarm.team.config.vllm_gateway_url", "http://litellm-host:4000/v1")
     monkeypatch.setattr("swarm.team.config.coordinator_frequency_penalty", 0.4)
+    monkeypatch.setattr("swarm.team.config.member_frequency_penalty", 0.1)
 
     result = _build_team(
         agent_specs=None,
@@ -235,7 +254,7 @@ def test_build_team_does_not_apply_coordinator_frequency_penalty_to_member_agent
     )
 
     for member in result.members:
-        assert member.model.frequency_penalty is None
+        assert member.model.frequency_penalty == 0.1
 
 
 # ── _build_team wiring: interception hook shared across coordinator AND every member ──

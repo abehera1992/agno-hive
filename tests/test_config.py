@@ -83,3 +83,61 @@ def test_read_only_max_iterations_is_tighter_than_the_default_max_iterations():
     mod = _reload_config()
     cfg = mod.Config()
     assert cfg.read_only_max_iterations < cfg.max_iterations
+
+
+# ── Member-agent sampling caps (2026-08-12) ───────────────────────────────────────
+# Confirmed live: a Researcher turn stalled 4+ minutes with the same repetition-loop
+# signature the coordinator's own temperature/max_tokens/frequency_penalty fix
+# (2026-08-10) targets -- but that fix was scoped coordinator-only, leaving every
+# member agent on get_model()'s raw, unbounded defaults. See config.py's
+# member_temperature docstring for the full incident and swarm/agents.py for where
+# these are actually wired into every member-agent-building get_model() call.
+
+def test_member_temperature_default():
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.member_temperature == 0.2
+
+
+def test_member_temperature_from_env(monkeypatch):
+    monkeypatch.setenv("MEMBER_TEMPERATURE", "0.5")
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.member_temperature == 0.5
+
+
+def test_member_frequency_penalty_default():
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.member_frequency_penalty == 0.15
+
+
+def test_member_max_tokens_default():
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.member_max_tokens == 4096
+
+
+def test_coder_max_tokens_default():
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.coder_max_tokens == 8192
+
+
+def test_coder_max_tokens_is_larger_than_the_member_default():
+    """The whole point of a separate coder_max_tokens: Coder legitimately needs more
+    headroom for large diffs than a prose-output member agent does."""
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.coder_max_tokens > cfg.member_max_tokens
+
+
+def test_member_temperature_matches_the_coordinators_own_tuned_value_by_default():
+    """Reuses the coordinator's already-proven value rather than introducing a
+    separately-tuned one -- the failure mode being targeted is identical. Same-value
+    by default does not mean same field: test_agents_member_sampling_params.py
+    confirms retuning one does not silently retune the other."""
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.member_temperature == cfg.coordinator_temperature
+    assert cfg.member_frequency_penalty == cfg.coordinator_frequency_penalty

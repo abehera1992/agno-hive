@@ -143,9 +143,13 @@ async def test_ollama_backend_returns_ollama_tool_fix(monkeypatch):
 # coordinator_temperature docstring for the live evidence motivating this.
 
 async def test_temperature_defaults_to_none_when_not_passed(monkeypatch):
-    """Every existing caller of get_model() that doesn't pass temperature must be
-    completely unaffected -- this is the backward-compat guarantee for member
-    agents (make_coder, make_researcher, etc.), which intentionally do NOT pass it."""
+    """A caller that doesn't pass temperature must be completely unaffected -- this
+    is get_model()'s own backward-compat guarantee. (Historical note: until
+    2026-08-12, member agents -- make_coder, make_researcher, etc. -- were exactly
+    this "doesn't pass it" case, which is what let the coordinator's own
+    repetition-loop fix, config.coordinator_temperature, leave every member agent
+    unprotected. They now pass config.member_temperature/coder_max_tokens
+    explicitly -- see config.py's member_temperature docstring.)"""
     monkeypatch.setattr(config, "inference_backend", "vllm")
     monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
 
