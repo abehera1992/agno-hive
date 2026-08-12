@@ -221,3 +221,100 @@ async def test_stream_team_run_cancels_via_disconnect_checker_mid_stream(monkeyp
         )
 
     assert cancelled_run_ids == ["run-abc"]
+
+
+# ── _make_disconnect_checker's `.claimed` coordination (THIRD incident) ──────────
+# Confirmed live 2026-08-11, a third time: acancel_run (tested above) DOES fire
+# reliably, but api/server.py's OUTER _run_cancel_on_disconnect polling loop and
+# THIS inner checker both independently poll the same is_disconnected() on their
+# own ~2s timers. Whichever fires first starts cancelling/unwinding; if the other
+# ALSO fires while that unwind is mid-flight through nested anyio task-group
+# teardown (agno's MCP connection cleanup), the second cancellation delivery
+# corrupts anyio's per-task cancel-scope bookkeeping (confirmed via anyio's own
+# source: CancelScope.__exit__ raises "Attempted to exit a cancel scope that isn't
+# the current tasks's current cancel scope"), leaving the run in a state that never
+# resolves on its own. Fix: api.server.DisconnectSignal's shared `.claimed`
+# asyncio.Event, duck-typed here via getattr so a bare callable (every test above)
+# keeps working unchanged.
+
+
+class _FakeDisconnectSignal:
+    """Minimal stand-in for api.server.DisconnectSignal -- just the two things this
+    checker actually uses: an async __call__ and a shared `claimed` asyncio.Event."""
+
+    def __init__(self, disconnected: bool = True):
+        self.claimed = asyncio.Event()
+        self._disconnected = disconnected
+
+    async def __call__(self) -> bool:
+        return self._disconnected
+
+
+@pytest.mark.asyncio
+async def test_disconnect_checker_claims_the_signal_before_raising_when_unclaimed(monkeypatch):
+    monkeypatch.setattr(team, "_DISCONNECT_POLL_S", 0)
+
+    async def fake_acancel_run(run_id):
+        pass
+
+    monkeypatch.setattr(team, "acancel_run", fake_acancel_run)
+
+    signal = _FakeDisconnectSignal(disconnected=True)
+    assert not signal.claimed.is_set()
+
+    check = team._make_disconnect_checker(signal)
+    with pytest.raises(asyncio.CancelledError):
+        await check(_event(run_id="run-first-claim", event="TeamRunContent", content="x"))
+
+    # This checker is the one that detected the disconnect first -- it must have
+    # claimed the signal before raising, so api/server.py's outer loop stands down.
+    assert signal.claimed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_checker_stands_down_without_raising_when_already_claimed(monkeypatch):
+    """The regression case: the OUTER _run_cancel_on_disconnect loop claimed this
+    disconnect first (e.g. its own poll happened to land a moment earlier). This
+    checker must not ALSO raise CancelledError -- that second, uncoordinated
+    cancellation is exactly what corrupted anyio's cancel-scope bookkeeping live."""
+    monkeypatch.setattr(team, "_DISCONNECT_POLL_S", 0)
+    cancelled_run_ids = []
+
+    async def fake_acancel_run(run_id):
+        cancelled_run_ids.append(run_id)
+
+    monkeypatch.setattr(team, "acancel_run", fake_acancel_run)
+
+    signal = _FakeDisconnectSignal(disconnected=True)
+    signal.claimed.set()  # the outer loop already claimed this disconnect
+
+    check = team._make_disconnect_checker(signal)
+    # Must return quietly -- no CancelledError, even though is_disconnected() is True.
+    await check(_event(run_id="run-already-claimed", event="TeamRunContent", content="x"))
+
+    # acancel_run is still called: it's idempotent, and agno's own cancellation
+    # registry should know about the run regardless of which side "claimed" it --
+    # only the second raise (the dangerous part) is skipped.
+    assert cancelled_run_ids == ["run-already-claimed"]
+
+
+@pytest.mark.asyncio
+async def test_disconnect_checker_still_raises_for_a_bare_callable_without_claimed(monkeypatch):
+    """Backward compatibility: is_disconnected without a `.claimed` attribute (a bare
+    async callable -- what every test above this section passes, and what a caller
+    with no outer coordinator to worry about would still pass) is treated as "nobody
+    else is coordinating" and this still raises normally, unchanged from before this
+    fix."""
+    monkeypatch.setattr(team, "_DISCONNECT_POLL_S", 0)
+
+    async def fake_acancel_run(run_id):
+        pass
+
+    monkeypatch.setattr(team, "acancel_run", fake_acancel_run)
+
+    async def always_disconnected():
+        return True
+
+    check = team._make_disconnect_checker(always_disconnected)
+    with pytest.raises(asyncio.CancelledError):
+        await check(_event(run_id="run-bare-callable", event="TeamRunContent", content="x"))

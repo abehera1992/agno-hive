@@ -1796,11 +1796,29 @@ def _make_disconnect_checker(is_disconnected):
     this can't cover -- e.g. a disconnect before any event (and thus run_id) has
     arrived yet.
 
-    `is_disconnected` is an async callable returning bool (typically
-    `http_request.is_disconnected`), or None to disable disconnect checking entirely
-    (e.g. _verified_answer's retries when no request context is available) -- the
-    run_id capture still happens either way, harmlessly, in case a future caller wants
-    it.
+    `is_disconnected` is an async callable returning bool (typically an
+    api.server.DisconnectSignal instance), or None to disable disconnect checking
+    entirely (e.g. _verified_answer's retries when no request context is available) --
+    the run_id capture still happens either way, harmlessly, in case a future caller
+    wants it.
+
+    CRITICAL, confirmed live 2026-08-11 as a THIRD incident in this same area: if
+    `is_disconnected` is a DisconnectSignal, its shared `.claimed` Event is checked
+    before raising here, and set if not already set -- because api/server.py's OUTER
+    _run_cancel_on_disconnect polls the SAME is_disconnected() independently, on its
+    own timer. Without this coordination, both sides can detect the same disconnect
+    within moments of each other and BOTH act -- the outer task.cancel() landing while
+    THIS raise is already unwinding through nested async context managers (agno's MCP
+    connection cleanup) corrupts anyio's per-task cancel-scope bookkeeping (confirmed
+    via anyio's own source: CancelScope.__exit__ raises "Attempted to exit a cancel
+    scope that isn't the current tasks's current cancel scope" when a delivered
+    cancellation interleaves with its scope-stack updates mid-teardown), leaving the
+    run in a state that never resolves on its own -- a lingering ESTABLISHED
+    connection to LiteLLM and real ongoing vLLM generation, 10+ minutes after the
+    client had disconnected, ended only by restarting agno-api. See
+    api.server.DisconnectSignal's own docstring for the full mechanism. A bare
+    callable without a `.claimed` attribute (e.g. a raw lambda in a test) is treated
+    the same as "nobody else is coordinating" and this still raises normally.
     """
     state = {"run_id": None, "last_check": time.monotonic()}
 
@@ -1816,6 +1834,16 @@ def _make_disconnect_checker(is_disconnected):
         if await is_disconnected():
             if state["run_id"]:
                 await acancel_run(state["run_id"])
+            claimed = getattr(is_disconnected, "claimed", None)
+            if claimed is not None:
+                if claimed.is_set():
+                    # The outer _run_cancel_on_disconnect already claimed this
+                    # disconnect and is calling task.cancel() itself -- do not ALSO
+                    # raise here, that would be the second, uncoordinated
+                    # cancellation that corrupts anyio's cancel-scope bookkeeping.
+                    # Let asyncio's own normal task.cancel() delivery handle it.
+                    return
+                claimed.set()
             raise asyncio.CancelledError(
                 "client disconnected -- cancelled via agno's own run-cancellation API "
                 "(acancel_run), not just asyncio task cancellation"

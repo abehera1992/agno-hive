@@ -195,7 +195,46 @@ async def list_teams():
 _DISCONNECT_POLL_S = 2.0
 
 
-async def _run_cancel_on_disconnect(http_request, coro):
+class DisconnectSignal:
+    """Wraps http_request.is_disconnected() with a shared 'claimed' flag so the
+    OUTER polling loop below (_run_cancel_on_disconnect) and the INNER, independent
+    disconnect-checker inside the actual run (swarm/team.py's
+    _make_disconnect_checker, added 2026-08-11 to use agno's own native
+    acancel_run -- see its docstring) never BOTH act on the same disconnect.
+
+    Confirmed live 2026-08-11: both sides poll the SAME is_disconnected() on their
+    own ~_DISCONNECT_POLL_S-second timer, started at different moments -- so
+    whichever fires first starts cancelling/unwinding the run while the OTHER is
+    still on its own poll cycle. If that other side ALSO detects the disconnect and
+    calls task.cancel() (or raises its own CancelledError) while the first
+    cancellation is already unwinding through nested async context managers (here,
+    MCPTools.__aexit__ -> the mcp package's ClientSession.__aexit__ -> an anyio
+    TaskGroup.__aexit__), the second delivery lands in the middle of anyio's own
+    per-task cancel-scope bookkeeping and corrupts it: confirmed via anyio's own
+    source (_backends/_asyncio.py's CancelScope.__exit__) that "Attempted to exit a
+    cancel scope that isn't the current tasks's current cancel scope" is raised
+    when a task's tracked active scope doesn't match the scope trying to exit --
+    exactly what a cancellation delivered mid-teardown, interleaved with anyio's own
+    scope-stack updates, produces. The task was left in a state that never resolved
+    on its own (confirmed live: a lingering ESTABLISHED connection to LiteLLM, real
+    ongoing vLLM generation, ~10+ minutes after the client had disconnected -- ended
+    only by restarting agno-api).
+
+    `claimed` is checked-and-set synchronously (no `await` between the check and the
+    act) on both sides, so there is no window for the other side to slip in between
+    -- whichever side observes the disconnect first commits to handling it alone;
+    the other sees `claimed` already set and stands down.
+    """
+
+    def __init__(self, http_request):
+        self._http_request = http_request
+        self.claimed = asyncio.Event()
+
+    async def __call__(self) -> bool:
+        return await self._http_request.is_disconnected()
+
+
+async def _run_cancel_on_disconnect(http_request, coro, disconnect_signal: "DisconnectSignal | None" = None):
     """Await `coro`, but cancel it if the HTTP client goes away.
 
     Without this a client that times out, is Ctrl-C'd, or loses its connection leaves
@@ -213,6 +252,13 @@ async def _run_cancel_on_disconnect(http_request, coro):
     The poll interval is deliberately coarse. is_disconnected() on a request whose body
     is already consumed is cheap, but this runs for the entire life of a multi-minute
     task, and detecting an abandoned run 2s late costs nothing.
+
+    `disconnect_signal`, when supplied, coordinates with swarm/team.py's own
+    disconnect-checker inside the run itself -- see DisconnectSignal's docstring for
+    why calling task.cancel() here after that inner mechanism has ALREADY started
+    cancelling corrupts anyio's cancel-scope bookkeeping. None (the default) preserves
+    the original, always-call-task.cancel() behavior for any caller that doesn't pass
+    one.
     """
     task = asyncio.ensure_future(coro)
     try:
@@ -221,7 +267,13 @@ async def _run_cancel_on_disconnect(http_request, coro):
             if done:
                 return task.result()
             if await http_request.is_disconnected():
-                task.cancel()
+                if disconnect_signal is None or not disconnect_signal.claimed.is_set():
+                    if disconnect_signal is not None:
+                        disconnect_signal.claimed.set()
+                    task.cancel()
+                # Either this call just cancelled the task, or the inner mechanism
+                # already did (disconnect_signal.claimed was set first) -- either
+                # way, just wait for it to actually finish unwinding.
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
@@ -232,7 +284,10 @@ async def _run_cancel_on_disconnect(http_request, coro):
                 # the access log.
                 raise HTTPException(status_code=499, detail="client disconnected")
     except asyncio.CancelledError:
-        task.cancel()
+        if disconnect_signal is None or not disconnect_signal.claimed.is_set():
+            if disconnect_signal is not None:
+                disconnect_signal.claimed.set()
+            task.cancel()
         raise
 
 
@@ -288,6 +343,7 @@ async def run(request: RunRequest, http_request: Request):
     # history — report 0 injected context rather than the (unenforced) message count.
     context_size = 0 if is_chain_handoff else len(prior_messages)
 
+    disconnect_signal = DisconnectSignal(http_request)
     result, tokens, clarification = await _run_cancel_on_disconnect(
         http_request,
         run_task_async(
@@ -301,8 +357,9 @@ async def run(request: RunRequest, http_request: Request):
             session_id=session_id,
             mode=team_mode,
             read_only=request.read_only,
-            is_disconnected=http_request.is_disconnected,
+            is_disconnected=disconnect_signal,
         ),
+        disconnect_signal=disconnect_signal,
     )
 
     # Append this turn to session
@@ -434,6 +491,12 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
 
     async def generate():
         try:
+            # No outer _run_cancel_on_disconnect wraps /stream (Starlette's own
+            # StreamingResponse machinery stops calling generate() on disconnect
+            # instead), so there is no second, independent cancellation source to
+            # coordinate with here -- DisconnectSignal's .claimed flag is simply
+            # never contended in this path. Used anyway for a single consistent
+            # shape across both endpoints, matching /run's own wiring above.
             async for chunk in run_task_stream(
                 task=request.task,
                 agent_specs=agent_specs,
@@ -444,7 +507,7 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
                 project_id=request.project_id,
                 session_id=session_id,
                 mode=stream_mode,
-                is_disconnected=http_request.is_disconnected,
+                is_disconnected=DisconnectSignal(http_request),
             ):
                 if isinstance(chunk, str):
                     yield f"data: {_json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
