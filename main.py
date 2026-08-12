@@ -6,8 +6,15 @@ Usage:
   python main.py --serve-lightrag                            # LightRAG MCP server on LIGHTRAG_MCP_PORT (default 9002)
   python main.py --index --path /repo --project-id <id>     # index a repo into LightRAG
   python main.py --index --path /repo --project-id <id> --force  # force full reindex
+  python main.py --run-worker                                # internal: worker-process entrypoint for
+                                                               # api/server.py's process-boundary cancellation
+                                                               # (reads a run_task_async() payload from stdin,
+                                                               # writes one JSON result line to stdout). Not
+                                                               # meant to be invoked by hand -- see
+                                                               # api/server.py's _run_worker_subprocess().
 """
 import asyncio
+import json
 import sys
 from swarm.team import run_task_async
 from observability.setup import setup_telemetry
@@ -30,22 +37,95 @@ async def _interactive() -> None:
             print(result)
 
 
-if __name__ == "__main__":
+async def _run_worker() -> dict:
+    """Worker-process entrypoint for /run's process-boundary execution (see
+    DOCS.md "Process-Boundary Cancellation" for the full design). Reads a
+    pre-resolved run_task_async() kwargs payload from stdin (JSON — the parent,
+    api/server.py's /run handler, does all team/session/MCP-URL resolution
+    exactly as it always has; this process's only job is the actual
+    run_task_async call), runs it, and returns the result as a plain dict for
+    __main__ to print as the single JSON line on stdout.
+
+    Returns rather than prints directly: __main__ redirects sys.stdout to
+    stderr for the whole run (so every existing [team]/[api] print() call
+    throughout the codebase, unchanged, lands on stderr instead) and only
+    restores real stdout afterward, right before printing the result -- that
+    keeps the swap-and-restore in ONE place instead of threading a "real
+    stdout" handle through this function. The parent inherits this process's
+    stderr straight through to its own stdout/journald, so
+    `journalctl -u agno-api` keeps showing the exact same trace lines it
+    always has; only the mechanism producing them moved one process over.
+
+    Deliberately carries NO is_disconnected/cancellation-checking wiring at
+    all -- this process is SIGKILLed outright by the parent on disconnect,
+    never asked to cooperatively unwind. That is the entire point of this
+    design: four rounds of cooperative cancellation (agno's own
+    acancel_run/araise_if_cancelled, generic asyncio task.cancel(), a shared
+    claimed-flag between two independent checkers) each closed one specific
+    way cancellation could land wrong inside agno + MCP + anyio's nested
+    async call graph, and each was followed by a new way it still didn't. A
+    hard process kill doesn't depend on this process -- or anything it calls
+    into -- behaving correctly under cancellation pressure; the OS reclaims
+    every socket and every anyio scope unconditionally when the process dies.
+    """
+    from api.models import AgentSpec
+
+    try:
+        payload = json.loads(sys.stdin.read())
+        agent_specs = (
+            [AgentSpec(**d) for d in payload["agent_specs"]]
+            if payload.get("agent_specs") else None
+        )
+        content, tokens, clarification = await run_task_async(
+            task=payload["task"],
+            agent_specs=agent_specs,
+            coordinator_model=payload.get("coordinator_model"),
+            coordinator_tools=payload.get("coordinator_tools"),
+            mcp_url=payload.get("mcp_url"),
+            mcp_urls=payload.get("mcp_urls"),
+            project_id=payload.get("project_id", "default"),
+            session_id=payload.get("session_id"),
+            mode=payload.get("mode", "coordinate"),
+            read_only=payload.get("read_only", False),
+        )
+        return {"content": content, "tokens": tokens, "clarification": clarification}
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _run_worker_main() -> None:
+    """Redirects stdout -> stderr BEFORE anything (including setup_telemetry()'s
+    own startup print) can write to it -- stdout must carry ONLY the final JSON
+    result line, nothing else, or the parent's single-line parse breaks."""
+    real_stdout = sys.stdout
+    sys.stdout = sys.stderr
     setup_telemetry()
-    if "--serve" in sys.argv:
+    result = asyncio.run(_run_worker())
+    sys.stdout = real_stdout
+    print(json.dumps(result), flush=True)
+
+
+if __name__ == "__main__":
+    if "--run-worker" in sys.argv:
+        _run_worker_main()
+    elif "--serve" in sys.argv:
+        setup_telemetry()
         import uvicorn
         from api.server import app
         from config.config import config
         print(f"[agno-hive] starting on 0.0.0.0:{config.api_port}")
         uvicorn.run(app, host="0.0.0.0", port=config.api_port)
     elif "--serve-lightrag" in sys.argv:
+        setup_telemetry()
         from config.config import config
         from lightrag_mcp.server import mcp
         print(f"[agno-hive] lightrag-mcp starting on 0.0.0.0:{config.lightrag_mcp_port}")
         mcp.run(transport="streamable-http")
     elif "--index" in sys.argv:
+        setup_telemetry()
         sys.argv.remove("--index")
         from indexer.cli import main as index_main
         index_main()
     else:
+        setup_telemetry()
         asyncio.run(_interactive())

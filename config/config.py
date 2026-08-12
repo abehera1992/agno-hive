@@ -235,6 +235,22 @@ class Config:
     # cap is reached than a Researcher/Planner/Reviewer turn needs.
     coder_max_tokens: int = int(os.getenv("CODER_MAX_TOKENS", "8192"))
 
+    # Process-boundary cancellation (Phase 1, 2026-08-12) -- see DOCS.md "Process-Boundary
+    # Cancellation" for the full design. /run's default path still calls run_task_async()
+    # in-process, cancelled cooperatively (api/server.py's _run_cancel_on_disconnect +
+    # swarm/team.py's _make_disconnect_checker) -- the same machinery responsible for four
+    # rounds of anyio cancel-scope corruption this stack has hit. When true, /run instead
+    # spawns `python main.py --run-worker` as a genuinely separate OS process
+    # (api/server.py's _run_worker_subprocess()) and SIGKILLs it outright on disconnect --
+    # no cooperative unwind, no anyio scope negotiation, because none of that code needs to
+    # run for the OS to correctly reclaim every socket and file descriptor when the process
+    # dies. Off by default until validated live against a deliberately-reproduced stall
+    # (same methodology as every other fix in this run: confirm zero lingering vLLM
+    # throughput and zero anyio errors after a kill, not just that the endpoint returned).
+    # Only /run is wired so far -- /stream needs an NDJSON-over-stdout protocol instead of
+    # this single-JSON-line one, deferred to a later phase.
+    use_worker_process_isolation: bool = os.getenv("USE_WORKER_PROCESS_ISOLATION", "false").lower() == "true"
+
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))
     session_window: int = int(os.getenv("AGNO_SESSION_WINDOW", "6"))

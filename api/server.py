@@ -1,6 +1,7 @@
 """AgnoHive FastAPI server — accepts task requests from remote clients over Tailscale."""
 import asyncio
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -291,6 +292,90 @@ async def _run_cancel_on_disconnect(http_request, coro, disconnect_signal: "Disc
         raise
 
 
+_WORKER_POLL_S = 2.0
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+async def _run_worker_subprocess(
+    http_request, payload: dict, argv: list[str] | None = None
+) -> tuple[str, dict, dict | None]:
+    """Runs run_task_async() in an isolated child process (`python main.py
+    --run-worker`, see main.py's _run_worker()) instead of in-process. See
+    DOCS.md "Process-Boundary Cancellation" for the full design.
+
+    Why: four rounds of cooperative cancellation in this codebase -- agno's own
+    acancel_run/araise_if_cancelled, generic asyncio task.cancel(), a shared
+    claimed-flag between two independent checkers (DisconnectSignal above), and
+    tracking every observed run_id instead of just the first -- each closed one
+    specific way cancellation could land wrong inside agno + MCP + anyio's
+    nested async call graph, and each was followed by a NEW way it still
+    didn't (most recently: cancelling several run_ids from the same event in
+    rapid succession still corrupted anyio's cancel-scope bookkeeping when
+    their generators shared overlapping async context managers). That pattern
+    -- a new interaction breaking after every fix -- is itself the signal:
+    cooperative cancellation across a framework we don't control has run out
+    of ROI. This sidesteps the whole bug class rather than looking for a fifth
+    fix: on disconnect the child process is SIGKILLed outright. The OS
+    reclaims every open socket and every anyio scope unconditionally when a
+    process dies -- no cooperation from agno's internals required, because
+    none of that cleanup code needs to run at all for the kernel to free the
+    resources.
+
+    `payload` is the exact kwargs run_task_async() would take, JSON-encoded --
+    see main.py's _run_worker() for the receiving side. `argv` defaults to the
+    real worker command; tests override it to spawn a small fixture script
+    instead, so this can be exercised without the real agno/MCP/vLLM stack.
+
+    Mirrors _run_cancel_on_disconnect's own polling shape deliberately -- same
+    structure, so the one difference (kill vs. cooperative cancel) is the only
+    thing a reader familiar with the old code needs to notice.
+    """
+    argv = argv or [sys.executable, "main.py", "--run-worker"]
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=None,  # inherit -- child's stderr (every [team]/[api] print, unchanged)
+                      # flows straight into this process's own stdout/journald
+        cwd=str(_REPO_ROOT),
+    )
+    proc.stdin.write(json.dumps(payload).encode())
+    proc.stdin.write_eof()
+    await proc.stdin.drain()
+
+    task = asyncio.ensure_future(proc.communicate())
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=_WORKER_POLL_S)
+            if done:
+                stdout_data, _ = task.result()
+                break
+            if await http_request.is_disconnected():
+                proc.kill()
+                await proc.wait()
+                print("[api] client disconnected — worker process killed, GPU work aborted")
+                raise HTTPException(status_code=499, detail="client disconnected")
+    except asyncio.CancelledError:
+        proc.kill()
+        raise
+
+    if proc.returncode != 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"worker process exited with code {proc.returncode}",
+        )
+
+    try:
+        result = json.loads(stdout_data.decode())
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"worker process produced unparseable output: {exc}"
+        )
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=result["error"])
+    return result["content"], result["tokens"], result["clarification"]
+
+
 @app.post("/run", response_model=RunResponse)
 async def run(request: RunRequest, http_request: Request):
     from api.models import SessionMeta
@@ -343,24 +428,45 @@ async def run(request: RunRequest, http_request: Request):
     # history — report 0 injected context rather than the (unenforced) message count.
     context_size = 0 if is_chain_handoff else len(prior_messages)
 
-    disconnect_signal = DisconnectSignal(http_request)
-    result, tokens, clarification = await _run_cancel_on_disconnect(
-        http_request,
-        run_task_async(
-            task=request.task,
-            agent_specs=agent_specs,
-            coordinator_model=coordinator_model,
-            coordinator_tools=coordinator_tools,
-            mcp_url=mcp_url,
-            mcp_urls=_resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url),
-            project_id=request.project_id,
-            session_id=session_id,
-            mode=team_mode,
-            read_only=request.read_only,
-            is_disconnected=disconnect_signal,
-        ),
-        disconnect_signal=disconnect_signal,
-    )
+    resolved_mcp_urls = _resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url)
+
+    if config.use_worker_process_isolation:
+        # Phase 1 of process-boundary cancellation (see DOCS.md) -- SIGKILLs a
+        # genuinely separate OS process on disconnect instead of cooperatively
+        # cancelling in-process. Feature-flagged off by default until validated
+        # live; see config.use_worker_process_isolation's own docstring.
+        worker_payload = {
+            "task": request.task,
+            "agent_specs": [a.model_dump() for a in agent_specs] if agent_specs else None,
+            "coordinator_model": coordinator_model,
+            "coordinator_tools": coordinator_tools,
+            "mcp_url": mcp_url,
+            "mcp_urls": resolved_mcp_urls,
+            "project_id": request.project_id,
+            "session_id": session_id,
+            "mode": team_mode,
+            "read_only": request.read_only,
+        }
+        result, tokens, clarification = await _run_worker_subprocess(http_request, worker_payload)
+    else:
+        disconnect_signal = DisconnectSignal(http_request)
+        result, tokens, clarification = await _run_cancel_on_disconnect(
+            http_request,
+            run_task_async(
+                task=request.task,
+                agent_specs=agent_specs,
+                coordinator_model=coordinator_model,
+                coordinator_tools=coordinator_tools,
+                mcp_url=mcp_url,
+                mcp_urls=resolved_mcp_urls,
+                project_id=request.project_id,
+                session_id=session_id,
+                mode=team_mode,
+                read_only=request.read_only,
+                is_disconnected=disconnect_signal,
+            ),
+            disconnect_signal=disconnect_signal,
+        )
 
     # Append this turn to session
     await append_message(session_id, "user", request.task)
