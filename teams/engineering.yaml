@@ -19,7 +19,6 @@ agents:
       - find_files
       - search_files
       - list_directory
-      - get_file_content
       - search_knowledge_graph
       - lightrag_query
       - web_search
@@ -28,7 +27,6 @@ agents:
     skills:
       - verification-discipline
     instructions:
-      - "SESSION CONTEXT: At session start, try get_file_content('hive.md') once — it has a pre-built directory tree and per-module summaries. Skip silently if not found."
       - You are a lightweight routing agent. Decide the fastest way to retrieve context for a query.
       - Always use tools that are actually available — check the connected MCP, do not assume tool names.
       - "Rules:"
