@@ -2200,7 +2200,18 @@ async def _run_heartbeat(
             f"{event_count_str}, coordinator still running",
             flush=True,
         )
-        if event_count is not None and event_count == last_event_count and since_last_tool >= interval:
+        last_progress_at = activity.get("last_progress_at")
+        if last_progress_at is not None:
+            # Preferred signal (2026-08-14, see the activity-dict-setup comment in
+            # run_task_async for the incident this closes): real progress (content or
+            # a tool event) landing, not just any raw stream event arriving.
+            is_stagnant = (now - last_progress_at) >= interval
+        else:
+            # Backward compat: a caller that never tracks last_progress_at (older
+            # tests, _stream_team_run's own retry-loop activity dict) keeps the
+            # original event-count-based judgment, unchanged.
+            is_stagnant = event_count is not None and event_count == last_event_count and since_last_tool >= interval
+        if is_stagnant:
             stagnant_ticks += 1
         else:
             stagnant_ticks = 0
@@ -2434,7 +2445,23 @@ async def run_task_async(
         # the heartbeat still fires even during a stretch with zero stream events of any
         # kind, which the content logging alone would not catch. See
         # _make_tool_interception_hook's docstring for the hook itself.
-        activity = {"last_call_name": None, "last_call_at": time.monotonic(), "stream_event_count": 0}
+        #
+        # last_progress_at (2026-08-14): separate from stream_event_count below on
+        # purpose -- see DOCS.md "Liveness-Based Auto-Kill" addendum. Only advances
+        # when the stream loop below classifies an event as real content or a real
+        # tool event, never on an empty/unrecognized one, so _run_heartbeat can tell
+        # "events keep arriving" apart from "events keep arriving AND at least one of
+        # them was real progress." Live 2026-08-13/14: a Researcher's tool calls were
+        # all being silently rejected by agno's own tool_call_limit (exceeded
+        # mid-run) -- agno yields zero stream event for a rejected call, but the
+        # model's own contentless turn still produced a RunContent event each time,
+        # so stream_event_count climbed continuously for 700+s with zero real
+        # progress, and the old stagnant_ticks check (keyed purely on
+        # stream_event_count going unchanged) never fired.
+        activity = {
+            "last_call_name": None, "last_call_at": time.monotonic(),
+            "stream_event_count": 0, "last_progress_at": time.monotonic(),
+        }
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
             read_only=read_only, skill_catalog=skill_catalog, activity=activity,
@@ -2491,6 +2518,7 @@ async def run_task_async(
                             activity["stream_event_count"] += 1
                             out = _stream_event_to_chunk(event)
                             if isinstance(out, str):
+                                activity["last_progress_at"] = time.monotonic()
                                 full_content.append(out)
                                 now = time.monotonic()
                                 if now - last_logged_at >= 10:
@@ -2504,6 +2532,7 @@ async def run_task_async(
                                     last_logged_at = now
                                     last_logged_len = len(joined)
                             elif isinstance(out, dict):
+                                activity["last_progress_at"] = time.monotonic()
                                 print(f"[team] stream tool event: {out}", flush=True)
                             else:
                                 # Diagnostic (2026-08-10, revised): the first version of this

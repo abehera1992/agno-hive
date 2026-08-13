@@ -250,6 +250,100 @@ async def test_new_stream_content_resets_stagnant_seconds_even_without_a_tool_ca
     assert snapshot["stagnant_seconds"] == 0
 
 
+# ── last_progress_at (2026-08-14): closes a gap the two tests above don't cover ─
+# -- stream_event_count climbing does NOT always mean real progress. Live
+# investigation 2026-08-13/14 found a Researcher stuck 700+s with vLLM generating
+# real tokens every ~2s (event_count climbing continuously) while every single
+# RunContent event carried content='' -- agno's own tool_call_limit enforcement
+# (agno/models/base.py:run_function_calls) silently rejects a tool call once the
+# per-agent cumulative count is exceeded (appends an error Message, `continue`s --
+# yields NO stream event for the rejected call), and nothing forces the model to
+# stop retrying. The OLD stagnation check (event_count == last_event_count) never
+# fired here because raw event_count kept growing from the empty RunContent
+# events themselves. last_progress_at is a NEW, separate signal the caller updates
+# only when _stream_event_to_chunk returns real content or a tool event (never on
+# an empty/unrecognized one) -- when present, _run_heartbeat prefers it over the
+# raw event-count check; when absent (every test above, and any older caller),
+# behavior is byte-for-byte unchanged.
+
+@pytest.mark.asyncio
+async def test_stagnant_seconds_grows_when_events_keep_arriving_but_carry_no_progress(tmp_path):
+    """The exact bug: stream_event_count climbs every tick (as if raw events keep
+    arriving) but last_progress_at never advances (as if every event is an empty,
+    silently-rejected tool-call turn) -- must still be judged stagnant."""
+    liveness_path = tmp_path / "liveness.json"
+    activity = {
+        "last_call_name": "search_files",
+        "last_call_at": time.monotonic() - 100,
+        "stream_event_count": 0,
+        "last_progress_at": time.monotonic() - 100,  # no real progress in 100s
+    }
+    task = asyncio.create_task(
+        _run_heartbeat(activity, time.monotonic(), interval=0.05, liveness_path=str(liveness_path))
+    )
+    for _ in range(3):
+        await asyncio.sleep(0.05)
+        activity["stream_event_count"] += 40  # raw events keep pouring in...
+        # ...but last_progress_at is deliberately NOT touched
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    snapshot = json.loads(liveness_path.read_text())
+    assert snapshot["stagnant_seconds"] >= 0.05 * 2
+
+
+@pytest.mark.asyncio
+async def test_last_progress_at_being_refreshed_keeps_stagnant_seconds_at_zero(tmp_path):
+    """Sanity check on the other side: when last_progress_at DOES keep advancing
+    (real content or a real tool call landing), stagnant_seconds must stay zero --
+    same guarantee test_new_stream_content_resets_stagnant_seconds_even_without_a_tool_call
+    gives the old signal, now proven for the new one."""
+    liveness_path = tmp_path / "liveness.json"
+    activity = {
+        "last_call_name": "x",
+        "last_call_at": time.monotonic() - 100,
+        "stream_event_count": 0,
+        "last_progress_at": time.monotonic(),
+    }
+    task = asyncio.create_task(
+        _run_heartbeat(activity, time.monotonic(), interval=0.03, liveness_path=str(liveness_path))
+    )
+    for _ in range(8):
+        await asyncio.sleep(0.01)
+        activity["last_progress_at"] = time.monotonic()  # real progress landing repeatedly
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    snapshot = json.loads(liveness_path.read_text())
+    assert snapshot["stagnant_seconds"] == 0
+
+
+@pytest.mark.asyncio
+async def test_absent_last_progress_at_falls_back_to_the_old_event_count_check(tmp_path):
+    """Backward compat, explicit: a caller that never sets last_progress_at (every
+    test above this section, and _stream_team_run's own retry-loop activity dict,
+    which doesn't track it) must behave exactly as before -- judged by raw
+    stream_event_count staying unchanged, not by the new field's absence."""
+    liveness_path = tmp_path / "liveness.json"
+    activity = {
+        "last_call_name": "x",
+        "last_call_at": time.monotonic() - 100,
+        "stream_event_count": 3,  # never changes across ticks below, no last_progress_at key at all
+    }
+    task = asyncio.create_task(
+        _run_heartbeat(activity, time.monotonic(), interval=0.05, liveness_path=str(liveness_path))
+    )
+    await asyncio.sleep(0.17)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    snapshot = json.loads(liveness_path.read_text())
+    assert snapshot["stagnant_seconds"] >= 0.05 * 2
+
+
 @pytest.mark.asyncio
 async def test_liveness_write_failure_does_not_crash_the_heartbeat(tmp_path, capsys):
     """A bookkeeping side effect must never take down the run it's watching --
