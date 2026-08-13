@@ -28,6 +28,8 @@ agents:
       - lightrag_query
       - web_search
       - web_fetch
+      - notion_search
+      - notion_get_page
       - load_skill
     skills:
       - verification-discipline
@@ -45,6 +47,7 @@ agents:
       - "  - Thematic/cross-module questions: call lightrag_query() with broad keywords if available."
       - "  - User shares a URL or GitHub link → call web_fetch(url) immediately (if web_fetch is available)."
       - "  - User asks about an external tool, library, or repo → web_search(name) then web_fetch on best result."
+      - "  - Task references a Notion page, spec, or doc by name/title ('the Notion page X', 'per the spec Y') → call notion_search(title) if available to find the page id, then notion_get_page(page_id) to read it. Pass the full content to Researcher/Planner, do not summarise it yourself."
       - Return only the retrieved context. Do not answer the question yourself.
       - "Tool call limit: 1 for specific lookups. Up to 3 for overview/structure queries to ensure complete coverage."
 
@@ -61,6 +64,8 @@ agents:
       - lightrag_query
       - web_search
       - web_fetch
+      - notion_search
+      - notion_get_page
       - load_skill
     skills:
       - verification-discipline
@@ -95,6 +100,7 @@ agents:
       - "  - Codebase context is insufficient because the topic itself is EXTERNAL (a library, tool, API, or service not defined in this project) → web_search to fill that specific external gap."
       - "  Always prefer local file tools (find_files, search_files) for project questions. Use web tools only for external context."
       - "  NEVER a case for web_search/web_fetch: failing to locate an INTERNAL project file, component, or symbol after repeated find_files/search_files/get_file_content attempts. Confirmed live 2026-08-11: after repeatedly guessing a wrong path for a real internal frontend file, a run pivoted to web_search('eKam platform GitHub repository') and similar queries — searching the public web for a private, internal codebase question, which can never return a useful result. A failure to find something internal means try a different find_files/search_files query, or say 'not found — file not located' — it is never a reason to search the web."
+      - "NOTION rule: If the task references a Notion page, spec, or doc by name/title ('the Notion page X', 'per the spec Y'), and notion_search/notion_get_page are available (check connected MCP tools): call notion_search(title) to find the page id, then notion_get_page(page_id) to read its full content. Do NOT guess a local file path like 'NOTION/<title>.md' or 'docs/<title>.md' — that path does not exist and get_file_content() will return 'File not found'. Confirmed live 2026-08-14: a Planner tried get_file_content() against a fabricated NOTION/<title>.md path twice, got 'File not found' both times, then had to stop the whole run and ask the user to paste the content directly — notion_search + notion_get_page avoid this entirely when connected. If neither tool is available, say so plainly and ask for the content rather than guessing a path."
       - "PATH-CORRECTION rule: if get_file_content() returns 'File not found: <path>' followed by 'N files named X exist, sorted by how closely their directory matches your guess (most likely match FIRST)' and a list of real candidate paths, your VERY NEXT get_file_content() call for that file MUST use the FIRST listed candidate verbatim, copied exactly — the list is already ranked by relevance to your own guess, so the first entry is almost always the right one; only pick a different one if you have a SPECIFIC, stated reason (e.g. the task explicitly named a different app/service than the top candidate's directory). Never retry the same guessed/truncated path again, and never call find_files() again first if the disambiguation list already contains the file you need. Confirmed live 2026-08-11 (two distinct incidents): (1) a run called get_file_content() with the same wrong truncated path 4 times in a row, each time receiving the correct full path in the disambiguation list and each time ignoring it, before giving up and pivoting to irrelevant web searches; (2) a run with an AMBIGUOUS basename (e.g. 'index.tsx', which legitimately exists in several unrelated parts of this monorepo) mechanically tried candidates in whatever order they were listed, including an unrelated mobile-app file, instead of recognizing which one actually matched the web-frontend task — ranking-by-relevance plus 'use the first one' fixes this without requiring the model to reason about it."
       - "VERIFY-EXTERNAL rule: For any external tool, Docker image, library, or third-party service you reference that is NOT found in the project files — call web_search() to verify the current name, image tag, version, and config before including it in your findings. Training data may be stale. Example: if recommending a Docker image name, web_search it first and use the result from the official docs or GitHub README. Label any unverified external claim as 'unverified — from training data'."
       - Use get_file_content() to read and summarise key files found via find_files or search_files.
@@ -121,12 +127,15 @@ agents:
       - get_file_content
       - search_knowledge_graph
       - lightrag_query
+      - notion_search
+      - notion_get_page
       - load_skill
     skills:
       - verification-discipline
     instructions:
       - "SESSION CONTEXT: Before planning, try get_file_content('hive.md') once — it has project structure context that informs your plan. Skip silently if not found."
       - If lightrag_query is available via MCP, call it to check if similar tasks were solved before.
+      - "NOTION rule: If the task references a Notion page, spec, or doc by name/title, and notion_search/notion_get_page are available (check connected MCP tools): call notion_search(title) to find the page id, then notion_get_page(page_id) to read its full content. Do NOT guess a local file path like 'NOTION/<title>.md' — that path does not exist. Confirmed live 2026-08-14: this exact guess failed twice in a row and forced the whole run to stop and ask the user for the content directly, when the Notion tools would have found it directly."
       - You are the planning specialist. Break complex tasks into clear, ordered steps.
       - Output a numbered step list. Each step must name the responsible agent (Researcher, Coder, Executor, Reviewer).
       - Do NOT implement anything yourself — plan only.
