@@ -30,6 +30,12 @@ What it catches, honestly stated:
     claim about it is false. Deciding that needs to read intent, which is what a
     reviewer or a human is for. This tool marks the symbol FOUND and says nothing
     about the claim.
+  * PROPOSED/NEW CODE — deliberately NOT checked as an existence claim. A symbol
+    introduced by a "new/add/create/propose" cue in prose, or found only in a fenced
+    code block when nothing was actually staged this task, is reported separately
+    under PROPOSED and never counted toward the fabrication verdict — a task whose
+    job is "propose the code changes needed" legitimately names things that don't
+    exist yet, and that is not the same failure this tool exists to catch.
 Treat a clean report as "nothing provably invented", never as "the answer is correct".
 """
 
@@ -149,6 +155,45 @@ def _is_negated_claim(answer: str, start: int, end: int) -> bool:
         return True
     after = answer[end:end + _NEGATION_WINDOW + 20]
     return bool(_NEGATION_AFTER_RE.match(after))
+
+
+# A "new/add/propose" cue shortly before a backticked span means the answer is
+# describing code to CREATE, not asserting it already exists -- verify_claims exists
+# to catch fabricated EXISTENCE claims, and a task whose whole point is "propose the
+# code changes needed" will legitimately name symbols that do not exist yet. Measured
+# live 2026-08-14: a read-only Phase-1 gap-analysis proposal (EkamApp parties module)
+# wrote "Add handlers: `openAddLocationModal`, `handleAddRegistration`,
+# `handleAddLocation`" and "Add a `stateOptions` list" -- both plain descriptions of
+# NEW code to write -- and every one of those symbols was reported NOT FOUND with a
+# "fix the answer before returning it -- this is fabrication" verdict, even though the
+# answer's own text explicitly said to ADD them.
+#
+# Window is wider than negation's (_NEGATION_WINDOW=20) on purpose: a real answer
+# states the cue ONCE ("Add handlers:") and then lists several comma-separated
+# backticked names after it, not one cue per name -- the 2nd and 3rd names in that
+# exact incident sit ~40-65 chars past the word "Add". Widening the window trades a
+# small amount of precision (an unrelated "add" mentioned earlier in a long sentence
+# could in principle suppress a real check) for closing a false-fabrication verdict
+# that otherwise fires on nearly every code-proposal task -- the more common and more
+# costly failure of the two, consistent with this file's own acknowledged limits (see
+# the module docstring's MISATTRIBUTED SYMBOLS note: this tool has never claimed to
+# read intent perfectly).
+_PROPOSED_NEW_WINDOW = 90
+_PROPOSED_NEW_CUE_RE = re.compile(
+    r"\b(add(?:ing|ed|s)?|new|create[sd]?|creating|introduc(?:e|es|ing)|"
+    r"propose[sd]?|proposing|required)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_proposed_new_claim(answer: str, start: int) -> bool:
+    """True if the text shortly before this backticked span frames it as NEW code
+    the answer is proposing to add, rather than an assertion that it already exists.
+    See _PROPOSED_NEW_CUE_RE's comment for the window-width tradeoff."""
+    before = answer[max(0, start - _PROPOSED_NEW_WINDOW):start]
+    return bool(_PROPOSED_NEW_CUE_RE.search(before))
+
+
 _CODE_DOTTED_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\b")
 
 _FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*\s*?\n(.*?)```", re.S)
@@ -434,35 +479,81 @@ def _code_idents(answer: str) -> list[str]:
     missed all three.
     """
     idents: list[str] = []
-
-    def _collect(text: str) -> None:
-        for m in _CODE_DOTTED_RE.finditer(text):
-            # A dotted-looking match immediately preceded by ANOTHER "." is a chained
-            # CSS/SCSS class selector (".foo.bar" -- "element needs both classes"),
-            # not a dotted member-access expression. Measured live 2026-08-05: staged
-            # CSS ".statusBadge.success { ... }" produced a "statusBadge.success"
-            # match indistinguishable from a real dotted identifier, and since that
-            # exact compound-selector text can never appear anywhere BUT the file
-            # currently being staged (it's brand new), it always reports NOT FOUND --
-            # flagging correct, newly-introduced CSS as fabrication and triggering an
-            # unnecessary correction retry.
-            if m.start() > 0 and text[m.start() - 1] == ".":
-                continue
-            tok = m.group(0)
-            left = tok.split(".", 1)[0].lower()
-            if left in _STDLIB_PREFIXES or left in _NOISE:
-                continue
+    for block in _FENCE_RE.findall(answer or ""):
+        for tok in _dotted_idents(block):
+            if tok not in idents:
+                idents.append(tok)
+    for path in _staged_files():
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for tok in _dotted_idents(text):
             if tok not in idents:
                 idents.append(tok)
 
-    for block in _FENCE_RE.findall(answer or ""):
-        _collect(block)
-    for path in _staged_files():
-        try:
-            _collect(path.read_text(encoding="utf-8", errors="replace"))
-        except Exception:
-            continue
+    return idents
 
+
+def _dotted_idents(text: str) -> list[str]:
+    """Dotted attribute-access tokens (item.stock_quantity, Model.field) in `text`.
+    Extracted from _code_idents (2026-08-14) so _proposed_code_block_idents below can
+    reuse the identical extraction/filtering logic per-fence instead of per-answer."""
+    out: list[str] = []
+    for m in _CODE_DOTTED_RE.finditer(text):
+        # A dotted-looking match immediately preceded by ANOTHER "." is a chained
+        # CSS/SCSS class selector (".foo.bar" -- "element needs both classes"),
+        # not a dotted member-access expression. Measured live 2026-08-05: staged
+        # CSS ".statusBadge.success { ... }" produced a "statusBadge.success"
+        # match indistinguishable from a real dotted identifier, and since that
+        # exact compound-selector text can never appear anywhere BUT the file
+        # currently being staged (it's brand new), it always reports NOT FOUND --
+        # flagging correct, newly-introduced CSS as fabrication and triggering an
+        # unnecessary correction retry.
+        if m.start() > 0 and text[m.start() - 1] == ".":
+            continue
+        tok = m.group(0)
+        left = tok.split(".", 1)[0].lower()
+        if left in _STDLIB_PREFIXES or left in _NOISE:
+            continue
+        if tok not in out:
+            out.append(tok)
+    return out
+
+
+# How far back (chars) to look before a fenced code block's opening ``` for a
+# new/add/propose cue heading -- generous enough for a markdown heading line plus a
+# blank line ("##### Proposed Code Insertion\n\n```tsx"), narrow enough that it
+# won't reach back into a PRIOR fence's own trailing prose.
+_PROPOSED_FENCE_WINDOW = 200
+
+
+def _proposed_code_block_idents(answer: str) -> set[str]:
+    """Dotted identifiers from a fenced code block in the answer's own prose whose
+    IMMEDIATELY PRECEDING text carries a new/add/propose cue (_PROPOSED_NEW_CUE_RE)
+    -- e.g. a heading like "Proposed Code Insertion" or "Required State Variables
+    (add to ...)" right before the fence. These are the answer's own new-code
+    illustration, not an existence claim (see _is_proposed_new_claim's docstring for
+    the live incident this closes).
+
+    Deliberately scoped to the answer's fences ONLY, never *.hive_proposed staged
+    file content -- a symbol that made it into an actually-staged file is real code
+    about to ship and must stay on the strict _code_idents path unconditionally,
+    same as before this fix.
+
+    A fence with no such preceding cue (a plain "here is the existing code" snippet)
+    is excluded here and stays on the normal strict path via _code_idents -- an
+    earlier version of this fix gated on whether ANYTHING was staged anywhere in the
+    project, which correctly caught the real incident but also wrongly relabeled a
+    plain "show me how X is used" quote of EXISTING code as a new-code proposal,
+    since a read-only Q&A call also has no staged file. Checking each fence's own
+    preceding text instead of a project-wide toggle fixes both at once.
+    """
+    idents: set[str] = set()
+    for m in _FENCE_RE.finditer(answer or ""):
+        window = answer[max(0, m.start() - _PROPOSED_FENCE_WINDOW):m.start()]
+        if _PROPOSED_NEW_CUE_RE.search(window):
+            idents.update(_dotted_idents(m.group(1)))
     return idents
 
 
@@ -670,16 +761,34 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
 
     # ── collect candidate claims ──────────────────────────────────────────────
     idents: list[str] = []
+    # Symbols the answer itself frames as new/proposed code -- reported separately
+    # below, never counted toward the fabrication verdict. See _is_proposed_new_claim
+    # and the have_staged comment just below for the two ways a symbol lands here.
+    proposed_idents: list[str] = []
     for m in _BACKTICK_RE.finditer(answer):
         span = m.group(1)
         tok = span.strip().rstrip("()").strip()
         if (_IDENT_RE.match(tok) or _DOTTED_RE.match(tok)) and tok.lower() not in _NOISE:
             if _is_negated_claim(answer, m.start(), m.end()):
                 continue
+            if _is_proposed_new_claim(answer, m.start()):
+                if tok not in idents and tok not in proposed_idents:
+                    proposed_idents.append(tok)
+                continue
             if tok not in idents:
                 idents.append(tok)
+    # Fenced-code-block identifiers whose block sits right after a new/add/propose
+    # heading (e.g. "Proposed Code Insertion") go to proposed_idents too -- see
+    # _proposed_code_block_idents' docstring. Everything else from _code_idents
+    # (a plain code quote with no such heading, or anything from a *.hive_proposed
+    # staged file, which that helper never scans) keeps the original strict path.
+    proposed_fence_idents = _proposed_code_block_idents(answer)
     for tok in _code_idents(answer):
-        if tok not in idents:
+        if tok in idents or tok in proposed_idents:
+            continue
+        if tok in proposed_fence_idents:
+            proposed_idents.append(tok)
+        else:
             idents.append(tok)
 
     file_lines: list[tuple[str, int]] = []
@@ -730,7 +839,7 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             if r not in routes:
                 routes.append(r)
 
-    if not (idents or file_lines or routes) and not _lint_code(answer):
+    if not (idents or file_lines or routes or proposed_idents) and not _lint_code(answer):
         return ("verify_claims: no checkable claims found (no backticked symbols, "
                 "code-block attribute references, file:line citations, API routes, "
                 "or convention violations).")
@@ -756,6 +865,17 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                            f"not in code: {hits[0][:70]}")
             else:
                 out.append(f"  FOUND      {tok:38s} {code_hits[0][:90]}")
+        out.append("")
+
+    # ── proposed / new code ──────────────────────────────────────────────────
+    if proposed_idents:
+        out.append(
+            f"PROPOSED ({len(proposed_idents[:_MAX_CLAIMS])} shown) — the answer itself "
+            f"frames these as new code to add, not a claim they already exist. Not "
+            f"counted toward the verdict below:"
+        )
+        for tok in proposed_idents[:_MAX_CLAIMS]:
+            out.append(f"  NEW        {tok}")
         out.append("")
 
     # ── file:line citations ───────────────────────────────────────────────────
