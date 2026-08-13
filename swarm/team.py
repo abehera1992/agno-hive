@@ -1519,6 +1519,7 @@ def _record_read(run_context, function_name: str, args: dict, agent_key: str, re
     only -- never the result content itself, which would just relocate the exact
     context-bloat problem _duplicate_read_stub already exists to stop."""
     if run_context is None or run_context.session_state is None:
+        print(f"[diag] _record_read: run_context={run_context!r} session_state=None -- SKIPPED", flush=True)
         return
     log = run_context.session_state.setdefault("read_log", [])
     log.append({
@@ -1529,6 +1530,12 @@ def _record_read(run_context, function_name: str, args: dict, agent_key: str, re
     })
     if len(log) > _MAX_READ_LOG_ENTRIES:
         del log[: len(log) - _MAX_READ_LOG_ENTRIES]
+    print(
+        f"[diag] _record_read: agent={agent_key or 'coordinator'} "
+        f"id(session_state)={id(run_context.session_state)} "
+        f"id(read_log)={id(log)} len(read_log)={len(log)}",
+        flush=True,
+    )
 
 
 def _make_read_cache_tool_hook():
@@ -1667,6 +1674,13 @@ def _make_delegation_log_hook():
             log.append({"tool": function_name, "args": logged_args})
             if len(log) > _MAX_DELEGATION_LOG_ENTRIES:
                 del log[: len(log) - _MAX_DELEGATION_LOG_ENTRIES]
+            print(
+                f"[diag] _delegation_log_hook: id(session_state)={id(run_context.session_state)} "
+                f"id(delegations_made)={id(log)} len={len(log)}",
+                flush=True,
+            )
+        else:
+            print(f"[diag] _delegation_log_hook: run_context={run_context!r} -- SKIPPED", flush=True)
 
         return result
 
