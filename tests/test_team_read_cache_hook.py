@@ -300,9 +300,10 @@ def test_build_team_registers_a_tool_hook_on_the_coordinator(monkeypatch):
         instructions=[],
     )
 
-    # read-cache hook (Detour fix) + interception hook (Phase 9a) -- both shared
+    # interception hook (Phase 9a) + read-cache hook (Detour fix) + delegation-log
+    # hook (shared session_state, 2026-08-13) -- all three shared
     assert result.tool_hooks is not None
-    assert len(result.tool_hooks) == 2
+    assert len(result.tool_hooks) == 3
 
 
 def test_interception_hook_is_listed_first_so_it_is_outermost(monkeypatch):
@@ -327,6 +328,7 @@ def test_interception_hook_is_listed_first_so_it_is_outermost(monkeypatch):
 
     assert result.tool_hooks[0].__name__ == "_tool_interception_hook"
     assert result.tool_hooks[1].__name__ == "_read_cache_tool_hook"
+    assert result.tool_hooks[2].__name__ == "_delegation_log_hook"
 
 
 def test_build_team_shares_the_same_hook_instance_between_coordinator_and_fallback_members(monkeypatch):
@@ -347,6 +349,135 @@ def test_build_team_shares_the_same_hook_instance_between_coordinator_and_fallba
     for member in result.members:
         assert member.tool_hooks is not None
         assert member.tool_hooks == result.tool_hooks  # same objects, not just equal
+
+
+# ── _record_read: mechanical read_log in shared session_state (2026-08-13) ─────
+# The mechanical backstop for _COORDINATOR_INSTRUCTIONS' "Don't make downstream
+# agents re-read" section -- that section is prose the coordinator must remember to
+# follow every time; this writes the same fact into session_state automatically,
+# on every genuinely FRESH fetch (never on a cache hit or a stub -- those aren't
+# new information, see _make_read_cache_tool_hook's docstring).
+
+
+class _FakeRunContext:
+    def __init__(self, session_state):
+        self.session_state = session_state
+
+
+@pytest.mark.asyncio
+async def test_fresh_fetch_records_one_read_log_entry():
+    hook = _make_read_cache_tool_hook()
+    run_context = _FakeRunContext({})
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    await hook(
+        "get_file_content", fake_get_file_content, {"relative_path": "x.py"},
+        agent=None, run_context=run_context,
+    )
+
+    assert len(run_context.session_state["read_log"]) == 1
+    entry = run_context.session_state["read_log"][0]
+    assert entry["tool"] == "get_file_content"
+    assert entry["args"] == {"relative_path": "x.py"}
+    assert entry["read_by"] == "coordinator"
+    assert entry["result_chars"] == len("file body")
+
+
+@pytest.mark.asyncio
+async def test_read_log_never_contains_the_actual_file_content():
+    """Only the length is recorded -- logging real content would just relocate the
+    exact context-bloat problem the duplicate-read stub exists to stop."""
+    hook = _make_read_cache_tool_hook()
+    run_context = _FakeRunContext({})
+    secret_content = "SECRET_MARKER_" + ("x" * 500)
+
+    async def fake_get_file_content(**kwargs):
+        return secret_content
+
+    await hook(
+        "get_file_content", fake_get_file_content, {"relative_path": "x.py"},
+        agent=None, run_context=run_context,
+    )
+
+    assert "SECRET_MARKER_" not in str(run_context.session_state["read_log"])
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_does_not_add_a_second_read_log_entry():
+    """The log tracks DISTINCT facts established, not every serve -- a second
+    agent's cache-hit read of the same file is not new information."""
+    hook = _make_read_cache_tool_hook()
+    run_context = _FakeRunContext({})
+    researcher = _FakeAgent("Researcher")
+    coder = _FakeAgent("Coder")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    await hook(
+        "get_file_content", fake_get_file_content, {"relative_path": "x.py"},
+        agent=researcher, run_context=run_context,
+    )
+    await hook(
+        "get_file_content", fake_get_file_content, {"relative_path": "x.py"},
+        agent=coder, run_context=run_context,
+    )
+
+    assert len(run_context.session_state["read_log"]) == 1
+    assert run_context.session_state["read_log"][0]["read_by"] == "Researcher"
+
+
+@pytest.mark.asyncio
+async def test_stubbed_repeat_call_does_not_add_a_new_read_log_entry():
+    hook = _make_read_cache_tool_hook()
+    run_context = _FakeRunContext({})
+    researcher = _FakeAgent("Researcher")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    for _ in range(5):  # well past the stub threshold
+        await hook(
+            "get_file_content", fake_get_file_content, {"relative_path": "x.py"},
+            agent=researcher, run_context=run_context,
+        )
+
+    assert len(run_context.session_state["read_log"]) == 1  # still just the one fresh fetch
+
+
+@pytest.mark.asyncio
+async def test_missing_run_context_does_not_crash_the_hook():
+    """A caller (or an older test) that never passes run_context must not break --
+    this is bookkeeping, never load-bearing for the actual tool call."""
+    hook = _make_read_cache_tool_hook()
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    result = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"})
+
+    assert result == "file body"
+
+
+@pytest.mark.asyncio
+async def test_run_context_with_none_session_state_does_not_crash_the_hook():
+    """RunContext.session_state defaults to None in agno itself (run/base.py) --
+    e.g. a Team/Agent built without an initial session_state=... value."""
+    hook = _make_read_cache_tool_hook()
+    run_context = _FakeRunContext(None)
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    result = await hook(
+        "get_file_content", fake_get_file_content, {"relative_path": "x.py"},
+        run_context=run_context,
+    )
+
+    assert result == "file body"
+    assert run_context.session_state is None  # untouched, not silently replaced
 
 
 def test_build_team_shares_the_same_hook_instance_with_spec_based_members(monkeypatch):

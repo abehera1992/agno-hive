@@ -276,6 +276,24 @@ _COORDINATOR_INSTRUCTIONS = [
     "  Redundant re-reads waste real tool calls and time without making the answer any more",
     "  correct — the citation is the same file content, not a fresher one.",
     "",
+    "── Shared state across the whole run (session_state) ────────────",
+    "  Two things are tracked for you automatically, with zero action needed: which files",
+    "  have already been read this run (by whom), and which delegations you have already",
+    "  made (to whom, what task). This is real structured state, not something you have to",
+    "  remember to check — it renders above/below in your own context automatically.",
+    "  Before delegate_task_to_member(s): check whether an equivalent delegation is already",
+    "  listed — if so, use that result instead of delegating the same or a near-identical",
+    "  task again.",
+    "  Before asking a member to investigate a file: check whether it is already listed as",
+    "  read — if so, forward what the prior reader already reported instead of re-delegating",
+    "  a read of the same file.",
+    "  You also have an update_session_state tool — use it to record a genuinely useful",
+    "  cross-cutting fact or decision (e.g. 'seller_documents was renamed to",
+    "  business_documents in migration X' or 'auth uses JWT, not sessions') so every later",
+    "  step in this run can see it without re-deriving it. Keep entries SMALL: a fact, a",
+    "  decision, a path — never full file content or a long pasted excerpt; that belongs in",
+    "  a normal tool result, not shared state.",
+    "",
     "── Multi-MCP tool selection ─────────────────────────────────────",
     "  hive-mcp is the PRIMARY server — use it for ALL file reads AND writes.",
     "  Typical hive-mcp tools: find_files, search_files, count_matches (deterministic counts),",
@@ -1472,6 +1490,44 @@ def _duplicate_read_stub(function_name: str, args: dict, agent_key: str, serve_c
     )
 
 
+# Shared session_state (AGNOHive architecture review, Recommendation on
+# share_member_interactions, 2026-08-13): agno's Team AND Agent classes both
+# already support session_state/enable_agentic_state (confirmed via direct source
+# read of the installed agno 2.5.17 -- team/team.py, agent/agent.py,
+# team/_task_tools.py) -- a real, structured, mergeable-across-delegations shared
+# dict, unused anywhere in this codebase until now. _record_read and
+# _make_delegation_log_hook are its first two consumers: mechanical, automatic
+# bookkeeping into session_state["read_log"] / session_state["delegations_made"],
+# never relying on a model proactively calling update_session_state for these two
+# specific facts (agents can still call it themselves for anything else worth
+# recording -- see _COORDINATOR_INSTRUCTIONS' new shared-state section). Written
+# once per DISTINCT fact (first real fetch, or each delegation call) -- not once per
+# serve -- so the log stays a compact "what's already been established", not a
+# duplicate of the per-agent serve-count bookkeeping the cache already does.
+_MAX_READ_LOG_ENTRIES = 200
+
+
+def _record_read(run_context, function_name: str, args: dict, agent_key: str, result_len: int) -> None:
+    """Record one real (non-stubbed, first-fetch) read into the run's shared
+    session_state. Defensive against run_context/session_state being None -- an
+    older agno version, a Team/Agent built without an initial session_state dict,
+    or a test double -- since a bookkeeping side effect must never break a real
+    tool call. Logs the tool name, args, and who read it, plus the RESULT LENGTH
+    only -- never the result content itself, which would just relocate the exact
+    context-bloat problem _duplicate_read_stub already exists to stop."""
+    if run_context is None or run_context.session_state is None:
+        return
+    log = run_context.session_state.setdefault("read_log", [])
+    log.append({
+        "tool": function_name,
+        "args": args,
+        "read_by": agent_key or "coordinator",
+        "result_chars": result_len,
+    })
+    if len(log) > _MAX_READ_LOG_ENTRIES:
+        del log[: len(log) - _MAX_READ_LOG_ENTRIES]
+
+
 def _make_read_cache_tool_hook():
     """Build a fresh, run-scoped cache for read-only tool calls -- a new dict per
     _build_team() call means the cache lives exactly as long as one run and can
@@ -1523,12 +1579,22 @@ def _make_read_cache_tool_hook():
     object for a delegated member's own call, or None for the coordinator's own
     direct call (no `team` param needed here to detect that: `getattr(None, "name",
     None) or ""` already resolves to "", the same "coordinator" sentinel
-    _stream_event_to_chunk's own agent_name convention already uses).
+    _stream_event_to_chunk's own agent_name convention already uses). `run_context`
+    is populated the same way (confirmed present on both Team and Agent since agno
+    2.5.17, `run/base.py`'s RunContext.session_state) -- this is what lets a fresh
+    fetch below also mechanically record itself into the run's shared session_state
+    (see _record_read), so a SIBLING agent can see "this was already read" as
+    structured fact instead of depending on the coordinator instruction ("Don't make
+    downstream agents re-read", _COORDINATOR_INSTRUCTIONS) to notice and manually
+    forward a citation every time. That instruction stays -- this is its mechanical
+    backstop, not a replacement; per-agent serve budgeting below is UNCHANGED and
+    deliberately untouched by this addition, since a second agent genuinely lacks the
+    content in its own context until it is served at least once, same as before.
     """
     cache: dict[tuple, object] = {}
     serve_counts: dict[tuple, int] = {}
 
-    async def _read_cache_tool_hook(function_name, function, args, agent=None):
+    async def _read_cache_tool_hook(function_name, function, args, agent=None, run_context=None):
         if function_name not in _CACHEABLE_READ_TOOLS:
             return await function(**args)
         try:
@@ -1540,11 +1606,15 @@ def _make_read_cache_tool_hook():
         cache_key = (function_name, args_key)
         serve_key = (agent_key, function_name, args_key)
 
-        if cache_key in cache:
-            result = cache[cache_key]
-        else:
+        is_fresh_fetch = cache_key not in cache
+        if is_fresh_fetch:
             result = await function(**args)
             cache[cache_key] = result
+        else:
+            result = cache[cache_key]
+
+        if is_fresh_fetch:
+            _record_read(run_context, function_name, args, agent_key, len(str(result)))
 
         serve_counts[serve_key] = serve_counts.get(serve_key, 0) + 1
         count = serve_counts[serve_key]
@@ -1553,6 +1623,51 @@ def _make_read_cache_tool_hook():
         return result
 
     return _read_cache_tool_hook
+
+
+_DELEGATION_TOOL_NAMES = {"delegate_task_to_member", "delegate_task_to_members"}
+_MAX_LOGGED_TASK_CHARS = 300
+_MAX_DELEGATION_LOG_ENTRIES = 200
+
+
+def _make_delegation_log_hook():
+    """Mechanically logs every delegation (member id + task text, never the
+    member's result) into the run's shared session_state["delegations_made"] --
+    the automatic counterpart to _record_read, for the OTHER half of the
+    cross-agent-duplication problem: the coordinator re-delegating a task it
+    already delegated, not a member re-reading a file a sibling already fetched.
+    Only the coordinator has delegate_task_to_member(s) on its own tool list in
+    this codebase's mode="coordinate"/"route"/"broadcast" usage (members do not
+    delegate further), so unlike _read_cache_tool_hook there is no per-agent
+    dimension to track here -- one shared list is the whole picture.
+
+    Pure observer: never caches, never stubs, never changes what the real
+    delegate_task_to_member(s) call does or returns -- delegation is not
+    idempotent (a second call to the same member can legitimately want fresh
+    context), so unlike reads this must never short-circuit the call itself,
+    only make the fact that it happened visible as structured state. Registered
+    in the SAME tool_hooks list as read_cache_hook/interception_hook -- position
+    in that list doesn't matter for this hook specifically, since every non-
+    delegation call already passes straight through via the early return."""
+    async def _delegation_log_hook(function_name, function, args, run_context=None):
+        if function_name not in _DELEGATION_TOOL_NAMES:
+            return await function(**args)
+
+        result = await function(**args)
+
+        if run_context is not None and run_context.session_state is not None:
+            logged_args = dict(args or {})
+            task_text = logged_args.get("task")
+            if isinstance(task_text, str) and len(task_text) > _MAX_LOGGED_TASK_CHARS:
+                logged_args["task"] = task_text[:_MAX_LOGGED_TASK_CHARS] + "...(truncated)"
+            log = run_context.session_state.setdefault("delegations_made", [])
+            log.append({"tool": function_name, "args": logged_args})
+            if len(log) > _MAX_DELEGATION_LOG_ENTRIES:
+                del log[: len(log) - _MAX_DELEGATION_LOG_ENTRIES]
+
+        return result
+
+    return _delegation_log_hook
 
 
 class ToolCallAborted(Exception):
@@ -1670,6 +1785,7 @@ def _build_team(
     # built with abort_event=None here -- see its own docstring for why that keeps
     # this a no-op audit-log pass-through today rather than a live abort switch.
     read_cache_hook = _make_read_cache_tool_hook()
+    delegation_log_hook = _make_delegation_log_hook()
     interception_hook = _make_tool_interception_hook(activity=activity)
     # Order matters: agno makes the FIRST hook in this list the OUTERMOST wrapper
     # (confirmed via agno.tools.function.Function._build_nested_execution_chain /
@@ -1681,8 +1797,10 @@ def _build_team(
     # [read_cache_hook, interception_hook] order, a heartbeat during a run of
     # nothing-but-cache-hits reported "194s since last tool call" while reads were
     # visibly still streaming in -- interception_hook's activity["last_call_at"]
-    # update was simply never reached for those calls.
-    tool_hooks = [interception_hook, read_cache_hook]
+    # update was simply never reached for those calls. delegation_log_hook's own
+    # position doesn't matter -- it's a pure observer that only acts on
+    # delegate_task_to_member(s) calls and never short-circuits them either way.
+    tool_hooks = [interception_hook, read_cache_hook, delegation_log_hook]
     if agent_specs:
         members = [
             make_agent_from_spec(spec, *mcp_list, skill_catalog=skill_catalog, tool_hooks=tool_hooks)
@@ -1722,6 +1840,24 @@ def _build_team(
         show_members_responses=True,
         share_member_interactions=True,
         add_member_tools_to_context=True,
+        # Shared session_state (2026-08-13): a real, agno-native, structured dict --
+        # copied to each delegated member at dispatch, merged back into this team-level
+        # copy when that member's turn ends (agno's own team/_task_tools.py, sequential
+        # and race-free in mode="coordinate"/"route" -- this codebase's only reachable
+        # modes; "broadcast" would need agno's separate merge_parallel_session_states,
+        # not exercised here since no team YAML uses it yet). Seeded with the two keys
+        # _record_read/_make_delegation_log_hook write into mechanically; agents may
+        # also call update_session_state() themselves (enable_agentic_state=True below)
+        # for anything else worth recording -- see _COORDINATOR_INSTRUCTIONS' shared
+        # state section for the convention (small structured facts, never full file
+        # content -- that would just relocate the exact bloat problem this exists to
+        # avoid). add_session_state_to_context=True renders it into the prompt
+        # automatically so a smaller local model doesn't need to proactively think to
+        # go look for it -- the same "mechanical over hoped-for" lesson this run's
+        # own read-cache stubbing and tool-surface guards are already built on.
+        session_state={"read_log": [], "delegations_made": []},
+        enable_agentic_state=True,
+        add_session_state_to_context=True,
         markdown=True,
         # read_only-scoped, not global -- see config.read_only_max_iterations'
         # docstring for the live scope-creep incident this fixes and why a read-only

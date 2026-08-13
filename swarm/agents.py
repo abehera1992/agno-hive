@@ -89,6 +89,7 @@ _BASE_PREAMBLE = [
     "If lightrag_query is available via MCP, call it with relevant keywords before starting.",
     "Do NOT call lightrag_insert on the project namespace — successful outcomes are captured automatically into a separate experience namespace by the feedback loop. Free-text inserts into the project namespace poison code-grounding retrieval.",
     "HONESTY: never claim a change was made or that a task succeeded if a tool returned an error, an empty result, or did not apply. Report the exact failure instead. A partial result is a FAILURE, not a success.",
+    "SHARED STATE: your context includes read_log — files already read this run, by whom, tracked automatically. Before reading a file, check whether it's already listed — if so, use what the prior reader found instead of reading it again. You also have update_session_state — use it for a small, genuinely reusable fact or decision (never full file content) so a later step in this run doesn't have to re-derive it.",
 ]
 
 
@@ -166,10 +167,24 @@ def make_agent_from_spec(
         add_name_to_context=True,
         tool_call_limit=config.tool_call_limit,
         tool_hooks=tool_hooks,
+        enable_agentic_state=True,
+        add_session_state_to_context=True,
     )
 
 
-_COMMON_AGENT_KWARGS = dict(markdown=True, add_name_to_context=True, tool_call_limit=config.tool_call_limit)
+# enable_agentic_state/add_session_state_to_context (2026-08-13): agno's Agent class
+# supports the identical session_state mechanism as Team (confirmed via direct source
+# read, agent/agent.py) -- turning both on here is what lets a MEMBER (not just the
+# coordinator) see the shared read_log/delegations_made automatically each turn, and
+# call update_session_state itself. No initial session_state= needed here: agno's own
+# team/_task_tools.py hands each delegated member a deepcopy of the TEAM's current
+# session_state at dispatch time and merges it back after, regardless of what the
+# member was constructed with -- see swarm/team.py's _build_team for where the one
+# real seed dict lives.
+_COMMON_AGENT_KWARGS = dict(
+    markdown=True, add_name_to_context=True, tool_call_limit=config.tool_call_limit,
+    enable_agentic_state=True, add_session_state_to_context=True,
+)
 
 
 def make_coder(*mcps: MCPTools, tool_hooks: list | None = None) -> Agent:
