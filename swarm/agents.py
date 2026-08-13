@@ -1,4 +1,6 @@
 from agno.agent import Agent
+from agno.run import RunContext
+from agno.tools import tool as agno_tool
 from agno.tools.mcp import MCPTools
 from .tool_fix import OllamaToolFix
 from config.config import config
@@ -114,6 +116,44 @@ def format_skill_catalog(catalog: list[dict], names: list[str] | None) -> str:
     return "\n".join(lines)
 
 
+# update_session_state (2026-08-13, replaces enable_agentic_state=True): agno's OWN
+# auto-added tool for this (Team.enable_agentic_state / Agent.enable_agentic_state)
+# is broken for the TEAM case, confirmed live on ZGX 2026-08-13 -- agno builds it as
+# `Function(entrypoint=functools.partial(_update_session_state_tool, team))`
+# (agno/team/_tools.py), and Python's own typing.get_type_hints() does not support
+# functools.partial objects at all (raises "<partial ...> is not a module, class,
+# method, or function" -- confirmed against the exact installed version, agno
+# 2.5.17). Caught internally and logged as two non-fatal warnings ("Could not parse
+# args for update_session_state", "Failed to add validate decorator to entrypoint"),
+# so it never crashed a run -- but the tool's JSON schema never got built, meaning
+# any model that tried to call it would have nothing describing session_state_updates.
+# Fix: don't use agno's broken auto-tool at all. _update_session_state_tool's own
+# body (agno/team/_default_tools.py) never actually uses its bound `team` argument --
+# only run_context.session_state -- so a plain function below, registered as a normal
+# tool (no functools.partial involved, get_type_hints works fine on it), does the
+# identical job without the bug. enable_agentic_state is therefore NOT set anywhere
+# in this file -- setting it back to True would silently reintroduce a second,
+# same-named, broken tool alongside this one.
+def _update_session_state_impl(session_state_updates: dict, run_context: RunContext = None) -> str:
+    if run_context is None or run_context.session_state is None:
+        return "No shared state available to update."
+    run_context.session_state.update(session_state_updates)
+    return f"Updated shared state: {run_context.session_state}"
+
+
+@agno_tool
+async def update_session_state(session_state_updates: dict, run_context: RunContext = None) -> str:
+    """Record a small, genuinely reusable fact or decision into the shared state every
+    agent in this run can see -- a renamed table, a confirmed architecture decision, a
+    fact a later step will need. Never full file content or a long pasted excerpt;
+    that belongs in a normal tool result, not shared state.
+
+    Args:
+        session_state_updates (dict): key-value pairs to merge into the shared state.
+    """
+    return _update_session_state_impl(session_state_updates, run_context)
+
+
 def make_agent_from_spec(
     spec, *mcps: MCPTools, skill_catalog: list[dict] | None = None, tool_hooks: list | None = None
 ) -> Agent:
@@ -159,7 +199,7 @@ def make_agent_from_spec(
             temperature=config.member_temperature, max_tokens=max_tokens,
             frequency_penalty=config.member_frequency_penalty,
         ),
-        tools=agent_tools,
+        tools=agent_tools + [update_session_state],
         instructions=instructions,
         role=spec.role,
         description=spec.description,
@@ -167,23 +207,21 @@ def make_agent_from_spec(
         add_name_to_context=True,
         tool_call_limit=config.tool_call_limit,
         tool_hooks=tool_hooks,
-        enable_agentic_state=True,
         add_session_state_to_context=True,
     )
 
 
-# enable_agentic_state/add_session_state_to_context (2026-08-13): agno's Agent class
-# supports the identical session_state mechanism as Team (confirmed via direct source
-# read, agent/agent.py) -- turning both on here is what lets a MEMBER (not just the
-# coordinator) see the shared read_log/delegations_made automatically each turn, and
-# call update_session_state itself. No initial session_state= needed here: agno's own
-# team/_task_tools.py hands each delegated member a deepcopy of the TEAM's current
-# session_state at dispatch time and merges it back after, regardless of what the
-# member was constructed with -- see swarm/team.py's _build_team for where the one
-# real seed dict lives.
+# add_session_state_to_context (2026-08-13): agno's Agent class supports the identical
+# session_state mechanism as Team (confirmed via direct source read, agent/agent.py) --
+# turning it on here is what lets a MEMBER (not just the coordinator) see the shared
+# read_log/delegations_made automatically each turn, rendered straight into its own
+# prompt. No initial session_state= needed here: agno's own team/_task_tools.py hands
+# each delegated member a deepcopy of the TEAM's current session_state at dispatch
+# time and merges it back after, regardless of what the member was constructed with --
+# see swarm/team.py's _build_team for where the one real seed dict lives.
 _COMMON_AGENT_KWARGS = dict(
     markdown=True, add_name_to_context=True, tool_call_limit=config.tool_call_limit,
-    enable_agentic_state=True, add_session_state_to_context=True,
+    add_session_state_to_context=True,
 )
 
 
@@ -195,7 +233,7 @@ def make_coder(*mcps: MCPTools, tool_hooks: list | None = None) -> Agent:
             temperature=config.member_temperature, max_tokens=config.coder_max_tokens,
             frequency_penalty=config.member_frequency_penalty,
         ),
-        tools=list(mcps),
+        tools=list(mcps) + [update_session_state],
         tool_hooks=tool_hooks,
         description="Implementation specialist. Write clean, idiomatic code following existing patterns. Use apply_diff() for existing files, write_file() only for new ones.",
         instructions=[
@@ -221,7 +259,7 @@ def make_reviewer(*mcps: MCPTools, tool_hooks: list | None = None) -> Agent:
             temperature=config.member_temperature, max_tokens=config.member_max_tokens,
             frequency_penalty=config.member_frequency_penalty,
         ),
-        tools=list(mcps),
+        tools=list(mcps) + [update_session_state],
         tool_hooks=tool_hooks,
         description="Code review specialist. Check correctness, security, and consistency. Flag real problems only — never style preferences.",
         instructions=[
@@ -244,7 +282,7 @@ def make_planner(*mcps: MCPTools) -> Agent:
             temperature=config.member_temperature, max_tokens=config.member_max_tokens,
             frequency_penalty=config.member_frequency_penalty,
         ),
-        tools=list(mcps),
+        tools=list(mcps) + [update_session_state],
         description="Task decomposition specialist. Break complex tasks into numbered steps naming the responsible agent, files to touch, and risks.",
         instructions=[
             *_BASE_PREAMBLE,
@@ -267,7 +305,7 @@ def make_researcher(*mcps: MCPTools) -> Agent:
             temperature=config.member_temperature, max_tokens=config.member_max_tokens,
             frequency_penalty=config.member_frequency_penalty,
         ),
-        tools=list(mcps),
+        tools=list(mcps) + [update_session_state],
         description="Codebase investigation specialist. Read real files and ground every claim in file content — never describe from directory names alone.",
         instructions=[
             *_BASE_PREAMBLE,
@@ -290,7 +328,7 @@ def make_executor(*mcps: MCPTools) -> Agent:
             temperature=config.member_temperature, max_tokens=config.member_max_tokens,
             frequency_penalty=config.member_frequency_penalty,
         ),
-        tools=list(mcps),
+        tools=list(mcps) + [update_session_state],
         description="Execution and validation specialist. Run commands and report exact stdout/stderr — never paraphrase errors.",
         instructions=[
             *_BASE_PREAMBLE,
@@ -312,7 +350,7 @@ def make_context_router(*mcps: MCPTools) -> Agent:
             temperature=config.member_temperature, max_tokens=config.member_max_tokens,
             frequency_penalty=config.member_frequency_penalty,
         ),
-        tools=list(mcps),
+        tools=list(mcps) + [update_session_state],
         description="Lightweight query router. Pick the fastest retrieval path and return raw results — never interpret or answer yourself.",
         instructions=[
             "Decide the fastest way to retrieve context for a query.",

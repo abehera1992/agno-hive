@@ -201,7 +201,12 @@ def test_build_team_seeds_session_state_with_read_log_and_delegations_made(monke
     assert result.session_state == {"read_log": [], "delegations_made": []}
 
 
-def test_build_team_enables_agentic_state_and_context_injection(monkeypatch):
+def test_build_team_has_context_injection_and_its_own_update_session_state_tool(monkeypatch):
+    """add_session_state_to_context=True is agno's own, working correctly.
+    enable_agentic_state is deliberately never set -- agno's own auto-tool for it
+    is broken (see swarm/agents.py's update_session_state docstring, confirmed
+    live on ZGX 2026-08-13); agno-hive's own update_session_state (imported from
+    swarm.agents) is added to coordinator_tools_list directly instead."""
     monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
 
     result = _build_team(
@@ -213,11 +218,13 @@ def test_build_team_enables_agentic_state_and_context_injection(monkeypatch):
         instructions=[],
     )
 
-    assert result.enable_agentic_state is True
+    assert result.enable_agentic_state is False
     assert result.add_session_state_to_context is True
+    from swarm.agents import update_session_state
+    assert update_session_state in result.tools
 
 
-def test_build_team_fallback_members_also_have_agentic_state_enabled(monkeypatch):
+def test_build_team_fallback_members_also_have_shared_state_wired_in(monkeypatch):
     """make_coder/make_reviewer (the agent_specs=None fallback path) -- members
     need this too, not just the coordinator's own Team object, since agno hands
     each delegated member its own session_state copy at dispatch regardless."""
@@ -232,12 +239,14 @@ def test_build_team_fallback_members_also_have_agentic_state_enabled(monkeypatch
         instructions=[],
     )
 
+    from swarm.agents import update_session_state
     for member in result.members:
-        assert member.enable_agentic_state is True
+        assert member.enable_agentic_state is False
         assert member.add_session_state_to_context is True
+        assert update_session_state in member.tools
 
 
-def test_build_team_spec_based_members_also_have_agentic_state_enabled(monkeypatch):
+def test_build_team_spec_based_members_also_have_shared_state_wired_in(monkeypatch):
     """agent_specs path (make_agent_from_spec) -- the primary path used by the
     real engineering.yaml team, not just the make_coder/make_reviewer fallback."""
     monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
@@ -260,5 +269,7 @@ def test_build_team_spec_based_members_also_have_agentic_state_enabled(monkeypat
         instructions=[],
     )
 
-    assert result.members[0].enable_agentic_state is True
+    from swarm.agents import update_session_state
+    assert result.members[0].enable_agentic_state is False
     assert result.members[0].add_session_state_to_context is True
+    assert update_session_state in result.members[0].tools

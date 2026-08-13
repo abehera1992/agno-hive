@@ -10,7 +10,10 @@ from agno.run.team import TeamRunOutput
 from agno.team import Team
 from agno.tools import tool as agno_tool
 from agno.tools.mcp import MCPTools
-from .agents import make_coder, make_reviewer, make_agent_from_spec, get_model, format_skill_catalog
+from .agents import (
+    make_coder, make_reviewer, make_agent_from_spec, get_model, format_skill_catalog,
+    update_session_state,
+)
 from .feedback import record_success, record_success_bg, record_failure, load_failure_context
 from . import model_routing
 from config.config import config
@@ -1823,7 +1826,7 @@ def _build_team(
     # surface additionally excludes write tools regardless of the request's read_only value.
     _coordinator_tool_scope = read_only or config.coordinator_no_direct_writes
     coordinator_tools_list = list(_scope_coordinator_tools(coordinator_tools, mcp_list, _coordinator_tool_scope)) + [
-        request_clarification
+        request_clarification, update_session_state,
     ]
     return Team(
         name=name,
@@ -1847,16 +1850,18 @@ def _build_team(
         # modes; "broadcast" would need agno's separate merge_parallel_session_states,
         # not exercised here since no team YAML uses it yet). Seeded with the two keys
         # _record_read/_make_delegation_log_hook write into mechanically; agents may
-        # also call update_session_state() themselves (enable_agentic_state=True below)
-        # for anything else worth recording -- see _COORDINATOR_INSTRUCTIONS' shared
-        # state section for the convention (small structured facts, never full file
-        # content -- that would just relocate the exact bloat problem this exists to
-        # avoid). add_session_state_to_context=True renders it into the prompt
-        # automatically so a smaller local model doesn't need to proactively think to
-        # go look for it -- the same "mechanical over hoped-for" lesson this run's
-        # own read-cache stubbing and tool-surface guards are already built on.
+        # also call update_session_state (swarm/agents.py -- added to
+        # coordinator_tools_list above, NOT via agno's own enable_agentic_state, which
+        # is deliberately never set anywhere in this codebase -- see that function's
+        # own docstring for the confirmed-live agno 2.5.17 bug this avoids) for
+        # anything else worth recording -- see _COORDINATOR_INSTRUCTIONS' shared state
+        # section for the convention (small structured facts, never full file content
+        # -- that would just relocate the exact bloat problem this exists to avoid).
+        # add_session_state_to_context=True renders it into the prompt automatically
+        # so a smaller local model doesn't need to proactively think to go look for it
+        # -- the same "mechanical over hoped-for" lesson this run's own read-cache
+        # stubbing and tool-surface guards are already built on.
         session_state={"read_log": [], "delegations_made": []},
-        enable_agentic_state=True,
         add_session_state_to_context=True,
         markdown=True,
         # read_only-scoped, not global -- see config.read_only_max_iterations'
