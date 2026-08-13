@@ -136,15 +136,8 @@ def format_skill_catalog(catalog: list[dict], names: list[str] | None) -> str:
 # same-named, broken tool alongside this one.
 def _update_session_state_impl(session_state_updates: dict, run_context: RunContext = None) -> str:
     if run_context is None or run_context.session_state is None:
-        print(f"[diag] _update_session_state_impl: run_context={run_context!r} -- SKIPPED", flush=True)
         return "No shared state available to update."
     run_context.session_state.update(session_state_updates)
-    print(
-        f"[diag] _update_session_state_impl: id(session_state)={id(run_context.session_state)} "
-        f"read_log_len={len(run_context.session_state.get('read_log', []))} "
-        f"delegations_len={len(run_context.session_state.get('delegations_made', []))}",
-        flush=True,
-    )
     return f"Updated shared state: {run_context.session_state}"
 
 
