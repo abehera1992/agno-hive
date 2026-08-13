@@ -480,6 +480,96 @@ async def test_run_context_with_none_session_state_does_not_crash_the_hook():
     assert run_context.session_state is None  # untouched, not silently replaced
 
 
+# ── activity["max_stub_serve_count"] (2026-08-13, Recommendation #2) ───────────
+# The Tier-2 signal for the liveness-based auto-kill (see DOCS.md "Liveness-Based
+# Auto-Kill") -- a model still calling the identical read after the escalated
+# "STOP calling this" stub is the sharpest "not converging" signal this file
+# produces. Reuses the serve_counts bookkeeping that already existed here for an
+# unrelated reason; nothing about the caching/stubbing behavior itself changes.
+
+@pytest.mark.asyncio
+async def test_max_stub_serve_count_untouched_while_within_the_real_content_budget():
+    """Serves 1-2 are real content, never stubbed -- activity must not be
+    touched until a stub is actually served."""
+    activity = {}
+    hook = _make_read_cache_tool_hook(activity=activity)
+    researcher = _FakeAgent("Researcher")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    for _ in range(2):
+        await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+
+    assert "max_stub_serve_count" not in activity
+
+
+@pytest.mark.asyncio
+async def test_max_stub_serve_count_records_the_first_stubbed_serve():
+    activity = {}
+    hook = _make_read_cache_tool_hook(activity=activity)
+    researcher = _FakeAgent("Researcher")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    for _ in range(3):  # serve 3 is the first stub (budget is 2)
+        await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+
+    assert activity["max_stub_serve_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_max_stub_serve_count_tracks_the_highest_count_seen():
+    activity = {}
+    hook = _make_read_cache_tool_hook(activity=activity)
+    researcher = _FakeAgent("Researcher")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    for _ in range(8):
+        await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+
+    assert activity["max_stub_serve_count"] == 8
+
+
+@pytest.mark.asyncio
+async def test_max_stub_serve_count_is_the_max_across_different_calls_not_the_last():
+    """A second, distinct (tool, args) pair stubbed at a LOWER count than an
+    earlier one must not overwrite the higher-water mark -- the whole point is
+    catching the worst offender across the run, not just the most recent one."""
+    activity = {}
+    hook = _make_read_cache_tool_hook(activity=activity)
+    researcher = _FakeAgent("Researcher")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    for _ in range(6):
+        await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+    for _ in range(3):  # a different file, stubbed at a lower count
+        await hook("get_file_content", fake_get_file_content, {"relative_path": "y.py"}, agent=researcher)
+
+    assert activity["max_stub_serve_count"] == 6
+
+
+@pytest.mark.asyncio
+async def test_max_stub_serve_count_not_touched_when_activity_is_none():
+    """Default (activity=None, every other test in this file) -- must not crash,
+    same defensive posture as every other optional-activity site in this hook."""
+    hook = _make_read_cache_tool_hook()
+    researcher = _FakeAgent("Researcher")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    for _ in range(5):
+        result = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+
+    assert result != "file body"  # still stubs correctly with no activity dict
+
+
 def test_build_team_shares_the_same_hook_instance_with_spec_based_members(monkeypatch):
     """agent_specs path (make_agent_from_spec) -- the primary path used by the
     real engineering.yaml team, not just the make_coder/make_reviewer fallback."""

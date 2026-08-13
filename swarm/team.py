@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 import time
 from contextlib import AsyncExitStack, suppress
@@ -1531,7 +1532,7 @@ def _record_read(run_context, function_name: str, args: dict, agent_key: str, re
         del log[: len(log) - _MAX_READ_LOG_ENTRIES]
 
 
-def _make_read_cache_tool_hook():
+def _make_read_cache_tool_hook(activity: dict | None = None):
     """Build a fresh, run-scoped cache for read-only tool calls -- a new dict per
     _build_team() call means the cache lives exactly as long as one run and can
     never leak stale data across sessions/tasks.
@@ -1593,6 +1594,18 @@ def _make_read_cache_tool_hook():
     backstop, not a replacement; per-agent serve budgeting below is UNCHANGED and
     deliberately untouched by this addition, since a second agent genuinely lacks the
     content in its own context until it is served at least once, same as before.
+
+    `activity` (default None, same convention as _make_tool_interception_hook's own
+    parameter of the same name -- both hooks read/write the ONE dict a caller passes
+    to both) gets `activity["max_stub_serve_count"]` bumped to the highest serve
+    count seen across the whole run whenever a stub is actually served. This is the
+    Tier-2 signal for the liveness-based auto-kill (see DOCS.md "Liveness-Based
+    Auto-Kill"): a model still calling the identical read after being told to stop
+    3+ times (the escalated stub wording, _STUB_ESCALATION_SERVE) is the sharpest
+    "not converging" signal this file can produce, sharper than any timer, and it
+    was already being computed here for an unrelated reason -- this just also
+    surfaces it to the one place (the heartbeat, and through it the parent process)
+    that can act on it.
     """
     cache: dict[tuple, object] = {}
     serve_counts: dict[tuple, int] = {}
@@ -1622,6 +1635,8 @@ def _make_read_cache_tool_hook():
         serve_counts[serve_key] = serve_counts.get(serve_key, 0) + 1
         count = serve_counts[serve_key]
         if count > _MAX_FULL_SERVES_PER_AGENT:
+            if activity is not None:
+                activity["max_stub_serve_count"] = max(activity.get("max_stub_serve_count", 0), count)
             return _duplicate_read_stub(function_name, args, agent_key, count, len(str(result)))
         return result
 
@@ -1787,7 +1802,7 @@ def _build_team(
     # those are load-bearing, not incidental. The interception hook (Phase 9a) is
     # built with abort_event=None here -- see its own docstring for why that keeps
     # this a no-op audit-log pass-through today rather than a live abort switch.
-    read_cache_hook = _make_read_cache_tool_hook()
+    read_cache_hook = _make_read_cache_tool_hook(activity=activity)
     delegation_log_hook = _make_delegation_log_hook()
     interception_hook = _make_tool_interception_hook(activity=activity)
     # Order matters: agno makes the FIRST hook in this list the OUTERMOST wrapper
@@ -2134,7 +2149,10 @@ async def run_task_stream(
                 task_duration.record(time.perf_counter() - t0, {"project_id": project_id})
 
 
-async def _run_heartbeat(activity: dict, run_started: float, interval: float = 30.0) -> None:
+async def _run_heartbeat(
+    activity: dict, run_started: float, interval: float = 30.0,
+    liveness_path: str | None = None,
+) -> None:
     """Prints a periodic status line while team.arun() is one opaque blocking
     await, so a long stretch with zero tool calls -- the coordinator generating
     a long answer, or genuinely stalled -- is visible as a trail of log lines
@@ -2153,7 +2171,22 @@ async def _run_heartbeat(activity: dict, run_started: float, interval: float = 3
     "no events are arriving from team.arun(stream=True) at all," two very
     different problems needing different fixes. A count that keeps climbing
     each heartbeat means the former; one stuck at the same number means the
-    latter."""
+    latter.
+
+    `liveness_path` (default None = previous behaviour) is the Recommendation-#2
+    liveness-based auto-kill's write side (see DOCS.md "Liveness-Based Auto-Kill"):
+    each tick, also writes a small JSON snapshot api/server.py's own poll loop
+    reads to decide whether to kill this run. Tracks CONSECUTIVE ticks with
+    NEITHER a new tool call NOR new stream content ("stagnant_ticks") rather than
+    a raw timestamp -- this process's and the parent's own time.monotonic() clocks
+    are not reliably comparable across a process boundary, but "N seconds of
+    nothing happening, as judged by the process that was actually watching" is a
+    plain duration either side can reason about identically. Written atomically
+    (temp file + os.replace) so a concurrent read from the parent can never see a
+    torn write. A write failure is logged, never raised -- this is bookkeeping for
+    an optional safety net, not allowed to take down the run it's watching."""
+    last_event_count = activity.get("stream_event_count")
+    stagnant_ticks = 0
     while True:
         await asyncio.sleep(interval)
         now = time.monotonic()
@@ -2167,6 +2200,23 @@ async def _run_heartbeat(activity: dict, run_started: float, interval: float = 3
             f"{event_count_str}, coordinator still running",
             flush=True,
         )
+        if event_count is not None and event_count == last_event_count and since_last_tool >= interval:
+            stagnant_ticks += 1
+        else:
+            stagnant_ticks = 0
+        last_event_count = event_count
+        if liveness_path:
+            try:
+                snapshot = {
+                    "stagnant_seconds": stagnant_ticks * interval,
+                    "max_stub_serve_count": activity.get("max_stub_serve_count", 0),
+                }
+                tmp_path = f"{liveness_path}.tmp"
+                with open(tmp_path, "w") as f:
+                    json.dump(snapshot, f)
+                os.replace(tmp_path, liveness_path)
+            except OSError as exc:
+                print(f"[team] liveness write warning: {exc}", flush=True)
 
 
 async def _stream_team_run(team, prompt: str, *, log_label: str = "verify-retry") -> tuple[str, "TeamRunOutput | None"]:
@@ -2263,8 +2313,15 @@ async def run_task_async(
     session_id: str | None = None,
     mode: str = "coordinate",
     read_only: bool = False,
+    liveness_path: str | None = None,
 ) -> tuple[str, dict, dict | None]:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer.
+
+    `liveness_path` (default None) is forwarded to _run_heartbeat -- see its own
+    docstring and DOCS.md "Liveness-Based Auto-Kill". api/server.py's worker-
+    subprocess poll loop supplies this (computed from the child's own pid) when
+    config.enable_liveness_autokill is set; main.py's CLI one-shot path and every
+    existing caller that doesn't pass it get the previous behaviour unchanged.
 
     Returns (content, tokens, clarification). clarification is None on a normal
     completed answer; when the coordinator emitted a needs_clarification block
@@ -2395,7 +2452,9 @@ async def run_task_async(
             t0 = time.perf_counter()
             try:
                 with _tracer.start_as_current_span("agno.team.run"):
-                    heartbeat_task = asyncio.create_task(_run_heartbeat(activity, time.monotonic()))
+                    heartbeat_task = asyncio.create_task(
+                        _run_heartbeat(activity, time.monotonic(), liveness_path=liveness_path)
+                    )
                     full_content: list[str] = []
                     # 2026-08-10, corrected same day: originally tracked "last_event" (whatever
                     # happened to be the final stream item) for token/clarification extraction,

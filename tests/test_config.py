@@ -141,3 +141,46 @@ def test_member_temperature_matches_the_coordinators_own_tuned_value_by_default(
     cfg = mod.Config()
     assert cfg.member_temperature == cfg.coordinator_temperature
     assert cfg.member_frequency_penalty == cfg.coordinator_frequency_penalty
+
+
+# ── Liveness-based auto-kill (Recommendation #2, 2026-08-13) ──────────────────
+
+def test_enable_liveness_autokill_defaults_off():
+    """Off by default until validated live against a deliberately-reproduced
+    stall -- same rollout discipline use_worker_process_isolation had."""
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.enable_liveness_autokill is False
+
+
+def test_enable_liveness_autokill_from_env(monkeypatch):
+    monkeypatch.setenv("ENABLE_LIVENESS_AUTOKILL", "true")
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.enable_liveness_autokill is True
+
+
+def test_liveness_silence_threshold_default():
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.liveness_silence_threshold_s == 300
+
+
+def test_liveness_silence_threshold_from_env(monkeypatch):
+    monkeypatch.setenv("LIVENESS_SILENCE_THRESHOLD_S", "120")
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.liveness_silence_threshold_s == 120
+
+
+def test_liveness_stub_serve_threshold_default():
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.liveness_stub_serve_threshold == 8
+
+
+def test_liveness_stub_serve_threshold_from_env(monkeypatch):
+    monkeypatch.setenv("LIVENESS_STUB_SERVE_THRESHOLD", "5")
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.liveness_stub_serve_threshold == 5

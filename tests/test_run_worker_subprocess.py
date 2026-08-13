@@ -108,6 +108,80 @@ async def test_disconnect_kills_a_genuinely_hung_worker(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_liveness_kill_terminates_a_stalled_worker_even_without_a_disconnect(monkeypatch):
+    """Recommendation #2 (see DOCS.md "Liveness-Based Auto-Kill"): a worker whose
+    own heartbeat reports genuine staleness must be killed even though the client
+    never disconnected -- a second trigger condition on the SAME actuator
+    (proc.kill()) the disconnect path already uses, not a new one.
+
+    Patches server.config (the object api/server.py's own module namespace
+    already holds), NOT a freshly `from config.config import config`-ed one --
+    if this test suite's own test_config.py ran its _reload_config() helper
+    earlier in the same pytest session (it deletes config.config from
+    sys.modules), a fresh in-function import here would silently resolve to a
+    DIFFERENT object than the one _run_worker_subprocess actually reads,
+    making the monkeypatch a no-op that happens to still pass by coincidence
+    for the False case and fail outright for the True one. Confirmed live:
+    this was the exact failure mode before switching to server.config."""
+    import api.server as server
+    monkeypatch.setattr(server, "_WORKER_POLL_S", 0.05)
+    monkeypatch.setattr(server.config, "enable_liveness_autokill", True)
+
+    http_request = _FakeHTTPRequest()  # never disconnects -- only liveness can end this
+    payload = {"task": "x", "_test_mode": "stale"}
+
+    with pytest.raises(HTTPException) as exc_info:
+        await asyncio.wait_for(
+            _run_worker_subprocess(http_request, payload, argv=_FIXTURE), timeout=10.0
+        )
+
+    assert exc_info.value.status_code == 504
+    assert "auto-terminated" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_liveness_kill_leaves_no_snapshot_file_behind(monkeypatch, tmp_path):
+    """Cleanup is the parent's job -- a SIGKILLed child never reaches its own
+    finally, so the snapshot file must not linger on disk after the kill."""
+    import api.server as server
+    monkeypatch.setattr(server, "_WORKER_POLL_S", 0.05)
+    monkeypatch.setattr(server.config, "enable_liveness_autokill", True)
+    monkeypatch.setattr(server.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    http_request = _FakeHTTPRequest()
+    payload = {"task": "x", "_test_mode": "stale"}
+
+    with pytest.raises(HTTPException):
+        await asyncio.wait_for(
+            _run_worker_subprocess(http_request, payload, argv=_FIXTURE), timeout=10.0
+        )
+
+    assert list(tmp_path.glob("agnohive-liveness-*.json")) == []
+
+
+@pytest.mark.asyncio
+async def test_liveness_kill_disabled_by_default_even_for_a_stale_worker(monkeypatch):
+    """Off by default (config.enable_liveness_autokill=False) -- matches the same
+    rollout discipline use_worker_process_isolation had: ship off, validate live,
+    flip on. wait_for's own TimeoutError firing (not an HTTPException) confirms
+    genuinely no kill happened via this path, not just that a different one did;
+    the CancelledError this raises is still handled by _run_worker_subprocess's
+    own except-CancelledError cleanup, so the child process itself doesn't leak
+    even though this specific mechanism stayed inert."""
+    import api.server as server
+    monkeypatch.setattr(server, "_WORKER_POLL_S", 0.05)
+    monkeypatch.setattr(server.config, "enable_liveness_autokill", False)
+
+    http_request = _FakeHTTPRequest()  # never disconnects
+    payload = {"task": "x", "_test_mode": "stale"}
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            _run_worker_subprocess(http_request, payload, argv=_FIXTURE), timeout=0.5
+        )
+
+
+@pytest.mark.asyncio
 async def test_default_argv_is_the_real_worker_command(monkeypatch):
     """Confirms the production default (no argv override) points at the real
     entrypoint `python main.py --run-worker` -- only tests pass argv to

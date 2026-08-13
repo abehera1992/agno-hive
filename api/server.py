@@ -2,6 +2,7 @@
 import asyncio
 import json
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -197,6 +198,36 @@ _WORKER_POLL_S = 2.0
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _liveness_kill_reason(snapshot: dict) -> str | None:
+    """Given a liveness snapshot dict (written each tick by swarm.team._run_heartbeat,
+    read from disk by the worker-subprocess poll loops below), return a human-readable
+    reason to kill the run, or None if it's still healthy. Pure function, no I/O -- the
+    decision logic is testable independent of file-reading/subprocess mechanics. See
+    DOCS.md "Liveness-Based Auto-Kill" for the full design and why these two signals
+    (not a single generic timeout) were chosen."""
+    stagnant = snapshot.get("stagnant_seconds", 0)
+    if stagnant > config.liveness_silence_threshold_s:
+        return f"no tool call or new stream content for over {config.liveness_silence_threshold_s:.0f}s"
+    stub_count = snapshot.get("max_stub_serve_count", 0)
+    if stub_count > config.liveness_stub_serve_threshold:
+        return f"repeated an identical call {stub_count} times despite being told to stop"
+    return None
+
+
+def _read_liveness_snapshot(path: "Path") -> dict | None:
+    """Best-effort read of a liveness snapshot -- missing file (run hasn't reached its
+    first heartbeat tick yet, or liveness is disabled for this build), a torn/partial
+    write, or any other OSError/JSONDecodeError all just mean "nothing to act on yet,"
+    never a crash. The write side is already atomic (temp file + os.replace in
+    _run_heartbeat), so a torn read should not happen in practice; this stays
+    defensive anyway, matching every other piece of this mechanism's own posture."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 async def _run_worker_subprocess(
     http_request, payload: dict, argv: list[str] | None = None
 ) -> tuple[str, dict, dict | None]:
@@ -232,6 +263,15 @@ async def _run_worker_subprocess(
     see main.py's _run_worker() for the receiving side. `argv` defaults to the
     real worker command; tests override it to spawn a small fixture script
     instead, so this can be exercised without the real agno/MCP/vLLM stack.
+
+    Liveness-based auto-kill (Recommendation #2, 2026-08-13, see DOCS.md
+    "Liveness-Based Auto-Kill"): when config.enable_liveness_autokill is set, this
+    same poll loop ALSO reads a small JSON snapshot swarm/team.py's heartbeat
+    writes each tick to a path keyed by this child's own pid, and kills the
+    process the identical way a disconnect does -- same actuator, second trigger
+    condition -- if _liveness_kill_reason judges it stale. Distinguished from a
+    disconnect via a 504 (vs. 499) so a caller can tell "gave up because it looked
+    stuck" apart from "you left."
     """
     argv = argv or [sys.executable, "main.py", "--run-worker"]
     proc = await asyncio.create_subprocess_exec(
@@ -242,7 +282,9 @@ async def _run_worker_subprocess(
                       # flows straight into this process's own stdout/journald
         cwd=str(_REPO_ROOT),
     )
-    proc.stdin.write(json.dumps(payload).encode())
+    liveness_path = Path(tempfile.gettempdir()) / f"agnohive-liveness-{proc.pid}.json"
+    worker_payload = {**payload, "liveness_path": str(liveness_path)}
+    proc.stdin.write(json.dumps(worker_payload).encode())
     proc.stdin.write_eof()
     await proc.stdin.drain()
 
@@ -258,9 +300,23 @@ async def _run_worker_subprocess(
                 await proc.wait()
                 print("[api] client disconnected — worker process killed, GPU work aborted")
                 raise HTTPException(status_code=499, detail="client disconnected")
+            if config.enable_liveness_autokill:
+                snapshot = _read_liveness_snapshot(liveness_path)
+                if snapshot is not None:
+                    reason = _liveness_kill_reason(snapshot)
+                    if reason is not None:
+                        proc.kill()
+                        await proc.wait()
+                        print(f"[api] run auto-terminated (liveness): {reason}")
+                        raise HTTPException(status_code=504, detail=f"run auto-terminated: {reason}")
     except asyncio.CancelledError:
         proc.kill()
         raise
+    finally:
+        try:
+            liveness_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     if proc.returncode != 0:
         raise HTTPException(

@@ -235,6 +235,31 @@ class Config:
     # cap is reached than a Researcher/Planner/Reviewer turn needs.
     coder_max_tokens: int = int(os.getenv("CODER_MAX_TOKENS", "8192"))
 
+    # Liveness-based auto-kill (Recommendation #2, 2026-08-13 -- see DOCS.md
+    # "Liveness-Based Auto-Kill"). The token caps above bound any SINGLE generation,
+    # and tool_call_limit/max_iterations eventually bound the whole loop -- but a run
+    # can still burn several minutes of real GPU time before hitting either ceiling.
+    # This closes that gap: api/server.py's existing worker-subprocess poll loop
+    # (the same one that already kills on client disconnect, see "Process-Boundary
+    # Cancellation") gains a second trigger, reading a small liveness snapshot
+    # swarm/team.py's heartbeat writes each tick. Off by default until live-validated
+    # against a deliberately-reproduced stall, same rollout discipline as every other
+    # risky mechanism in this codebase (use_worker_process_isolation's own history).
+    enable_liveness_autokill: bool = os.getenv("ENABLE_LIVENESS_AUTOKILL", "false").lower() == "true"
+    # Tier 1 (backstop): kill if NEITHER a new tool call NOR new stream content has
+    # happened for this many seconds. 300s was chosen from live-observed call
+    # latencies (every real tool call measured this session finished in 0.03-3.2s),
+    # not a guess -- ~90x margin above anything normal, while still ending a stall
+    # roughly 6x faster than agno_run's own 1800s client-side timeout.
+    liveness_silence_threshold_s: float = float(os.getenv("LIVENESS_SILENCE_THRESHOLD_S", "300"))
+    # Tier 2 (primary, sharper signal): kill if a model has been served the escalated
+    # "STOP calling this" stub (_STUB_ESCALATION_SERVE, serve 5+) and STILL kept
+    # calling the identical (tool, args) pair this many times total. 8 is 3 strikes
+    # past that escalation point -- grounded in the existing tuned constant, not
+    # arbitrary: every call past serve 5 is direct evidence of ignoring an explicit
+    # instruction, and 3 more confirms it isn't one stray repeat.
+    liveness_stub_serve_threshold: int = int(os.getenv("LIVENESS_STUB_SERVE_THRESHOLD", "8"))
+
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))
     session_window: int = int(os.getenv("AGNO_SESSION_WINDOW", "6"))

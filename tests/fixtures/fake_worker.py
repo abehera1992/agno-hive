@@ -19,6 +19,13 @@ a task:
       actually terminates a process that isn't cooperating, the entire point
       of the process-boundary design (see DOCS.md "Process-Boundary
       Cancellation").
+  "stale"   -- writes an already-stale liveness snapshot to the path the
+      parent computed and passed in (payload["liveness_path"]), then hangs
+      exactly like "hang" -- mirrors a genuinely stalled real worker (whose
+      _run_heartbeat keeps writing an aging snapshot) well enough to prove
+      _run_worker_subprocess's liveness-based auto-kill path (see DOCS.md
+      "Liveness-Based Auto-Kill") actually terminates it, without needing a
+      real 300s wait or the real agno/MCP/vLLM stack.
 """
 import json
 import sys
@@ -30,6 +37,13 @@ def main() -> None:
     mode = payload.get("_test_mode", "success")
 
     if mode == "hang":
+        while True:
+            time.sleep(3600)
+    elif mode == "stale":
+        liveness_path = payload.get("liveness_path")
+        if liveness_path:
+            with open(liveness_path, "w") as f:
+                json.dump({"stagnant_seconds": 999999, "max_stub_serve_count": 0}, f)
         while True:
             time.sleep(3600)
     elif mode == "crash":

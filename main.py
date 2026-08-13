@@ -93,6 +93,7 @@ async def _run_worker() -> dict:
             session_id=payload.get("session_id"),
             mode=payload.get("mode", "coordinate"),
             read_only=payload.get("read_only", False),
+            liveness_path=payload.get("liveness_path"),
         )
         return {"content": content, "tokens": tokens, "clarification": clarification}
     except Exception as exc:
