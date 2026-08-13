@@ -100,6 +100,21 @@ def test_update_session_state_is_a_function_named_correctly():
     assert update_session_state.name == "update_session_state"
 
 
+def test_update_session_state_schema_actually_admits_real_properties():
+    """The bug this guards against: a bare `dict` type hint on session_state_updates
+    produced {"type": "object", "properties": {}, "additionalProperties": false} --
+    valid JSON Schema that mechanically FORBIDS every property, so {} was the ONLY
+    value that could ever satisfy it. Confirmed live: qwen3-coder-30b called this
+    tool with session_state_updates={} on 3/3 attempts despite being told the exact
+    key/value to pass -- a schema bug, not a model-reliability one. dict[str, str]
+    must produce a schema whose additionalProperties genuinely admits values, not
+    an empty-properties trap."""
+    schema = update_session_state.parameters["properties"]["session_state_updates"]
+
+    assert schema["additionalProperties"] != False  # noqa: E712 -- must not be the trap
+    assert schema.get("additionalProperties") not in (None, {})
+
+
 def test_update_session_state_does_not_stop_the_run():
     """Unlike request_clarification, this is routine bookkeeping mid-run -- the
     agent must continue working after calling it, not end its turn."""

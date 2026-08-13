@@ -134,7 +134,22 @@ def format_skill_catalog(catalog: list[dict], names: list[str] | None) -> str:
 # identical job without the bug. enable_agentic_state is therefore NOT set anywhere
 # in this file -- setting it back to True would silently reintroduce a second,
 # same-named, broken tool alongside this one.
-def _update_session_state_impl(session_state_updates: dict, run_context: RunContext = None) -> str:
+#
+# session_state_updates: dict[str, str] -- NOT bare `dict` (2026-08-13, second bug
+# found the same way as the first: live-inspecting the actual schema rather than
+# assuming). agno's schema builder turns a bare `dict` type hint into
+# `{"type": "object", "properties": {}, "additionalProperties": false}` -- valid
+# JSON Schema, but one that mechanically FORBIDS every property, so the ONLY value
+# that ever satisfies it is `{}`. Confirmed live: qwen3-coder-30b called this tool
+# with session_state_updates={} on 3/3 attempts despite the task explicitly spelling
+# out the real key/value to pass -- not a model-reliability failure, the schema
+# itself made every other answer invalid. `dict[str, str]` produces
+# `"additionalProperties": {"type": "string"}`, a schema that actually admits real
+# key/value pairs. String-only values are a deliberate constraint, not a limitation:
+# every intended use (a renamed table, a confirmed decision, a fact to remember) is
+# naturally string-shaped, and it structurally can't become a place to dump nested
+# JSON/file content either.
+def _update_session_state_impl(session_state_updates: dict[str, str], run_context: RunContext = None) -> str:
     if run_context is None or run_context.session_state is None:
         return "No shared state available to update."
     run_context.session_state.update(session_state_updates)
@@ -142,14 +157,15 @@ def _update_session_state_impl(session_state_updates: dict, run_context: RunCont
 
 
 @agno_tool
-async def update_session_state(session_state_updates: dict, run_context: RunContext = None) -> str:
+async def update_session_state(session_state_updates: dict[str, str], run_context: RunContext = None) -> str:
     """Record a small, genuinely reusable fact or decision into the shared state every
-    agent in this run can see -- a renamed table, a confirmed architecture decision, a
-    fact a later step will need. Never full file content or a long pasted excerpt;
-    that belongs in a normal tool result, not shared state.
+    agent in this run can see. Never full file content or a long pasted excerpt; that
+    belongs in a normal tool result, not shared state.
+
+    Example: session_state_updates={"business_documents_table": "renamed from seller_documents in migration d0e1f2a3b4c5"}
 
     Args:
-        session_state_updates (dict): key-value pairs to merge into the shared state.
+        session_state_updates (dict[str, str]): key-value pairs to merge into the shared state. Values must be strings.
     """
     return _update_session_state_impl(session_state_updates, run_context)
 
