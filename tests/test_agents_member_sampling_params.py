@@ -49,14 +49,54 @@ def test_make_agent_from_spec_non_coder_gets_member_sampling_params():
     assert agent.model.max_tokens == 4096
 
 
-def test_make_agent_from_spec_coder_gets_the_larger_coder_max_tokens():
+def test_make_agent_from_spec_named_coder_no_longer_auto_gets_the_larger_budget():
+    """Recommendation #4 (2026-08-13, see DOCS.md "Declarative Per-Role Policy")
+    deliberately removed make_agent_from_spec's old `if spec.name == "Coder"`
+    name-based special-case -- a raw AgentSpec named "Coder" with no explicit
+    max_tokens (e.g. a direct RunRequest.agents POST, which never goes through
+    _load_team()'s DB-fallback resolution) now gets the same member_max_tokens
+    every other role gets, not a silent magic bump by name. The next test shows
+    how a caller gets the larger budget now: set it explicitly."""
     spec = AgentSpec(name="Coder", role="engineer", model="qwen2.5-coder:32b", instructions=["x"])
+
+    agent = make_agent_from_spec(spec)
+
+    assert agent.model.max_tokens == 4096  # member_max_tokens, NOT coder_max_tokens
+
+
+def test_make_agent_from_spec_honors_an_explicit_max_tokens_on_the_spec():
+    """The replacement mechanism for Coder's larger budget: _load_team()
+    (api/server.py) now sets AgentSpec.max_tokens explicitly from a team YAML
+    field or a team_role_models DB row (Coder's max_tokens=8192 lives there --
+    see swarm/model_routing.py's _TEAM_ROLE_POLICY_OVERRIDES) before
+    make_agent_from_spec ever sees the spec. Same end result for the shipped
+    engineering.yaml, achieved declaratively instead of by name-matching in code."""
+    spec = AgentSpec(
+        name="Coder", role="engineer", model="qwen2.5-coder:32b", instructions=["x"],
+        max_tokens=8192,
+    )
 
     agent = make_agent_from_spec(spec)
 
     assert agent.model.temperature == 0.2
     assert agent.model.frequency_penalty == 0.15
     assert agent.model.max_tokens == 8192
+
+
+def test_make_agent_from_spec_honors_an_explicit_temperature_and_tool_call_limit():
+    """The other two declarative fields, independent of max_tokens -- any role
+    can now override any one of the three without needing a name-matched
+    special-case in code for it."""
+    spec = AgentSpec(
+        name="Researcher", role="engineer", model="qwen2.5-coder:32b", instructions=["x"],
+        temperature=0.05, tool_call_limit=3,
+    )
+
+    agent = make_agent_from_spec(spec)
+
+    assert agent.model.temperature == 0.05
+    assert agent.tool_call_limit == 3
+    assert agent.model.max_tokens == 4096  # untouched -- falls back to member_max_tokens
 
 
 def test_make_coder_gets_coder_max_tokens():

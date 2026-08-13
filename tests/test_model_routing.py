@@ -65,6 +65,25 @@ async def test_seeded_team_role_defaults_cover_every_shipped_team():
         assert mr.get_default_model(team_name, role_name) == model_id
 
 
+async def test_seeded_coder_override_carries_the_larger_max_tokens():
+    """Recommendation #4 (2026-08-13, see DOCS.md "Declarative Per-Role Policy"):
+    the seed data's _TEAM_ROLE_POLICY_OVERRIDES entry for (engineering, Coder)
+    replaces the old hardcoded `if spec.name == "Coder"` special-case that used
+    to live in swarm/agents.py -- a fresh deployment's Coder role must still get
+    max_tokens=8192, just from a data row now instead of code."""
+    await mr.load_cache()
+    policy = mr.get_role_policy("engineering", "Coder")
+    assert policy.max_tokens == 8192
+
+
+async def test_seeded_roles_without_an_override_have_no_policy_set():
+    await mr.load_cache()
+    policy = mr.get_role_policy("engineering", "Researcher")
+    assert policy.temperature is None
+    assert policy.max_tokens is None
+    assert policy.tool_call_limit is None
+
+
 # ── cache lookups ─────────────────────────────────────────────────────────────
 
 async def test_get_route_returns_none_before_cache_loaded():
@@ -79,6 +98,19 @@ async def test_get_route_returns_none_for_unregistered_id():
 async def test_get_default_model_returns_none_for_unknown_team_role():
     await mr.load_cache()
     assert mr.get_default_model("engineering", "NoSuchRole") is None
+
+
+async def test_get_role_policy_returns_none_for_unknown_team_role():
+    await mr.load_cache()
+    assert mr.get_role_policy("engineering", "NoSuchRole") is None
+
+
+async def test_get_default_model_stays_correct_via_the_role_policy_cache():
+    """get_default_model() is now a thin wrapper over the same cache
+    get_role_policy() reads -- must still return exactly the model_id, not the
+    whole RolePolicy object or something else."""
+    await mr.load_cache()
+    assert mr.get_default_model("engineering", "Coder") == mr.get_role_policy("engineering", "Coder").model_id
 
 
 # ── ensure_cache_loaded idempotency ──────────────────────────────────────────
@@ -178,6 +210,26 @@ async def test_reload_detects_team_role_model_changes():
 
     assert diff["team_role_models"]["changed"] == ["engineering/Coder"]
     assert mr.get_default_model("engineering", "Coder") == "qwen3-coder:30b"
+
+
+async def test_reload_detects_a_policy_only_change_not_just_model_id():
+    """RolePolicy is a frozen dataclass, so the diff's value-equality check
+    (after_roles[k] != before_roles[k]) must catch a change to temperature/
+    max_tokens/tool_call_limit alone, with model_id untouched -- not just a
+    model_id swap. Confirms role_changed isn't secretly still comparing bare
+    model_id strings."""
+    await mr.ensure_cache_loaded()
+    async with db.get_engine().begin() as conn:
+        await conn.execute(
+            sa.update(db.team_role_models)
+            .where(db.team_role_models.c.team_name == "engineering", db.team_role_models.c.role_name == "Researcher")
+            .values(temperature=0.05)  # model_id left exactly as seeded
+        )
+
+    diff = await mr.reload()
+
+    assert diff["team_role_models"]["changed"] == ["engineering/Researcher"]
+    assert mr.get_role_policy("engineering", "Researcher").temperature == 0.05
 
 
 # ── inactive rows ─────────────────────────────────────────────────────────────

@@ -83,6 +83,21 @@ def _load_team(name: str) -> tuple[list[AgentSpec], str, str, list[str] | None]:
                     ),
                 )
             a["model"] = default
+        # Declarative per-role policy (Recommendation #4, 2026-08-13, see DOCS.md
+        # "Declarative Per-Role Policy") — identical precedence to model: above,
+        # one field at a time: the YAML's own value always wins; a field the YAML
+        # never set gets filled from the SAME team_role_models row model: already
+        # consults, if that row sets it. A field neither the YAML nor the DB sets
+        # stays None on the AgentSpec, and make_agent_from_spec() falls back to
+        # config.py's global default — unchanged behavior for every role that
+        # never opts in.
+        policy = model_routing.get_role_policy(name, a["name"])
+        if policy is not None:
+            for field in ("temperature", "max_tokens", "tool_call_limit"):
+                if a.get(field) is None:
+                    db_value = getattr(policy, field)
+                    if db_value is not None:
+                        a[field] = db_value
         agents.append(AgentSpec(**a))
     coordinator = data.get("coordinator_model") or model_routing.get_default_model(name, "Coordinator") or config.leader_model
     mode = data.get("mode", "coordinate")
@@ -922,9 +937,14 @@ async def list_team_role_models():
 
 @app.post("/admin/model-routes/teams", status_code=201)
 async def upsert_team_role_model(entry: TeamRoleModelEntry):
-    """Create or replace the DEFAULT model for one (team, role) pair — see
-    swarm/model_routing.py's get_default_model(): a team YAML's own model: field,
-    when present, always overrides this."""
+    """Create or replace the DEFAULT model AND declarative policy (Recommendation
+    #4, 2026-08-13 — temperature/max_tokens/tool_call_limit) for one (team, role)
+    pair — see swarm/model_routing.py's get_default_model()/get_role_policy(): a
+    team YAML's own fields, when present, always override these. A full
+    replace, not a partial patch: the UPDATE path writes every field on `entry`,
+    including a None left as None — re-upserting with a policy field omitted
+    clears any previous override for that field back to "use config.py's global
+    default," not "leave whatever was there before."""
     async with db.get_engine().begin() as conn:
         existing = (
             await conn.execute(
@@ -942,7 +962,10 @@ async def upsert_team_role_model(entry: TeamRoleModelEntry):
                         db.team_role_models.c.team_name == entry.team_name,
                         db.team_role_models.c.role_name == entry.role_name,
                     )
-                    .values(model_id=entry.model_id)
+                    .values(
+                        model_id=entry.model_id, temperature=entry.temperature,
+                        max_tokens=entry.max_tokens, tool_call_limit=entry.tool_call_limit,
+                    )
                 )
             else:
                 await conn.execute(db.team_role_models.insert().values(**entry.model_dump()))

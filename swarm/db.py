@@ -15,6 +15,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -23,6 +24,8 @@ from sqlalchemy import (
     Text,
     Uuid,
     event,
+    inspect,
+    text,
 )
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -103,6 +106,17 @@ team_role_models = Table(
     Column("team_name", Text, primary_key=True),
     Column("role_name", Text, primary_key=True),            # 'Coordinator', 'Executor', ...
     Column("model_id", Text, ForeignKey("model_catalog.model_id"), nullable=False),
+    # Declarative per-role policy (Recommendation #4, 2026-08-13, see DOCS.md
+    # "Declarative Per-Role Policy") -- replaces swarm/agents.py's old hardcoded
+    # `if spec.name == "Coder"` special-case and config.py's global-only
+    # member_temperature/member_max_tokens/tool_call_limit for anything that needs
+    # a per-role override. NULL (the default for every row) means "use config.py's
+    # existing global default" -- adding these columns changes nothing for a team
+    # that never sets them, same precedence model_id already established: a team
+    # YAML's own field wins when present, this DB row fills the gap otherwise.
+    Column("temperature", Float, nullable=True),
+    Column("max_tokens", Integer, nullable=True),
+    Column("tool_call_limit", Integer, nullable=True),
 )
 
 
@@ -169,14 +183,43 @@ def get_engine() -> AsyncEngine:
     return _engine
 
 
+_TEAM_ROLE_MODELS_NEW_COLUMNS = {
+    "temperature": "FLOAT",
+    "max_tokens": "INTEGER",
+    "tool_call_limit": "INTEGER",
+}
+
+
+def _existing_team_role_models_columns(sync_conn) -> set[str]:
+    return {c["name"] for c in inspect(sync_conn).get_columns("team_role_models")}
+
+
 async def ensure_schema() -> None:
     """Idempotent bootstrap — create_all() only creates tables that don't already
     exist, so this is safe to call on every startup (matches the old CREATE TABLE
     IF NOT EXISTS ethos) against either a fresh SQLite file or an existing ZGX
-    Postgres database that already has these tables from prior deployments."""
+    Postgres database that already has these tables from prior deployments.
+
+    team_role_models is the one table this codebase has ever needed to widen
+    after it was already deployed and populated (Recommendation #4, 2026-08-13):
+    create_all() only creates MISSING tables, it never ALTERs an existing one, so
+    on ZGX's already-populated database a plain create_all() would silently leave
+    temperature/max_tokens/tool_call_limit missing entirely -- not merely NULL,
+    genuinely absent -- breaking the first INSERT or SELECT that touches them.
+    Handled by introspecting the table's REAL columns first and only issuing
+    `ALTER TABLE ADD COLUMN` for ones actually missing, rather than a blind
+    try/except ALTER: Postgres aborts the whole enclosing transaction on any
+    failed statement within it (unlike SQLite), so a failed "already exists"
+    ALTER here would poison every later statement in this same `engine.begin()`
+    block, including create_all() itself if this ran first. Introspecting avoids
+    ever attempting the failing statement in the first place."""
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)
+        existing_columns = await conn.run_sync(_existing_team_role_models_columns)
+        for col_name, col_type in _TEAM_ROLE_MODELS_NEW_COLUMNS.items():
+            if col_name not in existing_columns:
+                await conn.execute(text(f"ALTER TABLE team_role_models ADD COLUMN {col_name} {col_type}"))
 
 
 async def reset_engine_for_tests() -> None:

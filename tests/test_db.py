@@ -116,6 +116,68 @@ async def test_team_role_models_model_id_fk_rejects_unknown_model(monkeypatch):
             )
 
 
+async def test_ensure_schema_adds_missing_columns_to_an_already_deployed_table(monkeypatch):
+    """The operationally critical case (Recommendation #4, 2026-08-13, see DOCS.md
+    "Declarative Per-Role Policy"): create_all() only creates tables that don't
+    already exist -- it never ALTERs one that does, so a database that already
+    had team_role_models before temperature/max_tokens/tool_call_limit were added
+    to its Python definition (ZGX's real, populated deployment) would silently
+    keep missing those 3 columns forever under plain create_all(), breaking the
+    first INSERT/SELECT that touches them. Simulates that exact pre-upgrade state
+    by creating the table with the OLD 3-column shape via raw SQL first, then
+    confirms ensure_schema() adds the missing columns without erroring or
+    touching the model_catalog FK/existing data."""
+    monkeypatch.setattr(config, "database_url", "sqlite+aiosqlite:///:memory:")
+    await db.reset_engine_for_tests()
+
+    async with db.get_engine().begin() as conn:
+        await conn.execute(sa.text(
+            "CREATE TABLE model_catalog ("
+            "  model_id TEXT PRIMARY KEY, kind TEXT NOT NULL, provider TEXT NOT NULL,"
+            "  vllm_served_as TEXT, requires_cloud_gate BOOLEAN NOT NULL, active BOOLEAN NOT NULL"
+            ")"
+        ))
+        await conn.execute(sa.text(
+            "CREATE TABLE team_role_models ("
+            "  team_name TEXT NOT NULL, role_name TEXT NOT NULL, model_id TEXT NOT NULL,"
+            "  PRIMARY KEY (team_name, role_name),"
+            "  FOREIGN KEY (model_id) REFERENCES model_catalog(model_id)"
+            ")"
+        ))
+        await conn.execute(
+            sa.text("INSERT INTO model_catalog VALUES ('pre-existing-model', 'local', 'local', NULL, 0, 1)")
+        )
+        await conn.execute(
+            sa.text("INSERT INTO team_role_models VALUES ('engineering', 'Coder', 'pre-existing-model')")
+        )
+
+    await db.ensure_schema()  # must not raise, must not touch the row already there
+
+    async with db.get_engine().begin() as conn:
+        columns = await conn.run_sync(db._existing_team_role_models_columns)
+        rows = (await conn.execute(sa.select(db.team_role_models))).mappings().all()
+
+    assert {"team_name", "role_name", "model_id", "temperature", "max_tokens", "tool_call_limit"} <= columns
+    assert len(rows) == 1
+    assert rows[0]["model_id"] == "pre-existing-model"
+    assert rows[0]["temperature"] is None  # newly-added column, NULL for a pre-existing row
+    assert rows[0]["max_tokens"] is None
+    assert rows[0]["tool_call_limit"] is None
+
+
+async def test_ensure_schema_column_migration_is_idempotent(monkeypatch):
+    """Running ensure_schema() a second time after the columns already exist
+    (a fresh SQLite deployment where create_all() created the full shape from
+    the start, OR a database this migration has already run against once) must
+    not error -- the introspect-first check exists specifically to make the
+    ALTER TABLE path skip cleanly instead of hitting "duplicate column"."""
+    monkeypatch.setattr(config, "database_url", "sqlite+aiosqlite:///:memory:")
+    await db.reset_engine_for_tests()
+
+    await db.ensure_schema()
+    await db.ensure_schema()  # must not raise
+
+
 async def test_model_catalog_model_id_is_primary_key(monkeypatch):
     monkeypatch.setattr(config, "database_url", "sqlite+aiosqlite:///:memory:")
     await db.reset_engine_for_tests()

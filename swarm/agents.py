@@ -202,17 +202,33 @@ def make_agent_from_spec(
     if catalog_text:
         instructions.append(catalog_text)
 
-    # Coder gets more max_tokens headroom (large diffs) than every other member agent --
-    # see config.coder_max_tokens/member_max_tokens for the full rationale. Matched by name
-    # since spec is a plain data object (teams/engineering.yaml's "name: Coder" entry), not a
-    # type distinct from the other member specs.
-    max_tokens = config.coder_max_tokens if spec.name == "Coder" else config.member_max_tokens
+    # Declarative per-role policy (Recommendation #4, 2026-08-13, see DOCS.md
+    # "Declarative Per-Role Policy") -- replaces the old hardcoded
+    # `max_tokens = config.coder_max_tokens if spec.name == "Coder" else
+    # config.member_max_tokens` special-case. spec.temperature/max_tokens/
+    # tool_call_limit are set by api/server.py's _load_team() from a team YAML
+    # field or a team_role_models DB row (Coder's max_tokens=8192 now lives
+    # there, same value, no behavior change for the shipped teams). getattr with
+    # a None default, not direct attribute access, the same defensive pattern
+    # already used for spec.skills a few lines up -- spec is a plain data object
+    # (a real AgentSpec from _load_team(), or a test fake), and older/lighter
+    # fakes that predate this addition legitimately don't define these three
+    # attributes at all.
+    temperature = getattr(spec, "temperature", None)
+    if temperature is None:
+        temperature = config.member_temperature
+    max_tokens = getattr(spec, "max_tokens", None)
+    if max_tokens is None:
+        max_tokens = config.member_max_tokens
+    tool_call_limit = getattr(spec, "tool_call_limit", None)
+    if tool_call_limit is None:
+        tool_call_limit = config.tool_call_limit
 
     return Agent(
         name=spec.name,
         model=get_model(
             spec.model, config.ollama_host,
-            temperature=config.member_temperature, max_tokens=max_tokens,
+            temperature=temperature, max_tokens=max_tokens,
             frequency_penalty=config.member_frequency_penalty,
         ),
         tools=agent_tools + [update_session_state],
@@ -221,7 +237,7 @@ def make_agent_from_spec(
         description=spec.description,
         markdown=True,
         add_name_to_context=True,
-        tool_call_limit=config.tool_call_limit,
+        tool_call_limit=tool_call_limit,
         tool_hooks=tool_hooks,
         add_session_state_to_context=True,
     )

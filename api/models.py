@@ -21,6 +21,19 @@ class AgentSpec(BaseModel):
                                           # advertised" — the agent can still call
                                           # load_skill(name) directly if it knows the
                                           # name, but nothing is proactively listed.
+    # Declarative per-role policy (Recommendation #4, 2026-08-13, see DOCS.md
+    # "Declarative Per-Role Policy") — same optional-with-fallback shape as model:
+    # above, one layer down: a team YAML MAY set these explicitly, MAY leave them
+    # unset and let api/server.py's _load_team() fill a gap from
+    # model_routing.get_role_policy(team_name, role_name)'s DB row, or leave both
+    # unset, in which case swarm/agents.py's make_agent_from_spec() falls back to
+    # config.py's existing global member_temperature/member_max_tokens/
+    # tool_call_limit — today's behavior, unchanged, for any role nobody has
+    # opted in for. Replaces the old hardcoded `if spec.name == "Coder"`
+    # special-case in swarm/agents.py with an explicit DB row instead.
+    temperature: float | None = None
+    max_tokens: int | None = None
+    tool_call_limit: int | None = None
 
 
 class RunRequest(BaseModel):
@@ -186,6 +199,16 @@ class TeamRoleModelEntry(BaseModel):
     team_name: str
     role_name: str
     model_id: str
+    # Declarative per-role policy (Recommendation #4, 2026-08-13) — see
+    # AgentSpec's own comment for the full precedence chain. None (the default)
+    # means "no override for this field" — upsert_team_role_model's UPDATE path
+    # writes these through as-is, so explicitly re-upserting with a field left at
+    # None clears any previous override for that field back to "use config.py's
+    # global default," the same "absence means default" contract create/read
+    # already had for model_id.
+    temperature: float | None = None
+    max_tokens: int | None = None
+    tool_call_limit: int | None = None
 
 
 class ModelRoutesReloadResponse(BaseModel):

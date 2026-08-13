@@ -121,15 +121,69 @@ async def test_upsert_team_role_model_creates_then_updates():
 
     await upsert_team_role_model(TeamRoleModelEntry(team_name="myteam", role_name="Coder", model_id="model-a"))
     listed = await list_team_role_models()
-    assert {"team_name": "myteam", "role_name": "Coder", "model_id": "model-a"} in [dict(r) for r in listed["defaults"]]
+    # temperature/max_tokens/tool_call_limit (Recommendation #4, 2026-08-13) are
+    # always present on a row now, None here since this entry never set them.
+    assert {
+        "team_name": "myteam", "role_name": "Coder", "model_id": "model-a",
+        "temperature": None, "max_tokens": None, "tool_call_limit": None,
+    } in [dict(r) for r in listed["defaults"]]
 
     # Upsert again with a different model_id -- must UPDATE, not create a duplicate row
     await upsert_team_role_model(TeamRoleModelEntry(team_name="myteam", role_name="Coder", model_id="model-b"))
     listed = await list_team_role_models()
     rows = [dict(r) for r in listed["defaults"]]
     assert [r for r in rows if r["team_name"] == "myteam" and r["role_name"] == "Coder"] == [
-        {"team_name": "myteam", "role_name": "Coder", "model_id": "model-b"}
+        {
+            "team_name": "myteam", "role_name": "Coder", "model_id": "model-b",
+            "temperature": None, "max_tokens": None, "tool_call_limit": None,
+        }
     ]
+
+
+async def test_upsert_team_role_model_writes_through_the_declarative_policy_fields():
+    """Recommendation #4 (2026-08-13, see DOCS.md "Declarative Per-Role Policy") --
+    the UPDATE path must write temperature/max_tokens/tool_call_limit, not just
+    model_id, on both the initial create and a later re-upsert."""
+    from api.server import create_model_route, list_team_role_models, upsert_team_role_model
+
+    await create_model_route(ModelCatalogEntry(model_id="model-a", kind="local", provider="local"))
+
+    await upsert_team_role_model(
+        TeamRoleModelEntry(team_name="myteam", role_name="Coder", model_id="model-a", max_tokens=8192)
+    )
+    rows = [dict(r) for r in (await list_team_role_models())["defaults"]]
+    assert [r for r in rows if r["role_name"] == "Coder"][0]["max_tokens"] == 8192
+
+    # Re-upsert (UPDATE path, entry already exists) with a different policy value
+    await upsert_team_role_model(
+        TeamRoleModelEntry(
+            team_name="myteam", role_name="Coder", model_id="model-a",
+            temperature=0.1, max_tokens=8192, tool_call_limit=5,
+        )
+    )
+    rows = [dict(r) for r in (await list_team_role_models())["defaults"]]
+    updated = [r for r in rows if r["role_name"] == "Coder"][0]
+    assert updated["temperature"] == 0.1
+    assert updated["max_tokens"] == 8192
+    assert updated["tool_call_limit"] == 5
+
+
+async def test_upsert_team_role_model_reupsert_with_field_omitted_clears_it():
+    """A full-replace UPDATE, not a partial PATCH: re-upserting without a
+    previously-set policy field must clear it back to None (config.py's global
+    default), not silently preserve the old value -- see upsert_team_role_model's
+    own docstring for why this is the deliberate contract."""
+    from api.server import create_model_route, list_team_role_models, upsert_team_role_model
+
+    await create_model_route(ModelCatalogEntry(model_id="model-a", kind="local", provider="local"))
+    await upsert_team_role_model(
+        TeamRoleModelEntry(team_name="myteam", role_name="Coder", model_id="model-a", max_tokens=8192)
+    )
+
+    await upsert_team_role_model(TeamRoleModelEntry(team_name="myteam", role_name="Coder", model_id="model-a"))
+
+    rows = [dict(r) for r in (await list_team_role_models())["defaults"]]
+    assert [r for r in rows if r["role_name"] == "Coder"][0]["max_tokens"] is None
 
 
 async def test_upsert_team_role_model_rejects_unknown_model_id():

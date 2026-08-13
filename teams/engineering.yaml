@@ -9,6 +9,11 @@ description: Full engineering team — routes context, researches codebase, plan
 # coordinator_model / each agent's model: are DB-managed (AGNOHive 2.3.2 addendum,
 # 2026-08-08) — see team_role_models, seeded with the values the comment above
 # describes. Set model: back here to pin a role and take it out of DB control again.
+# temperature: / max_tokens: / tool_call_limit: are ALSO DB-managed the same way
+# (Recommendation #4, 2026-08-13, see DOCS.md "Declarative Per-Role Policy") —
+# Coder's larger max_tokens=8192 lives in team_role_models now, not a hardcoded
+# name-match in swarm/agents.py. Set any of these fields back here per-agent to
+# pin it and take that one field out of DB control, same override rule as model:.
 
 agents:
   - name: ContextRouter
