@@ -3,7 +3,7 @@ run_task_stream yields for each raw agno event. No agno Team/MCP dependency:
 built from bare objects with just the attributes the function reads."""
 from types import SimpleNamespace
 
-from swarm.team import _is_cancelled_event, _stream_event_to_chunk
+from swarm.team import _stream_event_to_chunk
 
 
 def _content_event(content):
@@ -120,35 +120,3 @@ def test_team_level_tool_event_defaults_agent_name_to_empty_string():
     event = _tool_started("search_files", {"pattern": "x"})
     out = _stream_event_to_chunk(event)
     assert out["agent_name"] == ""
-
-
-# ── _is_cancelled_event ──────────────────────────────────────────────────────────
-# Confirmed live 2026-08-11: agno's own _arun_tasks_stream (agno/team/_run.py, the
-# function backing team.arun(stream=True, ...)) catches a real asyncio.CancelledError
-# internally and yields one of these events instead of re-raising -- breaking
-# cooperative cancellation at the library boundary. _is_cancelled_event() is what lets
-# every consumer of the stream detect this and raise its own CancelledError to
-# restore propagation (see the call sites in run_task_async / run_task_stream /
-# _stream_team_run).
-
-def test_is_cancelled_event_recognizes_team_run_cancelled():
-    event = SimpleNamespace(event="TeamRunCancelled", content=None)
-    assert _is_cancelled_event(event) is True
-
-
-def test_is_cancelled_event_recognizes_bare_run_cancelled():
-    """The member-agent-level equivalent, same naming convention as
-    RunContent/ToolCallStarted having no 'Team' prefix."""
-    event = SimpleNamespace(event="RunCancelled", content=None)
-    assert _is_cancelled_event(event) is True
-
-
-def test_is_cancelled_event_false_for_ordinary_content_event():
-    assert _is_cancelled_event(_content_event("hello")) is False
-
-
-def test_is_cancelled_event_false_for_the_final_run_output_object():
-    """The real TeamRunOutput object (yielded when yield_run_output=True) has no
-    .event attribute at all -- must not be misclassified as a cancellation."""
-    run_output = SimpleNamespace(content="done", messages=[], tools=[])
-    assert _is_cancelled_event(run_output) is False

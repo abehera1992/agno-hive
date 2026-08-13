@@ -141,21 +141,3 @@ def test_member_temperature_matches_the_coordinators_own_tuned_value_by_default(
     cfg = mod.Config()
     assert cfg.member_temperature == cfg.coordinator_temperature
     assert cfg.member_frequency_penalty == cfg.coordinator_frequency_penalty
-
-
-# ── Process-boundary cancellation (Phase 1, 2026-08-12) ───────────────────────────
-
-def test_use_worker_process_isolation_defaults_off():
-    """Off by default until validated live against a deliberately-reproduced
-    stall -- see config.py's own docstring and DOCS.md "Process-Boundary
-    Cancellation"."""
-    mod = _reload_config()
-    cfg = mod.Config()
-    assert cfg.use_worker_process_isolation is False
-
-
-def test_use_worker_process_isolation_from_env(monkeypatch):
-    monkeypatch.setenv("USE_WORKER_PROCESS_ISOLATION", "true")
-    mod = _reload_config()
-    cfg = mod.Config()
-    assert cfg.use_worker_process_isolation is True

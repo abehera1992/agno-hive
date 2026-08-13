@@ -193,105 +193,6 @@ async def list_teams():
     return {"teams": teams}
 
 
-_DISCONNECT_POLL_S = 2.0
-
-
-class DisconnectSignal:
-    """Wraps http_request.is_disconnected() with a shared 'claimed' flag so the
-    OUTER polling loop below (_run_cancel_on_disconnect) and the INNER, independent
-    disconnect-checker inside the actual run (swarm/team.py's
-    _make_disconnect_checker, added 2026-08-11 to use agno's own native
-    acancel_run -- see its docstring) never BOTH act on the same disconnect.
-
-    Confirmed live 2026-08-11: both sides poll the SAME is_disconnected() on their
-    own ~_DISCONNECT_POLL_S-second timer, started at different moments -- so
-    whichever fires first starts cancelling/unwinding the run while the OTHER is
-    still on its own poll cycle. If that other side ALSO detects the disconnect and
-    calls task.cancel() (or raises its own CancelledError) while the first
-    cancellation is already unwinding through nested async context managers (here,
-    MCPTools.__aexit__ -> the mcp package's ClientSession.__aexit__ -> an anyio
-    TaskGroup.__aexit__), the second delivery lands in the middle of anyio's own
-    per-task cancel-scope bookkeeping and corrupts it: confirmed via anyio's own
-    source (_backends/_asyncio.py's CancelScope.__exit__) that "Attempted to exit a
-    cancel scope that isn't the current tasks's current cancel scope" is raised
-    when a task's tracked active scope doesn't match the scope trying to exit --
-    exactly what a cancellation delivered mid-teardown, interleaved with anyio's own
-    scope-stack updates, produces. The task was left in a state that never resolved
-    on its own (confirmed live: a lingering ESTABLISHED connection to LiteLLM, real
-    ongoing vLLM generation, ~10+ minutes after the client had disconnected -- ended
-    only by restarting agno-api).
-
-    `claimed` is checked-and-set synchronously (no `await` between the check and the
-    act) on both sides, so there is no window for the other side to slip in between
-    -- whichever side observes the disconnect first commits to handling it alone;
-    the other sees `claimed` already set and stands down.
-    """
-
-    def __init__(self, http_request):
-        self._http_request = http_request
-        self.claimed = asyncio.Event()
-
-    async def __call__(self) -> bool:
-        return await self._http_request.is_disconnected()
-
-
-async def _run_cancel_on_disconnect(http_request, coro, disconnect_signal: "DisconnectSignal | None" = None):
-    """Await `coro`, but cancel it if the HTTP client goes away.
-
-    Without this a client that times out, is Ctrl-C'd, or loses its connection leaves
-    the run executing to completion on the GPU with nobody to receive the answer. Those
-    orphans accumulate: on 2026-07-31 a handful of abandoned eval runs kept the GPU at
-    96% and made every subsequent measurement look pathological — a trivial one-file
-    read timed out at 600s that completes in 74s on an idle box. It also burns real
-    money and thermal budget for output that is discarded.
-
-    Cancellation propagates the whole way down: cancelling the task raises
-    CancelledError at the next await, which closes the httpx connection to vLLM, and
-    vLLM aborts generation when its client disconnects. So the GPU work actually stops
-    rather than merely being ignored.
-
-    The poll interval is deliberately coarse. is_disconnected() on a request whose body
-    is already consumed is cheap, but this runs for the entire life of a multi-minute
-    task, and detecting an abandoned run 2s late costs nothing.
-
-    `disconnect_signal`, when supplied, coordinates with swarm/team.py's own
-    disconnect-checker inside the run itself -- see DisconnectSignal's docstring for
-    why calling task.cancel() here after that inner mechanism has ALREADY started
-    cancelling corrupts anyio's cancel-scope bookkeeping. None (the default) preserves
-    the original, always-call-task.cancel() behavior for any caller that doesn't pass
-    one.
-    """
-    task = asyncio.ensure_future(coro)
-    try:
-        while True:
-            done, _ = await asyncio.wait({task}, timeout=_DISCONNECT_POLL_S)
-            if done:
-                return task.result()
-            if await http_request.is_disconnected():
-                if disconnect_signal is None or not disconnect_signal.claimed.is_set():
-                    if disconnect_signal is not None:
-                        disconnect_signal.claimed.set()
-                    task.cancel()
-                # Either this call just cancelled the task, or the inner mechanism
-                # already did (disconnect_signal.claimed was set first) -- either
-                # way, just wait for it to actually finish unwinding.
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                print("[api] client disconnected — run cancelled, GPU work aborted")
-                # 499 (nginx's "client closed request"): nobody is listening, but the
-                # status distinguishes an abandoned run from a real server failure in
-                # the access log.
-                raise HTTPException(status_code=499, detail="client disconnected")
-    except asyncio.CancelledError:
-        if disconnect_signal is None or not disconnect_signal.claimed.is_set():
-            if disconnect_signal is not None:
-                disconnect_signal.claimed.set()
-            task.cancel()
-        raise
-
-
 _WORKER_POLL_S = 2.0
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -303,32 +204,34 @@ async def _run_worker_subprocess(
     --run-worker`, see main.py's _run_worker()) instead of in-process. See
     DOCS.md "Process-Boundary Cancellation" for the full design.
 
-    Why: four rounds of cooperative cancellation in this codebase -- agno's own
-    acancel_run/araise_if_cancelled, generic asyncio task.cancel(), a shared
-    claimed-flag between two independent checkers (DisconnectSignal above), and
-    tracking every observed run_id instead of just the first -- each closed one
-    specific way cancellation could land wrong inside agno + MCP + anyio's
-    nested async call graph, and each was followed by a NEW way it still
-    didn't (most recently: cancelling several run_ids from the same event in
-    rapid succession still corrupted anyio's cancel-scope bookkeeping when
-    their generators shared overlapping async context managers). That pattern
-    -- a new interaction breaking after every fix -- is itself the signal:
-    cooperative cancellation across a framework we don't control has run out
-    of ROI. This sidesteps the whole bug class rather than looking for a fifth
-    fix: on disconnect the child process is SIGKILLed outright. The OS
-    reclaims every open socket and every anyio scope unconditionally when a
-    process dies -- no cooperation from agno's internals required, because
-    none of that cleanup code needs to run at all for the kernel to free the
-    resources.
+    Why: four rounds of cooperative cancellation this codebase used to have --
+    agno's own acancel_run/araise_if_cancelled, generic asyncio task.cancel(), a
+    shared claimed-flag between two independent checkers, and tracking every
+    observed run_id instead of just the first -- each closed one specific way
+    cancellation could land wrong inside agno + MCP + anyio's nested async call
+    graph, and each was followed by a NEW way it still didn't (most recently:
+    cancelling several run_ids from the same event in rapid succession still
+    corrupted anyio's cancel-scope bookkeeping when their generators shared
+    overlapping async context managers). That pattern -- a new interaction
+    breaking after every fix -- was itself the signal: cooperative cancellation
+    across a framework we don't control had run out of ROI. This sidesteps the
+    whole bug class rather than continuing to look for the next fix: on
+    disconnect the child process is SIGKILLed outright. The OS reclaims every
+    open socket and every anyio scope unconditionally when a process dies -- no
+    cooperation from agno's internals required, because none of that cleanup
+    code needs to run at all for the kernel to free the resources. Validated
+    live 2026-08-12: three deliberate mid-flight kills (two /run, one /stream,
+    one specifically mid-write), zero anyio errors in any of them -- the first
+    clean kills this whole investigation produced. The old cooperative path
+    (DisconnectSignal, _run_cancel_on_disconnect, _make_disconnect_checker) was
+    removed the same day once both endpoints had this replacement validated;
+    see DOCS.md "Process-Boundary Cancellation" for the full incident history
+    and validation record.
 
     `payload` is the exact kwargs run_task_async() would take, JSON-encoded --
     see main.py's _run_worker() for the receiving side. `argv` defaults to the
     real worker command; tests override it to spawn a small fixture script
     instead, so this can be exercised without the real agno/MCP/vLLM stack.
-
-    Mirrors _run_cancel_on_disconnect's own polling shape deliberately -- same
-    structure, so the one difference (kill vs. cooperative cancel) is the only
-    thing a reader familiar with the old code needs to notice.
     """
     argv = argv or [sys.executable, "main.py", "--run-worker"]
     proc = await asyncio.create_subprocess_exec(
@@ -498,43 +401,24 @@ async def run(request: RunRequest, http_request: Request):
 
     resolved_mcp_urls = _resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url)
 
-    if config.use_worker_process_isolation:
-        # Phase 1 of process-boundary cancellation (see DOCS.md) -- SIGKILLs a
-        # genuinely separate OS process on disconnect instead of cooperatively
-        # cancelling in-process. Feature-flagged off by default until validated
-        # live; see config.use_worker_process_isolation's own docstring.
-        worker_payload = {
-            "task": request.task,
-            "agent_specs": [a.model_dump() for a in agent_specs] if agent_specs else None,
-            "coordinator_model": coordinator_model,
-            "coordinator_tools": coordinator_tools,
-            "mcp_url": mcp_url,
-            "mcp_urls": resolved_mcp_urls,
-            "project_id": request.project_id,
-            "session_id": session_id,
-            "mode": team_mode,
-            "read_only": request.read_only,
-        }
-        result, tokens, clarification = await _run_worker_subprocess(http_request, worker_payload)
-    else:
-        disconnect_signal = DisconnectSignal(http_request)
-        result, tokens, clarification = await _run_cancel_on_disconnect(
-            http_request,
-            run_task_async(
-                task=request.task,
-                agent_specs=agent_specs,
-                coordinator_model=coordinator_model,
-                coordinator_tools=coordinator_tools,
-                mcp_url=mcp_url,
-                mcp_urls=resolved_mcp_urls,
-                project_id=request.project_id,
-                session_id=session_id,
-                mode=team_mode,
-                read_only=request.read_only,
-                is_disconnected=disconnect_signal,
-            ),
-            disconnect_signal=disconnect_signal,
-        )
+    # Process-boundary cancellation (see DOCS.md "Process-Boundary Cancellation") --
+    # runs in an isolated child process, SIGKILLed outright on disconnect. Replaced
+    # the original in-process cooperative-cancellation path (DisconnectSignal,
+    # _run_cancel_on_disconnect) on 2026-08-12 once validated live: three clean
+    # kills, zero anyio errors, including one mid-write.
+    worker_payload = {
+        "task": request.task,
+        "agent_specs": [a.model_dump() for a in agent_specs] if agent_specs else None,
+        "coordinator_model": coordinator_model,
+        "coordinator_tools": coordinator_tools,
+        "mcp_url": mcp_url,
+        "mcp_urls": resolved_mcp_urls,
+        "project_id": request.project_id,
+        "session_id": session_id,
+        "mode": team_mode,
+        "read_only": request.read_only,
+    }
+    result, tokens, clarification = await _run_worker_subprocess(http_request, worker_payload)
 
     # Append this turn to session
     await append_message(session_id, "user", request.task)
@@ -667,42 +551,25 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
 
     async def generate():
         try:
-            if config.use_worker_process_isolation:
-                # Phase 3 of process-boundary cancellation (see DOCS.md) -- same
-                # SIGKILL-on-disconnect mechanism Phase 1/2 already validated live
-                # for /run, extended to /stream's incremental delivery via
-                # _stream_worker_subprocess's NDJSON-over-stdout protocol.
-                stream_source = _stream_worker_subprocess(http_request, {
-                    "task": request.task,
-                    "agent_specs": [a.model_dump() for a in agent_specs] if agent_specs else None,
-                    "coordinator_model": coordinator_model,
-                    "coordinator_tools": coordinator_tools,
-                    "mcp_url": mcp_url,
-                    "mcp_urls": resolved_mcp_urls,
-                    "project_id": request.project_id,
-                    "session_id": session_id,
-                    "mode": stream_mode,
-                    "read_only": request.read_only,
-                })
-            else:
-                # No outer _run_cancel_on_disconnect wraps /stream (Starlette's own
-                # StreamingResponse machinery stops calling generate() on disconnect
-                # instead), so there is no second, independent cancellation source to
-                # coordinate with here -- DisconnectSignal's .claimed flag is simply
-                # never contended in this path. Used anyway for a single consistent
-                # shape across both endpoints, matching /run's own wiring above.
-                stream_source = run_task_stream(
-                    task=request.task,
-                    agent_specs=agent_specs,
-                    coordinator_model=coordinator_model,
-                    coordinator_tools=coordinator_tools,
-                    mcp_url=mcp_url,
-                    mcp_urls=resolved_mcp_urls,
-                    project_id=request.project_id,
-                    session_id=session_id,
-                    mode=stream_mode,
-                    is_disconnected=DisconnectSignal(http_request),
-                )
+            # Process-boundary cancellation (see DOCS.md "Process-Boundary
+            # Cancellation") -- same SIGKILL-on-disconnect mechanism validated live
+            # for /run, extended to /stream's incremental delivery via
+            # _stream_worker_subprocess's NDJSON-over-stdout protocol. Replaced the
+            # original in-process cooperative path (DisconnectSignal + plain
+            # run_task_stream(is_disconnected=...)) on 2026-08-12 once both endpoints
+            # had a validated replacement.
+            stream_source = _stream_worker_subprocess(http_request, {
+                "task": request.task,
+                "agent_specs": [a.model_dump() for a in agent_specs] if agent_specs else None,
+                "coordinator_model": coordinator_model,
+                "coordinator_tools": coordinator_tools,
+                "mcp_url": mcp_url,
+                "mcp_urls": resolved_mcp_urls,
+                "project_id": request.project_id,
+                "session_id": session_id,
+                "mode": stream_mode,
+                "read_only": request.read_only,
+            })
 
             async for chunk in stream_source:
                 if isinstance(chunk, str):
