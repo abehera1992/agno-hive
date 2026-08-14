@@ -1115,7 +1115,7 @@ def _summarize_actual_writes(*results) -> str:
 
 
 async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | None,
-                           result=None) -> str:
+                           result=None, liveness_path: str | None = None) -> str:
     """Check the draft's claims and, if any are unverifiable, give the team ONE chance
     to correct itself against the evidence.
 
@@ -1182,6 +1182,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"brand-new file), confirm its response actually indicates success, and "
                 f"only THEN report the change as made. If the write tool keeps failing, "
                 f"report the exact failure message instead of claiming success.",
+                liveness_path=liveness_path,
             )
             all_results.append(retry)
             if retried:
@@ -1247,7 +1248,9 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"your earlier answer."
             )
         try:
-            retried, retry = await _stream_team_run(team, f"{task}\n\n{claim_note}")
+            retried, retry = await _stream_team_run(
+                team, f"{task}\n\n{claim_note}", liveness_path=liveness_path,
+            )
             all_results.append(retry)
             if retried:
                 retry_unverified = _unverified_claimed_searches(retried, retry)
@@ -1298,6 +1301,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"codebase but does not apply here. Base every statement on text you have "
                 f"actually read this run, and if the thing asked about does not exist, say "
                 f"so plainly.",
+                liveness_path=liveness_path,
             )
             all_results.append(retry)
             if retried:
@@ -1428,7 +1432,9 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         )
     retry_prompt = f"{task}\n\nIMPORTANT: " + " Also, ".join(instructions)
     try:
-        corrected, retry = await _stream_team_run(team, retry_prompt)
+        corrected, retry = await _stream_team_run(
+            team, retry_prompt, liveness_path=liveness_path,
+        )
         all_results.append(retry)
     except Exception as exc:
         print(f"[team] verify retry failed: {exc}")
@@ -2324,7 +2330,9 @@ async def _run_heartbeat(
                 print(f"[team] liveness write warning: {exc}", flush=True)
 
 
-async def _stream_team_run(team, prompt: str, *, log_label: str = "verify-retry") -> tuple[str, "TeamRunOutput | None"]:
+async def _stream_team_run(
+    team, prompt: str, *, log_label: str = "verify-retry", liveness_path: str | None = None
+) -> tuple[str, "TeamRunOutput | None"]:
     """Run team.arun(prompt, stream=True, yield_run_output=True) with the same
     content-preview/tool-event/heartbeat visibility run_task_async's outer call has,
     for callers that used to make a single opaque `await team.arun(prompt)` -- today,
@@ -2356,9 +2364,33 @@ async def _stream_team_run(team, prompt: str, *, log_label: str = "verify-retry"
     it has no access to the tool_hook closure the original team was built with, so
     "last tool call name" reporting is not meaningful here (always "(none yet)"); the
     stream_event_count and elapsed-time fields are still accurate and are the signal
-    that actually mattered in the 17-minute incident this exists to fix."""
-    activity = {"last_call_name": None, "last_call_at": time.monotonic(), "stream_event_count": 0}
-    heartbeat_task = asyncio.create_task(_run_heartbeat(activity, time.monotonic()))
+    that actually mattered in the 17-minute incident this exists to fix.
+
+    liveness_path (2026-08-14, closes a real production hang): forwarded to
+    _run_heartbeat exactly like run_task_async's own call does, and last_progress_at
+    is now tracked in this function's activity dict too -- until this fix, NEITHER
+    was true, so a retry that stalled here was invisible to the process-level
+    liveness auto-kill entirely (that watchdog only ever sees what a caller writes
+    to liveness_path -- writing nothing means it never observes staleness, so it
+    never kills anything). Confirmed live: a verify_claims correction retry emitted
+    nothing but empty TeamRunContent events for 30+ minutes with real, distinct
+    vLLM completions the whole time (confirmed via each event's own
+    model_provider_data carrying a unique completion id -- not one hung stream),
+    and NOTHING ended it -- not the 300s liveness threshold (this code path never
+    fed it), not agno's own retry bounds (0 base retries, 1 guidance retry -- far
+    too few to explain it). It only stopped because the CLIENT's own unrelated
+    1800s httpx timeout eventually dropped the connection, which is not a fix, just
+    an accidental, much-later backstop. The caller (currently only _verified_answer)
+    must be given a liveness_path to actually close this -- omitting it (the
+    default) reproduces the exact unprotected behavior above, so every caller of
+    this function needs updating alongside this fix, not just this function itself."""
+    activity = {
+        "last_call_name": None, "last_call_at": time.monotonic(),
+        "stream_event_count": 0, "last_progress_at": time.monotonic(),
+    }
+    heartbeat_task = asyncio.create_task(
+        _run_heartbeat(activity, time.monotonic(), liveness_path=liveness_path)
+    )
     full_content: list[str] = []
     final_run_output: "TeamRunOutput | None" = None
     last_logged_len = 0
@@ -2372,6 +2404,7 @@ async def _stream_team_run(team, prompt: str, *, log_label: str = "verify-retry"
             activity["stream_event_count"] += 1
             out = _stream_event_to_chunk(event)
             if isinstance(out, str):
+                activity["last_progress_at"] = time.monotonic()
                 full_content.append(out)
                 now = time.monotonic()
                 if now - last_logged_at >= 10:
@@ -2385,6 +2418,7 @@ async def _stream_team_run(team, prompt: str, *, log_label: str = "verify-retry"
                     last_logged_at = now
                     last_logged_len = len(joined)
             elif isinstance(out, dict):
+                activity["last_progress_at"] = time.monotonic()
                 print(f"[{log_label}] stream tool event: {out}", flush=True)
             else:
                 _log_unclassified_stream_event(log_label, event, unrecognized_event_counts)
@@ -2668,7 +2702,7 @@ async def run_task_async(
                 try:
                     content = await _verified_answer(
                         content, task, team, all_mcp_urls[0] if all_mcp_urls else None,
-                        final_run_output)
+                        final_run_output, liveness_path=liveness_path)
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
                 tokens = _extract_tokens(final_run_output)

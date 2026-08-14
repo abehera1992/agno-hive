@@ -323,9 +323,13 @@ async def test_last_progress_at_being_refreshed_keeps_stagnant_seconds_at_zero(t
 @pytest.mark.asyncio
 async def test_absent_last_progress_at_falls_back_to_the_old_event_count_check(tmp_path):
     """Backward compat, explicit: a caller that never sets last_progress_at (every
-    test above this section, and _stream_team_run's own retry-loop activity dict,
-    which doesn't track it) must behave exactly as before -- judged by raw
-    stream_event_count staying unchanged, not by the new field's absence."""
+    test above this section) must behave exactly as before -- judged by raw
+    stream_event_count staying unchanged, not by the new field's absence.
+    _stream_team_run's own retry-loop activity dict USED to be such a caller
+    (documented here until 2026-08-14) -- it now tracks last_progress_at itself,
+    see test_stream_team_run_liveness.py, closing a real production hang this
+    gap directly caused. This test still matters as the general contract for any
+    other/future bare caller, just no longer describes _stream_team_run."""
     liveness_path = tmp_path / "liveness.json"
     activity = {
         "last_call_name": "x",
