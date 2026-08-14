@@ -2007,6 +2007,49 @@ def _stream_event_to_chunk(event) -> str | dict | None:
     return None
 
 
+# How much recently-generated text to search for a repeat -- wide enough to span
+# several of the periodic 10s content-preview batches this is checked alongside
+# (the real incident's batches ran ~700-900 chars each), narrow enough that a
+# phrase legitimately reused once near the start of a long answer, then never
+# again, doesn't false-positive purely because it's technically still in the
+# same accumulated string somewhere.
+_REPETITION_LOOKBACK_CHARS = 4000
+# Below this length, a verbatim match is too likely to be a short, legitimately
+# reused phrase (a file path, "the function exists") rather than real evidence
+# of a degenerate loop -- confirmed live 2026-08-14, the actual repeated
+# sentence in the incident this exists to catch was well over 100 chars.
+_REPETITION_MIN_SEGMENT_LEN = 60
+
+
+def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:
+    """True if `new_segment` (freshly generated text, appended to the accumulated
+    answer) is essentially a verbatim repeat of something generated recently,
+    rather than genuine new progress.
+
+    Confirmed live 2026-08-14: a coordinator run generated real, continuously
+    GROWING content (60,000+ chars) that was nonetheless a useless loop -- the
+    same sentence repeated verbatim for 17+ minutes, padded with large, VARIABLE
+    runs of blank newlines between each repeat. Whitespace is normalized (every
+    run of whitespace collapsed to one space) before comparing specifically
+    because of that padding -- a literal, unnormalized substring check would see
+    each repeat as a "different" string purely due to a different amount of
+    surrounding blank lines and miss the loop entirely.
+
+    Deliberately narrow: only substantial segments (>= _REPETITION_MIN_SEGMENT_LEN
+    after normalization) are checked, and only against a bounded recent window
+    (_REPETITION_LOOKBACK_CHARS) of prior content, not the whole answer -- see
+    each constant's own comment for why. This function does not decide what to DO
+    about a detected loop (that's the caller's job, e.g. declining to advance
+    last_progress_at) -- it only answers "does this look like one segment being
+    generated over and over," nothing about intent or correctness.
+    """
+    normalized_new = " ".join(new_segment.split())
+    if len(normalized_new) < _REPETITION_MIN_SEGMENT_LEN:
+        return False
+    normalized_prior = " ".join(prior_content[-_REPETITION_LOOKBACK_CHARS:].split())
+    return normalized_new in normalized_prior
+
+
 def _log_unclassified_stream_event(log_label: str, event, unrecognized_event_counts: dict[str, int]) -> None:
     """Log a stream event _stream_event_to_chunk() couldn't turn into a text delta or
     a tool-call sentinel -- most often a content-type event whose .content came back
@@ -2409,12 +2452,29 @@ async def _stream_team_run(
                 now = time.monotonic()
                 if now - last_logged_at >= 10:
                     joined = "".join(full_content)
-                    preview = joined[last_logged_len:][-300:]
-                    print(
-                        f"[{log_label}] content: +{len(joined) - last_logged_len} chars "
-                        f"({len(joined)} total) -- ...{preview!r}",
-                        flush=True,
-                    )
+                    new_segment = joined[last_logged_len:]
+                    preview = new_segment[-300:]
+                    if _looks_like_repetition_loop(new_segment, joined[:last_logged_len]):
+                        # This batch's per-chunk updates above already advanced
+                        # last_progress_at -- roll it back to before this batch
+                        # started, so a loop that keeps recurring accumulates real
+                        # stagnant_seconds instead of looking like continuous
+                        # progress forever. A one-off flagged batch followed by
+                        # genuinely new content self-corrects on the very next
+                        # chunk's own immediate update above.
+                        activity["last_progress_at"] = last_logged_at
+                        print(
+                            f"[{log_label}] repetition loop detected -- the last "
+                            f"{len(new_segment)} chars look like a repeat of earlier "
+                            f"content, not counted as progress: ...{preview!r}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[{log_label}] content: +{len(joined) - last_logged_len} chars "
+                            f"({len(joined)} total) -- ...{preview!r}",
+                            flush=True,
+                        )
                     last_logged_at = now
                     last_logged_len = len(joined)
             elif isinstance(out, dict):
@@ -2641,12 +2701,25 @@ async def run_task_async(
                                 now = time.monotonic()
                                 if now - last_logged_at >= 10:
                                     joined = "".join(full_content)
-                                    preview = joined[last_logged_len:][-300:]
-                                    print(
-                                        f"[team] content: +{len(joined) - last_logged_len} chars "
-                                        f"({len(joined)} total) -- ...{preview!r}",
-                                        flush=True,
-                                    )
+                                    new_segment = joined[last_logged_len:]
+                                    preview = new_segment[-300:]
+                                    if _looks_like_repetition_loop(new_segment, joined[:last_logged_len]):
+                                        # See _stream_team_run's identical block for
+                                        # the full rationale -- kept in sync deliberately.
+                                        activity["last_progress_at"] = last_logged_at
+                                        print(
+                                            f"[team] repetition loop detected -- the last "
+                                            f"{len(new_segment)} chars look like a repeat of "
+                                            f"earlier content, not counted as progress: "
+                                            f"...{preview!r}",
+                                            flush=True,
+                                        )
+                                    else:
+                                        print(
+                                            f"[team] content: +{len(joined) - last_logged_len} chars "
+                                            f"({len(joined)} total) -- ...{preview!r}",
+                                            flush=True,
+                                        )
                                     last_logged_at = now
                                     last_logged_len = len(joined)
                             elif isinstance(out, dict):
