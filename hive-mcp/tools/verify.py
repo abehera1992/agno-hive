@@ -36,6 +36,16 @@ What it catches, honestly stated:
     under PROPOSED and never counted toward the fabrication verdict — a task whose
     job is "propose the code changes needed" legitimately names things that don't
     exist yet, and that is not the same failure this tool exists to catch.
+  * ORM `table.column` CLAIMS — a dotted claim whose joined literal string is not
+    found falls back to checking the bare attribute name alone (whole-word, code
+    only). If found, reported as SPLIT-FOUND, not NOT FOUND, and not counted toward
+    the verdict — the relationship (does THIS table really have THIS column) is not
+    verified, same acknowledged limit as MISATTRIBUTED SYMBOLS above, but a real
+    attribute existing somewhere is stronger evidence than a joined-string miss alone.
+  * hive-mcp'S OWN TOOL NAMES — a backticked mention of one of hive-mcp's registered
+    tool names (see _MCP_TOOL_NAMES) is treated as the model naming which tool it
+    called, not a code-symbol claim about the target project, and is excluded from
+    checking entirely — same treatment as _NOISE.
 Treat a clean report as "nothing provably invented", never as "the answer is correct".
 """
 
@@ -123,6 +133,40 @@ _STDLIB_PREFIXES = {
     "os", "sys", "io", "csv", "json", "re", "time", "logging", "subprocess",
     "pathlib", "datetime", "typing", "asyncio", "functools", "itertools",
     "collections",
+}
+
+# hive-mcp's OWN registered tool names (see main.py's _tool(...) calls). A backticked
+# mention of one of these in an answer's prose is virtually always the model naming
+# which tool it called ("verified using `search_files_batch`"), not a claim that a
+# symbol by this name exists in the TARGET project being checked — these names live
+# in hive-mcp's own source, never the project's. Measured live 2026-08-14:
+# `search_files_batch` (a real, registered tool, hive-mcp/tools/context.py:401) was
+# reported NOT FOUND because it was grepped against EkamApp's repo, where a hive-mcp
+# tool name has no reason to appear. Kept as a hand-maintained set rather than
+# imported from main.py: main.py conditionally registers integration tools
+# (Notion/DB/migrations) behind env-var gates this module has no reason to satisfy
+# just to check an answer's text.
+_MCP_TOOL_NAMES = {
+    "get_project_context", "get_file_content", "get_files_batch", "find_files",
+    "search_files", "search_files_batch", "count_matches", "verify_claims",
+    "list_skills", "load_skill", "list_directory", "list_directory_tree",
+    "write_file", "apply_diff", "run_command",
+    "run_shell", "run_docker", "get_env_info", "check_port", "list_processes",
+    "bash_session_start", "bash_run", "bash_session_close", "bash_job_status",
+    "bash_job_kill",
+    "git_status", "git_log", "git_diff", "git_log_file", "git_blame",
+    "index_project", "scan_project_context", "web_search", "web_fetch",
+    "confirm_action", "reject_action",
+    "notion_search", "notion_get_page", "notion_get_database_schema",
+    "notion_query_database", "notion_items_in_sprint", "notion_get_item_with_relations",
+    "notion_find_work_item", "notion_create_page", "notion_update_page_props",
+    "notion_append_blocks", "notion_append_markdown", "notion_replace_section",
+    "notion_update_block", "notion_delete_block", "notion_trash_page",
+    "notion_update_content", "run_migration", "db_query", "db_schema",
+    "delegate_task_to_member", "delegate_task_to_members", "get_member_information",
+    "agno_run", "agno_list_teams", "get_context_section", "list_recent_files",
+    "search_knowledge_graph", "get_graph_report", "memory_search", "memory_store",
+    "lightrag_query",
 }
 
 # A backtick immediately preceded by a negation cue, or immediately followed by an
@@ -769,6 +813,8 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
         span = m.group(1)
         tok = span.strip().rstrip("()").strip()
         if (_IDENT_RE.match(tok) or _DOTTED_RE.match(tok)) and tok.lower() not in _NOISE:
+            if tok in _MCP_TOOL_NAMES:
+                continue
             if _is_negated_claim(answer, m.start(), m.end()):
                 continue
             if _is_proposed_new_claim(answer, m.start()):
@@ -854,6 +900,39 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             dotted = "." in tok
             hits = _rg(tok, fixed=True, glob_filter=glob_filter, whole_word=not dotted)
             if not hits:
+                # Dotted `owner.attribute` claims (a table/column, a class/field, a
+                # struct/property -- this tool has no idea which, and does not need
+                # to) never appear as one literal joined string whenever the
+                # framework or language declares the "owner" and the "attribute" in
+                # two separate statements rather than one inline expression -- true
+                # of most ORMs and struct/schema definitions across most languages,
+                # not any one of them specifically, which is why this fallback
+                # parses none of that syntax and only ever looks at the identifier
+                # AFTER the last dot. Confirmed live 2026-08-14 on one concrete case
+                # (an EkamApp SQLAlchemy model, table name and column declared on
+                # separate lines): `item_categories.sku_prefix` genuinely existed
+                # (ItemCategory.sku_prefix, models.py:129) and the answer's claim was
+                # correct, but `rg -F` for the joined string found nothing and this
+                # tool reported real, correct code as fabrication. Before declaring
+                # NOT FOUND, fall back to the bare attribute name alone (whole-word,
+                # code only) -- if THAT exists, this is the same MISATTRIBUTED
+                # SYMBOLS blind spot the module docstring already accepts (proves
+                # existence, not the claimed relationship) rather than an invented
+                # symbol, so it is reported distinctly and does not count toward the
+                # fabrication verdict.
+                if dotted:
+                    attr = tok.rsplit(".", 1)[-1]
+                    attr_hits = _rg(attr, fixed=True, glob_filter=glob_filter, whole_word=True)
+                    attr_code_hits = [h for h in attr_hits
+                                       if not h.split(":", 1)[0].lower().endswith(_DOC_EXTS)]
+                    if attr_code_hits:
+                        out.append(
+                            f"  SPLIT-FOUND {tok:36s} <-- \"{attr}\" exists in code "
+                            f"({attr_code_hits[0][:70]}) but not joined as this exact "
+                            f"dotted string; the table/class-attribute relationship "
+                            f"itself is not verified"
+                        )
+                        continue
                 problems += 1
                 out.append(f"  NOT FOUND  {tok:38s} <-- does not exist in the project")
                 continue
