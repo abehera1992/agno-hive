@@ -62,6 +62,16 @@ EXCLUDE_EXTS: set[str] = _BASE_EXTS
 # Checked FIRST so a project can re-open exactly one thing without disabling a whole rule.
 ALLOW_GLOBS: list[str] = list(config.EXCLUDE_ALLOW)
 
+# hive-mcp's OWN scratch directory (tools/scratch.py) -- hive-owned and intentionally
+# readable, unlike .git/.venv/etc. Not a project EXCLUDE_ALLOW entry because this isn't
+# project-specific configuration, it's a hive-mcp implementation detail that must always
+# work: get_file_content() calls is_excluded() before serving any path (see
+# test_context_exclusions.py), so without this exception a model could never read back
+# more than the preview of an offloaded result -- the whole feature would be silently
+# useless. Exact directory-name match only (checked against parts[0] below), not a
+# prefix, so e.g. ".hive_scratchpad/" is not accidentally swept into the exception too.
+_HIVE_OWNED_DIRS = {".hive_scratch"}
+
 
 def rg_args() -> list[str]:
     """Negative --glob arguments for a ripgrep invocation.
@@ -88,13 +98,24 @@ def rg_args() -> list[str]:
 
 def is_excluded(rel_path: str) -> bool:
     """True if this project-relative path is off-limits to read, write, search or index."""
-    rel = str(rel_path).replace("\\", "/").lstrip("./")
+    rel = str(rel_path).replace("\\", "/")
+    # A literal "./" PREFIX only -- NOT str.lstrip("./"), which strips a *set* of
+    # characters repeatedly from the left, not a prefix string. That previously ate
+    # the leading dot off any dotted path too (".git/config" -> "git/config"),
+    # silently defeating exclusion for any dot-directory that isn't ALSO listed
+    # without its dot elsewhere in EXCLUDE_DIRS. ".venv" masked this (both ".venv"
+    # and "venv" are listed), ".git" did not (only the dotted form is listed) --
+    # confirmed live 2026-08-14: is_excluded(".git/config") returned False.
+    while rel.startswith("./"):
+        rel = rel[2:]
     if not rel:
+        return False
+    parts = [p for p in rel.split("/") if p]
+    if parts and parts[0] in _HIVE_OWNED_DIRS:
         return False
     for allow in ALLOW_GLOBS:
         if fnmatch.fnmatch(rel, allow):
             return False
-    parts = [p for p in rel.split("/") if p]
     # Leading dot-directories are skipped, but NOT dotfiles at the root: a repo's
     # .env.example / .gitignore are legitimately readable, and excluding every dotted
     # name would hide them.

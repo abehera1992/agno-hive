@@ -392,3 +392,89 @@ def test_apply_diff_non_scss_success_has_no_selectors_line(tmp_path, monkeypatch
     result = files.apply_diff("sample.py", "return 1", "return 2")
 
     assert "Selectors touched:" not in result
+
+
+# ── run_command offload (2026-08-14, session/context-overflow pipeline part #2) ──
+# run_command had ZERO size protection before this -- raw, unbounded stdout/stderr
+# returned straight to the model. get_file_content/search_files already reduce
+# oversized results a different way (skeleton, head+tail, capped truncation); this
+# was the confirmed gap. See tools/scratch.py for the offload mechanism itself
+# (fully tested independently in test_scratch.py) -- these tests only confirm the
+# WIRING: that run_command's final formatted output actually routes through it.
+
+def test_run_command_small_output_is_unaffected_by_offload(tmp_path, monkeypatch):
+    monkeypatch.setattr(files, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(files, "WRITE_REVIEW", False)
+
+    result = files.run_command("echo hello")
+
+    assert "hello" in result
+    assert "[exit 0]" in result
+    assert "Output too large" not in result
+
+
+def test_run_command_routes_its_result_through_maybe_offload(tmp_path, monkeypatch):
+    """Spy on maybe_offload to confirm run_command's fully-formatted output (stdout
+    + stderr + exit code, exactly what used to be returned raw) is what gets passed
+    through, and that whatever maybe_offload returns is what the caller sees --
+    proving the wiring isn't bypassed, without needing a 20,000+ char real command
+    output in a fast unit test (that path is exercised for real below)."""
+    monkeypatch.setattr(files, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(files, "WRITE_REVIEW", False)
+    calls = []
+
+    def _fake_offload(result, hint, **kwargs):
+        calls.append((result, hint))
+        return "SENTINEL-OFFLOADED"
+
+    monkeypatch.setattr(files, "maybe_offload", _fake_offload)
+
+    result = files.run_command("echo hello")
+
+    assert result == "SENTINEL-OFFLOADED"
+    assert len(calls) == 1
+    passed_result, passed_hint = calls[0]
+    assert "hello" in passed_result
+    assert "[exit 0]" in passed_result
+    assert "echo hello" in passed_hint
+
+
+def test_run_command_genuinely_oversized_output_is_offloaded_to_a_real_scratch_file(tmp_path, monkeypatch):
+    """End-to-end, no mocking of maybe_offload itself: a real command producing
+    output past the threshold results in a real, readable scratch file."""
+    from tools import scratch
+    monkeypatch.setattr(files, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(files, "WRITE_REVIEW", False)
+    monkeypatch.setattr(scratch, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(scratch, "_OFFLOAD_THRESHOLD_CHARS", 50)
+
+    result = files.run_command("echo " + "x" * 200)
+
+    assert "Output too large" in result
+    assert ".hive_scratch/" in result
+    scratch_dir = tmp_path / ".hive_scratch"
+    assert scratch_dir.is_dir()
+    files_written = list(scratch_dir.iterdir())
+    assert len(files_written) == 1
+    assert "x" * 200 in files_written[0].read_text(encoding="utf-8")
+
+
+def test_run_command_timeout_message_is_not_affected_by_offload(tmp_path, monkeypatch):
+    """A short, structured error message (never oversized) must never be routed
+    through the offload machinery -- it's not "the tool's result" in the sense
+    maybe_offload cares about, it's a control-flow message about NOT getting one.
+    Mocks subprocess.run directly (rather than a real 'sleep' command) so this
+    stays portable across platforms/shells."""
+    import subprocess
+    monkeypatch.setattr(files, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(files, "WRITE_REVIEW", False)
+
+    def _fake_run(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="slow-cmd", timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    result = files.run_command("slow-cmd", timeout=1)
+
+    assert "timed out" in result
+    assert "Output too large" not in result

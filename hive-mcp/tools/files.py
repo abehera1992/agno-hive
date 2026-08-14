@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import PROJECT_ROOT, WRITE_REVIEW
 
 from .exclusions import is_excluded
+from .scratch import maybe_offload
 
 _PROPOSED_SUFFIX = ".hive_proposed"
 _IN_DOCKER = Path("/.dockerenv").exists()
@@ -447,7 +448,12 @@ def run_command(command: str, timeout: int = 120) -> str:
         if result.stderr.strip():
             parts.append(f"[stderr]\n{result.stderr.strip()}")
         parts.append(f"[exit {result.returncode}]")
-        return "\n".join(parts)
+        # No overflow protection existed here before (unlike get_file_content/
+        # search_files, which already reduce oversized results a different way --
+        # see tools/scratch.py's module docstring). A command like a verbose test
+        # run or a large git log could return an unbounded blob straight into the
+        # model's context.
+        return maybe_offload("\n".join(parts), hint=command)
     except __import__("subprocess").TimeoutExpired:
         return f"run_command timed out after {timeout}s"
     except Exception as e:
