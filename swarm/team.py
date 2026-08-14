@@ -2001,6 +2001,51 @@ def _stream_event_to_chunk(event) -> str | dict | None:
     return None
 
 
+def _log_unclassified_stream_event(log_label: str, event, unrecognized_event_counts: dict[str, int]) -> None:
+    """Log a stream event _stream_event_to_chunk() couldn't turn into a text delta or
+    a tool-call sentinel -- most often a content-type event whose .content came back
+    empty this particular delta, ordinarily harmless in isolation (normal for a
+    streaming API to emit an occasional content-less chunk), but seen dozens of times
+    in a row with no intervening tool call or real content in between, it is the
+    signature of a genuine stall. Confirmed live 2026-08-14: re-running a task on a
+    chained session, the coordinator's last real tool call was followed by 5 minutes
+    of NOTHING but empty TeamRunContent events -- zero tool-call events, zero content
+    growth -- until the (separately fixed, 2026-08-14) liveness auto-kill correctly
+    ended it. Ruled out directly: the ZGX thermal watchdog (zero log entries that
+    window, GPU sitting at 54C against its 78-83C trigger) and a crashed/hung vLLM
+    backend (vllm-coord's own access log showed a continuous, healthy burst of
+    freshly established, individually-completed /v1/chat/completions requests the
+    entire time -- not one long-hung stream). That rules out the backend; something
+    upstream of this event classification keeps re-invoking the model turn after
+    turn and getting nothing usable back each time. Extracted from two near-identical
+    inline copies (run_task_stream's _stream_team_run and run_task_async's own
+    streaming block) into one function so the next diagnostic addition -- like
+    model_provider_data below -- lands in exactly one place instead of two that can
+    drift apart, the same duplication trap _extract_handoff_summary's two call sites
+    already demonstrated in this file.
+
+    Logs the 1st, 2nd, and every 20th occurrence per event type (unchanged threshold)
+    -- now also printing model_provider_data, the one field on these events most
+    likely to carry a raw finish_reason or provider-side hint that .content and
+    .reasoning_content alone don't, needed to get past speculation the next time this
+    pattern recurs instead of re-deriving the same "ruled out X, Y, Z" investigation
+    from scratch."""
+    event_type = getattr(event, "event", "") or "(no .event attr)"
+    unrecognized_event_counts[event_type] = unrecognized_event_counts.get(event_type, 0) + 1
+    count = unrecognized_event_counts[event_type]
+    if count not in (1, 2) and count % 20 != 0:
+        return
+    content_val = getattr(event, "content", "<no .content attr>")
+    reasoning_val = getattr(event, "reasoning_content", "<no .reasoning_content attr>")
+    provider_val = getattr(event, "model_provider_data", "<no .model_provider_data attr>")
+    print(
+        f"[{log_label}] unrecognized stream event #{count} of type {event_type!r}: "
+        f"content={content_val!r}, reasoning_content={reasoning_val!r}, "
+        f"model_provider_data={provider_val!r}",
+        flush=True,
+    )
+
+
 async def run_task_stream(
     task: str,
     agent_specs: list | None = None,
@@ -2342,17 +2387,7 @@ async def _stream_team_run(team, prompt: str, *, log_label: str = "verify-retry"
             elif isinstance(out, dict):
                 print(f"[{log_label}] stream tool event: {out}", flush=True)
             else:
-                event_type = getattr(event, "event", "") or "(no .event attr)"
-                unrecognized_event_counts[event_type] = unrecognized_event_counts.get(event_type, 0) + 1
-                count = unrecognized_event_counts[event_type]
-                if count in (1, 2) or count % 20 == 0:
-                    content_val = getattr(event, "content", "<no .content attr>")
-                    reasoning_val = getattr(event, "reasoning_content", "<no .reasoning_content attr>")
-                    print(
-                        f"[{log_label}] unrecognized stream event #{count} of type {event_type!r}: "
-                        f"content={content_val!r}, reasoning_content={reasoning_val!r}",
-                        flush=True,
-                    )
+                _log_unclassified_stream_event(log_label, event, unrecognized_event_counts)
     finally:
         heartbeat_task.cancel()
         with suppress(asyncio.CancelledError):
@@ -2591,22 +2626,10 @@ async def run_task_async(
                                 # meaning many events of the SAME type were all failing
                                 # classification and the log-once design couldn't tell "seen once,
                                 # harmless" apart from "seen 100+ times, something's genuinely
-                                # wrong" -- both looked identical: one line. Now counts occurrences
-                                # per type and logs the 1st, 2nd, and every 20th after that,
-                                # showing the actual .content/.reasoning_content values (not just
-                                # the type name) so a consistently-empty field is visible directly
-                                # instead of inferred from silence.
-                                event_type = getattr(event, "event", "") or "(no .event attr)"
-                                unrecognized_event_counts[event_type] = unrecognized_event_counts.get(event_type, 0) + 1
-                                count = unrecognized_event_counts[event_type]
-                                if count in (1, 2) or count % 20 == 0:
-                                    content_val = getattr(event, "content", "<no .content attr>")
-                                    reasoning_val = getattr(event, "reasoning_content", "<no .reasoning_content attr>")
-                                    print(
-                                        f"[team] unrecognized stream event #{count} of type {event_type!r}: "
-                                        f"content={content_val!r}, reasoning_content={reasoning_val!r}",
-                                        flush=True,
-                                    )
+                                # wrong" -- both looked identical: one line. See
+                                # _log_unclassified_stream_event's own docstring for what got added
+                                # 2026-08-14 and why (deduped from two copies at the same time).
+                                _log_unclassified_stream_event("team", event, unrecognized_event_counts)
                     finally:
                         heartbeat_task.cancel()
                         with suppress(asyncio.CancelledError):
