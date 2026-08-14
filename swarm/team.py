@@ -518,11 +518,55 @@ def _cloud_provider_error_message(exc: Exception) -> "str | None":
     return None
 
 
-def _extract_handoff_summary(task: str, content: str) -> str:
+_HANDOFF_EXCERPT_MAX = 5       # how many of the most recent read-tool results to keep
+_HANDOFF_EXCERPT_CHARS = 800   # per-excerpt cap -- same truncation convention run_task_async
+                                # already uses for session_messages injection (msg['content'][:800])
+
+
+def _extract_tool_excerpts(messages) -> list[tuple[str, str]]:
+    """The most recent read-tool results from a run's message history -- (tool_name,
+    truncated content) pairs, oldest-to-newest of the last _HANDOFF_EXCERPT_MAX kept.
+
+    Deterministic, no LLM involved -- consistent with this codebase's existing stance
+    on the exact same tradeoff (see hive-mcp/tools/verify.py's own module docstring:
+    "a model cannot be trusted to audit its own output"), applied here to session
+    handoffs instead of claim verification. Reuses _READ_TOOLS (the same set
+    _count_read_calls already keys off) rather than defining a second overlapping
+    list -- a write tool's result ("applied: src/foo.tsx") is not evidence worth
+    carrying forward the same way a read result is.
+    """
+    out: list[tuple[str, str]] = []
+    for m in messages or []:
+        if getattr(m, "role", None) != "tool":
+            continue
+        name = getattr(m, "tool_name", None) or getattr(m, "name", None)
+        if name not in _READ_TOOLS:
+            continue
+        content = getattr(m, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            continue
+        out.append((name, content[:_HANDOFF_EXCERPT_CHARS]))
+    return out[-_HANDOFF_EXCERPT_MAX:]
+
+
+def _extract_handoff_summary(task: str, content: str, final_run_output=None) -> str:
     """Extract a compact chain-boundary handoff block from a completed run's output.
 
     Stored as the session summary so the next chained call gets a small structured
     digest instead of the full message history — preventing context overflow.
+
+    Widened 2026-08-14 (session/context-overflow pipeline, part #1): the original
+    version only ever regexed the coordinator's rendered FINAL ANSWER text -- file
+    paths in backticks, up to 5 short bullets. Confirmed live: a chained call working
+    from that alone had no memory of the actual file content or schema field names a
+    prior turn had already read, only a list of file PATHS -- it had to re-search and
+    re-read everything from scratch before it could even start the actual requested
+    work, wasting most of its own time budget, then stalled before producing an
+    answer. final_run_output (the real TeamRunOutput, when passed) adds real excerpts
+    from the run's own read-tool results via _extract_tool_excerpts -- see that
+    function's docstring for why this stays deterministic rather than a second LLM
+    summarization pass. final_run_output=None (the default) keeps the original
+    file-path/bullet-only behavior for any caller that doesn't have it.
     """
     import re
     from datetime import datetime, timezone
@@ -559,6 +603,11 @@ def _extract_handoff_summary(task: str, content: str) -> str:
         lines.append("Key outcomes:")
         for b in key_outcomes:
             lines.append(f"  - {b[:100]}")
+    excerpts = _extract_tool_excerpts(getattr(final_run_output, "messages", None))
+    if excerpts:
+        lines.append("Recent tool results (most recent last):")
+        for name, text in excerpts:
+            lines.append(f"  [{name}] {text}")
     lines.append("──────────────────────────────────────────────────────────────────")
 
     return "\n".join(lines)
@@ -2120,7 +2169,7 @@ async def run_task_stream(
                 # gets a small structured digest instead of the full message history.
                 if session_id:
                     from swarm.sessions import save_handoff_summary
-                    handoff = _extract_handoff_summary(task, combined)
+                    handoff = _extract_handoff_summary(task, combined, final_run_output)
                     asyncio.ensure_future(save_handoff_summary(session_id, handoff))
                 # Primary path (2026-08-10): a real request_clarification tool call. Unlike
                 # the old fenced-text convention, a caller consuming stream events already
@@ -2608,7 +2657,7 @@ async def run_task_async(
                 # gets a small structured digest instead of the full message history.
                 if session_id:
                     from swarm.sessions import save_handoff_summary
-                    handoff = _extract_handoff_summary(task, content)
+                    handoff = _extract_handoff_summary(task, content, final_run_output)
                     asyncio.ensure_future(save_handoff_summary(session_id, handoff))
                 return content, tokens, None
             except Exception as exc:
