@@ -570,6 +570,87 @@ async def test_max_stub_serve_count_not_touched_when_activity_is_none():
     assert result != "file body"  # still stubs correctly with no activity dict
 
 
+# ── activity["total_stub_serve_count"] (2026-08-14) ────────────────────────────
+# Closes a real, precisely-measured gap in max_stub_serve_count above: that
+# signal is the HIGHEST count seen for any SINGLE (agent, tool, args) key, so a
+# model that spreads its non-convergence across several different already-
+# stubbed files -- rotating A, B, C, A, B, C... instead of hammering just one --
+# can keep every individual key's count just under the Tier-2 threshold even
+# though the run is just as stuck. Confirmed live 2026-08-14: a real run
+# rotated between 3 files, each served 6-8 times (21 stub serves total), and
+# max_stub_serve_count peaked at exactly 8 -- one shy of the >8 trigger -- while
+# the run went on to stall completely and was only caught by the much slower
+# Tier-1 300s silence backstop. total_stub_serve_count sums EVERY stub serve
+# across the whole run, regardless of which key it belongs to, so this same
+# pattern trips its own (separate, higher) threshold instead of hiding between
+# several individually-under-threshold counters.
+
+@pytest.mark.asyncio
+async def test_total_stub_serve_count_untouched_while_within_the_real_content_budget():
+    activity = {}
+    hook = _make_read_cache_tool_hook(activity=activity)
+    researcher = _FakeAgent("Researcher")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    for _ in range(2):
+        await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+
+    assert "total_stub_serve_count" not in activity
+
+
+@pytest.mark.asyncio
+async def test_total_stub_serve_count_increments_once_per_stub_serve():
+    activity = {}
+    hook = _make_read_cache_tool_hook(activity=activity)
+    researcher = _FakeAgent("Researcher")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    for _ in range(5):  # serves 1-2 real, 3-5 stubbed -- 3 stub serves
+        await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+
+    assert activity["total_stub_serve_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_total_stub_serve_count_sums_ACROSS_different_keys_unlike_the_max_signal():
+    """The exact real-world shape this closes: rotating between 3 DIFFERENT
+    files, each individually stubbed a few times, none crossing the per-key
+    Tier-2 threshold alone -- but the aggregate must still add up."""
+    activity = {}
+    hook = _make_read_cache_tool_hook(activity=activity)
+    researcher = _FakeAgent("Researcher")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    for path in ("a.py", "b.py", "c.py"):
+        for _ in range(4):  # serves 1-2 real, 3-4 stubbed -- 2 stub serves each
+            await hook("get_file_content", fake_get_file_content, {"relative_path": path}, agent=researcher)
+
+    # 3 files x 2 stub serves each = 6 total -- no single file's own count (4)
+    # comes anywhere near a realistic Tier-2 threshold, but the sum is real.
+    assert activity["total_stub_serve_count"] == 6
+    assert activity["max_stub_serve_count"] == 4  # the per-key signal stays low
+
+
+@pytest.mark.asyncio
+async def test_total_stub_serve_count_not_touched_when_activity_is_none():
+    hook = _make_read_cache_tool_hook()
+    researcher = _FakeAgent("Researcher")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    for _ in range(5):
+        result = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+
+    assert result != "file body"  # still stubs correctly with no activity dict
+
+
 def test_build_team_shares_the_same_hook_instance_with_spec_based_members(monkeypatch):
     """agent_specs path (make_agent_from_spec) -- the primary path used by the
     real engineering.yaml team, not just the make_coder/make_reviewer fallback."""

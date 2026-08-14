@@ -184,3 +184,16 @@ def test_liveness_stub_serve_threshold_from_env(monkeypatch):
     mod = _reload_config()
     cfg = mod.Config()
     assert cfg.liveness_stub_serve_threshold == 5
+
+
+def test_liveness_aggregate_stub_threshold_default():
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.liveness_aggregate_stub_threshold == 15
+
+
+def test_liveness_aggregate_stub_threshold_from_env(monkeypatch):
+    monkeypatch.setenv("LIVENESS_AGGREGATE_STUB_THRESHOLD", "20")
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.liveness_aggregate_stub_threshold == 20

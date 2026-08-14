@@ -260,6 +260,20 @@ class Config:
     # instruction, and 3 more confirms it isn't one stray repeat.
     liveness_stub_serve_threshold: int = int(os.getenv("LIVENESS_STUB_SERVE_THRESHOLD", "8"))
 
+    # Tier 3 (2026-08-14): sums duplicate-read stub serves across the WHOLE run,
+    # regardless of which (agent, tool, args) key each one belongs to -- closes a
+    # real, precisely-measured gap in the per-key Tier 2 signal above. Confirmed
+    # live: a run rotated between 3 already-cached files (6-8 serves each, 21
+    # total) and never crossed the per-key threshold on any single one (peaked at
+    # exactly 8, one shy of the >8 trigger), so only the much slower 300s Tier-1
+    # silence backstop eventually caught it. 15 is roughly 2x the per-key
+    # threshold -- high enough that a legitimately complex multi-file task
+    # touching many distinct files, each read once or twice (never enough to be
+    # stubbed at all), never approaches it, since only a REPEATED identical call
+    # counts here in the first place; low enough to catch this exact shape well
+    # before a 300s silence backstop would.
+    liveness_aggregate_stub_threshold: int = int(os.getenv("LIVENESS_AGGREGATE_STUB_THRESHOLD", "15"))
+
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))
     session_window: int = int(os.getenv("AGNO_SESSION_WINDOW", "6"))

@@ -1767,6 +1767,17 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     was already being computed here for an unrelated reason -- this just also
     surfaces it to the one place (the heartbeat, and through it the parent process)
     that can act on it.
+
+    `activity["total_stub_serve_count"]` (2026-08-14) is a second, aggregate
+    Tier-3 signal alongside the per-key one above: incremented once per stub
+    serve regardless of which (agent, tool, args) key it belongs to. Confirmed
+    live: a run rotated its reads between 3 already-cached files (6-8 serves
+    each, 21 stub serves total) and never crossed the per-key threshold on any
+    SINGLE one of them -- max_stub_serve_count peaked at exactly 8, one shy of
+    its own >8 trigger -- so the run was just as stuck as any single-file
+    repeater, but invisible to that signal alone. Summing across keys catches
+    "spreads the non-convergence across several files" the same way the per-key
+    max already catches "hammers one file."
     """
     cache: dict[tuple, object] = {}
     serve_counts: dict[tuple, int] = {}
@@ -1798,6 +1809,13 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         if count > _MAX_FULL_SERVES_PER_AGENT:
             if activity is not None:
                 activity["max_stub_serve_count"] = max(activity.get("max_stub_serve_count", 0), count)
+                # total_stub_serve_count (2026-08-14): the aggregate Tier-3 signal,
+                # incremented once per stub serve regardless of WHICH key it
+                # belongs to -- see this hook's own docstring section on it for
+                # the live incident this closes (max_stub_serve_count alone missed
+                # a model rotating its non-convergence across several different
+                # already-stubbed files, each individually staying under budget).
+                activity["total_stub_serve_count"] = activity.get("total_stub_serve_count", 0) + 1
             return _duplicate_read_stub(function_name, args, agent_key, count, len(str(result)))
         return result
 
@@ -2531,6 +2549,7 @@ async def _run_heartbeat(
                 snapshot = {
                     "stagnant_seconds": stagnant_ticks * interval,
                     "max_stub_serve_count": activity.get("max_stub_serve_count", 0),
+                    "total_stub_serve_count": activity.get("total_stub_serve_count", 0),
                 }
                 tmp_path = f"{liveness_path}.tmp"
                 with open(tmp_path, "w") as f:

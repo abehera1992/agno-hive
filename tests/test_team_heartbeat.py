@@ -349,6 +349,30 @@ async def test_absent_last_progress_at_falls_back_to_the_old_event_count_check(t
 
 
 @pytest.mark.asyncio
+async def test_liveness_snapshot_carries_total_stub_serve_count_from_activity(tmp_path):
+    """total_stub_serve_count (2026-08-14) -- the aggregate Tier-2 signal
+    alongside max_stub_serve_count's own per-key one, see
+    test_team_read_cache_hook.py's own section for the live incident this
+    closes (a model rotating between several already-stubbed files, each
+    individually staying under the per-key threshold)."""
+    liveness_path = tmp_path / "liveness.json"
+    activity = {
+        "last_call_name": "get_file_content", "last_call_at": time.monotonic(),
+        "stream_event_count": 1, "max_stub_serve_count": 4, "total_stub_serve_count": 11,
+    }
+    task = asyncio.create_task(
+        _run_heartbeat(activity, time.monotonic(), interval=0.05, liveness_path=str(liveness_path))
+    )
+    await asyncio.sleep(0.12)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    snapshot = json.loads(liveness_path.read_text())
+    assert snapshot["total_stub_serve_count"] == 11
+
+
+@pytest.mark.asyncio
 async def test_liveness_write_failure_does_not_crash_the_heartbeat(tmp_path, capsys):
     """A bookkeeping side effect must never take down the run it's watching --
     an unwritable path (a directory that doesn't exist) logs a warning and the

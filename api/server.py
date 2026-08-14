@@ -218,14 +218,26 @@ def _liveness_kill_reason(snapshot: dict) -> str | None:
     read from disk by the worker-subprocess poll loops below), return a human-readable
     reason to kill the run, or None if it's still healthy. Pure function, no I/O -- the
     decision logic is testable independent of file-reading/subprocess mechanics. See
-    DOCS.md "Liveness-Based Auto-Kill" for the full design and why these two signals
-    (not a single generic timeout) were chosen."""
+    DOCS.md "Liveness-Based Auto-Kill" for the full design and why these signals
+    (not a single generic timeout) were chosen. Three tiers: silence (Tier 1,
+    backstop), a single key's repeated-identical-call count (Tier 2), and the SUM
+    of stub serves across every key in the run (Tier 3, 2026-08-14 -- catches a
+    model that rotates its non-convergence across several different files instead
+    of hammering one, which can keep every individual Tier-2 count just under
+    threshold; see swarm/team.py's _make_read_cache_tool_hook docstring for the
+    live incident)."""
     stagnant = snapshot.get("stagnant_seconds", 0)
     if stagnant > config.liveness_silence_threshold_s:
         return f"no tool call or new stream content for over {config.liveness_silence_threshold_s:.0f}s"
     stub_count = snapshot.get("max_stub_serve_count", 0)
     if stub_count > config.liveness_stub_serve_threshold:
         return f"repeated an identical call {stub_count} times despite being told to stop"
+    total_stub_count = snapshot.get("total_stub_serve_count", 0)
+    if total_stub_count > config.liveness_aggregate_stub_threshold:
+        return (
+            f"served {total_stub_count} duplicate-read stubs across the run despite "
+            f"repeated stop instructions"
+        )
     return None
 
 
