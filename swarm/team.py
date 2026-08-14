@@ -1114,6 +1114,67 @@ def _summarize_actual_writes(*results) -> str:
     )
 
 
+# How far back into the answer to look for a stated-but-never-taken next action.
+# Generous enough to span a real closing clause ("Let me search for relevant
+# files and code patterns related to parties and inventory implementation.")
+# plus a little slack, narrow enough that an unrelated "let me check X" used
+# somewhere in the middle of a long, otherwise-finished answer can't reach in.
+_UNFINISHED_INTENT_WINDOW = 260
+# The trigger phrases themselves -- deliberately narrow to first-person stated
+# INTENT verbs, not e.g. "let me know" (a benign closing offer on an already-
+# finished answer, confirmed live as a real near-miss worth excluding
+# explicitly). The trailing `[^.!?\n]{0,140}` allows a short object clause
+# ("...for relevant files and code patterns...implementation.") without
+# reaching so far that it could cross into unrelated later text.
+_UNFINISHED_INTENT_RE = re.compile(
+    r"\b(let me (?:try|check|search|look at|verify|see)\b|"
+    r"i(?:'ll| will) (?:now )?(?:check|search|verify|look|try)\b|"
+    r"i need to (?:check|search|verify|look)\b)"
+    r"[^.!?\n]{0,140}[.:]?\s*$",
+    re.IGNORECASE,
+)
+# If the matched tail itself already says the step was done ("...which I have
+# already done above"), this is a genuinely finished answer that happens to
+# restate its own reasoning near the end, not an unfinished one -- confirmed as
+# a real near-miss the plain trigger-phrase check alone would false-positive on.
+_UNFINISHED_INTENT_COMPLETION_CUE_RE = re.compile(
+    r"\b(already|have (?:done|completed|verified|confirmed)|has (?:been )?(?:done|completed))\b",
+    re.IGNORECASE,
+)
+
+
+def _ends_with_unfinished_intent(content: str) -> bool:
+    """True if `content`'s own final words describe a NEXT action rather than a
+    completed one -- the model narrated what it was about to do and then simply
+    stopped, instead of actually doing it and reporting a result.
+
+    Confirmed live 2026-08-14: on a genuinely fresh, un-chained session, a run
+    returned a clean 200 OK in 33s having only gathered partial Notion data
+    (three successful notion_get_page calls, each with an escalating max_lines
+    the model apparently assumed meant the content was truncated) -- ending on
+    "Let me search for relevant files and code patterns related to parties and
+    inventory implementation." with that search never actually happening. Not a
+    hang, not a crash, not a token-cap truncation (the returned content was only
+    ~1,400 chars, nowhere near coordinator_max_tokens' ~16,000-char ceiling) --
+    the coordinator appears to have decided its turn was complete despite the
+    task being nowhere near done.
+
+    Deliberately narrow to avoid two real near-misses found while designing
+    this: a benign closing offer ("Let me know if you'd like me to look into
+    X next") on an ALREADY-finished answer never matches the trigger phrases at
+    all (none of them are "let me know"); and a genuinely finished answer that
+    happens to restate its own completed reasoning near the end ("I need to
+    verify this... which I have already done above") is excluded via
+    _UNFINISHED_INTENT_COMPLETION_CUE_RE even though it matches the trigger
+    phrase, since the SAME clause also says the step already happened.
+    """
+    tail = (content or "").rstrip()[-_UNFINISHED_INTENT_WINDOW:]
+    m = _UNFINISHED_INTENT_RE.search(tail)
+    if not m:
+        return False
+    return not _UNFINISHED_INTENT_COMPLETION_CUE_RE.search(m.group(0))
+
+
 async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | None,
                            result=None, liveness_path: str | None = None) -> str:
     """Check the draft's claims and, if any are unverifiable, give the team ONE chance
@@ -1149,9 +1210,54 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # docstring for the live incident this closes.
     all_results = [result]
 
-    # Claimed-write check, FIRST — a fabricated "file changed" claim means the rest of
+    # Unfinished-intent check, before every other guard — an answer whose own final
+    # words describe a NEXT action rather than a completed one means the rest of its
+    # content is incomplete by definition, more fundamental than whether any specific
+    # claim within it happens to be right. Confirmed live 2026-08-14: a fresh,
+    # un-chained session returned a clean 200 OK in 33s having only gathered partial
+    # Notion data, ending on "Let me search for relevant files and code patterns
+    # related to parties and inventory implementation." with that search never
+    # actually happening — no hang, no crash, just a task that stopped short.
+    if _ends_with_unfinished_intent(content or ""):
+        if len(all_results) > 1:
+            return (
+                f"{content}\n\n---\n**This answer ends mid-task — its own final words "
+                f"describe a next action that was never taken. Treat this as INCOMPLETE, "
+                f"not a finished answer. (Not retried: this run's one correction retry "
+                f"was already used by an earlier check.)**"
+                + _summarize_actual_writes(*all_results)
+            )
+        print("[team] answer ends on a stated next action that was never taken — retrying to actually finish the task")
+        try:
+            retried, retry = await _stream_team_run(
+                team,
+                f"{task}\n\n"
+                f"IMPORTANT: a previous attempt stopped mid-task — it described a next "
+                f"step (e.g. 'let me search the codebase for X') but never actually took "
+                f"it, and the response ended there without a real answer. Do not repeat "
+                f"that mistake: actually call the tool(s) you say you are about to use, "
+                f"follow through on every stated step, and only stop once you have a "
+                f"complete, finished answer to the original task.",
+                liveness_path=liveness_path,
+            )
+            all_results.append(retry)
+            if retried:
+                if _ends_with_unfinished_intent(retried):
+                    return (
+                        f"{retried}\n\n---\n**This answer still ends mid-task after one "
+                        f"retry — its own final words describe a next action that was "
+                        f"never taken. Treat this as INCOMPLETE.**"
+                        + _summarize_actual_writes(*all_results)
+                    )
+                content, result = retried, retry
+        except Exception as exc:
+            print(f"[team] unfinished-intent retry failed: {exc}")
+
+    # Claimed-write check — a fabricated "file changed" claim means the rest of
     # the answer's factual content is moot, so this runs before the fact-groundedness
-    # checks below rather than after. Only fires when writes are DETERMINABLE and zero
+    # checks below rather than after (the unfinished-intent check above runs earlier
+    # still, since a task that never finished is more fundamental than either).
+    # Only fires when writes are DETERMINABLE and zero
     # succeeded; -1 (undeterminable) is deliberately excluded, matching the read-evidence
     # check's own reasoning: "we could not tell" must never be treated as "nothing
     # succeeded". See _count_successful_write_calls for the live incident this fixes.
@@ -2019,21 +2125,67 @@ _REPETITION_LOOKBACK_CHARS = 4000
 # of a degenerate loop -- confirmed live 2026-08-14, the actual repeated
 # sentence in the incident this exists to catch was well over 100 chars.
 _REPETITION_MIN_SEGMENT_LEN = 60
+# A small set of hedging/intensifier words common in a model's own escalating
+# self-correction ("more specific" -> "even more specific") -- confirmed live
+# 2026-08-14 on a SECOND, distinct incident the same day: the coordinator never
+# repeated anything verbatim (the check above correctly stayed silent), but
+# spiraled through slightly reworded restatements of "I need to be [even] more
+# specific with my citations, let me try again..." without ever landing on an
+# answer. Stripped before comparing so "more specific" and "even more specific"
+# normalize to the same text. Deliberately short and generic-word-only (never a
+# content word) -- removing a handful of filler words from a long sentence does
+# not make two genuinely DIFFERENT sentences collapse into a false match, since
+# the actual content words (what the sentence is ABOUT) are untouched.
+_REPETITION_FILLER_WORDS = frozenset({
+    "even", "really", "very", "actually", "now", "again", "just", "simply",
+})
+# How much of a new segment's OPENING alone counts as evidence of a repeat, when
+# the full segment isn't a substring match. Confirmed live 2026-08-14: each
+# version of the self-correction spiral above shared the same opening but kept
+# APPENDING new clauses ("...from the codebase:" -> "...from the codebase, using
+# the exact text from the files:" -> "...and make sure to include the actual
+# file content..."), so no later, longer version was ever a full substring of an
+# earlier, shorter one -- only their shared beginning repeats. Same minimum
+# length as _REPETITION_MIN_SEGMENT_LEN applies to the extracted prefix too, so
+# a short generic opening ("I need to check") isn't enough on its own.
+_REPETITION_PREFIX_CHARS = 80
+
+
+def _normalize_for_repetition_check(text: str) -> str:
+    """Whitespace-collapsed, filler-word-stripped form used for repetition
+    comparison -- see _REPETITION_FILLER_WORDS' own comment for why filler
+    words are stripped, not just whitespace."""
+    words = text.split()
+    return " ".join(w for w in words if w.lower() not in _REPETITION_FILLER_WORDS)
 
 
 def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:
     """True if `new_segment` (freshly generated text, appended to the accumulated
-    answer) is essentially a verbatim repeat of something generated recently,
-    rather than genuine new progress.
+    answer) is essentially a repeat of something generated recently, rather than
+    genuine new progress -- either a literal repeat, or a lightly reworded /
+    escalating restatement of one.
 
-    Confirmed live 2026-08-14: a coordinator run generated real, continuously
-    GROWING content (60,000+ chars) that was nonetheless a useless loop -- the
-    same sentence repeated verbatim for 17+ minutes, padded with large, VARIABLE
-    runs of blank newlines between each repeat. Whitespace is normalized (every
-    run of whitespace collapsed to one space) before comparing specifically
-    because of that padding -- a literal, unnormalized substring check would see
-    each repeat as a "different" string purely due to a different amount of
-    surrounding blank lines and miss the loop entirely.
+    Confirmed live 2026-08-14 (first incident): a coordinator run generated real,
+    continuously GROWING content (60,000+ chars) that was nonetheless a useless
+    loop -- the same sentence repeated verbatim for 17+ minutes, padded with
+    large, VARIABLE runs of blank newlines between each repeat. Whitespace is
+    normalized (every run of whitespace collapsed to one space) before comparing
+    specifically because of that padding -- a literal, unnormalized substring
+    check would see each repeat as a "different" string purely due to a
+    different amount of surrounding blank lines and miss the loop entirely.
+
+    Confirmed live 2026-08-14 (second, distinct incident, same day): a DIFFERENT
+    run never repeated anything verbatim, so a pure substring check stayed
+    silent, yet the coordinator still never produced a real answer -- it
+    spiraled through escalating self-corrections about its own citation
+    precision instead ("I need to be more specific... let me try again" ->
+    "I need to be even more specific... let me try again... using the exact
+    text..."). Closed by two additions, both applied only after the cheap exact
+    check below has already failed: (1) filler-word stripping, so an inserted
+    intensifier doesn't defeat the match; (2) also checking whether just the new
+    segment's OPENING recurs, since each version kept appending new trailing
+    clauses, so no version was ever a full substring of an earlier one -- only
+    their shared beginning repeats.
 
     Deliberately narrow: only substantial segments (>= _REPETITION_MIN_SEGMENT_LEN
     after normalization) are checked, and only against a bounded recent window
@@ -2047,7 +2199,22 @@ def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:
     if len(normalized_new) < _REPETITION_MIN_SEGMENT_LEN:
         return False
     normalized_prior = " ".join(prior_content[-_REPETITION_LOOKBACK_CHARS:].split())
-    return normalized_new in normalized_prior
+    if normalized_new in normalized_prior:
+        return True
+
+    filler_stripped_new = _normalize_for_repetition_check(new_segment)
+    if len(filler_stripped_new) < _REPETITION_MIN_SEGMENT_LEN:
+        return False
+    filler_stripped_prior = _normalize_for_repetition_check(
+        prior_content[-_REPETITION_LOOKBACK_CHARS:]
+    )
+    if filler_stripped_new in filler_stripped_prior:
+        return True
+
+    prefix = filler_stripped_new[:_REPETITION_PREFIX_CHARS]
+    if len(prefix) < _REPETITION_MIN_SEGMENT_LEN:
+        return False
+    return prefix in filler_stripped_prior
 
 
 def _log_unclassified_stream_event(log_label: str, event, unrecognized_event_counts: dict[str, int]) -> None:
