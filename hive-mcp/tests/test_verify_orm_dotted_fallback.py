@@ -69,6 +69,33 @@ def test_dotted_fallback_does_not_count_a_doc_only_attribute_match(monkeypatch):
     assert "NOT FOUND" in report
 
 
+def test_dotted_fallback_still_applies_when_the_joined_string_is_a_doc_only_hit(monkeypatch):
+    """Confirmed live 2026-08-14, the SAME day this fallback shipped: CLAUDE.md came
+    to quote the literal joined string `item_categories.sku_prefix` (documenting this
+    exact incident), which made the raw `hits` list non-empty on the next run and
+    skipped the fallback entirely -- landing on DOC ONLY instead of ever trying
+    SPLIT-FOUND, even though the attribute itself genuinely exists in code. A
+    doc-only hit on the joined string carries no more evidence about the real
+    table/attribute relationship than no hit at all, so this must still reach the
+    fallback and report SPLIT-FOUND, not DOC ONLY."""
+    def fake_rg(pattern, fixed=True, glob_filter="", whole_word=False):
+        if pattern == "item_categories.sku_prefix":
+            return ["CLAUDE.md:447:  - item_categories.sku_prefix already exists"]
+        if pattern == "sku_prefix" and whole_word:
+            return ["API/inventory-service/models.py:129:    sku_prefix = Column(String(8), nullable=True)"]
+        return []
+
+    monkeypatch.setattr(verify, "_rg", fake_rg)
+    answer = "The column `item_categories.sku_prefix` already exists."
+
+    report = verify.verify_claims(answer)
+
+    assert "DOC ONLY" not in report
+    assert "NOT FOUND" not in report
+    assert "SPLIT-FOUND" in report
+    assert "VERDICT: every checked claim exists" in report
+
+
 def test_non_dotted_claims_are_unaffected_by_this_fallback(monkeypatch):
     """A bare (non-dotted) NOT FOUND symbol must never attempt the split fallback
     -- there is nothing to split."""

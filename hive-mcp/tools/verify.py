@@ -899,7 +899,9 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
         for tok in idents[:_MAX_CLAIMS]:
             dotted = "." in tok
             hits = _rg(tok, fixed=True, glob_filter=glob_filter, whole_word=not dotted)
-            if not hits:
+            code_hits = [h for h in hits
+                         if not h.split(":", 1)[0].lower().endswith(_DOC_EXTS)]
+            if not code_hits:
                 # Dotted `owner.attribute` claims (a table/column, a class/field, a
                 # struct/property -- this tool has no idea which, and does not need
                 # to) never appear as one literal joined string whenever the
@@ -920,6 +922,15 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                 # existence, not the claimed relationship) rather than an invented
                 # symbol, so it is reported distinctly and does not count toward the
                 # fabrication verdict.
+                #
+                # Gated on `not code_hits`, not `not hits` -- a live re-test the SAME
+                # day this fallback shipped found the gap: CLAUDE.md itself came to
+                # quote the literal string `item_categories.sku_prefix` (documenting
+                # this exact incident), which made `hits` non-empty on the very next
+                # run and skipped the fallback entirely, landing on DOC ONLY instead
+                # of ever trying SPLIT-FOUND. A doc-only hit on the joined string is
+                # exactly as uninformative about the real relationship as no hit at
+                # all, so both cases now reach the same fallback.
                 if dotted:
                     attr = tok.rsplit(".", 1)[-1]
                     attr_hits = _rg(attr, fixed=True, glob_filter=glob_filter, whole_word=True)
@@ -934,16 +945,13 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                         )
                         continue
                 problems += 1
-                out.append(f"  NOT FOUND  {tok:38s} <-- does not exist in the project")
+                if hits:
+                    out.append(f"  DOC ONLY   {tok:38s} <-- appears only in documentation, "
+                               f"not in code: {hits[0][:70]}")
+                else:
+                    out.append(f"  NOT FOUND  {tok:38s} <-- does not exist in the project")
                 continue
-            code_hits = [h for h in hits
-                         if not h.split(":", 1)[0].lower().endswith(_DOC_EXTS)]
-            if not code_hits:
-                problems += 1
-                out.append(f"  DOC ONLY   {tok:38s} <-- appears only in documentation, "
-                           f"not in code: {hits[0][:70]}")
-            else:
-                out.append(f"  FOUND      {tok:38s} {code_hits[0][:90]}")
+            out.append(f"  FOUND      {tok:38s} {code_hits[0][:90]}")
         out.append("")
 
     # ── proposed / new code ──────────────────────────────────────────────────
