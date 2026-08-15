@@ -1710,6 +1710,18 @@ async def _fill_count_markers(content: str, hive_mcp_url: str | None) -> str:
 _CACHEABLE_READ_TOOLS = {
     "get_file_content", "get_files_batch", "search_files", "search_files_batch",
     "find_files", "list_directory", "list_directory_tree", "count_matches",
+    # lightrag_query added 2026-08-15 -- live-confirmed the exact same self-
+    # reinforcing loop this whole cache exists for (see the block comment right
+    # below), just on a different tool: a parallel-review run called
+    # lightrag_query with the IDENTICAL (query, project_id, mode) args 9+ times
+    # in a row, each time getting the SAME successful real result back but
+    # writing "failed, falling back to find_files" into shared state anyway and
+    # then immediately repeating the same call instead of actually falling back.
+    # No new mechanism needed -- lightrag_query is read-only and deterministic
+    # within a run exactly like the tools already here; adding it reuses the
+    # proven duplicate-serve escalation (2 full serves, then an escalating stub,
+    # then the aggregate forced-answer nudge) instead of a bespoke fix.
+    "lightrag_query",
 }
 
 # The network-only cache below (skip the hive-mcp round-trip, still hand back the

@@ -51,6 +51,7 @@ already-hardened setup:
 import inspect
 from pathlib import Path
 
+import pytest
 import yaml
 
 from swarm.team import _project_id_preamble, _team_roster_preamble, run_task_async, run_task_stream
@@ -331,3 +332,40 @@ def test_run_task_async_and_stream_forward_project_id_to_build_team():
 
     assert "project_id=project_id" in async_source
     assert "project_id=project_id" in stream_source
+
+
+# ── lightrag_query added to the duplicate-read cache (2026-08-15, 3rd live failure) ─
+#
+# Even with a WORKING project_id (both fixes above deployed), a parallel-review
+# run had SecurityReviewer call lightrag_query with the IDENTICAL args 9+ times in
+# a row -- each call genuinely succeeded (real content came back every time), but
+# the agent wrote "failed, falling back to find_files" into shared state anyway
+# and immediately repeated the SAME call instead of ever actually falling back.
+# This is the exact self-reinforcing duplicate-read loop _make_read_cache_tool_hook
+# already exists to stop for get_file_content/search_files/etc -- lightrag_query
+# was simply never added to the set it watches. No new mechanism, just widening
+# the existing, already-proven one.
+
+def test_lightrag_query_is_in_the_cacheable_read_tools_set():
+    from swarm.team import _CACHEABLE_READ_TOOLS
+
+    assert "lightrag_query" in _CACHEABLE_READ_TOOLS
+
+
+@pytest.mark.asyncio
+async def test_read_cache_hook_stubs_a_repeated_identical_lightrag_query_call():
+    from swarm.team import _make_read_cache_tool_hook
+
+    hook = _make_read_cache_tool_hook()
+
+    async def fake_lightrag_query(**kwargs):
+        return "── Project (ekam) ──\nThe file config/config.py is a central config file..."
+
+    args = {"query": "Find config/config.py", "project_id": "ekam", "mode": "local"}
+    first = await hook("lightrag_query", fake_lightrag_query, args)
+    second = await hook("lightrag_query", fake_lightrag_query, args)
+    third = await hook("lightrag_query", fake_lightrag_query, args)
+
+    assert "central config file" in first
+    assert "central config file" in second  # tolerated (serve 1-2 get real content)
+    assert "Already returned this exact" in third  # serve 3+ gets the stub, not the real content again
