@@ -88,7 +88,7 @@ def get_model(
 
 _BASE_PREAMBLE = [
     "SESSION CONTEXT: At session start, if project context hasn't been provided by the coordinator, try get_file_content('hive.md') once for a pre-built project overview (directory tree, per-module summaries). Skip silently if not found — it's optional.",
-    "If lightrag_query is available via MCP, call it with relevant keywords before starting.",
+    "lightrag_query is always connected server-side (api/server.py's _resolve_mcp_urls appends it regardless of caller opt-in) — call it with relevant keywords before starting.",
     "Do NOT call lightrag_insert on the project namespace — successful outcomes are captured automatically into a separate experience namespace by the feedback loop. Free-text inserts into the project namespace poison code-grounding retrieval.",
     "HONESTY: never claim a change was made or that a task succeeded if a tool returned an error, an empty result, or did not apply. Report the exact failure instead. A partial result is a FAILURE, not a success.",
     "SHARED STATE: your context includes read_log — files already read this run, by whom, tracked automatically. Before reading a file, check whether it's already listed — if so, use what the prior reader found instead of reading it again. You also have update_session_state — use it for a small, genuinely reusable fact or decision (never full file content) so a later step in this run doesn't have to re-derive it.",

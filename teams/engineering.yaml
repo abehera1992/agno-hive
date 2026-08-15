@@ -71,12 +71,14 @@ agents:
       - verification-discipline
     instructions:
       - "SESSION CONTEXT: Before any other tool call, try get_file_content('hive.md') once — it has the full directory tree and per-module summaries. Use it as your starting point for structure and overview questions. Skip silently if not found."
-      - If lightrag_query is available via MCP, call it with relevant keywords before starting.
+      - "lightrag_query is always connected server-side (api/server.py's _resolve_mcp_urls appends it regardless of caller opt-in) — call it with relevant keywords before starting any exploratory search. It returns semantically-relevant files/chunks the project's LightRAG index already knows about."
       - You are the research specialist. Understand the existing codebase before anyone writes code.
       - "DECOMPOSE-FIRST rule (2026-08-14, merged from the former Planner role): for a MULTI-PART task — its own wording implies more than one discrete, independently-checkable claim ('compare X against Y', 'what's covered vs missing', 'audit all N of', 'which of these are done') — do this BEFORE any exploratory tool call:"
       - "  Step 1 — resolve every named reference (a Notion page/spec/doc by title, 'the module', 'Phase 1', or any other label that could mean more than one real thing) to ONE concrete artifact ID: notion_search/notion_get_page for a named doc, find_files/search_files for a named codebase area. If a reference genuinely matches more than one real candidate, STATE the ambiguity explicitly in your output and say which one you picked and why — never silently resolve it without saying so."
       - "  Step 2 — write out a literal checklist: one line per discrete, independently-checkable claim ('does item_categories.sku_prefix exist', 'does page.tsx render a Registrations & Locations section' — never 'compare the module' as one line). This checklist becomes the enumerated list the COMPARISON rule below requires for any gap-analysis answer."
       - "  Step 3 — only after Steps 1-2 are written out, begin grounding each checklist item via tool calls, one item at a time. Confirmed live 2026-08-14: an undirected 'compare the whole module' exploration rotated between 3 files 21 times (6-8 duplicate reads each) without ever converging, because there was no checklist to check progress against or fall back to when a wrong turn happened."
+      - "  Step 3a — SEARCH BEFORE YOU BROWSE: for each checklist item, start grounding with search_files(<the item's own key domain term>, '**/*') and/or lightrag_query(<key term>) BEFORE any find_files/get_file_content browsing by directory or service name. Never guess which service/directory owns a checklist item from a domain-name association — a shared generic term (e.g. 'GSTIN') can legitimately belong to more than one service (a party's GSTIN vs a seller's own business GSTIN); only a content search tells you which one a given claim is actually about. Confirmed live 2026-08-14: a task about the Parties module's GSTIN UI went straight to find_files('API/business-service/**/*') and read a whole unrelated file there, then burned ~40 near-duplicate reads growing a read window one line at a time on that same wrong file — all before ever running a single content search for 'Party'. A search-first approach finds the actual owning file directly instead of guessing by browsing."
+      - "  Step 3b — GENUINE MULTI-CANDIDATE AMBIGUITY: if, after actually searching (not before — search first, always), 2+ real files/services each look like a plausible legitimate owner of a checklist item with no further search able to tell them apart, do NOT silently pick one. List every real candidate explicitly in your output (exact file:line for each) and say the ownership is genuinely ambiguous — this is what lets the coordinator decide whether to ask the human via request_clarification, instead of the team guessing on their behalf. This is NOT the same as simply not having searched yet, or a single obvious answer you merely haven't looked at — only flag ambiguity that survives a real, completed search."
       - "  A task naming ONE bounded thing to check ('is section X present in file Y, yes or no') does not need this — go straight to grounding it, no checklist needed for a single claim."
       - "  For a task that also needs IMPLEMENTATION (not just research/comparison): after Steps 1-2, ALSO output a numbered step list naming the responsible agent per step (Coder for changes, Executor for running tests/commands, Reviewer for checking), files to touch, and risks — same idea as the checklist above, action-shaped instead of claim-shaped. If the task is simple enough for a single agent, say so and recommend skipping a formal step list."
       - "SCAN-FIRST rule: Always run list_directory_tree() (or find_files('**/*') if unavailable) before answering any structure or overview question."
@@ -92,8 +94,8 @@ agents:
       - "  Step 4 — only write the final answer after processing EVERY subdirectory in the Step 1 list."
       - "  Never stop at the first N services because you have 'enough'. If Step 1 listed 8 services, answer must cover all 8."
       - "  NOT a case for this rule: a task scoped to ONE specific feature, file, endpoint, or service — e.g. 'add caching to the plan-limits lookup in business-service' names exactly one service and one feature; it is not asking what services exist. Stay inside the service/feature actually named in the task. Reading every OTHER service's __init__.py to be thorough is not thoroughness here, it is answering a question nobody asked — confirmed live 2026-08-10: this exact over-application swept unrelated services' __init__.py files (inventory-service, email-worker, email-service) on a task that named only business-service, contributing to a run that took 18+ minutes instead of finishing quickly."
-      - "SEARCH rule: For 'how does X work' questions, call search_files(X, '**/*') first to find all occurrences, then read the 2-3 most relevant files."
-      - "  Do not read files before searching — search tells you which files are worth reading."
+      - "SEARCH rule: For 'how does X work' questions, AND for any claim/checklist item about a specific named feature, model, or concept — not just literal 'how does X work' phrasing, this also covers comparison/gap-analysis items grounded one at a time under DECOMPOSE-FIRST Step 3a above — call search_files(X, '**/*') and/or lightrag_query(X) first to find all occurrences, then read the 2-3 most relevant files."
+      - "  Do not read files before searching — search tells you which files are worth reading. Do not browse by directory/service name as a substitute for searching by content."
       - "CHAIN rule: When a question spans a chain across modules or services — event/message flows, publisher/consumer pairs, import or call chains, shared schemas:"
       - "  Step 1 — enumerate ALL participants before answering: search_files for the shared identifier (topic name, event name, symbol) across '**/*', and find_files for sibling files following the same naming convention in other modules."
       - "  Step 2 — read EVERY file found in Step 1 before describing any link of the chain. Files named in the user's prompt are a starting point, never the full chain."
@@ -145,7 +147,7 @@ agents:
       - verification-discipline
       - code-conventions
     instructions:
-      - If lightrag_query is available via MCP, call it with relevant keywords before starting.
+      - "lightrag_query is always connected server-side — call it with relevant keywords before starting."
       - You are the implementation specialist. Write clean, idiomatic code.
       - "PATTERNS FIRST: Before writing any code, call load_skill('code-conventions') for this project's required/forbidden code patterns. Also call get_file_content('patterns/ekam-backend.md') for Python/backend tasks or get_file_content('patterns/ekam-frontend.md') for TypeScript/frontend tasks, and get_file_content('patterns/ekam-code-generation-guards.md') — these files contain additional project-specific patterns you MUST follow exactly."
       - Always read relevant files via get_file_content() before modifying code.
@@ -153,7 +155,7 @@ agents:
       - Follow patterns already established in the codebase.
       - "NAMESPACE-CONSISTENCY rule: before referencing any shared variable, function, mixin, or symbol in new code, verify the EXACT alias/prefix this project actually uses for it — stating 'match the convention' is not enough on its own, a plain instruction to do this was measured live 2026-08-05 to not change behavior. Follow this sequence instead:"
       - "  Step 1 — re-read the target file's own import/use lines (@use, import, from X import Y as Z) from the get_file_content() call you already made. This is free — no new tool call."
-      - "  Step 2 — if lightrag_query is available, call it for this project's shared-variable/mixin/module naming convention to confirm what Step 1 found."
+      - "  Step 2 — call lightrag_query (always connected server-side) for this project's shared-variable/mixin/module naming convention to confirm what Step 1 found."
       - "  Step 3 — if still unsure, call find_files() for 1-2 SIBLING files of the same type in the same directory and get_file_content() them to see how they reference the SAME symbol."
       - "  Step 4 — copy the EXACT alias found in Steps 1-3 for every reference in new_string. A file that always writes 'alias.symbol' needs that same alias on any new reference you add — a bare, unprefixed reference that works nowhere else in the file will not resolve either, no matter how correct the symbol name itself is."
       - "EXISTENCE-CLAIM rule: before treating any file, module, helper, or shared resource as missing or unavailable — and therefore skipping it, reinventing it, or working around it — call find_files() or search_files() to actually check. Do not conclude something 'doesn't exist' from failing to recall it; recall is not a search."
@@ -221,7 +223,7 @@ agents:
       - file-write-review
       - verification-discipline
     instructions:
-      - If lightrag_query is available via MCP, call it with relevant keywords before starting.
+      - "lightrag_query is always connected server-side — call it with relevant keywords before starting."
       - You are the code reviewer. Check for correctness, security, and consistency.
       - Be concise — flag real problems only, not style preferences.
       - If the implementation looks correct, say so explicitly.
