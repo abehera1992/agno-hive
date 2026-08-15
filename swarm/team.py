@@ -2770,7 +2770,17 @@ async def _stream_team_run(
             activity["stream_event_count"] += 1
             out = _stream_event_to_chunk(event)
             if isinstance(out, str):
-                activity["last_progress_at"] = time.monotonic()
+                # Deliberately NOT updating last_progress_at here on every chunk --
+                # a chunk arriving mid-loop can't yet be told apart from genuine new
+                # content (only the 10s-boundary repetition check below can tell).
+                # An earlier version updated it unconditionally per-chunk, which meant
+                # a rollback below was immediately re-stomped forward by the very next
+                # chunk of the SAME repeating block (still inside the same 10s window),
+                # so stagnant_seconds could never accumulate past ~10-20s no matter how
+                # long a loop ran. Confirmed live 2026-08-14: 13+ minutes of
+                # continuously-detected repetition never tripped the 300s Tier-1
+                # auto-kill. Now last_progress_at only ever advances in the non-repeat
+                # branch below, once per 10s window.
                 full_content.append(out)
                 now = time.monotonic()
                 if now - last_logged_at >= 10:
@@ -2778,14 +2788,9 @@ async def _stream_team_run(
                     new_segment = joined[last_logged_len:]
                     preview = new_segment[-300:]
                     if _looks_like_repetition_loop(new_segment, joined[:last_logged_len]):
-                        # This batch's per-chunk updates above already advanced
-                        # last_progress_at -- roll it back to before this batch
-                        # started, so a loop that keeps recurring accumulates real
-                        # stagnant_seconds instead of looking like continuous
-                        # progress forever. A one-off flagged batch followed by
-                        # genuinely new content self-corrects on the very next
-                        # chunk's own immediate update above.
-                        activity["last_progress_at"] = last_logged_at
+                        # Leave last_progress_at untouched -- it already reflects the
+                        # last time genuinely new content was confirmed, and a repeat
+                        # this window doesn't change that fact.
                         print(
                             f"[{log_label}] repetition loop detected -- the last "
                             f"{len(new_segment)} chars look like a repeat of earlier "
@@ -2793,6 +2798,7 @@ async def _stream_team_run(
                             flush=True,
                         )
                     else:
+                        activity["last_progress_at"] = now
                         print(
                             f"[{log_label}] content: +{len(joined) - last_logged_len} chars "
                             f"({len(joined)} total) -- ...{preview!r}",
@@ -3019,7 +3025,11 @@ async def run_task_async(
                             activity["stream_event_count"] += 1
                             out = _stream_event_to_chunk(event)
                             if isinstance(out, str):
-                                activity["last_progress_at"] = time.monotonic()
+                                # See _stream_team_run's identical block for the full
+                                # rationale -- kept in sync deliberately. Deliberately
+                                # NOT updating last_progress_at per-chunk here; only the
+                                # 10s-boundary check below advances it, and only on
+                                # confirmed non-repeat content.
                                 full_content.append(out)
                                 now = time.monotonic()
                                 if now - last_logged_at >= 10:
@@ -3027,9 +3037,8 @@ async def run_task_async(
                                     new_segment = joined[last_logged_len:]
                                     preview = new_segment[-300:]
                                     if _looks_like_repetition_loop(new_segment, joined[:last_logged_len]):
-                                        # See _stream_team_run's identical block for
-                                        # the full rationale -- kept in sync deliberately.
-                                        activity["last_progress_at"] = last_logged_at
+                                        # Leave last_progress_at untouched -- see
+                                        # _stream_team_run's identical block.
                                         print(
                                             f"[team] repetition loop detected -- the last "
                                             f"{len(new_segment)} chars look like a repeat of "
@@ -3038,6 +3047,7 @@ async def run_task_async(
                                             flush=True,
                                         )
                                     else:
+                                        activity["last_progress_at"] = now
                                         print(
                                             f"[team] content: +{len(joined) - last_logged_len} chars "
                                             f"({len(joined)} total) -- ...{preview!r}",
