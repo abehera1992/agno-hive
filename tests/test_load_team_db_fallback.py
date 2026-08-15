@@ -128,7 +128,6 @@ async def test_load_team_coordinator_falls_back_to_config_leader_model_as_last_r
     ("engineering", "qwen3-coder:30b", {
         "ContextRouter": "llama3.1:8b",
         "Researcher": "qwen2.5-coder:32b",
-        "Planner": "qwen2.5-coder:32b",
         "Coder": "qwen2.5-coder:32b",
         "Executor": "llama3.1:8b",
         "Reviewer": "qwen2.5-coder:32b",

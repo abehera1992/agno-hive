@@ -306,29 +306,6 @@ def make_reviewer(*mcps: MCPTools, tool_hooks: list | None = None) -> Agent:
     )
 
 
-def make_planner(*mcps: MCPTools) -> Agent:
-    return Agent(
-        name="Planner",
-        model=get_model(
-            config.planner_model, config.ollama_host,
-            temperature=config.member_temperature, max_tokens=config.member_max_tokens,
-            frequency_penalty=config.member_frequency_penalty,
-        ),
-        tools=list(mcps) + [update_session_state],
-        description="Task decomposition specialist. Break complex tasks into numbered steps naming the responsible agent, files to touch, and risks.",
-        instructions=[
-            *_BASE_PREAMBLE,
-            "Break complex tasks into clear, ordered steps.",
-            "Before planning, call lightrag_query() to check if similar tasks were solved before.",
-            "Output a numbered step list. Each step must name the responsible agent (Researcher, Coder, Executor, Reviewer).",
-            "Do NOT implement anything yourself — plan only.",
-            "If the task is simple enough for a single agent, say so and recommend skipping the plan.",
-        ],
-        role="Senior engineer who decomposes tasks into actionable steps for the team.",
-        **_COMMON_AGENT_KWARGS,
-    )
-
-
 def make_researcher(*mcps: MCPTools) -> Agent:
     return Agent(
         name="Researcher",

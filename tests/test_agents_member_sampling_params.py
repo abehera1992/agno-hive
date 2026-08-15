@@ -1,4 +1,4 @@
-"""Regression test: every member agent (ContextRouter, Researcher, Planner, Coder,
+"""Regression test: every member agent (ContextRouter, Researcher, Coder,
 Executor, Reviewer) must get the same repetition-loop protection the coordinator has
 had since 2026-08-10 -- pinned temperature, a bounded max_tokens, and a repetition
 penalty.
@@ -25,7 +25,7 @@ from api.models import AgentSpec
 from config.config import config
 from swarm.agents import (
     make_agent_from_spec, make_coder, make_context_router, make_executor,
-    make_planner, make_researcher, make_reviewer,
+    make_researcher, make_reviewer,
 )
 
 
@@ -108,7 +108,7 @@ def test_make_coder_gets_coder_max_tokens():
 
 
 @pytest.mark.parametrize(
-    "make_fn", [make_reviewer, make_planner, make_researcher, make_executor, make_context_router]
+    "make_fn", [make_reviewer, make_researcher, make_executor, make_context_router]
 )
 def test_other_member_builders_get_member_max_tokens(make_fn):
     agent = make_fn()

@@ -201,7 +201,6 @@ _TEAM_ROLE_DEFAULTS = [
     ("engineering", "Coordinator", "qwen3-coder:30b"),
     ("engineering", "ContextRouter", "llama3.1:8b"),
     ("engineering", "Researcher", "qwen2.5-coder:32b"),
-    ("engineering", "Planner", "qwen2.5-coder:32b"),
     ("engineering", "Coder", "qwen2.5-coder:32b"),
     ("engineering", "Executor", "llama3.1:8b"),
     ("engineering", "Reviewer", "qwen2.5-coder:32b"),

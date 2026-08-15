@@ -1,5 +1,5 @@
 """Regression test: every member agent builder (make_agent_from_spec, make_coder,
-make_reviewer, make_planner, make_researcher, make_executor, make_context_router)
+make_reviewer, make_researcher, make_executor, make_context_router)
 must have BOTH halves of agno-hive's own session_state mechanism wired in:
 add_session_state_to_context=True (agno's own, working correctly -- renders the
 current state into the agent's own prompt automatically) and update_session_state
@@ -29,7 +29,7 @@ from api.models import AgentSpec
 from config.config import config
 from swarm.agents import (
     _update_session_state_impl, make_agent_from_spec, make_coder, make_context_router,
-    make_executor, make_planner, make_researcher, make_reviewer, update_session_state,
+    make_executor, make_researcher, make_reviewer, update_session_state,
 )
 
 
@@ -143,7 +143,7 @@ def test_make_agent_from_spec_never_sets_agnos_own_broken_flag():
 
 @pytest.mark.parametrize(
     "make_fn",
-    [make_coder, make_reviewer, make_planner, make_researcher, make_executor, make_context_router],
+    [make_coder, make_reviewer, make_researcher, make_executor, make_context_router],
 )
 def test_common_kwargs_builders_have_shared_state_wired_in(make_fn):
     agent = make_fn()
@@ -153,7 +153,7 @@ def test_common_kwargs_builders_have_shared_state_wired_in(make_fn):
     assert agent.enable_agentic_state is False
 
 
-@pytest.mark.parametrize("make_fn", [make_coder, make_reviewer, make_planner, make_researcher, make_executor])
+@pytest.mark.parametrize("make_fn", [make_coder, make_reviewer, make_researcher, make_executor])
 def test_base_preamble_builders_mention_shared_state_in_instructions(make_fn):
     """ContextRouter deliberately excluded -- its instructions list does not
     include _BASE_PREAMBLE (kept minimal/fast by design); it still gets the

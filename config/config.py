@@ -16,7 +16,6 @@ class Config:
     leader_model: str = os.getenv("LEADER_MODEL", "qwen2.5-coder:32b")
     coder_model: str = os.getenv("CODER_MODEL", "qwen2.5-coder:32b")
     reviewer_model: str = os.getenv("REVIEWER_MODEL", "qwen2.5-coder:32b")
-    planner_model: str = os.getenv("PLANNER_MODEL", "qwen2.5-coder:32b")
     researcher_model: str = os.getenv("RESEARCHER_MODEL", "qwen2.5-coder:32b")
     executor_model: str = os.getenv("EXECUTOR_MODEL", "llama3.1:8b")
     router_model: str = os.getenv("ROUTER_MODEL", "llama3.1:8b")  # ContextRouter agent (swarm/agents.py) + session compaction (swarm/sessions.py). Cheap 8b is intended — do NOT raise it.
