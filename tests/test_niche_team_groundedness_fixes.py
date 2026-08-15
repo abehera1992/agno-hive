@@ -467,6 +467,52 @@ def test_member_id_inserts_a_dash_at_camelcase_boundaries():
     assert _member_id("PerformanceReviewer") == "performance-reviewer"
 
 
+# ── _COORDINATOR_DISCOVERY_TOOLS: lightrag_query/get_context_section excluded too ──
+#
+# The coordinator's direct tool surface always excludes _COORDINATOR_DISCOVERY_TOOLS
+# regardless of a team's own coordinator_tools: YAML allowlist -- confirmed by
+# reading _scope_coordinator_tools directly, this is a hard code-level filter, the
+# same "tool surface constrains behavior, not just instructions" mechanism already
+# proven live for find_files/search_files/etc (2026-08-11). lightrag_query and
+# get_context_section were missed when that set was first built. Live-confirmed gaps,
+# same day: a planning run had the coordinator call lightrag_query 3 times directly
+# instead of delegating to Researcher (never reaching planning's Notion tools, which
+# only member agents have); a parallel-review run had the coordinator call
+# get_context_section ~25 times directly across topics with zero relevance to the
+# task instead of ever delegating.
+
+def _fake_mcp(functions: dict):
+    from types import SimpleNamespace
+    return SimpleNamespace(functions=functions)
+
+
+def test_lightrag_query_and_get_context_section_are_coordinator_discovery_tools():
+    from swarm.team import _COORDINATOR_DISCOVERY_TOOLS
+
+    assert "lightrag_query" in _COORDINATOR_DISCOVERY_TOOLS
+    assert "get_context_section" in _COORDINATOR_DISCOVERY_TOOLS
+
+
+def test_scope_coordinator_tools_excludes_lightrag_query_even_when_allowlisted():
+    from swarm.team import _scope_coordinator_tools
+
+    mcp = _fake_mcp({
+        "lightrag_query": "lightrag_query_fn",
+        "get_context_section": "get_context_section_fn",
+        "get_file_content": "get_file_content_fn",
+    })
+
+    # Even though the allowlist explicitly names both discovery tools (matching
+    # planning.yaml's/parallel-review.yaml's own real coordinator_tools: lists),
+    # the hard exclusion still wins.
+    scoped = _scope_coordinator_tools(
+        ["lightrag_query", "get_context_section", "get_file_content"], [mcp], read_only=True,
+    )
+    assert "lightrag_query_fn" not in scoped
+    assert "get_context_section_fn" not in scoped
+    assert "get_file_content_fn" in scoped
+
+
 def test_coordinator_instructions_delegation_examples_use_the_real_member_id():
     """The actual live bug: _COORDINATOR_INSTRUCTIONS' own example code told the
     coordinator to type the display name verbatim. Every delegate_task_to_member

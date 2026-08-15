@@ -80,7 +80,8 @@ _COORDINATOR_INSTRUCTIONS = [
     "",
     "── Locating unfamiliar files — you do not have find_files/search_files/list_directory ─",
     "  find_files, search_files, list_directory, list_directory_tree,",
-    "  search_knowledge_graph, web_search, and web_fetch are NOT on your own tool list —",
+    "  search_knowledge_graph, web_search, web_fetch, lightrag_query, and",
+    "  get_context_section are NOT on your own tool list —",
     "  this is deliberate, not a connection problem. If the task requires FINDING a file,",
     "  page, or component named only by feature or description (not an exact path already",
     "  known from the user's prompt, this session's own prior tool results, or a teammate's",
@@ -531,9 +532,24 @@ def _strip_mutating(specs: list, tool_names: list[str] | None) -> tuple[list, li
 # capability isn't lost by removing them here, only moved: ContextRouter and
 # Researcher both carry the same tools in teams/engineering.yaml, so external
 # research still happens, just delegated like discovery already is.
+#
+# lightrag_query/get_context_section added 2026-08-15 -- same incident class,
+# found live on `planning` (which lists both in its own coordinator_tools:
+# allowlist, so neither was previously blocked by this set at all): a run that
+# should have delegated to Researcher instead had the coordinator call
+# lightrag_query 3 times directly and produce the whole answer itself, never
+# reaching Researcher/ContextRouter/Planner or planning's own Notion tools (only
+# the MEMBER agents have notion_search/notion_get_page, not the coordinator) --
+# and a separate parallel-review run had the coordinator call get_context_section
+# ~25 times directly across topics with zero relevance to the task (seller, buyer,
+# docker, krakend, delivery-board) instead of ever delegating. Both tools are
+# semantic-search/reference lookups, the same category as search_knowledge_graph
+# already excluded above -- this closes the same gap for the two tools that were
+# missed the first time this set was built.
 _COORDINATOR_DISCOVERY_TOOLS = {
     "find_files", "search_files", "list_directory", "list_directory_tree",
     "search_knowledge_graph", "web_search", "web_fetch",
+    "lightrag_query", "get_context_section",
 }
 
 
