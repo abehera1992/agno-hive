@@ -47,6 +47,18 @@ already-hardened setup:
    namespace is "ekam" (2,646 docs); "default" (the request-level fallback when a
    caller omits project_id) has only 2. `_project_id_preamble()` now states the
    real value explicitly, universally (all 4 teams, not team-scoped).
+
+6. Same day, 3rd/4th live failures on `parallel-review`: even with a WORKING
+   project_id (#5), lightrag_query kept "succeeding" with real but purely
+   DESCRIPTIVE/summary content about a named file's role -- never its literal
+   source -- so the earlier FALLBACK rule's failure-triggered condition (#3-shaped
+   wording) never fired, and separately the model repeated the identical failing
+   call 9+ times before the run's own budget ran out. Fixed with two changes:
+   `lightrag_query` added to `_CACHEABLE_READ_TOOLS` (swarm/team.py) so the
+   already-proven duplicate-serve escalation applies to it too, and a new
+   KNOWN-PATH rule on all 3 review agents (parallel-review.yaml) requiring
+   get_file_content(path) as the FIRST call whenever the task already names a
+   specific path -- lightrag_query reserved for genuine discovery only.
 """
 import inspect
 from pathlib import Path
@@ -350,6 +362,33 @@ def test_lightrag_query_is_in_the_cacheable_read_tools_set():
     from swarm.team import _CACHEABLE_READ_TOOLS
 
     assert "lightrag_query" in _CACHEABLE_READ_TOOLS
+
+
+def test_researcher_has_known_path_rule():
+    instructions = " ".join(_agent(_load(_PARALLEL_REVIEW_YAML), "Researcher")["instructions"]).lower()
+    assert "known-path rule" in instructions
+    assert "get_file_content" in instructions
+
+
+def test_security_reviewer_has_known_path_rule():
+    instructions = " ".join(_agent(_load(_PARALLEL_REVIEW_YAML), "SecurityReviewer")["instructions"]).lower()
+    assert "known-path rule" in instructions
+    assert "get_file_content" in instructions
+
+
+def test_performance_reviewer_has_known_path_rule():
+    instructions = " ".join(_agent(_load(_PARALLEL_REVIEW_YAML), "PerformanceReviewer")["instructions"]).lower()
+    assert "known-path rule" in instructions
+    assert "get_file_content" in instructions
+
+
+def test_known_path_rule_explains_lightrag_is_summary_not_literal_source():
+    """The actual root cause, not just tool-name presence: lightrag_query kept
+    'succeeding' with real but purely descriptive content -- the model needs to
+    understand WHY that's insufficient, not just be told a different tool name."""
+    for agent_name in ("Researcher", "SecurityReviewer", "PerformanceReviewer"):
+        instructions = " ".join(_agent(_load(_PARALLEL_REVIEW_YAML), agent_name)["instructions"]).lower()
+        assert "summary" in instructions or "literal source" in instructions
 
 
 @pytest.mark.asyncio
