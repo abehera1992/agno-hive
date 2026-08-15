@@ -491,6 +491,7 @@ def test_lightrag_query_and_get_context_section_are_coordinator_discovery_tools(
 
     assert "lightrag_query" in _COORDINATOR_DISCOVERY_TOOLS
     assert "get_context_section" in _COORDINATOR_DISCOVERY_TOOLS
+    assert "get_graph_report" in _COORDINATOR_DISCOVERY_TOOLS
 
 
 def test_scope_coordinator_tools_excludes_lightrag_query_even_when_allowlisted():

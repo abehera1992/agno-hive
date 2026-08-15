@@ -81,7 +81,7 @@ _COORDINATOR_INSTRUCTIONS = [
     "── Locating unfamiliar files — you do not have find_files/search_files/list_directory ─",
     "  find_files, search_files, list_directory, list_directory_tree,",
     "  search_knowledge_graph, web_search, web_fetch, lightrag_query, and",
-    "  get_context_section are NOT on your own tool list —",
+    "  get_context_section, and get_graph_report are NOT on your own tool list —",
     "  this is deliberate, not a connection problem. If the task requires FINDING a file,",
     "  page, or component named only by feature or description (not an exact path already",
     "  known from the user's prompt, this session's own prior tool results, or a teammate's",
@@ -550,6 +550,12 @@ _COORDINATOR_DISCOVERY_TOOLS = {
     "find_files", "search_files", "list_directory", "list_directory_tree",
     "search_knowledge_graph", "web_search", "web_fetch",
     "lightrag_query", "get_context_section",
+    # get_graph_report added 2026-08-15, same live validation pass -- missed when
+    # get_context_section was added right above it. Same graphify/knowledge-graph
+    # reference-lookup category; live-observed the coordinator calling it directly
+    # (repeatedly, ~40s apart, heading toward another 300s liveness auto-kill)
+    # immediately after get_context_section's own direct calls in the same run.
+    "get_graph_report",
 }
 
 
