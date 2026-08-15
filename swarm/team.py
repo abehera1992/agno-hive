@@ -405,6 +405,40 @@ def _team_roster_preamble(agent_specs: list | None) -> list[str]:
     return lines
 
 
+def _project_id_preamble(project_id: str) -> list[str]:
+    """2026-08-15 -- root-caused live during the parallel-review groundedness pass:
+    `project_id` (the real LightRAG namespace, e.g. "ekam") is a parameter
+    run_task_async/run_task_stream already receive, but it was ONLY ever used
+    server-side (telemetry, load_failure_context) -- never surfaced into any
+    agent's own instructions/context. Every agent whose tools include
+    lightrag_query/lightrag_insert/index_project takes `project_id` as a free-form
+    string argument IT chooses (confirmed by reading lightrag_mcp/server.py's own
+    tool signatures) -- with nothing telling it the real value, it has always had
+    to guess.
+
+    Confirmed live via direct postgres query (`agno.lightrag_doc_status.workspace`,
+    ZGX): the real, correctly-indexed EkamApp namespace is "ekam" (2,646 docs) --
+    "default" (server.py's own RunRequest.project_id default when a caller omits
+    it) has only 2 docs, essentially empty. Real, distinct guessed-wrong values
+    already exist in that same table from past sessions: "ekamweb", "ekamapp",
+    "EkamApp" (1-2 stray docs each -- accidental pollution, not real indexed
+    content) and, live on 2026-08-15's parallel-review validation run, an
+    outright-fabricated UUID that made lightrag_query hard-error with "graph name
+    is invalid". A model with zero grounding for a required tool argument does not
+    reliably guess it, guesses a DIFFERENT wrong value nearly every time, and this
+    was never caught earlier because most runs' actual answers came from other
+    tools (get_file_content, get_context_section) that don't depend on it.
+
+    A single clear instruction line removes the guessing entirely -- this is not a
+    per-team concern, so it applies universally (prepended alongside
+    _team_roster_preamble, not team-scoped).
+    """
+    return [
+        f"── This project's LightRAG namespace (for lightrag_query/lightrag_insert/index_project's project_id argument): '{project_id}' — ALWAYS use this EXACT value. Never guess, invent, or infer a different project_id (not a directory name, not a UUID, not a variant spelling) — an unrecognized value returns empty/no-context results or a hard error, not a helpful failure. ──",
+        "",
+    ]
+
+
 # Tools that CHANGE something — the repo, the host, or an external system. Named here,
 # server-side, so a caller asking for a read-only run does not have to know (or keep in
 # sync with) which tools mutate. Prefix matching covers integration families that grow
@@ -2698,7 +2732,10 @@ async def run_task_stream(
         )
     )
 
-    instructions = _team_roster_preamble(agent_specs) + list(_COORDINATOR_INSTRUCTIONS)
+    instructions = (
+        _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
+        + list(_COORDINATOR_INSTRUCTIONS)
+    )
     if skill_catalog:
         instructions += ["", format_skill_catalog(skill_catalog, None)]
     if failure_context:
@@ -3122,7 +3159,10 @@ async def run_task_async(
         )
     )
 
-    instructions = _team_roster_preamble(agent_specs) + list(_COORDINATOR_INSTRUCTIONS)
+    instructions = (
+        _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
+        + list(_COORDINATOR_INSTRUCTIONS)
+    )
     if skill_catalog:
         instructions += ["", format_skill_catalog(skill_catalog, None)]
     if failure_context:

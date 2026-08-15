@@ -35,13 +35,25 @@ already-hardened setup:
    prose (real regression risk), `_team_roster_preamble()` prepends a small,
    dynamically-generated, per-run block naming each team's REAL members ahead
    of it -- purely additive.
+
+5. Root-caused live during parallel-review validation (2026-08-15): `project_id`
+   (the real LightRAG namespace, e.g. "ekam") was NEVER surfaced into any agent's
+   instructions -- confirmed by reading lightrag_mcp/server.py's own tool
+   signatures, `project_id` is a free-form argument the CALLING AGENT chooses.
+   With nothing telling it the real value, agents guessed -- sometimes a
+   plausible-but-wrong directory name, once an outright-fabricated UUID that made
+   lightrag_query hard-error with "graph name is invalid". Confirmed via direct
+   postgres query (agno.lightrag_doc_status.workspace, ZGX): the real indexed
+   namespace is "ekam" (2,646 docs); "default" (the request-level fallback when a
+   caller omits project_id) has only 2. `_project_id_preamble()` now states the
+   real value explicitly, universally (all 4 teams, not team-scoped).
 """
 import inspect
 from pathlib import Path
 
 import yaml
 
-from swarm.team import _team_roster_preamble, run_task_async, run_task_stream
+from swarm.team import _project_id_preamble, _team_roster_preamble, run_task_async, run_task_stream
 
 _PARALLEL_REVIEW_YAML = Path(__file__).parent.parent / "teams" / "parallel-review.yaml"
 _PLANNING_YAML = Path(__file__).parent.parent / "teams" / "planning.yaml"
@@ -189,10 +201,45 @@ def test_falls_back_to_role_when_description_is_none():
 def test_result_is_prepended_ahead_of_coordinator_instructions_in_both_functions():
     """Source-inspection check (same convention as test_gate_team_scoping.py's
     team_name wiring checks) -- neither run_task_async nor run_task_stream is
-    unit-tested directly elsewhere (heavy MCP/session setup); confirms the
-    preamble is prepended, not appended or omitted, in both places it's built."""
+    unit-tested directly elsewhere (heavy MCP/session setup); confirms BOTH
+    preambles are prepended, not appended or omitted, in both places they're
+    built, and that _project_id_preamble comes first (project namespace is more
+    fundamental than the roster -- order between the two doesn't functionally
+    matter, but this locks the actual shipped order so a future edit that
+    silently drops one is caught)."""
     async_source = inspect.getsource(run_task_async)
     stream_source = inspect.getsource(run_task_stream)
 
-    assert "_team_roster_preamble(agent_specs) + list(_COORDINATOR_INSTRUCTIONS)" in async_source
-    assert "_team_roster_preamble(agent_specs) + list(_COORDINATOR_INSTRUCTIONS)" in stream_source
+    expected = (
+        "_project_id_preamble(project_id) + _team_roster_preamble(agent_specs)\n"
+        "        + list(_COORDINATOR_INSTRUCTIONS)"
+    )
+    assert expected in async_source
+    assert expected in stream_source
+
+
+# ── _project_id_preamble ─────────────────────────────────────────────────────────
+
+def test_states_the_real_project_id_explicitly():
+    result = _project_id_preamble("ekam")
+    joined = "\n".join(result)
+
+    assert "'ekam'" in joined
+    assert "lightrag_query" in joined
+
+
+def test_default_project_id_is_stated_too_not_special_cased():
+    """"default" is a real, if near-empty, namespace -- the preamble must state
+    whatever value it's given, not silently skip or special-case it. Guessing
+    is the failure this exists to remove, for every value, not just the common
+    ones."""
+    result = _project_id_preamble("default")
+
+    assert "'default'" in "\n".join(result)
+
+
+def test_warns_against_guessing_or_inventing_a_value():
+    result = _project_id_preamble("ekam")
+    joined = "\n".join(result).lower()
+
+    assert "never guess" in joined or "never" in joined and "guess" in joined
