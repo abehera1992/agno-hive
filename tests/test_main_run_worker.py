@@ -121,6 +121,46 @@ async def test_agent_specs_are_reconstructed_as_real_agentspec_objects(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_team_name_passes_through_to_run_task_async(monkeypatch):
+    """2026-08-15 gate-scope extension -- api/server.py's /run handler now sends
+    team_name in the worker payload so _build_team's per-team gate policy
+    (see tests/test_gate_team_scoping.py) reaches the actual run."""
+    _set_stdin(monkeypatch, {"task": "plan the sprint", "team_name": "sprint-master"})
+
+    captured = {}
+
+    async def fake_run_task_async(**kwargs):
+        captured.update(kwargs)
+        return "ok", {}, None
+
+    monkeypatch.setattr(main, "run_task_async", fake_run_task_async)
+
+    await main._run_worker()
+
+    assert captured["team_name"] == "sprint-master"
+
+
+@pytest.mark.asyncio
+async def test_missing_team_name_passes_through_as_none(monkeypatch):
+    """A payload with no team_name key (e.g. an older client, or main.py's own
+    __main__ one-shot CLI path) must not break -- run_task_async's own
+    team_name=None default preserves exact prior behavior."""
+    _set_stdin(monkeypatch, {"task": "x"})
+
+    captured = {}
+
+    async def fake_run_task_async(**kwargs):
+        captured.update(kwargs)
+        return "ok", {}, None
+
+    monkeypatch.setattr(main, "run_task_async", fake_run_task_async)
+
+    await main._run_worker()
+
+    assert captured["team_name"] is None
+
+
+@pytest.mark.asyncio
 async def test_missing_optional_fields_use_run_task_asyncs_own_defaults(monkeypatch):
     """A minimal payload (just task) must not pass None where run_task_async
     expects its own default (project_id="default", mode="coordinate",

@@ -94,6 +94,7 @@ async def _run_worker() -> dict:
             mode=payload.get("mode", "coordinate"),
             read_only=payload.get("read_only", False),
             liveness_path=payload.get("liveness_path"),
+            team_name=payload.get("team_name"),
         )
         return {"content": content, "tokens": tokens, "clarification": clarification}
     except Exception as exc:
@@ -155,6 +156,7 @@ async def _run_stream_worker(real_stdout) -> None:
             session_id=payload.get("session_id"),
             mode=payload.get("mode", "coordinate"),
             read_only=payload.get("read_only", False),
+            team_name=payload.get("team_name"),
         ):
             print(json.dumps({"ok": True, "v": chunk}), file=real_stdout, flush=True)
     except Exception as exc:

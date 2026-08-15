@@ -1925,7 +1925,7 @@ def _is_multi_part_task(task: str | None) -> bool:
     return bool(_MULTI_PART_TASK_RE.search(task or ""))
 
 
-def _make_decompose_first_gate_hook(task: str | None):
+def _make_decompose_first_gate_hook(task: str | None, researcher_member_id: str = "Researcher"):
     """Phase 2 (2026-08-14) of the "AgnoHive - Engineering Team 2.0 Update" plan --
     a mechanical backstop for Phase 1's prose-only coordinator instruction
     ("delegate multi-part tasks to Researcher WHOLE"), confirmed live NOT to be
@@ -1972,8 +1972,19 @@ def _make_decompose_first_gate_hook(task: str | None):
     `task=None` (the default) makes this hook a permanent no-op -- any caller
     that doesn't pass the original task string gets the exact pre-2026-08-14
     pass-through behavior, byte-for-byte.
+
+    `researcher_member_id` (default "Researcher", matching every pre-2026-08-15
+    caller byte-for-byte) is the actual name of this TEAM's researcher-shaped
+    member -- added for the 2026-08-15 gate-scope extension to parallel-review
+    and sprint-master (see tests/test_gate_team_scoping.py). Not every team
+    names this role "Researcher": `teams/sprint-master.yaml`'s equivalent agent
+    is `BacklogResearcher`. Comparison is case-insensitive (`.lower()`), same as
+    the original hardcoded check; the REDIRECTED message text uses this team's
+    real name too, so a blocked sprint-master call is never told to delegate to
+    a member ("Researcher") that team doesn't actually have.
     """
     state = {"decided": False}
+    target_lower = researcher_member_id.strip().lower()
 
     async def _decompose_first_gate_hook(function_name, function, args, run_context=None):
         if function_name not in _DELEGATION_TOOL_NAMES:
@@ -1986,16 +1997,16 @@ def _make_decompose_first_gate_hook(task: str | None):
             return await function(**args)
 
         member_id = str((args or {}).get("member_id", "")).strip().lower()
-        if member_id == "researcher":
+        if member_id == target_lower:
             return await function(**args)
 
         target = (args or {}).get("member_id", "?")
         return (
             f"REDIRECTED: this task is multi-part — its own wording implies more "
             f"than one discrete, independently-checkable claim — and must be "
-            f"delegated to Researcher WHOLE first, not piecemeal to {target!r}. "
-            f"Researcher now also decomposes tasks internally (its own "
-            f"DECOMPOSE-FIRST rule): call delegate_task_to_member('Researcher', "
+            f"delegated to {researcher_member_id} WHOLE first, not piecemeal to {target!r}. "
+            f"{researcher_member_id} now also decomposes tasks internally (its own "
+            f"DECOMPOSE-FIRST rule): call delegate_task_to_member({researcher_member_id!r}, "
             f"<the full original task, unabridged>) instead. This delegation to "
             f"{target!r} was NOT executed."
         )
@@ -2006,8 +2017,26 @@ def _make_decompose_first_gate_hook(task: str | None):
 _BROWSE_TOOL_NAMES = {"list_directory_tree", "find_files", "get_file_content"}
 _SEARCH_TOOL_NAMES = {"search_files", "lightrag_query"}
 
+# 2026-08-15 gate-scope extension -- resolution of the "AgnoHive - Engineering
+# Team 2.0 Update" plan's 4th open question. The two mechanical gates above were
+# ALREADY structurally unconditional (keyed only on _is_multi_part_task(task) and
+# a hardcoded "Researcher" agent-name match, with no team-identity awareness at
+# all) -- which meant they were silently already active for `planning` too (its
+# own agent happens to be named "Researcher"), contradicting this exact
+# decision's "planning excluded" answer, and would have MISFIRED on
+# `sprint-master` (whose researcher-shaped agent is actually named
+# BacklogResearcher, confirmed by reading teams/sprint-master.yaml) rather than
+# simply staying inactive. `_build_team`'s `team_name` kwarg (default None) uses
+# these two maps to compute, per team, whether the gates apply at all and which
+# agent name plays the Researcher role -- see tests/test_gate_team_scoping.py.
+_GATE_ENABLED_TEAMS = {"engineering", "parallel-review", "sprint-master"}
+_RESEARCHER_AGENT_NAME_BY_TEAM = {
+    "sprint-master": "BacklogResearcher",
+}
+_DEFAULT_RESEARCHER_AGENT_NAME = "Researcher"
 
-def _make_search_before_browse_gate_hook(task: str | None):
+
+def _make_search_before_browse_gate_hook(task: str | None, researcher_agent_name: str = "Researcher"):
     """A mechanical backstop for teams/engineering.yaml's Researcher DECOMPOSE-FIRST
     Step 3a ("search before you browse"), confirmed live NOT to be reliably followed
     on its own -- THREE separate live tests (2026-08-14, 2026-08-15 x2, the last one
@@ -2040,12 +2069,19 @@ def _make_search_before_browse_gate_hook(task: str | None):
 
     `task=None` (the default) makes this hook a permanent no-op, same convention as
     `_make_decompose_first_gate_hook`.
+
+    `researcher_agent_name` (default "Researcher", matching every pre-2026-08-15
+    caller byte-for-byte) is the actual name of this team's researcher-shaped
+    agent -- added for the 2026-08-15 gate-scope extension to parallel-review and
+    sprint-master (see `_make_decompose_first_gate_hook`'s matching parameter and
+    tests/test_gate_team_scoping.py). `teams/sprint-master.yaml`'s equivalent
+    agent is named `BacklogResearcher`, not `Researcher`.
     """
     state = {"searched": False}
 
     async def _search_before_browse_gate_hook(function_name, function, args, agent=None, run_context=None):
         agent_key = getattr(agent, "name", None) or ""
-        if agent_key != "Researcher":
+        if agent_key != researcher_agent_name:
             return await function(**args)
         if function_name in _SEARCH_TOOL_NAMES:
             state["searched"] = True
@@ -2208,6 +2244,7 @@ def _build_team(
     skill_catalog: list[dict] | None = None,
     activity: dict | None = None,
     task: str | None = None,
+    team_name: str | None = None,
 ) -> Team:
     """Build a coordinator Team from agent specs (or the default Coder+Reviewer), sharing the
     already-connected `mcp_list`. Factored out of run_task_async / run_task_stream so the same
@@ -2220,15 +2257,27 @@ def _build_team(
     `activity` (default None = previous behaviour) is forwarded to the interception hook so a
     caller can run a heartbeat alongside team.arun() -- see _make_tool_interception_hook.
     `task` (default None = previous behaviour, permanent no-op) is the original top-level task
-    string, forwarded to the decompose-first gate hook -- see _make_decompose_first_gate_hook."""
+    string, forwarded to the decompose-first gate hook -- see _make_decompose_first_gate_hook.
+    `team_name` (default None) selects the per-team gate policy (see _GATE_ENABLED_TEAMS /
+    _RESEARCHER_AGENT_NAME_BY_TEAM above) -- None preserves the exact pre-2026-08-15
+    unconditional-gate behaviour byte-for-byte, matching every caller that doesn't pass it."""
     # One cache per run, shared by the coordinator AND every member agent (not just
     # the coordinator) -- see _make_read_cache_tool_hook's docstring for why both of
     # those are load-bearing, not incidental. The interception hook (Phase 9a) is
     # built with abort_event=None here -- see its own docstring for why that keeps
     # this a no-op audit-log pass-through today rather than a live abort switch.
     read_cache_hook = _make_read_cache_tool_hook(activity=activity)
-    decompose_first_gate_hook = _make_decompose_first_gate_hook(task=task)
-    search_before_browse_gate_hook = _make_search_before_browse_gate_hook(task=task)
+    # team_name=None (any caller that predates this kwarg) keeps both gates armed
+    # exactly as before -- gate_task is only ever suppressed for a team_name that
+    # was explicitly resolved and found NOT in the allowlist (e.g. "planning").
+    gate_task = task if (team_name is None or team_name in _GATE_ENABLED_TEAMS) else None
+    researcher_agent_name = _RESEARCHER_AGENT_NAME_BY_TEAM.get(team_name, _DEFAULT_RESEARCHER_AGENT_NAME)
+    decompose_first_gate_hook = _make_decompose_first_gate_hook(
+        task=gate_task, researcher_member_id=researcher_agent_name,
+    )
+    search_before_browse_gate_hook = _make_search_before_browse_gate_hook(
+        task=gate_task, researcher_agent_name=researcher_agent_name,
+    )
     delegation_log_hook = _make_delegation_log_hook()
     interception_hook = _make_tool_interception_hook(activity=activity)
     # Order matters: agno makes the FIRST hook in this list the OUTERMOST wrapper
@@ -2550,8 +2599,12 @@ async def run_task_stream(
     session_id: str | None = None,
     mode: str = "coordinate",
     read_only: bool = False,
+    team_name: str | None = None,
 ):
     """Same setup as run_task_async but yields text chunks as the coordinator generates them.
+
+    `team_name` (default None) is forwarded to _build_team -- see run_task_async's own
+    docstring for the 2026-08-15 gate-scope extension this supports.
 
     No cancellation-checking parameter -- see run_task_async's docstring for why
     (this function is invoked inside a worker process that gets SIGKILLed outright
@@ -2649,7 +2702,7 @@ async def run_task_stream(
         await model_routing.ensure_cache_loaded()
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
-            read_only=read_only, skill_catalog=skill_catalog, task=task,
+            read_only=read_only, skill_catalog=skill_catalog, task=task, team_name=team_name,
         )
 
         full_content: list[str] = []
@@ -2954,8 +3007,13 @@ async def run_task_async(
     mode: str = "coordinate",
     read_only: bool = False,
     liveness_path: str | None = None,
+    team_name: str | None = None,
 ) -> tuple[str, dict, dict | None]:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer.
+
+    `team_name` (default None) is forwarded to _build_team -- see its own docstring
+    and _GATE_ENABLED_TEAMS for the 2026-08-15 gate-scope extension. None preserves
+    prior behaviour unchanged for every caller that doesn't pass it.
 
     `liveness_path` (default None) is forwarded to _run_heartbeat -- see its own
     docstring and DOCS.md "Liveness-Based Auto-Kill". api/server.py's worker-
@@ -3094,6 +3152,7 @@ async def run_task_async(
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
             read_only=read_only, skill_catalog=skill_catalog, activity=activity, task=task,
+            team_name=team_name,
         )
 
         span_attrs = {

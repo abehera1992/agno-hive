@@ -99,6 +99,45 @@ async def test_payload_fields_pass_through_to_run_task_stream(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_team_name_passes_through_to_run_task_stream(monkeypatch):
+    """2026-08-15 gate-scope extension -- mirrors
+    test_main_run_worker.py::test_team_name_passes_through_to_run_task_async
+    for the streaming path."""
+    _set_stdin(monkeypatch, {"task": "review this code", "team_name": "parallel-review"})
+
+    captured = {}
+
+    async def fake_run_task_stream(**kwargs):
+        captured.update(kwargs)
+        return
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(main, "run_task_stream", fake_run_task_stream)
+
+    await main._run_stream_worker(io.StringIO())
+
+    assert captured["team_name"] == "parallel-review"
+
+
+@pytest.mark.asyncio
+async def test_missing_team_name_passes_through_as_none(monkeypatch):
+    _set_stdin(monkeypatch, {"task": "x"})
+
+    captured = {}
+
+    async def fake_run_task_stream(**kwargs):
+        captured.update(kwargs)
+        return
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(main, "run_task_stream", fake_run_task_stream)
+
+    await main._run_stream_worker(io.StringIO())
+
+    assert captured["team_name"] is None
+
+
+@pytest.mark.asyncio
 async def test_agent_specs_are_reconstructed_as_real_agentspec_objects(monkeypatch):
     payload = {
         "task": "x",

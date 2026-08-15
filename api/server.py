@@ -436,26 +436,38 @@ async def run(request: RunRequest, http_request: Request):
     start = time.perf_counter()
 
     # Resolve team spec
+    # gate_team_name (2026-08-15 gate-scope extension, see swarm/team.py's
+    # _GATE_ENABLED_TEAMS) is the underlying team identity _build_team needs to
+    # decide gate policy -- distinct from team_name below, which is the DISPLAY
+    # string returned in RunResponse.team (e.g. "router:engineering", not
+    # "engineering"). request.agents (raw AgentSpecs posted directly, no team
+    # YAML) gets gate_team_name=None -- an arbitrary roster has no guaranteed
+    # "Researcher"-shaped member, so the gates correctly stay off (see
+    # _GATE_ENABLED_TEAMS' fail-safe-off default for any unrecognized name).
     if request.agents:
         agent_specs = request.agents
         coordinator_model = config.leader_model
         team_mode = request.mode or "coordinate"
         team_name = request.team or "custom"
         coordinator_tools = None
+        gate_team_name = None
     elif request.team == "router":
         # EK-88 classifier-then-dispatch: one LLM call picks the team, then run it normally.
         chosen = await _route_to_team(request.task, ROUTABLE_TEAMS, config.router_classifier_model, config.ollama_host)
         agent_specs, coordinator_model, team_mode, coordinator_tools = _load_team(chosen)
         team_mode = request.mode or team_mode
         team_name = f"router:{chosen}"
+        gate_team_name = chosen
     elif request.team:
         agent_specs, coordinator_model, team_mode, coordinator_tools = _load_team(request.team)
         team_mode = request.mode or team_mode  # request-level override wins
         team_name = request.team
+        gate_team_name = request.team
     else:
         agent_specs, coordinator_model, team_mode, coordinator_tools = _load_team("engineering")
         team_mode = request.mode or team_mode
         team_name = "engineering"
+        gate_team_name = "engineering"
 
     all_models = list({coordinator_model} | {a.model for a in agent_specs})
     models_pulled = await ensure_models(all_models, config.ollama_host)
@@ -500,6 +512,7 @@ async def run(request: RunRequest, http_request: Request):
         "session_id": session_id,
         "mode": team_mode,
         "read_only": request.read_only,
+        "team_name": gate_team_name,
     }
     result, tokens, clarification = await _run_worker_subprocess(http_request, worker_payload)
 
@@ -563,6 +576,13 @@ async def plan(request: RunRequest):
         mcp_url=mcp_url,
         mcp_urls=_resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url),
         project_id=request.project_id,
+        # Explicit, not the team_name=None default -- /plan always runs the
+        # "planning" team, which the 2026-08-15 gate-scope extension explicitly
+        # excludes (its own Researcher agent must stay ungated; see
+        # swarm/team.py's _GATE_ENABLED_TEAMS). Passing team_name=None here would
+        # silently leave the OLD unconditional-gate leak in place for this one
+        # remaining call site.
+        team_name="planning",
     )
     return PlanResponse(
         plan=plan_text,
@@ -600,17 +620,22 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
     """
     import json as _json
 
+    # gate_team_name -- see /run's identical comment above (2026-08-15 gate-scope
+    # extension). /stream has no router branch, so this mirrors /run's other 3.
     if request.agents:
         agent_specs = request.agents
         coordinator_model = config.leader_model
         stream_mode = request.mode or "coordinate"
         coordinator_tools = None
+        gate_team_name = None
     elif request.team:
         agent_specs, coordinator_model, stream_mode, coordinator_tools = _load_team(request.team)
         stream_mode = request.mode or stream_mode
+        gate_team_name = request.team
     else:
         agent_specs, coordinator_model, stream_mode, coordinator_tools = _load_team("engineering")
         stream_mode = request.mode or stream_mode
+        gate_team_name = "engineering"
 
     mcp_url = request.mcp_url or config.mcp_url
 
@@ -652,6 +677,7 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
                 "session_id": session_id,
                 "mode": stream_mode,
                 "read_only": request.read_only,
+                "team_name": gate_team_name,
             })
 
             async for chunk in stream_source:
