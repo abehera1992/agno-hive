@@ -70,6 +70,43 @@ def test_parallel_review_mode_is_broadcast_not_collaborate():
     assert data["mode"] == "broadcast"
 
 
+# ── parallel-review.yaml: lightrag-empty fallback (2026-08-15, live-validated gap) ──
+#
+# Live-confirmed 2026-08-15, after the broadcast mode fix above: with broadcast
+# correctly dispatching to all 3 reviewers (delegate_task_to_members WAS called,
+# confirmed via the run's own session_state log), SecurityReviewer and
+# PerformanceReviewer each tried lightrag_query('config.py'...) exactly once, got
+# back "[no-context]", and gave up -- calling request_clarification instead of
+# falling back to find_files/search_files, tools both agents already had on their
+# own tool list the whole time. config/config.py is a real, existing file. Fixed
+# with an explicit FALLBACK rule on all 3 review agents.
+
+def test_researcher_has_lightrag_fallback_rule():
+    instructions = " ".join(_agent(_load(_PARALLEL_REVIEW_YAML), "Researcher")["instructions"])
+    assert "fallback rule" in instructions.lower()
+    assert "find_files" in instructions and "search_files" in instructions
+
+
+def test_security_reviewer_has_lightrag_fallback_rule():
+    instructions = " ".join(_agent(_load(_PARALLEL_REVIEW_YAML), "SecurityReviewer")["instructions"])
+    assert "fallback rule" in instructions.lower()
+    assert "find_files" in instructions and "search_files" in instructions
+
+
+def test_performance_reviewer_has_lightrag_fallback_rule():
+    instructions = " ".join(_agent(_load(_PARALLEL_REVIEW_YAML), "PerformanceReviewer")["instructions"])
+    assert "fallback rule" in instructions.lower()
+    assert "find_files" in instructions and "search_files" in instructions
+
+
+def test_fallback_rule_tells_agents_not_to_stop_after_one_attempt():
+    """The core behavioral fix, not just tool-name presence -- the live failure was
+    stopping/asking for clarification after exactly one lightrag_query miss."""
+    for agent_name in ("Researcher", "SecurityReviewer", "PerformanceReviewer"):
+        instructions = " ".join(_agent(_load(_PARALLEL_REVIEW_YAML), agent_name)["instructions"]).lower()
+        assert "never stop" in instructions or "immediately fall back" in instructions
+
+
 # ── planning.yaml: Notion tools ─────────────────────────────────────────────────
 
 def test_planning_context_router_has_notion_read_tools():

@@ -45,6 +45,7 @@ agents:
       - Call list_directory_tree() or find_files('**/*') first to map the full structure before reading any file.
       - Read at least one entry-point file per top-level directory — never describe a module from its name alone.
       - For 'how does X work' questions run search_files(X, '**/*') to find all occurrences, then read the 2-3 most relevant files.
+      - "FALLBACK rule (2026-08-15): if lightrag_query returns no results, '[no-context]', or an unhelpful/empty answer, immediately fall back to find_files('**/*') and/or search_files(<key term>, '**/*') — you have both tools directly. Never stop, guess, or call request_clarification after only one failed lightrag_query attempt; a single semantic-search miss is not evidence the file doesn't exist."
       - Ground every claim in an actual file read from this session — never fabricate paths or function names.
       - Cover every top-level directory in your response; stopping at the first interesting result is a failure.
 
@@ -64,6 +65,7 @@ agents:
       - Focus on OWASP Top 10 — injection, broken auth, sensitive data exposure, security misconfiguration.
       - Search for secrets and credentials with search_files patterns like 'password', 'secret', 'api_key', 'token'.
       - Check auth middleware and permission guards — read the actual implementation, not just the imports.
+      - "FALLBACK rule (2026-08-15): if lightrag_query returns no results, '[no-context]', or an unhelpful/empty answer, immediately fall back to find_files('**/*') and/or search_files(<key term>, '**/*') — you have both tools directly. Never stop, guess, or call request_clarification after only one failed lightrag_query attempt; a single semantic-search miss is not evidence the file doesn't exist. Confirmed live 2026-08-15: a task naming a real, existing file (config/config.py) was reported as inaccessible after only ONE lightrag_query attempt that returned '[no-context]' — find_files/search_files were never tried, even though both were on this agent's own tool list the whole time."
       - Flag real vulnerabilities only with exact file:line references. Do not report theoretical risks without evidence.
       - If git_diff is available, review changed files specifically before reviewing the broader codebase.
 
@@ -82,5 +84,6 @@ agents:
       - Search for database query patterns — look for ORM calls inside loops (N+1), missing .select_related()/.prefetch_related(), unbounded queries.
       - Check for missing pagination on list endpoints.
       - Look for synchronous operations in async contexts and blocking I/O in hot paths.
+      - "FALLBACK rule (2026-08-15): if lightrag_query returns no results, '[no-context]', or an unhelpful/empty answer, immediately fall back to find_files('**/*') and/or search_files(<key term>, '**/*') — you have both tools directly. Never stop, guess, or call request_clarification after only one failed lightrag_query attempt; a single semantic-search miss is not evidence the file doesn't exist."
       - Cite specific file:line for every finding with a concrete explanation of the performance impact.
       - Prioritise findings by impact — a confirmed N+1 on a high-traffic endpoint outweighs a minor inefficiency.
