@@ -122,18 +122,22 @@ def test_ambiguity_flagging_step_distinguishes_from_not_having_searched_yet():
 # ── SEARCH rule broadened beyond literal "how does X work" ─────────────────
 
 def test_search_rule_covers_comparison_items_not_just_how_does_x_work():
+    """The old standalone SEARCH rule (scoped narrowly to literal 'how does X
+    work' phrasing) was consolidated into DECOMPOSE-FIRST's Step 3a on
+    2026-08-15 -- one rule instead of two overlapping ones. Step 3a now covers
+    both checklist items and 'how does X work' questions in a single place."""
     data = _load_engineering_yaml()
     researcher = _agent(data, "Researcher")
     joined = " ".join(researcher["instructions"])
-    assert "not just literal 'how does x work' phrasing" in joined.lower()
-    assert "comparison/gap-analysis items" in joined.lower()
+    assert "how does x work" in joined.lower()
+    assert "for each checklist item" in joined.lower()
 
 
 def test_search_rule_forbids_directory_browsing_as_a_search_substitute():
     data = _load_engineering_yaml()
     researcher = _agent(data, "Researcher")
     joined = " ".join(researcher["instructions"])
-    assert "do not browse by directory/service name as a substitute for searching" in joined.lower()
+    assert "never find_files/get_file_content/list_directory_tree browsing" in joined.lower()
 
 
 # ── Coordinator-side: flagged ambiguity is a real request_clarification trigger ──
