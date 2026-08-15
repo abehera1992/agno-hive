@@ -148,7 +148,45 @@ async def test_decompose_gate_with_backlogresearcher_still_blocks_other_members(
 
 
 @pytest.mark.asyncio
-async def test_decompose_gate_with_backlogresearcher_name_check_is_case_insensitive():
+async def test_decompose_gate_matches_the_real_agno_member_id_form_with_dash():
+    """Corrected 2026-08-15: agno's real delegate_task_to_member lookup key for
+    "BacklogResearcher" is "backlog-researcher" (a dash inserted at the camelCase
+    boundary, confirmed by reading agno.utils.string.url_safe_string directly) --
+    NOT "backlogresearcher" (no dash), which the gate's OLD naive `.lower()`
+    comparison incorrectly treated as the match target. A plain lowercase-no-dash
+    string is not actually a valid member_id agno would ever resolve."""
+    hook = _make_decompose_first_gate_hook(
+        task=_MULTI_PART_TASK, researcher_member_id="BacklogResearcher",
+    )
+
+    result = await hook(
+        "delegate_task_to_member", _fake_delegate,
+        {"member_id": "backlog-researcher", "task": _MULTI_PART_TASK},
+    )
+
+    assert result.startswith("delegated:")
+
+
+@pytest.mark.asyncio
+async def test_decompose_gate_normalizes_case_on_the_correctly_dashed_form():
+    hook = _make_decompose_first_gate_hook(
+        task=_MULTI_PART_TASK, researcher_member_id="BacklogResearcher",
+    )
+
+    result = await hook(
+        "delegate_task_to_member", _fake_delegate,
+        {"member_id": "Backlog-Researcher", "task": _MULTI_PART_TASK},
+    )
+
+    assert result.startswith("delegated:")
+
+
+@pytest.mark.asyncio
+async def test_decompose_gate_rejects_the_old_incorrect_no_dash_form():
+    """The exact live-confirmed bug: a coordinator that sends the plain-lowercased
+    display name (no dash) is NOT actually using a valid agno member_id, so the
+    gate must still redirect it -- silently accepting it would have hidden this
+    exact incident instead of catching it."""
     hook = _make_decompose_first_gate_hook(
         task=_MULTI_PART_TASK, researcher_member_id="BacklogResearcher",
     )
@@ -158,7 +196,8 @@ async def test_decompose_gate_with_backlogresearcher_name_check_is_case_insensit
         {"member_id": "backlogresearcher", "task": _MULTI_PART_TASK},
     )
 
-    assert result.startswith("delegated:")
+    assert "REDIRECTED" in result
+    assert "backlog-researcher" in result  # the redirect teaches the CORRECT form
 
 
 # ── _make_search_before_browse_gate_hook: researcher_agent_name parameterization ─

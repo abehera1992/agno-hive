@@ -11,6 +11,7 @@ from agno.run.team import TeamRunOutput
 from agno.team import Team
 from agno.tools import tool as agno_tool
 from agno.tools.mcp import MCPTools
+from agno.utils.string import url_safe_string
 from .agents import (
     make_coder, make_reviewer, make_agent_from_spec, get_model, format_skill_catalog,
     update_session_state,
@@ -83,7 +84,7 @@ _COORDINATOR_INSTRUCTIONS = [
     "  this is deliberate, not a connection problem. If the task requires FINDING a file,",
     "  page, or component named only by feature or description (not an exact path already",
     "  known from the user's prompt, this session's own prior tool results, or a teammate's",
-    "  citation), call delegate_task_to_member('ContextRouter', ...) to have it locate the",
+    "  citation), call delegate_task_to_member('context-router', ...) to have it locate the",
     "  real path — do not try to work around the missing tools yourself, do not guess a",
     "  path from memory or naming conventions, and NEVER search the public web to learn an",
     "  INTERNAL, private codebase's own structure — the web has no way to know it and never",
@@ -215,7 +216,7 @@ _COORDINATOR_INSTRUCTIONS = [
     "  User prompts are often short and vague. Do not infer — discover.",
     "  You do NOT have find_files/search_files/list_directory/list_directory_tree/",
     "  search_knowledge_graph directly (see the rule above) — every 'discover the structure",
-    "  or find the right file' step below means delegate_task_to_member('ContextRouter', ...),",
+    "  or find the right file' step below means delegate_task_to_member('context-router', ...),",
     "  not calling those tools yourself. get_file_content() on a path you already have (from",
     "  the user, this session, or ContextRouter's result) IS still yours to call directly.",
     "  Never describe a directory or module from its name alone.",
@@ -230,7 +231,7 @@ _COORDINATOR_INSTRUCTIONS = [
     "Choose the FASTEST path to answer — do not delegate more than the task needs:",
     "",
     "For overview / structure questions ('list directories', 'what does X do', 'show me the project'):",
-    "  1. delegate_task_to_member('ContextRouter', 'call list_directory_tree() and return the full",
+    "  1. delegate_task_to_member('context-router', 'call list_directory_tree() and return the full",
     "     directory structure') — ContextRouter picks the right tool for this on the connected MCP.",
     "  2. For each top-level directory it returns: read one entry file yourself with get_file_content()",
     "     (README, main.py, __init__.py, config).",
@@ -238,14 +239,14 @@ _COORDINATOR_INSTRUCTIONS = [
     "  → Do not use get_project_context() as a shortcut — it may be stale or incomplete.",
     "",
     "For 'how does X work' / feature questions:",
-    "  1. delegate_task_to_member('ContextRouter', 'search_files for \"X\" across the whole codebase",
+    "  1. delegate_task_to_member('context-router', 'search_files for \"X\" across the whole codebase",
     "     and return every matching file:line') — find every file that references X.",
     "  2. get_file_content() yourself on the 2-3 most relevant files it returns.",
     "  3. If the project MCP exposes a documentation section tool (e.g. get_context_section),",
     "     call it with the topic keyword — do not assume the tool name or the doc file name.",
     "",
     "For code pattern / convention questions ('how do we do X', 'what style do we use'):",
-    "  1. delegate_task_to_member('ContextRouter', 'find_files for <extension> and search_files for",
+    "  1. delegate_task_to_member('context-router', 'find_files for <extension> and search_files for",
     "     <pattern>, return real paths') to discover and verify real paths.",
     "  2. get_file_content(path) yourself on 1-2 files if you need more detail.",
     "  → Skip broad context tools for these queries — go straight to the files once you have paths.",
@@ -256,7 +257,7 @@ _COORDINATOR_INSTRUCTIONS = [
     "     called it earlier in this same response (including after a retry or correction round),",
     "     do NOT call it again — you already have its output, use that.",
     "  2. ALWAYS read at least one existing reference file of the same type before writing. If you",
-    "     don't already know its exact path, delegate_task_to_member('ContextRouter', ...) to find",
+    "     don't already know its exact path, delegate_task_to_member('context-router', ...) to find",
     "     it first, then get_file_content() it yourself. NEVER skip this step — guessing conventions",
     "     produces broken code.",
     "  3. Delegate writing to Coder, review to Reviewer",
@@ -384,12 +385,20 @@ def _team_roster_preamble(agent_specs: list | None) -> list[str]:
     Deliberately does NOT edit or remove any of that existing text -- it took 8
     live-validated phases to get engineering's coordinator instructions right, and
     a full rewrite/split was assessed as materially higher regression risk than
-    it's worth here. This is purely additive: confirmed live 2026-08-15 that a
-    coordinator can already correctly delegate to its REAL named members (the
-    sprint-master gate-scope validation run used BacklogResearcher/StoryWriter
-    correctly) even with the wrong hardcoded engineering names also present in its
-    prompt -- so this preamble is reinforcement against a real but apparently
-    non-fatal inaccuracy, not a fix for an observed failure.
+    it's worth here. This is purely additive.
+
+    Correction (2026-08-15, same day): this function's first version showed only
+    each agent's DISPLAY name (spec.name) as "the name to use" -- factually wrong
+    for delegate_task_to_member's own member_id argument on any multi-word name.
+    Confirmed live: a planning-team coordinator run tried
+    delegate_task_to_member(member_id='ContextRouter', ...) (the exact display
+    name this function told it to use) and failed, then misdiagnosed the failure
+    as "a fundamental failure in the team member resolution system" and abandoned
+    delegation entirely for the rest of the run. See `_member_id()`'s own
+    docstring for the root cause (agno's real lookup key inserts a dash at each
+    camelCase boundary before lowercasing) and why single-word names (Researcher,
+    Planner, BacklogResearcher is NOT single-word and IS affected) hid this for
+    so long. Now shows the real member_id form as the primary value.
 
     Returns [] for agent_specs=None/empty (the default Coder+Reviewer fallback
     path, which predates team YAMLs) -- unaffected either way, since that path's
@@ -397,10 +406,15 @@ def _team_roster_preamble(agent_specs: list | None) -> list[str]:
     """
     if not agent_specs:
         return []
-    lines = ["── Your team's actual members (delegate ONLY to these, by these exact names) ──"]
+    lines = [
+        "── Your team's actual members — delegate_task_to_member's member_id argument "
+        "MUST be the exact id shown below (NOT the display name in parentheses; "
+        "a multi-word display name gets a dash inserted at each word boundary "
+        "and is lowercased for its real id, e.g. 'FooBarAgent' -> 'foo-bar-agent') ──"
+    ]
     for spec in agent_specs:
         label = spec.description or spec.role
-        lines.append(f"  {spec.name} — {label}")
+        lines.append(f"  {_member_id(spec.name)}  (display name: {spec.name}) — {label}")
     lines.append("")
     return lines
 
@@ -1976,6 +1990,32 @@ _DELEGATION_TOOL_NAMES = {"delegate_task_to_member", "delegate_task_to_members"}
 _MAX_LOGGED_TASK_CHARS = 300
 _MAX_DELEGATION_LOG_ENTRIES = 200
 
+def _member_id(display_name: str) -> str:
+    """The real, canonical value a delegate_task_to_member(member_id=...) call must
+    use for a given agent's display name -- 2026-08-15, root-caused live during
+    planning validation. Thin wrapper over agno's OWN `url_safe_string` (confirmed
+    by reading agno/utils/team.py's `get_member_id`, the exact function agno's
+    `_find_member_by_id` compares against with a plain `==`, no normalization on
+    its side): spaces become dashes, camelCase becomes kebab-case, then everything
+    is lowercased. This means for any MULTI-WORD agent name, the correct
+    member_id is NOT the display name lowercased -- e.g. "ContextRouter" ->
+    "context-router", "BacklogResearcher" -> "backlog-researcher" -- a dash gets
+    inserted, which a naive `.lower()` never produces.
+
+    Live-confirmed as a real bug, not theoretical: a planning-team coordinator run
+    tried `delegate_task_to_member(member_id='ContextRouter', ...)` (the exact
+    display name, matching this file's own _COORDINATOR_INSTRUCTIONS examples and
+    _team_roster_preamble's old wording) -- agno's exact-match lookup failed, and
+    the coordinator's own narration concluded "a fundamental failure in the team
+    member resolution system" rather than recognizing its own casing/format
+    mistake, then abandoned delegation entirely for the rest of the run. Single-
+    word names (Researcher, Planner, Coder, Executor, Reviewer) were never
+    affected -- url_safe_string only lowercases those, with no dash insertion --
+    which is why this went unnoticed until a multi-word name (ContextRouter) hit it.
+    """
+    return url_safe_string(display_name)
+
+
 # Same trigger-phrase set as teams/engineering.yaml's own DECOMPOSE-FIRST rule text
 # ("its own wording implies more than one discrete, independently-checkable claim")
 # -- kept in sync deliberately, not derived mechanically from the YAML, since the
@@ -2056,17 +2096,26 @@ def _make_decompose_first_gate_hook(task: str | None, researcher_member_id: str 
     pass-through behavior, byte-for-byte.
 
     `researcher_member_id` (default "Researcher", matching every pre-2026-08-15
-    caller byte-for-byte) is the actual name of this TEAM's researcher-shaped
-    member -- added for the 2026-08-15 gate-scope extension to parallel-review
-    and sprint-master (see tests/test_gate_team_scoping.py). Not every team
-    names this role "Researcher": `teams/sprint-master.yaml`'s equivalent agent
-    is `BacklogResearcher`. Comparison is case-insensitive (`.lower()`), same as
-    the original hardcoded check; the REDIRECTED message text uses this team's
-    real name too, so a blocked sprint-master call is never told to delegate to
-    a member ("Researcher") that team doesn't actually have.
+    caller byte-for-byte) is the actual DISPLAY name of this TEAM's researcher-
+    shaped member -- added for the 2026-08-15 gate-scope extension to
+    parallel-review and sprint-master (see tests/test_gate_team_scoping.py). Not
+    every team names this role "Researcher": `teams/sprint-master.yaml`'s
+    equivalent agent is `BacklogResearcher`.
+
+    Comparison normalizes BOTH sides through `_member_id()` (agno's own
+    url_safe_string transform), not a bare `.lower()` -- 2026-08-15 fix, found
+    live: for a multi-word display name, agno's REAL delegate_task_to_member
+    lookup key inserts a dash at each camelCase boundary before lowercasing
+    ("BacklogResearcher" -> "backlog-researcher"), which plain `.lower()` never
+    produces ("backlogresearcher", no dash) -- the old comparison could never
+    match a CORRECTLY-formatted delegation to a multi-word member, only single-
+    word ones (Researcher, Planner) were ever safe. The REDIRECTED message's own
+    code example now shows the real member_id form too, not the display name --
+    telling the coordinator to literally type the wrong string was the actual
+    root cause of a live incident, not just a comparison bug.
     """
     state = {"decided": False}
-    target_lower = researcher_member_id.strip().lower()
+    target_id = _member_id(researcher_member_id)
 
     async def _decompose_first_gate_hook(function_name, function, args, run_context=None):
         if function_name not in _DELEGATION_TOOL_NAMES:
@@ -2078,8 +2127,8 @@ def _make_decompose_first_gate_hook(task: str | None, researcher_member_id: str 
         if function_name != "delegate_task_to_member":
             return await function(**args)
 
-        member_id = str((args or {}).get("member_id", "")).strip().lower()
-        if member_id == target_lower:
+        member_id = _member_id(str((args or {}).get("member_id", "")).strip())
+        if member_id == target_id:
             return await function(**args)
 
         target = (args or {}).get("member_id", "?")
@@ -2088,7 +2137,7 @@ def _make_decompose_first_gate_hook(task: str | None, researcher_member_id: str 
             f"than one discrete, independently-checkable claim — and must be "
             f"delegated to {researcher_member_id} WHOLE first, not piecemeal to {target!r}. "
             f"{researcher_member_id} now also decomposes tasks internally (its own "
-            f"DECOMPOSE-FIRST rule): call delegate_task_to_member({researcher_member_id!r}, "
+            f"DECOMPOSE-FIRST rule): call delegate_task_to_member({target_id!r}, "
             f"<the full original task, unabridged>) instead. This delegation to "
             f"{target!r} was NOT executed."
         )

@@ -52,7 +52,13 @@ def test_section_names_every_removed_discovery_tool():
 
 def test_section_directs_to_delegate_task_to_member_contextrouter():
     text = _joined()
-    assert "delegate_task_to_member('ContextRouter'" in text
+    # 2026-08-15: the code example must use the real agno member_id ('context-router'
+    # -- a dash inserted at the camelCase boundary, then lowercased, confirmed by
+    # reading agno.utils.string.url_safe_string directly), not the display name
+    # ('ContextRouter'). Live-confirmed as a real bug: a coordinator that typed the
+    # display name verbatim (matching this exact string this test used to assert)
+    # failed to delegate and gave up on delegation entirely for the rest of the run.
+    assert "delegate_task_to_member('context-router'" in text
 
 
 def test_get_file_content_is_explicitly_kept_as_still_directly_callable():
@@ -83,9 +89,11 @@ def test_scan_first_rule_reflects_the_removed_tools_not_the_old_direct_steps():
 
 def test_query_routing_tables_delegate_instead_of_calling_tools_directly():
     text = _joined()
-    assert "delegate_task_to_member('ContextRouter', 'call list_directory_tree()" in text
-    assert "delegate_task_to_member('ContextRouter', 'search_files for" in text
-    assert "delegate_task_to_member('ContextRouter', 'find_files for <extension>" in text
+    # 2026-08-15: 'context-router', not the display name -- see the sibling test
+    # above for the real-bug rationale.
+    assert "delegate_task_to_member('context-router', 'call list_directory_tree()" in text
+    assert "delegate_task_to_member('context-router', 'search_files for" in text
+    assert "delegate_task_to_member('context-router', 'find_files for <extension>" in text
 
 
 def test_clarification_section_no_longer_tells_coordinator_to_research_with_removed_tools():

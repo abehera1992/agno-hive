@@ -66,7 +66,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from swarm.team import _project_id_preamble, _team_roster_preamble, run_task_async, run_task_stream
+from swarm.team import _member_id, _project_id_preamble, _team_roster_preamble, run_task_async, run_task_stream
 
 _PARALLEL_REVIEW_YAML = Path(__file__).parent.parent / "teams" / "parallel-review.yaml"
 _PLANNING_YAML = Path(__file__).parent.parent / "teams" / "planning.yaml"
@@ -215,6 +215,23 @@ def test_lists_every_real_agent_by_exact_name():
     assert "BacklogResearcher" in joined
     assert "StoryWriter" in joined
     assert "ContextRouter" not in joined  # sprint-master has no such member
+
+
+def test_shows_the_real_member_id_form_not_just_the_display_name(monkeypatch):
+    """2026-08-15 correction -- the original version showed ONLY the display name
+    (e.g. "ContextRouter") as "the name to use", which is factually wrong for
+    delegate_task_to_member's own member_id argument on a multi-word name (agno's
+    real lookup key is "context-router", confirmed by reading
+    agno.utils.string.url_safe_string directly). Live-confirmed as the actual root
+    cause of a planning-team incident: the coordinator used the display name
+    verbatim, failed, and concluded the whole delegation system was broken."""
+    specs = [_spec("ContextRouter", "Lightweight query router.")]
+
+    result = _team_roster_preamble(specs)
+    joined = "\n".join(result)
+
+    assert "context-router" in joined
+    assert "ContextRouter" in joined  # display name still shown, for readability
 
 
 def test_falls_back_to_role_when_description_is_none():
@@ -408,3 +425,49 @@ async def test_read_cache_hook_stubs_a_repeated_identical_lightrag_query_call():
     assert "central config file" in first
     assert "central config file" in second  # tolerated (serve 1-2 get real content)
     assert "Already returned this exact" in third  # serve 3+ gets the stub, not the real content again
+
+
+# ── _member_id: the real agno delegate_task_to_member key (2026-08-15, root cause) ──
+#
+# Root-caused live during planning validation: agno's own `Team.get_member_id()`
+# (confirmed by reading agno/utils/team.py + agno/utils/string.py directly) runs a
+# member's display name through `url_safe_string`, which inserts a dash at every
+# camelCase boundary before lowercasing -- "ContextRouter" -> "context-router".
+# `agno/team/_tools.py`'s `_find_member_by_id` compares against this transformed
+# value with a plain `==`, no normalization on its side. agno-hive's own
+# _team_roster_preamble and _COORDINATOR_INSTRUCTIONS examples showed the raw
+# display name as "the name to use" -- factually wrong for any multi-word agent.
+# Live-confirmed: a planning-team coordinator tried
+# delegate_task_to_member(member_id='ContextRouter', ...), failed, and concluded
+# "a fundamental failure in the team member resolution system" instead of
+# recognizing its own format mistake -- then abandoned delegation for the rest of
+# the run (silently losing access to planning's Notion tools, which only the
+# member agents have).
+
+def test_member_id_single_word_names_are_just_lowercased():
+    assert _member_id("Researcher") == "researcher"
+    assert _member_id("Planner") == "planner"
+    assert _member_id("Coder") == "coder"
+
+
+def test_member_id_inserts_a_dash_at_camelcase_boundaries():
+    assert _member_id("ContextRouter") == "context-router"
+    assert _member_id("BacklogResearcher") == "backlog-researcher"
+    assert _member_id("StoryWriter") == "story-writer"
+    assert _member_id("SecurityReviewer") == "security-reviewer"
+    assert _member_id("PerformanceReviewer") == "performance-reviewer"
+
+
+def test_coordinator_instructions_delegation_examples_use_the_real_member_id():
+    """The actual live bug: _COORDINATOR_INSTRUCTIONS' own example code told the
+    coordinator to type the display name verbatim. Every delegate_task_to_member
+    example naming the ContextRouter role must now use its real id."""
+    from swarm.team import _COORDINATOR_INSTRUCTIONS
+
+    text = "\n".join(_COORDINATOR_INSTRUCTIONS)
+    delegate_examples = [
+        line for line in _COORDINATOR_INSTRUCTIONS
+        if "delegate_task_to_member(" in line and "ContextRouter" in line
+    ]
+    assert delegate_examples == []  # no code example uses the wrong display-name form
+    assert "delegate_task_to_member('context-router'" in text
