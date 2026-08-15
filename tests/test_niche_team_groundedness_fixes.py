@@ -381,6 +381,15 @@ def test_lightrag_query_is_in_the_cacheable_read_tools_set():
     assert "lightrag_query" in _CACHEABLE_READ_TOOLS
 
 
+def test_search_knowledge_graph_is_in_the_cacheable_read_tools_set():
+    """Same day, same pattern, different tool: a planning-team run cycled the
+    SAME ~6 search_knowledge_graph queries twice in a row, each one succeeding,
+    then went silent until the 300s liveness auto-kill fired."""
+    from swarm.team import _CACHEABLE_READ_TOOLS
+
+    assert "search_knowledge_graph" in _CACHEABLE_READ_TOOLS
+
+
 def test_researcher_has_known_path_rule():
     instructions = " ".join(_agent(_load(_PARALLEL_REVIEW_YAML), "Researcher")["instructions"]).lower()
     assert "known-path rule" in instructions

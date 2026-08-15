@@ -1736,6 +1736,15 @@ _CACHEABLE_READ_TOOLS = {
     # proven duplicate-serve escalation (2 full serves, then an escalating stub,
     # then the aggregate forced-answer nudge) instead of a bespoke fix.
     "lightrag_query",
+    # search_knowledge_graph added 2026-08-15, same day, same pattern: a planning-
+    # team run cycled the SAME set of ~6 search_knowledge_graph queries
+    # ({'query': 'parties form', 'limit': 10}, 'parties page', 'parties
+    # component', ... ) TWICE through in a row, each call genuinely succeeding,
+    # then stopped calling any tool at all and streamed nothing but empty content
+    # for 2+ minutes until the 300s liveness auto-kill fired. Same fix as
+    # lightrag_query above -- this tool is read-only/deterministic within a run,
+    # widening the cache set is a proven pattern, not a new mechanism.
+    "search_knowledge_graph",
 }
 
 # The network-only cache below (skip the hive-mcp round-trip, still hand back the
