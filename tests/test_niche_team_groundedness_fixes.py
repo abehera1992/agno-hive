@@ -257,3 +257,77 @@ def test_warns_against_guessing_or_inventing_a_value():
     joined = "\n".join(result).lower()
 
     assert "never guess" in joined or "never" in joined and "guess" in joined
+
+
+# ── project_id also reaching MEMBER agents (2026-08-15, 2nd live failure) ────────
+#
+# _project_id_preamble above is real but INSUFFICIENT alone: confirmed by reading
+# agno/team/team.py directly, Team(instructions=...) only reaches the team
+# LEADER/coordinator's own prompt -- member agents are separate Agent objects with
+# their own instructions built purely from spec.instructions. Live-confirmed:
+# SecurityReviewer/PerformanceReviewer kept fabricating a NEW UUID-shaped
+# project_id on a run AFTER the coordinator-level fix had already deployed.
+# make_agent_from_spec() now takes project_id directly and prepends the same
+# instruction into each MEMBER agent's own prompt.
+
+def test_make_agent_from_spec_prepends_project_id_instruction(monkeypatch):
+    from api.models import AgentSpec
+    from swarm.agents import make_agent_from_spec
+
+    monkeypatch.setattr("swarm.agents.config.inference_backend", "ollama")
+    spec = AgentSpec(
+        name="SecurityReviewer", role="reviewer", model="qwen2.5-coder:32b",
+        instructions=["base instruction"],
+    )
+
+    agent = make_agent_from_spec(spec, project_id="ekam")
+
+    joined = "\n".join(agent.instructions)
+    assert "'ekam'" in joined
+    assert "lightrag_query" in joined
+    assert "base instruction" in joined
+
+
+def test_make_agent_from_spec_without_project_id_is_unchanged(monkeypatch):
+    monkeypatch.setattr("swarm.agents.config.inference_backend", "ollama")
+    from api.models import AgentSpec
+    from swarm.agents import make_agent_from_spec
+
+    spec = AgentSpec(
+        name="SecurityReviewer", role="reviewer", model="qwen2.5-coder:32b",
+        instructions=["base instruction"],
+    )
+
+    agent = make_agent_from_spec(spec)
+
+    assert agent.instructions == ["base instruction"]
+
+
+def test_build_team_forwards_project_id_to_each_member_agent(monkeypatch):
+    from api.models import AgentSpec
+    from swarm.team import _build_team
+
+    monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
+    specs = [
+        AgentSpec(name="Researcher", role="r", model="qwen2.5-coder:32b", instructions=["do research"]),
+        AgentSpec(name="SecurityReviewer", role="r", model="qwen2.5-coder:32b", instructions=["do security"]),
+    ]
+
+    team = _build_team(
+        specs, "qwen2.5-coder:32b", None, "broadcast", [], [],
+        project_id="ekam",
+    )
+
+    for member in team.members:
+        joined = "\n".join(member.instructions)
+        assert "'ekam'" in joined
+
+
+def test_run_task_async_and_stream_forward_project_id_to_build_team():
+    """Source-inspection check, same convention as the other wiring tests in this
+    file -- neither function is unit-tested directly (heavy MCP/session setup)."""
+    async_source = inspect.getsource(run_task_async)
+    stream_source = inspect.getsource(run_task_stream)
+
+    assert "project_id=project_id" in async_source
+    assert "project_id=project_id" in stream_source

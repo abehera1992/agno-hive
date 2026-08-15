@@ -185,7 +185,8 @@ async def update_session_state(session_state_updates: dict[str, str], run_contex
 
 
 def make_agent_from_spec(
-    spec, *mcps: MCPTools, skill_catalog: list[dict] | None = None, tool_hooks: list | None = None
+    spec, *mcps: MCPTools, skill_catalog: list[dict] | None = None, tool_hooks: list | None = None,
+    project_id: str | None = None,
 ) -> Agent:
     """Build an Agent from a dynamic spec.
 
@@ -201,6 +202,20 @@ def make_agent_from_spec(
     swarm/team.py's _build_team passes the SAME hook instance to every member agent
     (plus the coordinator's own Team(...)) so a read-cache hook can share one dict
     across the whole run, not one per agent.
+
+    project_id (default None) prepends a "use this exact LightRAG namespace"
+    instruction line -- added 2026-08-15 after discovering, via a live
+    parallel-review run, that agno's `Team(instructions=...)` (swarm/team.py's own
+    _project_id_preamble) ONLY reaches the team LEADER/coordinator's own prompt,
+    confirmed by reading agno/team/team.py directly ("Skills provide additional
+    instructions... to the team leader"). Member agents are separate Agent objects
+    built here, with their own instructions from spec.instructions alone -- the
+    coordinator-level preamble was, despite being deployed, having ZERO effect on
+    whichever member actually calls lightrag_query/lightrag_insert/index_project.
+    Confirmed live: SecurityReviewer/PerformanceReviewer kept fabricating a
+    different UUID-shaped project_id on every run even after the coordinator-level
+    fix shipped. None (the default) leaves instructions byte-for-byte unchanged
+    for any caller that doesn't pass it.
     """
     if spec.tools:
         all_funcs: dict = {}
@@ -212,6 +227,14 @@ def make_agent_from_spec(
         agent_tools = list(mcps)
 
     instructions = list(spec.instructions)
+    if project_id:
+        instructions = [
+            f"── This project's LightRAG namespace (for lightrag_query/lightrag_insert/index_project's "
+            f"project_id argument): '{project_id}' — ALWAYS use this EXACT value. Never guess, invent, or "
+            f"infer a different project_id (not a directory name, not a UUID, not a variant spelling) — an "
+            f"unrecognized value returns empty/no-context results or a hard error, not a helpful failure. ──",
+            "",
+        ] + instructions
     catalog_text = format_skill_catalog(skill_catalog or [], getattr(spec, "skills", None))
     if catalog_text:
         instructions.append(catalog_text)

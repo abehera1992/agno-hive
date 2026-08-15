@@ -2330,6 +2330,7 @@ def _build_team(
     activity: dict | None = None,
     task: str | None = None,
     team_name: str | None = None,
+    project_id: str | None = None,
 ) -> Team:
     """Build a coordinator Team from agent specs (or the default Coder+Reviewer), sharing the
     already-connected `mcp_list`. Factored out of run_task_async / run_task_stream so the same
@@ -2345,7 +2346,11 @@ def _build_team(
     string, forwarded to the decompose-first gate hook -- see _make_decompose_first_gate_hook.
     `team_name` (default None) selects the per-team gate policy (see _GATE_ENABLED_TEAMS /
     _RESEARCHER_AGENT_NAME_BY_TEAM above) -- None preserves the exact pre-2026-08-15
-    unconditional-gate behaviour byte-for-byte, matching every caller that doesn't pass it."""
+    unconditional-gate behaviour byte-for-byte, matching every caller that doesn't pass it.
+    `project_id` (default None) is forwarded to each spec-based member agent's own
+    construction (see make_agent_from_spec's own docstring) -- unlike `task`/`instructions`,
+    the shared `instructions` list passed to Team(...) only reaches the coordinator, never
+    member agents, so this has to be threaded separately."""
     # One cache per run, shared by the coordinator AND every member agent (not just
     # the coordinator) -- see _make_read_cache_tool_hook's docstring for why both of
     # those are load-bearing, not incidental. The interception hook (Phase 9a) is
@@ -2397,7 +2402,10 @@ def _build_team(
     ]
     if agent_specs:
         members = [
-            make_agent_from_spec(spec, *mcp_list, skill_catalog=skill_catalog, tool_hooks=tool_hooks)
+            make_agent_from_spec(
+                spec, *mcp_list, skill_catalog=skill_catalog, tool_hooks=tool_hooks,
+                project_id=project_id,
+            )
             for spec in agent_specs
         ]
     else:
@@ -2795,6 +2803,7 @@ async def run_task_stream(
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
             read_only=read_only, skill_catalog=skill_catalog, task=task, team_name=team_name,
+            project_id=project_id,
         )
 
         full_content: list[str] = []
@@ -3247,7 +3256,7 @@ async def run_task_async(
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
             read_only=read_only, skill_catalog=skill_catalog, activity=activity, task=task,
-            team_name=team_name,
+            team_name=team_name, project_id=project_id,
         )
 
         span_attrs = {
