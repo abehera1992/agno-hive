@@ -1846,6 +1846,114 @@ _DELEGATION_TOOL_NAMES = {"delegate_task_to_member", "delegate_task_to_members"}
 _MAX_LOGGED_TASK_CHARS = 300
 _MAX_DELEGATION_LOG_ENTRIES = 200
 
+# Same trigger-phrase set as teams/engineering.yaml's own DECOMPOSE-FIRST rule text
+# ("its own wording implies more than one discrete, independently-checkable claim")
+# -- kept in sync deliberately, not derived mechanically from the YAML, since the
+# YAML's copy is prose read by the model and this one is a hard mechanical gate; the
+# two only need to agree in SPIRIT, not be the same object. See _is_multi_part_task's
+# own docstring for the live incident this exists to catch.
+_MULTI_PART_TASK_RE = re.compile(
+    r"\bcompare\b[\s\S]{0,80}\bagainst\b|"
+    r"\bwhat'?s\s+(?:already\s+)?covered\b|\bcovered\s+vs\.?\s+(?:what'?s\s+)?(?:still\s+)?missing\b|"
+    r"\baudit\s+all\b|\bwhich\s+of\s+these\b|\bgap\s+analysis\b",
+    re.IGNORECASE,
+)
+
+
+def _is_multi_part_task(task: str | None) -> bool:
+    """True if `task`'s own wording implies more than one discrete, independently-
+    checkable claim ("compare X against Y", "what's covered vs missing", "audit all
+    N of", "which of these are done") -- the SAME classification teams/engineering.yaml's
+    DECOMPOSE-FIRST rule asks Researcher to apply to itself, mirrored here as a
+    mechanical pre-check on the coordinator's OWN delegation choices.
+
+    Deliberately narrow (a handful of specific phrase patterns, not a broad heuristic
+    like sentence length or word count) -- false positives here block a legitimate
+    narrow delegation the coordinator was right to make; false negatives just mean
+    Phase 1's prose instruction is the only thing covering that task, same as before
+    this existed. Narrow-but-precise is the safer failure direction for a mechanical
+    gate sitting in front of every coordinator delegation.
+    """
+    return bool(_MULTI_PART_TASK_RE.search(task or ""))
+
+
+def _make_decompose_first_gate_hook(task: str | None):
+    """Phase 2 (2026-08-14) of the "AgnoHive - Engineering Team 2.0 Update" plan --
+    a mechanical backstop for Phase 1's prose-only coordinator instruction
+    ("delegate multi-part tasks to Researcher WHOLE"), confirmed live NOT to be
+    reliably followed on its own: a fresh-session re-run of the exact multi-part
+    prompt that motivated the whole plan still saw the coordinator open with a
+    narrow delegate_task_to_member('ContextRouter', 'search_files for "party"...')
+    call instead -- the same piecemeal pattern Phase 1 was meant to replace.
+    ContextRouter then looped 14 identical calls before the Tier-2 liveness
+    auto-kill caught it, and Researcher's own DECOMPOSE-FIRST rule never got a
+    chance to run, because the coordinator never delegated to it in the first
+    place. Phase 1's prose instruction was measured insufficient, not assumed --
+    see the Hive Troubleshooting / Engineering Team 2.0 Notion pages for the full
+    incident.
+
+    Intercepts ONLY the coordinator's OWN delegate_task_to_member(s) calls --
+    the only tool that ever carries these names in this codebase's
+    mode="coordinate"/"route" usage (members do not delegate further, confirmed
+    by _make_delegation_log_hook's own docstring). For a task classified
+    multi-part (_is_multi_part_task), blocks ONLY the very FIRST delegation call
+    of the run if it targets a member other than Researcher -- every delegation
+    after that first one is left alone, whether the first was blocked or not.
+    This is a one-time nudge onto the right path, not a standing restriction: a
+    legitimate narrow follow-up delegation AFTER Researcher has already produced
+    its checklist must never be blocked, or this would reintroduce the OVER-
+    delegation-prevention problem the coordinator's own "stop delegating once
+    answered" instruction already exists to avoid (see _COORDINATOR_INSTRUCTIONS).
+
+    A blocked call returns a redirect message instead of executing --
+    delegate_task_to_member(s) is not idempotent (see _make_delegation_log_hook's
+    own docstring), so unlike a duplicate READ this never re-serves cached data;
+    it simply never calls the real delegation function at all for that one call,
+    the same intercept-and-redirect shape _duplicate_read_stub already uses for a
+    different problem.
+
+    `delegate_task_to_members` (plural, agno's broadcast-mode tool) is
+    deliberately NEVER blocked -- this codebase's only reachable modes are
+    coordinate/route (see DOCS.md's `mode="collaborate"` finding: an unrecognized
+    mode string silently falls through to coordinate's own default, so plural
+    broadcast delegation is effectively unused in practice) -- but it still
+    counts as "the first delegation call" for gating purposes, so a genuinely
+    multi-part task that opens with a (rare) broadcast call doesn't leave the
+    gate armed for a LATER narrow call that should have been checked.
+
+    `task=None` (the default) makes this hook a permanent no-op -- any caller
+    that doesn't pass the original task string gets the exact pre-2026-08-14
+    pass-through behavior, byte-for-byte.
+    """
+    state = {"decided": False}
+
+    async def _decompose_first_gate_hook(function_name, function, args, run_context=None):
+        if function_name not in _DELEGATION_TOOL_NAMES:
+            return await function(**args)
+        if state["decided"] or not _is_multi_part_task(task):
+            return await function(**args)
+        state["decided"] = True
+
+        if function_name != "delegate_task_to_member":
+            return await function(**args)
+
+        member_id = str((args or {}).get("member_id", "")).strip().lower()
+        if member_id == "researcher":
+            return await function(**args)
+
+        target = (args or {}).get("member_id", "?")
+        return (
+            f"REDIRECTED: this task is multi-part — its own wording implies more "
+            f"than one discrete, independently-checkable claim — and must be "
+            f"delegated to Researcher WHOLE first, not piecemeal to {target!r}. "
+            f"Researcher now also decomposes tasks internally (its own "
+            f"DECOMPOSE-FIRST rule): call delegate_task_to_member('Researcher', "
+            f"<the full original task, unabridged>) instead. This delegation to "
+            f"{target!r} was NOT executed."
+        )
+
+    return _decompose_first_gate_hook
+
 
 def _make_delegation_log_hook():
     """Mechanically logs every delegation (member id + task text, never the
@@ -1985,6 +2093,7 @@ def _build_team(
     read_only: bool = False,
     skill_catalog: list[dict] | None = None,
     activity: dict | None = None,
+    task: str | None = None,
 ) -> Team:
     """Build a coordinator Team from agent specs (or the default Coder+Reviewer), sharing the
     already-connected `mcp_list`. Factored out of run_task_async / run_task_stream so the same
@@ -1995,13 +2104,16 @@ def _build_team(
     L1 catalog can be filtered per agent role — the default Coder+Reviewer fallback path (used
     only when agent_specs is empty) does not take a catalog; that path predates team YAMLs.
     `activity` (default None = previous behaviour) is forwarded to the interception hook so a
-    caller can run a heartbeat alongside team.arun() -- see _make_tool_interception_hook."""
+    caller can run a heartbeat alongside team.arun() -- see _make_tool_interception_hook.
+    `task` (default None = previous behaviour, permanent no-op) is the original top-level task
+    string, forwarded to the decompose-first gate hook -- see _make_decompose_first_gate_hook."""
     # One cache per run, shared by the coordinator AND every member agent (not just
     # the coordinator) -- see _make_read_cache_tool_hook's docstring for why both of
     # those are load-bearing, not incidental. The interception hook (Phase 9a) is
     # built with abort_event=None here -- see its own docstring for why that keeps
     # this a no-op audit-log pass-through today rather than a live abort switch.
     read_cache_hook = _make_read_cache_tool_hook(activity=activity)
+    decompose_first_gate_hook = _make_decompose_first_gate_hook(task=task)
     delegation_log_hook = _make_delegation_log_hook()
     interception_hook = _make_tool_interception_hook(activity=activity)
     # Order matters: agno makes the FIRST hook in this list the OUTERMOST wrapper
@@ -2014,10 +2126,15 @@ def _build_team(
     # [read_cache_hook, interception_hook] order, a heartbeat during a run of
     # nothing-but-cache-hits reported "194s since last tool call" while reads were
     # visibly still streaming in -- interception_hook's activity["last_call_at"]
-    # update was simply never reached for those calls. delegation_log_hook's own
-    # position doesn't matter -- it's a pure observer that only acts on
-    # delegate_task_to_member(s) calls and never short-circuits them either way.
-    tool_hooks = [interception_hook, read_cache_hook, delegation_log_hook]
+    # update was simply never reached for those calls. decompose_first_gate_hook is
+    # listed BEFORE delegation_log_hook deliberately (2026-08-14): when it blocks a
+    # call, it never invokes the nested function at all, which means
+    # delegation_log_hook (nested inside it) never runs either -- a blocked
+    # delegation is correctly absent from session_state["delegations_made"], not
+    # logged as if it had actually happened. delegation_log_hook's own relative
+    # position among the other hooks doesn't matter beyond that -- it's a pure
+    # observer that never short-circuits a call itself.
+    tool_hooks = [interception_hook, read_cache_hook, decompose_first_gate_hook, delegation_log_hook]
     if agent_specs:
         members = [
             make_agent_from_spec(spec, *mcp_list, skill_catalog=skill_catalog, tool_hooks=tool_hooks)
@@ -2410,7 +2527,7 @@ async def run_task_stream(
         await model_routing.ensure_cache_loaded()
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
-            read_only=read_only, skill_catalog=skill_catalog,
+            read_only=read_only, skill_catalog=skill_catalog, task=task,
         )
 
         full_content: list[str] = []
@@ -2848,7 +2965,7 @@ async def run_task_async(
         }
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
-            read_only=read_only, skill_catalog=skill_catalog, activity=activity,
+            read_only=read_only, skill_catalog=skill_catalog, activity=activity, task=task,
         )
 
         span_attrs = {
