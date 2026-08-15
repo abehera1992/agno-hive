@@ -129,6 +129,34 @@ async def test_unmapped_model_id_with_vllm_backend_falls_back_to_dash_mangling(m
     assert model.id == "some-unmapped-tag"
 
 
+async def test_vllm_backend_returns_vllm_tool_fix(monkeypatch):
+    """2026-08-15: get_model()'s vLLM branch used plain OpenAILike until a live,
+    reproducible incident showed vLLM's own tool-call parser doesn't always
+    extract a model's raw <tool_call> text into a structured delta -- see
+    swarm/tool_fix.py's own module docstring. VLLMToolFix (same recovery logic
+    as OllamaToolFix, shared via a mixin) must be what get_model() actually
+    returns on this path now, not stock OpenAILike."""
+    monkeypatch.setattr(config, "inference_backend", "vllm")
+    monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
+
+    model = get_model("qwen2.5-coder:32b", "http://ollama-host")
+
+    assert type(model).__name__ == "VLLMToolFix"
+
+
+async def test_cloud_route_still_returns_plain_openai_like_not_vllm_tool_fix(monkeypatch):
+    """The vLLM tool-call-text quirk is a local open-weight model training
+    artifact (Hermes-format prompting) -- a real cloud provider's own native
+    tool-calling is reliable and structured. VLLMToolFix must stay scoped to
+    the local vLLM branch only; the cloud route is deliberately untouched."""
+    monkeypatch.setattr(config, "allow_cloud_models", True)
+    monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
+
+    model = get_model("claude-sonnet-cloud", "http://ollama-host")
+
+    assert type(model).__name__ == "OpenAILike"
+
+
 async def test_ollama_backend_returns_ollama_tool_fix(monkeypatch):
     monkeypatch.setattr(config, "inference_backend", "ollama")
 

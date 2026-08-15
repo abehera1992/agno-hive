@@ -1,4 +1,5 @@
-"""OllamaToolFix — handles non-standard tool call output from Ollama models.
+"""OllamaToolFix / VLLMToolFix — client-side recovery for tool-call intent that
+arrives as raw content text instead of a structured tool_calls entry.
 
 Supported formats:
   1. <tool_call>{"name": ..., "arguments": ...}</tool_call> (qwen2.5)
@@ -10,6 +11,23 @@ Supported formats:
 
 NOTE: agno-internal tools (delegate_task_to_member, delegate_task_to_members) are
 intentionally excluded from MCP tool call interception so agno can handle them natively.
+
+VLLMToolFix (2026-08-15): the SAME recovery, ported onto the OpenAILike/vLLM path.
+get_model()'s vLLM branch (swarm/agents.py) previously used plain OpenAILike with
+NO client-side recovery at all -- OllamaToolFix was only ever wired into the
+Ollama fallback branch. Confirmed live via a direct, reproducible gateway request
+(bypassing agno's own classification entirely): this project's ONLY served vLLM
+model, qwen3-coder-30b (every local model_id collapses onto it via the ALL-MoE
+consolidation in model_catalog), correctly emits Format 1
+(<tool_call>{"name": "search_files", ...}</tool_call>) in BOTH streaming and
+non-streaming mode -- vLLM's own engine logs show sustained ~20-24 tokens/s
+generation the whole time, ruling out an instant-EOS "gives up" explanation --
+but LiteLLM's own hermes-format tool-call parser does not reliably extract it
+into a structured tool_calls delta. When that extraction fails, the raw tagged
+text has no recovery layer under the current vLLM-backend configuration and the
+turn comes back with no usable content and no tool call, so agno just re-prompts
+with the identical context -- a silent, repeating loop until the 300s liveness
+auto-kill (config.liveness_silence_threshold_s) fires with zero answer produced.
 """
 
 # agno team internal tools — do not strip from content, let agno handle natively
@@ -19,10 +37,17 @@ import re
 from typing import Any
 
 from agno.models.ollama import Ollama
+from agno.models.openai.like import OpenAILike
 from agno.models.response import ModelResponse
 
 
-class OllamaToolFix(Ollama):
+class _ToolCallRecoveryMixin:
+    """Shared parsing + response-hook logic for OllamaToolFix and VLLMToolFix.
+    Relies on `super()._parse_provider_response(...)` / `..._delta(...)`
+    resolving to the real base model class (Ollama or OpenAILike) via each
+    subclass's own MRO — the mixin itself makes no network/base-class
+    assumptions beyond that both base classes expose the same two hook methods
+    (confirmed: both come from agno.models.base.Model)."""
 
     def _parse_tool_calls_from_content(self, content: str) -> list[dict]:
         calls: list[dict] = []
@@ -146,7 +171,6 @@ class OllamaToolFix(Ollama):
                     model_response.tool_calls = tool_calls
                     model_response.content = ""
 
-
         return model_response
 
     def _parse_provider_response_delta(self, response: Any) -> ModelResponse:
@@ -164,3 +188,14 @@ class OllamaToolFix(Ollama):
                     model_response.content = ""
 
         return model_response
+
+
+class OllamaToolFix(_ToolCallRecoveryMixin, Ollama):
+    pass
+
+
+class VLLMToolFix(_ToolCallRecoveryMixin, OpenAILike):
+    """Same recovery as OllamaToolFix, for the vLLM/OpenAILike path — see this
+    module's own docstring for the live incident (2026-08-15) that motivated
+    porting it here rather than leaving OllamaToolFix as Ollama-only."""
+    pass

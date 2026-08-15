@@ -2,7 +2,7 @@ from agno.agent import Agent
 from agno.run import RunContext
 from agno.tools import tool as agno_tool
 from agno.tools.mcp import MCPTools
-from .tool_fix import OllamaToolFix
+from .tool_fix import OllamaToolFix, VLLMToolFix
 from config.config import config
 from swarm import model_routing
 
@@ -48,9 +48,24 @@ def get_model(
     into a local-only team) must fail loudly, never send a request off-network by
     accident.
 
-    vllm   -> llama-swap OpenAI gateway. vLLM serves native tool-calls via its
-              per-model parsers (--tool-call-parser), so stock OpenAILike works with
-              NO tool-fix. Model id is mapped to the llama-swap served name.
+    vllm   -> LiteLLM gateway -> vLLM's own --tool-call-parser (hermes, for this
+              project's served model). CORRECTED 2026-08-15: this was assumed to
+              make stock OpenAILike sufficient with NO tool-fix needed, on the
+              theory that vLLM's native parser always converts a model's raw
+              tool-call text into a structured tool_calls delta. Confirmed FALSE
+              via direct, reproducible evidence: a raw gateway request (bypassing
+              agno's own classification) showed qwen3-coder-30b (this project's
+              only served vLLM model, per the ALL-MoE consolidation) correctly
+              emitting Format 1 (<tool_call>{"name": ...}</tool_call>) in both
+              streaming and non-streaming mode, with vLLM's engine logs showing
+              genuine sustained token generation the whole time -- but the parser
+              did not reliably extract it into tool_calls, leaving the raw tagged
+              text sitting in content with nothing downstream able to recover it.
+              That produced a real, live, repeated symptom: an empty turn, no
+              tool call, agno re-prompting with the identical context, silently
+              looping until the 300s liveness auto-kill. VLLMToolFix (same
+              recovery logic as OllamaToolFix, ported via a shared mixin) now
+              covers this path too. Model id is mapped to the served name.
     ollama -> OllamaToolFix, which extracts tool calls from Ollama's text formats
               (native tool_calls, <tool_call> tags, <|python_tag|>, bare JSON, qwen3 XML).
     """
@@ -77,9 +92,8 @@ def get_model(
         )
 
     if config.inference_backend == "vllm":
-        from agno.models.openai.like import OpenAILike
         served = route.vllm_served_as or model_id.replace(":", "-")
-        return OpenAILike(
+        return VLLMToolFix(
             id=served, base_url=config.vllm_gateway_url, api_key="EMPTY",
             temperature=temperature, max_tokens=max_tokens, frequency_penalty=frequency_penalty,
         )
