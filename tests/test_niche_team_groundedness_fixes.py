@@ -119,6 +119,20 @@ def test_fallback_rule_tells_agents_not_to_stop_after_one_attempt():
         assert "never stop" in instructions or "immediately fall back" in instructions
 
 
+def test_fallback_rule_widened_to_cover_errors_not_just_empty_results():
+    """2nd live failure, same day: the original wording ('no results, [no-context],
+    or an unhelpful/empty answer') did not cover an outright ERROR string
+    ('Query failed: graph name is invalid') -- the model kept retrying the SAME
+    broken call across all 3 mode values (~40+ times) instead of ever falling
+    back, because the instruction's trigger condition never matched a hard error.
+    Must now explicitly cover error strings AND cap retries at one attempt."""
+    for agent_name in ("Researcher", "SecurityReviewer", "PerformanceReviewer"):
+        instructions = " ".join(_agent(_load(_PARALLEL_REVIEW_YAML), agent_name)["instructions"]).lower()
+        assert "error" in instructions
+        assert "at most once" in instructions
+        assert "do not retry" in instructions
+
+
 # ── planning.yaml: Notion tools ─────────────────────────────────────────────────
 
 def test_planning_context_router_has_notion_read_tools():
