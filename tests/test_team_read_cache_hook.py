@@ -302,10 +302,11 @@ def test_build_team_registers_a_tool_hook_on_the_coordinator(monkeypatch):
 
     # interception hook (Phase 9a) + search-before-browse gate hook (2026-08-15) +
     # read-cache hook (Detour fix) + decompose-first gate hook (Engineering Team 2.0
-    # Phase 2, 2026-08-14) + delegation-log hook (shared session_state, 2026-08-13)
-    # -- all five shared
+    # Phase 2, 2026-08-14) + duplicate-delegation gate hook (2026-08-15, T2c
+    # groundedness incident) + delegation-log hook (shared session_state, 2026-08-13)
+    # -- all six shared
     assert result.tool_hooks is not None
-    assert len(result.tool_hooks) == 5
+    assert len(result.tool_hooks) == 6
 
 
 def test_interception_hook_is_listed_first_so_it_is_outermost(monkeypatch):
@@ -318,7 +319,8 @@ def test_interception_hook_is_listed_first_so_it_is_outermost(monkeypatch):
     were visibly still streaming, because interception_hook was skipped entirely on
     every cache hit. search_before_browse_gate_hook (2026-08-15) sits before
     read_cache_hook so a blocked browse call never reaches the cache/serve-count
-    bookkeeping either -- it never really happened. decompose_first_gate_hook sits
+    bookkeeping either -- it never really happened. decompose_first_gate_hook and
+    duplicate_delegation_gate_hook (2026-08-15, T2c groundedness incident) both sit
     before delegation_log_hook so a blocked delegation is never logged as if it had
     happened -- see _build_team's own comment on this ordering."""
     monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
@@ -336,7 +338,8 @@ def test_interception_hook_is_listed_first_so_it_is_outermost(monkeypatch):
     assert result.tool_hooks[1].__name__ == "_search_before_browse_gate_hook"
     assert result.tool_hooks[2].__name__ == "_read_cache_tool_hook"
     assert result.tool_hooks[3].__name__ == "_decompose_first_gate_hook"
-    assert result.tool_hooks[4].__name__ == "_delegation_log_hook"
+    assert result.tool_hooks[4].__name__ == "_duplicate_delegation_gate_hook"
+    assert result.tool_hooks[5].__name__ == "_delegation_log_hook"
 
 
 def test_build_team_shares_the_same_hook_instance_between_coordinator_and_fallback_members(monkeypatch):

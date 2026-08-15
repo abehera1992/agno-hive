@@ -527,3 +527,29 @@ def test_coordinator_instructions_delegation_examples_use_the_real_member_id():
     ]
     assert delegate_examples == []  # no code example uses the wrong display-name form
     assert "delegate_task_to_member('context-router'" in text
+
+
+def test_coordinator_instructions_have_a_conflict_resolution_section():
+    """T2c live incident (2026-08-15, parallel-review groundedness retest): three
+    independently-cited member reports quoted the real schema content from
+    API/inventory-service/models.py; a fourth, uncited report said the file "was
+    not found". The coordinator's synthesis sided with the single uncited negative
+    report over three cited positive ones. This section is the prose-side fix --
+    the mechanical-side fix is _make_duplicate_delegation_gate_hook (see
+    tests/test_duplicate_delegation_gate_hook.py), which stops the duplicate
+    broadcast that produced the conflicting report in the first place."""
+    from swarm.team import _COORDINATOR_INSTRUCTIONS
+
+    text = "\n".join(_COORDINATOR_INSTRUCTIONS)
+    assert "Resolving conflicting member reports" in text
+    assert "the CITED, QUOTED-CONTENT answer" in text
+    assert "T2c parallel-review groundedness retest" in text
+
+
+def test_conflict_resolution_section_precedes_general_rules():
+    from swarm.team import _COORDINATOR_INSTRUCTIONS
+
+    text = "\n".join(_COORDINATOR_INSTRUCTIONS)
+    idx_conflict = text.index("Resolving conflicting member reports")
+    idx_general = text.index("General rules")
+    assert idx_conflict < idx_general

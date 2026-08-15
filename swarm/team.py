@@ -337,6 +337,32 @@ _COORDINATOR_INSTRUCTIONS = [
     "  If only one MCP is connected, use it for everything.",
     "  Discover available tools from the connected MCP — do not assume tool names exist.",
     "",
+    "── Resolving conflicting member reports (CRITICAL) ──────────────",
+    "  Live incident (2026-08-15, T2c parallel-review groundedness retest): three independently-",
+    "  cited member reports quoted the exact same file's real content (a full, correct schema",
+    "  with field names/types taken verbatim from get_file_content output) — a fourth report,",
+    "  from a member whose own path guess had failed, concluded 'the file was not found /",
+    "  cannot be identified'. The coordinator's synthesis sided with the SINGLE uncited negative",
+    "  report over the THREE independently-cited positive ones, then went on to read six",
+    "  unrelated services' models.py files trying to re-verify from scratch, and still returned",
+    "  the wrong 'does not exist' answer as final — despite already holding the right answer,",
+    "  quoted, three times over.",
+    "  If two members (or the same member across two delegation rounds) report DIFFERENT",
+    "  conclusions about the same fact — one quotes real content from a specific file:line,",
+    "  another says it was not found or cannot be identified — the CITED, QUOTED-CONTENT answer",
+    "  wins. Never average the two, never split the difference, and never default to the",
+    "  negative conclusion just because 'not found' sounds like the more cautious answer.",
+    "  A 'not found' report after a failed or narrow search is NOT equal evidence to a report",
+    "  that already quoted the real content — the second is verified; the first only means that",
+    "  ONE member's search attempt failed, not that the thing doesn't exist.",
+    "  Before concluding anything 'does not exist' or 'cannot be identified with certainty':",
+    "  check whether ANY teammate this run already cited a specific working path for it. If so,",
+    "  trust that citation — or, if you want to double-check, call get_file_content on that",
+    "  EXACT path yourself. Do NOT go hunting through unrelated candidate paths (a different",
+    "  service's models.py, a similarly-named file elsewhere) as if the already-confirmed path",
+    "  might be wrong — a prior successful, quoted read is never invalidated by a later,",
+    "  different member's failed guess at a different path.",
+    "",
     "── General rules ──────────────────────────────────────────────",
     "  - Base answers on file contents, not assumptions",
     "  - Synthesise member outputs into one coherent response",
@@ -2282,6 +2308,111 @@ def _make_search_before_browse_gate_hook(task: str | None, researcher_agent_name
     return _search_before_browse_gate_hook
 
 
+def _normalize_delegation_task(task_text) -> str:
+    """Whitespace/case-folded form of a delegation's task text, used ONLY for
+    exact-duplicate comparison in _make_duplicate_delegation_gate_hook -- not a
+    general-purpose normalizer. Collapses internal whitespace runs and lowercases,
+    so two calls differing only in incidental spacing/case still compare equal;
+    anything else (a reworded ask, a narrower/wider scope) compares unequal, which
+    is the intended narrow-not-broad behavior (see that function's own docstring)."""
+    return " ".join(str(task_text or "").split()).lower()
+
+
+def _make_duplicate_delegation_gate_hook():
+    """Mechanical backstop for _COORDINATOR_INSTRUCTIONS' own prose-only rule
+    ("Before delegate_task_to_member(s): check whether an equivalent delegation is
+    already listed... use that result instead of delegating the same or a near-
+    identical task again") -- confirmed live NOT reliably followed, the same class
+    of failure this file has already hit and fixed twice
+    (_make_decompose_first_gate_hook, _make_search_before_browse_gate_hook): prose
+    instruction proven insufficient by direct measurement -> mechanical enforcement.
+
+    Live incident (2026-08-15, T2c parallel-review groundedness retest): the
+    coordinator called delegate_task_to_members with the EXACT SAME task text
+    twice -- once at run start, again ~2.5 minutes later -- after round 1 had
+    already produced two independently-correct, fully-cited member answers.
+    Round 2 introduced a conflicting WRONG answer from one member (a failed path
+    guess concluded "models.py not found") alongside a second correct one, and
+    the coordinator's synthesis sided with the wrong, uncited answer over three
+    independently-cited correct ones (see the new "Resolving conflicting member
+    reports" section of _COORDINATOR_INSTRUCTIONS, added the same day as this
+    gate, for the prose-side half of this fix). Blocking the duplicate broadcast
+    at the gate prevents this incident SHAPE from recurring at the source: if
+    round 2 never fires, there is nothing for a flawed synthesis step to get
+    confused by. Two identical incidents of this same shape were also observed
+    with delegate_task_to_member (singular) during the same test session -- a
+    coordinator re-delegating byte-identical read/extract tasks to the same
+    member 3-5 times in a row, each a genuinely wasted ~10-30s round-trip.
+
+    Compares against session_state["delegations_made"] -- the exact structured
+    log _make_delegation_log_hook already populates for every executed
+    delegation this run. This hook must run BEFORE delegation_log_hook in the
+    tool_hooks list (see _build_team's ordering comment) so a blocked call is
+    correctly absent from that log, not recorded as if it had actually happened.
+
+    delegate_task_to_member (singular): blocks ONLY an exact (post-normalization)
+    repeat of BOTH member_id (compared via _member_id(), matching agno's own real
+    lookup key) AND task text, to the SAME member. A follow-up delegation with
+    different wording, a narrower/wider scope, or to a DIFFERENT member is never
+    blocked -- same narrow-not-broad philosophy _is_multi_part_task's own
+    docstring argues for: false positives here block a legitimate follow-up
+    delegation the coordinator was right to make.
+
+    delegate_task_to_members (plural, broadcast): compared against prior
+    delegate_task_to_members calls only, keyed on normalized task text alone (no
+    member_id -- it goes to the whole team) -- this is the exact shape of the
+    live incident above.
+
+    A blocked call returns a redirect message instead of executing -- the same
+    intercept-and-redirect shape _make_decompose_first_gate_hook already uses.
+    Delegation is not idempotent IN GENERAL (a second call to the same member can
+    legitimately want fresh context after new information emerged -- see
+    _make_delegation_log_hook's own docstring), but an EXACT repeat of a call
+    already logged this run is never that case by definition: the request text
+    didn't change, so there is no new information for a fresh call to act on.
+    """
+    async def _duplicate_delegation_gate_hook(function_name, function, args, run_context=None):
+        if function_name not in _DELEGATION_TOOL_NAMES:
+            return await function(**args)
+
+        log = []
+        if run_context is not None and run_context.session_state is not None:
+            log = run_context.session_state.get("delegations_made", [])
+
+        task_text = _normalize_delegation_task((args or {}).get("task"))
+        if not task_text:
+            return await function(**args)
+
+        if function_name == "delegate_task_to_member":
+            member_id = _member_id(str((args or {}).get("member_id", "")).strip())
+            for entry in log:
+                if entry.get("tool") != "delegate_task_to_member":
+                    continue
+                prior_args = entry.get("args") or {}
+                prior_member = _member_id(str(prior_args.get("member_id", "")).strip())
+                if prior_member == member_id and _normalize_delegation_task(prior_args.get("task")) == task_text:
+                    return (
+                        f"REDIRECTED: this exact task was already delegated to {member_id!r} "
+                        f"earlier this run — use that result instead of delegating it again. "
+                        f"This delegate_task_to_member call was NOT executed."
+                    )
+        else:
+            for entry in log:
+                if entry.get("tool") != "delegate_task_to_members":
+                    continue
+                prior_task = _normalize_delegation_task((entry.get("args") or {}).get("task"))
+                if prior_task == task_text:
+                    return (
+                        "REDIRECTED: this exact task was already broadcast to the whole team "
+                        "earlier this run — use those results instead of broadcasting it again. "
+                        "This delegate_task_to_members call was NOT executed."
+                    )
+
+        return await function(**args)
+
+    return _duplicate_delegation_gate_hook
+
+
 def _make_delegation_log_hook():
     """Mechanically logs every delegation (member id + task text, never the
     member's result) into the run's shared session_state["delegations_made"] --
@@ -2464,6 +2595,7 @@ def _build_team(
     search_before_browse_gate_hook = _make_search_before_browse_gate_hook(
         task=search_gate_task, researcher_agent_name=researcher_agent_name,
     )
+    duplicate_delegation_gate_hook = _make_duplicate_delegation_gate_hook()
     delegation_log_hook = _make_delegation_log_hook()
     interception_hook = _make_tool_interception_hook(activity=activity)
     # Order matters: agno makes the FIRST hook in this list the OUTERMOST wrapper
@@ -2487,10 +2619,18 @@ def _build_team(
     # search_before_browse_gate_hook sits BEFORE read_cache_hook (more outer) so a
     # blocked browse call never reaches the cache/serve-count bookkeeping at all --
     # it never really happened, the same principle decompose_first_gate_hook's own
-    # positioning comment documents for delegation_log_hook.
+    # positioning comment documents for delegation_log_hook. duplicate_delegation_gate_hook
+    # (2026-08-15, see its own docstring for the T2c incident that motivated it) sits
+    # BEFORE delegation_log_hook for the identical reason decompose_first_gate_hook does --
+    # a blocked duplicate must never be logged into delegations_made as if it had actually
+    # executed, or a THIRD identical attempt would find its own blocked-but-logged entry
+    # and short-circuit correctly by accident rather than by design. It also needs
+    # delegation_log_hook's log to already be populated with EARLIER real calls, which is
+    # naturally true regardless of relative ordering between the two, since the log is
+    # read fresh from session_state on every call, not snapshotted at hook-construction time.
     tool_hooks = [
         interception_hook, search_before_browse_gate_hook, read_cache_hook,
-        decompose_first_gate_hook, delegation_log_hook,
+        decompose_first_gate_hook, duplicate_delegation_gate_hook, delegation_log_hook,
     ]
     if agent_specs:
         members = [
