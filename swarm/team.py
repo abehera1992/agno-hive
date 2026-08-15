@@ -1662,6 +1662,23 @@ _MAX_FULL_SERVES_PER_AGENT = 2
 # not the same sentence a third time.
 _STUB_ESCALATION_SERVE = 5
 
+# 2026-08-15: a THIRD escalation tier, keyed on the AGGREGATE total_stub_serve_count
+# (already computed for the Tier-3 liveness signal, config.liveness_aggregate_stub_threshold
+# = 15) rather than any single (agent, tool, args) key's own count. Confirmed live: a
+# run that correctly grounded itself in the right files (unlike every earlier incident
+# this file's other guards target) still never converged -- it cycled through the SAME
+# ~5 already-fully-read files, re-requesting each one in turn, so no INDIVIDUAL file's
+# serve_count crossed _STUB_ESCALATION_SERVE by much before the run was killed by the
+# Tier-3 aggregate liveness check at total_stub_serve_count > 15, having produced zero
+# answer. The per-key escalated stub message ("do not call this again") only ever
+# addresses the ONE file just re-requested -- it says nothing about the other 4 in the
+# rotation, so the model can "route around" it by cycling to a different already-read
+# file instead of actually stopping. This tier fires once the AGGREGATE crosses a
+# threshold well before the Tier-3 kill (15), addressing the rotation as a whole
+# instead of one file at a time -- a genuine chance to converge instead of only ever
+# hearing about it after the run has already been killed with no answer produced.
+_FORCED_ANSWER_AGGREGATE_THRESHOLD = 6
+
 
 def _duplicate_read_stub(function_name: str, args: dict, agent_key: str, serve_count: int, result_len: int) -> str:
     who = agent_key or "the coordinator"
@@ -1679,6 +1696,26 @@ def _duplicate_read_stub(function_name: str, args: dict, agent_key: str, serve_c
         f"information. You already have everything this call can return. If you are "
         f"stuck, answer with what you have now, or say what you could not determine — "
         f"do not call this again."
+    )
+
+
+def _forced_answer_nudge(agent_key: str, total_stub_count: int) -> str:
+    """The aggregate-tier message (see _FORCED_ANSWER_AGGREGATE_THRESHOLD) — replaces
+    _duplicate_read_stub's normal per-key wording once the run-wide total crosses the
+    threshold, on EVERY subsequent duplicate call (not a one-shot), since a model that
+    ignores it once may still respond to seeing it again rather than reverting to a
+    softer message that already failed to land."""
+    who = agent_key or "the coordinator"
+    return (
+        f"FORCED STOP — this is not about the one file {who} just re-requested: across "
+        f"this whole run, {who} has now re-requested already-fetched content "
+        f"{total_stub_count} times total, counting duplicates of ANY file, not just this "
+        f"one. That means {who} is cycling through content already fully in context "
+        f"instead of making progress. Do NOT call get_file_content, find_files, "
+        f"search_files, list_directory_tree, or get_files_batch again this turn — of ANY "
+        f"file. Write the final answer NOW using what is already in context. If something "
+        f"specific is still genuinely missing, say exactly what could not be determined "
+        f"instead of attempting another read."
     )
 
 
@@ -1834,6 +1871,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         serve_counts[serve_key] = serve_counts.get(serve_key, 0) + 1
         count = serve_counts[serve_key]
         if count > _MAX_FULL_SERVES_PER_AGENT:
+            total = None
             if activity is not None:
                 activity["max_stub_serve_count"] = max(activity.get("max_stub_serve_count", 0), count)
                 # total_stub_serve_count (2026-08-14): the aggregate Tier-3 signal,
@@ -1843,6 +1881,9 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 # a model rotating its non-convergence across several different
                 # already-stubbed files, each individually staying under budget).
                 activity["total_stub_serve_count"] = activity.get("total_stub_serve_count", 0) + 1
+                total = activity["total_stub_serve_count"]
+            if total is not None and total >= _FORCED_ANSWER_AGGREGATE_THRESHOLD:
+                return _forced_answer_nudge(agent_key, total)
             return _duplicate_read_stub(function_name, args, agent_key, count, len(str(result)))
         return result
 
@@ -1960,6 +2001,72 @@ def _make_decompose_first_gate_hook(task: str | None):
         )
 
     return _decompose_first_gate_hook
+
+
+_BROWSE_TOOL_NAMES = {"list_directory_tree", "find_files", "get_file_content"}
+_SEARCH_TOOL_NAMES = {"search_files", "lightrag_query"}
+
+
+def _make_search_before_browse_gate_hook(task: str | None):
+    """A mechanical backstop for teams/engineering.yaml's Researcher DECOMPOSE-FIRST
+    Step 3a ("search before you browse"), confirmed live NOT to be reliably followed
+    on its own -- THREE separate live tests (2026-08-14, 2026-08-15 x2, the last one
+    even after Step 3a was shortened, moved earlier, and reworded "ALWAYS, NO
+    EXCEPTIONS") all saw Researcher open a multi-part checklist item with
+    find_files/get_file_content browsing by directory or service name, never once
+    calling search_files or lightrag_query. Same escalation this codebase already
+    took once for delegation (Phase 1's prose "delegate whole to Researcher" ->
+    Phase 2's _make_decompose_first_gate_hook, both above): prose instruction proven
+    insufficient by direct measurement -> mechanical enforcement.
+
+    Scoped to Researcher only (via the `agent` kwarg's own `.name`) -- ContextRouter's
+    entire job is fast retrieval via these same tool names, and Coder/Reviewer
+    legitimately need get_file_content before editing/reviewing; blocking either
+    would be a real regression, not a fix. Scoped to _is_multi_part_task(task) the
+    same as the decompose-first gate above, for the same reason: a bounded single-file
+    task ("is section X present in file Y") already names its target and correctly
+    skips DECOMPOSE-FIRST's checklist machinery entirely (measured live: 42s, no
+    decomposition needed) -- forcing a search first there would only slow down the
+    one shape that already works.
+
+    Unlike the decompose-first gate's one-time nudge, this gate stays SHUT (blocks
+    every qualifying browse call, not just the first) until Researcher's OWN first
+    search_files/lightrag_query call this run -- there is no analogous
+    over-restriction risk here the way repeated delegation-blocking would reintroduce
+    the over-delegation problem (see the decompose-first gate's own docstring):
+    Researcher can unblock itself with exactly one search call, after which every
+    subsequent browse call (reading the search's own top hits, as Step 3a says to)
+    passes through freely for the rest of the run.
+
+    `task=None` (the default) makes this hook a permanent no-op, same convention as
+    `_make_decompose_first_gate_hook`.
+    """
+    state = {"searched": False}
+
+    async def _search_before_browse_gate_hook(function_name, function, args, agent=None, run_context=None):
+        agent_key = getattr(agent, "name", None) or ""
+        if agent_key != "Researcher":
+            return await function(**args)
+        if function_name in _SEARCH_TOOL_NAMES:
+            state["searched"] = True
+            return await function(**args)
+        if function_name not in _BROWSE_TOOL_NAMES:
+            return await function(**args)
+        if state["searched"] or not _is_multi_part_task(task):
+            return await function(**args)
+
+        return (
+            f"REDIRECTED: {function_name} was blocked — for a multi-part task, "
+            f"Researcher must run a content search FIRST (search_files(<the checklist "
+            f"item's own key domain term>, '**/*') and/or lightrag_query(<key term>)) "
+            f"before any directory/file browsing. This is what finds the actual owning "
+            f"file directly instead of guessing a service/directory from a domain-name "
+            f"association. Call search_files or lightrag_query now — every browse call "
+            f"after your first search this run will go through normally. This "
+            f"{function_name} call was NOT executed."
+        )
+
+    return _search_before_browse_gate_hook
 
 
 def _make_delegation_log_hook():
@@ -2121,6 +2228,7 @@ def _build_team(
     # this a no-op audit-log pass-through today rather than a live abort switch.
     read_cache_hook = _make_read_cache_tool_hook(activity=activity)
     decompose_first_gate_hook = _make_decompose_first_gate_hook(task=task)
+    search_before_browse_gate_hook = _make_search_before_browse_gate_hook(task=task)
     delegation_log_hook = _make_delegation_log_hook()
     interception_hook = _make_tool_interception_hook(activity=activity)
     # Order matters: agno makes the FIRST hook in this list the OUTERMOST wrapper
@@ -2141,7 +2249,14 @@ def _build_team(
     # logged as if it had actually happened. delegation_log_hook's own relative
     # position among the other hooks doesn't matter beyond that -- it's a pure
     # observer that never short-circuits a call itself.
-    tool_hooks = [interception_hook, read_cache_hook, decompose_first_gate_hook, delegation_log_hook]
+    # search_before_browse_gate_hook sits BEFORE read_cache_hook (more outer) so a
+    # blocked browse call never reaches the cache/serve-count bookkeeping at all --
+    # it never really happened, the same principle decompose_first_gate_hook's own
+    # positioning comment documents for delegation_log_hook.
+    tool_hooks = [
+        interception_hook, search_before_browse_gate_hook, read_cache_hook,
+        decompose_first_gate_hook, delegation_log_hook,
+    ]
     if agent_specs:
         members = [
             make_agent_from_spec(spec, *mcp_list, skill_catalog=skill_catalog, tool_hooks=tool_hooks)
