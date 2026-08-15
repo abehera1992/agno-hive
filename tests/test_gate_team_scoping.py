@@ -79,7 +79,21 @@ def test_gate_enabled_teams_is_engineering_parallel_review_sprint_master_only():
 
 
 def test_planning_is_not_in_the_gate_enabled_teams():
+    """This set now governs the decompose-first gate ONLY -- see
+    _SEARCH_GATE_ENABLED_TEAMS below for the (broader) search-before-browse set."""
     assert "planning" not in _GATE_ENABLED_TEAMS
+
+
+def test_search_gate_enabled_teams_includes_planning():
+    from swarm.team import _SEARCH_GATE_ENABLED_TEAMS
+
+    assert "planning" in _SEARCH_GATE_ENABLED_TEAMS
+
+
+def test_search_gate_enabled_teams_is_a_strict_superset_of_decompose_gate_teams():
+    from swarm.team import _SEARCH_GATE_ENABLED_TEAMS
+
+    assert _GATE_ENABLED_TEAMS < _SEARCH_GATE_ENABLED_TEAMS
 
 
 def test_sprint_master_researcher_agent_name_is_backlogresearcher():
@@ -282,13 +296,14 @@ async def test_build_team_sprint_master_search_gate_scopes_to_backlogresearcher(
 
 
 @pytest.mark.asyncio
-async def test_build_team_planning_disables_both_gates(monkeypatch):
-    """The actual bug this extension fixes: `planning`'s Researcher agent was
-    ALREADY being silently gated before this change (task threaded through
-    unconditionally, and planning's agent happens to be literally named
-    'Researcher') -- contradicting the resolved open question's explicit
-    'planning excluded' answer. team_name='planning' must now leave both gates
-    fully inert regardless of how multi-part the task text looks."""
+async def test_build_team_planning_disables_decompose_first_gate_only(monkeypatch):
+    """`planning`'s decompose-first gate stays OFF (2026-08-15, unchanged from the
+    original gate-scope extension) -- its own separate, differently-shaped Planner
+    (DISCUSSION/ROADMAP dual-mode) means the redirect message's premise
+    ("Researcher now also decomposes tasks internally, merged with Planner") is
+    simply FALSE for this team: planning's Researcher and Planner are two distinct
+    agents, not a merged role. Forcing a delegate-whole-to-Researcher redirect here
+    would be actively wrong advice, not just unnecessary."""
     monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
 
     result = _build_team(
@@ -297,15 +312,42 @@ async def test_build_team_planning_disables_both_gates(monkeypatch):
         team_name="planning",
     )
     decompose_hook = next(h for h in result.tool_hooks if h.__name__ == "_decompose_first_gate_hook")
-    search_hook = next(h for h in result.tool_hooks if h.__name__ == "_search_before_browse_gate_hook")
 
     delegate_out = await decompose_hook(
         "delegate_task_to_member", _fake_delegate, {"member_id": "ContextRouter", "task": "narrow"}
     )
     assert delegate_out.startswith("delegated:")  # NOT redirected -- planning is excluded
 
-    browse_out = await search_hook("find_files", _fake_browse, {}, agent=_FakeAgent("Researcher"))
-    assert browse_out.startswith("browsed:")  # NOT redirected -- planning is excluded
+
+@pytest.mark.asyncio
+async def test_build_team_planning_now_enables_search_before_browse_gate(monkeypatch):
+    """2026-08-15 refinement: unlike the decompose-first gate, search-before-browse's
+    rationale ('search before you browse, to find the actually-owning file directly
+    instead of guessing a service/directory from a domain-name association') holds
+    regardless of whether Planner is merged into Researcher or stays separate --
+    it's about HOW Researcher grounds one claim, not about the inter-agent shape.
+    Originally excluded alongside the decompose-first gate by the first pass of this
+    extension (a real, previously-unnoticed leak: planning's own Researcher was
+    silently gated before ANY of this existed, then over-correctively excluded from
+    BOTH gates when the leak was closed) -- this test locks in the corrected,
+    narrower scope: planning's Researcher now gets real search-before-browse
+    protection, the same prose-insufficiency problem Phase 5/6 already measured and
+    fixed for engineering."""
+    monkeypatch.setattr("swarm.team.config.inference_backend", "ollama")
+
+    result = _build_team(
+        agent_specs=None, coordinator_model="qwen2.5-coder:32b", coordinator_tools=None,
+        mode="coordinate", mcp_list=[], instructions=[], task=_MULTI_PART_TASK,
+        team_name="planning",
+    )
+    search_hook = next(h for h in result.tool_hooks if h.__name__ == "_search_before_browse_gate_hook")
+
+    blocked = await search_hook("find_files", _fake_browse, {}, agent=_FakeAgent("Researcher"))
+    assert "REDIRECTED" in blocked  # NOW gated -- planning's Researcher gets real protection
+
+    # Planner (planning's own, separate agent) must never be touched by this gate.
+    planner_pass = await search_hook("find_files", _fake_browse, {}, agent=_FakeAgent("Planner"))
+    assert planner_pass.startswith("browsed:")
 
 
 @pytest.mark.asyncio

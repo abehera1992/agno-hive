@@ -5,8 +5,12 @@ description: Plan-only team — routes context, researches codebase, and produce
 # it out of DB control again.
 # Read-only allowlist for the coordinator's direct tool surface (members are scoped separately
 # via their own `tools:` lists). Without this, the coordinator receives every tool from every
-# connected MCP unfiltered — including write/staging tools (apply_diff, write_file, notion_*,
+# connected MCP unfiltered — including write/staging tools (apply_diff, write_file,
+# notion_create_page/notion_update_*/notion_trash_page/notion_delete_block,
 # confirm_action/reject_action) that this team must never call. Keep this list read-only.
+# notion_search/notion_get_page (added 2026-08-15) are the read-only exception, matching
+# engineering.yaml's own per-agent grant — needed so the coordinator can itself read a spec
+# a task names, not only via delegation.
 coordinator_tools:
   - list_directory_tree
   - find_files
@@ -16,6 +20,8 @@ coordinator_tools:
   - search_knowledge_graph
   - lightrag_query
   - get_context_section
+  - notion_search
+  - notion_get_page
 
 agents:
   - name: ContextRouter
@@ -31,6 +37,8 @@ agents:
       - lightrag_query
       - web_search
       - web_fetch
+      - notion_search
+      - notion_get_page
     instructions:
       - "SESSION CONTEXT: At session start, try get_file_content('hive.md') once — it has a pre-built directory tree and per-module summaries. Skip silently if not found."
       - "FILE PATH SHORTCUT: If the user mentions a specific file path in their prompt (e.g. 'lib/megaMenuData.ts', 'src/components/Foo.tsx'), call get_file_content() on that path directly — no search needed."
@@ -43,6 +51,7 @@ agents:
       - "  - Semantic/memory questions    → lightrag_query() if available, else search_knowledge_graph()"
       - "  - User shares a URL or GitHub link → web_fetch(url) immediately if available"
       - "  - External tool/library/repo   → web_search(name) then web_fetch on best result if available"
+      - "  - Task references a Notion page, spec, or doc by name/title ('the Notion page X', 'per the spec Y') → call notion_search(title) if available to find the page id, then notion_get_page(page_id) to read it. Pass the full content to Researcher/Planner, do not summarise it yourself."
       - Return only the retrieved context. Do not answer the question yourself.
       - "Tool call limit: 1 for specific lookups, up to 3 for overview/structure queries."
 
@@ -59,9 +68,12 @@ agents:
       - lightrag_query
       - web_search
       - web_fetch
+      - notion_search
+      - notion_get_page
     instructions:
       - "SESSION CONTEXT: Before any other tool call, try get_file_content('hive.md') once — it has the full directory tree and per-module summaries. Use it as your starting point. Skip silently if not found."
-      - If lightrag_query is available via MCP, call it with relevant keywords before starting.
+      - "lightrag_query is always connected server-side (api/server.py's _resolve_mcp_urls appends it regardless of caller opt-in) — call it with relevant keywords before starting any exploratory search. It returns semantically-relevant files/chunks the project's LightRAG index already knows about."
+      - "NOTION rule: if the task names a Notion page, spec, or doc by title ('the Notion page X', 'per the spec Y'), call notion_search(title) to find the page id, then notion_get_page(page_id) to read the full content before researching the codebase side — ground the comparison in the REAL spec text, never a remembered/assumed summary of it."
       - You are the research specialist. Understand the existing codebase before anyone plans.
       - "SCAN-FIRST rule: Always run list_directory_tree() (or find_files('**/*') if unavailable) before answering any structure or overview question."
       - "  Never describe a directory from its name alone — read at least one entry file inside it to ground your answer."
@@ -94,9 +106,12 @@ agents:
       - get_file_content
       - search_knowledge_graph
       - lightrag_query
+      - notion_search
+      - notion_get_page
     instructions:
       - "SESSION CONTEXT: Before planning, try get_file_content('hive.md') once — it has project structure context that informs your plan. Skip silently if not found."
-      - If lightrag_query is available via MCP, call it to check if similar tasks were solved before.
+      - "lightrag_query is always connected server-side (api/server.py's _resolve_mcp_urls appends it regardless of caller opt-in) — call it to check if similar tasks were solved before."
+      - "NOTION rule: if Researcher's findings reference a Notion spec by title but didn't include its full text, call notion_search(title) then notion_get_page(page_id) yourself before finalizing a plan against it — never plan against a spec's title alone."
       - You are the planning specialist. Detect the query type first and adjust your output accordingly.
       - "DISCUSSION / ROADMAP — triggered when the query contains 'discuss', 'roadmap', 'scope', 'thoughts', 'how should', 'what if', 'let's', 'planning to', 'future':"
       - "  Output a STRATEGIC ANALYSIS. Do NOT produce a numbered implementation step list."

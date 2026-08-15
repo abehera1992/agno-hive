@@ -369,6 +369,42 @@ _COORDINATOR_INSTRUCTIONS = [
 ]
 
 
+def _team_roster_preamble(agent_specs: list | None) -> list[str]:
+    """A real, per-team member roster computed from the actual `agent_specs` this
+    run was built with -- 2026-08-15, part of the parallel-review/planning
+    groundedness pass. Prepended AHEAD of _COORDINATOR_INSTRUCTIONS (not merged
+    into it) so the real roster is the first thing the coordinator sees, before
+    _COORDINATOR_INSTRUCTIONS' own hardcoded example line ("Delegate to team
+    members (ContextRouter, Researcher, Coder, Executor, Reviewer)") and several
+    scenario blocks that name ContextRouter/Coder/Reviewer specifically -- all of
+    which describe engineering's roster and are factually wrong for every other
+    team (parallel-review has no ContextRouter; sprint-master's roster is
+    BacklogResearcher/StoryWriter; planning has no Coder/Executor/Reviewer at all).
+
+    Deliberately does NOT edit or remove any of that existing text -- it took 8
+    live-validated phases to get engineering's coordinator instructions right, and
+    a full rewrite/split was assessed as materially higher regression risk than
+    it's worth here. This is purely additive: confirmed live 2026-08-15 that a
+    coordinator can already correctly delegate to its REAL named members (the
+    sprint-master gate-scope validation run used BacklogResearcher/StoryWriter
+    correctly) even with the wrong hardcoded engineering names also present in its
+    prompt -- so this preamble is reinforcement against a real but apparently
+    non-fatal inaccuracy, not a fix for an observed failure.
+
+    Returns [] for agent_specs=None/empty (the default Coder+Reviewer fallback
+    path, which predates team YAMLs) -- unaffected either way, since that path's
+    own two-name roster happens to already be a subset of the hardcoded example.
+    """
+    if not agent_specs:
+        return []
+    lines = ["── Your team's actual members (delegate ONLY to these, by these exact names) ──"]
+    for spec in agent_specs:
+        label = spec.description or spec.role
+        lines.append(f"  {spec.name} — {label}")
+    lines.append("")
+    return lines
+
+
 # Tools that CHANGE something — the repo, the host, or an external system. Named here,
 # server-side, so a caller asking for a read-only run does not have to know (or keep in
 # sync with) which tools mutate. Prefix matching covers integration families that grow
@@ -2030,6 +2066,21 @@ _SEARCH_TOOL_NAMES = {"search_files", "lightrag_query"}
 # these two maps to compute, per team, whether the gates apply at all and which
 # agent name plays the Researcher role -- see tests/test_gate_team_scoping.py.
 _GATE_ENABLED_TEAMS = {"engineering", "parallel-review", "sprint-master"}
+# search-before-browse-only extension (2026-08-15, follow-up to the gate-scope
+# extension above): planning's own Researcher was found to be excluded from BOTH
+# gates alongside its Planner -- but the two gates rest on genuinely different
+# premises. Decompose-first's redirect text says "Researcher now also decomposes
+# tasks internally (merged with the former Planner role)" -- true for engineering/
+# parallel-review/sprint-master, FALSE for planning, whose Researcher and Planner
+# are two distinct, separately-shaped agents (Planner has its own DISCUSSION/
+# ROADMAP vs IMPLEMENTATION dual-mode instructions) -- forcing that gate on
+# planning would inject actively wrong advice. Search-before-browse's premise
+# ("search before you browse, to find the actually-owning file directly instead of
+# guessing a service/directory from a domain-name association") has nothing to do
+# with the Researcher/Planner relationship -- it holds for ANY Researcher grounding
+# ANY claim. So this set is intentionally a superset of _GATE_ENABLED_TEAMS, not a
+# second independent allowlist.
+_SEARCH_GATE_ENABLED_TEAMS = _GATE_ENABLED_TEAMS | {"planning"}
 _RESEARCHER_AGENT_NAME_BY_TEAM = {
     "sprint-master": "BacklogResearcher",
 }
@@ -2268,15 +2319,19 @@ def _build_team(
     # this a no-op audit-log pass-through today rather than a live abort switch.
     read_cache_hook = _make_read_cache_tool_hook(activity=activity)
     # team_name=None (any caller that predates this kwarg) keeps both gates armed
-    # exactly as before -- gate_task is only ever suppressed for a team_name that
-    # was explicitly resolved and found NOT in the allowlist (e.g. "planning").
-    gate_task = task if (team_name is None or team_name in _GATE_ENABLED_TEAMS) else None
+    # exactly as before -- each gate_task is only ever suppressed for a team_name
+    # that was explicitly resolved and found NOT in ITS OWN allowlist. The two
+    # gates use different allowlists (_GATE_ENABLED_TEAMS vs the broader
+    # _SEARCH_GATE_ENABLED_TEAMS) -- see _SEARCH_GATE_ENABLED_TEAMS' own comment
+    # for why planning gets search-before-browse but not decompose-first.
+    decompose_gate_task = task if (team_name is None or team_name in _GATE_ENABLED_TEAMS) else None
+    search_gate_task = task if (team_name is None or team_name in _SEARCH_GATE_ENABLED_TEAMS) else None
     researcher_agent_name = _RESEARCHER_AGENT_NAME_BY_TEAM.get(team_name, _DEFAULT_RESEARCHER_AGENT_NAME)
     decompose_first_gate_hook = _make_decompose_first_gate_hook(
-        task=gate_task, researcher_member_id=researcher_agent_name,
+        task=decompose_gate_task, researcher_member_id=researcher_agent_name,
     )
     search_before_browse_gate_hook = _make_search_before_browse_gate_hook(
-        task=gate_task, researcher_agent_name=researcher_agent_name,
+        task=search_gate_task, researcher_agent_name=researcher_agent_name,
     )
     delegation_log_hook = _make_delegation_log_hook()
     interception_hook = _make_tool_interception_hook(activity=activity)
@@ -2643,7 +2698,7 @@ async def run_task_stream(
         )
     )
 
-    instructions = list(_COORDINATOR_INSTRUCTIONS)
+    instructions = _team_roster_preamble(agent_specs) + list(_COORDINATOR_INSTRUCTIONS)
     if skill_catalog:
         instructions += ["", format_skill_catalog(skill_catalog, None)]
     if failure_context:
@@ -3067,7 +3122,7 @@ async def run_task_async(
         )
     )
 
-    instructions = list(_COORDINATOR_INSTRUCTIONS)
+    instructions = _team_roster_preamble(agent_specs) + list(_COORDINATOR_INSTRUCTIONS)
     if skill_catalog:
         instructions += ["", format_skill_catalog(skill_catalog, None)]
     if failure_context:

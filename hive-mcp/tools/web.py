@@ -7,9 +7,13 @@ Tools:
     web_search(query, max_results)  — DuckDuckGo full-text search, returns titles + URLs + snippets
     web_fetch(url, max_chars)       — fetch a URL and return clean readable text
                                       GitHub repos: returns README via GitHub API
+                                      PDFs: extracts real text via pypdf (2026-08-15 — previously
+                                            fell through to the generic branch and returned raw
+                                            binary bytes decoded as text, unusable garbage)
                                       All other pages: strips nav/scripts/ads via BeautifulSoup
 """
 import base64
+import io
 import re
 import sys
 from pathlib import Path
@@ -104,6 +108,46 @@ def _github_repo_summary(owner: str, repo: str) -> str:
         return f"GitHub fetch failed: {exc}"
 
 
+def _extract_pdf_text(pdf_bytes: bytes, max_chars: int) -> str:
+    """Extract readable text from PDF bytes via pypdf. Never raises -- a corrupt,
+    encrypted, or scanned-image-only PDF returns a clear message instead of an
+    exception (matching web_fetch's own "return a string, always" contract) or,
+    the pre-2026-08-15 behavior this replaces, silently unreadable binary garbage."""
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return "PDF extraction unavailable — pypdf not installed."
+
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception as exc:
+        return f"Could not open PDF (corrupt or unsupported format): {exc}"
+
+    if reader.is_encrypted:
+        try:
+            reader.decrypt("")
+        except Exception:
+            return "PDF is password-protected — cannot extract text."
+
+    parts = []
+    total = 0
+    for page in reader.pages:
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            continue
+        if text.strip():
+            parts.append(text)
+            total += len(text)
+        if total >= max_chars:
+            break
+
+    if not parts:
+        return "PDF contains no extractable text (likely scanned images with no OCR layer)."
+
+    return "\n\n".join(parts)[:max_chars]
+
+
 # ── MCP tools ─────────────────────────────────────────────────────────────────
 
 def web_search(query: str, max_results: int = 5) -> str:
@@ -148,6 +192,7 @@ def web_fetch(url: str, max_chars: int = 8000) -> str:
     Handles:
     - GitHub repos (github.com/owner/repo) — returns repo metadata + README via GitHub API
     - GitHub raw files                      — returns raw file content directly
+    - PDFs                                  — extracts real text via pypdf
     - Documentation sites, blog posts       — strips nav/scripts/ads, returns main content
     - Any other HTTP URL                    — returns cleaned plain text
 
@@ -185,6 +230,13 @@ def web_fetch(url: str, max_chars: int = 8000) -> str:
         )
         resp.raise_for_status()
         content_type = resp.headers.get("content-type", "")
+
+        # Check both content-type AND the URL's own extension -- some servers send
+        # application/octet-stream for a PDF instead of application/pdf, and the
+        # extension is a reliable enough second signal not to fall through to the
+        # generic branch (which would decode the raw PDF bytes as text -- garbage).
+        if "pdf" in content_type or url.lower().split("?")[0].endswith(".pdf"):
+            return _extract_pdf_text(resp.content, max_chars)
 
         if "html" in content_type:
             return _clean_html(resp.text, max_chars)

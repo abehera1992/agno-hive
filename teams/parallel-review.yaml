@@ -3,7 +3,16 @@ description: Parallel read-only analysis — Researcher, SecurityReviewer, and P
 # coordinator_model / each agent's model: are DB-managed (AGNOHive 2.3.2 addendum,
 # 2026-08-08) — see team_role_models. Set model: back here to pin a role and take
 # it out of DB control again.
-mode: collaborate
+# mode: broadcast (corrected 2026-08-15, was "collaborate") -- "collaborate" is NOT a
+# real agno TeamMode (confirmed against the installed agno/team/mode.py: the only
+# values are coordinate/route/broadcast/tasks). agno/team/_init.py's mode-resolution
+# if/elif chain never matched the unrecognized string, so respond_directly/
+# delegate_to_all_members silently stayed at their coordinate-equivalent defaults --
+# this team was NEVER actually broadcasting the task to all 3 reviewers simultaneously
+# as this file's own description above claims; it ran exactly like plain coordinate
+# mode, leaving it up to the coordinator to correctly delegate to all three itself.
+# broadcast is the real TeamMode matching "All agents receive the task at once".
+mode: broadcast
 # Read-only allowlist for the coordinator's direct tool surface (members are scoped separately
 # via their own `tools:` lists). Without this, the coordinator receives every tool from every
 # connected MCP unfiltered — including write/staging tools (apply_diff, write_file, notion_*,
