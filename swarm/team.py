@@ -2486,11 +2486,36 @@ def _make_duplicate_delegation_gate_hook():
     coordinator re-delegating byte-identical read/extract tasks to the same
     member 3-5 times in a row, each a genuinely wasted ~10-30s round-trip.
 
-    Compares against session_state["delegations_made"] -- the exact structured
-    log _make_delegation_log_hook already populates for every executed
-    delegation this run. This hook must run BEFORE delegation_log_hook in the
-    tool_hooks list (see _build_team's ordering comment) so a blocked call is
-    correctly absent from that log, not recorded as if it had actually happened.
+    Maintains its OWN closure-local log -- a plain list captured once when this
+    function is called (the same pattern _make_decompose_first_gate_hook's
+    `state = {"decided": False}` and _make_search_before_browse_gate_hook's
+    `state = {"searched": False}` already use) -- rather than reading
+    session_state["delegations_made"] the way the original 2026-08-15 version
+    did. That version was live-verified BROKEN, not just insufficient, on
+    2026-08-16: a byte-identical delegate_task_to_members call, ~70s after the
+    first, was never redirected. Root-caused with direct instrumentation
+    (temporary diagnostic prints of id(run_context)/id(run_context.session_state)
+    on every call, three live re-runs): agno constructs a genuinely NEW
+    RunContext -- and therefore a new, empty session_state dict -- for EACH
+    separate delegate_task_to_members call within the SAME overall run. Two
+    consecutive calls in the same run showed completely different
+    run_context_id AND session_state_id values, with log_len=0 both times --
+    session_state is simply never threaded across delegate_task_to_members
+    calls the way _build_team's own "Two things are tracked for you
+    automatically" instruction (and the original version of this gate) assumed.
+    This also means the COORDINATOR's own prose-visible view of
+    session_state["delegations_made"] (rendered into its context via
+    add_session_state_to_context) is equally unreliable for this specific tool
+    -- a closure-local log sidesteps the problem entirely rather than depending
+    on agno's session_state threading being fixed.
+    _make_delegation_log_hook's OWN session_state write is left unchanged --
+    it may still be meaningful for delegate_task_to_member (singular, not
+    confirmed broken the same way) and for whatever the coordinator's own
+    context rendering is worth; this gate simply no longer depends on it.
+    This hook now records its own log entry directly, immediately after a
+    real (non-redirected) delegation call returns -- there is no separate
+    "run before/after delegation_log_hook" ordering concern anymore, since
+    this gate is fully self-contained.
 
     delegate_task_to_member (singular): blocks ONLY an exact (post-normalization)
     repeat of BOTH member_id (compared via _member_id(), matching agno's own real
@@ -2513,27 +2538,11 @@ def _make_duplicate_delegation_gate_hook():
     already logged this run is never that case by definition: the request text
     didn't change, so there is no new information for a fresh call to act on.
     """
+    log: list[dict] = []
+
     async def _duplicate_delegation_gate_hook(function_name, function, args, run_context=None):
         if function_name not in _DELEGATION_TOOL_NAMES:
             return await function(**args)
-
-        log = []
-        if run_context is not None and run_context.session_state is not None:
-            log = run_context.session_state.get("delegations_made", [])
-
-        # TEMPORARY DIAGNOSTIC (2026-08-16, T2e live re-verification): a byte-
-        # identical delegate_task_to_members call was NOT redirected live, despite
-        # this gate's own unit tests (fake run_context) passing. This print
-        # confirms or refutes whether session_state["delegations_made"] mutations
-        # from an EARLIER delegate call are actually visible to a LATER hook
-        # invocation within the same real agno run -- remove once root-caused.
-        print(
-            f"[dup-delegation-diag] function={function_name!r} "
-            f"run_context_id={id(run_context)} "
-            f"session_state_id={id(run_context.session_state) if run_context else None} "
-            f"log_len={len(log)} log_tools={[e.get('tool') for e in log]}",
-            flush=True,
-        )
 
         task_text = _normalize_delegation_task((args or {}).get("task"))
         if not task_text:
@@ -2564,7 +2573,9 @@ def _make_duplicate_delegation_gate_hook():
                         "This delegate_task_to_members call was NOT executed."
                     )
 
-        return await function(**args)
+        result = await function(**args)
+        log.append({"tool": function_name, "args": dict(args or {})})
+        return result
 
     return _duplicate_delegation_gate_hook
 
@@ -2776,14 +2787,15 @@ def _build_team(
     # blocked browse call never reaches the cache/serve-count bookkeeping at all --
     # it never really happened, the same principle decompose_first_gate_hook's own
     # positioning comment documents for delegation_log_hook. duplicate_delegation_gate_hook
-    # (2026-08-15, see its own docstring for the T2c incident that motivated it) sits
-    # BEFORE delegation_log_hook for the identical reason decompose_first_gate_hook does --
-    # a blocked duplicate must never be logged into delegations_made as if it had actually
-    # executed, or a THIRD identical attempt would find its own blocked-but-logged entry
-    # and short-circuit correctly by accident rather than by design. It also needs
-    # delegation_log_hook's log to already be populated with EARLIER real calls, which is
-    # naturally true regardless of relative ordering between the two, since the log is
-    # read fresh from session_state on every call, not snapshotted at hook-construction time.
+    # (2026-08-15, see its own docstring for the T2c incident that motivated it; rewritten
+    # 2026-08-16 to use its own closure-local log instead of session_state -- live-confirmed
+    # broken for delegate_task_to_members: agno constructs a genuinely NEW RunContext, and
+    # therefore a fresh empty session_state, for each separate call within the same run) is
+    # now fully self-contained -- it maintains and checks its own log directly, with no
+    # dependency on delegation_log_hook or session_state at all, so its position relative to
+    # delegation_log_hook no longer matters for correctness (delegation_log_hook's own
+    # session_state write is independent and may still be observed elsewhere in a member's
+    # context, unaffected by this hook's now-separate bookkeeping).
     tool_hooks = [
         interception_hook, search_before_browse_gate_hook, read_cache_hook,
         decompose_first_gate_hook, duplicate_delegation_gate_hook, delegation_log_hook,

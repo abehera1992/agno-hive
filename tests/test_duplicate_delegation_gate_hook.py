@@ -8,18 +8,22 @@ _make_duplicate_delegation_gate_hook's own docstring for the full writeup): the
 coordinator called delegate_task_to_members with the EXACT SAME task text twice,
 ~2.5 minutes apart, after round 1 had already produced two independently-correct,
 fully-cited member answers. Round 2 introduced a conflicting wrong answer, and the
-coordinator's synthesis sided with the wrong one over three correct ones. This gate
-prevents the duplicate broadcast/delegation from ever firing in the first place --
-the companion fix (a new "Resolving conflicting member reports" section in
-_COORDINATOR_INSTRUCTIONS) covers the synthesis side for cases where two genuinely
-different delegations still produce conflicting reports.
+coordinator's synthesis sided with the wrong one over three correct ones.
+
+Rewritten 2026-08-16: the original version compared against
+run_context.session_state["delegations_made"], seeded via a fake run_context in
+these tests. That was live-confirmed BROKEN, not just untested against the real
+thing: direct instrumentation (id(run_context), id(run_context.session_state) on
+every call) showed agno constructs a genuinely NEW RunContext -- and therefore a
+fresh, empty session_state -- for each separate delegate_task_to_members call
+within the SAME run, so a real duplicate was never actually caught live despite
+this file's own tests passing against the fake. The gate now maintains its own
+closure-local log (the same pattern _make_decompose_first_gate_hook's
+`state = {"decided": False}` already uses) -- these tests now make TWO
+SEQUENTIAL calls through the SAME hook instance to exercise it, rather than
+pre-seeding a fake run_context's session_state.
 """
 from swarm.team import _normalize_delegation_task, _make_duplicate_delegation_gate_hook
-
-
-class _FakeRunContext:
-    def __init__(self, session_state):
-        self.session_state = session_state
 
 
 async def _fake_delegate(**kwargs):
@@ -63,35 +67,31 @@ async def test_non_delegation_tool_calls_are_never_touched():
 
 async def test_first_delegation_this_run_is_never_blocked():
     hook = _make_duplicate_delegation_gate_hook()
-    run_context = _FakeRunContext({"delegations_made": []})
 
     result = await hook(
         "delegate_task_to_member", _fake_delegate,
         {"member_id": "Researcher", "task": "Read x.md and summarize it"},
-        run_context=run_context,
+        run_context=None,
     )
 
     assert result.startswith("delegated:")
 
 
-async def test_exact_repeat_to_same_member_is_blocked():
+async def test_exact_repeat_to_same_member_is_blocked_on_the_second_call():
+    """The gate's own closure records the first call's real execution, then
+    blocks a second, identical one against that same closure -- no run_context
+    involved at all, matching what's actually true live (a fresh RunContext per
+    delegate_task_to_members call, but the SAME hook function object/closure
+    persists across all calls in one run)."""
     hook = _make_duplicate_delegation_gate_hook()
-    run_context = _FakeRunContext({
-        "delegations_made": [
-            {"tool": "delegate_task_to_member", "args": {
-                "member_id": "researcher", "task": "Read x.md and summarize it",
-            }},
-        ],
-    })
+    args = {"member_id": "Researcher", "task": "Read x.md and summarize it"}
 
-    result = await hook(
-        "delegate_task_to_member", _fake_delegate,
-        {"member_id": "Researcher", "task": "Read x.md and summarize it"},
-        run_context=run_context,
-    )
+    first = await hook("delegate_task_to_member", _fake_delegate, args, run_context=None)
+    second = await hook("delegate_task_to_member", _fake_delegate, args, run_context=None)
 
-    assert result.startswith("REDIRECTED:")
-    assert "already delegated" in result
+    assert first.startswith("delegated:")
+    assert second.startswith("REDIRECTED:")
+    assert "already delegated" in second
 
 
 async def test_repeat_normalizes_whitespace_and_case_before_comparing():
@@ -99,81 +99,77 @@ async def test_repeat_normalizes_whitespace_and_case_before_comparing():
     gate should also catch incidental whitespace/case drift from the model
     re-typing the same request slightly differently."""
     hook = _make_duplicate_delegation_gate_hook()
-    run_context = _FakeRunContext({
-        "delegations_made": [
-            {"tool": "delegate_task_to_member", "args": {
-                "member_id": "researcher", "task": "Read x.md   and summarize it",
-            }},
-        ],
-    })
 
-    result = await hook(
+    first = await hook(
+        "delegate_task_to_member", _fake_delegate,
+        {"member_id": "researcher", "task": "Read x.md   and summarize it"},
+        run_context=None,
+    )
+    second = await hook(
         "delegate_task_to_member", _fake_delegate,
         {"member_id": "Researcher", "task": "read x.md and summarize it"},
-        run_context=run_context,
+        run_context=None,
     )
 
-    assert result.startswith("REDIRECTED:")
+    assert first.startswith("delegated:")
+    assert second.startswith("REDIRECTED:")
 
 
 async def test_repeat_matches_via_real_member_id_form_not_display_name():
     """Confirms this gate uses _member_id() (agno's real dashed/lowercased lookup
-    key), not a bare display-name comparison -- a multi-word member logged as
+    key), not a bare display-name comparison -- a multi-word member called as
     'context-router' must still match a later call spelled 'ContextRouter'."""
     hook = _make_duplicate_delegation_gate_hook()
-    run_context = _FakeRunContext({
-        "delegations_made": [
-            {"tool": "delegate_task_to_member", "args": {
-                "member_id": "context-router", "task": "list_directory_tree()",
-            }},
-        ],
-    })
 
-    result = await hook(
+    first = await hook(
+        "delegate_task_to_member", _fake_delegate,
+        {"member_id": "context-router", "task": "list_directory_tree()"},
+        run_context=None,
+    )
+    second = await hook(
         "delegate_task_to_member", _fake_delegate,
         {"member_id": "ContextRouter", "task": "list_directory_tree()"},
-        run_context=run_context,
+        run_context=None,
     )
 
-    assert result.startswith("REDIRECTED:")
+    assert first.startswith("delegated:")
+    assert second.startswith("REDIRECTED:")
 
 
 async def test_same_task_to_a_different_member_is_not_blocked():
     hook = _make_duplicate_delegation_gate_hook()
-    run_context = _FakeRunContext({
-        "delegations_made": [
-            {"tool": "delegate_task_to_member", "args": {
-                "member_id": "researcher", "task": "Read x.md and summarize it",
-            }},
-        ],
-    })
 
-    result = await hook(
+    first = await hook(
+        "delegate_task_to_member", _fake_delegate,
+        {"member_id": "Researcher", "task": "Read x.md and summarize it"},
+        run_context=None,
+    )
+    second = await hook(
         "delegate_task_to_member", _fake_delegate,
         {"member_id": "SecurityReviewer", "task": "Read x.md and summarize it"},
-        run_context=run_context,
+        run_context=None,
     )
 
-    assert result.startswith("delegated:")
+    assert first.startswith("delegated:")
+    assert second.startswith("delegated:")
 
 
 async def test_differently_worded_follow_up_to_same_member_is_not_blocked():
     hook = _make_duplicate_delegation_gate_hook()
-    run_context = _FakeRunContext({
-        "delegations_made": [
-            {"tool": "delegate_task_to_member", "args": {
-                "member_id": "researcher", "task": "Read x.md and summarize it",
-            }},
-        ],
-    })
 
-    result = await hook(
+    first = await hook(
+        "delegate_task_to_member", _fake_delegate,
+        {"member_id": "Researcher", "task": "Read x.md and summarize it"},
+        run_context=None,
+    )
+    second = await hook(
         "delegate_task_to_member", _fake_delegate,
         {"member_id": "Researcher", "task": "Now read y.md and compare it to x.md"},
-        run_context=run_context,
+        run_context=None,
     )
 
-    assert result.startswith("delegated:")
+    assert first.startswith("delegated:")
+    assert second.startswith("delegated:")
 
 
 async def test_blocked_call_is_never_actually_invoked():
@@ -184,56 +180,58 @@ async def test_blocked_call_is_never_actually_invoked():
         return "should not run"
 
     hook = _make_duplicate_delegation_gate_hook()
-    run_context = _FakeRunContext({
-        "delegations_made": [
-            {"tool": "delegate_task_to_member", "args": {"member_id": "researcher", "task": "dup task"}},
-        ],
-    })
+    args = {"member_id": "Researcher", "task": "dup task"}
 
-    await hook(
-        "delegate_task_to_member", tracking_delegate,
-        {"member_id": "Researcher", "task": "dup task"},
-        run_context=run_context,
-    )
+    await hook("delegate_task_to_member", tracking_delegate, args, run_context=None)
+    calls.clear()  # only interested in whether the SECOND call reaches the function
+    await hook("delegate_task_to_member", tracking_delegate, args, run_context=None)
 
     assert calls == []
+
+
+async def test_a_third_identical_call_is_also_blocked():
+    """The closure log accumulates real entries -- it must not stop protecting
+    after the first block (e.g. by clearing itself)."""
+    hook = _make_duplicate_delegation_gate_hook()
+    args = {"member_id": "Researcher", "task": "dup task"}
+
+    first = await hook("delegate_task_to_member", _fake_delegate, args, run_context=None)
+    second = await hook("delegate_task_to_member", _fake_delegate, args, run_context=None)
+    third = await hook("delegate_task_to_member", _fake_delegate, args, run_context=None)
+
+    assert first.startswith("delegated:")
+    assert second.startswith("REDIRECTED:")
+    assert third.startswith("REDIRECTED:")
 
 
 # ── _make_duplicate_delegation_gate_hook: delegate_task_to_members (broadcast) ───
 
 async def test_first_broadcast_this_run_is_never_blocked():
     hook = _make_duplicate_delegation_gate_hook()
-    run_context = _FakeRunContext({"delegations_made": []})
 
     result = await hook(
         "delegate_task_to_members", _fake_delegate,
         {"task": "Read the schema file and list every table and field."},
-        run_context=run_context,
+        run_context=None,
     )
 
     assert result.startswith("delegated:")
 
 
-async def test_exact_repeat_broadcast_is_blocked():
-    """The actual T2c incident shape: delegate_task_to_members called twice with
-    byte-identical task text."""
+async def test_exact_repeat_broadcast_is_blocked_on_the_second_call():
+    """The actual T2c/T2e live-incident shape: delegate_task_to_members called
+    twice with byte-identical task text, each call carrying its OWN fresh
+    RunContext (confirmed live 2026-08-16) -- this hook's closure-local log,
+    not run_context, is what makes the second call detectable at all."""
     hook = _make_duplicate_delegation_gate_hook()
-    run_context = _FakeRunContext({
-        "delegations_made": [
-            {"tool": "delegate_task_to_members", "args": {
-                "task": "Read the schema file and list every table and field.",
-            }},
-        ],
-    })
+    args = {"task": "Read the schema file and list every table and field."}
 
-    result = await hook(
-        "delegate_task_to_members", _fake_delegate,
-        {"task": "Read the schema file and list every table and field."},
-        run_context=run_context,
-    )
+    first = await hook("delegate_task_to_members", _fake_delegate, args, run_context=None)
+    second = await hook("delegate_task_to_members", _fake_delegate, args, run_context=None)
 
-    assert result.startswith("REDIRECTED:")
-    assert "already broadcast" in result
+    assert first.startswith("delegated:")
+    assert second.startswith("REDIRECTED:")
+    assert "already broadcast" in second
 
 
 async def test_broadcast_repeat_does_not_match_a_singular_delegate_log_entry():
@@ -241,38 +239,52 @@ async def test_broadcast_repeat_does_not_match_a_singular_delegate_log_entry():
     separate spaces -- a prior singular delegation with the same text must never
     block a later broadcast call, since they are semantically different actions."""
     hook = _make_duplicate_delegation_gate_hook()
-    run_context = _FakeRunContext({
-        "delegations_made": [
-            {"tool": "delegate_task_to_member", "args": {
-                "member_id": "researcher", "task": "Read the schema file and list every table and field.",
-            }},
-        ],
-    })
 
-    result = await hook(
+    first = await hook(
+        "delegate_task_to_member", _fake_delegate,
+        {"member_id": "Researcher", "task": "Read the schema file and list every table and field."},
+        run_context=None,
+    )
+    second = await hook(
         "delegate_task_to_members", _fake_delegate,
         {"task": "Read the schema file and list every table and field."},
-        run_context=run_context,
+        run_context=None,
     )
 
-    assert result.startswith("delegated:")
+    assert first.startswith("delegated:")
+    assert second.startswith("delegated:")
 
 
 async def test_differently_worded_broadcast_is_not_blocked():
     hook = _make_duplicate_delegation_gate_hook()
-    run_context = _FakeRunContext({
-        "delegations_made": [
-            {"tool": "delegate_task_to_members", "args": {"task": "Read the schema file."}},
-        ],
-    })
 
-    result = await hook(
+    first = await hook(
         "delegate_task_to_members", _fake_delegate,
-        {"task": "Now check the API endpoints for security issues."},
-        run_context=run_context,
+        {"task": "Read the schema file."}, run_context=None,
+    )
+    second = await hook(
+        "delegate_task_to_members", _fake_delegate,
+        {"task": "Now check the API endpoints for security issues."}, run_context=None,
     )
 
-    assert result.startswith("delegated:")
+    assert first.startswith("delegated:")
+    assert second.startswith("delegated:")
+
+
+# ── Isolation between separate hook instances (separate runs) ────────────────────
+
+async def test_two_separate_hook_instances_do_not_share_state():
+    """Each _build_team() call constructs its own hook via
+    _make_duplicate_delegation_gate_hook() -- one run's delegations must never
+    leak into a different run's closure."""
+    hook_a = _make_duplicate_delegation_gate_hook()
+    hook_b = _make_duplicate_delegation_gate_hook()
+    args = {"member_id": "Researcher", "task": "same task text"}
+
+    await hook_a("delegate_task_to_member", _fake_delegate, args, run_context=None)
+    result_b = await hook_b("delegate_task_to_member", _fake_delegate, args, run_context=None)
+
+    assert result_b.startswith("delegated:")
 
 
 # ── Edge cases shared by both tool shapes ────────────────────────────────────────
@@ -289,31 +301,12 @@ async def test_missing_run_context_does_not_crash_and_never_blocks():
     assert result.startswith("delegated:")
 
 
-async def test_none_session_state_does_not_crash_and_never_blocks():
-    hook = _make_duplicate_delegation_gate_hook()
-    run_context = _FakeRunContext(None)
-
-    result = await hook(
-        "delegate_task_to_member", _fake_delegate,
-        {"member_id": "Researcher", "task": "Read x.md"},
-        run_context=run_context,
-    )
-
-    assert result.startswith("delegated:")
-
-
 async def test_empty_task_text_is_never_blocked():
     hook = _make_duplicate_delegation_gate_hook()
-    run_context = _FakeRunContext({
-        "delegations_made": [
-            {"tool": "delegate_task_to_member", "args": {"member_id": "researcher", "task": ""}},
-        ],
-    })
+    args = {"member_id": "Researcher", "task": ""}
 
-    result = await hook(
-        "delegate_task_to_member", _fake_delegate,
-        {"member_id": "Researcher", "task": ""},
-        run_context=run_context,
-    )
+    first = await hook("delegate_task_to_member", _fake_delegate, args, run_context=None)
+    second = await hook("delegate_task_to_member", _fake_delegate, args, run_context=None)
 
-    assert result.startswith("delegated:")
+    assert first.startswith("delegated:")
+    assert second.startswith("delegated:")
