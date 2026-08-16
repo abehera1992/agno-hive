@@ -514,6 +514,132 @@ def test_scope_coordinator_tools_excludes_lightrag_query_even_when_allowlisted()
     assert "get_file_content_fn" in scoped
 
 
+# ── Notion discovery tools: engineering coordinator forced to delegate, ──────────
+# ── sprint-master exempted (deliberate, tested prior design) ─────────────────────
+#
+# Live incident (2026-08-15, T10b engineering-team groundedness retest):
+# teams/engineering.yaml has NO coordinator_tools: allowlist at all, so
+# _scope_coordinator_tools' no-allowlist branch handed its coordinator every tool
+# from every connected MCP except _COORDINATOR_DISCOVERY_TOOLS -- Notion included.
+# Asked a sprint-lookup question, the coordinator hand-built raw
+# notion_query_database relation filters itself (5 failed attempts) instead of
+# delegating to a member with real Notion-usage instructions, and never
+# synthesized a final answer. sprint-master.yaml is the deliberate exception --
+# its own coordinator_tools comment documents that direct coordinator access to
+# these same read tools was a tested fix for a different, earlier incident.
+
+def test_notion_read_tools_are_in_the_notion_discovery_set():
+    """Notion discovery tools are deliberately kept in their OWN set, not unioned
+    into _COORDINATOR_DISCOVERY_TOOLS itself -- _scope_coordinator_tools' _keep()
+    checks both sets together, but _COORDINATOR_DISCOVERY_TOOLS stays the
+    unconditional (no team exemption possible) set, while _NOTION_DISCOVERY_TOOLS
+    is the one _NOTION_DISCOVERY_EXEMPT_TEAMS can opt out of."""
+    from swarm.team import _NOTION_DISCOVERY_TOOLS
+
+    for tool in (
+        "notion_search", "notion_get_page", "notion_get_database_schema",
+        "notion_query_database", "notion_items_in_sprint",
+        "notion_get_item_with_relations", "notion_find_work_item",
+    ):
+        assert tool in _NOTION_DISCOVERY_TOOLS
+
+
+def test_notion_write_tools_are_never_in_either_discovery_set():
+    """Only read/query tools are forced through delegation -- write tools stay
+    directly callable by the coordinator, gated by WRITE_REVIEW like any other
+    write, consistent with the project's own delivery-board-sync workflow."""
+    from swarm.team import _NOTION_DISCOVERY_TOOLS, _COORDINATOR_DISCOVERY_TOOLS
+
+    for tool in (
+        "notion_create_page", "notion_update_page_props", "notion_append_blocks",
+        "notion_append_markdown", "notion_trash_page", "notion_update_content",
+        "notion_update_block", "notion_delete_block",
+    ):
+        assert tool not in _NOTION_DISCOVERY_TOOLS
+        assert tool not in _COORDINATOR_DISCOVERY_TOOLS
+
+
+def test_engineering_coordinator_notion_reads_excluded_even_when_allowlisted():
+    from swarm.team import _scope_coordinator_tools
+
+    mcp = _fake_mcp({
+        "notion_search": "notion_search_fn",
+        "notion_items_in_sprint": "notion_items_in_sprint_fn",
+        "get_file_content": "get_file_content_fn",
+    })
+
+    scoped = _scope_coordinator_tools(
+        ["notion_search", "notion_items_in_sprint", "get_file_content"], [mcp],
+        read_only=False, team_name="engineering",
+    )
+    assert "notion_search_fn" not in scoped
+    assert "notion_items_in_sprint_fn" not in scoped
+    assert "get_file_content_fn" in scoped
+
+
+def test_engineering_coordinator_no_allowlist_still_excludes_notion_reads():
+    """The exact live-incident shape: engineering.yaml passes NO coordinator_tools
+    at all, landing in the no-allowlist branch."""
+    from swarm.team import _scope_coordinator_tools
+
+    mcp = _fake_mcp({
+        "notion_query_database": "notion_query_database_fn",
+        "notion_get_item_with_relations": "notion_get_item_with_relations_fn",
+        "apply_diff": "apply_diff_fn",
+    })
+
+    scoped = _scope_coordinator_tools(None, [mcp], read_only=False, team_name="engineering")
+    assert "notion_query_database_fn" not in scoped
+    assert "notion_get_item_with_relations_fn" not in scoped
+    assert "apply_diff_fn" in scoped  # writes are unaffected -- only Notion reads are gated
+
+
+def test_sprint_master_coordinator_keeps_direct_notion_read_access():
+    """The deliberate exemption -- sprint-master's own coordinator_tools comment
+    documents this direct access as a tested fix for a prior, unrelated incident
+    (delegating board reads to BacklogResearcher thrashed ~400s and gave up)."""
+    from swarm.team import _scope_coordinator_tools
+
+    mcp = _fake_mcp({
+        "notion_search": "notion_search_fn",
+        "notion_query_database": "notion_query_database_fn",
+        "notion_items_in_sprint": "notion_items_in_sprint_fn",
+        "notion_get_item_with_relations": "notion_get_item_with_relations_fn",
+        "notion_find_work_item": "notion_find_work_item_fn",
+        "notion_get_database_schema": "notion_get_database_schema_fn",
+        "notion_get_page": "notion_get_page_fn",
+    })
+
+    scoped = _scope_coordinator_tools(
+        list(mcp.functions.keys()), [mcp], read_only=False, team_name="sprint-master",
+    )
+    for fn in mcp.functions.values():
+        assert fn in scoped
+
+
+def test_default_team_name_none_preserves_prior_behavior_notion_excluded():
+    """A caller that doesn't pass team_name (every pre-2026-08-15 caller) gets the
+    Notion tools excluded too -- None is not accidentally treated as exempt."""
+    from swarm.team import _scope_coordinator_tools
+
+    mcp = _fake_mcp({"notion_search": "notion_search_fn", "get_file_content": "get_file_content_fn"})
+
+    scoped = _scope_coordinator_tools(["notion_search", "get_file_content"], [mcp], read_only=True)
+    assert "notion_search_fn" not in scoped
+    assert "get_file_content_fn" in scoped
+
+
+def test_some_other_team_name_does_not_get_the_sprint_master_exemption():
+    from swarm.team import _scope_coordinator_tools
+
+    mcp = _fake_mcp({"notion_search": "notion_search_fn"})
+
+    scoped = _scope_coordinator_tools(
+        ["notion_search"], [mcp], read_only=False, team_name="parallel-review",
+    )
+    assert "notion_search_fn" not in scoped
+
+
 def test_coordinator_instructions_delegation_examples_use_the_real_member_id():
     """The actual live bug: _COORDINATOR_INSTRUCTIONS' own example code told the
     coordinator to type the display name verbatim. Every delegate_task_to_member

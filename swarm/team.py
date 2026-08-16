@@ -613,9 +613,51 @@ _COORDINATOR_DISCOVERY_TOOLS = {
     # immediately after get_context_section's own direct calls in the same run.
     "get_graph_report",
 }
+# Notion READ/discovery tools added 2026-08-15, same incident class as the set
+# above, found live on `engineering` (which -- unlike parallel-review/planning --
+# has NO coordinator_tools: allowlist at all in teams/engineering.yaml, so
+# _scope_coordinator_tools' no-allowlist branch handed the coordinator every tool
+# from every connected MCP except _COORDINATOR_DISCOVERY_TOOLS, Notion included):
+# asked a sprint-lookup question, the coordinator directly hand-built raw
+# notion_query_database relation filters instead of delegating -- 5 failed
+# attempts (one with a dropped dash mid-UUID, a plausible model transcription
+# slip, not the root cause) before it stumbled onto the purpose-built
+# notion_items_in_sprint tool with no run budget left to synthesize a final
+# answer. teams/sprint-master.yaml's BacklogResearcher carries the exact
+# instruction that would have prevented this ("SPRINT QUESTIONS -- USE THE
+# PURPOSE-BUILT TOOL: ... you do NOT look up the sprint id yourself") -- but
+# that's member-agent YAML instruction text, invisible to the coordinator, which
+# has no equivalent guidance of its own. Same fix shape as lightrag_query/
+# get_context_section above: these are reference-lookup/discovery tools, not
+# writes (notion_create_page/notion_update_page_props/etc. deliberately NOT
+# included -- engineering's coordinator legitimately writes Notion content as
+# part of the project's own delivery-board-sync workflow, gated by WRITE_REVIEW
+# same as any other write tool; only the READ/query side needs to be forced
+# through a properly-instructed member).
+#
+# Kept as a SEPARATE set, not merged into _COORDINATOR_DISCOVERY_TOOLS directly,
+# because sprint-master is a real, deliberate exception: its own coordinator_tools
+# comment documents that direct (non-delegated) coordinator access to these exact
+# read tools was a TESTED FIX for a prior incident ("a read-only coordinator could
+# not complete writes... delegation to the worker was unreliable -- it thrashed
+# ~400s then gave up"). Blanket-adding these to _COORDINATOR_DISCOVERY_TOOLS would
+# silently strip them from sprint-master too (`_keep()` applies even to a team's
+# own explicit coordinator_tools: allowlist, by design -- see lightrag_query's own
+# comment above), regressing a different, already-fixed problem while fixing this
+# one. _scope_coordinator_tools takes a `team_name` and exempts exactly this set
+# for `_NOTION_DISCOVERY_EXEMPT_TEAMS` instead.
+_NOTION_DISCOVERY_TOOLS = {
+    "notion_search", "notion_get_page", "notion_get_database_schema",
+    "notion_query_database", "notion_items_in_sprint",
+    "notion_get_item_with_relations", "notion_find_work_item",
+}
+_NOTION_DISCOVERY_EXEMPT_TEAMS = {"sprint-master"}
 
 
-def _scope_coordinator_tools(tool_names: list[str] | None, mcp_list: list, read_only: bool = False):
+def _scope_coordinator_tools(
+    tool_names: list[str] | None, mcp_list: list, read_only: bool = False,
+    team_name: str | None = None,
+):
     """Scope the coordinator's direct MCP tool surface to an explicit allowlist, and
     always exclude _COORDINATOR_DISCOVERY_TOOLS (see its own docstring above).
 
@@ -633,13 +675,25 @@ def _scope_coordinator_tools(tool_names: list[str] | None, mcp_list: list, read_
     returned mcp_list unfiltered; confirmed via mcp.functions already being reliably
     populated by the time this runs (the read_only and explicit-allowlist branches have
     depended on it since 2026-07-31 with no reported gap).
+
+    `team_name` (default None, matching every pre-2026-08-15 caller byte-for-byte)
+    exempts `_NOTION_DISCOVERY_TOOLS` from the discovery-block for teams listed in
+    `_NOTION_DISCOVERY_EXEMPT_TEAMS` — currently just `sprint-master`, whose own
+    coordinator_tools comment documents that direct (non-delegated) access to these
+    exact read tools was a deliberate, tested fix for a different prior incident.
+    See _NOTION_DISCOVERY_TOOLS's own comment for why this is a separate exemption
+    rather than simply not adding those tools to _COORDINATOR_DISCOVERY_TOOLS at all.
     """
     all_funcs: dict = {}
     for mcp in mcp_list:
         all_funcs.update(mcp.functions)
 
+    notion_exempt = team_name in _NOTION_DISCOVERY_EXEMPT_TEAMS
+
     def _keep(name: str) -> bool:
-        return name not in _COORDINATOR_DISCOVERY_TOOLS
+        if name not in _COORDINATOR_DISCOVERY_TOOLS and name not in _NOTION_DISCOVERY_TOOLS:
+            return True
+        return notion_exempt and name in _NOTION_DISCOVERY_TOOLS
 
     if not tool_names and not read_only:
         scoped = [f for n, f in all_funcs.items() if _keep(n)]
@@ -2697,7 +2751,9 @@ def _build_team(
     # before; this doesn't change their behavior at all, only whether the coordinator's own
     # surface additionally excludes write tools regardless of the request's read_only value.
     _coordinator_tool_scope = read_only or config.coordinator_no_direct_writes
-    coordinator_tools_list = list(_scope_coordinator_tools(coordinator_tools, mcp_list, _coordinator_tool_scope)) + [
+    coordinator_tools_list = list(_scope_coordinator_tools(
+        coordinator_tools, mcp_list, _coordinator_tool_scope, team_name=team_name,
+    )) + [
         request_clarification, update_session_state,
     ]
     return Team(
