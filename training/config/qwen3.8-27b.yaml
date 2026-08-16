@@ -54,18 +54,40 @@ lora:
   # before v2 widened it. Applying that lesson up front here rather than
   # discovering it the same way again.
   #
-  # The 5 added names (in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, out_proj) are
-  # confirmed real nn.Linear layers inside the linear-attention (GDN) blocks —
-  # verified via the same meta-device inspection, not assumed from the name.
+  # The added names (in_proj_qkv, in_proj_z, out_proj) are confirmed real
+  # nn.Linear layers inside the linear-attention (GDN) blocks — verified via the
+  # same meta-device inspection, not assumed from the name.
   # Deliberately EXCLUDES conv1d: it's a small state-space mixing layer
   # (~41K params/layer, nn.Conv1d not nn.Linear) and PEFT/Unsloth LoRA support for
   # Conv1d on a brand-new architecture with no dedicated Unsloth fast-path is an
   # unproven combination not worth risking on a first attempt. If this run
   # underperforms and conv1d coverage looks like the reason, that is the next
   # lever — not a blind first try.
+  #
+  # in_proj_a/in_proj_b REMOVED 2026-08-16 after the first attempt with them
+  # included went NaN at epoch ~3.4/4 (train_loss: nan, grad_norm: nan for the
+  # last ~15% of steps). Root-caused precisely, not just suspected: loaded both
+  # the clean end-of-epoch-3 checkpoint (checkpoint-312, 0/992 NaN tensors) and
+  # the corrupted final checkpoint (checkpoint-416, 96/992 NaN) and diffed which
+  # tensors differed -- ALL 96 NaN tensors were in_proj_a/in_proj_b's lora_B
+  # weights across all 48 linear-attention layers (48 layers x 2 modules), with
+  # zero NaN anywhere else, including the other 3 added linear-attention modules
+  # (in_proj_qkv/in_proj_z/out_proj), which stayed completely stable through all
+  # 416 steps. in_proj_a/in_proj_b are the GDN mechanism's small state-space
+  # gating scalars (real weight shape (48, 5120) -- confirmed via the same
+  # meta-device inspection as the rest of this list), not regular attention
+  # projections; their lora_B matrices were already an order of magnitude
+  # smaller in magnitude than lora_A's even at the last clean checkpoint
+  # (0.0007 vs 0.0147 max abs) -- numerically the most fragile parameters in
+  # the whole target list, and the ones Unsloth's own loader.py flags this
+  # architecture's GDN layers for ("GDN layers produce NaN grad norms" in
+  # FORCE_FLOAT32's comment) turned out to be specifically these, not the GDN
+  # block as a whole. Also low-value to keep: they're low-level state-space
+  # gates, not content/decision-relevant pathways, so dropping them costs
+  # little of what this run is actually trying to teach (citation restraint).
   target_modules: [
     q_proj, k_proj, v_proj, o_proj,
-    in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, out_proj,
+    in_proj_qkv, in_proj_z, out_proj,
     gate_proj, up_proj, down_proj,
   ]
   use_gradient_checkpointing: unsloth
