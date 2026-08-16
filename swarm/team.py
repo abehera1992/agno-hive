@@ -3050,6 +3050,13 @@ async def run_task_stream(
         )
 
         full_content: list[str] = []
+        # See _stream_team_run's own docstring for the narration-leak incident this
+        # tracks -- reset to len(full_content) on every tool event so the final
+        # fallback (used only when final_run_output.content is empty) can prefer
+        # just the text generated SINCE the last tool call, not the whole run's
+        # accumulated transcript (which interleaves every agent's own pre-tool-call
+        # narration with the real final answer).
+        last_segment_start = 0
         final_run_output: "TeamRunOutput | None" = None
 
         with _tracer.start_as_current_span("agno.task.stream", attributes={
@@ -3088,8 +3095,11 @@ async def run_task_stream(
                         yield out
                     elif isinstance(out, dict):
                         yield out
+                        last_segment_start = len(full_content)
                 accumulated = "".join(full_content) or "(no response)"
-                combined = final_run_output.content if final_run_output and final_run_output.content else accumulated
+                final_segment = "".join(full_content[last_segment_start:]).strip()
+                fallback_content = final_segment if final_segment else accumulated
+                combined = final_run_output.content if final_run_output and final_run_output.content else fallback_content
                 # Tier-3 guard: fill [[COUNT ...]] markers in the final content (streamed
                 # chunks above are pre-substitution; the done-sentinel content is corrected).
                 try:
@@ -3238,12 +3248,35 @@ async def _stream_team_run(
     test fakes that don't construct a real TeamRunOutput).
 
     Returns (content, run_output) -- content prefers the real TeamRunOutput's own
-    .content when available, falling back to the accumulated stream text only if the
-    run never reached that final yield (e.g. it was cancelled mid-stream). run_output
-    is None in that same edge case -- callers already null-check every helper that
-    reads it (_count_read_calls etc. all return -1/"undeterminable" for a bare
-    getattr(None, ...) miss, the same fail-safe posture used everywhere else in this
-    module), so this degrades the same way a non-streaming call raising would have.
+    .content when available. The fallback path was assumed rare (only a mid-stream
+    cancellation, where the final yield never arrives) but is NOT -- live-confirmed
+    2026-08-15 (T1e/T2e/T3e engineering-team groundedness retest): a normal,
+    successfully-COMPLETED multi-agent coordination run routinely leaves
+    final_run_output.content empty too (agno does not always populate the Team-level
+    .content field once the coordinator has synthesized an answer via delegated
+    members rather than generating it directly), so this fallback fires far more
+    often than the "cancelled mid-stream" case it was written for.
+
+    When it does fire, the fallback is the LAST contiguous run of text chunks SINCE
+    THE LAST TOOL EVENT (start or end, coordinator's own or any delegated member's)
+    -- not the full accumulated transcript of the whole run. Live-confirmed incident
+    this fixes: the full accumulated transcript concatenates every agent's own
+    mid-process narration ("I'll investigate the pattern...", "I apologize for the
+    error, let me correct that...", "I'll check the Notion page...") emitted BEFORE
+    each tool call, in front of the real final answer -- returning that whole
+    transcript as "the answer" leaked internal scratch narration into every
+    user-facing response that hit this fallback. The segment-since-last-tool-event
+    heuristic reliably isolates just the coordinator's final synthesis text, since no
+    further tool calls happen once synthesis begins. Still falls back to the FULL
+    accumulated transcript if that last segment is empty (e.g. the stream's very
+    last event was itself a tool call with no trailing text) -- this function must
+    never return truly nothing over returning something imperfect.
+
+    run_output is None in the mid-stream-cancellation edge case -- callers already
+    null-check every helper that reads it (_count_read_calls etc. all return
+    -1/"undeterminable" for a bare getattr(None, ...) miss, the same fail-safe
+    posture used everywhere else in this module), so this degrades the same way a
+    non-streaming call raising would have.
 
     Runs its own heartbeat with its OWN fresh activity dict, not the original run's --
     it has no access to the tool_hook closure the original team was built with, so
@@ -3277,6 +3310,12 @@ async def _stream_team_run(
         _run_heartbeat(activity, time.monotonic(), liveness_path=liveness_path)
     )
     full_content: list[str] = []
+    # Index into full_content marking where the CURRENT (most recent) text segment
+    # started -- reset to len(full_content) on every tool event, so the slice
+    # full_content[last_segment_start:] always holds just the text generated SINCE
+    # the last tool call, from any agent. See this function's own docstring for the
+    # narration-leak incident this exists to fix.
+    last_segment_start = 0
     final_run_output: "TeamRunOutput | None" = None
     last_logged_len = 0
     last_logged_at = time.monotonic()
@@ -3328,6 +3367,7 @@ async def _stream_team_run(
             elif isinstance(out, dict):
                 activity["last_progress_at"] = time.monotonic()
                 print(f"[{log_label}] stream tool event: {out}", flush=True)
+                last_segment_start = len(full_content)
             else:
                 _log_unclassified_stream_event(log_label, event, unrecognized_event_counts)
     finally:
@@ -3335,7 +3375,9 @@ async def _stream_team_run(
         with suppress(asyncio.CancelledError):
             await heartbeat_task
     accumulated = "".join(full_content) or "(no response)"
-    content = final_run_output.content if final_run_output and final_run_output.content else accumulated
+    final_segment = "".join(full_content[last_segment_start:]).strip()
+    fallback_content = final_segment if final_segment else accumulated
+    content = final_run_output.content if final_run_output and final_run_output.content else fallback_content
     return content, final_run_output
 
 
@@ -3533,6 +3575,12 @@ async def run_task_async(
                     final_run_output: "TeamRunOutput | None" = None
                     last_logged_len = 0
                     last_logged_at = time.monotonic()
+                    # See _stream_team_run's own docstring for the narration-leak incident
+                    # this tracks -- reset to len(full_content) on every tool event so the
+                    # final fallback (used only when final_run_output.content is empty) can
+                    # prefer just the text generated SINCE the last tool call, not the whole
+                    # run's accumulated transcript.
+                    last_segment_start = 0
                     try:
                         # Consuming the stream internally (2026-08-10) instead of one opaque
                         # blocking team.arun(task) -- external behavior (return type, downstream
@@ -3586,6 +3634,7 @@ async def run_task_async(
                             elif isinstance(out, dict):
                                 activity["last_progress_at"] = time.monotonic()
                                 print(f"[team] stream tool event: {out}", flush=True)
+                                last_segment_start = len(full_content)
                             else:
                                 # Diagnostic (2026-08-10, revised): the first version of this
                                 # logged each unique event.event TYPE once -- but a live run
@@ -3603,7 +3652,9 @@ async def run_task_async(
                         with suppress(asyncio.CancelledError):
                             await heartbeat_task
                 accumulated = "".join(full_content) or "(no response)"
-                content = final_run_output.content if final_run_output and final_run_output.content else accumulated
+                final_segment = "".join(full_content[last_segment_start:]).strip()
+                fallback_content = final_segment if final_segment else accumulated
+                content = final_run_output.content if final_run_output and final_run_output.content else fallback_content
                 # Clarification check runs BEFORE the claim-verification/count-marker
                 # guards below, and short-circuits past both when found: those guards
                 # validate a completed factual answer, and a clarification block is
