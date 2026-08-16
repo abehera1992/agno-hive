@@ -2521,6 +2521,20 @@ def _make_duplicate_delegation_gate_hook():
         if run_context is not None and run_context.session_state is not None:
             log = run_context.session_state.get("delegations_made", [])
 
+        # TEMPORARY DIAGNOSTIC (2026-08-16, T2e live re-verification): a byte-
+        # identical delegate_task_to_members call was NOT redirected live, despite
+        # this gate's own unit tests (fake run_context) passing. This print
+        # confirms or refutes whether session_state["delegations_made"] mutations
+        # from an EARLIER delegate call are actually visible to a LATER hook
+        # invocation within the same real agno run -- remove once root-caused.
+        print(
+            f"[dup-delegation-diag] function={function_name!r} "
+            f"run_context_id={id(run_context)} "
+            f"session_state_id={id(run_context.session_state) if run_context else None} "
+            f"log_len={len(log)} log_tools={[e.get('tool') for e in log]}",
+            flush=True,
+        )
+
         task_text = _normalize_delegation_task((args or {}).get("task"))
         if not task_text:
             return await function(**args)
