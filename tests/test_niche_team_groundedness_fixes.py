@@ -756,6 +756,36 @@ def test_no_process_narration_section_follows_entity_match_discipline():
     assert idx_entity < idx_narration
 
 
+def test_shared_state_section_covers_reworded_delegation_duplicates():
+    """T2c live incident (2026-08-15, parallel-review groundedness retest): a
+    reworded (not byte-identical) re-delegation of the same underlying question
+    evades the mechanical duplicate-delegation gate (_make_duplicate_delegation_
+    gate_hook only blocks exact/whitespace-normalized repeats, by design -- two
+    empirically-tested similarity metrics, SequenceMatcher ratio and Jaccard
+    word-overlap, were both found to produce unsafe false positives on
+    realistic legitimate delegation sequences, e.g. asking about "Party" fields
+    then legitimately asking about "PartyRegistration" fields). This is a
+    prose-only strengthening of the existing session_state guidance, not a new
+    mechanical gate, for the same reason entity-match discipline and
+    no-process-narration are prose-only."""
+    from swarm.team import _COORDINATOR_INSTRUCTIONS
+
+    text = "\n".join(_COORDINATOR_INSTRUCTIONS)
+    assert "REWORDED duplicates count too" in text
+    assert "PartyRegistration have" in text
+    assert "am I asking about the SAME target" in text
+
+
+def test_reworded_duplicate_guidance_lives_in_the_session_state_section():
+    from swarm.team import _COORDINATOR_INSTRUCTIONS
+
+    text = "\n".join(_COORDINATOR_INSTRUCTIONS)
+    idx_session_state = text.index("Shared state across the whole run")
+    idx_reworded = text.index("REWORDED duplicates count too")
+    idx_multi_mcp = text.index("Multi-MCP tool selection")
+    assert idx_session_state < idx_reworded < idx_multi_mcp
+
+
 def test_no_process_narration_section_tells_coordinator_to_clean_up_member_reports():
     """The instructions must not claim they "apply to member agents too" -- they
     structurally can't, since _COORDINATOR_INSTRUCTIONS only ever reaches the
