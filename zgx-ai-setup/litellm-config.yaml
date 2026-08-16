@@ -1,8 +1,11 @@
 # LiteLLM gateway routing (mounted into the litellm container at /app/config.yaml).
 # ALL-MoE: only the qwen3-coder-30b route is actually used (the whole roster maps to it
-# via swarm/agents.py _VLLM_MODEL_MAP). The 32b/7b/8b routes are kept for the optional
-# "diverse roster" variant (dedicated 32B on :8004 + llama-swap pool on :9100) — harmless
-# when unused. api_key is a dummy; vLLM ignores it.
+# via the model_catalog DB table's vllm_served_as column, read through swarm/model_routing.py's
+# in-process cache -- NOT swarm/agents.py's _VLLM_MODEL_MAP, which stopped existing as of the
+# 2026-08-08 AGNOHive 2.3.2 addendum; this comment referenced it after it was already gone,
+# corrected 2026-08-16). The 32b/7b/8b routes are kept for the optional "diverse roster"
+# variant (dedicated 32B on :8004 + llama-swap pool on :9100) — harmless when unused.
+# api_key is a dummy; vLLM ignores it.
 #
 # api_base values (since 2026-08-08): litellm no longer runs on network_mode: host (see
 # docker-compose.yml), so `localhost` inside the litellm container no longer reaches the
