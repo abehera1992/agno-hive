@@ -2924,7 +2924,35 @@ _REPETITION_FILLER_WORDS = frozenset({
 # earlier, shorter one -- only their shared beginning repeats. Same minimum
 # length as _REPETITION_MIN_SEGMENT_LEN applies to the extracted prefix too, so
 # a short generic opening ("I need to check") isn't enough on its own.
-_REPETITION_PREFIX_CHARS = 80
+#
+# Raised 80 -> 100 (2026-08-16, T4 live incident, engineering-team groundedness
+# retest): a genuinely long-form, correctly-progressing design-document
+# generation task ("Design how the Parties module should be extended... Plan
+# only") was auto-killed at 482s with "no tool call or new stream content for
+# over 300s" -- but journalctl showed stream events climbing continuously the
+# whole time (892 -> 949 -> 1005), real new content, not a stall. A design doc
+# with numbered phases / per-field entries naturally repeats STRUCTURE across
+# sections (consistent headers, consistent label-before-value formatting) even
+# though the actual content differs each time -- and 80 chars is well within
+# reach of two merely similarly-FORMATTED (not actually repeated) sections.
+#
+# NOT raised further, even though a bigger gap would reduce this false-positive
+# risk more: tests/test_repetition_loop_detector.py's own reproduction of the
+# original escalating-self-correction incident (the real text that motivated
+# this whole check) shares only ~110-120 chars of actual overlap between its
+# "prior" and "new_segment" variants before they diverge -- at 150 the check
+# stopped detecting that real incident at all (both existing detection tests
+# started failing). 100 is the calibrated middle: a real, tested improvement
+# over 80 (raises the bar above a bare structural-header echo) without
+# encroaching on the ~110-char floor the original incident's own text needs to
+# still be caught. This narrows but does not eliminate the false-positive
+# surface for very long, heavily-templated documents whose per-section
+# boilerplate happens to run close to 100 chars -- if that recurs, the next
+# lever is requiring the prefix to recur MULTIPLE times in the lookback before
+# flagging (a genuine loop repeats the same opening over and over; a
+# templated-but-different section's similar header typically does not), not a
+# further threshold increase.
+_REPETITION_PREFIX_CHARS = 100
 
 
 def _normalize_for_repetition_check(text: str) -> str:

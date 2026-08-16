@@ -155,3 +155,67 @@ def test_genuinely_different_sentences_sharing_a_few_words_are_not_flagged():
     )
 
     assert _looks_like_repetition_loop(new_segment, prior) is False
+
+
+# ── _REPETITION_PREFIX_CHARS calibration (2026-08-16, T4 live incident) ──────────
+#
+# Live incident: a genuinely progressing, long-form design-document generation
+# task was auto-killed at 482s -- journalctl showed stream events climbing
+# continuously the whole time, real new content, not a stall. A design doc with
+# numbered phases / per-field entries naturally repeats STRUCTURE across sections
+# (consistent headers, consistent label-before-value formatting) even though the
+# actual content differs each time. _REPETITION_PREFIX_CHARS raised 80 -> 100 --
+# a calibrated middle, not raised further, because the ORIGINAL escalating-
+# self-correction incident's own text (test_intensifier_reworded_near_repeat_is_
+# detected / test_growing_tail_after_a_shared_opening_is_still_detected above)
+# only shares ~110-120 chars of real overlap before diverging -- 150 stopped
+# detecting that real incident entirely.
+
+def test_two_similarly_structured_but_substantively_different_design_sections_are_not_flagged():
+    """The T4 incident's actual shape: two consecutive design-doc sections share
+    a near-identical structural header/label pattern (~80-90 chars) but then
+    diverge into genuinely different content -- must not be flagged, unlike a
+    real repeat where the SAME text continues past the header."""
+    prior = (
+        "### Phase 2: Party Registration Schema Extension\n\n"
+        "**Files to modify:**\n- API/inventory-service/models.py\n\n"
+        "**Changes:** Add a nullable gstin_verified boolean column to the "
+        "party_registrations table, defaulting to false, to track manual "
+        "verification status separately from the existing gstin field."
+    )
+    new_segment = (
+        "### Phase 3: Warehouse Location Schema Extension\n\n"
+        "**Files to modify:**\n- API/inventory-service/models.py\n\n"
+        "**Changes:** Add a new warehouse_code column to the party_locations "
+        "table, unique per tenant, to support multi-branch inventory routing "
+        "distinct from the existing location_type classification."
+    )
+
+    assert _looks_like_repetition_loop(new_segment, prior) is False
+
+
+def test_prefix_chars_calibrated_to_100_not_further_raised():
+    from swarm.team import _REPETITION_PREFIX_CHARS
+
+    assert _REPETITION_PREFIX_CHARS == 100
+
+
+def test_original_escalating_incident_still_detected_at_the_calibrated_threshold():
+    """Regression guard: the calibration above (80 -> 100, deliberately not
+    higher) must never silently stop catching the real incident this whole
+    detector was built for. This mirrors
+    test_intensifier_reworded_near_repeat_is_detected but exists here,
+    alongside the T4 calibration tests, specifically to make the tradeoff
+    between the two incidents visible in one place."""
+    prior = (
+        "I need to be more specific with my file:line citations. Let me try "
+        "again with exact verbatim citations from the codebase and check every "
+        "claim carefully before finalizing the comparison table."
+    )
+    new_segment = (
+        "I need to be even more specific with my file:line citations. Let me "
+        "try again with exact verbatim citations from the codebase, using the "
+        "exact text from the files this time to be certain."
+    )
+
+    assert _looks_like_repetition_loop(new_segment, prior) is True
