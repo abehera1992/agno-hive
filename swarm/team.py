@@ -2544,6 +2544,19 @@ def _make_duplicate_delegation_gate_hook():
         if function_name not in _DELEGATION_TOOL_NAMES:
             return await function(**args)
 
+        # TEMPORARY DIAGNOSTIC (2026-08-16, round 2): the closure-based rewrite
+        # STILL did not redirect a live byte-identical repeat (T2i). Confirms or
+        # refutes whether this specific hook CLOSURE (id(log)) is the same object
+        # across both calls within one run -- if id(log) differs, something is
+        # rebuilding/copying the hook itself per call, not just per run, which
+        # would explain the closure never accumulating entries either.
+        print(
+            f"[dup-delegation-diag2] function={function_name!r} "
+            f"hook_id={id(_duplicate_delegation_gate_hook)} log_id={id(log)} "
+            f"log_len={len(log)} log_tools={[e.get('tool') for e in log]}",
+            flush=True,
+        )
+
         task_text = _normalize_delegation_task((args or {}).get("task"))
         if not task_text:
             return await function(**args)
