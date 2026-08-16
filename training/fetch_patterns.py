@@ -11,6 +11,15 @@ can be rebuilt on ZGX without cloning the project.
     # arbitrary source, for eval-case ground truth
     python -m training.fetch_patterns --glob "API/inventory-service/**/*.py" \
                                       --out /tmp/ekam-src
+
+Default --mcp-url points at hive-mcp (AGNO_SYSTEM_MCP_URL), NOT the project MCP
+(AGNO_MCP_URL) -- confirmed live 2026-08-16 while regenerating the training corpus:
+find_files/get_file_content were removed from EkamApp's own MCP server in commit
+2e0fbe1 (2026-08-04, generic file-I/O tools deliberately migrated to hive-mcp to
+decouple client-machine file I/O from any one project) but this script's default
+was never updated, so it silently returned "found 0 file(s)" for every call since
+then instead of erroring -- find_files against a server that doesn't register that
+tool name returns an empty result, not a failure.
 """
 
 from __future__ import annotations
@@ -57,7 +66,7 @@ async def run(mcp_url: str, glob: str, out: Path, limit: int) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mcp-url", default=os.getenv("AGNO_MCP_URL", "http://100.87.159.86:9000/mcp"))
+    ap.add_argument("--mcp-url", default=os.getenv("AGNO_SYSTEM_MCP_URL", "http://100.87.159.86:9003/mcp"))
     ap.add_argument("--glob", default="patterns/**/*.md")
     ap.add_argument("--out", default="/tmp/project-patterns")
     ap.add_argument("--limit", type=int, default=40)
