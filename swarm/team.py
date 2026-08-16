@@ -2456,8 +2456,22 @@ def _normalize_delegation_task(task_text) -> str:
     general-purpose normalizer. Collapses internal whitespace runs and lowercases,
     so two calls differing only in incidental spacing/case still compare equal;
     anything else (a reworded ask, a narrower/wider scope) compares unequal, which
-    is the intended narrow-not-broad behavior (see that function's own docstring)."""
-    return " ".join(str(task_text or "").split()).lower()
+    is the intended narrow-not-broad behavior (see that function's own docstring).
+
+    Also strips stray ellipses (2026-08-16, T2j live re-verification of the
+    closure-based rewrite): a real repeat delegation differed from its own prior
+    call by nothing but an inserted "..." between two words ("backend and list"
+    vs "backend... and list") -- confirmed via direct closure instrumentation
+    that the underlying persistence mechanism was correct (hook_id/log_id
+    identical across calls, log_len incremented 0 -> 1 exactly as designed) and
+    this single stray token was the ENTIRE reason the exact-match check missed
+    a genuinely trivial repeat. Unlike fuzzy similarity (SequenceMatcher/Jaccard,
+    both empirically ruled out for this gate -- see the gate's own docstring),
+    stripping a specific, narrow punctuation artifact is still a deterministic,
+    zero-judgment normalization step, not a similarity threshold -- it does not
+    reintroduce the false-positive risk that ruled out fuzzy matching."""
+    stripped = re.sub(r"\.{2,}|…", " ", str(task_text or ""))
+    return " ".join(stripped.split()).lower()
 
 
 def _make_duplicate_delegation_gate_hook():
@@ -2543,19 +2557,6 @@ def _make_duplicate_delegation_gate_hook():
     async def _duplicate_delegation_gate_hook(function_name, function, args, run_context=None):
         if function_name not in _DELEGATION_TOOL_NAMES:
             return await function(**args)
-
-        # TEMPORARY DIAGNOSTIC (2026-08-16, round 2): the closure-based rewrite
-        # STILL did not redirect a live byte-identical repeat (T2i). Confirms or
-        # refutes whether this specific hook CLOSURE (id(log)) is the same object
-        # across both calls within one run -- if id(log) differs, something is
-        # rebuilding/copying the hook itself per call, not just per run, which
-        # would explain the closure never accumulating entries either.
-        print(
-            f"[dup-delegation-diag2] function={function_name!r} "
-            f"hook_id={id(_duplicate_delegation_gate_hook)} log_id={id(log)} "
-            f"log_len={len(log)} log_tools={[e.get('tool') for e in log]}",
-            flush=True,
-        )
 
         task_text = _normalize_delegation_task((args or {}).get("task"))
         if not task_text:

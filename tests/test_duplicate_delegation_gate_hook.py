@@ -52,6 +52,33 @@ def test_differently_worded_tasks_are_not_equal():
     assert _normalize_delegation_task("Read patterns/x.md") != _normalize_delegation_task("Read patterns/y.md")
 
 
+def test_stray_ellipsis_is_stripped():
+    """T2j live incident (2026-08-16): a real repeat delegation differed from
+    its own prior call by nothing but an inserted '...' between two words
+    ('backend and list' vs 'backend... and list') -- confirmed via direct
+    closure instrumentation that the persistence mechanism itself was already
+    correct; this single stray token was the entire reason the exact-match
+    check missed a genuinely trivial repeat."""
+    a = "Read the actual model/schema file for the Parties module backend and list all tables and fields."
+    b = "Read the actual model/schema file for the Parties module backend... and list all tables and fields."
+    assert _normalize_delegation_task(a) == _normalize_delegation_task(b)
+
+
+def test_unicode_ellipsis_character_is_also_stripped():
+    a = "Read the file and summarize it."
+    b = "Read the file… and summarize it."
+    assert _normalize_delegation_task(a) == _normalize_delegation_task(b)
+
+
+def test_genuinely_different_tasks_still_differ_after_ellipsis_stripping():
+    """Ellipsis-stripping must not be so aggressive it collapses genuinely
+    different requests -- this is still a narrow, deterministic normalization
+    step, not a similarity threshold."""
+    a = "Read x.md and summarize it..."
+    b = "Read y.md and summarize it..."
+    assert _normalize_delegation_task(a) != _normalize_delegation_task(b)
+
+
 # ── _make_duplicate_delegation_gate_hook: delegate_task_to_member ────────────────
 
 async def test_non_delegation_tool_calls_are_never_touched():
@@ -216,6 +243,31 @@ async def test_first_broadcast_this_run_is_never_blocked():
     )
 
     assert result.startswith("delegated:")
+
+
+async def test_t2j_incident_shape_ellipsis_variant_is_now_blocked():
+    """The exact real incident, end-to-end through the hook: round 2's task text
+    differed from round 1's only by an inserted ellipsis. Before the
+    ellipsis-stripping fix this was NOT blocked (a genuine gap, not a bug in
+    persistence -- confirmed live the closure itself was already working
+    correctly). Must be blocked now."""
+    hook = _make_duplicate_delegation_gate_hook()
+    round1 = {
+        "task": "Read the actual model/schema file for the Parties module backend "
+                "and list all tables and fields. Do not guess field names — base "
+                "your response strictly on the file content.",
+    }
+    round2 = {
+        "task": "Read the actual model/schema file for the Parties module backend... "
+                "and list all tables and fields. Do not guess field names — base "
+                "your response strictly on the file content.",
+    }
+
+    first = await hook("delegate_task_to_members", _fake_delegate, round1, run_context=None)
+    second = await hook("delegate_task_to_members", _fake_delegate, round2, run_context=None)
+
+    assert first.startswith("delegated:")
+    assert second.startswith("REDIRECTED:")
 
 
 async def test_exact_repeat_broadcast_is_blocked_on_the_second_call():
