@@ -553,3 +553,39 @@ def test_conflict_resolution_section_precedes_general_rules():
     idx_conflict = text.index("Resolving conflicting member reports")
     idx_general = text.index("General rules")
     assert idx_conflict < idx_general
+
+
+def test_coordinator_instructions_have_an_entity_match_discipline_section():
+    """T10/T11 live incidents (2026-08-15, engineering-team groundedness retest):
+    real, correctly-fetched Notion items (T10) and a real, correctly-described CSV
+    import feature (T11) were both cited as answering a question about "Parties"
+    when neither actually named Parties -- verify_claims cannot catch this since
+    nothing was fabricated, only mis-attributed. This section is a prose-only
+    discipline (no mechanical grep can verify semantic relevance the way existence
+    checks work), consistent with verify.py's own documented MISATTRIBUTED SYMBOLS
+    limitation ("proves existence, not the claimed relationship")."""
+    from swarm.team import _COORDINATOR_INSTRUCTIONS
+
+    text = "\n".join(_COORDINATOR_INSTRUCTIONS)
+    assert "Entity-match discipline" in text
+    assert "hive-mcp Notion tooling enhancements" in text
+    assert "tally_import_api.py" in text
+    assert "prose-only discipline" in text
+
+
+def test_entity_match_discipline_section_precedes_general_rules():
+    from swarm.team import _COORDINATOR_INSTRUCTIONS
+
+    text = "\n".join(_COORDINATOR_INSTRUCTIONS)
+    idx_entity = text.index("Entity-match discipline")
+    idx_general = text.index("General rules")
+    assert idx_entity < idx_general
+
+
+def test_entity_match_discipline_follows_conflict_resolution_section():
+    from swarm.team import _COORDINATOR_INSTRUCTIONS
+
+    text = "\n".join(_COORDINATOR_INSTRUCTIONS)
+    idx_conflict = text.index("Resolving conflicting member reports")
+    idx_entity = text.index("Entity-match discipline")
+    assert idx_conflict < idx_entity
