@@ -96,7 +96,7 @@ Those are the only prompts where stale-weight fabrication is detectable.
 
 ```bash
 ~/miniforge3/envs/zgx/bin/python -m training.eval.harness \
-  --base-url http://localhost:8003/v1 --model qwen3-coder-30b \
+  --base-url http://localhost:8003/v1 --model local-shared \
   --out training/eval/baseline.json \
   --label "untuned Qwen3-30B-A3B-Instruct-2507-FP8 (baseline, 15-20 cases)"
 ```

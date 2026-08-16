@@ -17,8 +17,9 @@ get_model()'s vLLM branch (swarm/agents.py) previously used plain OpenAILike wit
 NO client-side recovery at all -- OllamaToolFix was only ever wired into the
 Ollama fallback branch. Confirmed live via a direct, reproducible gateway request
 (bypassing agno's own classification entirely): this project's ONLY served vLLM
-model, qwen3-coder-30b (every local model_id collapses onto it via the ALL-MoE
-consolidation in model_catalog), correctly emits Format 1
+model, local-shared (every local model_id collapses onto it via the ALL-MoE
+consolidation in model_catalog; called qwen3-coder-30b at the time of this
+2026-08-15 investigation, renamed 2026-08-16), correctly emits Format 1
 (<tool_call>{"name": "search_files", ...}</tool_call>) in BOTH streaming and
 non-streaming mode -- vLLM's own engine logs show sustained ~20-24 tokens/s
 generation the whole time, ruling out an instant-EOS "gives up" explanation --

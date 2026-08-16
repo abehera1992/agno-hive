@@ -46,7 +46,7 @@ async def test_seeded_local_models_carry_the_all_moe_consolidation_mapping():
     await mr.load_cache()
     route = mr.get_route("qwen2.5-coder:32b")
     assert route.kind == "local"
-    assert route.vllm_served_as == "qwen3-coder-30b"
+    assert route.vllm_served_as == "local-shared"
     assert route.requires_cloud_gate is False
 
 

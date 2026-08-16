@@ -1,11 +1,16 @@
 # LiteLLM gateway routing (mounted into the litellm container at /app/config.yaml).
-# ALL-MoE: only the qwen3-coder-30b route is actually used (the whole roster maps to it
+# ALL-MoE: only the local-shared route is actually used (the whole roster maps to it
 # via the model_catalog DB table's vllm_served_as column, read through swarm/model_routing.py's
-# in-process cache -- NOT swarm/agents.py's _VLLM_MODEL_MAP, which stopped existing as of the
-# 2026-08-08 AGNOHive 2.3.2 addendum; this comment referenced it after it was already gone,
-# corrected 2026-08-16). The 32b/7b/8b routes are kept for the optional "diverse roster"
+# in-process cache). The 32b/7b/8b routes are kept for the optional "diverse roster"
 # variant (dedicated 32B on :8004 + llama-swap pool on :9100) — harmless when unused.
 # api_key is a dummy; vLLM ignores it.
+#
+# "local-shared" (renamed 2026-08-16 from "qwen3-coder-30b"): deliberately NOT named
+# after any model family. The old name was kept "stable" through three real served-
+# model swaps (granite4.1:30b -> qwen3-coder:30b -> Qwen3-30B-A3B-Instruct-2507-FP8 ->
+# now the fine-tuned qwen3-30b-hive-v2-fp8) and stopped describing the actual model
+# after the FIRST of those swaps. See swarm/model_routing.py's _LOCAL_MODELS comment
+# for the full rationale.
 #
 # api_base values (since 2026-08-08): litellm no longer runs on network_mode: host (see
 # docker-compose.yml), so `localhost` inside the litellm container no longer reaches the
@@ -15,15 +20,15 @@
 # reached via `host.docker.internal` (resolvable via the `extra_hosts` entry on the litellm
 # service) since they still run directly on the host, published on a host port.
 model_list:
-  - model_name: qwen3-coder-30b
-    litellm_params: {model: openai/qwen3-coder-30b, api_base: http://vllm-coord:8000/v1, api_key: "dummy"}
+  - model_name: local-shared
+    litellm_params: {model: openai/local-shared, api_base: http://vllm-coord:8000/v1, api_key: "dummy"}
 
   # --- Phase 3 candidate registry (2026-07-30) ---------------------------------
   # `qwen3-30b-instruct` is an ALIAS for the live baseline on vllm-coord — the same served
-  # process as qwen3-coder-30b, exposed under the agreed baseline identifier so eval
+  # process as local-shared, exposed under the agreed baseline identifier so eval
   # reports name it consistently. Adds no memory.
   - model_name: qwen3-30b-instruct
-    litellm_params: {model: openai/qwen3-coder-30b, api_base: http://vllm-coord:8000/v1, api_key: "dummy"}
+    litellm_params: {model: openai/local-shared, api_base: http://vllm-coord:8000/v1, api_key: "dummy"}
   # `qwen3-30b-hive-v1` routes to :8005 (host.docker.internal, not a compose service --
   # see the api_base note above), where the MERGED BF16 candidate is served DURING the
   # maintenance window only. This is a registry entry, NOT concurrent A/B:

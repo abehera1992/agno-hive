@@ -176,10 +176,18 @@ _LOCAL_MODELS = [
     # provider is "local" (not "ollama"/"vllm" specifically) because a single
     # row serves BOTH backends — which one actually runs is
     # config.inference_backend's call at request time, not a per-model fact.
-    ("qwen3-coder:30b", "qwen3-coder-30b"),
-    ("qwen2.5-coder:32b", "qwen3-coder-30b"),
-    ("qwen2.5-coder:7b", "qwen3-coder-30b"),
-    ("llama3.1:8b", "qwen3-coder-30b"),
+    #
+    # served alias is "local-shared", deliberately NOT named after any model family
+    # (renamed 2026-08-16 from "qwen3-coder-30b"). That name was kept "stable" through
+    # three real served-model swaps (granite4.1:30b -> qwen3-coder:30b -> Qwen3-30B-
+    # A3B-Instruct-2507-FP8 -> now the fine-tuned qwen3-30b-hive-v2-fp8) and stopped
+    # describing the actual model after the FIRST of those swaps -- a vendor-committed
+    # "stable" alias is not actually stable, it just delays the day the name goes
+    # stale. "local-shared" never claims a model family, so it can't drift again.
+    ("qwen3-coder:30b", "local-shared"),
+    ("qwen2.5-coder:32b", "local-shared"),
+    ("qwen2.5-coder:7b", "local-shared"),
+    ("llama3.1:8b", "local-shared"),
 ]
 
 _CLOUD_MODELS = [

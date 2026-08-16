@@ -116,7 +116,7 @@ async def test_non_cloud_model_id_with_vllm_backend_unaffected_by_allow_cloud_mo
 
     model = get_model("qwen2.5-coder:32b", "http://ollama-host")
 
-    assert model.id == "qwen3-coder-30b"  # collapsed via the seeded ALL-MoE consolidation row
+    assert model.id == "local-shared"  # collapsed via the seeded ALL-MoE consolidation row
     assert model.base_url == "http://litellm-host:4000/v1"
 
 

@@ -12,10 +12,26 @@
 
 services:
   # Resident coordinator — serves the agno roster + LightRAG via LiteLLM under the
-  # stable alias qwen3-coder-30b (kept so litellm-config + agents _VLLM_MODEL_MAP need
-  # no change). Backing model is Qwen3-30B-A3B-Instruct-2507 (general-instruct, non-thinking,
+  # stable alias local-shared (renamed 2026-08-16 from qwen3-coder-30b -- see
+  # swarm/model_routing.py's _LOCAL_MODELS comment for why a vendor/family-neutral
+  # name was chosen instead of another borrowed-from-a-model name).
+  #
+  # CORRECTED 2026-08-16 -- this block previously read `serve Qwen/Qwen3-30B-A3B-
+  # Instruct-2507-FP8` with no /model volume mount, which was STALE: `docker inspect
+  # vllm-coord` on the real running container showed `serve /model` with
+  # `/home/abehera1992/models/qwen3-30b-hive-v2-fp8` bind-mounted to `/model` --
+  # the actual promoted Phase 3/4 fine-tune (training/RUNBOOK.md), not the vanilla
+  # base. The Phase 4 promotion swap was applied live on ZGX and never committed back
+  # here. This mismatch was silent and dangerous: a force-recreate from this file
+  # would have reverted production to the untuned base model with no warning.
+  # If a future promotion swaps the served checkpoint again, update the volume mount
+  # below AND this comment in the SAME change that does the live swap on ZGX --
+  # do not let this drift a second time.
+  #
+  # Backing lineage: Qwen3-30B-A3B-Instruct-2507 (general-instruct, non-thinking,
   # 3B-active MoE) — swapped in 2026-07-25 to replace Qwen3-Coder-30B; uses the hermes
-  # tool-parser (general instruct), not qwen3_coder.
+  # tool-parser (general instruct), not qwen3_coder. Fine-tuned via QLoRA+ORPO
+  # (training/config/qwen3-30b.yaml) and promoted 2026-07-30 as qwen3-30b-hive-v2-fp8.
   # --max-model-len: the fixed per-run injection (~56K: hive.md + patterns) plus a real
   # multi-tool engineering task overflows 65536; 131072 was the stable middle ground but a
   # 6-step migration-writing task still overflowed it (2026-07-28). 262144 was tried and
@@ -27,8 +43,8 @@ services:
     restart: unless-stopped
     entrypoint: ["vllm"]
     command: >
-      serve Qwen/Qwen3-30B-A3B-Instruct-2507-FP8
-      --served-model-name qwen3-coder-30b
+      serve /model
+      --served-model-name local-shared
       --enable-auto-tool-choice --tool-call-parser hermes
       --gpu-memory-utilization 0.6 --max-model-len 262144
       --host 0.0.0.0 --port 8000
@@ -36,6 +52,7 @@ services:
       - "8003:8000"
     volumes:
       - /home/abehera1992/.cache/vllm-hf:/root/.cache/huggingface
+      - /home/abehera1992/models/qwen3-30b-hive-v2-fp8:/model
     environment:
       - HF_TOKEN=${HF_TOKEN}
     devices:

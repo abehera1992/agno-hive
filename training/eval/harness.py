@@ -1,6 +1,6 @@
 """Phase 2 eval harness — five DECOUPLED scorers against a live OpenAI-compatible model.
 
-    python -m training.eval.harness --base-url http://localhost:8003/v1 --model qwen3-coder-30b
+    python -m training.eval.harness --base-url http://localhost:8003/v1 --model local-shared
 
 Why decoupled: case E-2 (2026-07-30) produced a perfectly correct parameter name and
 type annotation attached to a fabricated line number. A single pass/fail scorer marks
@@ -447,7 +447,7 @@ def load_cases() -> list[dict]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://localhost:8003/v1")
-    ap.add_argument("--model", default="qwen3-coder-30b")
+    ap.add_argument("--model", default="local-shared")
     ap.add_argument("--out", default="training/eval/baseline.json")
     ap.add_argument("--label", default="untuned baseline")
     a = ap.parse_args()

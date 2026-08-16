@@ -15,7 +15,7 @@ agno swarm + LightRAG
 LiteLLM  :4000   (gateway — model-name routing, request_timeout)
         |
         v
-vLLM coordinator :8003   Qwen3-30B-A3B-Instruct-2507-FP8  (served as qwen3-coder-30b;
+vLLM coordinator :8003   Qwen3-30B-A3B-Instruct-2507-FP8  (served as local-shared;
                          --tool-call-parser hermes; general-instruct, non-thinking, 3B-active
                          MoE — swapped 2026-07-25 from Qwen3-Coder-30B for stronger grounding
                          within the same ~30 GB footprint)
@@ -30,8 +30,11 @@ Ollama   :11434                          (fallback backend — see Reversibility
 The dense `qwen2.5-coder:32b` was dropped after an A/B showed it ~5–7× slower per token
 than the 30B A3B MoE on the GB10 with no quality edge, so the entire roster collapses onto
 the single resident 30B (the `model_catalog` DB table's `vllm_served_as` column maps every
-tag → `qwen3-coder-30b` — AGNOHive 2.3.2 addendum, 2026-08-08; was a hardcoded
+tag → `local-shared` — AGNOHive 2.3.2 addendum, 2026-08-08; was a hardcoded
 `swarm/agents.py _VLLM_MODEL_MAP` dict before this — see `docs/guide/cloud-models.md`).
+Renamed 2026-08-16 from `qwen3-coder-30b`, a name inherited from a model swapped out
+back on 2026-07-25 — deliberately vendor/family-neutral now so it can't go stale the
+same way again on the next served-model swap.
 vLLM continuous-batching serves the concurrent agent + LightRAG load on the one model
 (measured: 8 concurrent requests in ~17 s, no queueing).
 

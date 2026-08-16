@@ -84,7 +84,7 @@ docker logs vllm-coord --tail 20            # watch for "Uvicorn running"
 
 | Service | Hugging Face model | Served as | Port | GPU mem | Always on? |
 |---|---|---|---|---|---|
-| `vllm-coord` | [`Qwen/Qwen3-30B-A3B-Instruct-2507-FP8`](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507-FP8) | `qwen3-coder-30b` | 8003 | 0.6 | ✅ yes — serves the whole roster |
+| `vllm-coord` | [`Qwen/Qwen3-30B-A3B-Instruct-2507-FP8`](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507-FP8) | `local-shared` | 8003 | 0.6 | ✅ yes — serves the whole roster |
 | `vllm-embed` | [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) | — | 8002 | 0.05 | ✅ yes — LightRAG query embeddings |
 | `vllm-extract` | [`RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8`](https://huggingface.co/RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8) | `llama3.1-8b` | 9100 | 0.1 | ❌ **indexing-only** — start before `hive --bootstrap`, stop after (`docker start/stop vllm-extract`) to free ~13 GB |
 | `litellm` | — (gateway, no weights) | — | 4000 | — | ✅ yes |
@@ -92,11 +92,11 @@ docker logs vllm-coord --tail 20            # watch for "Uvicorn running"
 <details>
 <summary><b>📋 Notes (click to expand)</b></summary>
 
-> **`vllm-coord`'s served name (`qwen3-coder-30b`) can be an alias for a fine-tuned checkpoint.** The compose file above serves the stock HF base directly; a production deployment may instead mount a locally fine-tuned/requantized checkpoint under the same served name (e.g. an Unsloth QLoRA+ORPO fine-tune merged and FP8-requantized) so `litellm-config.yaml` and the `model_catalog` DB table's `vllm_served_as` column need no change either way. Check `docker inspect vllm-coord` (or the `command:` line in `zgx-ai-setup/docker-compose.yml`) to see what's actually mounted on a given box — `serve <hf-repo-id>` means the stock base; `serve /path/to/local/checkpoint` means a fine-tune.
+> **`vllm-coord`'s served name (`local-shared`) can be an alias for a fine-tuned checkpoint.** The compose file above serves the stock HF base directly; a production deployment may instead mount a locally fine-tuned/requantized checkpoint under the same served name (e.g. an Unsloth QLoRA+ORPO fine-tune merged and FP8-requantized) so `litellm-config.yaml` and the `model_catalog` DB table's `vllm_served_as` column need no change either way. Check `docker inspect vllm-coord` (or the `command:` line in `zgx-ai-setup/docker-compose.yml`) to see what's actually mounted on a given box — `serve <hf-repo-id>` means the stock base; `serve /path/to/local/checkpoint` means a fine-tune. The alias is named `local-shared` rather than after any specific model (renamed 2026-08-16 from `qwen3-coder-30b`, itself a name inherited from a model that stopped being served back on 2026-07-25) precisely so it never needs renaming again on the next swap or fine-tune promotion — and `docker-compose.yml`'s own committed state drifted from the real live mount once already because of this, so keep the two in sync going forward.
 >
 > **ALL-MoE consolidation:** unlike Ollama (which keeps a diverse roster warm — different models for different roles), the vLLM stack collapses the entire roster onto the one resident coordinator (`vllm_served_as` in the `model_catalog` DB table — AGNOHive 2.3.2 addendum, 2026-08-08; was a hardcoded `_VLLM_MODEL_MAP` dict in `swarm/agents.py` before this). This trades per-role model diversity for continuous-batching throughput and one large resident KV cache, since the dense 32B Ollama models measured 5–7× slower per token on GB10 with no measurable code-quality edge over the MoE coordinator.
 >
-> **`vllm-extract` is indexing-only.** A LightRAG *query* uses the coordinator (`qwen3-coder-30b`) for keyword extraction + synthesis, not `vllm-extract` — that server is only the entity-extraction LLM used while indexing (`hive --bootstrap`). Leaving it resident wastes ~13 GB of unified memory for zero benefit outside indexing runs.
+> **`vllm-extract` is indexing-only.** A LightRAG *query* uses the coordinator (`local-shared`) for keyword extraction + synthesis, not `vllm-extract` — that server is only the entity-extraction LLM used while indexing (`hive --bootstrap`). Leaving it resident wastes ~13 GB of unified memory for zero benefit outside indexing runs.
 >
 > **Context window:** `vllm-coord --max-model-len` is tuned for the fixed per-run injection (`hive.md` + `patterns/**/*.md` ≈ 56K tokens) plus real multi-tool tasks — see `zgx-ai-setup/docker-compose.yml` for the current value and the reasoning in its comments.
 

@@ -61,7 +61,7 @@ class Config:
     # (measured: 37s on the 30B vs 186s on the 32B for the same query). Contention with the
     # coordinator on the 30B is the lesser evil vs the dense model's generation latency.
     vllm_llm_base_url: str = os.getenv("VLLM_LLM_BASE_URL", "http://localhost:4000/v1")
-    vllm_llm_model: str = os.getenv("VLLM_LLM_MODEL", "qwen3-coder-30b")
+    vllm_llm_model: str = os.getenv("VLLM_LLM_MODEL", "local-shared")
     vllm_embed_base_url: str = os.getenv("VLLM_EMBED_BASE_URL", "http://localhost:8002/v1")
     vllm_embed_model: str = os.getenv("VLLM_EMBED_MODEL", "Qwen/Qwen3-Embedding-0.6B")
     # Agno swarm gateway — LiteLLM proxy (:4000) -> llama-swap (:9100, on-demand swap) -> vLLM.
