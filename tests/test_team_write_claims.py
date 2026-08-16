@@ -315,6 +315,50 @@ async def test_verified_answer_retries_on_a_lint_violation_report(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_verified_answer_never_tells_the_model_a_doc_only_symbol_does_not_exist(monkeypatch):
+    """T1e live incident (2026-08-15, engineering team): a report mixing a real
+    NOT FOUND fabrication with a real DOC ONLY citation (patterns/ekam-frontend.md:
+    1109, symbol inventory.party_module_settings) must retry ONLY for the genuine
+    fabrication -- the retry prompt must never tell the model the DOC ONLY symbol
+    "does not exist... do not mention it again", since it factually does exist (in
+    documentation). Before this fix, _claim_token(ln, ("NOT FOUND", "DOC ONLY"))
+    swept both into missing_symbols, and a real, correctly-cited pattern got
+    discarded and reported as non-existent."""
+    canned_report = (
+        "SYMBOLS (2 checked):\n"
+        "  DOC ONLY   inventory.party_module_settings        <-- appears only in "
+        "documentation, not in code: patterns/ekam-frontend.md:1109\n"
+        "  NOT FOUND  totallyMadeUpSymbolXyz                 <-- does not exist in "
+        "the project\n\n"
+        "VERDICT: 1 claim(s) could NOT be found in the project."
+    )
+    call_count = {"n": 0}
+
+    async def fake_verify_claims(content, hive_mcp_url):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return canned_report, True
+        return "VERDICT: every checked claim exists in the project.", False
+
+    monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
+
+    original_result = _msgs(_tool_msg("get_file_content", "patterns/ekam-frontend.md"))
+    content = "Uses inventory.party_module_settings and totallyMadeUpSymbolXyz."
+    retry_result = SimpleNamespace(
+        content="Corrected answer.",
+        messages=[_tool_msg("get_file_content", "patterns/ekam-frontend.md")],
+    )
+    fake_team = _FakeTeam(retry_result)
+
+    await team._verified_answer(content, "describe the pattern", fake_team, "http://fake/mcp", result=original_result)
+
+    assert len(fake_team.prompts) == 1
+    prompt = fake_team.prompts[0]
+    assert "totallyMadeUpSymbolXyz" in prompt
+    assert "inventory.party_module_settings" not in prompt
+
+
+@pytest.mark.asyncio
 async def test_verified_answer_ground_truth_survives_a_retry_that_makes_no_new_write(monkeypatch):
     """Confirmed live 2026-08-06: a Coder staged a real (if namespace-wrong)
     .statusBadge in its FIRST attempt. A lint-violation retry then gave up honestly

@@ -1613,8 +1613,19 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 return rest[0] if rest else None
         return None
 
+    # "DOC ONLY" deliberately excluded (2026-08-15, T1e live incident, engineering
+    # team) -- hive-mcp/tools/verify.py's DOC ONLY branch no longer counts toward
+    # `problems`/`bad` (a real documentation citation is not fabrication just because
+    # a literal code-grep can't independently confirm it), so a report reaching this
+    # retry with ONLY DOC ONLY items no longer gets here at all. But if a retry DOES
+    # fire for a genuinely separate reason (a real NOT FOUND/BAD citation elsewhere in
+    # the same report), any DOC ONLY line present must still never be swept into this
+    # "does not exist... do not mention it again" instruction -- that is factually
+    # wrong for a DOC ONLY item and was the exact live incident that caused a
+    # correctly-cited, real pattern (patterns/ekam-frontend.md:1109) to be discarded
+    # and reported as not existing.
     missing_symbols = [t for ln in report.splitlines()
-                        if (t := _claim_token(ln, ("NOT FOUND", "DOC ONLY")))]
+                        if (t := _claim_token(ln, ("NOT FOUND",)))]
     bad_citations = [t for ln in report.splitlines()
                       if (t := _claim_token(ln, ("BAD", "AMBIGUOUS", "MISMATCH")))]
     # verify_claims' CONVENTIONS section (CODE_LINT_FORBID/REQUIRE, and the SCSS

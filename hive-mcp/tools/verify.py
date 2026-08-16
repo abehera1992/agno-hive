@@ -892,6 +892,10 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
 
     out: list[str] = ["verify_claims — deterministic grep of the claims in this answer", ""]
     problems = 0
+    # DOC ONLY items are tracked SEPARATELY from problems (2026-08-15, T1e live
+    # incident, engineering team) -- see the DOC ONLY branch below for why they must
+    # never count toward the fabrication verdict.
+    doc_only_count = 0
 
     # ── symbols ───────────────────────────────────────────────────────────────
     if idents:
@@ -944,11 +948,34 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                             f"itself is not verified"
                         )
                         continue
-                problems += 1
                 if hits:
+                    # NOT counted toward `problems` (2026-08-15, T1e live incident,
+                    # engineering team): a symbol that appears in real project
+                    # documentation is NOT fabrication just because this grep-based
+                    # check cannot also confirm it as one literal string in code --
+                    # it may be constructed dynamically (an f-string table name, a
+                    # loop-generated identifier), or the documentation may name a
+                    # convention/pattern rather than a source-literal symbol at all.
+                    # Confirmed live: a real, correctly-cited documentation hit
+                    # (patterns/ekam-frontend.md:1109, symbol
+                    # inventory.party_module_settings) was counted as a `problems`
+                    # hit here, which set _verify_claims' `bad=True` and drove
+                    # swarm/team.py's one-shot correction retry to instruct the
+                    # model "does not exist here... do not mention it again" --
+                    # the model then discarded its own correct citation and
+                    # answered that an entire real, documented pattern "does not
+                    # exist". A DOC ONLY hit is evidence the thing IS real
+                    # (documented), just not code-grep-confirmed -- the opposite of
+                    # NOT FOUND, and must never carry the same "fabrication, fix
+                    # before returning" verdict language.
+                    doc_only_count += 1
                     out.append(f"  DOC ONLY   {tok:38s} <-- appears only in documentation, "
-                               f"not in code: {hits[0][:70]}")
+                               f"not in code: {hits[0][:70]} (this is a real citation, not "
+                               f"fabrication -- the exact string was not independently "
+                               f"confirmed in code, which can happen for dynamically "
+                               f"constructed identifiers or documented conventions)")
                 else:
+                    problems += 1
                     out.append(f"  NOT FOUND  {tok:38s} <-- does not exist in the project")
                 continue
             out.append(f"  FOUND      {tok:38s} {code_hits[0][:90]}")
@@ -1058,6 +1085,21 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
         out.append(f"VERDICT: {problems} claim(s) could NOT be found in the project. "
                    f"Fix the answer before returning it — a NOT FOUND symbol or a BAD "
                    f"citation is fabrication, not a near miss.")
+        if doc_only_count:
+            out.append(f"NOTE: {doc_only_count} additional DOC ONLY item(s) above are NOT "
+                       f"part of this verdict and do NOT need to be fixed or retracted — "
+                       f"they are real citations found in project documentation, just not "
+                       f"independently confirmed as a literal string in code.")
+    elif doc_only_count:
+        # A report containing ONLY DOC ONLY items (no real problems) must read as a
+        # clean pass, not a fabrication warning -- this is the exact shape of the T1e
+        # incident this whole section exists to fix. "could NOT be found" (the literal
+        # substring swarm/team.py's _verify_claims checks for) must NOT appear here.
+        out.append(f"VERDICT: no fabricated claims found. {doc_only_count} claim(s) are "
+                   f"DOC ONLY (see above) — real documentation citations that a literal "
+                   f"code grep could not independently confirm, which is expected for "
+                   f"dynamically-constructed identifiers or documented conventions. This "
+                   f"is not fabrication and does not need to be fixed.")
     else:
         out.append("VERDICT: every checked claim exists in the project. NOTE: this "
                    "proves existence only. It does NOT confirm the symbol does what the "
