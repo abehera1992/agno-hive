@@ -1,0 +1,10 @@
+{
+  "id": "C2-tenant-ids-endpoint",
+  "kind": "citation",
+  "provenance": "EK-269 replaced business-service's direct cross-schema query with an internal API call (2026-07-30). Verified directly against API/authentication-service/router/tenant_service_api.py 2026-08-16.",
+  "scorers": ["grounding", "citation"],
+  "prompt": "Numbered excerpt from API/authentication-service/router/tenant_service_api.py:\n\n   254|\n   255|@router.post(\"/internal/tenant-ids-by-users\", status_code=200)\n   256|async def internal_tenant_ids_by_users(\n   257|    request: Request,\n   258|    db: db_dependency,\n   259|):\n\nWhich line declares the route decorator, and what HTTP status code does it declare for a successful response?",
+  "required_facts": ["200"],
+  "forbidden_facts": ["201", "204"],
+  "correct_lines": [255]
+}

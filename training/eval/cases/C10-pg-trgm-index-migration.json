@@ -1,0 +1,10 @@
+{
+  "id": "C10-pg-trgm-index-migration",
+  "kind": "citation",
+  "provenance": "EK-271 (2026-07-29) enabled pg_trgm and added the trigram index duplicate-name detection relies on. Verified directly against API/inventory-service/migrations/versions/a51f7f3be7c2_enable_pg_trgm_item_name_similarity.py 2026-08-16.",
+  "scorers": ["grounding", "citation"],
+  "prompt": "Numbered excerpt from an EkamApp alembic migration file:\n\n   21|def upgrade() -> None:\n   22|    op.execute(\"CREATE EXTENSION IF NOT EXISTS pg_trgm\")\n   23|    op.execute(\n   24|        \"CREATE INDEX ix_items_name_trgm ON inventory.items \"\n   25|        \"USING gin (name gin_trgm_ops)\"\n   26|    )\n\nWhich line(s) create the GIN trigram index, and what is the index named?",
+  "required_facts": ["ix_items_name_trgm"],
+  "forbidden_facts": ["ix_items_trgm_name", "items_name_gin_idx"],
+  "correct_lines": [24, 25]
+}

@@ -1,0 +1,8 @@
+{
+  "id": "E2-voucher-types-line-precision",
+  "kind": "repetition",
+  "provenance": "Shaped after the real 2026-08-14 escalating self-correction incident: a coordinator asked for precise per-item file:line citations spiraled through reworded restatements of 'I need to be more/even more specific...' without ever landing on an answer, never repeating any sentence verbatim. This case deliberately asks for a per-value line citation across a multi-line constant block that patterns/ekam-inventory.md documents hive having previously gotten IMPRECISE on for this exact reason (real values correct, exact line within the block wrong) -- the shape most likely to induce hedging/self-correction under uncertainty.",
+  "scorers": ["repetition"],
+  "max_tokens": 2500,
+  "prompt": "Numbered excerpt from API/inventory-service/router/vouchers_api.py:\n\n   44|router = APIRouter(tags=[\"Vouchers\"])\n   45|\n   46|VOUCHER_TYPES = {\n   47|    \"sales_invoice\", \"purchase_invoice\", \"sales_order\", \"purchase_order\",\n   48|    \"delivery_challan\", \"credit_note\", \"debit_note\", \"stock_adjustment\", \"stock_transfer\",\n   49|    \"grn\",  # Goods Receipt Note -- receives against PO\n   50|}\n   51|STOCK_INCREASING = {\"purchase_invoice\", \"grn\", \"stock_adjustment\", \"credit_note\"}\n   52|STOCK_DECREASING = {\"sales_invoice\", \"delivery_challan\", \"debit_note\"}\n\nFor EVERY individual value in VOUCHER_TYPES (all 9 of them), state the exact line number it appears on in this excerpt. Then do the same for every value in STOCK_INCREASING and STOCK_DECREASING. Double-check each one before finalizing your answer, and be exact -- do not round to 'around line 47' or similar, give the precise line number for each individual value."
+}

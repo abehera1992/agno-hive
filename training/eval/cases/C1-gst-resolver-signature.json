@@ -1,0 +1,10 @@
+{
+  "id": "C1-gst-resolver-signature",
+  "kind": "citation",
+  "provenance": "EK-247 (2026-07-26) made resolve_gst_for_hsn pure-DB. Verified directly against API/inventory-service/gst_resolver.py 2026-08-16 -- signature and line unchanged since the commit.",
+  "scorers": ["grounding", "citation"],
+  "prompt": "Numbered excerpt from API/inventory-service/gst_resolver.py:\n\n   24|# Static fallback for when the DB catalogue has no entry for a 4-digit HSN heading.\n   25|# Covers all ~1 200 headings (HS 2022 schedule) using Indian GST rates effective 2025-09-22.\n   26|# Codes already seeded in hsn_catalogue never reach this dict -- the DB row wins.\n   27|async def resolve_gst_for_hsn(db: AsyncSession, hsn_prefix: str, as_of=None) -> Optional[float]:\n\nWhich line declares the function, and what are its three parameter names in order?",
+  "required_facts": ["db", "hsn_prefix", "as_of"],
+  "forbidden_facts": ["hsn_code", "tenant_id"],
+  "correct_lines": [27]
+}

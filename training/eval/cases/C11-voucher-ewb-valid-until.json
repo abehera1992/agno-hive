@@ -1,0 +1,10 @@
+{
+  "id": "C11-voucher-ewb-valid-until",
+  "kind": "citation",
+  "provenance": "Vouchers module documented 2026-08-06 (patterns/ekam-inventory.md), which itself flags that EkamApp has NO generic expiry_date/valid_until/expires_at field -- only this GST-specific one. Verified directly against API/inventory-service/models.py:386-388 2026-08-16.",
+  "scorers": ["grounding", "citation"],
+  "prompt": "Numbered excerpt from API/inventory-service/models.py:\n\n   383|    irp_status = Column(String(20), nullable=True, server_default=\"not_applicable\")\n   384|    irp_reported_at = Column(DateTime(timezone=True), nullable=True)\n   385|    ewb_status = Column(String(20), nullable=True)\n   386|    ewb_valid_until = Column(\n   387|        DateTime(timezone=True), nullable=True\n   388|    )  # IRP e-invoice IRN\n   389|    ewb_number = Column(String(20), nullable=True)  # e-way bill number\n\nWhich line declares the e-way bill expiry field, and does the Voucher model also have a generic expiry_date or valid_until field separate from this one?",
+  "required_facts": ["no|does not|only this"],
+  "forbidden_facts": ["yes, there is also", "expiry_date field exists"],
+  "correct_lines": [386]
+}

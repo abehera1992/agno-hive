@@ -1,0 +1,10 @@
+{
+  "id": "C3-router-signature",
+  "kind": "citation",
+  "provenance": "EK-269 changed the GET /items signature on 2026-07-30 -- recent change, so stale weights show up. Verified accurate against the real file 2026-08-16 (line unchanged since).",
+  "scorers": ["grounding", "citation"],
+  "prompt": "Numbered excerpt from API/inventory-service/router/items_api.py:\n\n   206|    category: Optional[str] = None,\n   207|    category_id: Optional[UUID] = None,\n   208|    item_type: Optional[str] = None,\n   209|    status_filter: Literal[\"active\", \"inactive\", \"all\"] = Query(\"active\", alias=\"status\"),\n   210|    tags: Optional[str] = None,\n\nWhich line declares the parameter whose wire-level name is `status`?",
+  "required_facts": ["status_filter", "alias"],
+  "forbidden_facts": ["active_only", "bool"],
+  "correct_lines": [209]
+}

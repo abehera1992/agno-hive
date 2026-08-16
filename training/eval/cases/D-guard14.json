@@ -1,0 +1,13 @@
+{
+  "id": "D-guard14",
+  "kind": "guard",
+  "provenance": "ekam-code-generation-guards.md GUARD 14 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "scorers": [
+    "guard"
+  ],
+  "prompt": "Project rule:\nThe `relative_path` argument to `apply_diff()` must always be the **original file path**\n(e.g. `src/components/MyComponent.tsx`). Never pass the `.hive_proposed` path.\n\nThe MCP server automatically reads from the staged `.hive_proposed` file when it exists \u2014\nyou do not need to (and must not) reference the `.hive_proposed` path in `apply_diff`.\n\nWrite code that follows this rule. Output only code.",
+  "guard_required": [
+    "MyComponent.tsx"
+  ],
+  "guard_forbidden": []
+}

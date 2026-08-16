@@ -1,0 +1,10 @@
+{
+  "id": "C4-voucher-types-grn",
+  "kind": "citation",
+  "provenance": "Vouchers module documented 2026-08-06 (patterns/ekam-inventory.md). Verified directly against API/inventory-service/router/vouchers_api.py 2026-08-16. `grn` sits alone on its own line unlike the other 8 wrapped values -- a genuinely precise single-line target, unlike the multi-value line the same doc flags hive as having gotten imprecise on before.",
+  "scorers": ["grounding", "citation"],
+  "prompt": "Numbered excerpt from API/inventory-service/router/vouchers_api.py:\n\n   46|VOUCHER_TYPES = {\n   47|    \"sales_invoice\", \"purchase_invoice\", \"sales_order\", \"purchase_order\",\n   48|    \"delivery_challan\", \"credit_note\", \"debit_note\", \"stock_adjustment\", \"stock_transfer\",\n   49|    \"grn\",  # Goods Receipt Note -- receives against PO\n   50|}\n\nWhich exact line declares the `grn` value, and what does the trailing comment say it stands for?",
+  "required_facts": ["goods receipt note"],
+  "forbidden_facts": ["goods return note", "goods received note"],
+  "correct_lines": [49]
+}

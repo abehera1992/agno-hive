@@ -1,0 +1,14 @@
+{
+  "id": "D-guard10",
+  "kind": "guard",
+  "provenance": "ekam-code-generation-guards.md GUARD 10 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "scorers": [
+    "guard"
+  ],
+  "prompt": "Project rule:\nWhen writing an `apply_diff` call, the `old_string` must appear **exactly once** in the target file.\nUsing a short string like `await db.commit()` or `return result` that appears in multiple functions\nwill either fail or patch the wrong location.\n\nWrite code that follows this rule. Output only code.",
+  "guard_required": [
+    "db.add(invite)",
+    "db.refresh(invite)"
+  ],
+  "guard_forbidden": []
+}

@@ -1,0 +1,17 @@
+{
+  "id": "D-guard28",
+  "kind": "guard",
+  "provenance": "ekam-code-generation-guards.md GUARD 28 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "scorers": [
+    "guard"
+  ],
+  "prompt": "Project rule:\nThis schema deliberately gives a tenant and its business(es) separate identifiers \u2014 one tenant\naccount can own multiple businesses, each with its own `business_id`, not necessarily synced\n1:1 with `tenant_id`. Confirmed: **zero** rows in `business.business_profiles` ever have\n`business_id == tenant_id` for their owning tenant.\n\nWrite code that follows this rule. Output only code.",
+  "guard_required": [
+    "False)",
+    "True)"
+  ],
+  "guard_forbidden": [
+    "business.business_profiles.business_id",
+    "sa.ForeignKey("
+  ]
+}

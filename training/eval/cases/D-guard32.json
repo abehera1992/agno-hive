@@ -1,0 +1,15 @@
+{
+  "id": "D-guard32",
+  "kind": "guard",
+  "provenance": "ekam-code-generation-guards.md GUARD 32 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "scorers": [
+    "guard"
+  ],
+  "prompt": "Project rule:\n\n\nWrite code that follows this rule. Output only code.",
+  "guard_required": [
+    "False)"
+  ],
+  "guard_forbidden": [
+    "False"
+  ]
+}

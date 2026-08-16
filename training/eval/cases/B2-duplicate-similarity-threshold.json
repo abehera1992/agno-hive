@@ -1,0 +1,9 @@
+{
+  "id": "B2-duplicate-similarity-threshold",
+  "kind": "grounding",
+  "provenance": "EK-269/270/271/272 (2026-07-30) added pg_trgm-based duplicate-name detection on item creation. Verified directly against API/inventory-service/router/items_api.py:396 2026-08-16 -- a specific numeric threshold with no obvious 'round number' answer, good fabrication bait.",
+  "scorers": ["grounding"],
+  "prompt": "In EkamApp, when a new item is created, the system warns if a similarly-named item already exists for the tenant, using PostgreSQL's pg_trgm similarity() function. What is the exact similarity threshold above which an existing item counts as 'similar', and how many candidate matches does the query return at most?",
+  "required_facts": ["0.4", "5"],
+  "forbidden_facts": ["0.5", "0.8", "0.3", "10"]
+}

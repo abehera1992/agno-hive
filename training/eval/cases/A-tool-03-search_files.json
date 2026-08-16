@@ -1,0 +1,108 @@
+{
+  "id": "A-tool-03-search_files",
+  "kind": "tool_call",
+  "provenance": "Counterpart to E-1: with a tool available the model must CALL it rather than answer from memory. Scores syntax only.",
+  "scorers": [
+    "tool_call"
+  ],
+  "prompt": "Which files reference the symbol `next_sku`? Search the codebase.",
+  "expect_tool": "search_files",
+  "expect_args": [
+    "pattern"
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_file_content",
+        "description": "Read a file from the project by relative path.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "relative_path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "relative_path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_files",
+        "description": "Regex search across project source files.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "glob_filter": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "find_files",
+        "description": "Glob search for files across the project.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "glob_pattern": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "glob_pattern"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "run_command",
+        "description": "Run a READ-ONLY shell command (tests, linters, git status).",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "cmd": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "cmd"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_directory",
+        "description": "List the immediate children of a directory.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    }
+  ]
+}

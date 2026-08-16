@@ -1,0 +1,10 @@
+{
+  "id": "C6-auth-client-signature",
+  "kind": "citation",
+  "provenance": "EK-269 (2026-07-30) replaced a direct cross-schema query with this client helper. Verified directly against API/utils/service_clients/auth_service_client.py 2026-08-16.",
+  "scorers": ["grounding", "citation"],
+  "prompt": "Numbered excerpt from API/utils/service_clients/auth_service_client.py:\n\n   47|async def get_tenant_ids_for_users(\n   48|    user_ids: list[str],\n   49|    internal_api_key: str,\n   50|) -> dict:\n\nWhich line declares the function itself (not its parameters), and what are the two parameter names?",
+  "required_facts": ["user_ids", "internal_api_key"],
+  "forbidden_facts": ["tenant_id", "api_key\""],
+  "correct_lines": [47]
+}

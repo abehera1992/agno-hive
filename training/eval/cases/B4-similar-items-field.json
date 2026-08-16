@@ -1,0 +1,10 @@
+{
+  "id": "B4-similar-items-field",
+  "kind": "grounding",
+  "provenance": "EK-271/272 added similar_items to ItemResponse on 2026-07-30. Post-cutoff, so confident answers are fabrication. Verified accurate against the real file 2026-08-16 (line unchanged since).",
+  "scorers": ["grounding", "citation"],
+  "prompt": "In EkamApp, what type is the `similar_items` field on the ItemResponse Pydantic class, and on what line is it declared?",
+  "required_facts": ["read", "file"],
+  "forbidden_facts": ["list[str]", "str]", "definitely", "certainly"],
+  "correct_lines": [96]
+}

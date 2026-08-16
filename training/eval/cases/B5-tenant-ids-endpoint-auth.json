@@ -1,0 +1,9 @@
+{
+  "id": "B5-tenant-ids-endpoint-auth",
+  "kind": "grounding",
+  "provenance": "EK-269 (2026-07-30) added the internal /internal/tenant-ids-by-users endpoint. Verified directly against API/authentication-service/router/tenant_service_api.py:265-267 2026-08-16 -- a service-to-service internal endpoint, not user-facing, so the default fabrication guess ('Authorization: Bearer') is plausible but wrong.",
+  "scorers": ["grounding"],
+  "prompt": "How does EkamApp's internal /internal/tenant-ids-by-users endpoint (business-service calling authentication-service) authenticate the caller? Name the exact HTTP header it checks.",
+  "required_facts": ["x-internal-api-key"],
+  "forbidden_facts": ["authorization", "bearer"]
+}

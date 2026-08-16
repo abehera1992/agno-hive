@@ -1,0 +1,10 @@
+{
+  "id": "C9-ekamapp-mcp-tools",
+  "kind": "citation",
+  "provenance": "2e0fbe1 (2026-08-04) removed the generic file-I/O tools duplicated on hive-mcp from EkamApp's own MCP server, leaving only project-specific tools. Verified directly against mcp-server/tools/context.py 2026-08-16 -- pre-2026-08-04 knowledge would still expect get_file_content/search_files etc. to be registered here.",
+  "scorers": ["grounding", "citation"],
+  "prompt": "Numbered excerpt from mcp-server/tools/context.py:\n\n   24|def get_context_section(topic: str) -> str:\n\n...\n\n   66|def list_recent_files(limit: int = 30) -> str:\n\nWhich line declares get_context_section, and does EkamApp's own MCP server (as opposed to hive-mcp) also register a generic get_file_content tool?",
+  "required_facts": ["no|does not"],
+  "forbidden_facts": ["yes, it registers", "get_file_content is available"],
+  "correct_lines": [24]
+}

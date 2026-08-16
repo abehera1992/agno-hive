@@ -1,4 +1,4 @@
-"""Phase 2 eval harness — four DECOUPLED scorers against a live OpenAI-compatible model.
+"""Phase 2 eval harness — five DECOUPLED scorers against a live OpenAI-compatible model.
 
     python -m training.eval.harness --base-url http://localhost:8003/v1 --model qwen3-coder-30b
 
@@ -9,14 +9,31 @@ would let citation regressions hide behind grounding gains. Each dimension is th
 scored and reported separately, and a case only participates in the dimensions it declares.
 
 Scorers
-  A. tool_call  — % of tool-using cases where the model emits a well-formed call with
-                  the right tool name and parseable args (syntax, not judgement).
-  B. grounding  — % of required facts present, IGNORING any line numbers. Fabricated
-                  facts (declared per case) score negative.
-  C. citation   — of the line numbers actually asserted, how many are right. Asserting
-                  nothing and describing the location in prose is a PASS, not an
-                  abstention: on a large file that is the correct behaviour.
-  D. guard      — % adherence to a project guard (required/forbidden substrings).
+  A. tool_call   — % of tool-using cases where the model emits a well-formed call with
+                   the right tool name and parseable args (syntax, not judgement).
+  B. grounding   — % of required facts present, IGNORING any line numbers. Fabricated
+                   facts (declared per case) score negative.
+  C. citation    — of the line numbers actually asserted, how many are right. Asserting
+                   nothing and describing the location in prose is a PASS, not an
+                   abstention: on a large file that is the correct behaviour.
+  D. guard       — % adherence to a project guard (required/forbidden substrings).
+  E. repetition  — does a single completion converge, or does it degenerate into
+                   self-repetition? Added 2026-08-16 after four LIVE swarm incidents
+                   (verbatim sentence looped for 60,000+ chars over 17+ minutes;
+                   an escalating reworded self-correction spiral that never repeated
+                   verbatim but never landed on an answer either; a narration leak; a
+                   false-positive liveness kill) none of which any of A-D could ever
+                   have caught — those are all single-shot correctness scorers, and the
+                   incidents were properties of long, multi-turn GENERATION, not of what
+                   a completion said. This is a proxy, not equivalent coverage: it can
+                   only see degeneracy that fits inside one bounded completion at
+                   temperature 0, not the actual multi-turn streamed drift that produced
+                   the live incidents. A real check of THAT requires routing real tasks
+                   through the candidate once it is served (see RUNBOOK Phase 3b/5) and
+                   watching whether swarm/team.py's own liveness/repetition detector
+                   fires — this scorer exists so a candidate that is obviously prone to
+                   short-horizon looping gets caught before that later, more expensive
+                   step, not instead of it.
 
 Every scorer returns (score in 0..1, detail string) so failures are explainable.
 """
@@ -45,16 +62,69 @@ CASES_DIR = Path(__file__).parent / "cases"
 # "number"/"no." plus up to 12 non-digit, same-line characters.
 _LINE_CLAIM_RE = re.compile(r"\blines?\b(?:\s*(?:numbers?|nos?\.?))?[^\d\n]{0,12}(\d{1,5})", re.I)
 
+# Ported from swarm/team.py's _looks_like_repetition_loop / _REPETITION_* constants
+# rather than imported: that module pulls in agno + the full swarm dependency chain,
+# and this harness is deliberately stdlib-only so it can run standalone against any
+# OpenAI-compatible endpoint. Keep these four constants and _looks_like_repetition_loop
+# in sync with swarm/team.py by hand if that detector's calibration changes again —
+# the values below (as of 2026-08-16) match it exactly.
+_REPETITION_LOOKBACK_CHARS = 4000
+_REPETITION_MIN_SEGMENT_LEN = 60
+_REPETITION_FILLER_WORDS = frozenset({
+    "even", "really", "very", "actually", "now", "again", "just", "simply",
+})
+_REPETITION_PREFIX_CHARS = 100
+# How wide a slice of the completion to treat as one "new segment" when walking the
+# text looking for a repeat of something earlier in the SAME completion. The runtime
+# detector checks streamed batches as they arrive (~700-900 chars each in the real
+# incident); a full offline completion has no natural batch boundary, so a fixed
+# window is used instead. Narrower than the runtime's typical batch so a shorter
+# eval completion (capped at a few thousand tokens, not tens of thousands of chars)
+# still gets multiple scan points instead of just one or two.
+_REPETITION_SCAN_WINDOW_CHARS = 400
+
+
+def _normalize_for_repetition_check(text: str) -> str:
+    words = text.split()
+    return " ".join(w for w in words if w.lower() not in _REPETITION_FILLER_WORDS)
+
+
+def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:
+    """True if `new_segment` looks like a repeat (verbatim, or lightly reworded /
+    escalating) of something in the recent lookback window of `prior_content`,
+    rather than genuine new progress. See swarm/team.py's own copy for the full
+    incident history this logic is calibrated against."""
+    normalized_new = " ".join(new_segment.split())
+    if len(normalized_new) < _REPETITION_MIN_SEGMENT_LEN:
+        return False
+    normalized_prior = " ".join(prior_content[-_REPETITION_LOOKBACK_CHARS:].split())
+    if normalized_new in normalized_prior:
+        return True
+
+    filler_stripped_new = _normalize_for_repetition_check(new_segment)
+    if len(filler_stripped_new) < _REPETITION_MIN_SEGMENT_LEN:
+        return False
+    filler_stripped_prior = _normalize_for_repetition_check(
+        prior_content[-_REPETITION_LOOKBACK_CHARS:]
+    )
+    if filler_stripped_new in filler_stripped_prior:
+        return True
+
+    prefix = filler_stripped_new[:_REPETITION_PREFIX_CHARS]
+    if len(prefix) < _REPETITION_MIN_SEGMENT_LEN:
+        return False
+    return prefix in filler_stripped_prior
+
 
 # ── model client ──────────────────────────────────────────────────────────────
 
 def call_model(
     base_url: str, model: str, messages: list[dict], tools: list[dict] | None = None,
-    timeout: int = 180, temperature: float = 0.0,
+    timeout: int = 180, temperature: float = 0.0, max_tokens: int = 800,
 ) -> dict:
     payload: dict[str, Any] = {
         "model": model, "messages": messages,
-        "temperature": temperature, "max_tokens": 800,
+        "temperature": temperature, "max_tokens": max_tokens,
     }
     if tools:
         payload["tools"] = tools
@@ -135,6 +205,24 @@ def score_grounding(case: dict, text: str) -> tuple[float, str]:
     if miss:
         parts.append(f"missing: {miss}")
     return score, "; ".join(parts)
+
+
+def score_repetition(case: dict, text: str) -> tuple[float, str]:
+    """E. Convergence — does this completion degenerate into self-repetition?
+
+    Binary, not graduated: the runtime detector this mirrors doesn't grade severity
+    either, it just decides "loop or not" at each check point. Walks the completion
+    in fixed windows, treating each window as a freshly-generated segment and
+    everything before it as the prior content — the same shape the runtime detector
+    sees while streaming, just replayed against a completed string instead of live
+    deltas."""
+    window = _REPETITION_SCAN_WINDOW_CHARS
+    for i in range(window, len(text), window):
+        segment = text[i:i + window]
+        prior = text[:i]
+        if _looks_like_repetition_loop(segment, prior):
+            return 0.0, f"repetition/degeneracy detected at char offset {i}"
+    return 1.0, "no repetition/degeneracy detected"
 
 
 def score_citation(case: dict, text: str) -> tuple[float, str]:
@@ -309,10 +397,12 @@ SCORERS = {
     "citation": ("C", score_citation),
     "guard": ("D", score_guard),
     "structural": ("D", score_structural),
+    "repetition": ("E", score_repetition),
 }
 
 # Both `guard` and `structural` measure Axis D; the harness aggregates them together.
-AXIS_OF = {"tool_call": "A", "grounding": "B", "citation": "C", "guard": "D", "structural": "D"}
+AXIS_OF = {"tool_call": "A", "grounding": "B", "citation": "C", "guard": "D",
+           "structural": "D", "repetition": "E"}
 
 
 # ── runner ────────────────────────────────────────────────────────────────────
@@ -322,9 +412,15 @@ def run_case(case: dict, base_url: str, model: str) -> dict:
     if case.get("system"):
         messages.insert(0, {"role": "system", "content": case["system"]})
 
+    # Axis E cases need room for a loop to actually manifest — the harness default of
+    # 800 tokens is tuned for the short, single-fact answers A-D cases expect, and
+    # would truncate a repetition scan before it could see anything.
+    max_tokens = case.get("max_tokens", 800)
+
     t0 = time.time()
     try:
-        resp = call_model(base_url, model, messages, tools=case.get("tools"))
+        resp = call_model(base_url, model, messages, tools=case.get("tools"),
+                           max_tokens=max_tokens)
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         return {"id": case["id"], "error": f"{type(e).__name__}: {e}", "scores": {}}
     elapsed = time.time() - t0

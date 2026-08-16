@@ -1,0 +1,17 @@
+{
+  "id": "D-guard4",
+  "kind": "guard",
+  "provenance": "ekam-code-generation-guards.md GUARD 4 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "scorers": [
+    "guard"
+  ],
+  "prompt": "Project rule:\nThis project uses SQLAlchemy 2.x async throughout. Every DB dependency is\n`AsyncSession = Depends(get_async_db)`. Using sync `Session` will deadlock uvicorn.\n\nWrite code that follows this rule. Output only code.",
+  "guard_required": [
+    "AsyncSession",
+    "Depends(get_async_db))"
+  ],
+  "guard_forbidden": [
+    "Depends(get_db))",
+    "Session"
+  ]
+}

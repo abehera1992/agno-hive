@@ -33,7 +33,17 @@ AXES = {
     "grounding": "grounding_min",
     "citation": "citation_min",
     "guard": "guard_min",
+    "repetition": "repetition_min",
 }
+
+# Axes a config's `gate:` block doesn't set a floor for are scored and printed by the
+# harness but not enforced here. This is how `repetition` (Axis E, added 2026-08-16)
+# rolls out: an unvalidated new scorer with no track record yet shouldn't be able to
+# block a promotion on n=1 confidence, so existing configs (qwen3-30b.yaml,
+# qwen36-35b.yaml) are read as-is, un-edited, and simply never enforce it. A config
+# opts in by adding `repetition_min:` to its own `gate:` block once the scorer has
+# enough runs behind it to trust a floor.
+OPTIONAL_AXES = {"repetition"}
 
 
 def resolve_floor(spec: float | str, baseline: float | None, axis: str) -> float:
@@ -102,6 +112,11 @@ def dry_run(cfg: dict) -> int:
         good = n >= need
         ok &= good
         print(f"  {letter}. {axis:11s} n={n:3d}   {'PASS' if good else f'FAIL (need {need})'}")
+    # Informational only: an optional axis never blocks suite readiness (see
+    # OPTIONAL_AXES), so its dry-run line doesn't feed into `ok`.
+    if "repetition" in counts:
+        n = counts["repetition"]
+        print(f"  E. repetition n={n:3d}   (informational — not enforced by this config)")
     print("=" * 62)
     print("RESULT: suite is ready to score a candidate."
           if ok else "RESULT: suite NOT ready — expand the short axes.")
@@ -141,6 +156,17 @@ def main() -> None:
         b = base.get("aggregate", {}).get(axis)
         c = cand.get("aggregate", {}).get(axis)
         n = n_cases(cand, axis)
+
+        if axis in OPTIONAL_AXES and key not in gate:
+            # This config hasn't opted this axis into enforcement (see OPTIONAL_AXES).
+            # Still surface the number if the harness scored it — silently dropping a
+            # real score from the printed table would look like the scorer never ran.
+            if c is not None:
+                delta = f"{(c - b):+.3f}" if b is not None else "n/a"
+                print(f"{axis:12s} {b if b is not None else float('nan'):7.3f} {c:7.3f} "
+                      f"{delta:>8s} {'n/a':>7s} {n:4d}  INFO (not enforced)")
+            continue
+
         floor = resolve_floor(gate[key], b, axis)
         floor_note = "  (= baseline - tol)" if isinstance(gate[key], str) else ""
 

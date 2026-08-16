@@ -1,0 +1,14 @@
+{
+  "id": "D-guard36",
+  "kind": "guard",
+  "provenance": "ekam-code-generation-guards.md GUARD 36 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "scorers": [
+    "guard"
+  ],
+  "prompt": "Project rule:\nProduced 2026-07-29: asked for a backfill script that \"verifies uniqueness, and if any\nduplicates found, raise an error instead of committing\" \u2014 the Coder wrote\n`await db.commit()` for the item updates, and only ran the duplicate-check query\n**after** that commit had already gone through. The subsequent `raise ValueError(...)` on\nfinding duplicates then had nothing to prevent \u2014 the bad data was al\n\nWrite code that follows this rule. Output only code.",
+  "guard_required": [
+    "db.flush()",
+    "db.rollback()"
+  ],
+  "guard_forbidden": []
+}

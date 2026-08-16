@@ -1,0 +1,17 @@
+{
+  "id": "D-guard20",
+  "kind": "guard",
+  "provenance": "ekam-code-generation-guards.md GUARD 20 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "scorers": [
+    "guard"
+  ],
+  "prompt": "Project rule:\nWhen a Pydantic request schema has extra fields that don't correspond to ORM columns\n(e.g. `override_reason`, `attested` used only for validation logic, not persisted), you\nMUST exclude them before `**model_dump()` into the SQLAlchemy model constructor. SQLAlchemy's\ndeclarative `__init__` checks `hasattr(cls, key)` for every kwarg and raises `TypeError:\ninvalid keyword argument` for anything not a\n\nWrite code that follows this rule. Output only code.",
+  "guard_required": [
+    "Item(",
+    "True"
+  ],
+  "guard_forbidden": [
+    "Item(tenant_id",
+    "True))"
+  ]
+}

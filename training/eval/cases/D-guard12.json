@@ -1,0 +1,13 @@
+{
+  "id": "D-guard12",
+  "kind": "guard",
+  "provenance": "ekam-code-generation-guards.md GUARD 12 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "scorers": [
+    "guard"
+  ],
+  "prompt": "Project rule:\nIf `apply_diff()` returns anything starting with `\"apply_diff failed:\"`, the change was NOT made.\nReport the exact error to the coordinator and STOP. Do NOT describe what the change would look\nlike. Do NOT claim `review_pending`. Do NOT continue to the next diff.\n\nThe most common cause is an `old_string` that does not exactly match the file content. Fix:\ncall `get_file_content(path)` to read the c\n\nWrite code that follows this rule. Output only code.",
+  "guard_required": [
+    "get_file_content(path)"
+  ],
+  "guard_forbidden": []
+}

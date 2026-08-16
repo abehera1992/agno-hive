@@ -1,0 +1,8 @@
+{
+  "id": "E1-vouchers-redemption-design-doc",
+  "kind": "repetition",
+  "provenance": "Shaped after the real 2026-08-16 T4 live incident: a long-form, numbered-phase design-doc generation task was auto-killed by the swarm's liveness detector at 482s even though it was genuinely progressing -- structural repetition across phases (consistent headers, consistent label-before-value formatting) looks superficially like a loop. This case reproduces that shape directly against the candidate model in isolation, grounded in the real, documented Vouchers module (patterns/ekam-inventory.md) rather than an invented one.",
+  "scorers": ["repetition"],
+  "max_tokens": 2500,
+  "prompt": "Design how the Vouchers module (API/inventory-service/, models.py's Voucher class, router/vouchers_api.py) should be extended to add a redemption audit trail for credit_note and debit_note voucher types. Plan only, no code. Write it as numbered phases (Phase 1, Phase 2, ...), and for each phase list: the files to modify, and a short paragraph of what changes and why. Cover at minimum: the new audit table, the API endpoint(s) to record a redemption, and how it interacts with the existing status state machine (draft/posted/cancelled)."
+}

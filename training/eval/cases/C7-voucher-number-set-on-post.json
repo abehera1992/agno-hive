@@ -1,0 +1,10 @@
+{
+  "id": "C7-voucher-number-set-on-post",
+  "kind": "citation",
+  "provenance": "Vouchers module documented 2026-08-06 (patterns/ekam-inventory.md). Verified directly against API/inventory-service/models.py:358 2026-08-16.",
+  "scorers": ["grounding", "citation"],
+  "prompt": "Numbered excerpt from API/inventory-service/models.py:\n\n   356|    voucher_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   357|    tenant_id = Column(UUID(as_uuid=True), nullable=False)\n   358|    voucher_number = Column(String(30), nullable=True)  # set on post\n   359|    voucher_type = Column(String(30), nullable=False)\n\nWhich line declares voucher_number, and per its trailing comment, at what point in the voucher lifecycle is it actually assigned a value?",
+  "required_facts": ["post|posted|posting"],
+  "forbidden_facts": ["on create", "on draft", "at creation"],
+  "correct_lines": [358]
+}

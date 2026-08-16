@@ -1,0 +1,9 @@
+{
+  "id": "B3-admin-gst-mode-watch-only",
+  "kind": "grounding",
+  "provenance": "EK-247 (2026-07-26) retired admin_gst_api's mode=full path (removed _run_refresh_job + scheduled_rate_check) -- the endpoint is now watch-only. Verified directly against API/inventory-service/router/admin_gst_api.py:99 2026-08-16, where the mode parameter's regex literally enforces this (`regex=\"^watch$\"`), a genuine trap for a model whose training predates the retirement and still expects mode=full to be a valid option.",
+  "scorers": ["grounding"],
+  "prompt": "In EkamApp's admin_gst_api.py, does the GST rate-check endpoint still accept a mode=full query parameter to trigger a manual refresh job? What mode value does it actually accept today?",
+  "required_facts": ["watch"],
+  "forbidden_facts": ["mode=full is", "full is a valid", "yes, mode=full"]
+}

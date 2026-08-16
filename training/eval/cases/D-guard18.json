@@ -1,0 +1,13 @@
+{
+  "id": "D-guard18",
+  "kind": "guard",
+  "provenance": "ekam-code-generation-guards.md GUARD 18 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "scorers": [
+    "guard"
+  ],
+  "prompt": "Project rule:\nSQLAlchemy 2.x's `AsyncSession.execute()` does not accept a bare Python string \u2014\nit raises `ObjectNotExecutableError`. Any hand-written SQL (not built via `select()`/`update()`)\nmust be wrapped.\n\nWrite code that follows this rule. Output only code.",
+  "guard_required": [
+    "text("
+  ],
+  "guard_forbidden": []
+}

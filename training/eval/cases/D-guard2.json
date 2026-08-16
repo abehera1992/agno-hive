@@ -1,0 +1,13 @@
+{
+  "id": "D-guard2",
+  "kind": "guard",
+  "provenance": "ekam-code-generation-guards.md GUARD 2 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "scorers": [
+    "guard"
+  ],
+  "prompt": "Project rule:\nWhen building a diff/changelog, always snapshot the current value into a local\nvariable **before** you change it. Reading from the object after mutation gives the new value.\n\nWrite code that follows this rule. Output only code.",
+  "guard_required": [
+    "old_used"
+  ],
+  "guard_forbidden": []
+}

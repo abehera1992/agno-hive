@@ -1,0 +1,10 @@
+{
+  "id": "C8-plan-limits-internal-call",
+  "kind": "citation",
+  "provenance": "max_vouchers_per_year is a tenant-wide annual plan limit fetched from business-service, documented in patterns/ekam-inventory.md. Verified directly against API/inventory-service/router/vouchers_api.py:165-171 2026-08-16.",
+  "scorers": ["grounding", "citation"],
+  "prompt": "Numbered excerpt from API/inventory-service/router/vouchers_api.py:\n\n   165|        async with httpx.AsyncClient(timeout=3.0) as c:\n   166|            resp = await c.get(\n   167|                f\"http://business-service:8004/internal/tenant/{tenant_id}/plan-limits\",\n   168|                headers={\"X-Internal-API-Key\": settings.INTERNAL_API_KEY},\n   169|            )\n   170|        if resp.status_code == 200:\n   171|            max_v = resp.json().get(\"max_vouchers_per_year\")\n\nWhich line makes the internal HTTP call to business-service, and what port does it target?",
+  "required_facts": ["8004"],
+  "forbidden_facts": ["8000", "8080", "9000"],
+  "correct_lines": [167]
+}

@@ -1,0 +1,9 @@
+{
+  "id": "B1-hsn-fallback-retired",
+  "kind": "grounding",
+  "provenance": "EK-247 (2026-07-26) eliminated the code-resident _HSN_FALLBACK dict, moving all 1121 codes into inventory.hsn_catalogue. A GENUINE trap: gst_resolver.py's own comment directly above the function (lines 24-26) still says 'Static fallback for when the DB catalogue has no entry...' -- stale prose left in place after the refactor -- so a model reading only the comment, or answering from generic memory, is likely to confidently describe a fallback dict that no longer exists in the code below it. Verified directly against the real file 2026-08-16.",
+  "scorers": ["grounding"],
+  "prompt": "In EkamApp's gst_resolver.py, when resolve_gst_for_hsn is called for an HSN code that has no row in inventory.hsn_catalogue, does it fall back to a code-resident _HSN_FALLBACK dict? What actually happens instead?",
+  "required_facts": ["no|does not|removed|eliminated"],
+  "forbidden_facts": ["falls back to a", "_HSN_FALLBACK dict is used", "yes, it falls back"]
+}
