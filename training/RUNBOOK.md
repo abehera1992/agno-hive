@@ -153,6 +153,16 @@ systemctl --user stop agno-api.service
 # free the GPU: coord (~72 GB), extract (~11 GB), embed (~7 GB)
 docker stop vllm-coord vllm-extract vllm-embed
 
+# STOP THIS BEFORE TRAINING STARTS -- not optional. Its "stale inference" detector
+# fires `docker restart vllm-coord` after 25 CONTINUOUS minutes of GPU util >=88%,
+# with zero awareness of whether that util is stuck vLLM inference or a legitimate
+# training run -- and QLoRA training sits at 90-96% util for its whole multi-hour
+# duration. Found live 2026-08-16: caught with ~9-10 min to spare before it would
+# have restarted vllm-coord mid-training, reopening production traffic capability
+# while the window was still supposed to be in effect and risking GPU/unified-memory
+# contention corrupting the run. Full detail: DOCS.md "zgx-thermal-watchdog.service".
+systemctl --user stop zgx-thermal-watchdog.service
+
 # confirm ~110 GB is actually free before starting
 free -g | head -2
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv
@@ -233,6 +243,12 @@ sleep 240
 curl -s -o /dev/null -w "vllm-coord HTTP %{http_code}\n" http://localhost:8003/v1/models
 systemctl --user start agno-api.service
 curl -s http://localhost:9001/health
+
+# Re-arm the thermal watchdog stopped at the start of Phase 3b -- it does not
+# restart itself. Skipping this leaves the GPU with no thermal protection at all
+# until the next person happens to notice.
+systemctl --user start zgx-thermal-watchdog.service
+systemctl --user status zgx-thermal-watchdog.service
 ```
 
 ---
