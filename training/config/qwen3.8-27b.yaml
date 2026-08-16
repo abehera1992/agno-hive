@@ -1,0 +1,111 @@
+# Phase 3 recipe — QLoRA + ORPO on Qwen3.8-27B (BF16 base).
+#
+# First attempt on this base model (2026-08-16). This is a genuinely different
+# architecture from every prior candidate — dense (not MoE, unlike qwen3-30b.yaml's
+# base), but a HYBRID: 64 decoder layers where only 16 (every 4th) use regular full
+# attention (q_proj/k_proj/v_proj/o_proj); the other 48 use linear attention (GDN-
+# style: in_proj_qkv/in_proj_z/in_proj_a/in_proj_b/out_proj + a conv1d mixing layer)
+# with a COMPLETELY DIFFERENT, non-overlapping module set. Confirmed live 2026-08-16
+# by building just the text decoder on torch's meta device (transformers 5.5.0,
+# AutoModel.from_config, no weights downloaded) and walking all 64 layers' named
+# modules — not inferred from the config or guessed from the model card.
+#
+# Measured baseline for the CURRENT production model (qwen3-30b-hive-v2-fp8) on the
+# widened 44-case suite (2026-08-16, training/eval/baseline.json):
+#     A tool_call 1.000 (n=12)   B grounding 0.766 (n=16)
+#     C citation  0.917 (n=12)   D guard     0.214 (n=14)
+# This is NOT a baseline for Qwen3.8-27B itself — the untuned Qwen3.8-27B baseline
+# still needs its own harness run (Phase 2.5.3-equivalent, this base model) before
+# the gate can compare a trained candidate against anything meaningful.
+
+# Not yet downloaded (Phase 3a) — path is where snapshot_download will place it.
+base_model: /home/abehera1992/models/Qwen3.8-27B
+staging_dir: /home/abehera1992/models
+
+# ── naming standard (matches qwen3-30b.yaml's convention) ─────────────────────
+# candidate : Qwen3.8-27B-hive-v1   <- the tuned artifact
+# baseline  : qwen3.8-27b-instruct  <- the untuned reference the gate compares against
+candidate_name: Qwen3.8-27B-hive-v1
+baseline_name: qwen3.8-27b-instruct
+
+output_dir: checkpoints/qwen3.8-27b-hive-v1
+merged_dir: checkpoints/qwen3.8-27b-hive-v1-merged-bf16
+
+# ── data ──────────────────────────────────────────────────────────────────────
+# REUSED, not rebuilt (RUNBOOK.md Step 1 decision) — the corpus is sourced from
+# agno-hive itself (patterns/*.md guard pairs + synthetic citation pairs generated
+# against agno-hive source), never from the base model, so it is base-model-
+# independent and the same 195 preference pairs apply here unchanged.
+dataset: training/data/corpus_v2.jsonl
+objective: orpo
+
+# ── LoRA ──────────────────────────────────────────────────────────────────────
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  bias: none
+  # WIDENED beyond qwen3-30b.yaml's 7 — see the architecture note above. The
+  # original 7 alone would only adapt the 16 full-attention layers' attention path
+  # (1 in 4) plus every layer's MLP, leaving the other 48 layers' attention
+  # mechanism completely untouched. qwen3-30b.yaml's own history warns about
+  # exactly this shape of mistake: its v1 used a too-narrow target_modules and
+  # came out completely INERT (reward margins negative, every axis delta 0.000)
+  # before v2 widened it. Applying that lesson up front here rather than
+  # discovering it the same way again.
+  #
+  # The 5 added names (in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, out_proj) are
+  # confirmed real nn.Linear layers inside the linear-attention (GDN) blocks —
+  # verified via the same meta-device inspection, not assumed from the name.
+  # Deliberately EXCLUDES conv1d: it's a small state-space mixing layer
+  # (~41K params/layer, nn.Conv1d not nn.Linear) and PEFT/Unsloth LoRA support for
+  # Conv1d on a brand-new architecture with no dedicated Unsloth fast-path is an
+  # unproven combination not worth risking on a first attempt. If this run
+  # underperforms and conv1d coverage looks like the reason, that is the next
+  # lever — not a blind first try.
+  target_modules: [
+    q_proj, k_proj, v_proj, o_proj,
+    in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, out_proj,
+    gate_proj, up_proj, down_proj,
+  ]
+  use_gradient_checkpointing: unsloth
+
+# ── optimisation ──────────────────────────────────────────────────────────────
+# Unchanged from qwen3-30b.yaml — no documented, evidenced reason yet to deviate.
+# If Phase 3b's run comes out inert again despite the wider target_modules above,
+# these are the next thing to revisit, not the first.
+train:
+  max_seq_length: 2048
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-5
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.05
+  num_train_epochs: 4
+  max_steps: -1
+  optim: adamw_8bit
+  weight_decay: 0.01
+  beta: 0.3
+  bf16: true
+  seed: 42
+  logging_steps: 5
+  save_strategy: epoch
+
+# ── quantisation ──────────────────────────────────────────────────────────────
+load_in_4bit: true      # QLoRA — same rationale as qwen3-30b.yaml (~17GB envelope)
+
+# ── promotion gate (Phase 3 -> 4) ─────────────────────────────────────────────
+# Same thresholds and reasoning as qwen3-30b.yaml (see that file's own gate: block
+# for the full history of why D has no absolute floor and C does). min_cases_per_axis
+# matches the widened 44-case suite this run will be scored against
+# (A=12, B=16, C=12, D=14 — all >=12).
+gate:
+  citation_min: 0.80
+  grounding_min: 0.85
+  tool_call_min: 0.98
+  guard_min: baseline
+  guard_target: 0.65
+  min_cases_per_axis: 12
+  # repetition_min intentionally NOT set — Axis E is new (2026-08-16), unvalidated,
+  # and stays informational-only (training/eval/gate.py's OPTIONAL_AXES) until it
+  # has a track record. It is still scored and printed, just not enforced.
