@@ -16,8 +16,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
+import httpx
 from sqlalchemy import select
 
+from config.config import config
 from swarm import db
 
 
@@ -151,6 +153,94 @@ async def reload() -> dict:
         "model_catalog": {"added": added, "removed": removed, "changed": changed},
         "team_role_models": {"added": role_added, "removed": role_removed, "changed": role_changed},
     }
+
+
+async def check_coordinator_readiness(team_name: str = "engineering") -> str | None:
+    """Best-effort startup diagnostic, added 2026-08-16 after a real gap was
+    found: nothing in this codebase ever verified that a resolved model_id's
+    backend (Ollama or the vLLM/LiteLLM gateway) is actually reachable, or that
+    the model is actually pulled/served. A brand-new user cloning the repo gets
+    a silently, unconditionally auto-seeded model_catalog (see load_cache()
+    above) regardless of whether Ollama/vLLM exist on their machine at all --
+    /health only confirms the FastAPI process itself is alive, and the first
+    real signal of a missing backend was previously a raw connection error or
+    404 surfacing deep inside agno's model client mid-task, nowhere near this
+    project's own "fail loudly and specifically" convention (e.g.
+    ALLOW_CLOUD_MODELS).
+
+    Checks ONLY the Coordinator of one representative team (default
+    "engineering") -- a full per-role audit of every row in team_role_models
+    belongs in a dedicated admin endpoint, not something that runs on every
+    process start. Returns None if it looks healthy, OR if the check itself
+    can't reach a conclusion (no DB row yet, cloud-routed, request shape
+    unexpected) -- this is diagnostic only and must never be the reason
+    startup fails or a task is blocked; a wrong warning is a nuisance, a
+    false-negative silence is acceptable, but blocking on this check is not.
+    Returns a human-actionable message naming the exact command to run
+    otherwise.
+    """
+    try:
+        model_id = get_default_model(team_name, "Coordinator")
+        if not model_id:
+            return None
+        route = get_route(model_id)
+        if route is None or route.kind == "cloud":
+            # Unregistered/inactive falls back to get_model()'s own existing
+            # behavior, not a backend-readiness concern. Cloud readiness is a
+            # credentials/network question already covered by the
+            # ALLOW_CLOUD_MODELS gate, not a local-setup one.
+            return None
+
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            if config.inference_backend == "ollama":
+                host = config.ollama_host or "http://localhost:11434"
+                try:
+                    resp = await client.get(f"{host.rstrip('/')}/api/tags")
+                    resp.raise_for_status()
+                except httpx.HTTPError:
+                    return (
+                        f"Ollama isn't reachable at {host} — the Coordinator's model "
+                        f"({model_id!r}) can't be served. Install/start Ollama, then run "
+                        f"`ollama pull {model_id}`. See docs/guide/setup.md."
+                    )
+                # Ollama model names in `ollama list`/`/api/tags` carry a tag suffix
+                # (e.g. ":latest") even for what was pulled as a bare name — match on
+                # a prefix so a real pull of `model_id` is recognized regardless of
+                # the exact suffix Ollama reports it under.
+                pulled = {m.get("name", "") for m in resp.json().get("models", [])}
+                if not any(n == model_id or n.startswith(f"{model_id}") for n in pulled):
+                    return (
+                        f"Ollama is running but doesn't have `{model_id}` pulled yet "
+                        f"(the Coordinator's model for team {team_name!r}). Run "
+                        f"`ollama pull {model_id}`."
+                    )
+            elif config.inference_backend == "vllm":
+                served_as = route.vllm_served_as or model_id.replace(":", "-")
+                try:
+                    resp = await client.get(f"{config.vllm_gateway_url.rstrip('/')}/models")
+                    resp.raise_for_status()
+                except httpx.HTTPError:
+                    return (
+                        f"The vLLM/LiteLLM gateway isn't reachable at "
+                        f"{config.vllm_gateway_url} — the Coordinator's model "
+                        f"({model_id!r} -> {served_as!r}) can't be served. Start the "
+                        f"stack: `docker compose -f zgx-ai-setup/docker-compose.yml up "
+                        f"-d`. See docs/guide/setup.md."
+                    )
+                served = {m.get("id", "") for m in resp.json().get("data", [])}
+                if served_as not in served:
+                    return (
+                        f"The LiteLLM gateway is up but doesn't know about "
+                        f"`{served_as}` (the Coordinator's served alias for team "
+                        f"{team_name!r}). Check zgx-ai-setup/litellm-config.yaml and "
+                        f"that the matching vLLM container is running."
+                    )
+    except Exception:
+        # Never let a diagnostic check crash startup or a task -- anything
+        # unexpected (malformed response, unknown backend value, etc.) is
+        # treated the same as "couldn't reach a conclusion."
+        return None
+    return None
 
 
 async def reset_cache_for_tests() -> None:

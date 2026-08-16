@@ -126,6 +126,32 @@ INFERENCE_BACKEND=ollama python main.py --serve
 
 On ZGX (systemd), set `INFERENCE_BACKEND` in the service's environment file and `systemctl --user restart agno-api.service` — see [🚀 Running AGNOHive](running.md).
 
+### 🩺 Startup readiness check
+
+Added 2026-08-16 to close a real gap: `model_catalog`/`team_role_models` (the
+DB-backed routing tables — see `docs/guide/cloud-models.md`) auto-seed with
+plausible-looking defaults the moment the app starts, **whether or not Ollama
+or vLLM actually exist on the machine**. Without any further check, a
+brand-new setup that skipped a step above would see `/health` report `ok` and
+only discover the problem as a raw connection error deep inside a real task.
+
+Both `python main.py --serve` and `python main.py "<task>"` now run a
+non-blocking check on startup: is the Coordinator's resolved model actually
+reachable on the configured backend? If not, a warning is printed naming the
+exact fix —
+
+```
+[readiness] WARNING: Ollama isn't reachable at http://localhost:11434 — the Coordinator's
+model ('qwen3-coder:30b') can't be served. Install/start Ollama, then run
+`ollama pull qwen3-coder:30b`. See docs/guide/setup.md.
+```
+
+— instead of a generic failure the first time a task actually runs. This
+never blocks startup or a task even if the check itself fails for an
+unrelated reason (`swarm/model_routing.check_coordinator_readiness()`); it
+only checks the Coordinator of one representative team (`engineering` by
+default), not every row in `team_role_models`.
+
 ## Client machine prerequisites
 
 - Docker (for hive-mcp)

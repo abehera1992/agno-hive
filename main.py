@@ -22,11 +22,22 @@ Usage:
 import asyncio
 import json
 import sys
+from swarm import model_routing
 from swarm.team import run_task_async, run_task_stream
 from observability.setup import setup_telemetry
 
 
 async def _interactive() -> None:
+    # Non-blocking diagnostic (2026-08-16), once per process — the CLI path
+    # never runs api/server.py's startup event, so it needs its own call.
+    # See model_routing.check_coordinator_readiness()'s docstring for the
+    # onboarding gap this closes: a brand-new user with no Ollama/vLLM set up
+    # otherwise gets a raw connection error mid-task instead of this.
+    await model_routing.ensure_cache_loaded()
+    warning = await model_routing.check_coordinator_readiness()
+    if warning:
+        print(f"[readiness] WARNING: {warning}\n")
+
     if len(sys.argv) > 1:
         result = await run_task_async(" ".join(sys.argv[1:]))
         print(result)

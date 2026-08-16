@@ -169,6 +169,11 @@ async def _load_model_routing_cache():
     # YAML that omits a role's model: field.
     await db.ensure_schema()
     await model_routing.ensure_cache_loaded()
+    # Non-blocking diagnostic (2026-08-16) — never delays or fails startup, see
+    # check_coordinator_readiness()'s own docstring for the gap this closes.
+    warning = await model_routing.check_coordinator_readiness()
+    if warning:
+        print(f"[readiness] WARNING: {warning}")
 
 
 @app.on_event("startup")
