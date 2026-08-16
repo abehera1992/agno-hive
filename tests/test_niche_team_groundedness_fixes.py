@@ -715,3 +715,55 @@ def test_entity_match_discipline_follows_conflict_resolution_section():
     idx_conflict = text.index("Resolving conflicting member reports")
     idx_entity = text.index("Entity-match discipline")
     assert idx_conflict < idx_entity
+
+
+def test_coordinator_instructions_have_a_no_process_narration_section():
+    """T5/T7/T8/T9/T12/T13 live incidents (2026-08-15/16, engineering-team
+    groundedness retest): every one of these otherwise-correct runs opened its
+    delivered answer with process narration ("I'll review...", "I apologize for
+    the error...", "Now I'll examine...") baked directly into agno's own
+    final_run_output.content -- a genuinely different bug from the earlier
+    fallback-accumulator narration leak (already fixed, see
+    test_stream_narration_leak_fix.py), since final_run_output.content is
+    non-empty here; the model itself wrote the narration as part of its real
+    answer. This is a prose-only fix by design -- narration is "what the model
+    says," the class of problem this codebase's own established lesson says
+    instructions CAN shape (unlike tool-choice/action problems, which need
+    mechanical enforcement)."""
+    from swarm.team import _COORDINATOR_INSTRUCTIONS
+
+    text = "\n".join(_COORDINATOR_INSTRUCTIONS)
+    assert "No process narration in your final answer" in text
+    assert "I apologize for the error, let me try again" in text
+    assert "not a scratchpad" in text
+
+
+def test_no_process_narration_section_precedes_general_rules():
+    from swarm.team import _COORDINATOR_INSTRUCTIONS
+
+    text = "\n".join(_COORDINATOR_INSTRUCTIONS)
+    idx_narration = text.index("No process narration")
+    idx_general = text.index("General rules")
+    assert idx_narration < idx_general
+
+
+def test_no_process_narration_section_follows_entity_match_discipline():
+    from swarm.team import _COORDINATOR_INSTRUCTIONS
+
+    text = "\n".join(_COORDINATOR_INSTRUCTIONS)
+    idx_entity = text.index("Entity-match discipline")
+    idx_narration = text.index("No process narration")
+    assert idx_entity < idx_narration
+
+
+def test_no_process_narration_section_tells_coordinator_to_clean_up_member_reports():
+    """The instructions must not claim they "apply to member agents too" -- they
+    structurally can't, since _COORDINATOR_INSTRUCTIONS only ever reaches the
+    coordinator (member agents get separate, static instructions from their own
+    YAML specs). The section must instead tell the coordinator to clean up a
+    member's narration when synthesising, which the coordinator genuinely can do."""
+    from swarm.team import _COORDINATOR_INSTRUCTIONS
+
+    text = "\n".join(_COORDINATOR_INSTRUCTIONS)
+    assert "these instructions do not reach member agents, only you" in text
+    assert "do NOT forward a" in text
