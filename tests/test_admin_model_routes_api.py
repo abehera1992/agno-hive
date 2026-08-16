@@ -17,9 +17,10 @@ from swarm import db, model_routing as mr
 async def _fresh_db(monkeypatch):
     monkeypatch.setattr(config, "database_url", "sqlite+aiosqlite:///:memory:")
     monkeypatch.setattr(config, "postgres_uri", "")
+    monkeypatch.setattr(config, "model_routing_database_url", "sqlite+aiosqlite:///:memory:")
     await db.reset_engine_for_tests()
     await mr.reset_cache_for_tests()
-    await db.ensure_schema()
+    await db.ensure_routing_schema()
     yield
 
 

@@ -44,6 +44,17 @@ class Config:
     # existing ZGX deployments keep working without touching their .env.
     database_url: str = os.getenv("DATABASE_URL", "")
 
+    # model_catalog/team_role_models ONLY — deliberately separate from database_url
+    # above (split 2026-08-16). Unset by default -> swarm/db.py's
+    # resolve_routing_database_url() uses its own dedicated SQLite file and does
+    # NOT fall back to postgres_uri/database_url, unlike the app-storage DB above.
+    # That fallback is exactly what silently landed these two tables inside ZGX's
+    # Apache AGE graph Postgres instance on 2026-08-08 (POSTGRES_URI was already
+    # set for sessions/feedback, so routing config inherited it with no explicit
+    # decision made for it specifically). Set this only if routing config should
+    # genuinely live somewhere other than its own SQLite file.
+    model_routing_database_url: str = os.getenv("MODEL_ROUTING_DATABASE_URL", "")
+
     # LightRAG MCP server
     lightrag_mcp_port: int = int(os.getenv("LIGHTRAG_MCP_PORT", "9002"))
     lightrag_mcp_url: str = os.getenv("LIGHTRAG_MCP_URL", "http://localhost:9002/mcp")

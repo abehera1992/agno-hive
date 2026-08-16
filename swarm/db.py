@@ -6,6 +6,20 @@ separately, read-only, via hive-mcp's db_schema/db_query tools.
 Engine-agnostic by design (AGNOHive 2.3.2 addendum, 2026-08-08): ships as a local
 SQLite file with zero provisioning (config.database_url unset), or point it at
 Postgres/MySQL/anything SQLAlchemy has a dialect for. See docs/guide/cloud-models.md.
+
+TWO separate engines, not one (split 2026-08-16). chat_sessions/session_messages/
+failure_log use resolve_database_url()/get_engine() (DATABASE_URL, falling back to
+the legacy POSTGRES_URI, falling back to SQLite) — unchanged. model_catalog/
+team_role_models use resolve_routing_database_url()/get_routing_engine(), which
+deliberately does NOT fall back to POSTGRES_URI: that fallback is exactly what
+caused these two tables to land inside ZGX's Apache AGE graph-storage Postgres
+instance on 2026-08-08, coupling model-routing config to a graph database for no
+reason other than POSTGRES_URI already being set for the OTHER three tables — the
+design page for this feature explicitly ruled out that coupling, but the code's
+compatibility fallback ("so ZGX needs no .env change") reintroduced it anyway,
+silently, the same day. Routing config now defaults to its own dedicated SQLite
+file unconditionally unless MODEL_ROUTING_DATABASE_URL is explicitly set — no
+implicit inheritance from whatever the session/feedback tables happen to use.
 """
 from __future__ import annotations
 
@@ -34,8 +48,15 @@ from sqlalchemy.sql import func
 from config.config import config
 
 _DEFAULT_SQLITE_PATH = Path(__file__).resolve().parent.parent / "data" / "agnohive.db"
+_DEFAULT_ROUTING_SQLITE_PATH = Path(__file__).resolve().parent.parent / "data" / "model_routing.db"
 
 metadata = MetaData()
+# Deliberately a SEPARATE MetaData, not a second binding of the same one -- there is
+# no foreign key crossing between {chat_sessions, session_messages, failure_log} and
+# {model_catalog, team_role_models}, so nothing is lost by giving the routing tables
+# their own metadata.create_all() scope, and it's what makes get_routing_engine()
+# create ONLY these two tables in the dedicated SQLite file instead of all five.
+routing_metadata = MetaData()
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -91,8 +112,13 @@ Index("failure_log_project_idx", failure_log.c.project_id, failure_log.c.created
 # model_catalog / team_role_models (AGNOHive 2.3.2 addendum) — replaces
 # swarm/agents.py's old _VLLM_MODEL_MAP dict + _CLOUD_ALIASES set. See
 # swarm/model_routing.py for the cache + get_model() integration.
+#
+# Bound to routing_metadata, NOT metadata — see the module docstring's "TWO
+# separate engines" note. These two tables live in their own dedicated SQLite
+# file via get_routing_engine(), independent of wherever chat_sessions/
+# session_messages/failure_log happen to be.
 model_catalog = Table(
-    "model_catalog", metadata,
+    "model_catalog", routing_metadata,
     Column("model_id", Text, primary_key=True),           # 'qwen3-coder:30b', 'claude-sonnet-cloud'
     Column("kind", Text, nullable=False),                  # 'local' | 'cloud'
     Column("provider", Text, nullable=False),               # 'ollama' | 'vllm' | 'anthropic' | 'openai' | ...
@@ -102,7 +128,7 @@ model_catalog = Table(
 )
 
 team_role_models = Table(
-    "team_role_models", metadata,
+    "team_role_models", routing_metadata,
     Column("team_name", Text, primary_key=True),
     Column("role_name", Text, primary_key=True),            # 'Coordinator', 'Executor', ...
     Column("model_id", Text, ForeignKey("model_catalog.model_id"), nullable=False),
@@ -148,39 +174,75 @@ def resolve_database_url() -> str:
     return f"sqlite+aiosqlite:///{_DEFAULT_SQLITE_PATH}"
 
 
+def resolve_routing_database_url() -> str:
+    """MODEL_ROUTING_DATABASE_URL if explicitly set, otherwise a dedicated SQLite
+    file — deliberately NOT falling back to DATABASE_URL/POSTGRES_URI the way
+    resolve_database_url() does. That fallback chain is exactly what put
+    model_catalog/team_role_models inside ZGX's Apache AGE graph Postgres instance
+    on 2026-08-08 (POSTGRES_URI was already set for the other three tables, so the
+    routing tables inherited it with no explicit decision made for them). Routing
+    config gets its own default so it can never again silently inherit wherever
+    the session/feedback tables happen to live."""
+    if config.model_routing_database_url:
+        return _normalize_async_url(config.model_routing_database_url)
+    _DEFAULT_ROUTING_SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    return f"sqlite+aiosqlite:///{_DEFAULT_ROUTING_SQLITE_PATH}"
+
+
+def _build_engine(url: str) -> AsyncEngine:
+    if "sqlite" in url and ":memory:" in url:
+        # In-memory SQLite is per-connection by default, so a normal pool would
+        # silently hand out a fresh (empty) database on every checkout. StaticPool
+        # keeps ONE connection alive for the engine's lifetime — required for
+        # in-memory SQLite to behave like a real shared database (used by tests).
+        engine = create_async_engine(
+            url, poolclass=StaticPool, connect_args={"check_same_thread": False}
+        )
+    else:
+        engine = create_async_engine(url)
+    if url.startswith("sqlite"):
+        # SQLite does not enforce foreign keys by default — without this,
+        # ON DELETE CASCADE (chat_sessions -> session_messages, and
+        # team_role_models -> model_catalog) silently no-ops, a behavior
+        # divergence from Postgres (which enforces FKs unconditionally).
+        @event.listens_for(engine.sync_engine, "connect")
+        def _enable_sqlite_fk(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+    return engine
+
+
 _engine: AsyncEngine | None = None
 _engine_url: str | None = None
 
 
 def get_engine() -> AsyncEngine:
-    """Process-wide engine, rebuilt if the resolved URL changes (test isolation —
-    monkeypatching config.database_url between tests must not reuse a stale
-    connection pool bound to the previous URL)."""
+    """Process-wide engine for chat_sessions/session_messages/failure_log,
+    rebuilt if the resolved URL changes (test isolation — monkeypatching
+    config.database_url between tests must not reuse a stale connection pool
+    bound to the previous URL)."""
     global _engine, _engine_url
     url = resolve_database_url()
     if _engine is None or _engine_url != url:
-        if "sqlite" in url and ":memory:" in url:
-            # In-memory SQLite is per-connection by default, so a normal pool would
-            # silently hand out a fresh (empty) database on every checkout. StaticPool
-            # keeps ONE connection alive for the engine's lifetime — required for
-            # in-memory SQLite to behave like a real shared database (used by tests).
-            _engine = create_async_engine(
-                url, poolclass=StaticPool, connect_args={"check_same_thread": False}
-            )
-        else:
-            _engine = create_async_engine(url)
+        _engine = _build_engine(url)
         _engine_url = url
-        if url.startswith("sqlite"):
-            # SQLite does not enforce foreign keys by default — without this,
-            # ON DELETE CASCADE (chat_sessions -> session_messages) silently no-ops
-            # and delete_session() would leave orphaned message rows, a behavior
-            # divergence from Postgres (which enforces FKs unconditionally).
-            @event.listens_for(_engine.sync_engine, "connect")
-            def _enable_sqlite_fk(dbapi_connection, connection_record):
-                cursor = dbapi_connection.cursor()
-                cursor.execute("PRAGMA foreign_keys=ON")
-                cursor.close()
     return _engine
+
+
+_routing_engine: AsyncEngine | None = None
+_routing_engine_url: str | None = None
+
+
+def get_routing_engine() -> AsyncEngine:
+    """Process-wide engine for model_catalog/team_role_models ONLY — separate
+    from get_engine() by design, see resolve_routing_database_url()."""
+    global _routing_engine, _routing_engine_url
+    url = resolve_routing_database_url()
+    if _routing_engine is None or _routing_engine_url != url:
+        _routing_engine = _build_engine(url)
+        _routing_engine_url = url
+    return _routing_engine
 
 
 _TEAM_ROLE_MODELS_NEW_COLUMNS = {
@@ -195,15 +257,25 @@ def _existing_team_role_models_columns(sync_conn) -> set[str]:
 
 
 async def ensure_schema() -> None:
-    """Idempotent bootstrap — create_all() only creates tables that don't already
-    exist, so this is safe to call on every startup (matches the old CREATE TABLE
-    IF NOT EXISTS ethos) against either a fresh SQLite file or an existing ZGX
+    """Idempotent bootstrap for chat_sessions/session_messages/failure_log —
+    create_all() only creates tables that don't already exist, so this is safe to
+    call on every startup against either a fresh SQLite file or an existing ZGX
     Postgres database that already has these tables from prior deployments.
+    model_catalog/team_role_models are handled separately by
+    ensure_routing_schema() against get_routing_engine()."""
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.run_sync(metadata.create_all)
+
+
+async def ensure_routing_schema() -> None:
+    """Idempotent bootstrap for model_catalog/team_role_models, against the
+    SEPARATE routing engine (see resolve_routing_database_url()).
 
     team_role_models is the one table this codebase has ever needed to widen
     after it was already deployed and populated (Recommendation #4, 2026-08-13):
     create_all() only creates MISSING tables, it never ALTERs an existing one, so
-    on ZGX's already-populated database a plain create_all() would silently leave
+    on an already-populated database a plain create_all() would silently leave
     temperature/max_tokens/tool_call_limit missing entirely -- not merely NULL,
     genuinely absent -- breaking the first INSERT or SELECT that touches them.
     Handled by introspecting the table's REAL columns first and only issuing
@@ -212,10 +284,12 @@ async def ensure_schema() -> None:
     failed statement within it (unlike SQLite), so a failed "already exists"
     ALTER here would poison every later statement in this same `engine.begin()`
     block, including create_all() itself if this ran first. Introspecting avoids
-    ever attempting the failing statement in the first place."""
-    engine = get_engine()
+    ever attempting the failing statement in the first place. Kept even though
+    the routing store is SQLite-only in practice now, since a future
+    MODEL_ROUTING_DATABASE_URL could still point at Postgres."""
+    engine = get_routing_engine()
     async with engine.begin() as conn:
-        await conn.run_sync(metadata.create_all)
+        await conn.run_sync(routing_metadata.create_all)
         existing_columns = await conn.run_sync(_existing_team_role_models_columns)
         for col_name, col_type in _TEAM_ROLE_MODELS_NEW_COLUMNS.items():
             if col_name not in existing_columns:
@@ -223,10 +297,14 @@ async def ensure_schema() -> None:
 
 
 async def reset_engine_for_tests() -> None:
-    """Dispose the cached engine so the next get_engine() call rebuilds against
-    whatever config.database_url a test just monkeypatched. Test-only."""
-    global _engine, _engine_url
+    """Dispose both cached engines so the next get_engine()/get_routing_engine()
+    call rebuilds against whatever config a test just monkeypatched. Test-only."""
+    global _engine, _engine_url, _routing_engine, _routing_engine_url
     if _engine is not None:
         await _engine.dispose()
     _engine = None
     _engine_url = None
+    if _routing_engine is not None:
+        await _routing_engine.dispose()
+    _routing_engine = None
+    _routing_engine_url = None

@@ -23,6 +23,7 @@ from swarm.agents import get_model
 async def _fresh_model_routing_cache(monkeypatch):
     monkeypatch.setattr(config, "database_url", "sqlite+aiosqlite:///:memory:")
     monkeypatch.setattr(config, "postgres_uri", "")
+    monkeypatch.setattr(config, "model_routing_database_url", "sqlite+aiosqlite:///:memory:")
     await db.reset_engine_for_tests()
     await model_routing.reset_cache_for_tests()
     await model_routing.ensure_cache_loaded()  # triggers the seed against the fresh empty DB
@@ -93,7 +94,7 @@ async def test_inactive_route_falls_back_to_unregistered_behavior(monkeypatch):
     monkeypatch.setattr(config, "inference_backend", "vllm")
     monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
 
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         await conn.execute(
             sa.update(db.model_catalog)
             .where(db.model_catalog.c.model_id == "qwen2.5-coder:32b")

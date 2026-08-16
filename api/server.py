@@ -919,7 +919,7 @@ import sqlalchemy as sa
 
 @app.get("/admin/model-routes")
 async def list_model_routes():
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         rows = (await conn.execute(sa.select(db.model_catalog))).mappings().all()
     return {"models": [dict(r) for r in rows]}
 
@@ -927,7 +927,7 @@ async def list_model_routes():
 @app.post("/admin/model-routes", status_code=201)
 async def create_model_route(entry: ModelCatalogEntry):
     try:
-        async with db.get_engine().begin() as conn:
+        async with db.get_routing_engine().begin() as conn:
             await conn.execute(db.model_catalog.insert().values(**entry.model_dump()))
     except sa.exc.IntegrityError as exc:
         raise HTTPException(status_code=409, detail=f"model_id '{entry.model_id}' already exists: {exc}")
@@ -939,7 +939,7 @@ async def update_model_route(model_id: str, patch: ModelCatalogPatch):
     values = {k: v for k, v in patch.model_dump().items() if v is not None}
     if not values:
         raise HTTPException(status_code=400, detail="no fields supplied to update")
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         result = await conn.execute(
             sa.update(db.model_catalog).where(db.model_catalog.c.model_id == model_id).values(**values)
         )
@@ -954,7 +954,7 @@ async def update_model_route(model_id: str, patch: ModelCatalogPatch):
 @app.delete("/admin/model-routes/{model_id}")
 async def delete_model_route(model_id: str):
     try:
-        async with db.get_engine().begin() as conn:
+        async with db.get_routing_engine().begin() as conn:
             result = await conn.execute(sa.delete(db.model_catalog).where(db.model_catalog.c.model_id == model_id))
     except sa.exc.IntegrityError as exc:
         raise HTTPException(
@@ -968,7 +968,7 @@ async def delete_model_route(model_id: str):
 
 @app.get("/admin/model-routes/teams")
 async def list_team_role_models():
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         rows = (await conn.execute(sa.select(db.team_role_models))).mappings().all()
     return {"defaults": [dict(r) for r in rows]}
 
@@ -983,7 +983,7 @@ async def upsert_team_role_model(entry: TeamRoleModelEntry):
     including a None left as None — re-upserting with a policy field omitted
     clears any previous override for that field back to "use config.py's global
     default," not "leave whatever was there before."""
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         existing = (
             await conn.execute(
                 sa.select(db.team_role_models.c.team_name).where(
@@ -1014,7 +1014,7 @@ async def upsert_team_role_model(entry: TeamRoleModelEntry):
 
 @app.delete("/admin/model-routes/teams/{team_name}/{role_name}")
 async def delete_team_role_model(team_name: str, role_name: str):
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         result = await conn.execute(
             sa.delete(db.team_role_models).where(
                 db.team_role_models.c.team_name == team_name, db.team_role_models.c.role_name == role_name,

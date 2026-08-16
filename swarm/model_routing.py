@@ -95,8 +95,8 @@ async def load_cache() -> None:
     """(Re)populate the in-process cache from the DB, seeding defaults into a
     brand-new/empty model_catalog first so a fresh deployment (SQLite by
     default) gets working local-model routing without a manual seed step."""
-    await db.ensure_schema()
-    async with db.get_engine().begin() as conn:
+    await db.ensure_routing_schema()
+    async with db.get_routing_engine().begin() as conn:
         existing = (await conn.execute(select(db.model_catalog.c.model_id).limit(1))).first()
         if existing is None:
             await _seed_defaults(conn)

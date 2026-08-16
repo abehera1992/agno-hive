@@ -19,6 +19,7 @@ from swarm import db, model_routing as mr
 async def _fresh_db(monkeypatch):
     monkeypatch.setattr(config, "database_url", "sqlite+aiosqlite:///:memory:")
     monkeypatch.setattr(config, "postgres_uri", "")
+    monkeypatch.setattr(config, "model_routing_database_url", "sqlite+aiosqlite:///:memory:")
     await db.reset_engine_for_tests()
     await mr.reset_cache_for_tests()
     yield
@@ -41,7 +42,7 @@ async def test_load_team_falls_back_to_db_default_when_model_omitted(tmp_path, m
     monkeypatch.setattr(server, "_TEAMS_DIR", tmp_path)
 
     await mr.ensure_cache_loaded()  # seeds model_catalog + team_role_models, including engineering/Coder
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         await conn.execute(
             db.team_role_models.insert().values(
                 team_name="synthetic-team", role_name="Coder", model_id="qwen2.5-coder:32b",
@@ -68,7 +69,7 @@ async def test_load_team_yaml_model_field_overrides_db_default(tmp_path, monkeyp
     monkeypatch.setattr(server, "_TEAMS_DIR", tmp_path)
 
     await mr.ensure_cache_loaded()
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         await conn.execute(
             db.team_role_models.insert().values(
                 team_name="synthetic-team", role_name="Coder", model_id="qwen2.5-coder:32b",

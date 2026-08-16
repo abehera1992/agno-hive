@@ -13,6 +13,7 @@ from swarm import db, model_routing as mr
 async def _fresh_state(monkeypatch):
     monkeypatch.setattr(config, "database_url", "sqlite+aiosqlite:///:memory:")
     monkeypatch.setattr(config, "postgres_uri", "")
+    monkeypatch.setattr(config, "model_routing_database_url", "sqlite+aiosqlite:///:memory:")
     await db.reset_engine_for_tests()
     await mr.reset_cache_for_tests()
     yield
@@ -22,14 +23,14 @@ async def _fresh_state(monkeypatch):
 
 async def test_load_cache_seeds_an_empty_model_catalog():
     await mr.load_cache()
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         rows = (await conn.execute(sa.select(db.model_catalog))).mappings().all()
     assert len(rows) == len(mr._LOCAL_MODELS) + len(mr._CLOUD_MODELS)
 
 
 async def test_load_cache_does_not_reseed_a_non_empty_catalog():
     await mr.load_cache()
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         await conn.execute(
             db.model_catalog.insert().values(
                 model_id="custom-model", kind="local", provider="local",
@@ -37,7 +38,7 @@ async def test_load_cache_does_not_reseed_a_non_empty_catalog():
             )
         )
     await mr.load_cache()  # must NOT re-run the seed (would duplicate-key error if it tried)
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         rows = (await conn.execute(sa.select(db.model_catalog))).mappings().all()
     assert len(rows) == len(mr._LOCAL_MODELS) + len(mr._CLOUD_MODELS) + 1
 
@@ -145,7 +146,7 @@ async def test_reload_with_no_changes_returns_empty_diff():
 
 async def test_reload_detects_a_newly_added_model():
     await mr.ensure_cache_loaded()
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         await conn.execute(
             db.model_catalog.insert().values(
                 model_id="brand-new-model", kind="local", provider="local",
@@ -161,7 +162,7 @@ async def test_reload_detects_a_newly_added_model():
 
 async def test_reload_detects_a_removed_model():
     await mr.ensure_cache_loaded()
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         # Every seeded model is referenced by some team_role_models row (FK-
         # protected, correctly), so insert a throwaway, unreferenced row to
         # delete instead of removing a real one.
@@ -173,7 +174,7 @@ async def test_reload_detects_a_removed_model():
         )
     await mr.load_cache()
 
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         await conn.execute(sa.delete(db.model_catalog).where(db.model_catalog.c.model_id == "throwaway-model"))
 
     diff = await mr.reload()
@@ -184,7 +185,7 @@ async def test_reload_detects_a_removed_model():
 
 async def test_reload_detects_a_changed_model_field():
     await mr.ensure_cache_loaded()
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         await conn.execute(
             sa.update(db.model_catalog)
             .where(db.model_catalog.c.model_id == "qwen2.5-coder:32b")
@@ -199,7 +200,7 @@ async def test_reload_detects_a_changed_model_field():
 
 async def test_reload_detects_team_role_model_changes():
     await mr.ensure_cache_loaded()
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         await conn.execute(
             sa.update(db.team_role_models)
             .where(db.team_role_models.c.team_name == "engineering", db.team_role_models.c.role_name == "Coder")
@@ -219,7 +220,7 @@ async def test_reload_detects_a_policy_only_change_not_just_model_id():
     model_id swap. Confirms role_changed isn't secretly still comparing bare
     model_id strings."""
     await mr.ensure_cache_loaded()
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         await conn.execute(
             sa.update(db.team_role_models)
             .where(db.team_role_models.c.team_name == "engineering", db.team_role_models.c.role_name == "Researcher")
@@ -236,7 +237,7 @@ async def test_reload_detects_a_policy_only_change_not_just_model_id():
 
 async def test_inactive_row_is_invisible_to_get_route():
     await mr.ensure_cache_loaded()
-    async with db.get_engine().begin() as conn:
+    async with db.get_routing_engine().begin() as conn:
         await conn.execute(
             sa.update(db.model_catalog)
             .where(db.model_catalog.c.model_id == "gpt-4o-cloud")
