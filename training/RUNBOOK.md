@@ -176,7 +176,29 @@ Do **not** `docker rm` them — `docker start` restores the same config afterwar
 cd ~/agno-hive
 nohup ~/miniforge3/envs/zgx-train/bin/python -m training.train \
   --config training/config/qwen3-30b.yaml > /tmp/train.log 2>&1 &
+TRAIN_PID=$!
 tail -f /tmp/train.log
+```
+
+**Attach the training thermal guard immediately — not optional.** Stopping
+`zgx-thermal-watchdog.service` above removes ALL its thermal protection, not just the
+stale-inference trigger that made stopping it necessary — that watchdog can only ever
+`docker start/stop/restart` `vllm-coord`/`extract`/`embed`, so it was never able to
+protect against heat from the training process itself even when running, and its
+emergency tier would make things WORSE mid-training (starts vllm-coord back up on an
+already-overheating box). Confirmed live 2026-08-16: the first Qwen3.8-27B training
+attempt drove ZGX hot enough that the box auto-shut off outright, with zero monitoring
+in place and no graceful handling of the training process. Full incident + design
+rationale: `DOCS.md` "zgx-thermal-watchdog.service" (second incident note).
+
+```bash
+nohup ~/bin/training-thermal-guard.sh "$TRAIN_PID" \
+  > /tmp/thermal_guard_stdout.log 2>&1 < /dev/null &
+disown
+# log: /tmp/training_thermal_guard.log
+# SIGTERM at 90C sustained (2 polls), SIGKILL at 95C -- watches the training PID
+# directly, exits on its own once that PID is no longer running (script lives on
+# ZGX at ~/bin/, same location convention as thermal-watchdog.sh, not in this repo)
 ```
 
 Watch for: `peak GPU` (expect ~25–35 GB) and the loss trend. If peak approaches 100 GB,
