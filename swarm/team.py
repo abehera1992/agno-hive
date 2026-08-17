@@ -2661,22 +2661,11 @@ def _make_duplicate_delegation_gate_hook():
 
         if function_name == "delegate_task_to_member":
             member_id = _member_id(str((args or {}).get("member_id", "")).strip())
-            print(
-                f"[DIAG-dup-delegate] ENTRY hook_id={id(_duplicate_delegation_gate_hook)} "
-                f"log_id={id(log)} log_len={len(log)} member_id={member_id!r} "
-                f"task_text={task_text[:80]!r}",
-                flush=True,
-            )
             prior_entries = [
                 entry for entry in log
                 if entry.get("tool") == "delegate_task_to_member"
                 and _member_id(str((entry.get("args") or {}).get("member_id", "")).strip()) == member_id
             ]
-            print(
-                f"[DIAG-dup-delegate] prior_entries for member_id={member_id!r}: "
-                f"{len(prior_entries)} match(es) out of log_len={len(log)}",
-                flush=True,
-            )
             for entry in prior_entries:
                 if _normalize_delegation_task((entry.get("args") or {}).get("task")) == task_text:
                     return (
@@ -2740,22 +2729,12 @@ def _make_duplicate_delegation_gate_hook():
                             f"NOT executed."
                         )
 
-        print(
-            f"[DIAG-dup-delegate] EXECUTING (no prior match) hook_id={id(_duplicate_delegation_gate_hook)} "
-            f"log_id={id(log)} function_name={function_name!r}",
-            flush=True,
-        )
         result = await function(**args)
         log.append({
             "tool": function_name,
             "args": dict(args or {}),
             "audit": _parse_delegation_audit(raw_task),
         })
-        print(
-            f"[DIAG-dup-delegate] APPENDED hook_id={id(_duplicate_delegation_gate_hook)} "
-            f"log_id={id(log)} new_log_len={len(log)}",
-            flush=True,
-        )
         return result
 
     return _duplicate_delegation_gate_hook
@@ -2944,7 +2923,6 @@ def _build_team(
         task=search_gate_task, researcher_agent_name=researcher_agent_name,
     )
     duplicate_delegation_gate_hook = _make_duplicate_delegation_gate_hook()
-    print(f"[DIAG-dup-delegate] _build_team() constructed a NEW gate hook={id(duplicate_delegation_gate_hook)}", flush=True)
     delegation_log_hook = _make_delegation_log_hook()
     interception_hook = _make_tool_interception_hook(activity=activity)
     # Order matters: agno makes the FIRST hook in this list the OUTERMOST wrapper
