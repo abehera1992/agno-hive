@@ -23,7 +23,10 @@ closure-local log (the same pattern _make_decompose_first_gate_hook's
 SEQUENTIAL calls through the SAME hook instance to exercise it, rather than
 pre-seeding a fake run_context's session_state.
 """
-from swarm.team import _normalize_delegation_task, _make_duplicate_delegation_gate_hook
+from swarm.team import (
+    _normalize_delegation_task, _make_duplicate_delegation_gate_hook,
+    _parse_delegation_audit, _normalize_delegation_target,
+)
 
 
 async def _fake_delegate(**kwargs):
@@ -181,7 +184,14 @@ async def test_same_task_to_a_different_member_is_not_blocked():
     assert second.startswith("delegated:")
 
 
-async def test_differently_worded_follow_up_to_same_member_is_not_blocked():
+async def test_differently_worded_follow_up_to_same_member_without_audit_is_redirected():
+    """T1-T13 gap #2 follow-up (2026-08-16) changes this test's own expected
+    behavior on purpose: a 2nd+ call to an already-delegated-to member can no
+    longer skip straight through just because the wording differs -- it must
+    carry a <delegation_audit> tag so the tuple-based check below can tell a
+    genuinely different follow-up from a reworded duplicate (which the old
+    exact-text check alone could never catch -- see the gate's own docstring).
+    A missing tag is redirected asking for it, same as every other tier."""
     hook = _make_duplicate_delegation_gate_hook()
 
     first = await hook(
@@ -196,7 +206,135 @@ async def test_differently_worded_follow_up_to_same_member_is_not_blocked():
     )
 
     assert first.startswith("delegated:")
+    assert second.startswith("REDIRECTED:")
+    assert "delegation_audit" in second
+
+
+async def test_audited_follow_up_with_a_genuinely_different_target_is_not_blocked():
+    hook = _make_duplicate_delegation_gate_hook()
+
+    first = await hook(
+        "delegate_task_to_member", _fake_delegate,
+        {
+            "member_id": "Researcher",
+            "task": "<delegation_audit>component=parties; action=read; target=x.md</delegation_audit>\nRead x.md and summarize it",
+        },
+        run_context=None,
+    )
+    second = await hook(
+        "delegate_task_to_member", _fake_delegate,
+        {
+            "member_id": "Researcher",
+            "task": "<delegation_audit>component=parties; action=read; target=y.md</delegation_audit>\nNow read y.md and compare it to x.md",
+        },
+        run_context=None,
+    )
+
+    assert first.startswith("delegated:")
     assert second.startswith("delegated:")
+
+
+async def test_audited_follow_up_with_the_same_target_and_action_is_blocked_despite_different_wording():
+    """The exact scenario the T2c-shaped incident this gate exists for: two
+    calls about the same target with the same action, worded completely
+    differently -- the exact-text check alone would never catch this, the
+    tuple check does."""
+    hook = _make_duplicate_delegation_gate_hook()
+
+    first = await hook(
+        "delegate_task_to_member", _fake_delegate,
+        {
+            "member_id": "Researcher",
+            "task": (
+                "<delegation_audit>component=parties; action=read; "
+                "target=API/inventory-service/models.py</delegation_audit>\n"
+                "Read the actual model/schema file for the Parties module backend and list "
+                "all tables and fields. Do not guess field names."
+            ),
+        },
+        run_context=None,
+    )
+    second = await hook(
+        "delegate_task_to_member", _fake_delegate,
+        {
+            "member_id": "Researcher",
+            "task": (
+                "<delegation_audit>component=parties; action=read; "
+                "target=API/inventory-service/models.py</delegation_audit>\n"
+                "Read the actual model/schema file(s) for the Parties module backend. If the "
+                "thing asked about does not exist, say so plainly."
+            ),
+        },
+        run_context=None,
+    )
+
+    assert first.startswith("delegated:")
+    assert second.startswith("REDIRECTED:")
+    assert "same target" in second
+
+
+async def test_audit_only_required_from_the_second_call_onward():
+    """The very first delegation to a member never needs the audit tag --
+    there is nothing yet to compare it against."""
+    hook = _make_duplicate_delegation_gate_hook()
+
+    result = await hook(
+        "delegate_task_to_member", _fake_delegate,
+        {"member_id": "Researcher", "task": "Read x.md and summarize it"},
+        run_context=None,
+    )
+
+    assert result.startswith("delegated:")
+
+
+async def test_second_broadcast_without_audit_is_redirected():
+    hook = _make_duplicate_delegation_gate_hook()
+
+    first = await hook(
+        "delegate_task_to_members", _fake_delegate,
+        {"task": "Review the new auth endpoints for security issues"},
+        run_context=None,
+    )
+    second = await hook(
+        "delegate_task_to_members", _fake_delegate,
+        {"task": "Please review the newly added auth routes for any security problems"},
+        run_context=None,
+    )
+
+    assert first.startswith("delegated:")
+    assert second.startswith("REDIRECTED:")
+    assert "delegation_audit" in second
+
+
+async def test_second_broadcast_with_matching_audit_tuple_is_blocked():
+    hook = _make_duplicate_delegation_gate_hook()
+
+    first = await hook(
+        "delegate_task_to_members", _fake_delegate,
+        {
+            "task": (
+                "<delegation_audit>component=auth; action=verify; "
+                "target=API/authentication-service/router/auth_api.py</delegation_audit>\n"
+                "Review the new auth endpoints for security issues"
+            ),
+        },
+        run_context=None,
+    )
+    second = await hook(
+        "delegate_task_to_members", _fake_delegate,
+        {
+            "task": (
+                "<delegation_audit>component=auth; action=verify; "
+                "target=API/authentication-service/router/auth_api.py</delegation_audit>\n"
+                "Please review the newly added auth routes for any security problems"
+            ),
+        },
+        run_context=None,
+    )
+
+    assert first.startswith("delegated:")
+    assert second.startswith("REDIRECTED:")
+    assert "same target" in second
 
 
 async def test_blocked_call_is_never_actually_invoked():
@@ -307,7 +445,12 @@ async def test_broadcast_repeat_does_not_match_a_singular_delegate_log_entry():
     assert second.startswith("delegated:")
 
 
-async def test_differently_worded_broadcast_is_not_blocked():
+async def test_differently_worded_broadcast_without_audit_is_redirected():
+    """T1-T13 gap #2 follow-up (2026-08-16) changes this test's own expected
+    behavior on purpose -- see the singular-delegation equivalent above
+    (test_differently_worded_follow_up_to_same_member_without_audit_is_redirected)
+    for the full rationale; a genuinely-different 2nd+ broadcast still needs an
+    audit tag before it can be told apart from a reworded duplicate."""
     hook = _make_duplicate_delegation_gate_hook()
 
     first = await hook(
@@ -317,6 +460,31 @@ async def test_differently_worded_broadcast_is_not_blocked():
     second = await hook(
         "delegate_task_to_members", _fake_delegate,
         {"task": "Now check the API endpoints for security issues."}, run_context=None,
+    )
+
+    assert first.startswith("delegated:")
+    assert second.startswith("REDIRECTED:")
+    assert "delegation_audit" in second
+
+
+async def test_audited_broadcast_with_a_genuinely_different_target_is_not_blocked():
+    hook = _make_duplicate_delegation_gate_hook()
+
+    first = await hook(
+        "delegate_task_to_members", _fake_delegate,
+        {"task": "<delegation_audit>component=schema; action=read; target=models.py</delegation_audit>\nRead the schema file."},
+        run_context=None,
+    )
+    second = await hook(
+        "delegate_task_to_members", _fake_delegate,
+        {
+            "task": (
+                "<delegation_audit>component=auth; action=verify; "
+                "target=API/authentication-service/router/auth_api.py</delegation_audit>\n"
+                "Now check the API endpoints for security issues."
+            ),
+        },
+        run_context=None,
     )
 
     assert first.startswith("delegated:")
@@ -362,3 +530,59 @@ async def test_empty_task_text_is_never_blocked():
 
     assert first.startswith("delegated:")
     assert second.startswith("delegated:")
+
+
+# ── _parse_delegation_audit / _normalize_delegation_target: pure parsers ─────────
+
+def test_parses_a_well_formed_audit_tag():
+    task = (
+        "<delegation_audit>component=parties; action=read; "
+        "target=API/inventory-service/models.py</delegation_audit>\n"
+        "Read the model file"
+    )
+    assert _parse_delegation_audit(task) == {
+        "component": "parties",
+        "action": "read",
+        "target": "api/inventory-service/models.py",
+    }
+
+
+def test_action_is_lowercased():
+    task = "<delegation_audit>component=x; action=READ; target=y.md</delegation_audit>\nRead it"
+    assert _parse_delegation_audit(task)["action"] == "read"
+
+
+def test_out_of_vocabulary_action_still_parses():
+    """Deliberate: a strict vocabulary would risk redirecting a legitimate call
+    over a wording technicality -- the same false-positive shape that ruled out
+    fuzzy text matching (see the gate's own docstring)."""
+    task = "<delegation_audit>component=x; action=summarize; target=y.md</delegation_audit>\nDo it"
+    assert _parse_delegation_audit(task)["action"] == "summarize"
+
+
+def test_missing_audit_tag_returns_none():
+    assert _parse_delegation_audit("Just read the file, no audit tag here") is None
+
+
+def test_none_task_returns_none():
+    assert _parse_delegation_audit(None) is None
+
+
+def test_empty_task_returns_none():
+    assert _parse_delegation_audit("") is None
+
+
+def test_malformed_audit_tag_returns_none():
+    assert _parse_delegation_audit("<delegation_audit>not the right shape</delegation_audit>\nRead it") is None
+
+
+def test_target_backslashes_normalize_to_forward_slashes():
+    assert _normalize_delegation_target("API\\inventory-service\\models.py") == "api/inventory-service/models.py"
+
+
+def test_target_normalization_strips_and_lowercases():
+    assert _normalize_delegation_target("  Parties/Models.PY  ") == "parties/models.py"
+
+
+def test_none_target_normalizes_to_empty_string():
+    assert _normalize_delegation_target(None) == ""

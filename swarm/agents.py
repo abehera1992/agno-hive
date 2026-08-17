@@ -10,7 +10,7 @@ from swarm import model_routing
 def get_model(
     model_id: str, host: str,
     temperature: float | None = None, max_tokens: int | None = None,
-    frequency_penalty: float | None = None,
+    frequency_penalty: float | None = None, repetition_penalty: float | None = None,
 ):
     """Build the model object for an agent, honoring INFERENCE_BACKEND.
 
@@ -24,6 +24,16 @@ def get_model(
     backend, not the production path (see CLAUDE.md: ZGX runs vLLM+LiteLLM). Callers
     that want any of these pinned must pass it explicitly per call; the defaults stay
     unset so every other caller of get_model() is unaffected.
+
+    `repetition_penalty` (T1-T13 gap #1 follow-up, 2026-08-16; see
+    config.coordinator_repetition_penalty's own comment for the full rationale) is
+    NOT a native field on agno's OpenAIChat/OpenAILike (confirmed via
+    site-packages/agno/models/openai/chat.py) -- it is a vLLM-native SamplingParams
+    field, live-confirmed present on this project's actual served model
+    (GET /openapi.json on vllm-coord, 2026-08-16), reached via `extra_body`, which
+    OpenAIChat.get_request_params already forwards untouched into the OpenAI SDK
+    call and vLLM's OpenAI-compatible server merges into its own request schema.
+    None (the default) omits `extra_body` entirely -- byte-for-byte prior behavior.
 
     Routing lives in a DB-backed registry (AGNOHive 2.3.2 addendum, 2026-08-08),
     NOT hardcoded here — swarm/model_routing.py's in-process cache (populated from
@@ -96,6 +106,11 @@ def get_model(
         return VLLMToolFix(
             id=served, base_url=config.vllm_gateway_url, api_key="EMPTY",
             temperature=temperature, max_tokens=max_tokens, frequency_penalty=frequency_penalty,
+            # extra_body only, not a native OpenAIChat field -- see this function's own
+            # docstring. Only wired on the vLLM path: repetition_penalty is a vLLM-native
+            # SamplingParams field, not something the cloud branch above's arbitrary
+            # third-party provider is confirmed to support.
+            extra_body=({"repetition_penalty": repetition_penalty} if repetition_penalty is not None else None),
         )
     return OllamaToolFix(id=model_id, host=host)
 
@@ -267,6 +282,7 @@ def make_agent_from_spec(
             spec.model, config.ollama_host,
             temperature=temperature, max_tokens=max_tokens,
             frequency_penalty=config.member_frequency_penalty,
+            repetition_penalty=config.member_repetition_penalty,
         ),
         tools=agent_tools + [update_session_state],
         instructions=instructions,
@@ -301,6 +317,7 @@ def make_coder(*mcps: MCPTools, tool_hooks: list | None = None) -> Agent:
             config.coder_model, config.ollama_host,
             temperature=config.member_temperature, max_tokens=config.coder_max_tokens,
             frequency_penalty=config.member_frequency_penalty,
+            repetition_penalty=config.member_repetition_penalty,
         ),
         tools=list(mcps) + [update_session_state],
         tool_hooks=tool_hooks,
@@ -327,6 +344,7 @@ def make_reviewer(*mcps: MCPTools, tool_hooks: list | None = None) -> Agent:
             config.reviewer_model, config.ollama_host,
             temperature=config.member_temperature, max_tokens=config.member_max_tokens,
             frequency_penalty=config.member_frequency_penalty,
+            repetition_penalty=config.member_repetition_penalty,
         ),
         tools=list(mcps) + [update_session_state],
         tool_hooks=tool_hooks,
@@ -350,6 +368,7 @@ def make_researcher(*mcps: MCPTools) -> Agent:
             config.researcher_model, config.ollama_host,
             temperature=config.member_temperature, max_tokens=config.member_max_tokens,
             frequency_penalty=config.member_frequency_penalty,
+            repetition_penalty=config.member_repetition_penalty,
         ),
         tools=list(mcps) + [update_session_state],
         description="Codebase investigation specialist. Read real files and ground every claim in file content — never describe from directory names alone.",
@@ -373,6 +392,7 @@ def make_executor(*mcps: MCPTools) -> Agent:
             config.executor_model, config.ollama_host,
             temperature=config.member_temperature, max_tokens=config.member_max_tokens,
             frequency_penalty=config.member_frequency_penalty,
+            repetition_penalty=config.member_repetition_penalty,
         ),
         tools=list(mcps) + [update_session_state],
         description="Execution and validation specialist. Run commands and report exact stdout/stderr — never paraphrase errors.",
@@ -395,6 +415,7 @@ def make_context_router(*mcps: MCPTools) -> Agent:
             config.router_model, config.ollama_host,
             temperature=config.member_temperature, max_tokens=config.member_max_tokens,
             frequency_penalty=config.member_frequency_penalty,
+            repetition_penalty=config.member_repetition_penalty,
         ),
         tools=list(mcps) + [update_session_state],
         description="Lightweight query router. Pick the fastest retrieval path and return raw results — never interpret or answer yourself.",

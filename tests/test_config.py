@@ -112,6 +112,35 @@ def test_member_frequency_penalty_default():
     assert cfg.member_frequency_penalty == 0.15
 
 
+def test_member_repetition_penalty_defaults_to_none():
+    """T1-T13 gap #1 follow-up (2026-08-16): disabled by default -- unlike
+    frequency_penalty, this has not been live A/B tested on ZGX yet. See the
+    field's own comment in config.py."""
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.member_repetition_penalty is None
+
+
+def test_member_repetition_penalty_from_env(monkeypatch):
+    monkeypatch.setenv("MEMBER_REPETITION_PENALTY", "1.1")
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.member_repetition_penalty == 1.1
+
+
+def test_coordinator_repetition_penalty_defaults_to_none():
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.coordinator_repetition_penalty is None
+
+
+def test_coordinator_repetition_penalty_from_env(monkeypatch):
+    monkeypatch.setenv("COORDINATOR_REPETITION_PENALTY", "1.05")
+    mod = _reload_config()
+    cfg = mod.Config()
+    assert cfg.coordinator_repetition_penalty == 1.05
+
+
 def test_member_max_tokens_default():
     mod = _reload_config()
     cfg = mod.Config()

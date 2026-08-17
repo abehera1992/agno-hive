@@ -35,6 +35,7 @@ def _vllm_backend(monkeypatch):
     monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
     monkeypatch.setattr(config, "member_temperature", 0.2)
     monkeypatch.setattr(config, "member_frequency_penalty", 0.15)
+    monkeypatch.setattr(config, "member_repetition_penalty", None)
     monkeypatch.setattr(config, "member_max_tokens", 4096)
     monkeypatch.setattr(config, "coder_max_tokens", 8192)
 
@@ -130,4 +131,42 @@ def test_member_sampling_params_are_independent_of_coordinator_values(monkeypatc
 
     assert agent.model.temperature == 0.2
     assert agent.model.max_tokens == 4096
+
+
+# ── repetition_penalty / extra_body (T1-T13 gap #1 follow-up, 2026-08-16) ────────
+# Not a native OpenAIChat field (confirmed via site-packages/agno/models/openai/
+# chat.py) -- reaches vLLM through `extra_body`, which agno's own
+# get_request_params already forwards untouched. Disabled by default
+# (config.member_repetition_penalty / coordinator_repetition_penalty default to
+# None) -- see get_model()'s own docstring on why it hasn't been enabled yet.
+
+def test_extra_body_is_none_when_repetition_penalty_is_unset():
+    agent = make_researcher()
+
+    assert agent.model.extra_body is None
+
+
+def test_extra_body_carries_repetition_penalty_when_set(monkeypatch):
+    monkeypatch.setattr(config, "member_repetition_penalty", 1.1)
+
+    agent = make_researcher()
+
+    assert agent.model.extra_body == {"repetition_penalty": 1.1}
+
+
+def test_coder_also_gets_repetition_penalty_when_set(monkeypatch):
+    monkeypatch.setattr(config, "member_repetition_penalty", 1.1)
+
+    agent = make_coder()
+
+    assert agent.model.extra_body == {"repetition_penalty": 1.1}
+
+
+def test_agent_from_spec_also_gets_repetition_penalty_when_set(monkeypatch):
+    monkeypatch.setattr(config, "member_repetition_penalty", 1.1)
+    spec = AgentSpec(name="Researcher", role="engineer", model="qwen2.5-coder:32b", instructions=["x"])
+
+    agent = make_agent_from_spec(spec)
+
+    assert agent.model.extra_body == {"repetition_penalty": 1.1}
     assert agent.model.frequency_penalty == 0.15

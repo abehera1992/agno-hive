@@ -340,6 +340,17 @@ _COORDINATOR_INSTRUCTIONS = [
     "  if the target, scope, or goal is genuinely different (a different file, a different",
     "  module, a narrower or broader question) — matching phrasing to an unrelated target is",
     "  not grounds to skip it.",
+    "  MANDATORY when delegating to a member (or broadcasting) you have already delegated to /",
+    "  broadcast to this run: open the task argument with one audit line before the real task —",
+    "  '<delegation_audit>component=<short label>; action=<one of: read, search, analyze,",
+    "  implement, verify, plan>; target=<the exact file path/module/entity this call is",
+    "  about></delegation_audit>' — then the task text on the next line. This is enforced",
+    "  mechanically, not just requested: a 2nd+ call to the same member/broadcast missing this",
+    "  tag is redirected and NOT executed, and a tag whose target+action exactly match an",
+    "  earlier call to that member/broadcast is treated as the same duplicate this whole rule",
+    "  exists to prevent — even if the surrounding wording differs completely. Skip the tag",
+    "  entirely on the FIRST delegation to a given member/broadcast this run — there is nothing",
+    "  yet to compare it against.",
     "  Before asking a member to investigate a file: check whether it is already listed as",
     "  read — if so, forward what the prior reader already reported instead of re-delegating",
     "  a read of the same file.",
@@ -2474,6 +2485,70 @@ def _normalize_delegation_task(task_text) -> str:
     return " ".join(stripped.split()).lower()
 
 
+# T1-T13 gap #2 follow-up (2026-08-16): the exact-match check above and the
+# fuzzy-similarity attempts that preceded it (both SequenceMatcher and Jaccard,
+# both ruled out -- see _normalize_delegation_task's own docstring) sit at
+# opposite ends of the same failed axis: comparing raw prose either misses a
+# genuinely-reworded duplicate or flags an unrelated-but-similarly-phrased
+# follow-up ("what fields does Party have" vs "what fields does
+# PartyRegistration have" -- different TARGET, must never match). Rather than
+# tuning a third string-similarity threshold, this asks the MODEL to extract a
+# small structured {component, action, target} tuple up front -- semantic
+# classification is what LLMs are comparatively good at, unlike approximating
+# it after the fact from surface text. Target is meant to be copied verbatim
+# from something the task already names (a path, a module, an entity) --
+# comparing normalized Target values directly sidesteps the Party vs
+# PartyRegistration trap entirely, since those are two different targets by
+# construction, not two different phrasings of the same one.
+_DELEGATION_AUDIT_ACTIONS = frozenset({
+    "read", "search", "analyze", "implement", "verify", "plan",
+})
+# The audit tuple is embedded as a required literal PREFIX of the delegation's
+# own `task` argument, not emitted as separate free-standing text -- every tool
+# hook in this file (this one included) only ever sees a tool call's `args`,
+# never the coordinator's surrounding streamed text, so there is no other
+# place for a mechanical gate to actually read it from.
+_DELEGATION_AUDIT_RE = re.compile(
+    r"^\s*<delegation_audit>\s*component\s*=\s*(?P<component>[^;]*?)\s*;\s*"
+    r"action\s*=\s*(?P<action>[^;]*?)\s*;\s*target\s*=\s*(?P<target>.*?)\s*"
+    r"</delegation_audit>\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _normalize_delegation_target(target) -> str:
+    """Path-shaped normalization for an audit tuple's Target field -- lowercased,
+    backslashes unified to forward slashes, surrounding whitespace stripped --
+    so 'API/inventory-service/parties_api.py' and the same path written with
+    backslashes still compare equal. Deliberately simple: Target is meant to be
+    an exact path/module/entity copied from the task, not free prose, so any
+    heavier normalization would just reintroduce the fuzzy-matching problem
+    this whole mechanism exists to avoid."""
+    return str(target or "").strip().lower().replace("\\", "/")
+
+
+def _parse_delegation_audit(task_text) -> dict | None:
+    """Extracts the {component, action, target} tuple a re-delegation to an
+    already-delegated-to member/broadcast is required to open with (see
+    _make_duplicate_delegation_gate_hook) -- returns None if the prefix is
+    missing or malformed, never raises. `action` is lowercased for comparison
+    but NOT restricted to _DELEGATION_AUDIT_ACTIONS here -- an out-of-vocabulary
+    action is still usable for exact-tuple comparison, matching the "narrow, err
+    toward allowing" philosophy the exact-text check above already follows: a
+    strict vocabulary would risk redirecting a legitimate call over a wording
+    technicality, the same false-positive shape that ruled out fuzzy matching."""
+    if not task_text:
+        return None
+    m = _DELEGATION_AUDIT_RE.match(str(task_text))
+    if not m:
+        return None
+    return {
+        "component": m.group("component").strip(),
+        "action": m.group("action").strip().lower(),
+        "target": _normalize_delegation_target(m.group("target")),
+    }
+
+
 def _make_duplicate_delegation_gate_hook():
     """Mechanical backstop for _COORDINATOR_INSTRUCTIONS' own prose-only rule
     ("Before delegate_task_to_member(s): check whether an equivalent delegation is
@@ -2551,6 +2626,27 @@ def _make_duplicate_delegation_gate_hook():
     _make_delegation_log_hook's own docstring), but an EXACT repeat of a call
     already logged this run is never that case by definition: the request text
     didn't change, so there is no new information for a fresh call to act on.
+
+    T1-T13 gap #2 follow-up (2026-08-16): the exact-text check above still
+    misses a GENUINELY-reworded duplicate by design (see
+    _normalize_delegation_task's own docstring on why fuzzy string similarity
+    was ruled out). This adds a second, independent tier for that case: on the
+    SECOND-OR-LATER delegation to a given member (singular) or the
+    second-or-later broadcast (plural) — never the first, since there is
+    nothing yet to compare a first call against — the `task` argument is
+    required to open with a `<delegation_audit>component=...; action=...;
+    target=...</delegation_audit>` prefix (see _parse_delegation_audit). A
+    missing prefix on a qualifying call is redirected with the required
+    format, same intercept-and-redirect shape as every other tier. A present
+    prefix is compared against every prior qualifying entry's own parsed
+    audit — same normalized `target` AND same `action` is treated as a
+    duplicate regardless of how differently the surrounding prose reads,
+    exactly the case the T2c incident above slipped past. `component` is
+    informational only, never part of the match key — matching on Target+
+    Action alone is what keeps 'what fields does Party have' from colliding
+    with 'what fields does PartyRegistration have' (different targets), the
+    exact false-positive shape that ruled out fuzzy text matching in the
+    first place.
     """
     log: list[dict] = []
 
@@ -2558,37 +2654,87 @@ def _make_duplicate_delegation_gate_hook():
         if function_name not in _DELEGATION_TOOL_NAMES:
             return await function(**args)
 
-        task_text = _normalize_delegation_task((args or {}).get("task"))
+        raw_task = (args or {}).get("task")
+        task_text = _normalize_delegation_task(raw_task)
         if not task_text:
             return await function(**args)
 
         if function_name == "delegate_task_to_member":
             member_id = _member_id(str((args or {}).get("member_id", "")).strip())
-            for entry in log:
-                if entry.get("tool") != "delegate_task_to_member":
-                    continue
-                prior_args = entry.get("args") or {}
-                prior_member = _member_id(str(prior_args.get("member_id", "")).strip())
-                if prior_member == member_id and _normalize_delegation_task(prior_args.get("task")) == task_text:
+            prior_entries = [
+                entry for entry in log
+                if entry.get("tool") == "delegate_task_to_member"
+                and _member_id(str((entry.get("args") or {}).get("member_id", "")).strip()) == member_id
+            ]
+            for entry in prior_entries:
+                if _normalize_delegation_task((entry.get("args") or {}).get("task")) == task_text:
                     return (
                         f"REDIRECTED: this exact task was already delegated to {member_id!r} "
                         f"earlier this run — use that result instead of delegating it again. "
                         f"This delegate_task_to_member call was NOT executed."
                     )
+            if prior_entries:
+                audit = _parse_delegation_audit(raw_task)
+                if audit is None:
+                    return (
+                        f"REDIRECTED: {member_id!r} has already been delegated to earlier this "
+                        f"run — a re-delegation must open the task with an audit tag: "
+                        f"'<delegation_audit>component=<short label>; action=<one of: "
+                        f"{', '.join(sorted(_DELEGATION_AUDIT_ACTIONS))}>; target=<the exact file "
+                        f"path/module/entity this call is about></delegation_audit>' followed by "
+                        f"the real task text. This delegate_task_to_member call was NOT executed — "
+                        f"add the audit tag and retry."
+                    )
+                for entry in prior_entries:
+                    prior_audit = entry.get("audit")
+                    if prior_audit and prior_audit["target"] == audit["target"] and prior_audit["action"] == audit["action"]:
+                        return (
+                            f"REDIRECTED: a delegation to {member_id!r} with the same target "
+                            f"({audit['target']!r}) and action ({audit['action']!r}) was already "
+                            f"made earlier this run, just worded differently — use that result "
+                            f"instead of delegating it again. If this is genuinely a different "
+                            f"target or action, correct the audit tag to reflect that. This "
+                            f"delegate_task_to_member call was NOT executed."
+                        )
         else:
-            for entry in log:
-                if entry.get("tool") != "delegate_task_to_members":
-                    continue
-                prior_task = _normalize_delegation_task((entry.get("args") or {}).get("task"))
-                if prior_task == task_text:
+            prior_entries = [entry for entry in log if entry.get("tool") == "delegate_task_to_members"]
+            for entry in prior_entries:
+                if _normalize_delegation_task((entry.get("args") or {}).get("task")) == task_text:
                     return (
                         "REDIRECTED: this exact task was already broadcast to the whole team "
                         "earlier this run — use those results instead of broadcasting it again. "
                         "This delegate_task_to_members call was NOT executed."
                     )
+            if prior_entries:
+                audit = _parse_delegation_audit(raw_task)
+                if audit is None:
+                    return (
+                        "REDIRECTED: a broadcast has already been made earlier this run — a "
+                        "re-broadcast must open the task with an audit tag: "
+                        f"'<delegation_audit>component=<short label>; action=<one of: "
+                        f"{', '.join(sorted(_DELEGATION_AUDIT_ACTIONS))}>; target=<the exact file "
+                        "path/module/entity this call is about></delegation_audit>' followed by "
+                        "the real task text. This delegate_task_to_members call was NOT executed "
+                        "— add the audit tag and retry."
+                    )
+                for entry in prior_entries:
+                    prior_audit = entry.get("audit")
+                    if prior_audit and prior_audit["target"] == audit["target"] and prior_audit["action"] == audit["action"]:
+                        return (
+                            f"REDIRECTED: a broadcast with the same target ({audit['target']!r}) "
+                            f"and action ({audit['action']!r}) was already made earlier this run, "
+                            f"just worded differently — use those results instead of broadcasting "
+                            f"it again. If this is genuinely a different target or action, correct "
+                            f"the audit tag to reflect that. This delegate_task_to_members call was "
+                            f"NOT executed."
+                        )
 
         result = await function(**args)
-        log.append({"tool": function_name, "args": dict(args or {})})
+        log.append({
+            "tool": function_name,
+            "args": dict(args or {}),
+            "audit": _parse_delegation_audit(raw_task),
+        })
         return result
 
     return _duplicate_delegation_gate_hook
@@ -2851,6 +2997,7 @@ def _build_team(
             coordinator_model, config.ollama_host,
             temperature=config.coordinator_temperature, max_tokens=config.coordinator_max_tokens,
             frequency_penalty=config.coordinator_frequency_penalty,
+            repetition_penalty=config.coordinator_repetition_penalty,
         ),
         members=members,
         tools=coordinator_tools_list,
@@ -3082,6 +3229,73 @@ def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:
     if len(prefix) < _REPETITION_MIN_SEGMENT_LEN:
         return False
     return prefix in filler_stripped_prior
+
+
+_REPETITION_DECAY_WINDOW_CHARS = 1500
+# Large enough for a statistically meaningful n-gram sample even when a single
+# 10s-boundary new_segment chunk alone is short (~150-250 chars at a typical
+# ~20 tok/s generation rate), small enough to stay a LOCAL measurement --
+# decay is a property of what generation is doing RIGHT NOW, not something to
+# average against content from many minutes earlier in a long run. Smaller
+# than _REPETITION_LOOKBACK_CHARS on purpose -- that constant bounds a
+# containment SEARCH window (bigger is safer, just costs a longer string
+# scan); this bounds a diversity SAMPLE (too big dilutes a real local
+# collapse against healthy earlier prose, understating it).
+_REPETITION_DECAY_NGRAM_SIZE = 4
+# Word-level 4-grams: short enough that a slowly-drifting cycle (each
+# repetition varying a word or two) still produces overlapping n-grams, long
+# enough that ordinary English prose's natural short-word reuse ("the", "of",
+# "a") doesn't itself collapse the ratio the way unigrams/bigrams would.
+_REPETITION_DECAY_MIN_NGRAMS = 40
+# Below this many n-grams the ratio is too noisy to trust -- a short but
+# legitimately narrow-vocabulary passage (e.g. a list of similar file paths)
+# can have a naturally low ratio without being degenerate.
+_REPETITION_DECAY_RATIO_THRESHOLD = 0.30
+# Distinct-n-gram / total-n-gram ratio below this is treated as decay.
+# Deliberately conservative (favors under-triggering, i.e. missing a real
+# decay episode, over false-triggering on legitimately repetitive-but-valid
+# content, e.g. several similarly-shaped findings) -- unlike every other
+# threshold in this file, this one has NOT been tuned against a captured live
+# incident (the T1-T13 groundedness battery observed the "syntactically
+# valid, just degraded" failure shape but did not preserve a transcript of
+# it -- see DOCS.md / the "AgnoHive Teams" Notion page's "Known Open Gaps"
+# section). Treat this value as a starting point, not a validated one -- the
+# next live occurrence should be captured and used to confirm or retune it,
+# same discipline every other constant here was held to.
+
+
+def _looks_like_repetition_decay(new_segment: str, prior_content: str) -> bool:
+    """True if the recent window of generated text has collapsed into a small,
+    cycling vocabulary -- catches "syntactically valid, just degraded" drift
+    that never repeats one earlier segment closely enough for
+    _looks_like_repetition_loop's containment-based checks (exact / filler-
+    stripped / opening-prefix, all requiring a match against SOME specific
+    earlier passage) to catch. Deliberately a separate function rather than a
+    fourth tier bolted onto that one: _looks_like_repetition_loop answers "is
+    this a repeat of something specific already said," this answers "has
+    generation locally collapsed into a small recombined vocabulary,
+    regardless of whether it matches anything earlier" -- a different
+    question, checked over a different (shorter, purely local) window, not
+    _REPETITION_LOOKBACK_CHARS' bounded-but-still-comparative one.
+
+    See _REPETITION_DECAY_RATIO_THRESHOLD's own comment: this has not yet been
+    live-validated against a captured real incident. Called from both stream
+    loops below alongside _looks_like_repetition_loop (either True withholds
+    last_progress_at credit for that window) -- watch its own distinct log
+    line ("repetition DECAY detected") specifically on the next live pass for
+    false positives before trusting the threshold at face value.
+    """
+    window = (prior_content[-_REPETITION_DECAY_WINDOW_CHARS:] + new_segment)[-_REPETITION_DECAY_WINDOW_CHARS:]
+    words = window.split()
+    if len(words) < _REPETITION_DECAY_MIN_NGRAMS + _REPETITION_DECAY_NGRAM_SIZE:
+        return False
+    ngrams = [
+        tuple(w.lower() for w in words[i:i + _REPETITION_DECAY_NGRAM_SIZE])
+        for i in range(len(words) - _REPETITION_DECAY_NGRAM_SIZE + 1)
+    ]
+    if len(ngrams) < _REPETITION_DECAY_MIN_NGRAMS:
+        return False
+    return (len(set(ngrams)) / len(ngrams)) < _REPETITION_DECAY_RATIO_THRESHOLD
 
 
 def _log_unclassified_stream_event(log_label: str, event, unrecognized_event_counts: dict[str, int]) -> None:
@@ -3546,16 +3760,31 @@ async def _stream_team_run(
                     joined = "".join(full_content)
                     new_segment = joined[last_logged_len:]
                     preview = new_segment[-300:]
-                    if _looks_like_repetition_loop(new_segment, joined[:last_logged_len]):
+                    loop_detected = _looks_like_repetition_loop(new_segment, joined[:last_logged_len])
+                    decay_detected = not loop_detected and _looks_like_repetition_decay(
+                        new_segment, joined[:last_logged_len]
+                    )
+                    if loop_detected or decay_detected:
                         # Leave last_progress_at untouched -- it already reflects the
-                        # last time genuinely new content was confirmed, and a repeat
-                        # this window doesn't change that fact.
-                        print(
-                            f"[{log_label}] repetition loop detected -- the last "
-                            f"{len(new_segment)} chars look like a repeat of earlier "
-                            f"content, not counted as progress: ...{preview!r}",
-                            flush=True,
-                        )
+                        # last time genuinely new content was confirmed, and neither a
+                        # repeat nor a local diversity collapse this window changes that.
+                        if loop_detected:
+                            print(
+                                f"[{log_label}] repetition loop detected -- the last "
+                                f"{len(new_segment)} chars look like a repeat of earlier "
+                                f"content, not counted as progress: ...{preview!r}",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"[{log_label}] repetition DECAY detected -- the last "
+                                f"{len(new_segment)} chars have collapsed into a small "
+                                f"recombined vocabulary (not a match against earlier "
+                                f"content), not counted as progress -- unvalidated "
+                                f"threshold, see _looks_like_repetition_decay's own "
+                                f"docstring: ...{preview!r}",
+                                flush=True,
+                            )
                     else:
                         activity["last_progress_at"] = now
                         print(
@@ -3813,16 +4042,32 @@ async def run_task_async(
                                     joined = "".join(full_content)
                                     new_segment = joined[last_logged_len:]
                                     preview = new_segment[-300:]
-                                    if _looks_like_repetition_loop(new_segment, joined[:last_logged_len]):
+                                    loop_detected = _looks_like_repetition_loop(new_segment, joined[:last_logged_len])
+                                    decay_detected = not loop_detected and _looks_like_repetition_decay(
+                                        new_segment, joined[:last_logged_len]
+                                    )
+                                    if loop_detected or decay_detected:
                                         # Leave last_progress_at untouched -- see
                                         # _stream_team_run's identical block.
-                                        print(
-                                            f"[team] repetition loop detected -- the last "
-                                            f"{len(new_segment)} chars look like a repeat of "
-                                            f"earlier content, not counted as progress: "
-                                            f"...{preview!r}",
-                                            flush=True,
-                                        )
+                                        if loop_detected:
+                                            print(
+                                                f"[team] repetition loop detected -- the last "
+                                                f"{len(new_segment)} chars look like a repeat of "
+                                                f"earlier content, not counted as progress: "
+                                                f"...{preview!r}",
+                                                flush=True,
+                                            )
+                                        else:
+                                            print(
+                                                f"[team] repetition DECAY detected -- the last "
+                                                f"{len(new_segment)} chars have collapsed into a "
+                                                f"small recombined vocabulary (not a match against "
+                                                f"earlier content), not counted as progress -- "
+                                                f"unvalidated threshold, see "
+                                                f"_looks_like_repetition_decay's own docstring: "
+                                                f"...{preview!r}",
+                                                flush=True,
+                                            )
                                     else:
                                         activity["last_progress_at"] = now
                                         print(

@@ -294,3 +294,55 @@ async def test_temperature_max_tokens_and_frequency_penalty_all_pass_through_tog
     assert model.temperature == 0.2
     assert model.max_tokens == 4096
     assert model.frequency_penalty == 0.4
+
+
+# ── repetition_penalty / extra_body (T1-T13 gap #1 follow-up, 2026-08-16) ────────
+# Not a native OpenAIChat field -- only reachable through extra_body (confirmed
+# live against vllm-coord's own /openapi.json, 2026-08-16: repetition_penalty IS
+# a supported ChatCompletionRequest field on this vLLM version; no_repeat_ngram_size
+# is NOT). See get_model()'s own docstring for the full rationale.
+
+async def test_repetition_penalty_unset_omits_extra_body_on_vllm_backend(monkeypatch):
+    monkeypatch.setattr(config, "inference_backend", "vllm")
+    monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
+
+    model = get_model("qwen2.5-coder:32b", "http://ollama-host")
+
+    assert model.extra_body is None
+
+
+async def test_repetition_penalty_is_passed_through_extra_body_on_vllm_backend(monkeypatch):
+    monkeypatch.setattr(config, "inference_backend", "vllm")
+    monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
+
+    model = get_model("qwen2.5-coder:32b", "http://ollama-host", repetition_penalty=1.1)
+
+    assert model.extra_body == {"repetition_penalty": 1.1}
+
+
+async def test_repetition_penalty_is_never_passed_to_the_cloud_route(monkeypatch):
+    """repetition_penalty is a vLLM-native SamplingParams field -- confirmed
+    only against this project's own served vLLM model, not something an
+    arbitrary third-party cloud provider is known to support. The cloud
+    branch's OpenAILike construction deliberately never receives it."""
+    monkeypatch.setattr(config, "allow_cloud_models", True)
+    monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
+
+    model = get_model("claude-sonnet-cloud", "http://ollama-host", repetition_penalty=1.1)
+
+    assert not hasattr(model, "extra_body") or model.extra_body is None
+
+
+async def test_all_sampling_params_pass_through_together_including_repetition_penalty(monkeypatch):
+    monkeypatch.setattr(config, "inference_backend", "vllm")
+    monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
+
+    model = get_model(
+        "qwen2.5-coder:32b", "http://ollama-host",
+        temperature=0.2, max_tokens=4096, frequency_penalty=0.4, repetition_penalty=1.1,
+    )
+
+    assert model.temperature == 0.2
+    assert model.max_tokens == 4096
+    assert model.frequency_penalty == 0.4
+    assert model.extra_body == {"repetition_penalty": 1.1}

@@ -17,7 +17,7 @@ _looks_like_repetition_loop distinguishes "genuinely new text" from "a repeat of
 something already generated" so the SAME liveness/last_progress_at machinery can
 catch this too, regardless of how many separate completions it spans.
 """
-from swarm.team import _looks_like_repetition_loop
+from swarm.team import _looks_like_repetition_loop, _looks_like_repetition_decay
 
 
 def test_a_verbatim_repeated_sentence_is_detected():
@@ -56,6 +56,55 @@ def test_genuinely_new_content_is_not_flagged():
 
 def test_empty_segment_is_not_flagged():
     assert _looks_like_repetition_loop("", "some prior content here") is False
+
+
+# _looks_like_repetition_decay -- T1-T13 gap #1 follow-up (2026-08-16). Catches
+# "syntactically valid, just degraded" drift that never repeats one specific
+# earlier passage closely enough for _looks_like_repetition_loop's containment
+# checks above to catch -- a local diversity collapse instead of a containment
+# match. See the function's own docstring: threshold not yet live-validated
+# against a captured real incident, these tests lock down the mechanism's
+# shape (collapsed vocabulary flagged, healthy/short/empty text is not), not a
+# specific tuned-against-reality value.
+
+def test_collapsed_low_diversity_text_is_flagged_as_decay():
+    words = (["the", "value", "is", "correct"] * 3 + ["the", "value", "is", "right"] * 3) * 3
+    new_segment = " ".join(words)
+
+    assert _looks_like_repetition_decay(new_segment, "") is True
+
+
+def test_genuinely_diverse_text_is_not_flagged_as_decay():
+    new_segment = (
+        "The parties module exposes a REST endpoint for creating new business "
+        "entities, validating GSTIN numbers against the regulatory format, and "
+        "linking each party to its registered addresses. The inventory service "
+        "separately tracks stock keeping units, warehouse locations, and unit "
+        "of measure conversions used during purchase order reconciliation."
+    )
+
+    assert _looks_like_repetition_decay(new_segment, "") is False
+
+
+def test_short_segment_is_never_flagged_as_decay():
+    """Below _REPETITION_DECAY_MIN_NGRAMS words, the ratio is too noisy to trust --
+    avoids false-flagging a short, legitimately narrow-vocabulary passage."""
+    assert _looks_like_repetition_decay("the same words the same words", "") is False
+
+
+def test_empty_segment_is_not_flagged_as_decay():
+    assert _looks_like_repetition_decay("", "some prior content") is False
+
+
+def test_prior_content_contributes_to_the_decay_window():
+    """The diversity window combines a bounded tail of prior_content with
+    new_segment (see _REPETITION_DECAY_WINDOW_CHARS) -- a short new_segment that
+    is itself below the n-gram minimum can still be evaluated once combined with
+    enough recent prior content."""
+    prior = " ".join((["the", "value", "is", "correct"] * 3 + ["the", "value", "is", "right"] * 3) * 2)
+    new_segment = "the value is correct the value is right"
+
+    assert _looks_like_repetition_decay(new_segment, prior) is True
 
 
 def test_repetition_only_outside_the_lookback_window_is_not_flagged():

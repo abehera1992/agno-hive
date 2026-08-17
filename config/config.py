@@ -189,6 +189,38 @@ class Config:
     # forcing a fresh attempt). 0.15 is a gentler starting point to test whether it
     # still discourages prose repetition without visibly breaking tool-call formation.
     coordinator_frequency_penalty: float = float(os.getenv("COORDINATOR_FREQUENCY_PENALTY", "0.15"))
+    # T1-T13 gap #1 follow-up (2026-08-16): frequency_penalty above operates on cumulative
+    # OpenAI-API token counts across the whole response; vLLM's own native repetition_penalty
+    # is a different, harder lever -- multiplicatively discourages ANY already-seen token at
+    # EACH decoding step, closer to what actually suppresses the "syntactically valid, just
+    # degraded" drift the T1-T13 groundedness battery flagged as an open, unfixed gap
+    # (frequency_penalty's mitigation is real but doesn't specifically target the entropy-
+    # collapse shape of drift that never repeats one exact earlier segment -- see
+    # _looks_like_repetition_loop's diversity-check extension in swarm/team.py). Confirmed
+    # live against the actual running ZGX coordinator (GET /openapi.json on vllm-coord,
+    # 2026-08-16): repetition_penalty IS a supported ChatCompletionRequest field on this vLLM
+    # version; no_repeat_ngram_size is NOT (that's a HuggingFace-generate-specific param, never
+    # part of vLLM's SamplingParams) -- only repetition_penalty is wired below. Not a native
+    # field on agno's OpenAIChat (confirmed via site-packages/agno/models/openai/chat.py) --
+    # passed through `extra_body` instead, which OpenAIChat.get_request_params already
+    # forwards untouched into the OpenAI SDK call, and vLLM's OpenAI-compatible server merges
+    # directly into its own request schema.
+    #
+    # Defaults to None (disabled -- byte-for-byte today's behavior, extra_body omitted
+    # entirely) rather than a tuned nonzero value, unlike frequency_penalty's own field above:
+    # this has NOT been live A/B tested on ZGX yet, and frequency_penalty's own tuning history
+    # (0.4 -> 0.15, after 0.4 caused 192 consecutive empty completions by suppressing the
+    # structural tokens a valid tool call needs) is a direct, documented precedent that
+    # stacking a SECOND, differently-mechanized anti-repetition lever on top of an already-
+    # tuned first one, without live validation, risks the same failure mode -- possibly at a
+    # lower combined threshold than either penalty causes alone. 1.05-1.1 is the commonly-cited
+    # safe starting range for vLLM's repetition_penalty if/when this is enabled for testing --
+    # do not assume that range is correct for this specific model without repeating the same
+    # live-measurement discipline frequency_penalty's own tuning used.
+    coordinator_repetition_penalty: float | None = (
+        float(os.environ["COORDINATOR_REPETITION_PENALTY"])
+        if os.getenv("COORDINATOR_REPETITION_PENALTY") else None
+    )
     # Experiment (2026-08-10): every repetition-loop/empty-content stall diagnosed that day
     # showed ONLY TeamRunContent stream events (the coordinator's own output) -- never once a
     # RunContent event (what a delegated member agent emits). The coordinator's own
@@ -233,6 +265,15 @@ class Config:
     # member agent, not just the coordinator.
     member_temperature: float = float(os.getenv("MEMBER_TEMPERATURE", "0.2"))
     member_frequency_penalty: float = float(os.getenv("MEMBER_FREQUENCY_PENALTY", "0.15"))
+    # Member-agent counterpart of coordinator_repetition_penalty above -- same rationale,
+    # same disabled-by-default posture pending live validation. Reuses the coordinator's own
+    # value only if explicitly set for members too; the two are independently overridable via
+    # env, matching how member_frequency_penalty is its own field rather than a hardcoded
+    # copy of coordinator_frequency_penalty.
+    member_repetition_penalty: float | None = (
+        float(os.environ["MEMBER_REPETITION_PENALTY"])
+        if os.getenv("MEMBER_REPETITION_PENALTY") else None
+    )
     # Output-length cap for every member agent EXCEPT Coder (see coder_max_tokens below) --
     # same rationale as coordinator_max_tokens: bounds a repetition loop's worst case to a few
     # minutes instead of tens, while staying generous for a normal prose analysis, plan, or
