@@ -120,3 +120,47 @@ def test_team_level_tool_event_defaults_agent_name_to_empty_string():
     event = _tool_started("search_files", {"pattern": "x"})
     out = _stream_event_to_chunk(event)
     assert out["agent_name"] == ""
+
+
+# ── RunError/TeamRunError classification (2026-08-18 live incident) ─────────────
+# A litellm.ContextWindowExceededError on a long, delegation-heavy run arrived as
+# one of these event types and, before this fix, fell through to `return None`
+# (the same bucket as any harmless unrecognized event) -- the run then idled for
+# 5+ minutes until the 300s liveness auto-kill eventually caught it. See
+# _BackendRunError's own docstring in swarm/team.py for the fast-fail fix this
+# classification enables.
+
+def test_run_error_event_returns_run_error_sentinel():
+    event = SimpleNamespace(event="RunError", content="litellm.ContextWindowExceededError: ...")
+    out = _stream_event_to_chunk(event)
+    assert out == {
+        "__run_error__": True,
+        "message": "litellm.ContextWindowExceededError: ...",
+        "agent_name": "",
+    }
+
+
+def test_team_run_error_event_returns_run_error_sentinel():
+    event = SimpleNamespace(event="TeamRunError", content="some backend failure")
+    out = _stream_event_to_chunk(event)
+    assert out["__run_error__"] is True
+    assert out["message"] == "some backend failure"
+
+
+def test_run_error_event_with_agent_name_preserves_it():
+    event = SimpleNamespace(event="RunError", content="boom", agent_name="Researcher")
+    out = _stream_event_to_chunk(event)
+    assert out["agent_name"] == "Researcher"
+
+
+def test_run_error_event_with_no_content_gets_a_placeholder_message():
+    event = SimpleNamespace(event="RunError", content=None)
+    out = _stream_event_to_chunk(event)
+    assert out["__run_error__"] is True
+    assert "RunError" in out["message"]
+
+
+def test_run_error_event_with_empty_string_content_gets_a_placeholder_message():
+    event = SimpleNamespace(event="RunError", content="")
+    out = _stream_event_to_chunk(event)
+    assert out["message"]  # never an empty/falsy message

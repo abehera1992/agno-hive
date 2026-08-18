@@ -3151,6 +3151,41 @@ def _build_team(
 _CONTENT_EVENT_TYPES = {"TeamRunContent", "RunContent"}
 _TOOL_START_EVENT_TYPES = {"TeamToolCallStarted", "ToolCallStarted"}
 _TOOL_END_EVENT_TYPES = {"TeamToolCallCompleted", "ToolCallCompleted"}
+# agno's own signal that a model/provider call failed outright (confirmed live
+# 2026-08-18: a litellm.ContextWindowExceededError on a long, delegation-heavy
+# run arrives as one of these, .content carrying the real error text) --
+# distinct from the three sets above, which are all real progress. Previously
+# fell through to `return None` (the same bucket as any other unclassified
+# event), so the run just kept polling as if nothing had happened. What
+# actually happened next, confirmed via the SAME incident's logs: the
+# coordinator's very next delegate_task_to_member call crashed inside agno's
+# own code with "'NoneType' object has no attribute 'to_dict'" -- plausibly
+# the SAME context-overflow condition corrupting internal state on the retry,
+# though not confirmed from these logs alone -- and the run never produced
+# another real tool call or content chunk, idling until the 300s liveness
+# auto-kill eventually cleaned it up 5+ minutes later. See _BackendRunError's
+# own comment for the fix this classification enables.
+_ERROR_EVENT_TYPES = {"TeamRunError", "RunError"}
+
+
+class _BackendRunError(RuntimeError):
+    """Raised the moment a RunError/TeamRunError stream event is seen -- a real,
+    actionable failure from the underlying model/provider (context-window
+    overflow, a provider-side rejection, etc.), not a transient hiccup to wait
+    out. Deliberately fails FAST instead of letting the run idle for up to
+    config.liveness_silence_threshold_s (300s) before the liveness watchdog
+    notices nothing is progressing and kills it anyway -- same eventual
+    outcome, ~5 minutes sooner, with the real error message instead of a
+    generic "no tool call or new stream content" one.
+
+    Caught cleanly by existing machinery at every call site, no new plumbing
+    needed: main.py's _run_worker() already wraps run_task_async() in a bare
+    `except Exception as exc: return {"error": f"{type(exc).__name__}: {exc}"}`,
+    which api/server.py's _run_worker_subprocess() already converts into an
+    immediate HTTPException(500, ...) once the child process exits -- this
+    exception just needs to exist and propagate; every downstream conversion
+    already worked for any other exception type before this one did."""
+
 
 def _stream_event_to_chunk(event) -> str | dict | None:
     """Classify one raw agno team.arun(stream=True) event into what run_task_stream
@@ -3181,6 +3216,13 @@ def _stream_event_to_chunk(event) -> str | dict | None:
              "result_preview": str | None, "agent_name": str}. agent_name is "" for
              the coordinator's own calls (BaseAgentRunEvent's own default) and the
              member's name (e.g. "Researcher") for a delegated call.
+           — OR a run-error sentinel (2026-08-18): {"__run_error__": True,
+             "message": str, "agent_name": str} for a RunError/TeamRunError event
+             (a real backend failure, e.g. a context-window overflow) -- every
+             caller of this function checks for this shape FIRST, before treating
+             the dict as a tool event, and raises _BackendRunError(message)
+             immediately rather than continuing to poll. See _BackendRunError's
+             own docstring for why this exists.
       None — every other event type (dropped, same as the previous hard filter)
     """
     event_type = getattr(event, "event", "")
@@ -3206,6 +3248,13 @@ def _stream_event_to_chunk(event) -> str | dict | None:
             "__tool_event__": "end",
             "name": tool.tool_name,
             "result_preview": result[:200] if isinstance(result, str) else None,
+            "agent_name": getattr(event, "agent_name", "") or "",
+        }
+    if event_type in _ERROR_EVENT_TYPES:
+        message = getattr(event, "content", None)
+        return {
+            "__run_error__": True,
+            "message": message if isinstance(message, str) and message else f"backend reported {event_type} with no message",
             "agent_name": getattr(event, "agent_name", "") or "",
         }
     return None
@@ -3621,6 +3670,8 @@ async def run_task_stream(
                     if isinstance(out, str):
                         full_content.append(out)
                         yield out
+                    elif isinstance(out, dict) and out.get("__run_error__"):
+                        raise _BackendRunError(out["message"])
                     elif isinstance(out, dict):
                         yield out
                         last_segment_start = len(full_content)
@@ -3907,6 +3958,8 @@ async def _stream_team_run(
                         )
                     last_logged_at = now
                     last_logged_len = len(joined)
+            elif isinstance(out, dict) and out.get("__run_error__"):
+                raise _BackendRunError(out["message"])
             elif isinstance(out, dict):
                 activity["last_progress_at"] = time.monotonic()
                 print(f"[{log_label}] stream tool event: {out}", flush=True)
@@ -4191,6 +4244,8 @@ async def run_task_async(
                                         )
                                     last_logged_at = now
                                     last_logged_len = len(joined)
+                            elif isinstance(out, dict) and out.get("__run_error__"):
+                                raise _BackendRunError(out["message"])
                             elif isinstance(out, dict):
                                 activity["last_progress_at"] = time.monotonic()
                                 print(f"[team] stream tool event: {out}", flush=True)

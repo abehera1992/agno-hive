@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from swarm.team import _stream_team_run
+from swarm.team import _BackendRunError, _stream_team_run
 
 
 def _content_event(text: str):
@@ -163,3 +163,51 @@ async def test_activity_dict_last_progress_at_is_untouched_by_empty_only_events(
     # still be at (or before) the moment the function started, not later.
     assert activity["last_progress_at"] <= initial_mark + 0.05
     assert activity["stream_event_count"] == 3  # all three empty events still counted
+
+
+# ── Fast-fail on a real backend error (2026-08-18 live incident) ────────────────
+# A litellm.ContextWindowExceededError arrived as a RunError stream event on a
+# real run, was previously dropped (treated the same as any harmless
+# unrecognized event), and the run then idled for 5+ minutes producing nothing
+# until the 300s liveness auto-kill eventually caught it. This is the actual
+# fix: the moment such an event is seen, raise _BackendRunError immediately
+# instead of continuing to poll — main.py's _run_worker() already converts any
+# exception into a fast, clean {"error": ...} response with no new plumbing
+# needed (see _BackendRunError's own docstring in swarm/team.py).
+
+def _run_error_event(message: str):
+    return SimpleNamespace(event="RunError", content=message)
+
+
+@pytest.mark.asyncio
+async def test_run_error_event_raises_backend_run_error_immediately():
+    team = _FakeTeam([
+        _content_event("some real generated text"),
+        _run_error_event("litellm.ContextWindowExceededError: ..."),
+        _content_event("this should never be reached"),
+    ])
+
+    with pytest.raises(_BackendRunError, match="ContextWindowExceededError"):
+        await _stream_team_run(team, "prompt")
+
+
+@pytest.mark.asyncio
+async def test_run_error_cancels_the_heartbeat_task_via_finally(monkeypatch):
+    """The raise must still go through _stream_team_run's own `finally:
+    heartbeat_task.cancel()` -- not leak a running heartbeat task."""
+    cancelled = {"value": False}
+
+    async def fake_heartbeat(activity, start, interval=30.0, liveness_path=None):
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled["value"] = True
+            raise
+
+    monkeypatch.setattr("swarm.team._run_heartbeat", fake_heartbeat)
+    team = _FakeTeam([_run_error_event("boom")])
+
+    with pytest.raises(_BackendRunError):
+        await _stream_team_run(team, "prompt")
+
+    assert cancelled["value"] is True
