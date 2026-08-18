@@ -1839,7 +1839,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     reads = _count_read_calls(result)
     print(  # DIAG-read-log (temporary, 2026-08-18): find why session_state read_log
         f"[DIAG-read-log] reads={reads} has_messages={bool(getattr(result, 'messages', None))} "
-        f"session_state={getattr(result, 'session_state', 'NO_ATTR')!r}",
+        f"result.session_state={getattr(result, 'session_state', 'NO_ATTR')!r} "
+        f"team.session_state={getattr(team, 'session_state', 'NO_ATTR')!r}",
         flush=True,
     )
     if reads == 0 and _CLAIMY_RE.search(content or "") and len(all_results) > 1:
