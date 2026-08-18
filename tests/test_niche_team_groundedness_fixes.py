@@ -391,6 +391,18 @@ def test_search_knowledge_graph_is_in_the_cacheable_read_tools_set():
     assert "search_knowledge_graph" in _CACHEABLE_READ_TOOLS
 
 
+def test_web_search_and_web_fetch_are_in_the_cacheable_read_tools_set():
+    """2026-08-18, same pattern a third time: an engineering run researching an
+    external tool cycled the IDENTICAL 5-call web_search/web_fetch sequence
+    roughly every 13-15s for over a minute -- no FORCED STOP ever fired, since
+    neither tool was in this set -- then went silent until the 300s liveness
+    auto-kill fired."""
+    from swarm.team import _CACHEABLE_READ_TOOLS
+
+    assert "web_search" in _CACHEABLE_READ_TOOLS
+    assert "web_fetch" in _CACHEABLE_READ_TOOLS
+
+
 def test_researcher_has_known_path_rule():
     instructions = " ".join(_agent(_load(_PARALLEL_REVIEW_YAML), "Researcher")["instructions"]).lower()
     assert "known-path rule" in instructions

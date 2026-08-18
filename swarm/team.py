@@ -2044,6 +2044,17 @@ _CACHEABLE_READ_TOOLS = {
     # lightrag_query above -- this tool is read-only/deterministic within a run,
     # widening the cache set is a proven pattern, not a new mechanism.
     "search_knowledge_graph",
+    # web_search/web_fetch added 2026-08-18, same pattern a third time, found
+    # during a live T1-T13 groundedness re-run: an engineering run researching an
+    # external tool (Stalwart mail server docs) cycled the IDENTICAL 5-call
+    # sequence (2 web_search queries + 3 web_fetch URLs) roughly every 13-15s for
+    # over a minute -- no "FORCED STOP" ever fired, because neither tool was in
+    # this set -- then stopped calling any tool at all and streamed nothing but
+    # empty content until the 300s liveness auto-kill fired. Same fix as
+    # lightrag_query/search_knowledge_graph above: both are read-only within a
+    # run (a web page's content or a search result set does not change
+    # mid-task), so the same duplicate-serve escalation applies cleanly.
+    "web_search", "web_fetch",
 }
 
 # The network-only cache below (skip the hive-mcp round-trip, still hand back the
