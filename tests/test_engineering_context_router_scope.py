@@ -31,6 +31,8 @@ from pathlib import Path
 
 import yaml
 
+from tests._team_config_helpers import effective_tools
+
 _ENGINEERING_YAML = Path(__file__).parent.parent / "teams" / "engineering.yaml"
 
 
@@ -41,17 +43,19 @@ def _context_router_spec() -> dict:
 
 def test_context_router_tools_do_not_include_get_file_content():
     spec = _context_router_spec()
-    assert "get_file_content" not in spec["tools"]
+    tools = effective_tools("engineering", "ContextRouter", spec.get("tools"))
+    assert "get_file_content" not in tools
 
 
 def test_context_router_keeps_the_tools_its_own_instruction_tiers_actually_use():
     spec = _context_router_spec()
+    tools = effective_tools("engineering", "ContextRouter", spec.get("tools"))
     for tool in (
         "list_directory_tree", "find_files", "search_files", "list_directory",
         "search_knowledge_graph", "lightrag_query", "web_search", "web_fetch",
         "load_skill",
     ):
-        assert tool in spec["tools"], f"{tool} should still be available to ContextRouter"
+        assert tool in tools, f"{tool} should still be available to ContextRouter"
 
 
 def test_context_router_instructions_never_reference_get_file_content():

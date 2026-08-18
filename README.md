@@ -136,7 +136,7 @@ AGNOHive ships 4 reference teams. None of them is "the" product — swap models 
 
 Every agent's model is DB-managed by default — swap any role between local (**Ollama** / **vLLM + LiteLLM**) and cloud (OpenAI, Anthropic, Gemini, Perplexity, HuggingFace) via `POST /admin/model-routes` + `/reload`, no file edit needed → **[☁️ Cloud Model Providers](docs/guide/cloud-models.md)**
 
-A role's tools/skills/instructions can also be extended past its `teams/*.yaml` — additively, never overriding the file — via `POST /admin/team-config/*` + `/reload` → **[🧩 DB-Backed Team Config](docs/guide/team-config.md)**
+Every role's tools/skills are DB-managed by default the same way (YAML omits them; DB supplies the list), and supplementary instructions can be layered on top of a role's base `instructions:` without ever replacing them — configurable via `POST /admin/team-config/*` + `/reload` → **[🧩 DB-Backed Team Config](docs/guide/team-config.md)**
 
 Full roster, team modes, and the Sprint Master PM team in detail → **[🤖 Agents & Teams](docs/guide/agents-and-teams.md)**
 

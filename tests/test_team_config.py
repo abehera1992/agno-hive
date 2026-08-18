@@ -21,14 +21,16 @@ async def _fresh_state(monkeypatch):
 
 # ── seeding ───────────────────────────────────────────────────────────────────
 
-async def test_load_cache_seeds_tool_and_skill_grants_from_real_yaml():
+async def test_load_cache_seeds_tool_and_skill_grants_from_static_snapshot():
     await tc.load_cache()
     async with db.get_routing_engine().begin() as conn:
         tool_rows = (await conn.execute(sa.select(db.team_role_tools))).mappings().all()
         skill_rows = (await conn.execute(sa.select(db.team_role_skills))).mappings().all()
     assert len(tool_rows) > 0
     assert len(skill_rows) > 0
-    # Spot-check a real, known grant from teams/engineering.yaml
+    # Spot-check a real, known grant from _DEFAULT_TOOL_GRANTS (the former
+    # teams/engineering.yaml content, captured 2026-08-18 when tools:/skills:
+    # were removed from the YAML in favor of the DB as the runtime source)
     assert any(
         r["team_name"] == "engineering" and r["role_name"] == "Coder" and r["tool_name"] == "apply_diff"
         for r in tool_rows
@@ -57,7 +59,7 @@ async def test_instruction_overlays_and_gate_flags_start_empty():
     assert gate_rows == []
 
 
-async def test_registry_seeded_from_yaml_tool_and_skill_union():
+async def test_registry_seeded_from_default_tool_and_skill_grants():
     await tc.load_cache()
     assert tc.is_tool_registered("apply_diff")
     assert tc.is_tool_registered("get_file_content")

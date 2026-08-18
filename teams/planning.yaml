@@ -11,34 +11,16 @@ description: Plan-only team — routes context, researches codebase, and produce
 # notion_search/notion_get_page (added 2026-08-15) are the read-only exception, matching
 # engineering.yaml's own per-agent grant — needed so the coordinator can itself read a spec
 # a task names, not only via delegation.
-coordinator_tools:
-  - list_directory_tree
-  - find_files
-  - search_files
-  - get_file_content
-  - list_directory
-  - search_knowledge_graph
-  - lightrag_query
-  - get_context_section
-  - notion_search
-  - notion_get_page
+# coordinator_tools:/each agent's tools: are DB-managed (AGNOHive 2.3.3,
+# 2026-08-18) — see swarm/team_config.py's _DEFAULT_TOOL_GRANTS and
+# api/server.py's _load_team() Tier 1 comment. Set either back here to pin a
+# list and take it out of DB control again, same override rule as model: above.
 
 agents:
   - name: ContextRouter
     description: Lightweight query router. Pick the fastest retrieval path and return raw results — never interpret or answer yourself.
     role: Routing agent that retrieves the right context from the right backend.
-    tools:
-      - list_directory_tree
-      - find_files
-      - search_files
-      - list_directory
-      - get_file_content
-      - search_knowledge_graph
-      - lightrag_query
-      - web_search
-      - web_fetch
-      - notion_search
-      - notion_get_page
+    # tools: is DB-managed — see the coordinator_tools comment above.
     instructions:
       - "SESSION CONTEXT: At session start, try get_file_content('hive.md') once — it has a pre-built directory tree and per-module summaries. Skip silently if not found."
       - "FILE PATH SHORTCUT: If the user mentions a specific file path in their prompt (e.g. 'lib/megaMenuData.ts', 'src/components/Foo.tsx'), call get_file_content() on that path directly — no search needed."
@@ -58,18 +40,7 @@ agents:
   - name: Researcher
     description: Codebase investigation specialist. Read real files and ground every claim in file content — never describe from directory names alone.
     role: Senior engineer who investigates the codebase and surfaces relevant context.
-    tools:
-      - find_files
-      - search_files
-      - get_file_content
-      - list_directory
-      - list_directory_tree
-      - search_knowledge_graph
-      - lightrag_query
-      - web_search
-      - web_fetch
-      - notion_search
-      - notion_get_page
+    # tools: is DB-managed — see the coordinator_tools comment above.
     instructions:
       - "SESSION CONTEXT: Before any other tool call, try get_file_content('hive.md') once — it has the full directory tree and per-module summaries. Use it as your starting point. Skip silently if not found."
       - "lightrag_query is always connected server-side (api/server.py's _resolve_mcp_urls appends it regardless of caller opt-in) — call it with relevant keywords before starting any exploratory search. It returns semantically-relevant files/chunks the project's LightRAG index already knows about."
@@ -100,14 +71,7 @@ agents:
   - name: Planner
     description: Task decomposition specialist. Break complex tasks into numbered steps naming the responsible agent, files to touch, and risks.
     role: Senior engineer who decomposes tasks into actionable steps for the team.
-    tools:
-      - find_files
-      - search_files
-      - get_file_content
-      - search_knowledge_graph
-      - lightrag_query
-      - notion_search
-      - notion_get_page
+    # tools: is DB-managed — see the coordinator_tools comment above.
     instructions:
       - "SESSION CONTEXT: Before planning, try get_file_content('hive.md') once — it has project structure context that informs your plan. Skip silently if not found."
       - "lightrag_query is always connected server-side (api/server.py's _resolve_mcp_urls appends it regardless of caller opt-in) — call it to check if similar tasks were solved before."

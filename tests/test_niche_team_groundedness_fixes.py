@@ -67,6 +67,7 @@ import pytest
 import yaml
 
 from swarm.team import _member_id, _project_id_preamble, _team_roster_preamble, run_task_async, run_task_stream
+from tests._team_config_helpers import effective_tools
 
 _PARALLEL_REVIEW_YAML = Path(__file__).parent.parent / "teams" / "parallel-review.yaml"
 _PLANNING_YAML = Path(__file__).parent.parent / "teams" / "planning.yaml"
@@ -150,21 +151,21 @@ def test_fallback_rule_widened_to_cover_errors_not_just_empty_results():
 
 def test_planning_context_router_has_notion_read_tools():
     data = _load(_PLANNING_YAML)
-    tools = _agent(data, "ContextRouter")["tools"]
+    tools = effective_tools("planning", "ContextRouter", _agent(data, "ContextRouter").get("tools"))
     assert "notion_search" in tools
     assert "notion_get_page" in tools
 
 
 def test_planning_researcher_has_notion_read_tools():
     data = _load(_PLANNING_YAML)
-    tools = _agent(data, "Researcher")["tools"]
+    tools = effective_tools("planning", "Researcher", _agent(data, "Researcher").get("tools"))
     assert "notion_search" in tools
     assert "notion_get_page" in tools
 
 
 def test_planning_planner_has_notion_read_tools():
     data = _load(_PLANNING_YAML)
-    tools = _agent(data, "Planner")["tools"]
+    tools = effective_tools("planning", "Planner", _agent(data, "Planner").get("tools"))
     assert "notion_search" in tools
     assert "notion_get_page" in tools
 
@@ -173,8 +174,8 @@ def test_planning_researcher_notion_grant_matches_engineering_tool_set():
     """Not just present -- the SAME two read tools engineering.yaml grants, so
     planning's Researcher can't drift onto a write tool (notion_create_page etc.)
     by copy-paste error."""
-    planning_tools = set(_agent(_load(_PLANNING_YAML), "Researcher")["tools"])
-    engineering_tools = set(_agent(_load(_ENGINEERING_YAML), "Researcher")["tools"])
+    planning_tools = effective_tools("planning", "Researcher", _agent(_load(_PLANNING_YAML), "Researcher").get("tools"))
+    engineering_tools = effective_tools("engineering", "Researcher", _agent(_load(_ENGINEERING_YAML), "Researcher").get("tools"))
     notion_tools_planning = {t for t in planning_tools if t.startswith("notion_")}
     notion_tools_engineering = {t for t in engineering_tools if t.startswith("notion_")}
     assert notion_tools_planning == notion_tools_engineering == {"notion_search", "notion_get_page"}

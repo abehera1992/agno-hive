@@ -22,6 +22,8 @@ from pathlib import Path
 
 import yaml
 
+from tests._team_config_helpers import effective_tools
+
 _ENGINEERING_YAML = Path(__file__).parent.parent / "teams" / "engineering.yaml"
 _PLANNING_YAML = Path(__file__).parent.parent / "teams" / "planning.yaml"
 
@@ -114,7 +116,7 @@ def test_researcher_tool_list_is_unchanged_by_the_merge():
     tool Researcher lacked) -- the merge should not need to add or remove anything
     here, only fold in instructions."""
     agents = _engineering_agents()
-    tools = set(agents["Researcher"]["tools"])
+    tools = effective_tools("engineering", "Researcher", agents["Researcher"].get("tools"))
     for tool in (
         "find_files", "search_files", "get_file_content", "list_directory",
         "list_directory_tree", "search_knowledge_graph", "lightrag_query",

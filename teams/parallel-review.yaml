@@ -17,30 +17,16 @@ mode: broadcast
 # via their own `tools:` lists). Without this, the coordinator receives every tool from every
 # connected MCP unfiltered — including write/staging tools (apply_diff, write_file, notion_*,
 # confirm_action/reject_action) that this team must never call. Keep this list read-only.
-coordinator_tools:
-  - list_directory_tree
-  - find_files
-  - search_files
-  - get_file_content
-  - list_directory
-  - search_knowledge_graph
-  - lightrag_query
-  - get_context_section
-  - load_skill
+# coordinator_tools:/each agent's tools:/skills: are DB-managed (AGNOHive
+# 2.3.3, 2026-08-18) — see swarm/team_config.py's _DEFAULT_TOOL_GRANTS/
+# _DEFAULT_SKILL_GRANTS and api/server.py's _load_team() Tier 1 comment. Set
+# any back here to pin a list and take it out of DB control again, same
+# override rule as model: above.
 
 agents:
   - name: Researcher
     description: Codebase structure and data flow specialist. Maps modules, entry points, and dependencies.
     role: Maps overall structure, entry points, and data flow across the codebase.
-    tools:
-      - list_directory_tree
-      - find_files
-      - search_files
-      - get_file_content
-      - lightrag_query
-      - load_skill
-    skills:
-      - verification-discipline
     instructions:
       - Call list_directory_tree() or find_files('**/*') first to map the full structure before reading any file.
       - Read at least one entry-point file per top-level directory — never describe a module from its name alone.
@@ -53,15 +39,6 @@ agents:
   - name: SecurityReviewer
     description: Security analysis specialist. Identifies vulnerabilities, auth issues, and secrets exposure.
     role: Reviews auth flows, input validation, secrets handling, and API boundaries for vulnerabilities.
-    tools:
-      - get_file_content
-      - search_files
-      - find_files
-      - lightrag_query
-      - git_diff
-      - load_skill
-    skills:
-      - verification-discipline
     instructions:
       - Focus on OWASP Top 10 — injection, broken auth, sensitive data exposure, security misconfiguration.
       - Search for secrets and credentials with search_files patterns like 'password', 'secret', 'api_key', 'token'.
@@ -74,14 +51,6 @@ agents:
   - name: PerformanceReviewer
     description: Performance analysis specialist. Identifies N+1 queries, missing indexes, and hot-path bottlenecks.
     role: Reviews database queries, loops, caching patterns, and hot paths for performance issues.
-    tools:
-      - get_file_content
-      - search_files
-      - find_files
-      - lightrag_query
-      - load_skill
-    skills:
-      - verification-discipline
     instructions:
       - Search for database query patterns — look for ORM calls inside loops (N+1), missing .select_related()/.prefetch_related(), unbounded queries.
       - Check for missing pagination on list endpoints.

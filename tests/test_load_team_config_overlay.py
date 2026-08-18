@@ -1,8 +1,10 @@
 """Tests for AGNOHive 2.3.3's read-path wiring in api/server.py's _load_team():
-Tier 1 (DB-granted extra tools/skills, additive-union with a team YAML's own
-tools:/skills: list) and Tier 2 (additive-only instruction overlays, appended
-after the YAML's base instructions:). Mirrors
-tests/test_load_team_db_fallback.py's synthetic-team-in-tmp_path pattern."""
+Tier 1 (DB-backed tools/skills, override-with-fallback -- same precedence as
+model:/policy: the YAML's own tools:/skills:, when present, always wins
+outright; when the YAML omits the field, the DB supplies the role's full
+list) and Tier 2 (additive-only instruction overlays, appended after the
+YAML's base instructions:). Mirrors tests/test_load_team_db_fallback.py's
+synthetic-team-in-tmp_path pattern."""
 import pytest
 import yaml
 
@@ -63,52 +65,91 @@ def _base_yaml():
     }
 
 
-# ── Tier 1: tools union ───────────────────────────────────────────────────────
+# ── Tier 1: tools, override-with-DB-fallback ──────────────────────────────────
 
-async def test_db_granted_extra_tool_is_unioned_with_yaml_tools(tmp_path, monkeypatch):
+async def test_yaml_tools_win_outright_over_a_db_grant(tmp_path, monkeypatch):
+    """The YAML's own tools:, when present, always wins -- the same 'pin it
+    back here to take it out of DB control' escape hatch model: already has.
+    A DB row for this role is NOT unioned in; it's simply ignored."""
     from api import server
 
     _write_team_yaml(tmp_path, _base_yaml())
     monkeypatch.setattr(server, "_TEAMS_DIR", tmp_path)
     await tc.ensure_cache_loaded()
     await _add_tool_grant("synthetic-team", "Coder", "web_search")
-
-    agents, _, _, _ = server._load_team("synthetic-team")
-
-    assert set(agents[0].tools) == {"get_file_content", "apply_diff", "web_search"}
-
-
-async def test_no_db_grant_leaves_yaml_tools_unchanged(tmp_path, monkeypatch):
-    from api import server
-
-    _write_team_yaml(tmp_path, _base_yaml())
-    monkeypatch.setattr(server, "_TEAMS_DIR", tmp_path)
-    await tc.ensure_cache_loaded()
 
     agents, _, _, _ = server._load_team("synthetic-team")
 
     assert set(agents[0].tools) == {"get_file_content", "apply_diff"}
 
 
-async def test_db_grant_never_narrows_an_unrestricted_agent(tmp_path, monkeypatch):
-    """A role with NO tools: in its YAML is unrestricted (sees every connected
-    tool, per make_agent_from_spec's own `if spec.tools:` truthy check) -- a DB
-    grant must never turn that into a restrictive list of just the grant."""
+async def test_yaml_omits_tools_falls_back_to_full_db_list(tmp_path, monkeypatch):
+    """Once the YAML omits tools: entirely, the DB is the sole source -- the
+    role's tool list is exactly what's granted, not a union with anything."""
     from api import server
 
     data = _base_yaml()
-    del data["agents"][0]["tools"]  # unrestricted
+    del data["agents"][0]["tools"]
     _write_team_yaml(tmp_path, data)
     monkeypatch.setattr(server, "_TEAMS_DIR", tmp_path)
     await tc.ensure_cache_loaded()
     await _add_tool_grant("synthetic-team", "Coder", "web_search")
+    await _add_tool_grant("synthetic-team", "Coder", "get_file_content")
+
+    agents, _, _, _ = server._load_team("synthetic-team")
+
+    assert set(agents[0].tools) == {"web_search", "get_file_content"}
+
+
+async def test_no_yaml_tools_and_no_db_grant_stays_unrestricted(tmp_path, monkeypatch):
+    """A role with NO tools: in its YAML AND no DB rows either is unrestricted
+    (sees every connected tool, per make_agent_from_spec's own
+    `if spec.tools:` truthy check) -- the historical, pre-DB-migration
+    behavior for a role nobody has migrated yet."""
+    from api import server
+
+    data = _base_yaml()
+    del data["agents"][0]["tools"]
+    _write_team_yaml(tmp_path, data)
+    monkeypatch.setattr(server, "_TEAMS_DIR", tmp_path)
+    await tc.ensure_cache_loaded()
 
     agents, _, _, _ = server._load_team("synthetic-team")
 
     assert agents[0].tools is None
 
 
-async def test_db_granted_extra_coordinator_tool_is_unioned(tmp_path, monkeypatch):
+async def test_yaml_omits_coordinator_tools_falls_back_to_db(tmp_path, monkeypatch):
+    from api import server
+
+    data = _base_yaml()  # no coordinator_tools key
+    _write_team_yaml(tmp_path, data)
+    monkeypatch.setattr(server, "_TEAMS_DIR", tmp_path)
+    await tc.ensure_cache_loaded()
+    await _add_tool_grant("synthetic-team", "Coordinator", "notion_search")
+    await _add_tool_grant("synthetic-team", "Coordinator", "get_file_content")
+
+    _, _, _, coordinator_tools = server._load_team("synthetic-team")
+
+    assert set(coordinator_tools) == {"notion_search", "get_file_content"}
+
+
+async def test_no_coordinator_tools_yaml_field_and_no_db_grant_stays_unrestricted(tmp_path, monkeypatch):
+    """A team with NO coordinator_tools: at all (e.g. real engineering.yaml)
+    AND no DB rows either is unrestricted by design."""
+    from api import server
+
+    data = _base_yaml()  # no coordinator_tools key
+    _write_team_yaml(tmp_path, data)
+    monkeypatch.setattr(server, "_TEAMS_DIR", tmp_path)
+    await tc.ensure_cache_loaded()
+
+    _, _, _, coordinator_tools = server._load_team("synthetic-team")
+
+    assert coordinator_tools is None
+
+
+async def test_yaml_coordinator_tools_win_outright_over_a_db_grant(tmp_path, monkeypatch):
     from api import server
 
     data = _base_yaml()
@@ -120,29 +161,12 @@ async def test_db_granted_extra_coordinator_tool_is_unioned(tmp_path, monkeypatc
 
     _, _, _, coordinator_tools = server._load_team("synthetic-team")
 
-    assert set(coordinator_tools) == {"get_file_content", "notion_search"}
+    assert coordinator_tools == ["get_file_content"]
 
 
-async def test_no_coordinator_tools_yaml_field_is_unaffected_by_db_grants(tmp_path, monkeypatch):
-    """A team with NO coordinator_tools: at all (e.g. real engineering.yaml) is
-    unrestricted by design -- a DB grant must not turn that into a restrictive
-    allowlist either."""
-    from api import server
+# ── Tier 1: skills, override-with-DB-fallback (mirrors tools) ────────────────
 
-    data = _base_yaml()  # no coordinator_tools key
-    _write_team_yaml(tmp_path, data)
-    monkeypatch.setattr(server, "_TEAMS_DIR", tmp_path)
-    await tc.ensure_cache_loaded()
-    await _add_tool_grant("synthetic-team", "Coordinator", "notion_search")
-
-    _, _, _, coordinator_tools = server._load_team("synthetic-team")
-
-    assert coordinator_tools is None
-
-
-# ── Tier 1: skills union (mirrors tools) ──────────────────────────────────────
-
-async def test_db_granted_extra_skill_is_unioned_with_yaml_skills(tmp_path, monkeypatch):
+async def test_yaml_skills_win_outright_over_a_db_grant(tmp_path, monkeypatch):
     from api import server
 
     _write_team_yaml(tmp_path, _base_yaml())
@@ -152,7 +176,22 @@ async def test_db_granted_extra_skill_is_unioned_with_yaml_skills(tmp_path, monk
 
     agents, _, _, _ = server._load_team("synthetic-team")
 
-    assert set(agents[0].skills) == {"verification-discipline", "code-conventions"}
+    assert set(agents[0].skills) == {"verification-discipline"}
+
+
+async def test_yaml_omits_skills_falls_back_to_full_db_list(tmp_path, monkeypatch):
+    from api import server
+
+    data = _base_yaml()
+    del data["agents"][0]["skills"]
+    _write_team_yaml(tmp_path, data)
+    monkeypatch.setattr(server, "_TEAMS_DIR", tmp_path)
+    await tc.ensure_cache_loaded()
+    await _add_skill_grant("synthetic-team", "Coder", "code-conventions")
+
+    agents, _, _, _ = server._load_team("synthetic-team")
+
+    assert set(agents[0].skills) == {"code-conventions"}
 
 
 # ── Tier 2: instruction overlays ──────────────────────────────────────────────

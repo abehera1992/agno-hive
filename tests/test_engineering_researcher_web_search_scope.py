@@ -29,6 +29,8 @@ from pathlib import Path
 
 import yaml
 
+from tests._team_config_helpers import effective_skills
+
 _ENGINEERING_YAML = Path(__file__).parent.parent / "teams" / "engineering.yaml"
 _SKILLS_DIR = Path(__file__).parent.parent / "hive-mcp" / "skills"
 
@@ -37,7 +39,7 @@ def _researcher_instructions() -> str:
     data = yaml.safe_load(_ENGINEERING_YAML.read_text(encoding="utf-8"))
     researcher = next(a for a in data["agents"] if a["name"] == "Researcher")
     parts = list(researcher["instructions"])
-    for skill_name in researcher.get("skills", []):
+    for skill_name in effective_skills("engineering", "Researcher", researcher.get("skills")):
         skill_path = _SKILLS_DIR / skill_name / "SKILL.md"
         if skill_path.exists():
             parts.append(skill_path.read_text(encoding="utf-8"))

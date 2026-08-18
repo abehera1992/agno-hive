@@ -152,15 +152,20 @@ team_role_models = Table(
 # routing_metadata like model_catalog/team_role_models above, for the identical
 # reason: no FK crossing into {chat_sessions, session_messages, failure_log}.
 #
-# Tier 1 -- per-role tool/skill ALLOWLIST ADDITIONS. Deliberately additive-union
-# with a team YAML's own tools:/skills: list, not a replace-or-fallback the way
-# model_id is -- Phase 1's seed populates these tables from each team's CURRENT
-# YAML content, so immediately after migration (DB rows == YAML content) the
-# union changes nothing observably; a row added LATER via the admin API is a
-# genuine new grant layered on top, matching the "sits on top of, never
-# overrides" philosophy Tier 2 (below) also uses. A team YAML deliberately
-# hardcoding a full roster (e.g. a future engineering-cloud.yaml-style reference
-# team) is unaffected UNLESS someone explicitly grants that team extra rows later.
+# Tier 1 -- per-role tool/skill allowlist. Same override-with-DB-fallback
+# precedence as model_id (swarm/model_routing.py's team_role_models): a team
+# YAML's own tools:/skills:, when present, always wins outright -- the "pin it
+# back in the YAML to take it out of DB control" escape hatch; when the YAML
+# omits the field, these tables supply the role's full list. Changed 2026-08-18
+# from an initial additive-union design (DB rows layered on top of the YAML's
+# own list) to this replace-or-fallback design, specifically so the DB is the
+# actual runtime source of a role's tools/skills rather than a YAML-plus-extras
+# layer -- all 4 shipped teams/*.yaml have had their tools:/skills: fields
+# removed accordingly, with swarm/team_config.py's _DEFAULT_TOOL_GRANTS/
+# _DEFAULT_SKILL_GRANTS (a static snapshot of the former YAML content) seeding
+# these tables on a fresh deployment. A team YAML deliberately hardcoding a
+# full roster (e.g. a future engineering-cloud.yaml-style reference team) stays
+# unaffected as long as it keeps an explicit tools:/skills: list.
 team_role_tools = Table(
     "team_role_tools", routing_metadata,
     Column("team_name", Text, primary_key=True),

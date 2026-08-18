@@ -5,7 +5,7 @@
 ## Contents
 - [What this is](#what-this-is)
 - [The three tiers](#the-three-tiers)
-- [Tier 1 — extra tools/skills (additive-union)](#tier-1--extra-toolsskills-additive-union)
+- [Tier 1 — tools/skills (DB-primary, override-with-fallback)](#tier-1--toolsskills-db-primary-override-with-fallback)
 - [Tier 2 — instruction overlays (additive-only)](#tier-2--instruction-overlays-additive-only)
 - [Tier 3 — gate flags](#tier-3--gate-flags)
 - [Admin API](#admin-api)
@@ -16,27 +16,29 @@
 
 ## What this is
 
-Every `teams/*.yaml` file hardcodes each role's `tools:`, `skills:`, and `instructions:` — the same pattern `model_catalog`/`team_role_models` ([Cloud Model Providers](cloud-models.md)) replaced for model routing. AGNOHive 2.3.3 does the same for tools/skills/instructions/gates: three new SQLite/Postgres tables let a user grant a role an extra tool, add a supplementary instruction, or flip a gate on/off **without editing or redeploying a YAML file** — a prerequisite for a future command-center UI wrapper where these are user-configurable settings, not code changes.
+Every `teams/*.yaml` file used to hardcode each role's `tools:`, `skills:`, and `instructions:` — the same pattern `model_catalog`/`team_role_models` ([Cloud Model Providers](cloud-models.md)) replaced for model routing. AGNOHive 2.3.3 does the same for tools/skills/instructions/gates: three new SQLite/Postgres tables let a user grant a role a tool, add a supplementary instruction, or flip a gate on/off **without editing or redeploying a YAML file** — a prerequisite for a future command-center UI wrapper where these are user-configurable settings, not code changes.
 
-**The YAML files remain the source of truth for the base configuration.** Nothing in this feature replaces or overrides a YAML's existing `tools:`, `skills:`, or `instructions:` — every DB-backed addition is layered ADDITIVELY on top, at read time, inside `api/server.py`'s `_load_team()`. A team with zero DB rows behaves byte-for-byte identically to before this feature existed.
+**Tools/skills (Tier 1) and instructions (Tier 2) take deliberately different precedence, by explicit design choice:**
+- **Tier 1 (tools/skills) — the DB is the actual runtime source.** All 4 shipped `teams/*.yaml` have had their `tools:`/`skills:`/`coordinator_tools:` fields removed entirely; `_load_team()` resolves each role's list from the DB instead. A YAML can still declare an explicit list to pin a role and take it out of DB control — same escape hatch `model:` already has — but nothing ships that way by default anymore.
+- **Tier 2 (instructions) stays additive-only.** A role's base `instructions:` in the YAML are never touched; DB overlays are appended after them under a clear header. This was an explicit, separate requirement — the tested base instruction set is not something this feature is allowed to replace or reorder.
 
 ## The three tiers
 
 | Tier | What | Mechanism | Mutable via |
 |---|---|---|---|
-| 1 | Extra tools/skills per (team, role) | Additive-union with the YAML's own list | `POST/DELETE /admin/team-config/tools`, `/skills` |
-| 2 | Supplementary instructions per (team, role) | Appended after the YAML's base `instructions:`, under a clear header | `POST/PATCH/DELETE /admin/team-config/instruction-overlays` |
+| 1 | Tools/skills per (team, role) | DB is the source; YAML value, if present, overrides it outright (same precedence as `model:`) | `POST/DELETE /admin/team-config/tools`, `/skills` |
+| 2 | Supplementary instructions per (team, role) | Appended after the YAML's base `instructions:`, under a clear header — additive only | `POST/PATCH/DELETE /admin/team-config/instruction-overlays` |
 | 3 | Per-gate on/off (`decompose_first`, `search_before_browse`) | DB override falling back to the existing hardcoded team-membership default | `POST/DELETE /admin/team-config/gates` |
 
 All three read through one in-process cache module, `swarm/team_config.py` — same pattern as `swarm/model_routing.py`: loaded once at FastAPI startup via `ensure_cache_loaded()`, refreshed only via an explicit `POST /admin/team-config/reload`. No background TTL polling.
 
-## Tier 1 — extra tools/skills (additive-union)
+## Tier 1 — tools/skills (DB-primary, override-with-fallback)
 
-`team_role_tools` / `team_role_skills` (`swarm/db.py`) each hold `(team_name, role_name, tool_name | skill_name)` rows. At read time, `_load_team()` unions any matching rows into that role's `AgentSpec.tools` / `.skills` list — the YAML's own entries are never dropped, only added to.
+`team_role_tools` / `team_role_skills` (`swarm/db.py`) each hold `(team_name, role_name, tool_name | skill_name)` rows — one row per granted name. At read time, `_load_team()` resolves a role's tool/skill list with the same precedence `model:` already uses: **the YAML's own `tools:`/`skills:`, when present, wins outright** (DB rows for that role are simply not consulted); **when the YAML omits the field, the DB supplies the role's full list.** This changed from an initial additive-union design (DB rows layered on top of the YAML's own list) specifically so the DB would be the actual runtime source rather than a YAML-plus-extras layer — all 4 shipped teams had their `tools:`/`skills:`/`coordinator_tools:` fields removed accordingly, with `swarm/team_config.py`'s `_DEFAULT_TOOL_GRANTS`/`_DEFAULT_SKILL_GRANTS` (a static snapshot of the former YAML content) seeding these tables on a fresh deployment.
 
-**The one case this deliberately skips:** a role with no `tools:` field in its YAML at all is *unrestricted* — `swarm/agents.py`'s `make_agent_from_spec` treats `tools: None` as "sees every connected tool," not "sees nothing." A DB grant must never turn that into a restrictive allowlist containing only the granted tool, so the union only runs `if extra_tools and a.get("tools")` — an unrestricted role stays unrestricted regardless of what's granted to it in the DB. The same guard applies to `coordinator_tools`. This is covered directly by `tests/test_load_team_config_overlay.py`'s `test_db_grant_never_narrows_an_unrestricted_agent` and `test_no_coordinator_tools_yaml_field_is_unaffected_by_db_grants`.
+**The one case this deliberately preserves:** a role with no `tools:` field in its YAML *and* no rows in the DB is *unrestricted* — `swarm/agents.py`'s `make_agent_from_spec` treats `tools: None` as "sees every connected tool," not "sees nothing." A missing DB list must never resolve to an empty allowlist, so the fallback only replaces `a["tools"]` `if db_tools` is non-empty — a role nobody has migrated into the DB (e.g. `engineering`'s coordinator, which has never had a `coordinator_tools:` field or DB rows) stays unrestricted exactly as before. The same guard applies to `coordinator_tools`. Covered directly by `tests/test_load_team_config_overlay.py`'s `test_no_yaml_tools_and_no_db_grant_stays_unrestricted` and `test_no_coordinator_tools_yaml_field_and_no_db_grant_stays_unrestricted`.
 
-**Write-time registry validation.** A grant is only accepted if the tool/skill name already exists in `tool_registry`/`skill_registry` — two more small tables, seeded from a live enumeration of `hive-mcp`'s registered tools and the skill catalog (never hand-maintained; see [Adding a provider](cloud-models.md#adding-a-provider) for the equivalent pattern on the model-routing side). `POST /admin/team-config/tools` with an unregistered `tool_name` returns **400**, not a silent no-op — a typo'd tool name should fail loudly at write time, not surface later as a mysteriously-missing capability at run time. `POST /admin/team-config/registry/refresh` re-syncs the registry from a fresh enumeration when new tools/skills ship.
+**Write-time registry validation.** A grant is only accepted if the tool/skill name already exists in `tool_registry`/`skill_registry` — two more small tables, seeded from `_DEFAULT_TOOL_GRANTS`/`_DEFAULT_SKILL_GRANTS`'s own union of names on first run, refreshable from a live enumeration of `hive-mcp`'s registered tools and the skill catalog (never hand-maintained; see [Adding a provider](cloud-models.md#adding-a-provider) for the equivalent pattern on the model-routing side). `POST /admin/team-config/tools` with an unregistered `tool_name` returns **400**, not a silent no-op — a typo'd tool name should fail loudly at write time, not surface later as a mysteriously-missing capability at run time. `POST /admin/team-config/registry/refresh` re-syncs the registry from a fresh enumeration when new tools/skills ship.
 
 ## Tier 2 — instruction overlays (additive-only)
 
@@ -80,7 +82,7 @@ Identical philosophy to model routing: a write that isn't followed by `POST /adm
 
 ## What this deliberately does NOT do
 
-- **Never overrides or replaces a YAML's existing `tools:`/`skills:`/`instructions:`** — every mechanism here is additive-only, by design (see [Tier 1](#tier-1--extra-toolsskills-additive-union) and [Tier 2](#tier-2--instruction-overlays-additive-only) above for the specific guards).
+- **Never overrides or replaces a YAML's existing `instructions:`** — Tier 2 is additive-only, by design (see [Tier 2](#tier-2--instruction-overlays-additive-only) above). This does NOT apply to Tier 1: an explicit `tools:`/`skills:` in the YAML *does* override the DB outright (see [Tier 1](#tier-1--toolsskills-db-primary-override-with-fallback) above) — the two tiers use intentionally different precedence.
 - **Tier 3 mechanics (which gates exist, how a gate task is computed) stay in code** — only the on/off decision per team is DB-overridable. Adding a genuinely new gate is still a code change in `swarm/team.py`.
 - **No contradiction detection across overlays** — deferred, see [Tier 2](#tier-2--instruction-overlays-additive-only).
 - **No versioning/audit trail on overlay edits** beyond `active`/`created_by`/`created_at` — deleting and recreating is the only way to change text.

@@ -36,6 +36,8 @@ from pathlib import Path
 
 import yaml
 
+from tests._team_config_helpers import effective_skills
+
 _ENGINEERING_YAML = Path(__file__).parent.parent / "teams" / "engineering.yaml"
 _SKILLS_DIR = Path(__file__).parent.parent / "hive-mcp" / "skills"
 
@@ -92,8 +94,9 @@ def test_moved_skill_bodies_are_non_trivial():
 def test_researcher_skills_list_references_all_six_moved_skills():
     data = _load_engineering_yaml()
     researcher = _researcher(data)
+    skills = effective_skills("engineering", "Researcher", researcher.get("skills"))
     for skill_name in _MOVED_SKILLS:
-        assert skill_name in researcher["skills"]
+        assert skill_name in skills
 
 
 # ── An always-on pointer line survives for each moved rule, naming its trigger ──

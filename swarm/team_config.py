@@ -1,8 +1,20 @@
-"""DB-backed team config additions (AGNOHive 2.3.3, 2026-08-18) — per-role tool/
-skill allowlist ADDITIONS, additive-only supplementary instructions, and per-team
-gate on/off flags, layered on top of teams/*.yaml, never replacing it. See the
-Notion design page "AGNOHive 2.3.3 - Moving team yaml configs to sqlite db" for
-the full three-tier rationale this module implements.
+"""DB-backed team config (AGNOHive 2.3.3, 2026-08-18) — three tiers, each with
+its own precedence:
+  Tier 1 (tools/skills) — the DB is the actual runtime source. A team YAML's
+    own tools:/skills:, when present, still wins outright (same "pin it back
+    here to take it out of DB control" escape hatch model: already has), but
+    all 4 shipped teams/*.yaml have had those fields removed, so the DB
+    supplies them by default (see _DEFAULT_TOOL_GRANTS/_DEFAULT_SKILL_GRANTS
+    below and api/server.py's _load_team()). Changed 2026-08-18 from an
+    earlier additive-union design specifically to make the DB the primary
+    source rather than a YAML-plus-extras layer.
+  Tier 2 (instructions) — additive-only supplementary overlays, appended after
+    a role's base instructions:, never replacing them (explicit user
+    requirement — the base instruction set stays entirely YAML-owned).
+  Tier 3 (gates) — a DB override for decompose_first/search_before_browse,
+    falling back to the existing hardcoded team-membership default.
+See the Notion design page "AGNOHive 2.3.3 - Moving team yaml configs to
+sqlite db" for the full rationale.
 
 Mirrors swarm/model_routing.py's shape deliberately: an in-process cache, loaded
 once at startup (ensure_cache_loaded()) and refreshed only via an explicit
@@ -67,14 +79,16 @@ _load_lock = asyncio.Lock()
 
 
 def get_extra_tools(team_name: str, role_name: str) -> list[str]:
-    """Sync, cache-only. Additional tool names granted via the DB for this
-    (team, role) -- to be UNIONED with the team YAML's own tools: list, never
-    replacing it (see swarm/db.py's team_role_tools comment)."""
+    """Sync, cache-only. The DB-granted tool list for this (team, role) —
+    api/server.py's _load_team() uses this as the role's FULL tool list
+    whenever the team YAML omits tools:/coordinator_tools: (see that
+    function's Tier 1 comment). Name kept from the original additive-union
+    design; the DB is now the primary source, not an addition on top."""
     return sorted(_tools_cache.get((team_name, role_name), set()))
 
 
 def get_extra_skills(team_name: str, role_name: str) -> list[str]:
-    """Sync, cache-only. Same additive-union contract as get_extra_tools()."""
+    """Sync, cache-only. Same contract as get_extra_tools()."""
     return sorted(_skills_cache.get((team_name, role_name), set()))
 
 
@@ -257,72 +271,249 @@ async def reset_cache_for_tests() -> None:
 
 
 # ── Seed data ─────────────────────────────────────────────────────────────────
-# Populates team_role_tools/team_role_skills from each shipped team YAML's
-# CURRENT tools:/skills: content, so a fresh deployment's behavior is byte-for-
-# byte identical to today's pre-DB-migration behavior on first run (the DB
-# grants are a union superset that happens to equal the YAML content exactly at
-# seed time — see swarm/db.py's team_role_tools comment). Runs once, only when
-# team_role_tools is empty (see load_cache() above) — never overwrites rows an
-# admin has since added. team_role_instruction_overlays and team_gate_flags
-# deliberately start EMPTY for every role (see the Notion design's Phase 1 —
-# overlays are purely user-added going forward, and every team's gate behavior
-# stays exactly as the hardcoded _GATE_ENABLED_TEAMS/_SEARCH_GATE_ENABLED_TEAMS
-# sets already define until an admin explicitly overrides one).
+# Populates team_role_tools/team_role_skills so a fresh deployment's behavior is
+# byte-for-byte identical to the pre-DB-migration behavior on first run. Runs
+# once, only when team_role_tools is empty (see load_cache() above) — never
+# overwrites rows an admin has since added. team_role_instruction_overlays and
+# team_gate_flags deliberately start EMPTY for every role (see the Notion
+# design's Phase 1 — overlays are purely user-added going forward, and every
+# team's gate behavior stays exactly as the hardcoded
+# _GATE_ENABLED_TEAMS/_SEARCH_GATE_ENABLED_TEAMS sets already define until an
+# admin explicitly overrides one).
 #
-# tool_registry/skill_registry are seeded from the STATIC union of every
-# tool:/skill: name that appears across all shipped teams/*.yaml — a reasonable,
-# honest bootstrap (everything currently in active use is definitely a real,
-# valid name) — NOT a substitute for refresh_registry()'s live-MCP-sourced
-# refresh, which is the real source of truth once available. A name granted via
-# the admin API that isn't yet in the registry (a brand-new hive-mcp tool that
-# hasn't been through a refresh_registry() call yet) is correctly rejected until
-# the registry is refreshed — fail loud, not silently accept an unverifiable name.
+# 2026-08-18 follow-up: this used to be parsed live from each teams/*.yaml's
+# tools:/skills: content at seed time. Once the DB became the actual runtime
+# source (api/server.py's _load_team() now reads a role's tools/skills from
+# here whenever the YAML omits the field — see that function's Tier 1 comment)
+# and teams/*.yaml had those fields removed accordingly, there was nothing left
+# in the YAML for a fresh deployment to seed FROM — the static snapshot below
+# is what the YAML content actually was at migration time, captured once and
+# now the sole source of truth for a first-run seed. Editing an EXISTING
+# deployment's grants goes through the admin API below, not this snapshot.
+#
+# tool_registry/skill_registry are seeded from the union of every name below —
+# a reasonable, honest bootstrap (everything here was in active use at
+# migration time, so definitely a real, valid name) — NOT a substitute for
+# refresh_registry()'s live-MCP-sourced refresh, which is the real source of
+# truth once available. A name granted via the admin API that isn't yet in the
+# registry (a brand-new hive-mcp tool that hasn't been through a
+# refresh_registry() call yet) is correctly rejected until the registry is
+# refreshed — fail loud, not silently accept an unverifiable name.
 
-import yaml
-from pathlib import Path
+_DEFAULT_TOOL_GRANTS: set[tuple[str, str, str]] = {
+    ("engineering", "Coder", "apply_diff"),
+    ("engineering", "Coder", "find_files"),
+    ("engineering", "Coder", "get_file_content"),
+    ("engineering", "Coder", "lightrag_insert"),
+    ("engineering", "Coder", "lightrag_query"),
+    ("engineering", "Coder", "list_directory"),
+    ("engineering", "Coder", "load_skill"),
+    ("engineering", "Coder", "run_command"),
+    ("engineering", "Coder", "search_files"),
+    ("engineering", "Coder", "search_knowledge_graph"),
+    ("engineering", "Coder", "write_file"),
+    ("engineering", "ContextRouter", "find_files"),
+    ("engineering", "ContextRouter", "lightrag_query"),
+    ("engineering", "ContextRouter", "list_directory"),
+    ("engineering", "ContextRouter", "list_directory_tree"),
+    ("engineering", "ContextRouter", "load_skill"),
+    ("engineering", "ContextRouter", "notion_get_page"),
+    ("engineering", "ContextRouter", "notion_search"),
+    ("engineering", "ContextRouter", "search_files"),
+    ("engineering", "ContextRouter", "search_knowledge_graph"),
+    ("engineering", "ContextRouter", "web_fetch"),
+    ("engineering", "ContextRouter", "web_search"),
+    ("engineering", "Executor", "bash_job_kill"),
+    ("engineering", "Executor", "bash_job_status"),
+    ("engineering", "Executor", "bash_run"),
+    ("engineering", "Executor", "bash_session_close"),
+    ("engineering", "Executor", "bash_session_start"),
+    ("engineering", "Executor", "check_port"),
+    ("engineering", "Executor", "get_env_info"),
+    ("engineering", "Executor", "get_file_content"),
+    ("engineering", "Executor", "git_blame"),
+    ("engineering", "Executor", "git_diff"),
+    ("engineering", "Executor", "git_log"),
+    ("engineering", "Executor", "git_log_file"),
+    ("engineering", "Executor", "git_status"),
+    ("engineering", "Executor", "list_processes"),
+    ("engineering", "Executor", "load_skill"),
+    ("engineering", "Executor", "run_command"),
+    ("engineering", "Executor", "run_docker"),
+    ("engineering", "Executor", "run_shell"),
+    ("engineering", "Researcher", "find_files"),
+    ("engineering", "Researcher", "get_file_content"),
+    ("engineering", "Researcher", "lightrag_query"),
+    ("engineering", "Researcher", "list_directory"),
+    ("engineering", "Researcher", "list_directory_tree"),
+    ("engineering", "Researcher", "load_skill"),
+    ("engineering", "Researcher", "notion_get_page"),
+    ("engineering", "Researcher", "notion_search"),
+    ("engineering", "Researcher", "search_files"),
+    ("engineering", "Researcher", "search_knowledge_graph"),
+    ("engineering", "Researcher", "web_fetch"),
+    ("engineering", "Researcher", "web_search"),
+    ("engineering", "Reviewer", "find_files"),
+    ("engineering", "Reviewer", "get_file_content"),
+    ("engineering", "Reviewer", "git_diff"),
+    ("engineering", "Reviewer", "git_status"),
+    ("engineering", "Reviewer", "lightrag_insert"),
+    ("engineering", "Reviewer", "lightrag_query"),
+    ("engineering", "Reviewer", "load_skill"),
+    ("engineering", "Reviewer", "search_files"),
+    ("engineering", "Reviewer", "search_knowledge_graph"),
+    ("parallel-review", "Coordinator", "find_files"),
+    ("parallel-review", "Coordinator", "get_context_section"),
+    ("parallel-review", "Coordinator", "get_file_content"),
+    ("parallel-review", "Coordinator", "lightrag_query"),
+    ("parallel-review", "Coordinator", "list_directory"),
+    ("parallel-review", "Coordinator", "list_directory_tree"),
+    ("parallel-review", "Coordinator", "load_skill"),
+    ("parallel-review", "Coordinator", "search_files"),
+    ("parallel-review", "Coordinator", "search_knowledge_graph"),
+    ("parallel-review", "PerformanceReviewer", "find_files"),
+    ("parallel-review", "PerformanceReviewer", "get_file_content"),
+    ("parallel-review", "PerformanceReviewer", "lightrag_query"),
+    ("parallel-review", "PerformanceReviewer", "load_skill"),
+    ("parallel-review", "PerformanceReviewer", "search_files"),
+    ("parallel-review", "Researcher", "find_files"),
+    ("parallel-review", "Researcher", "get_file_content"),
+    ("parallel-review", "Researcher", "lightrag_query"),
+    ("parallel-review", "Researcher", "list_directory_tree"),
+    ("parallel-review", "Researcher", "load_skill"),
+    ("parallel-review", "Researcher", "search_files"),
+    ("parallel-review", "SecurityReviewer", "find_files"),
+    ("parallel-review", "SecurityReviewer", "get_file_content"),
+    ("parallel-review", "SecurityReviewer", "git_diff"),
+    ("parallel-review", "SecurityReviewer", "lightrag_query"),
+    ("parallel-review", "SecurityReviewer", "load_skill"),
+    ("parallel-review", "SecurityReviewer", "search_files"),
+    ("planning", "ContextRouter", "find_files"),
+    ("planning", "ContextRouter", "get_file_content"),
+    ("planning", "ContextRouter", "lightrag_query"),
+    ("planning", "ContextRouter", "list_directory"),
+    ("planning", "ContextRouter", "list_directory_tree"),
+    ("planning", "ContextRouter", "notion_get_page"),
+    ("planning", "ContextRouter", "notion_search"),
+    ("planning", "ContextRouter", "search_files"),
+    ("planning", "ContextRouter", "search_knowledge_graph"),
+    ("planning", "ContextRouter", "web_fetch"),
+    ("planning", "ContextRouter", "web_search"),
+    ("planning", "Coordinator", "find_files"),
+    ("planning", "Coordinator", "get_context_section"),
+    ("planning", "Coordinator", "get_file_content"),
+    ("planning", "Coordinator", "lightrag_query"),
+    ("planning", "Coordinator", "list_directory"),
+    ("planning", "Coordinator", "list_directory_tree"),
+    ("planning", "Coordinator", "notion_get_page"),
+    ("planning", "Coordinator", "notion_search"),
+    ("planning", "Coordinator", "search_files"),
+    ("planning", "Coordinator", "search_knowledge_graph"),
+    ("planning", "Planner", "find_files"),
+    ("planning", "Planner", "get_file_content"),
+    ("planning", "Planner", "lightrag_query"),
+    ("planning", "Planner", "notion_get_page"),
+    ("planning", "Planner", "notion_search"),
+    ("planning", "Planner", "search_files"),
+    ("planning", "Planner", "search_knowledge_graph"),
+    ("planning", "Researcher", "find_files"),
+    ("planning", "Researcher", "get_file_content"),
+    ("planning", "Researcher", "lightrag_query"),
+    ("planning", "Researcher", "list_directory"),
+    ("planning", "Researcher", "list_directory_tree"),
+    ("planning", "Researcher", "notion_get_page"),
+    ("planning", "Researcher", "notion_search"),
+    ("planning", "Researcher", "search_files"),
+    ("planning", "Researcher", "search_knowledge_graph"),
+    ("planning", "Researcher", "web_fetch"),
+    ("planning", "Researcher", "web_search"),
+    ("sprint-master", "BacklogResearcher", "find_files"),
+    ("sprint-master", "BacklogResearcher", "get_file_content"),
+    ("sprint-master", "BacklogResearcher", "load_skill"),
+    ("sprint-master", "BacklogResearcher", "notion_find_work_item"),
+    ("sprint-master", "BacklogResearcher", "notion_get_database_schema"),
+    ("sprint-master", "BacklogResearcher", "notion_get_item_with_relations"),
+    ("sprint-master", "BacklogResearcher", "notion_get_page"),
+    ("sprint-master", "BacklogResearcher", "notion_items_in_sprint"),
+    ("sprint-master", "BacklogResearcher", "notion_query_database"),
+    ("sprint-master", "BacklogResearcher", "notion_search"),
+    ("sprint-master", "Coordinator", "find_files"),
+    ("sprint-master", "Coordinator", "get_file_content"),
+    ("sprint-master", "Coordinator", "load_skill"),
+    ("sprint-master", "Coordinator", "notion_append_blocks"),
+    ("sprint-master", "Coordinator", "notion_append_markdown"),
+    ("sprint-master", "Coordinator", "notion_create_page"),
+    ("sprint-master", "Coordinator", "notion_delete_block"),
+    ("sprint-master", "Coordinator", "notion_find_work_item"),
+    ("sprint-master", "Coordinator", "notion_get_database_schema"),
+    ("sprint-master", "Coordinator", "notion_get_item_with_relations"),
+    ("sprint-master", "Coordinator", "notion_get_page"),
+    ("sprint-master", "Coordinator", "notion_items_in_sprint"),
+    ("sprint-master", "Coordinator", "notion_query_database"),
+    ("sprint-master", "Coordinator", "notion_replace_section"),
+    ("sprint-master", "Coordinator", "notion_search"),
+    ("sprint-master", "Coordinator", "notion_trash_page"),
+    ("sprint-master", "Coordinator", "notion_update_block"),
+    ("sprint-master", "Coordinator", "notion_update_content"),
+    ("sprint-master", "Coordinator", "notion_update_page_props"),
+    ("sprint-master", "StoryWriter", "get_file_content"),
+    ("sprint-master", "StoryWriter", "load_skill"),
+    ("sprint-master", "StoryWriter", "notion_append_blocks"),
+    ("sprint-master", "StoryWriter", "notion_append_markdown"),
+    ("sprint-master", "StoryWriter", "notion_create_page"),
+    ("sprint-master", "StoryWriter", "notion_delete_block"),
+    ("sprint-master", "StoryWriter", "notion_get_database_schema"),
+    ("sprint-master", "StoryWriter", "notion_get_page"),
+    ("sprint-master", "StoryWriter", "notion_query_database"),
+    ("sprint-master", "StoryWriter", "notion_replace_section"),
+    ("sprint-master", "StoryWriter", "notion_search"),
+    ("sprint-master", "StoryWriter", "notion_trash_page"),
+    ("sprint-master", "StoryWriter", "notion_update_block"),
+    ("sprint-master", "StoryWriter", "notion_update_content"),
+    ("sprint-master", "StoryWriter", "notion_update_page_props"),
+}
 
-_TEAMS_DIR = Path(__file__).resolve().parent.parent / "teams"
-
-
-def _read_team_yaml_tools_and_skills() -> tuple[set[tuple[str, str, str]], set[tuple[str, str, str]]]:
-    """Parses every teams/*.yaml directly (not via api/server.py's _load_team(),
-    which requires an event loop / DB-resolved model and is request-shaped, not
-    seed-shaped) — returns two sets of (team_name, role_name, name) triples,
-    one for tools and one for skills. Sets, not lists: a coordinator_tools entry
-    and a per-agent tools entry could name the same tool for the same (team,
-    role) in principle, and team_role_tools' primary key would reject a literal
-    duplicate insert — de-duplicating here is simpler than catching that at
-    insert time."""
-    tool_triples: set[tuple[str, str, str]] = set()
-    skill_triples: set[tuple[str, str, str]] = set()
-    for path in sorted(_TEAMS_DIR.glob("*.yaml")):
-        team_name = path.stem
-        data = yaml.safe_load(path.read_text())
-        for tool_name in (data.get("coordinator_tools") or []):
-            tool_triples.add((team_name, "Coordinator", tool_name))
-        for agent in data.get("agents", []):
-            role_name = agent["name"]
-            for tool_name in (agent.get("tools") or []):
-                tool_triples.add((team_name, role_name, tool_name))
-            for skill_name in (agent.get("skills") or []):
-                skill_triples.add((team_name, role_name, skill_name))
-    return tool_triples, skill_triples
+_DEFAULT_SKILL_GRANTS: set[tuple[str, str, str]] = {
+    ("engineering", "Coder", "code-conventions"),
+    ("engineering", "Coder", "counting-marker"),
+    ("engineering", "Coder", "file-write-review"),
+    ("engineering", "Coder", "verification-discipline"),
+    ("engineering", "ContextRouter", "verification-discipline"),
+    ("engineering", "Executor", "bash-sessions"),
+    ("engineering", "Executor", "file-write-review"),
+    ("engineering", "Executor", "verification-discipline"),
+    ("engineering", "Researcher", "chain-tracing-discipline"),
+    ("engineering", "Researcher", "codebase-enumeration-discipline"),
+    ("engineering", "Researcher", "external-framework-verification"),
+    ("engineering", "Researcher", "external-web-research"),
+    ("engineering", "Researcher", "notion-reference-discovery"),
+    ("engineering", "Researcher", "path-not-found-recovery"),
+    ("engineering", "Researcher", "verification-discipline"),
+    ("engineering", "Reviewer", "file-write-review"),
+    ("engineering", "Reviewer", "verification-discipline"),
+    ("parallel-review", "PerformanceReviewer", "verification-discipline"),
+    ("parallel-review", "Researcher", "verification-discipline"),
+    ("parallel-review", "SecurityReviewer", "verification-discipline"),
+    ("sprint-master", "BacklogResearcher", "notion-grounding"),
+    ("sprint-master", "BacklogResearcher", "verification-discipline"),
+    ("sprint-master", "StoryWriter", "file-write-review"),
+    ("sprint-master", "StoryWriter", "notion-grounding"),
+}
 
 
 async def _seed_defaults(conn) -> None:
-    tool_triples, skill_triples = _read_team_yaml_tools_and_skills()
-    all_tools = {name for (_, _, name) in tool_triples}
-    all_skills = {name for (_, _, name) in skill_triples}
+    all_tools = {name for (_, _, name) in _DEFAULT_TOOL_GRANTS}
+    all_skills = {name for (_, _, name) in _DEFAULT_SKILL_GRANTS}
 
-    if tool_triples:
+    if _DEFAULT_TOOL_GRANTS:
         await conn.execute(
             db.team_role_tools.insert(),
-            [{"team_name": t, "role_name": r, "tool_name": n} for (t, r, n) in tool_triples],
+            [{"team_name": t, "role_name": r, "tool_name": n} for (t, r, n) in _DEFAULT_TOOL_GRANTS],
         )
-    if skill_triples:
+    if _DEFAULT_SKILL_GRANTS:
         await conn.execute(
             db.team_role_skills.insert(),
-            [{"team_name": t, "role_name": r, "skill_name": n} for (t, r, n) in skill_triples],
+            [{"team_name": t, "role_name": r, "skill_name": n} for (t, r, n) in _DEFAULT_SKILL_GRANTS],
         )
     if all_tools:
         await conn.execute(db.tool_registry.insert(), [{"tool_name": t} for t in sorted(all_tools)])

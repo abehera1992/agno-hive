@@ -16,45 +16,16 @@ description: Generic, platform-agnostic PM team — reads and writes backlog/spr
 # complete writes (it lacked the write tool and delegation to the worker was unreliable — it
 # thrashed ~400s then gave up). Giving the coordinator the board write tools makes the path
 # robust; the WRITE_REVIEW gate, not tool restriction, is what keeps writes safe.
-coordinator_tools:
-  - notion_search
-  - notion_get_page
-  - notion_get_database_schema
-  - notion_query_database
-  - notion_items_in_sprint
-  - notion_get_item_with_relations
-  - notion_find_work_item
-  - notion_create_page
-  - notion_update_page_props
-  - notion_append_blocks
-  - notion_append_markdown
-  - notion_trash_page
-  - notion_update_content
-  - notion_replace_section
-  - notion_update_block
-  - notion_delete_block
-  - get_file_content
-  - find_files
-  - load_skill
+# coordinator_tools:/each agent's tools:/skills: are DB-managed (AGNOHive
+# 2.3.3, 2026-08-18) — see swarm/team_config.py's _DEFAULT_TOOL_GRANTS/
+# _DEFAULT_SKILL_GRANTS and api/server.py's _load_team() Tier 1 comment. Set
+# any back here to pin a list and take it out of DB control again, same
+# override rule as model: above.
 
 agents:
   - name: BacklogResearcher
     description: Delivery-board reader. Gathers current sprint/backlog state and the exact field + option names before any write.
     role: Project coordinator who reads the board state and confirms the valid field and option values for the writer.
-    tools:
-      - notion_search
-      - notion_get_page
-      - notion_get_database_schema
-      - notion_query_database
-      - notion_items_in_sprint
-      - notion_get_item_with_relations
-      - notion_find_work_item
-      - get_file_content
-      - find_files
-      - load_skill
-    skills:
-      - notion-grounding
-      - verification-discipline
     instructions:
       - You manage delivery tracking, not code. Your job is to gather the exact current state and the valid field/option names BEFORE any work item is created or changed. You never write anything yourself.
       - "BOARD FACTS: call get_file_content('docs/delivery-board.md') first — it holds the work-tracking data-source IDs, the field list (Type, Status, Stage, Priority, Area, Sprint, Spec), the exact option values for each, and the native Sub-item / Parent item 1 nesting rule. Treat it as the source of truth for field and option names."
@@ -70,25 +41,6 @@ agents:
   - name: StoryWriter
     description: Delivery-board writer. Creates, updates, and nests work items using simple values; stops at the review gate.
     role: Project coordinator who creates and updates backlog/sprint work items on the connected platform.
-    tools:
-      - notion_search
-      - notion_get_page
-      - notion_get_database_schema
-      - notion_query_database
-      - notion_create_page
-      - notion_update_page_props
-      - notion_append_blocks
-      - notion_append_markdown
-      - notion_trash_page
-      - notion_update_content
-      - notion_replace_section
-      - notion_update_block
-      - notion_delete_block
-      - get_file_content
-      - load_skill
-    skills:
-      - notion-grounding
-      - file-write-review
     instructions:
       - You write backlog and sprint work items on the connected work-tracking platform. You never edit code, run shell, or touch files — you have no such tools.
       - "SIMPLE VALUES: pass properties as a plain dict of field -> simple value (e.g. Status to 'Done', Area to 'Platform', Priority to 'P2'). The platform tool maps each value to the correct type from the schema — do NOT build typed property objects yourself."

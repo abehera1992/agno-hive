@@ -19,20 +19,11 @@ agents:
   - name: ContextRouter
     description: Lightweight query router. Pick the fastest retrieval path and return raw results — never interpret or answer yourself.
     role: Routing agent that retrieves the right context from the right backend.
-    tools:
-      - list_directory_tree
-      - find_files
-      - search_files
-      - list_directory
-      - search_knowledge_graph
-      - lightrag_query
-      - web_search
-      - web_fetch
-      - notion_search
-      - notion_get_page
-      - load_skill
-    skills:
-      - verification-discipline
+    # tools:/skills: are DB-managed (AGNOHive 2.3.3, 2026-08-18) — see
+    # swarm/team_config.py's _DEFAULT_TOOL_GRANTS/_DEFAULT_SKILL_GRANTS and
+    # api/server.py's _load_team() Tier 1 comment. Set either back here to pin
+    # this role's list and take it out of DB control again, same override rule
+    # as model: above.
     instructions:
       - You are a lightweight routing agent. Decide the fastest way to retrieve context for a query.
       - Always use tools that are actually available — check the connected MCP, do not assume tool names.
@@ -54,27 +45,7 @@ agents:
   - name: Researcher
     description: Codebase investigation AND task decomposition specialist (merged with the former Planner role, 2026-08-14 — see the "AgnoHive - Engineering Team 2.0 Update" Notion plan). Read real files and ground every claim in file content — never describe from directory names alone. For a multi-part task, decompose into a literal checklist BEFORE exploring; for an implementation task, also break it into steps naming the responsible agent.
     role: Senior engineer who investigates the codebase, decomposes multi-part tasks into actionable checklists, and surfaces grounded, verified findings for the team.
-    tools:
-      - find_files
-      - search_files
-      - get_file_content
-      - list_directory
-      - list_directory_tree
-      - search_knowledge_graph
-      - lightrag_query
-      - web_search
-      - web_fetch
-      - notion_search
-      - notion_get_page
-      - load_skill
-    skills:
-      - verification-discipline
-      - codebase-enumeration-discipline
-      - chain-tracing-discipline
-      - external-web-research
-      - notion-reference-discovery
-      - path-not-found-recovery
-      - external-framework-verification
+    # tools:/skills: are DB-managed — see the ContextRouter comment above.
     instructions:
       - "SESSION CONTEXT: Before any other tool call, try get_file_content('hive.md') once — it has the full directory tree and per-module summaries. Use it as your starting point for structure and overview questions. Skip silently if not found."
       - "lightrag_query is always connected server-side (api/server.py's _resolve_mcp_urls appends it regardless of caller opt-in) — call it with relevant keywords before starting any exploratory search. It returns semantically-relevant files/chunks the project's LightRAG index already knows about."
@@ -105,23 +76,7 @@ agents:
   - name: Coder
     description: Implementation specialist. Write clean, idiomatic code following existing patterns. Use apply_diff() for existing files, write_file() only for new ones.
     role: Senior software engineer who implements features and fixes bugs.
-    tools:
-      - get_file_content
-      - find_files
-      - search_files
-      - list_directory
-      - apply_diff
-      - write_file
-      - run_command
-      - search_knowledge_graph
-      - lightrag_insert
-      - lightrag_query
-      - load_skill
-    skills:
-      - file-write-review
-      - counting-marker
-      - verification-discipline
-      - code-conventions
+    # tools:/skills: are DB-managed — see the ContextRouter comment above.
     instructions:
       - "lightrag_query is always connected server-side — call it with relevant keywords before starting."
       - You are the implementation specialist. Write clean, idiomatic code.
@@ -149,29 +104,7 @@ agents:
   - name: Executor
     description: Execution and validation specialist. Run commands and report exact stdout/stderr — never paraphrase errors.
     role: Engineer who runs commands, executes tests, and reports results.
-    tools:
-      - run_command
-      - run_shell
-      - run_docker
-      - bash_session_start
-      - bash_run
-      - bash_session_close
-      - bash_job_status
-      - bash_job_kill
-      - get_file_content
-      - git_status
-      - git_log
-      - git_diff
-      - git_log_file
-      - git_blame
-      - get_env_info
-      - check_port
-      - list_processes
-      - load_skill
-    skills:
-      - file-write-review
-      - verification-discipline
-      - bash-sessions
+    # tools:/skills: are DB-managed — see the ContextRouter comment above.
     instructions:
       - You are the execution specialist. Run commands and validate results.
       - Use run_command() to execute tests, linters, or build steps.
@@ -185,19 +118,7 @@ agents:
   - name: Reviewer
     description: Code review specialist. Check correctness, security, and consistency. Flag real problems only — never style preferences.
     role: Senior engineer who reviews code for correctness and security.
-    tools:
-      - get_file_content
-      - find_files
-      - search_files
-      - git_diff
-      - git_status
-      - search_knowledge_graph
-      - lightrag_insert
-      - lightrag_query
-      - load_skill
-    skills:
-      - file-write-review
-      - verification-discipline
+    # tools:/skills: are DB-managed — see the ContextRouter comment above.
     instructions:
       - "lightrag_query is always connected server-side — call it with relevant keywords before starting."
       - You are the code reviewer. Check for correctness, security, and consistency.

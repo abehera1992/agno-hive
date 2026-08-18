@@ -100,22 +100,29 @@ def _load_team(name: str) -> tuple[list[AgentSpec], str, str, list[str] | None]:
                     db_value = getattr(policy, field)
                     if db_value is not None:
                         a[field] = db_value
-        # AGNOHive 2.3.3 (2026-08-18) -- Tier 1 (tools/skills): ADDITIVE union with
-        # a DB-granted extra list, never a replace-or-fallback the way model:/policy
-        # above are. `if a.get("tools")` (truthy check, matching
-        # make_agent_from_spec's own `if spec.tools:`) is deliberate: a["tools"]
-        # being None/absent means "unrestricted, sees every connected tool" (see
-        # that function's docstring) -- unioning DB extras into an ALREADY-
-        # unrestricted role would be a no-op at best and, if ever misread as
-        # "replace with just the extras", a real regression narrowing an
-        # unrestricted agent. Only a role with an existing explicit tools:/skills:
-        # list is a meaningful union target.
-        extra_tools = team_config.get_extra_tools(name, a["name"])
-        if extra_tools and a.get("tools"):
-            a["tools"] = sorted(set(a["tools"]) | set(extra_tools))
-        extra_skills = team_config.get_extra_skills(name, a["name"])
-        if extra_skills and a.get("skills"):
-            a["skills"] = sorted(set(a["skills"]) | set(extra_skills))
+        # AGNOHive 2.3.3 (2026-08-18) -- Tier 1 (tools/skills): same override-with-
+        # DB-fallback precedence as model:/policy above (2026-08-18 follow-up --
+        # shipped first as an additive union that kept YAML as the primary list;
+        # changed to replace-or-fallback per explicit follow-up request to make
+        # the DB the actual runtime source, not a YAML-plus-extras layer). A
+        # role's own tools:/skills: in the YAML, when present, always wins
+        # outright -- the same "pin it back here to take it out of DB control"
+        # escape hatch model: already has (all 4 shipped teams/*.yaml have had
+        # their tools:/skills: fields removed, since team_role_tools/
+        # team_role_skills was already fully seeded from those exact values).
+        # When the YAML omits the field, the DB supplies the full list; if the
+        # DB has no rows either, the field stays None/absent, meaning
+        # "unrestricted, sees every connected tool" (make_agent_from_spec's own
+        # `if spec.tools:` truthy check) -- unchanged for a role that was never
+        # migrated into the DB (e.g. engineering's coordinator, below).
+        if not a.get("tools"):
+            db_tools = team_config.get_extra_tools(name, a["name"])
+            if db_tools:
+                a["tools"] = db_tools
+        if not a.get("skills"):
+            db_skills = team_config.get_extra_skills(name, a["name"])
+            if db_skills:
+                a["skills"] = db_skills
         # Tier 2 (additive-only supplementary instructions): appended AFTER the
         # role's base instructions (YAML/hardcoded, untouched), under a clearly-
         # marked header -- never merged into or replacing the base list. Empty
@@ -131,13 +138,16 @@ def _load_team(name: str) -> tuple[list[AgentSpec], str, str, list[str] | None]:
     # (mirrors per-agent `tools:` scoping). None means "no scoping — full surface" —
     # the existing behavior, preserved for teams like `engineering` that need write access.
     coordinator_tools = data.get("coordinator_tools")
-    # Same additive-union rule as per-agent tools above, applied to the
-    # coordinator's own allowlist -- a team with NO coordinator_tools: (e.g.
-    # engineering, unrestricted by design) is left alone; only a team that
-    # already scopes its coordinator gets DB extras unioned in.
-    extra_coordinator_tools = team_config.get_extra_tools(name, "Coordinator")
-    if extra_coordinator_tools and coordinator_tools:
-        coordinator_tools = sorted(set(coordinator_tools) | set(extra_coordinator_tools))
+    # Same override-with-DB-fallback rule as per-agent tools above, applied to
+    # the coordinator's own allowlist -- a team with NO coordinator_tools: (e.g.
+    # engineering, unrestricted by design, with no DB rows either) is left
+    # alone; a team whose YAML omitted coordinator_tools: but has DB rows
+    # (sprint-master/planning/parallel-review, all migrated 2026-08-18) gets
+    # its allowlist from the DB instead.
+    if not coordinator_tools:
+        db_coordinator_tools = team_config.get_extra_tools(name, "Coordinator")
+        if db_coordinator_tools:
+            coordinator_tools = db_coordinator_tools
     return agents, coordinator, mode, coordinator_tools
 
 
