@@ -1271,23 +1271,50 @@ def _count_read_calls(result) -> int:
     treated as "it did not read". Reading absence as evidence of absence produced several
     wrong diagnoses on 2026-07-31, and a guard that made the same mistake would force
     pointless retries on correct answers.
+
+    2026-08-18 live incident: `result.messages` only ever holds the COORDINATOR's own
+    direct tool calls -- a delegated member agent's reads happen inside a SEPARATE,
+    nested run, visible to the coordinator's own message list only as one opaque
+    `delegate_task_to_member` call (not in `_READ_TOOLS`) plus the delegate's final
+    text answer. For a task the coordinator handles entirely through delegation (a
+    correct, encouraged pattern -- see _COORDINATOR_DISCOVERY_TOOLS' whole rationale
+    for forcing exactly this), `.messages`-only counting always returns 0 real reads
+    even when the delegated agent(s) read extensively and correctly -- a false
+    positive that triggered a retry on an ALREADY-CORRECT, doubly-Researcher-and-
+    Reviewer-verified gap-analysis answer, and that retry's fresh, un-grounded
+    re-run then produced a WRONG answer, overwriting the right one.
+
+    `session_state["read_log"]` (`_record_read`, written by `_make_read_cache_tool_hook`
+    on EVERY team member, coordinator or delegated, for exactly this reason -- see
+    that hook's own docstring on why per-agent registration was necessary) already
+    tracks every real fresh read across the WHOLE run regardless of delegation depth.
+    Combined with the `.messages` count below (still checked, still correct for the
+    coordinator's own direct reads) rather than replacing it -- either source finding
+    real evidence is sufficient; this only ever WIDENS what counts as "did read",
+    never narrows it, so it cannot introduce a new false negative.
     """
     msgs = getattr(result, "messages", None)
-    if not msgs:
-        return -1
     n, recognised = 0, False
-    for m in msgs:
-        for tc in (getattr(m, "tool_calls", None) or []):
-            recognised = True
-            fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", None)
-            name = (fn or {}).get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
-            if name in _READ_TOOLS:
-                n += 1
-        if getattr(m, "role", None) == "tool":
-            recognised = True
-            name = getattr(m, "tool_name", None) or getattr(m, "name", None)
-            if name in _READ_TOOLS:
-                n += 1
+    if msgs:
+        for m in msgs:
+            for tc in (getattr(m, "tool_calls", None) or []):
+                recognised = True
+                fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", None)
+                name = (fn or {}).get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+                if name in _READ_TOOLS:
+                    n += 1
+            if getattr(m, "role", None) == "tool":
+                recognised = True
+                name = getattr(m, "tool_name", None) or getattr(m, "name", None)
+                if name in _READ_TOOLS:
+                    n += 1
+
+    session_state = getattr(result, "session_state", None) or {}
+    read_log = session_state.get("read_log") if isinstance(session_state, dict) else None
+    if read_log:
+        recognised = True
+        n += sum(1 for entry in read_log if isinstance(entry, dict) and entry.get("tool") in _READ_TOOLS)
+
     return n if recognised else -1
 
 
