@@ -99,3 +99,33 @@ def test_query_routing_tables_delegate_instead_of_calling_tools_directly():
 def test_clarification_section_no_longer_tells_coordinator_to_research_with_removed_tools():
     text = _joined()
     assert "delegate to ContextRouter to research it, don't ask" in text
+
+
+# ── Turn-classification only applies with prior context (2026-08-18 live incident) ──
+#
+# A first-turn, zero-prior-context task got misclassified as REJECT/CANCEL and led
+# to a real, unrequested notion_trash_page call against unrelated data (see
+# test_niche_team_groundedness_fixes.py's notion_trash_page tests for the
+# structural tool-surface half of this fix).
+
+def test_turn_classification_states_it_requires_prior_context():
+    text = _joined()
+    start = text.index("Conversational turn detection")
+    section = text[start:text.index("ACTION APPROVAL —", start)]
+    assert "only" in section and "prior turn in THIS session" in section
+    assert "first message of a fresh session" in section
+    assert "Treat it as a plain TASK" in section
+
+
+def test_reject_cancel_forbids_any_tool_call_not_just_file_write_tools():
+    text = _joined()
+    start = text.index("REJECT / CANCEL")
+    section = text[start:text.index("CONVERSATIONAL —", start)]
+    assert "Do NOT call ANY tool of any kind" in section
+    assert "notion_trash_page" in section
+
+
+def test_outcome_honesty_rule_exists():
+    text = _joined()
+    assert "OUTCOME HONESTY" in text
+    assert "never say 'no changes applied'" in text.lower() or "no changes applied' or 'nothing" in text

@@ -576,6 +576,50 @@ def test_engineering_coordinator_no_allowlist_reaches_notion_replace_section():
     assert "notion_replace_section_fn" in scoped
 
 
+# ── notion_trash_page blocked from an unrestricted coordinator (2026-08-18) ──────
+#
+# Live incident: engineering.yaml's coordinator (no coordinator_tools: allowlist at
+# all) misclassified a plain, first-turn, zero-prior-context read-only task as a
+# REJECT/CANCEL conversational turn (see _COORDINATOR_INSTRUCTIONS' own fix for the
+# same incident) and called notion_trash_page against a real, unrelated, completed
+# sprint page with 24+ linked work items -- while narrating "no changes applied."
+# notion_trash_page is now always excluded from a coordinator with no explicit
+# allowlist, structurally (tool surface), not just by instruction.
+
+def test_notion_trash_page_blocked_from_unrestricted_coordinator():
+    from swarm.team import _scope_coordinator_tools
+
+    mcp = _fake_mcp({
+        "notion_trash_page": "notion_trash_page_fn",
+        "notion_create_page": "notion_create_page_fn",
+    })
+
+    scoped = _scope_coordinator_tools(None, [mcp], read_only=False, team_name="engineering")
+    assert "notion_trash_page_fn" not in scoped
+    # Other Notion writes (doc-sync) are unaffected -- this is a narrow exclusion.
+    assert "notion_create_page_fn" in scoped
+
+
+def test_notion_trash_page_still_reachable_via_an_explicit_allowlist():
+    """sprint-master.yaml (and its DB-seeded default) explicitly grants
+    notion_trash_page to the coordinator -- a deliberate, reviewed grant, unaffected
+    by the no-allowlist-only block above."""
+    from swarm.team import _scope_coordinator_tools
+
+    mcp = _fake_mcp({"notion_trash_page": "notion_trash_page_fn"})
+
+    scoped = _scope_coordinator_tools(
+        ["notion_trash_page"], [mcp], read_only=False, team_name="sprint-master",
+    )
+    assert "notion_trash_page_fn" in scoped
+
+
+def test_notion_trash_page_in_unscoped_blocked_set():
+    from swarm.team import _COORDINATOR_UNSCOPED_BLOCKED_TOOLS
+
+    assert "notion_trash_page" in _COORDINATOR_UNSCOPED_BLOCKED_TOOLS
+
+
 def test_engineering_coordinator_notion_reads_excluded_even_when_allowlisted():
     from swarm.team import _scope_coordinator_tools
 

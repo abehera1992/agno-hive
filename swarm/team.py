@@ -176,6 +176,13 @@ _COORDINATOR_INSTRUCTIONS = [
     "  made using notion_replace_section... no further action required' — a fabricated claim",
     "  about its own tool usage, and a second false claim of completion while the write actually",
     "  sat pending in the WRITE_REVIEW queue awaiting approval.",
+    "  OUTCOME HONESTY (2026-08-18 live incident): never say 'no changes applied' or 'nothing",
+    "  happened' unless you can verify, from THIS turn's own tool results, that zero write",
+    "  tools were actually called. Confirmed live: a coordinator called notion_trash_page",
+    "  (a real write, staged pending review) and then, in the same turn, replied 'Understood —",
+    "  no changes applied' — a false claim about an action it had just taken itself, not a",
+    "  substitution or a third party's action. If you called a write tool this turn, report",
+    "  its real result (success / staged-pending / error) — never a blanket 'nothing changed'.",
     "",
     "── Skills — on-demand instruction detail (CRITICAL) ─────────────",
     "  Call load_skill(name) for the full text of a skill BEFORE acting on a task",
@@ -187,6 +194,19 @@ _COORDINATOR_INSTRUCTIONS = [
     "  you already have instead.",
     "",
     "── Conversational turn detection (read this first) ─────────────",
+    "  This ENTIRE section (ACTION APPROVAL / REJECT-CANCEL / CONVERSATIONAL below) only",
+    "  applies when there IS a prior turn in THIS session for the current message to react",
+    "  to — a change you yourself already proposed or staged earlier in this same",
+    "  conversation. If this is the first message of a fresh session (no earlier turn, no",
+    "  proposal from you exists yet), NONE of these three categories can apply — there is",
+    "  nothing to approve, reject, or converse about yet. Treat it as a plain TASK",
+    "  regardless of what words it contains (2026-08-18 live incident: a first-turn, zero-",
+    "  prior-context request was misclassified as REJECT/CANCEL despite containing none of",
+    "  that category's trigger words and no proposal existing to reject — the coordinator",
+    "  invented the premise of a prior turn that never happened, then called a real",
+    "  destructive tool — notion_trash_page, on a page unrelated to the task — while",
+    "  narrating that nothing had changed).",
+    "",
     "  Not every message is a task. Classify the message before reaching for tools:",
     "",
     "  ACTION APPROVAL — always a TASK, never conversational:",
@@ -196,14 +216,22 @@ _COORDINATOR_INSTRUCTIONS = [
     "    → Delegate the write/implementation to the Coder immediately.",
     "    → Do NOT reply in plain prose about what you will do. Delegate and act.",
     "",
-    "  REJECT / CANCEL — user cancels a proposed action:",
+    "  REJECT / CANCEL — user cancels a proposed action THIS SESSION ALREADY PROPOSED:",
     "    If the user says 'reject', 'cancel', 'no don't', 'don't apply', 'stop', 'abort',",
-    "    'undo', 'revert', 'discard', 'roll back' in response to a proposed change → STOP.",
-    "    Do NOT delegate to Coder. Do NOT call apply_diff or write_file.",
+    "    'undo', 'revert', 'discard', 'roll back' in direct response to a change YOU proposed",
+    "    or staged earlier in THIS session → STOP. This branch never applies to a session's",
+    "    first message (see the note above).",
+    "    Do NOT call ANY tool of any kind to react — no apply_diff, write_file, run_command,",
+    "    no notion_* tool (including notion_trash_page/notion_delete_block), no",
+    "    delegate_task_to_member, nothing. The only correct response is plain text. This holds",
+    "    regardless of which platform or mechanism staged the original proposal.",
     "    If a .hive_proposed file was staged, reply exactly:",
     "      'Understood — no changes applied. To discard the staged file, type /reject or /cleanup in your hive CLI.'",
+    "    If a non-file action was staged (you were given a pending action_id), reply exactly:",
+    "      'Understood — no changes applied. The pending action is still awaiting review outside this conversation.'",
     "    If nothing was staged yet, reply: 'Understood — no changes applied.'",
-    "    Do NOT attempt to delete .hive_proposed files via run_command, run_shell, or any tool.",
+    "    Do NOT attempt to delete .hive_proposed files, trash pages, or resolve any pending",
+    "    action via run_command, run_shell, or any other tool — narrate only, call nothing.",
     "",
     "  CONVERSATIONAL — respond directly, NO tool calls:",
     "    - User shares an opinion, agrees, disagrees, or adds their own perspective",
@@ -719,6 +747,28 @@ _NOTION_DISCOVERY_TOOLS = {
 }
 _NOTION_DISCOVERY_EXEMPT_TEAMS = {"sprint-master"}
 
+# Destructive, page-level Notion tool never handed to a coordinator with NO
+# explicit coordinator_tools: allowlist (i.e. an "unrestricted" team like
+# engineering, which otherwise gets every non-mutating-in-read-only tool for
+# free — see _scope_coordinator_tools' no-allowlist branches). Found live
+# 2026-08-18: engineering's coordinator (no coordinator_tools: at all)
+# misclassified a plain, first-turn, zero-prior-context task as a
+# REJECT/CANCEL turn (see _COORDINATOR_INSTRUCTIONS' "Conversational turn
+# detection" fix, same incident) and, instead of calling nothing as that
+# branch requires, called notion_trash_page against a real, unrelated,
+# completed sprint page with 24+ linked work items -- narrating "no changes
+# applied" while the trash action sat genuinely staged in WRITE_REVIEW.
+# notion_create/update/append (ongoing doc-sync writes) are deliberately NOT
+# blocked here -- see _NOTION_DISCOVERY_TOOLS' own comment on why
+# engineering's coordinator legitimately writes Notion content as part of
+# this project's delivery-board-sync workflow. Page-level deletion is a
+# categorically different, much higher-blast-radius operation with no
+# legitimate use in that workflow. sprint-master (the PM/delivery-board team)
+# is unaffected: it explicitly grants notion_trash_page in its OWN
+# coordinator_tools: allowlist/DB rows, which bypasses these no-allowlist
+# branches entirely -- a real, reviewed grant, not an accidental one.
+_COORDINATOR_UNSCOPED_BLOCKED_TOOLS = {"notion_trash_page"}
+
 
 def _scope_coordinator_tools(
     tool_names: list[str] | None, mcp_list: list, read_only: bool = False,
@@ -749,6 +799,11 @@ def _scope_coordinator_tools(
     exact read tools was a deliberate, tested fix for a different prior incident.
     See _NOTION_DISCOVERY_TOOLS's own comment for why this is a separate exemption
     rather than simply not adding those tools to _COORDINATOR_DISCOVERY_TOOLS at all.
+
+    The two no-allowlist branches also always exclude `_COORDINATOR_UNSCOPED_BLOCKED_TOOLS`
+    (currently just `notion_trash_page`) — see that set's own comment. The explicit-
+    allowlist branch does NOT apply this block, since an allowlist naming the tool
+    (sprint-master's coordinator_tools:) is a deliberate, reviewed grant.
     """
     all_funcs: dict = {}
     for mcp in mcp_list:
@@ -762,7 +817,8 @@ def _scope_coordinator_tools(
         return notion_exempt and name in _NOTION_DISCOVERY_TOOLS
 
     if not tool_names and not read_only:
-        scoped = [f for n, f in all_funcs.items() if _keep(n)]
+        scoped = [f for n, f in all_funcs.items()
+                  if _keep(n) and n not in _COORDINATOR_UNSCOPED_BLOCKED_TOOLS]
         return scoped or mcp_list
     if not tool_names:
         # read_only with no allowlist: everything the MCPs expose, minus mutating tools.
