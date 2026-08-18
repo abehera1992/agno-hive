@@ -1837,6 +1837,11 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # a path:line). Conversational replies and "I could not determine" answers legitimately
     # need no reads and must not be retried.
     reads = _count_read_calls(result)
+    print(  # DIAG-read-log (temporary, 2026-08-18): find why session_state read_log
+        f"[DIAG-read-log] reads={reads} has_messages={bool(getattr(result, 'messages', None))} "
+        f"session_state={getattr(result, 'session_state', 'NO_ATTR')!r}",
+        flush=True,
+    )
     if reads == 0 and _CLAIMY_RE.search(content or "") and len(all_results) > 1:
         # Aggregate retry budget already spent -- surface rather than re-run again.
         return (
