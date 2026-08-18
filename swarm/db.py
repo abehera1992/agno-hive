@@ -145,6 +145,99 @@ team_role_models = Table(
     Column("tool_call_limit", Integer, nullable=True),
 )
 
+# AGNOHive 2.3.3 (2026-08-18) -- moving team YAML config (tools/skills/gate flags/
+# supplementary instructions) to the SAME dedicated routing SQLite engine, NOT a
+# new one -- see the Notion design page "AGNOHive 2.3.3 - Moving team yaml
+# configs to sqlite db" for the full three-tier rationale. Bound to
+# routing_metadata like model_catalog/team_role_models above, for the identical
+# reason: no FK crossing into {chat_sessions, session_messages, failure_log}.
+#
+# Tier 1 -- per-role tool/skill ALLOWLIST ADDITIONS. Deliberately additive-union
+# with a team YAML's own tools:/skills: list, not a replace-or-fallback the way
+# model_id is -- Phase 1's seed populates these tables from each team's CURRENT
+# YAML content, so immediately after migration (DB rows == YAML content) the
+# union changes nothing observably; a row added LATER via the admin API is a
+# genuine new grant layered on top, matching the "sits on top of, never
+# overrides" philosophy Tier 2 (below) also uses. A team YAML deliberately
+# hardcoding a full roster (e.g. a future engineering-cloud.yaml-style reference
+# team) is unaffected UNLESS someone explicitly grants that team extra rows later.
+team_role_tools = Table(
+    "team_role_tools", routing_metadata,
+    Column("team_name", Text, primary_key=True),
+    Column("role_name", Text, primary_key=True),   # 'Coordinator' for the coordinator's own allowlist
+    Column("tool_name", Text, primary_key=True),
+)
+
+team_role_skills = Table(
+    "team_role_skills", routing_metadata,
+    Column("team_name", Text, primary_key=True),
+    Column("role_name", Text, primary_key=True),
+    Column("skill_name", Text, primary_key=True),
+)
+
+# Registry of KNOWN tool/skill names -- Open Question #2's resolution (write-time
+# reject, not silent read-time skip). A row here means "this name was seen on a
+# live MCP connection / skill catalog as of last_seen_at" -- team_role_tools/
+# team_role_skills inserts are validated against these at the admin-API layer
+# (api/server.py), not at the DB layer (SQLite has no easy "value must exist in
+# this OTHER table's column" constraint short of a real FK, which would also
+# block inserting a tool grant before that tool has ever been seen once -- a
+# chicken-and-egg problem a plain application-level check avoids). Deliberately
+# NOT hand-maintained: refreshed FROM a live tool/skill enumeration via
+# swarm/team_config.py's refresh_registry(), the same "reload re-reads the live
+# source of truth" pattern model_routing.reload() already uses -- see that
+# module for why a registry that could go stale on its own would be worse than
+# the problem it exists to solve.
+tool_registry = Table(
+    "tool_registry", routing_metadata,
+    Column("tool_name", Text, primary_key=True),
+    Column("last_seen_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+skill_registry = Table(
+    "skill_registry", routing_metadata,
+    Column("skill_name", Text, primary_key=True),
+    Column("last_seen_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+# Tier 2 -- additive-only SUPPLEMENTARY instructions, layered on top of a role's
+# existing base instructions (the hardcoded/_COORDINATOR_INSTRUCTIONS and each
+# team YAML's own instructions: list) -- which stay completely OUT of this
+# migration, untouched, git-tracked, code-reviewed, exactly as before. A row here
+# can only ADD a line, never remove or replace one of the tested base
+# instructions, so (per the Notion design decision) this needs no versioning/
+# audit-trail ceremony the way a REPLACE mechanism would -- plain CRUD is enough.
+# Soft-capped at write time (see api/server.py's admin endpoint) to
+# _INSTRUCTION_OVERLAY_SOFT_CAP active rows per (team_name, role_name) --
+# Engineering Team 2.0's own Phase 5 already found and fixed a real instruction-
+# bloat problem once, and an unbounded user-editable list would reintroduce it.
+team_role_instruction_overlays = Table(
+    "team_role_instruction_overlays", routing_metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("team_name", Text, nullable=False),
+    Column("role_name", Text, nullable=False),
+    Column("instruction_text", Text, nullable=False),
+    Column("active", Boolean, nullable=False, default=True),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("created_by", Text, nullable=True),
+)
+Index("team_role_instruction_overlays_role_idx", team_role_instruction_overlays.c.team_name, team_role_instruction_overlays.c.role_name)
+
+# Open Question #1's resolution -- per-gate on/off flags as a Tier-1-style
+# boolean row, even though the gate's own LOGIC stays code (Tier 3). A row here
+# OVERRIDES swarm/team.py's hardcoded _GATE_ENABLED_TEAMS/_SEARCH_GATE_ENABLED_TEAMS
+# set-membership check for that one (team_name, gate_name) pair; no row for a
+# given team+gate falls back to the existing hardcoded set exactly as today --
+# see swarm/team_config.py's get_gate_enabled() and its call site in
+# swarm/team.py's _build_team(). gate_name is one of "decompose_first" /
+# "search_before_browse", matching the two mechanical gates that actually exist.
+team_gate_flags = Table(
+    "team_gate_flags", routing_metadata,
+    Column("team_name", Text, primary_key=True),
+    Column("gate_name", Text, primary_key=True),
+    Column("enabled", Boolean, nullable=False),
+)
+
 
 # ── Engine ────────────────────────────────────────────────────────────────────
 

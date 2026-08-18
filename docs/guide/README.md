@@ -10,6 +10,7 @@ Full reference guide, split by topic. Start with **Setup**, then **Running**, th
 | [🔌 API Usage](api.md) | HTTP endpoints — health, run, plan, session chaining, session tree/branch/fork, feedback loop |
 | [🤖 Agents & Teams](agents-and-teams.md) | Agent roster, team modes, the Sprint Master PM team |
 | [☁️ Cloud Model Providers](cloud-models.md) | Routing agents to OpenAI/Anthropic/Gemini/Perplexity/HuggingFace via LiteLLM, the `ALLOW_CLOUD_MODELS` opt-in gate |
+| [🧩 DB-Backed Team Config](team-config.md) | Per-role extra tools/skills, instruction overlays, and gate flags — layered additively on top of `teams/*.yaml`, editable at runtime |
 | [🔧 MCP Tools](mcp-tools.md) | Full tool reference for hive-mcp and project MCP, global memory namespaces |
 | [🔗 Integrations](integrations.md) | Connecting external platforms (Notion, …), the write-approval flow |
 | [🛠️ Development](development.md) | Git workflow, running tests, `tool_hooks` internals |

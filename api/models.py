@@ -214,3 +214,65 @@ class TeamRoleModelEntry(BaseModel):
 class ModelRoutesReloadResponse(BaseModel):
     model_catalog: dict[str, list[str]]      # {"added": [...], "removed": [...], "changed": [...]}
     team_role_models: dict[str, list[str]]
+
+
+# ── AGNOHive 2.3.3 (2026-08-18) — team config additions ──────────────────────
+# See swarm/db.py's team_role_tools/team_role_skills/team_role_instruction_overlays/
+# team_gate_flags comments for the full three-tier design this section's request/
+# response shapes serve.
+
+class TeamRoleToolEntry(BaseModel):
+    team_name: str
+    role_name: str
+    tool_name: str
+
+
+class TeamRoleSkillEntry(BaseModel):
+    team_name: str
+    role_name: str
+    skill_name: str
+
+
+class InstructionOverlayCreate(BaseModel):
+    team_name: str
+    role_name: str
+    instruction_text: str
+    created_by: str | None = None
+
+
+class InstructionOverlayPatch(BaseModel):
+    # Only `active` is patchable — the text itself is small enough that changing
+    # it is a delete-and-recreate, not a partial edit (see the Notion design's
+    # Tier 2 rationale: this mechanism deliberately has none of team_role_models'
+    # versioning ceremony, so there is no "new version" concept to PATCH toward).
+    active: bool | None = None
+
+
+class InstructionOverlayOut(BaseModel):
+    id: int
+    team_name: str
+    role_name: str
+    instruction_text: str
+    active: bool
+    created_at: datetime
+    created_by: str | None = None
+
+
+class TeamGateFlagEntry(BaseModel):
+    team_name: str
+    gate_name: str
+    enabled: bool
+
+
+class RegistryRefreshRequest(BaseModel):
+    tool_names: list[str] = []
+    skill_names: list[str] = []
+
+
+class TeamConfigReloadResponse(BaseModel):
+    tool_grants_added: dict[str, list[str]]
+    skill_grants_added: dict[str, list[str]]
+    overlay_count_delta: int
+    gates_changed: list[str]
+    tool_registry_size: int
+    skill_registry_size: int

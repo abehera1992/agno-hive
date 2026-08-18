@@ -17,7 +17,7 @@ from .agents import (
     update_session_state,
 )
 from .feedback import record_success, record_success_bg, record_failure, load_failure_context
-from . import model_routing
+from . import model_routing, team_config
 from config.config import config
 
 _tracer = trace.get_tracer("agno-hive.team")
@@ -2921,8 +2921,22 @@ def _build_team(
     # gates use different allowlists (_GATE_ENABLED_TEAMS vs the broader
     # _SEARCH_GATE_ENABLED_TEAMS) -- see _SEARCH_GATE_ENABLED_TEAMS' own comment
     # for why planning gets search-before-browse but not decompose-first.
-    decompose_gate_task = task if (team_name is None or team_name in _GATE_ENABLED_TEAMS) else None
-    search_gate_task = task if (team_name is None or team_name in _SEARCH_GATE_ENABLED_TEAMS) else None
+    # AGNOHive 2.3.3 (2026-08-18), Open Question #1's resolution: a
+    # team_gate_flags DB row for this exact (team_name, gate_name) pair
+    # OVERRIDES the hardcoded set-membership default computed below -- no row
+    # falls back to the exact pre-2026-08-18 behavior unchanged. team_config's
+    # cache is loaded via the same ensure_cache_loaded() call already made
+    # above this function's two callers (run_task_async/run_task_stream), so
+    # this stays a sync, cache-only lookup on the hot _build_team() path, same
+    # as model_routing.get_route()'s own contract.
+    decompose_gate_default = team_name is None or team_name in _GATE_ENABLED_TEAMS
+    decompose_gate_task = task if team_config.get_gate_enabled(
+        team_name, "decompose_first", default=decompose_gate_default
+    ) else None
+    search_gate_default = team_name is None or team_name in _SEARCH_GATE_ENABLED_TEAMS
+    search_gate_task = task if team_config.get_gate_enabled(
+        team_name, "search_before_browse", default=search_gate_default
+    ) else None
     researcher_agent_name = _RESEARCHER_AGENT_NAME_BY_TEAM.get(team_name, _DEFAULT_RESEARCHER_AGENT_NAME)
     decompose_first_gate_hook = _make_decompose_first_gate_hook(
         task=decompose_gate_task, researcher_member_id=researcher_agent_name,
@@ -3466,6 +3480,7 @@ async def run_task_stream(
         # (already loaded at startup, so this is a fast no-op) AND main.py's plain
         # CLI one-shot path, which never runs the FastAPI startup event.
         await model_routing.ensure_cache_loaded()
+        await team_config.ensure_cache_loaded()
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
             read_only=read_only, skill_catalog=skill_catalog, task=task, team_name=team_name,
@@ -3953,6 +3968,7 @@ async def run_task_async(
         # (already loaded at startup, so this is a fast no-op) AND main.py's plain
         # CLI one-shot path, which never runs the FastAPI startup event.
         await model_routing.ensure_cache_loaded()
+        await team_config.ensure_cache_loaded()
         # Fed by the interception hook on every tool call (coordinator or member);
         # the heartbeat task below reads it to report time-since-last-tool-call as a
         # backstop signal independent of the content-chunk logging below (2026-08-10) --

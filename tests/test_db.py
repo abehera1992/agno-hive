@@ -146,7 +146,10 @@ async def test_ensure_routing_schema_creates_the_two_routing_tables(monkeypatch)
 
     async with db.get_routing_engine().begin() as conn:
         names = await conn.run_sync(lambda sync_conn: sa.inspect(sync_conn).get_table_names())
-    assert set(names) == {"model_catalog", "team_role_models"}
+    assert set(names) == {
+        "model_catalog", "team_role_models", "team_role_tools", "team_role_skills",
+        "team_role_instruction_overlays", "team_gate_flags", "tool_registry", "skill_registry",
+    }  # AGNOHive 2.3.3 (2026-08-18) grew the routing engine's table set
 
 
 async def test_ensure_routing_schema_is_idempotent(monkeypatch):
@@ -276,5 +279,8 @@ async def test_app_and_routing_engines_are_independent_databases(monkeypatch):
         routing_names = await conn.run_sync(lambda sync_conn: sa.inspect(sync_conn).get_table_names())
 
     assert set(app_names) == {"chat_sessions", "session_messages", "failure_log"}
-    assert set(routing_names) == {"model_catalog", "team_role_models"}
+    assert set(routing_names) == {
+        "model_catalog", "team_role_models", "team_role_tools", "team_role_skills",
+        "team_role_instruction_overlays", "team_gate_flags", "tool_registry", "skill_registry",
+    }  # AGNOHive 2.3.3 (2026-08-18) grew the routing engine's table set
     assert db.get_engine() is not db.get_routing_engine()

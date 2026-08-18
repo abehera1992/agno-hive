@@ -14,12 +14,14 @@ from api.models import (
     FeedbackRequest, FeedbackResponse, BranchRequest, ForkRequest,
     ModelCatalogEntry, ModelCatalogPatch, TeamRoleModelEntry, ModelRoutesReloadResponse,
     ClarificationRequest,
+    TeamRoleToolEntry, TeamRoleSkillEntry, InstructionOverlayCreate, InstructionOverlayPatch,
+    InstructionOverlayOut, TeamGateFlagEntry, RegistryRefreshRequest, TeamConfigReloadResponse,
 )
 from fastapi.responses import StreamingResponse
 from swarm.ollama import ensure_models
 from swarm.team import run_task_async, run_task_stream
 from swarm.feedback import record_failure, record_success, drain_background_tasks
-from swarm import db, model_routing
+from swarm import db, model_routing, team_config
 from config.config import config
 from observability.setup import setup_telemetry
 from swarm.sessions import (
@@ -98,6 +100,30 @@ def _load_team(name: str) -> tuple[list[AgentSpec], str, str, list[str] | None]:
                     db_value = getattr(policy, field)
                     if db_value is not None:
                         a[field] = db_value
+        # AGNOHive 2.3.3 (2026-08-18) -- Tier 1 (tools/skills): ADDITIVE union with
+        # a DB-granted extra list, never a replace-or-fallback the way model:/policy
+        # above are. `if a.get("tools")` (truthy check, matching
+        # make_agent_from_spec's own `if spec.tools:`) is deliberate: a["tools"]
+        # being None/absent means "unrestricted, sees every connected tool" (see
+        # that function's docstring) -- unioning DB extras into an ALREADY-
+        # unrestricted role would be a no-op at best and, if ever misread as
+        # "replace with just the extras", a real regression narrowing an
+        # unrestricted agent. Only a role with an existing explicit tools:/skills:
+        # list is a meaningful union target.
+        extra_tools = team_config.get_extra_tools(name, a["name"])
+        if extra_tools and a.get("tools"):
+            a["tools"] = sorted(set(a["tools"]) | set(extra_tools))
+        extra_skills = team_config.get_extra_skills(name, a["name"])
+        if extra_skills and a.get("skills"):
+            a["skills"] = sorted(set(a["skills"]) | set(extra_skills))
+        # Tier 2 (additive-only supplementary instructions): appended AFTER the
+        # role's base instructions (YAML/hardcoded, untouched), under a clearly-
+        # marked header -- never merged into or replacing the base list. Empty
+        # when no active overlay rows exist for this (team, role), so this is a
+        # no-op for every role until an admin explicitly adds one.
+        overlays = team_config.get_instruction_overlays(name, a["name"])
+        if overlays:
+            a["instructions"] = list(a.get("instructions") or []) + [team_config.OVERLAY_HEADER] + overlays
         agents.append(AgentSpec(**a))
     coordinator = data.get("coordinator_model") or model_routing.get_default_model(name, "Coordinator") or config.leader_model
     mode = data.get("mode", "coordinate")
@@ -105,6 +131,13 @@ def _load_team(name: str) -> tuple[list[AgentSpec], str, str, list[str] | None]:
     # (mirrors per-agent `tools:` scoping). None means "no scoping — full surface" —
     # the existing behavior, preserved for teams like `engineering` that need write access.
     coordinator_tools = data.get("coordinator_tools")
+    # Same additive-union rule as per-agent tools above, applied to the
+    # coordinator's own allowlist -- a team with NO coordinator_tools: (e.g.
+    # engineering, unrestricted by design) is left alone; only a team that
+    # already scopes its coordinator gets DB extras unioned in.
+    extra_coordinator_tools = team_config.get_extra_tools(name, "Coordinator")
+    if extra_coordinator_tools and coordinator_tools:
+        coordinator_tools = sorted(set(coordinator_tools) | set(extra_coordinator_tools))
     return agents, coordinator, mode, coordinator_tools
 
 
@@ -169,6 +202,7 @@ async def _load_model_routing_cache():
     # YAML that omits a role's model: field.
     await db.ensure_schema()
     await model_routing.ensure_cache_loaded()
+    await team_config.ensure_cache_loaded()
     # Non-blocking diagnostic (2026-08-16) — never delays or fails startup, see
     # check_coordinator_readiness()'s own docstring for the gap this closes.
     warning = await model_routing.check_coordinator_readiness()
@@ -1037,3 +1071,300 @@ async def reload_model_routes():
     effect for already-running agents (see swarm/model_routing.reload())."""
     diff = await model_routing.reload()
     return ModelRoutesReloadResponse(**diff)
+
+
+# ── Admin: AGNOHive 2.3.3 team config additions (2026-08-18) ─────────────────
+# CRUD on team_role_tools/team_role_skills/team_role_instruction_overlays/
+# team_gate_flags — same unauthenticated-over-Tailscale trust boundary and same
+# "writes need an explicit /reload to take effect for already-running agents"
+# contract as /admin/model-routes above. See the Notion design page "AGNOHive
+# 2.3.3 - Moving team yaml configs to sqlite db" for the full three-tier
+# rationale; this section is Phase 3 of that plan.
+#
+# Registry validation (tools/skills, Open Question #2's resolution) queries the
+# DB directly, NOT team_config's in-process cache — an admin write must never
+# spuriously fail just because nobody happened to call
+# team_config.ensure_cache_loaded() yet in this process; a one-off admin call
+# reading the DB directly is cheap and always correct, unlike the hot per-agent-
+# construction read path (_load_team(), which stays cache-only by design).
+
+@app.get("/admin/team-config/tools")
+async def list_team_role_tools():
+    async with db.get_routing_engine().begin() as conn:
+        rows = (await conn.execute(sa.select(db.team_role_tools))).mappings().all()
+    return {"grants": [dict(r) for r in rows]}
+
+
+@app.post("/admin/team-config/tools", status_code=201)
+async def create_team_role_tool(entry: TeamRoleToolEntry):
+    async with db.get_routing_engine().begin() as conn:
+        registered = (
+            await conn.execute(sa.select(db.tool_registry.c.tool_name).where(db.tool_registry.c.tool_name == entry.tool_name))
+        ).first()
+        if registered is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"tool_name '{entry.tool_name}' is not in the tool registry — it must be seen on a "
+                    f"live MCP connection first (POST /admin/team-config/registry/refresh) before it can "
+                    f"be granted. This is deliberate: a hand-typed name that doesn't exist would otherwise "
+                    f"be silently inert (see the Notion design's Open Question #2 resolution)."
+                ),
+            )
+        try:
+            await conn.execute(db.team_role_tools.insert().values(**entry.model_dump()))
+        except sa.exc.IntegrityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{entry.team_name}/{entry.role_name} already has tool '{entry.tool_name}' granted: {exc}",
+            )
+    return entry
+
+
+@app.delete("/admin/team-config/tools/{team_name}/{role_name}/{tool_name}")
+async def delete_team_role_tool(team_name: str, role_name: str, tool_name: str):
+    async with db.get_routing_engine().begin() as conn:
+        result = await conn.execute(
+            sa.delete(db.team_role_tools).where(
+                db.team_role_tools.c.team_name == team_name,
+                db.team_role_tools.c.role_name == role_name,
+                db.team_role_tools.c.tool_name == tool_name,
+            )
+        )
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail=f"no such grant: {team_name}/{role_name}/{tool_name}")
+    return {"deleted": f"{team_name}/{role_name}/{tool_name}"}
+
+
+@app.get("/admin/team-config/skills")
+async def list_team_role_skills():
+    async with db.get_routing_engine().begin() as conn:
+        rows = (await conn.execute(sa.select(db.team_role_skills))).mappings().all()
+    return {"grants": [dict(r) for r in rows]}
+
+
+@app.post("/admin/team-config/skills", status_code=201)
+async def create_team_role_skill(entry: TeamRoleSkillEntry):
+    async with db.get_routing_engine().begin() as conn:
+        registered = (
+            await conn.execute(sa.select(db.skill_registry.c.skill_name).where(db.skill_registry.c.skill_name == entry.skill_name))
+        ).first()
+        if registered is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"skill_name '{entry.skill_name}' is not in the skill registry — it must be seen via "
+                    f"list_skills() first (POST /admin/team-config/registry/refresh) before it can be "
+                    f"granted. Same reject-at-write-not-silently rule as tools above."
+                ),
+            )
+        try:
+            await conn.execute(db.team_role_skills.insert().values(**entry.model_dump()))
+        except sa.exc.IntegrityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{entry.team_name}/{entry.role_name} already has skill '{entry.skill_name}' granted: {exc}",
+            )
+    return entry
+
+
+@app.delete("/admin/team-config/skills/{team_name}/{role_name}/{skill_name}")
+async def delete_team_role_skill(team_name: str, role_name: str, skill_name: str):
+    async with db.get_routing_engine().begin() as conn:
+        result = await conn.execute(
+            sa.delete(db.team_role_skills).where(
+                db.team_role_skills.c.team_name == team_name,
+                db.team_role_skills.c.role_name == role_name,
+                db.team_role_skills.c.skill_name == skill_name,
+            )
+        )
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail=f"no such grant: {team_name}/{role_name}/{skill_name}")
+    return {"deleted": f"{team_name}/{role_name}/{skill_name}"}
+
+
+@app.get("/admin/team-config/instruction-overlays", response_model=list[InstructionOverlayOut])
+async def list_instruction_overlays(team_name: str | None = None, role_name: str | None = None):
+    query = sa.select(db.team_role_instruction_overlays)
+    if team_name is not None:
+        query = query.where(db.team_role_instruction_overlays.c.team_name == team_name)
+    if role_name is not None:
+        query = query.where(db.team_role_instruction_overlays.c.role_name == role_name)
+    async with db.get_routing_engine().begin() as conn:
+        rows = (await conn.execute(query)).mappings().all()
+    return [InstructionOverlayOut(**dict(r)) for r in rows]
+
+
+@app.post("/admin/team-config/instruction-overlays", status_code=201, response_model=InstructionOverlayOut)
+async def create_instruction_overlay(entry: InstructionOverlayCreate):
+    """Rejects with 409 once the (team_name, role_name) pair already has
+    team_config.INSTRUCTION_OVERLAY_SOFT_CAP ACTIVE rows — Open Question #3's
+    resolution. Counts active rows only, so deactivating (PATCH active=false)
+    an existing overlay frees a slot without needing to delete it outright."""
+    async with db.get_routing_engine().begin() as conn:
+        active_count = (
+            await conn.execute(
+                sa.select(sa.func.count()).select_from(db.team_role_instruction_overlays).where(
+                    db.team_role_instruction_overlays.c.team_name == entry.team_name,
+                    db.team_role_instruction_overlays.c.role_name == entry.role_name,
+                    db.team_role_instruction_overlays.c.active.is_(True),
+                )
+            )
+        ).scalar_one()
+        if active_count >= team_config.INSTRUCTION_OVERLAY_SOFT_CAP:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{entry.team_name}/{entry.role_name} already has {active_count} active overlay "
+                    f"instructions — the soft cap ({team_config.INSTRUCTION_OVERLAY_SOFT_CAP}) would be "
+                    f"exceeded. Deactivate or delete an existing one first (see the Notion design's Open "
+                    f"Question #3 resolution — this cap exists because an unbounded user-editable "
+                    f"instruction list already caused a measured instruction-bloat regression once, "
+                    f"Engineering Team 2.0's own Phase 5)."
+                ),
+            )
+        result = await conn.execute(
+            db.team_role_instruction_overlays.insert().values(**entry.model_dump(), active=True)
+        )
+        # inserted_primary_key (not .returning()) -- portable across SQLite
+        # versions without depending on native RETURNING-clause support, which
+        # only shipped in SQLite 3.35+ and isn't guaranteed present in every
+        # Python's bundled sqlite3.
+        new_id = result.inserted_primary_key[0]
+        row = (
+            await conn.execute(sa.select(db.team_role_instruction_overlays).where(db.team_role_instruction_overlays.c.id == new_id))
+        ).mappings().first()
+    return InstructionOverlayOut(**dict(row))
+
+
+@app.patch("/admin/team-config/instruction-overlays/{overlay_id}", response_model=InstructionOverlayOut)
+async def patch_instruction_overlay(overlay_id: int, patch: InstructionOverlayPatch):
+    values = {k: v for k, v in patch.model_dump().items() if v is not None}
+    if not values:
+        raise HTTPException(status_code=400, detail="no fields supplied to update")
+    async with db.get_routing_engine().begin() as conn:
+        if values.get("active") is True:
+            row = (
+                await conn.execute(
+                    sa.select(
+                        db.team_role_instruction_overlays.c.team_name, db.team_role_instruction_overlays.c.role_name
+                    ).where(db.team_role_instruction_overlays.c.id == overlay_id)
+                )
+            ).mappings().first()
+            if row is not None:
+                active_count = (
+                    await conn.execute(
+                        sa.select(sa.func.count()).select_from(db.team_role_instruction_overlays).where(
+                            db.team_role_instruction_overlays.c.team_name == row["team_name"],
+                            db.team_role_instruction_overlays.c.role_name == row["role_name"],
+                            db.team_role_instruction_overlays.c.active.is_(True),
+                            db.team_role_instruction_overlays.c.id != overlay_id,
+                        )
+                    )
+                ).scalar_one()
+                if active_count >= team_config.INSTRUCTION_OVERLAY_SOFT_CAP:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"re-activating this overlay would exceed the soft cap "
+                            f"({team_config.INSTRUCTION_OVERLAY_SOFT_CAP}) for {row['team_name']}/{row['role_name']}"
+                        ),
+                    )
+        result = await conn.execute(
+            sa.update(db.team_role_instruction_overlays)
+            .where(db.team_role_instruction_overlays.c.id == overlay_id)
+            .values(**values)
+        )
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail=f"overlay id {overlay_id} not found")
+        row = (
+            await conn.execute(sa.select(db.team_role_instruction_overlays).where(db.team_role_instruction_overlays.c.id == overlay_id))
+        ).mappings().first()
+    return InstructionOverlayOut(**dict(row))
+
+
+@app.delete("/admin/team-config/instruction-overlays/{overlay_id}")
+async def delete_instruction_overlay(overlay_id: int):
+    async with db.get_routing_engine().begin() as conn:
+        result = await conn.execute(
+            sa.delete(db.team_role_instruction_overlays).where(db.team_role_instruction_overlays.c.id == overlay_id)
+        )
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail=f"overlay id {overlay_id} not found")
+    return {"deleted": overlay_id}
+
+
+@app.get("/admin/team-config/gates")
+async def list_team_gate_flags():
+    async with db.get_routing_engine().begin() as conn:
+        rows = (await conn.execute(sa.select(db.team_gate_flags))).mappings().all()
+    return {"flags": [dict(r) for r in rows]}
+
+
+@app.post("/admin/team-config/gates", status_code=201)
+async def upsert_team_gate_flag(entry: TeamGateFlagEntry):
+    if entry.gate_name not in team_config.GATE_NAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"gate_name must be one of {sorted(team_config.GATE_NAMES)}, got {entry.gate_name!r}",
+        )
+    async with db.get_routing_engine().begin() as conn:
+        existing = (
+            await conn.execute(
+                sa.select(db.team_gate_flags.c.team_name).where(
+                    db.team_gate_flags.c.team_name == entry.team_name,
+                    db.team_gate_flags.c.gate_name == entry.gate_name,
+                )
+            )
+        ).first()
+        if existing:
+            await conn.execute(
+                sa.update(db.team_gate_flags)
+                .where(
+                    db.team_gate_flags.c.team_name == entry.team_name,
+                    db.team_gate_flags.c.gate_name == entry.gate_name,
+                )
+                .values(enabled=entry.enabled)
+            )
+        else:
+            await conn.execute(db.team_gate_flags.insert().values(**entry.model_dump()))
+    return entry
+
+
+@app.delete("/admin/team-config/gates/{team_name}/{gate_name}")
+async def delete_team_gate_flag(team_name: str, gate_name: str):
+    """Removing a flag row reverts that (team, gate) to swarm/team.py's
+    hardcoded _GATE_ENABLED_TEAMS/_SEARCH_GATE_ENABLED_TEAMS default — not the
+    same as setting enabled=false, which would force it OFF even for a team the
+    hardcoded set already enables."""
+    async with db.get_routing_engine().begin() as conn:
+        result = await conn.execute(
+            sa.delete(db.team_gate_flags).where(
+                db.team_gate_flags.c.team_name == team_name, db.team_gate_flags.c.gate_name == gate_name,
+            )
+        )
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail=f"no flag for {team_name}/{gate_name}")
+    return {"deleted": f"{team_name}/{gate_name}"}
+
+
+@app.post("/admin/team-config/registry/refresh")
+async def refresh_team_config_registry(body: RegistryRefreshRequest):
+    """Refreshes tool_registry/skill_registry FROM a caller-supplied live
+    enumeration — see swarm/team_config.refresh_registry()'s own docstring for
+    why this module has no live MCP connection of its own to enumerate from.
+    A future swarm run (which DOES hold a live MCP session) can call this with
+    its own connected tool/skill list; for now this is also callable directly
+    with an explicit list for bootstrapping/testing."""
+    await team_config.refresh_registry(body.tool_names, body.skill_names)
+    return {"tool_names_refreshed": len(body.tool_names), "skill_names_refreshed": len(body.skill_names)}
+
+
+@app.post("/admin/team-config/reload", response_model=TeamConfigReloadResponse)
+async def reload_team_config():
+    """Re-read team_role_tools/team_role_skills/team_role_instruction_overlays/
+    team_gate_flags into the in-process cache and return what actually changed —
+    the ONLY way an admin edit above takes effect for already-running agents
+    (see swarm/team_config.reload())."""
+    diff = await team_config.reload()
+    return TeamConfigReloadResponse(**diff)
