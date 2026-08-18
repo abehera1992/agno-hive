@@ -553,10 +553,26 @@ def test_notion_write_tools_are_never_in_either_discovery_set():
     for tool in (
         "notion_create_page", "notion_update_page_props", "notion_append_blocks",
         "notion_append_markdown", "notion_trash_page", "notion_update_content",
-        "notion_update_block", "notion_delete_block",
+        "notion_update_block", "notion_delete_block", "notion_replace_section",
     ):
         assert tool not in _NOTION_DISCOVERY_TOOLS
         assert tool not in _COORDINATOR_DISCOVERY_TOOLS
+
+
+def test_engineering_coordinator_no_allowlist_reaches_notion_replace_section():
+    """2026-08-18 live incident: notion_replace_section is a real, registered
+    hive-mcp tool but was granted to NO team's tools:/coordinator_tools: allowlist
+    (confirmed via grep across teams/*.yaml at the time). engineering.yaml has no
+    coordinator_tools: allowlist at all, so its coordinator lands in the
+    no-allowlist branch -- confirms it already reaches notion_replace_section
+    there without any YAML change, since the tool is in neither discovery-exclusion
+    set (see test_notion_write_tools_are_never_in_either_discovery_set above)."""
+    from swarm.team import _scope_coordinator_tools
+
+    mcp = _fake_mcp({"notion_replace_section": "notion_replace_section_fn"})
+
+    scoped = _scope_coordinator_tools(None, [mcp], read_only=False, team_name="engineering")
+    assert "notion_replace_section_fn" in scoped
 
 
 def test_engineering_coordinator_notion_reads_excluded_even_when_allowlisted():
