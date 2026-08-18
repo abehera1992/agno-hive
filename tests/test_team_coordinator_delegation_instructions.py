@@ -170,3 +170,17 @@ def test_gap_analysis_section_requires_correcting_not_just_flagging():
     start = text.index("For gap-analysis / comparison questions")
     section = text[start:text.index("Project context (fetch on demand", start)]
     assert "CORRECT the summary yourself" in section
+
+
+def test_gap_analysis_section_warns_against_a_literal_unfilled_placeholder():
+    """2026-08-18 live re-test of this same fix: the coordinator delegated to
+    Reviewer with the task argument containing the LITERAL text
+    "<Researcher's full answer>" instead of the real answer content -- Reviewer
+    happened to recover by independently re-researching from scratch, but that
+    is not a guarantee. The instruction now explicitly warns against this
+    exact failure shape."""
+    text = _joined()
+    start = text.index("For gap-analysis / comparison questions")
+    section = text[start:text.index("Project context (fetch on demand", start)]
+    assert "copied in full, verbatim" in section
+    assert "placeholder" in section
