@@ -25,6 +25,7 @@ AGNOHive is a swarm of specialized agents — whatever roster your team YAML def
 - 🔌 **Works with any project** — point it at any repo via MCP, no project-specific setup required beyond the connection
 - 🔀 **Pluggable inference backend** — Ollama, vLLM, or 5 cloud providers, mixed per-agent, switchable without code changes; any machine can run it — see [how it works](#-how-it-works) below for the local-vs-cloud tradeoff and the one Apple Silicon caveat
 - 🗄️ **Ships ready to run** — app storage (sessions, feedback log, model routing) is a local SQLite file by default, zero setup; point `DATABASE_URL` at Postgres/MySQL/anything else if you already run one — see [Cloud Model Providers](docs/guide/cloud-models.md#engine-agnostic-storage-sqlite-by-default)
+- 🧩 **Team config lives in the DB too** — a role's tools/skills, supplementary instructions, and gate on/off flags are all editable via `/admin/team-config/*` without touching a YAML file or redeploying — see [DB-Backed Team Config](docs/guide/team-config.md)
 - 🌳 **Branchable sessions** — every conversation is a tree, not a flat log; rewind and branch with `/tree`, `/branch`, or fork a whole new session with `--fork`
 - ⌨️ **Mid-flight steering** — type a follow-up while a run is still streaming; it queues and fires automatically the moment the current run finishes
 
