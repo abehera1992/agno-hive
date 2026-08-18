@@ -129,3 +129,44 @@ def test_outcome_honesty_rule_exists():
     text = _joined()
     assert "OUTCOME HONESTY" in text
     assert "never say 'no changes applied'" in text.lower() or "no changes applied' or 'nothing" in text
+
+
+# ── Gap-analysis / comparison tasks now route through Reviewer too ─────────────
+# (2026-08-18 live incident: T11 of a T1-T13 groundedness re-run). The coordinator's
+# task-shape taxonomy previously had no category for comparison/gap-analysis
+# questions -- they fell through to a single Researcher delegation with no
+# cross-check, so Reviewer's own COMPARISON rule (teams/engineering.yaml, "re-derive
+# both enumerated lists... flag it") never got a chance to run at all. Confirmed via
+# ZGX journalctl for the actual incident: zero delegate_task_to_member calls to
+# 'reviewer' anywhere in that run's log.
+
+def test_gap_analysis_section_exists():
+    text = _joined()
+    assert "For gap-analysis / comparison questions" in text
+
+
+def test_gap_analysis_section_always_delegates_to_reviewer_as_a_second_step():
+    text = _joined()
+    start = text.index("For gap-analysis / comparison questions")
+    section = text[start:text.index("Project context (fetch on demand", start)]
+    assert "delegate_task_to_member('researcher'" in section
+    assert "ALWAYS delegate_task_to_member('reviewer'" in section
+    assert "never skip this step just because nothing is being written" in section
+
+
+def test_gap_analysis_section_names_the_live_incident():
+    """Names the concrete failure shape (13 vs 3, 'no gaps') -- not just an
+    abstract rule -- matching this file's own established convention of citing
+    the specific incident that motivated each fix."""
+    text = _joined()
+    start = text.index("For gap-analysis / comparison questions")
+    section = text[start:text.index("Project context (fetch on demand", start)]
+    assert "13 backend endpoints against 3 frontend hooks" in section
+    assert "'no gaps'" in section
+
+
+def test_gap_analysis_section_requires_correcting_not_just_flagging():
+    text = _joined()
+    start = text.index("For gap-analysis / comparison questions")
+    section = text[start:text.index("Project context (fetch on demand", start)]
+    assert "CORRECT the summary yourself" in section
