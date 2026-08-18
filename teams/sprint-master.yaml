@@ -30,6 +30,7 @@ coordinator_tools:
   - notion_append_markdown
   - notion_trash_page
   - notion_update_content
+  - notion_replace_section
   - notion_update_block
   - notion_delete_block
   - get_file_content
@@ -80,6 +81,7 @@ agents:
       - notion_append_markdown
       - notion_trash_page
       - notion_update_content
+      - notion_replace_section
       - notion_update_block
       - notion_delete_block
       - get_file_content
@@ -98,4 +100,5 @@ agents:
       - "PAGE IDS FOR UPDATES: to update or trash an EXISTING row, you need its real page_id. notion_query_database rows include '(page_id: <hex>)' — use that exact value for notion_update_page_props / notion_trash_page. NEVER pass the display id like 'EK-16' as page_id (it is not a page id and returns 400)."
       - "DELETE / REMOVE: to remove a work item from the board, call notion_trash_page(page_id). To purge an already-trashed item's stale link from a parent's relation (e.g. a Sprint's Work Items), update that parent with notion_update_page_props, setting the relation to the list of pages to KEEP. Trashing a row also drops it from notion_query_database results."
       - "IN-PLACE TEXT EDIT: to change existing text on a page (the page body, not a database field), prefer notion_update_content(page_id, old_str, new_str) — it finds the ONE block whose rendered markdown contains old_str and replaces it, rejecting zero/multiple matches so it never edits the wrong block. Use notion_update_block(block_id, ...) only to target a specific block id shown by notion_get_page; notion_delete_block(block_id) to remove a block. (Field/property changes still use notion_update_page_props.)"
+      - "REPLACING A WHOLE SECTION: when the edit is 'correct/replace the section under heading X' rather than a small in-line text swap, use notion_replace_section(page_id, section_heading, new_markdown) instead of notion_update_content — it matches by heading text, not by exact old_str, so it is not defeated by markdown round-tripping on underscores/special characters inside the section body (a real, confirmed failure mode of notion_update_content on content-heavy sections). If a task explicitly asks for notion_replace_section and it is unavailable for any reason, say so plainly and name the tool you used instead — never report that a specific tool was used when it was not."
       - "REVIEW GATE: writes are staged for human review. When a tool call returns action_pending, STOP and report the action_id verbatim — never call any confirm or reject tool yourself."
