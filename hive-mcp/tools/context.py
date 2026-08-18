@@ -333,7 +333,13 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
                 f"same way:\n"
                 + "\n".join(ranked)
             )
-        return f"File not found: {relative_path}"
+        return (
+            f"File not found: {relative_path}\n"
+            f"No file named '{basename}' exists anywhere in this project. Do NOT retry with a "
+            f"different offset/limit — a nonexistent file has no content at any offset, so "
+            f"changing those will never produce a different result. Call find_files() or "
+            f"search_files() to locate the correct path instead."
+        )
     if not target.is_file():
         return f"Not a file: {relative_path}"
     try:

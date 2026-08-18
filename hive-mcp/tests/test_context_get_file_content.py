@@ -94,13 +94,20 @@ def test_ambiguous_candidates_message_explicitly_warns_against_retrying_the_same
     assert "copied verbatim" in result
 
 
-def test_no_matching_basename_anywhere_returns_plain_not_found(tmp_path, monkeypatch):
+def test_no_matching_basename_anywhere_returns_not_found_with_no_retry_guidance(tmp_path, monkeypatch):
+    """2026-08-18 live incident: this was a bare 'File not found: X' with zero
+    guidance, unlike the one-candidate (auto-correct) and multi-candidate
+    ('do NOT retry') branches above -- a real run retried this exact path with
+    a steadily incrementing offset (0 -> 2500+ across 25 calls) as if
+    paginating a real file. Now carries the same 'do NOT retry' shape."""
     monkeypatch.setattr(context, "PROJECT_ROOT", tmp_path)
     (tmp_path / "unrelated.py").write_text("x = 1", encoding="utf-8")
 
     result = context.get_file_content("nowhere/NeverExisted.tsx")
 
-    assert result == "File not found: nowhere/NeverExisted.tsx"
+    assert result.startswith("File not found: nowhere/NeverExisted.tsx")
+    assert "Do NOT retry with a different offset/limit" in result
+    assert "find_files() or search_files()" in result
 
 
 def test_auto_corrected_read_preserves_offset_and_limit(tmp_path, monkeypatch):
