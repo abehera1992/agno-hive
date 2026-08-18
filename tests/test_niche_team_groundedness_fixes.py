@@ -560,33 +560,86 @@ def test_notion_write_tools_are_never_in_either_discovery_set():
         assert tool not in _COORDINATOR_DISCOVERY_TOOLS
 
 
-def test_engineering_coordinator_no_allowlist_reaches_notion_replace_section():
-    """2026-08-18 live incident: notion_replace_section is a real, registered
-    hive-mcp tool but was granted to NO team's tools:/coordinator_tools: allowlist
-    (confirmed via grep across teams/*.yaml at the time). engineering.yaml has no
-    coordinator_tools: allowlist at all, so its coordinator lands in the
-    no-allowlist branch -- confirms it already reaches notion_replace_section
-    there without any YAML change, since the tool is in neither discovery-exclusion
-    set (see test_notion_write_tools_are_never_in_either_discovery_set above)."""
+def test_engineering_coordinator_no_allowlist_no_longer_reaches_notion_replace_section():
+    """Earlier same-day incident (2026-08-18, tool-substitution honesty fix):
+    notion_replace_section was granted to NO team, sprint-master's coordinator
+    was explicitly fixed to have it, and this test originally confirmed
+    engineering's no-allowlist coordinator ALSO reached it as an unplanned side
+    effect (not blocked by either discovery-exclusion set). A LATER same-day
+    incident (see the Notion-write-tools-are-sprint-master-only tests above)
+    found that "for free" write access on engineering was itself the problem --
+    notion_replace_section is a write tool (_is_notion_write), so it is now
+    blocked from engineering the same as every other Notion write. sprint-master's
+    own explicit grant (the original fix for the earlier incident) is unaffected --
+    see test_notion_write_tools_still_reachable_by_sprint_master above."""
     from swarm.team import _scope_coordinator_tools
 
     mcp = _fake_mcp({"notion_replace_section": "notion_replace_section_fn"})
 
     scoped = _scope_coordinator_tools(None, [mcp], read_only=False, team_name="engineering")
-    assert "notion_replace_section_fn" in scoped
+    assert "notion_replace_section_fn" not in scoped
 
 
-# ── notion_trash_page blocked from an unrestricted coordinator (2026-08-18) ──────
+# ── Notion write tools are sprint-master-only (2026-08-18) ───────────────────────
 #
-# Live incident: engineering.yaml's coordinator (no coordinator_tools: allowlist at
-# all) misclassified a plain, first-turn, zero-prior-context read-only task as a
-# REJECT/CANCEL conversational turn (see _COORDINATOR_INSTRUCTIONS' own fix for the
-# same incident) and called notion_trash_page against a real, unrelated, completed
-# sprint page with 24+ linked work items -- while narrating "no changes applied."
-# notion_trash_page is now always excluded from a coordinator with no explicit
-# allowlist, structurally (tool surface), not just by instruction.
+# Two live incidents, same day, same underlying tendency: engineering.yaml's
+# coordinator (no coordinator_tools: allowlist at all) misclassified a plain,
+# first-turn, zero-prior-context read-only task and called notion_trash_page
+# against a real, unrelated, completed sprint page with 24+ linked work items --
+# while narrating "no changes applied." A first fix scoped only to
+# notion_trash_page held on retest (that tool was never called again), but the
+# coordinator routed around it via notion_create_page instead, creating a new
+# work item with a hallucinated parent database id. Blocking one tool at a time
+# doesn't close a behavioral tendency to reach for Notion writes on a team that
+# was never meant to have them -- the whole write family is now sprint-master-only,
+# structurally, across every _scope_coordinator_tools branch including an
+# explicit allowlist (so a future accidental grant is still blocked).
 
-def test_notion_trash_page_blocked_from_unrestricted_coordinator():
+def test_notion_write_tools_blocked_from_engineering_no_allowlist():
+    from swarm.team import _scope_coordinator_tools
+
+    mcp = _fake_mcp({
+        "notion_trash_page": "notion_trash_page_fn",
+        "notion_create_page": "notion_create_page_fn",
+        "notion_update_page_props": "notion_update_page_props_fn",
+        "notion_append_markdown": "notion_append_markdown_fn",
+        "notion_replace_section": "notion_replace_section_fn",
+        "notion_delete_block": "notion_delete_block_fn",
+        "notion_search": "notion_search_fn",  # a read tool -- must stay reachable
+    })
+
+    scoped = _scope_coordinator_tools(None, [mcp], read_only=False, team_name="engineering")
+    for blocked in (
+        "notion_trash_page_fn", "notion_create_page_fn", "notion_update_page_props_fn",
+        "notion_append_markdown_fn", "notion_replace_section_fn", "notion_delete_block_fn",
+    ):
+        assert blocked not in scoped
+    # Read/discovery tools are a separate, unaffected concern (forced through
+    # delegation by _NOTION_DISCOVERY_TOOLS, not blocked outright).
+    assert "notion_search_fn" not in scoped  # forced through delegation, not blocked-and-gone
+    from swarm.team import _NOTION_DISCOVERY_TOOLS
+    assert "notion_search" in _NOTION_DISCOVERY_TOOLS
+
+
+def test_notion_write_tools_blocked_from_an_explicit_non_sprint_master_allowlist():
+    """Even a future accidental grant -- a non-sprint-master team's YAML/DB
+    coordinator_tools: explicitly naming a Notion write tool -- is still blocked.
+    Unlike _NOTION_DISCOVERY_TOOLS' exemption, this block applies to the explicit-
+    allowlist branch too."""
+    from swarm.team import _scope_coordinator_tools
+
+    mcp = _fake_mcp({"notion_create_page": "notion_create_page_fn"})
+
+    scoped = _scope_coordinator_tools(
+        ["notion_create_page"], [mcp], read_only=False, team_name="planning",
+    )
+    assert "notion_create_page_fn" not in scoped
+
+
+def test_notion_write_tools_still_reachable_by_sprint_master():
+    """sprint-master.yaml (and its DB-seeded default) explicitly grants Notion
+    write tools to its coordinator -- a deliberate, reviewed grant, the one
+    exemption to the block above."""
     from swarm.team import _scope_coordinator_tools
 
     mcp = _fake_mcp({
@@ -594,30 +647,25 @@ def test_notion_trash_page_blocked_from_unrestricted_coordinator():
         "notion_create_page": "notion_create_page_fn",
     })
 
-    scoped = _scope_coordinator_tools(None, [mcp], read_only=False, team_name="engineering")
-    assert "notion_trash_page_fn" not in scoped
-    # Other Notion writes (doc-sync) are unaffected -- this is a narrow exclusion.
+    scoped = _scope_coordinator_tools(
+        ["notion_trash_page", "notion_create_page"], [mcp], read_only=False,
+        team_name="sprint-master",
+    )
+    assert "notion_trash_page_fn" in scoped
     assert "notion_create_page_fn" in scoped
 
 
-def test_notion_trash_page_still_reachable_via_an_explicit_allowlist():
-    """sprint-master.yaml (and its DB-seeded default) explicitly grants
-    notion_trash_page to the coordinator -- a deliberate, reviewed grant, unaffected
-    by the no-allowlist-only block above."""
-    from swarm.team import _scope_coordinator_tools
+def test_notion_write_prefixes_cover_every_real_write_family():
+    from swarm.team import _is_notion_write
 
-    mcp = _fake_mcp({"notion_trash_page": "notion_trash_page_fn"})
-
-    scoped = _scope_coordinator_tools(
-        ["notion_trash_page"], [mcp], read_only=False, team_name="sprint-master",
-    )
-    assert "notion_trash_page_fn" in scoped
-
-
-def test_notion_trash_page_in_unscoped_blocked_set():
-    from swarm.team import _COORDINATOR_UNSCOPED_BLOCKED_TOOLS
-
-    assert "notion_trash_page" in _COORDINATOR_UNSCOPED_BLOCKED_TOOLS
+    for tool in (
+        "notion_create_page", "notion_update_page_props", "notion_append_blocks",
+        "notion_append_markdown", "notion_replace_section", "notion_delete_block",
+        "notion_trash_page", "notion_update_content", "notion_update_block",
+    ):
+        assert _is_notion_write(tool), f"{tool} should be classified as a Notion write"
+    for tool in ("notion_search", "notion_get_page", "notion_query_database"):
+        assert not _is_notion_write(tool)
 
 
 def test_engineering_coordinator_notion_reads_excluded_even_when_allowlisted():

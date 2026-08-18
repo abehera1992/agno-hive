@@ -729,6 +729,18 @@ _COORDINATOR_DISCOVERY_TOOLS = {
 # same as any other write tool; only the READ/query side needs to be forced
 # through a properly-instructed member).
 #
+# SUPERSEDED 2026-08-18 (see _NOTION_WRITE_EXEMPT_TEAMS below): the rationale
+# above -- "engineering legitimately writes Notion content" -- was the
+# original design intent, but two live incidents the same day (a coordinator
+# with no coordinator_tools: allowlist calling notion_trash_page against an
+# unrelated real sprint page, then, after that specific tool was blocked,
+# calling notion_create_page instead with a hallucinated parent database id)
+# showed engineering's coordinator reaching for delivery-board writes with
+# none of sprint-master's guardrails (no notion_find_work_item lookup, no
+# schema-confirmed property values) for a task that never asked for a Notion
+# write at all. Notion WRITE access is now sprint-master-only, structurally
+# enforced below -- engineering keeps only the READ/discovery tools in
+# _NOTION_DISCOVERY_TOOLS above (still forced through delegation, unchanged).
 # Kept as a SEPARATE set, not merged into _COORDINATOR_DISCOVERY_TOOLS directly,
 # because sprint-master is a real, deliberate exception: its own coordinator_tools
 # comment documents that direct (non-delegated) coordinator access to these exact
@@ -747,27 +759,44 @@ _NOTION_DISCOVERY_TOOLS = {
 }
 _NOTION_DISCOVERY_EXEMPT_TEAMS = {"sprint-master"}
 
-# Destructive, page-level Notion tool never handed to a coordinator with NO
-# explicit coordinator_tools: allowlist (i.e. an "unrestricted" team like
-# engineering, which otherwise gets every non-mutating-in-read-only tool for
-# free — see _scope_coordinator_tools' no-allowlist branches). Found live
-# 2026-08-18: engineering's coordinator (no coordinator_tools: at all)
-# misclassified a plain, first-turn, zero-prior-context task as a
-# REJECT/CANCEL turn (see _COORDINATOR_INSTRUCTIONS' "Conversational turn
-# detection" fix, same incident) and, instead of calling nothing as that
-# branch requires, called notion_trash_page against a real, unrelated,
-# completed sprint page with 24+ linked work items -- narrating "no changes
-# applied" while the trash action sat genuinely staged in WRITE_REVIEW.
-# notion_create/update/append (ongoing doc-sync writes) are deliberately NOT
-# blocked here -- see _NOTION_DISCOVERY_TOOLS' own comment on why
-# engineering's coordinator legitimately writes Notion content as part of
-# this project's delivery-board-sync workflow. Page-level deletion is a
-# categorically different, much higher-blast-radius operation with no
-# legitimate use in that workflow. sprint-master (the PM/delivery-board team)
-# is unaffected: it explicitly grants notion_trash_page in its OWN
-# coordinator_tools: allowlist/DB rows, which bypasses these no-allowlist
-# branches entirely -- a real, reviewed grant, not an accidental one.
-_COORDINATOR_UNSCOPED_BLOCKED_TOOLS = {"notion_trash_page"}
+# Every Notion WRITE tool (create/update/append/replace/delete/trash — same
+# families as _MUTATING_PREFIXES' notion_* entries) is blocked from the
+# coordinator's direct tool surface for every team EXCEPT sprint-master, the
+# one team with a real, board-CRUD-aware coordinator (schema-confirmed
+# property values, notion_find_work_item lookups before writing, the
+# WRITE_REVIEW gate) built for this. Applied in ALL THREE branches of
+# _scope_coordinator_tools below -- no-allowlist, read-only, AND explicit
+# allowlist -- so a future accidental grant of a Notion write tool to a non-
+# sprint-master team's coordinator_tools: (YAML or DB) is still structurally
+# blocked, not just today's no-allowlist gap.
+#
+# Two live incidents, same day (2026-08-18), same underlying tendency:
+# engineering.yaml has no coordinator_tools: allowlist at all (unrestricted),
+# so its coordinator got every Notion write tool "for free." Given a plain,
+# first-turn, zero-prior-context task that never asked for any Notion write
+# (a "look up and summarize this page" request), it called notion_trash_page
+# against a real, unrelated, completed sprint page with 24+ linked work
+# items -- narrating "no changes applied" while the trash action sat
+# genuinely staged in WRITE_REVIEW. A first fix scoped only to
+# notion_trash_page held (that specific tool was never called again on
+# retest) but the coordinator routed around it via notion_create_page
+# instead -- creating a new delivery-board work item nested under that same
+# sprint page, with a parent_id that did not even match the real, documented
+# Work Items database id. Both were caught and rejected before any write
+# landed, purely because WRITE_REVIEW held -- the gap was the coordinator
+# attempting an unrequested write at all, and no per-tool block closes that
+# for certain, since there was no reason to believe a third Notion write tool
+# wouldn't be reached for next. Blocking the whole family, not just the one
+# tool that happened to be used first, is the actual fix.
+_NOTION_WRITE_PREFIXES = (
+    "notion_create", "notion_update", "notion_append", "notion_replace",
+    "notion_delete", "notion_trash",
+)
+_NOTION_WRITE_EXEMPT_TEAMS = {"sprint-master"}
+
+
+def _is_notion_write(name: str) -> bool:
+    return name.startswith(_NOTION_WRITE_PREFIXES)
 
 
 def _scope_coordinator_tools(
@@ -800,25 +829,30 @@ def _scope_coordinator_tools(
     See _NOTION_DISCOVERY_TOOLS's own comment for why this is a separate exemption
     rather than simply not adding those tools to _COORDINATOR_DISCOVERY_TOOLS at all.
 
-    The two no-allowlist branches also always exclude `_COORDINATOR_UNSCOPED_BLOCKED_TOOLS`
-    (currently just `notion_trash_page`) — see that set's own comment. The explicit-
-    allowlist branch does NOT apply this block, since an allowlist naming the tool
-    (sprint-master's coordinator_tools:) is a deliberate, reviewed grant.
+    ALL THREE branches also always exclude a Notion WRITE tool
+    (`_is_notion_write`) unless `team_name in _NOTION_WRITE_EXEMPT_TEAMS`
+    (currently just `sprint-master`) — see that set's own comment. Unlike
+    `_NOTION_DISCOVERY_TOOLS`'s exemption, this one applies even to an
+    explicit `coordinator_tools:` allowlist naming the tool by name: Notion
+    write access is sprint-master-only by design now, not something any
+    other team's YAML/DB grant can re-enable.
     """
     all_funcs: dict = {}
     for mcp in mcp_list:
         all_funcs.update(mcp.functions)
 
     notion_exempt = team_name in _NOTION_DISCOVERY_EXEMPT_TEAMS
+    notion_write_exempt = team_name in _NOTION_WRITE_EXEMPT_TEAMS
 
     def _keep(name: str) -> bool:
+        if not notion_write_exempt and _is_notion_write(name):
+            return False
         if name not in _COORDINATOR_DISCOVERY_TOOLS and name not in _NOTION_DISCOVERY_TOOLS:
             return True
         return notion_exempt and name in _NOTION_DISCOVERY_TOOLS
 
     if not tool_names and not read_only:
-        scoped = [f for n, f in all_funcs.items()
-                  if _keep(n) and n not in _COORDINATOR_UNSCOPED_BLOCKED_TOOLS]
+        scoped = [f for n, f in all_funcs.items() if _keep(n)]
         return scoped or mcp_list
     if not tool_names:
         # read_only with no allowlist: everything the MCPs expose, minus mutating tools.
