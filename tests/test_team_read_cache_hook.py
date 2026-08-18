@@ -687,3 +687,163 @@ def test_build_team_shares_the_same_hook_instance_with_spec_based_members(monkey
 
     assert len(result.members) == 1
     assert result.members[0].tool_hooks == result.tool_hooks
+
+
+# ── "File not found" pagination-retry short-circuit (2026-08-18 live incident) ──
+#
+# get_file_content on a path that does not exist anywhere in the project got
+# retried with a steadily incrementing offset (0 -> 2500+ across 25 calls) as if
+# paginating a real file. Each retry's offset differs, so the main identical-args
+# cache/serve-count mechanism above never catches it -- a separate counter, keyed
+# on relative_path alone (ignoring offset/limit), stubs starting from the 2nd
+# same-path not-found result.
+
+@pytest.mark.asyncio
+async def test_first_not_found_result_is_returned_unstubbed():
+    hook = _make_read_cache_tool_hook()
+
+    async def fake_get_file_content(**kwargs):
+        return f"File not found: {kwargs['relative_path']}"
+
+    result = await hook("get_file_content", fake_get_file_content, {"relative_path": "ghost.py"})
+
+    assert result == "File not found: ghost.py"
+
+
+@pytest.mark.asyncio
+async def test_second_not_found_result_for_the_same_path_gets_stubbed():
+    hook = _make_read_cache_tool_hook()
+
+    async def fake_get_file_content(**kwargs):
+        return f"File not found: {kwargs['relative_path']}"
+
+    await hook("get_file_content", fake_get_file_content, {"relative_path": "ghost.py"})
+    second = await hook("get_file_content", fake_get_file_content, {"relative_path": "ghost.py"})
+
+    assert "STOP calling get_file_content" in second
+    assert "ghost.py" in second
+    assert "does not exist" in second.lower() or "not to exist" in second.lower() or "not exist" in second.lower()
+
+
+@pytest.mark.asyncio
+async def test_not_found_retry_is_caught_even_when_offset_differs_each_time():
+    """The exact live incident shape: same path, different offset/limit each
+    call -- the normal identical-args cache would treat these as unrelated
+    entries, but this mechanism keys on relative_path alone."""
+    hook = _make_read_cache_tool_hook()
+
+    async def fake_get_file_content(**kwargs):
+        return f"File not found: {kwargs['relative_path']}"
+
+    await hook("get_file_content", fake_get_file_content, {"relative_path": "ghost.py", "offset": 0, "limit": 100})
+    second = await hook(
+        "get_file_content", fake_get_file_content, {"relative_path": "ghost.py", "offset": 100, "limit": 100},
+    )
+    third = await hook(
+        "get_file_content", fake_get_file_content, {"relative_path": "ghost.py", "offset": 200, "limit": 100},
+    )
+
+    assert "STOP calling get_file_content" in second
+    assert "STOP calling get_file_content" in third
+
+
+@pytest.mark.asyncio
+async def test_not_found_stub_does_not_call_the_real_function_again():
+    hook = _make_read_cache_tool_hook()
+    calls = []
+
+    async def fake_get_file_content(**kwargs):
+        calls.append(kwargs)
+        return f"File not found: {kwargs['relative_path']}"
+
+    for offset in (0, 100, 200, 300):
+        await hook("get_file_content", fake_get_file_content, {"relative_path": "ghost.py", "offset": offset})
+
+    # The first call always goes through; subsequent same-path not-found calls
+    # are stubbed WITHOUT calling the real function again.
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_not_found_tracking_is_scoped_to_relative_path_not_agent():
+    """A file's existence is an objective fact, not per-agent context -- unlike
+    the main serve-count budget (per-agent), this stubs a SECOND agent's first
+    look at an already-confirmed-missing path too."""
+    hook = _make_read_cache_tool_hook()
+    researcher = _FakeAgent("Researcher")
+    coder = _FakeAgent("Coder")
+
+    async def fake_get_file_content(**kwargs):
+        return f"File not found: {kwargs['relative_path']}"
+
+    await hook("get_file_content", fake_get_file_content, {"relative_path": "ghost.py"}, agent=researcher)
+    second = await hook("get_file_content", fake_get_file_content, {"relative_path": "ghost.py"}, agent=coder)
+
+    assert "STOP calling get_file_content" in second
+
+
+@pytest.mark.asyncio
+async def test_not_found_for_different_paths_does_not_cross_contaminate():
+    hook = _make_read_cache_tool_hook()
+
+    async def fake_get_file_content(**kwargs):
+        return f"File not found: {kwargs['relative_path']}"
+
+    await hook("get_file_content", fake_get_file_content, {"relative_path": "a.py"})
+    result = await hook("get_file_content", fake_get_file_content, {"relative_path": "b.py"})
+
+    assert result == "File not found: b.py"  # first look at a DIFFERENT path -- unstubbed
+
+
+@pytest.mark.asyncio
+async def test_real_content_is_never_mistaken_for_a_not_found_result():
+    """A file whose real content happens to start with unrelated text must never
+    trigger this path -- only an exact 'File not found:' prefix does."""
+    hook = _make_read_cache_tool_hook()
+
+    async def fake_get_file_content(**kwargs):
+        return "     1\t# File not found in the usual sense, but this IS real content"
+
+    first = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"})
+    second = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"})
+
+    assert "STOP calling get_file_content" not in second
+    assert second == first  # normal cache behavior, not the not-found stub
+
+
+@pytest.mark.asyncio
+async def test_not_found_short_circuit_updates_liveness_signals():
+    """Reuses the SAME activity signals the main duplicate-serve stub already
+    feeds (max_stub_serve_count / total_stub_serve_count), not a separate,
+    invisible-to-liveness counter."""
+    activity = {}
+    hook = _make_read_cache_tool_hook(activity=activity)
+
+    async def fake_get_file_content(**kwargs):
+        return f"File not found: {kwargs['relative_path']}"
+
+    await hook("get_file_content", fake_get_file_content, {"relative_path": "ghost.py"})
+    assert "max_stub_serve_count" not in activity  # first look -- not a repeat yet
+
+    await hook("get_file_content", fake_get_file_content, {"relative_path": "ghost.py"})
+    assert activity["max_stub_serve_count"] == 2
+    assert activity["total_stub_serve_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_not_found_stub_is_scoped_to_get_file_content_only():
+    """A different cacheable tool returning a string that happens to start with
+    'File not found:' must not trigger this -- the check is deliberately gated
+    on function_name == 'get_file_content'."""
+    hook = _make_read_cache_tool_hook()
+
+    async def fake_search_files(**kwargs):
+        return "File not found: some/path.py"
+
+    first = await hook("search_files", fake_search_files, {"pattern": "x"})
+    second = await hook("search_files", fake_search_files, {"pattern": "x"})
+
+    # Normal identical-args cache behavior (a plain repeat, not the not-found
+    # path) -- second call is a cache hit, not the STOP-calling stub.
+    assert second == first
+    assert "STOP calling get_file_content" not in second

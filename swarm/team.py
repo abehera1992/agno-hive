@@ -2114,6 +2114,33 @@ def _duplicate_read_stub(function_name: str, args: dict, agent_key: str, serve_c
     )
 
 
+def _not_found_retry_stub(relative_path: str, count: int) -> str:
+    """2026-08-18 live incident: get_file_content on a path that does not exist
+    ANYWHERE in the project (hive-mcp's own zero-candidate branch, plain
+    "File not found: <path>", no correction/candidate list to follow) got
+    retried with a steadily incrementing offset (0 -> 2500+ across 25 calls)
+    as if paginating a real file -- a plausible-looking but wrong inference,
+    since offset/limit ARE real, valid parameters for a genuine truncated
+    read, and nothing in the tool's own response for this specific branch
+    said otherwise (unlike the multi-candidate branch, which already tells
+    the model exactly what to do next). Each retry's offset differs, so
+    _MAX_FULL_SERVES_PER_AGENT's identical-args dedup never catches this --
+    a SEPARATE counter, keyed on relative_path alone (ignoring offset/limit,
+    and not per-agent: a file's existence is an objective fact, not
+    context-dependent), closes it. Live-caught burning 25+ calls with no
+    sign of stopping; a py-spy dump later confirmed the run this preceded
+    eventually stalled for an unrelated reason (see
+    config.model_request_timeout_s), but this loop is a real, distinct waste
+    on its own regardless of how the run that contained it ended."""
+    return (
+        f"STOP calling get_file_content('{relative_path}', ...) with a different "
+        f"offset/limit — this is attempt #{count} for a path that has been confirmed "
+        f"NOT TO EXIST anywhere in the project. A nonexistent file has no content at "
+        f"any offset; changing offset/limit will never produce a different result. "
+        f"Call find_files() or search_files() to locate the correct path instead."
+    )
+
+
 def _forced_answer_nudge(agent_key: str, total_stub_count: int) -> str:
     """The aggregate-tier message (see _FORCED_ANSWER_AGGREGATE_THRESHOLD) — replaces
     _duplicate_read_stub's normal per-key wording once the run-wide total crosses the
@@ -2257,9 +2284,23 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     repeater, but invisible to that signal alone. Summing across keys catches
     "spreads the non-convergence across several files" the same way the per-key
     max already catches "hammers one file."
+
+    Also short-circuits a DIFFERENT, non-identical-args repeat (2026-08-18):
+    get_file_content on a path confirmed not to exist gets retried with a
+    steadily incrementing offset, treating "File not found" as if it were a
+    truncated read needing pagination. Since each retry's offset differs, the
+    main cache/serve-count mechanism above never sees an identical-args repeat
+    to catch. A separate counter, keyed on relative_path alone (see
+    _not_found_retry_stub's own docstring), stubs starting from the 2nd
+    same-path not-found result regardless of offset/limit.
     """
     cache: dict[tuple, object] = {}
     serve_counts: dict[tuple, int] = {}
+    # Separate from `cache`/`serve_counts` above -- keyed on relative_path ALONE
+    # (no offset/limit, no agent), since a nonexistent file's absence is an
+    # objective fact for the whole run, not per-argument or per-agent context.
+    # See _not_found_retry_stub's own docstring for the live incident.
+    not_found_counts: dict[str, int] = {}
 
     async def _read_cache_tool_hook(function_name, function, args, agent=None, run_context=None):
         if function_name not in _CACHEABLE_READ_TOOLS:
@@ -2273,6 +2314,26 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         cache_key = (function_name, args_key)
         serve_key = (agent_key, function_name, args_key)
 
+        # Checked BEFORE calling the real function (unlike the identical-args
+        # cache below, which only avoids a re-call once cache_key repeats
+        # exactly) -- a retry with a DIFFERENT offset/limit on an
+        # already-confirmed-missing path is never a fresh cache_key, so without
+        # this early check the real hive-mcp round-trip would still happen on
+        # every retry even though the eventual result is thrown away. See
+        # _not_found_retry_stub's own docstring for the live incident this closes.
+        if (
+            function_name == "get_file_content"
+            and isinstance(args, dict) and args.get("relative_path")
+            and not_found_counts.get(args["relative_path"], 0) >= 1
+        ):
+            relative_path = args["relative_path"]
+            not_found_counts[relative_path] += 1
+            count = not_found_counts[relative_path]
+            if activity is not None:
+                activity["max_stub_serve_count"] = max(activity.get("max_stub_serve_count", 0), count)
+                activity["total_stub_serve_count"] = activity.get("total_stub_serve_count", 0) + 1
+            return _not_found_retry_stub(relative_path, count)
+
         is_fresh_fetch = cache_key not in cache
         if is_fresh_fetch:
             result = await function(**args)
@@ -2282,6 +2343,14 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
 
         if is_fresh_fetch:
             _record_read(run_context, function_name, args, agent_key, len(str(result)))
+
+        if (
+            function_name == "get_file_content"
+            and isinstance(result, str) and result.startswith("File not found:")
+            and isinstance(args, dict) and args.get("relative_path")
+        ):
+            relative_path = args["relative_path"]
+            not_found_counts[relative_path] = not_found_counts.get(relative_path, 0) + 1
 
         serve_counts[serve_key] = serve_counts.get(serve_key, 0) + 1
         count = serve_counts[serve_key]
