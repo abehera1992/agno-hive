@@ -346,3 +346,48 @@ async def test_all_sampling_params_pass_through_together_including_repetition_pe
     assert model.max_tokens == 4096
     assert model.frequency_penalty == 0.4
     assert model.extra_body == {"repetition_penalty": 1.1}
+
+
+# ── model_request_timeout_s (2026-08-18 live incident, T6/T12) ──────────────────
+# Neither the vLLM nor cloud branch passed agno's `timeout` kwarg through to the
+# underlying openai-python client, so a completion request whose response stream
+# went silent server-side had nothing to time it out at the HTTP layer -- a live
+# py-spy dump of the actually-stalled worker process showed the main thread
+# genuinely idle in `select()`, not a Python-level deadlock, only ever ended by
+# api/server.py's 300s liveness auto-kill SIGKILLing the whole process. Unlike
+# temperature/max_tokens/frequency_penalty above, this one is NOT caller-optional
+# -- every model construction must always carry SOME timeout, so there's no
+# "defaults to None when not passed" test here; config.model_request_timeout_s
+# always has a value (env-overridable, default 120s).
+
+async def test_model_request_timeout_is_passed_through_on_vllm_backend(monkeypatch):
+    monkeypatch.setattr(config, "inference_backend", "vllm")
+    monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
+    monkeypatch.setattr(config, "model_request_timeout_s", 120.0)
+
+    model = get_model("qwen2.5-coder:32b", "http://ollama-host")
+
+    assert model.timeout == 120.0
+
+
+async def test_model_request_timeout_is_passed_through_on_cloud_route(monkeypatch):
+    monkeypatch.setattr(config, "allow_cloud_models", True)
+    monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
+    monkeypatch.setattr(config, "model_request_timeout_s", 120.0)
+
+    model = get_model("claude-sonnet-cloud", "http://ollama-host")
+
+    assert model.timeout == 120.0
+
+
+async def test_model_request_timeout_respects_config_override(monkeypatch):
+    """Confirms the value actually flows from config, not a hardcoded literal in
+    get_model() itself -- a deployment can tune this via MODEL_REQUEST_TIMEOUT_S
+    without a code change."""
+    monkeypatch.setattr(config, "inference_backend", "vllm")
+    monkeypatch.setattr(config, "vllm_gateway_url", "http://litellm-host:4000/v1")
+    monkeypatch.setattr(config, "model_request_timeout_s", 45.0)
+
+    model = get_model("qwen2.5-coder:32b", "http://ollama-host")
+
+    assert model.timeout == 45.0

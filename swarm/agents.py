@@ -99,6 +99,10 @@ def get_model(
         return OpenAILike(
             id=model_id, base_url=config.vllm_gateway_url, api_key="EMPTY",
             temperature=temperature, max_tokens=max_tokens, frequency_penalty=frequency_penalty,
+            # See config.model_request_timeout_s's own docstring for the live hang this
+            # closes -- a request whose response stream goes silent server-side otherwise
+            # has nothing to time it out at the HTTP layer.
+            timeout=config.model_request_timeout_s,
         )
 
     if config.inference_backend == "vllm":
@@ -106,6 +110,7 @@ def get_model(
         return VLLMToolFix(
             id=served, base_url=config.vllm_gateway_url, api_key="EMPTY",
             temperature=temperature, max_tokens=max_tokens, frequency_penalty=frequency_penalty,
+            timeout=config.model_request_timeout_s,
             # extra_body only, not a native OpenAIChat field -- see this function's own
             # docstring. Only wired on the vLLM path: repetition_penalty is a vLLM-native
             # SamplingParams field, not something the cloud branch above's arbitrary

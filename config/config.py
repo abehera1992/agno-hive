@@ -286,6 +286,34 @@ class Config:
     # cap is reached than a Researcher/Planner/Reviewer turn needs.
     coder_max_tokens: int = int(os.getenv("CODER_MAX_TOKENS", "8192"))
 
+    # Per-model-call HTTP timeout (2026-08-18 live incident, T6/T12 of a T1-T13
+    # groundedness re-run) -- neither swarm/agents.py's vLLM (VLLMToolFix) nor
+    # cloud (OpenAILike) branch passed agno's `timeout` kwarg through to the
+    # underlying openai-python client, so a completion request whose response
+    # stream simply went silent server-side (litellm/vLLM never sending another
+    # byte, confirmed via litellm's own container log showing ZERO lines during
+    # the stall window) had nothing to time it out at the HTTP layer. Confirmed
+    # via a live py-spy dump of the actually-stalled worker process: the main
+    # thread sat genuinely idle in `select()` inside asyncio's event loop --
+    # not a Python-level deadlock or infinite loop, a real "waiting on a socket
+    # that will never deliver another byte" hang. The only thing that ever ended
+    # it was api/server.py's liveness_silence_threshold_s (300s) auto-kill,
+    # SIGKILLing the entire worker process from the outside.
+    #
+    # httpx (which the openai-python SDK uses under the hood) treats a single
+    # float `timeout` as a READ timeout -- max gap between successive chunks of
+    # a streaming response, not a hard ceiling on total request duration -- so
+    # this does NOT truncate a legitimate long single generation that's still
+    # actively sending tokens (every real tool call and content chunk measured
+    # this session landed well under 30s, let alone 120s); it only fires when
+    # nothing has arrived for the full window, exactly the hang this exists to
+    # catch. 120s chosen to fail well before the 300s liveness threshold, so a
+    # hung request surfaces as a clear, fast openai.APITimeoutError (caught by
+    # run_task_async's existing outer `except Exception` -> record_failure/
+    # re-raise path, same machinery _BackendRunError already uses) instead of a
+    # silent multi-minute stall only an external process kill can end.
+    model_request_timeout_s: float = float(os.getenv("MODEL_REQUEST_TIMEOUT_S", "120"))
+
     # Liveness-based auto-kill (Recommendation #2, 2026-08-13 -- see DOCS.md
     # "Liveness-Based Auto-Kill"). The token caps above bound any SINGLE generation,
     # and tool_call_limit/max_iterations eventually bound the whole loop -- but a run
