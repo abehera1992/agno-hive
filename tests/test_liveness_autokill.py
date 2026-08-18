@@ -79,6 +79,31 @@ def test_both_signals_unhealthy_still_returns_one_reason_not_a_crash():
     assert reason is not None
 
 
+# ── _MCP_TIMEOUT must stay meaningfully below liveness_silence_threshold_s ──────
+#
+# Root-caused live 2026-08-18 (T6 of a T1-T13 groundedness battery, task
+# kn7ohwq3h): swarm/team.py's _MCP_TIMEOUT (agno MCPTools' own client-side
+# per-tool-call timeout) was set to the exact same value as
+# config.liveness_silence_threshold_s (300s default). A genuinely hung MCP tool
+# call (confirmed: the coordinator called verify_claims; hive-mcp's own docker
+# logs show the request never arrived -- the hang was client-side) then raced
+# two timeouts set to identical thresholds. The outer, cruder liveness watchdog
+# (api/server.py, polling on its own clock) won that race by about a second
+# every time -- confirmed live: heartbeat logged "277s since last tool call" at
+# 18:29:12, the liveness SIGKILL fired at 18:29:13, and the interception hook's
+# own "RAISED ... after Ns" log (swarm/team.py's _make_tool_interception_hook)
+# never printed at all. The MCP client's own timeout never got a chance to fire
+# and produce a real, diagnostic exception -- the run just silently burned the
+# full 300s and died with a content-free 504. This test guards the fix: as long
+# as _MCP_TIMEOUT has real headroom below the liveness threshold, a stuck tool
+# call times out cleanly, with a logged reason, before the blunter kill fires.
+def test_mcp_timeout_has_headroom_before_liveness_kill():
+    from swarm.team import _MCP_TIMEOUT
+
+    assert _MCP_TIMEOUT < config.liveness_silence_threshold_s
+    assert config.liveness_silence_threshold_s - _MCP_TIMEOUT >= 60
+
+
 # ── Tier 3: total_stub_serve_count, the aggregate signal (2026-08-14) ──────────
 # Closes a real, precisely-measured gap: max_stub_serve_count is the highest
 # count for any SINGLE (agent, tool, args) key, so a model rotating between

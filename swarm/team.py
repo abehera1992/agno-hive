@@ -22,7 +22,24 @@ from config.config import config
 
 _tracer = trace.get_tracer("agno-hive.team")
 
-_MCP_TIMEOUT = 300  # lightrag_query synthesis ~90-120s; large file reads over Docker bind mounts can be slow — headroom so multi-read tasks don't die mid-read
+# T6 root-caused 2026-08-18: this was equal to config.liveness_silence_threshold_s
+# (300s default), so a genuinely hung MCP tool call (confirmed live: agent called
+# verify_claims with the full ~6.7KB final answer as its `answer` argument; hive-mcp's
+# own docker logs show ZERO trace of that request ever arriving -- the hang is
+# client-side, before any bytes reach the wire) never got a chance to time out and
+# raise its own catchable exception (_make_tool_interception_hook's `await
+# function(**args)` would log "RAISED ... after Ns"). Instead the coordinator sat
+# silent for the full 300s and the cruder, outer liveness watchdog (api/server.py,
+# polling activity["last_call_at"] on its own clock) always won the race by a second
+# or two, SIGKILLing the whole worker with a content-free "no tool call or new stream
+# content for over 300s" 504 -- discarding whatever diagnostic value the MCP client's
+# own TimeoutError would have carried. Live evidence (task kn7ohwq3h): heartbeat showed
+# "277s since last tool call (last: verify_claims)" at 18:29:12, then the liveness kill
+# fired at 18:29:13 -- one second later, with no RAISED log ever printed in between.
+# Lowered to 180s so a stuck tool call fails cleanly, with a real logged exception,
+# well before the 300s liveness kill would otherwise silently eat the whole window.
+# See test_mcp_timeout_has_headroom_before_liveness_kill for the invariant this relies on.
+_MCP_TIMEOUT = 180  # lightrag_query synthesis ~90-120s; large file reads over Docker bind mounts can be slow — headroom so multi-read tasks don't die mid-read
 
 # agno_run/agno_list_teams only make sense triggered from the Claude-Code side (the
 # project MCP); passing them to the coordinator would let it recurse back into this
@@ -1837,12 +1854,6 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # a path:line). Conversational replies and "I could not determine" answers legitimately
     # need no reads and must not be retried.
     reads = _count_read_calls(result)
-    print(  # DIAG-read-log (temporary, 2026-08-18): find why session_state read_log
-        f"[DIAG-read-log] reads={reads} has_messages={bool(getattr(result, 'messages', None))} "
-        f"result.session_state={getattr(result, 'session_state', 'NO_ATTR')!r} "
-        f"team.session_state={getattr(team, 'session_state', 'NO_ATTR')!r}",
-        flush=True,
-    )
     if reads == 0 and _CLAIMY_RE.search(content or "") and len(all_results) > 1:
         # Aggregate retry budget already spent -- surface rather than re-run again.
         return (
