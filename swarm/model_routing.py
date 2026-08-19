@@ -325,8 +325,43 @@ _TEAM_ROLE_DEFAULTS = [
 # ever runs against an empty model_catalog; an already-populated database (ZGX's)
 # needs the identical value applied once via a real /admin/model-routes/teams
 # call instead, since create_all()'s "missing table" check doesn't re-run seeding.
+#
+# engineering/Reviewer's tool_call_limit=45 (2026-08-18, T6 empty-completion-loop
+# root cause): confirmed live (task k9732nnic) that Reviewer's default 25-call
+# budget (config.tool_call_limit) is not enough headroom for its gap-analysis
+# cross-check role -- re-deriving both of Researcher's enumerated lists plus
+# independently verifying the conclusion legitimately needs ~16-18 reads, and
+# with zero margin for any repeated/paginated call, Reviewer hit exactly 25 real
+# tool calls (confirmed via journalctl: search_knowledge_graph + 8 distinct
+# get_file_content/search_files calls, THEN an unexplained full second pass
+# repeating 8 of those same calls verbatim -- see the empty-completion note
+# below for why it likely lost its place and restarted). Once agno's own
+# arun_function_calls/run_function_calls (agno/models/base.py) sees
+# current_function_call_count > tool_call_limit, it stops executing calls
+# entirely and instead appends `create_tool_call_limit_error_result` -- a
+# generic "Tool call limit reached... don't try again" tool-result message --
+# for every further attempt. This bypasses team.py's own tool_hooks chain
+# completely (the rejection happens inside agno's model layer, before any hook
+# in swarm/team.py ever runs), so none of this file's own escalating-stub
+# reinforcement (_duplicate_read_stub, _forced_answer_nudge) ever gets a chance
+# to redirect the model. Confirmed via vllm-coord's own engine logs (sustained
+# non-zero generation throughput, "Running: 1 reqs" almost continuously) plus
+# _log_unclassified_stream_event's own throttled counter (~20 raw
+# ModelRequestStarted/RunContent/ModelRequestCompleted cycles logged as one
+# print, each individual cycle only ~1-2s wall time): once past the ceiling,
+# the model kept re-attempting tool calls in a rapid (~1.5s/cycle), silent loop
+# -- each attempt voided by agno's own limit check with content='' that turn --
+# for the full 300s+ until the outer liveness watchdog killed the run. This
+# entry raises the ceiling so the legitimate cross-check completes with real
+# margin to spare, which is the correct fix for THIS incident's proximate
+# cause; the deeper gap (agno's own rejection path has no way to reach team.py's
+# reinforcement machinery, and a model that starts attempting tools it can't use
+# doesn't reliably self-correct into a text-only final answer) remains open --
+# see DOCS.md "Reviewer Empty-Completion Loop Root-Caused" for the full
+# investigation and the raw evidence this entry summarizes.
 _TEAM_ROLE_POLICY_OVERRIDES: dict[tuple[str, str], dict] = {
     ("engineering", "Coder"): {"max_tokens": 8192},
+    ("engineering", "Reviewer"): {"tool_call_limit": 45},
 }
 
 

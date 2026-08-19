@@ -85,6 +85,21 @@ async def test_seeded_roles_without_an_override_have_no_policy_set():
     assert policy.tool_call_limit is None
 
 
+async def test_seeded_reviewer_override_carries_the_raised_tool_call_limit():
+    """2026-08-18 (T6 empty-completion-loop root cause, see model_routing.py's
+    own _TEAM_ROLE_POLICY_OVERRIDES comment and DOCS.md "Reviewer
+    Empty-Completion Loop Root-Caused"): Reviewer's gap-analysis cross-check
+    legitimately needs more than config.tool_call_limit's default 25 real tool
+    calls, and once agno's own arun_function_calls exceeds that ceiling it has
+    no way to redirect the model back to a text answer -- confirmed live, the
+    model kept silently re-attempting rejected tool calls for 300s+ until the
+    liveness watchdog killed the run. A fresh deployment's seed data must carry
+    this override, not just a live ZGX-only DB patch."""
+    await mr.load_cache()
+    policy = mr.get_role_policy("engineering", "Reviewer")
+    assert policy.tool_call_limit == 45
+
+
 # ── cache lookups ─────────────────────────────────────────────────────────────
 
 async def test_get_route_returns_none_before_cache_loaded():
