@@ -23,6 +23,7 @@ import asyncio
 
 import pytest
 
+from swarm import team
 from swarm.team import (
     _make_read_cache_tool_hook, _build_team, _CACHEABLE_READ_TOOLS,
     _collapse_prior_stub_messages, _COLLAPSED_STUB_MARKER,
@@ -1327,3 +1328,60 @@ async def test_not_found_stub_is_scoped_to_get_file_content_only():
 
     assert second == first
     assert "STOP calling get_file_content" not in second
+
+
+# ── model-voluntary verify_claims timeout (2026-08-19) ──────────────────────────
+# See _MODEL_VERIFY_CLAIMS_TIMEOUT's own comment in swarm/team.py for the live
+# incidents this closes: a model-voluntary verify_claims call (the model has it
+# as a directly-callable MCP tool, distinct from _verified_answer()'s own
+# bespoke automatic check) goes through THIS hook, not _verify_claims()'s
+# _BESPOKE_MCP_SESSION_TIMEOUT -- so before this fix it was protected only by
+# the much longer _MCP_TIMEOUT (180s) with no graceful degradation, and a
+# second stacked call could blow past the 300s liveness ceiling entirely
+# unprotected. These tests confirm a slow call is cut off with a clean, handled
+# result instead of an uncaught exception, and a normal-speed call passes
+# through untouched.
+
+@pytest.mark.asyncio
+async def test_model_voluntary_verify_claims_times_out_with_a_handled_result(monkeypatch):
+    monkeypatch.setattr(team, "_MODEL_VERIFY_CLAIMS_TIMEOUT", 0.05)
+    hook = _make_read_cache_tool_hook()
+
+    async def hanging_verify_claims(**kwargs):
+        await asyncio.sleep(10)
+        return "should never get here"
+
+    result = await hook("verify_claims", hanging_verify_claims, {"answer": "some answer"})
+
+    assert "VERIFICATION UNAVAILABLE" in result
+    assert "Do NOT call verify_claims again" in result
+
+
+@pytest.mark.asyncio
+async def test_model_voluntary_verify_claims_passes_through_when_fast(monkeypatch):
+    monkeypatch.setattr(team, "_MODEL_VERIFY_CLAIMS_TIMEOUT", 5)
+    hook = _make_read_cache_tool_hook()
+
+    async def fast_verify_claims(**kwargs):
+        return "VERDICT: all claims verified"
+
+    result = await hook("verify_claims", fast_verify_claims, {"answer": "some answer"})
+
+    assert result == "VERDICT: all claims verified"
+
+
+@pytest.mark.asyncio
+async def test_model_voluntary_verify_claims_degrades_on_a_real_exception_too(monkeypatch):
+    """Not just timeouts -- any failure in the underlying call (e.g. a real
+    McpError from the persistent MCPTools connection's own _MCP_TIMEOUT firing
+    first) must degrade to the same handled result, never propagate up and
+    kill the run."""
+    monkeypatch.setattr(team, "_MODEL_VERIFY_CLAIMS_TIMEOUT", 5)
+    hook = _make_read_cache_tool_hook()
+
+    async def broken_verify_claims(**kwargs):
+        raise RuntimeError("Timed out while waiting for response to ClientRequest. Waited 180.0 seconds.")
+
+    result = await hook("verify_claims", broken_verify_claims, {"answer": "some answer"})
+
+    assert "VERIFICATION UNAVAILABLE" in result

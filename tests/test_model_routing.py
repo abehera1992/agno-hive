@@ -100,6 +100,19 @@ async def test_seeded_reviewer_override_carries_the_raised_tool_call_limit():
     assert policy.tool_call_limit == 45
 
 
+async def test_seeded_performance_reviewer_override_carries_the_raised_tool_call_limit():
+    """2026-08-19 (live 7-test groundedness battery): same empty-completion-loop
+    signature as the Reviewer incident above, confirmed via hive-mcp's own
+    server-side tool log -- PerformanceReviewer made ~26 distinct search_files
+    calls (one per symbol checked for auth/tenant-isolation) then made zero
+    further tool calls for the rest of the run while the client kept receiving
+    empty ModelRequestStarted/RunContent/ModelRequestCompleted cycles until the
+    300s liveness kill. Same fix, same reasoning, a role that never got it."""
+    await mr.load_cache()
+    policy = mr.get_role_policy("parallel-review", "PerformanceReviewer")
+    assert policy.tool_call_limit == 45
+
+
 # ── cache lookups ─────────────────────────────────────────────────────────────
 
 async def test_get_route_returns_none_before_cache_loaded():

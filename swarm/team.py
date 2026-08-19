@@ -60,6 +60,51 @@ _MCP_TIMEOUT = 180  # lightrag_query synthesis ~90-120s; large file reads over D
 # asyncio.TimeoutError instead of silently consuming the caller's entire budget.
 _BESPOKE_MCP_SESSION_TIMEOUT = 90
 
+# 2026-08-19 (live 7-test groundedness battery, tasks hive-test1-groundedness and
+# hive-test6-gstpropagation): _BESPOKE_MCP_SESSION_TIMEOUT above only protects
+# _verify_claims()'s own bespoke one-shot session -- the automatic post-answer
+# check _verified_answer() runs. It does NOT cover a MODEL-VOLUNTARY call to
+# verify_claims (the model has it as a directly-callable MCP tool and sometimes
+# invokes it mid-reasoning, logged as a plain `tool_hook: verify_claims(...)`
+# just like get_file_content/search_files) -- that path goes through the
+# agent's PERSISTENT MCPTools connection instead, protected only by the much
+# longer _MCP_TIMEOUT (180s). Cross-checked against hive-mcp's own server-side
+# tool log (ground truth, not just the ZGX-side client view): verify_claims's
+# own runtime scales with how many distinct claims/citations are in the answer
+# being checked (each needs its own multi-second grep), and for the exhaustive,
+# heavily-cited answers these test prompts asked for, real completion times were
+# 118s, 136s, 344s, 366s, and 1225s. Two live failures came directly from this:
+# task hive-test6-gstpropagation's model-voluntary call took 344s server-side --
+# _MCP_TIMEOUT correctly fired a clean McpError at 180s, but nothing catches
+# that exception and lets the run recover, so it died anyway 27s later when
+# liveness kicked in. task hive-test1-groundedness's FIRST model-voluntary call
+# succeeded normally (118s), but the model then immediately made a SECOND one
+# (136s server-side) -- nothing bounds a run against multiple slow
+# model-voluntary calls stacking within one 300s liveness window, and this
+# second call's client never got a response before the liveness kill silently
+# ended the run (frozen stream-event count, no exception ever surfaced).
+# Fix: wrap the model-voluntary call in its own SHORTER timeout (matching
+# _BESPOKE_MCP_SESSION_TIMEOUT for consistency -- well under _MCP_TIMEOUT so it
+# always wins the race) and degrade to a clean, handled TOOL RESULT instead of
+# an uncaught McpError -- this closes both failure modes at once: a slow call
+# now fails fast and visibly instead of blowing past _MCP_TIMEOUT, and the
+# result explicitly tells the model not to retry, bounding even a stacked
+# sequence of calls to a small, predictable multiple of this timeout.
+_MODEL_VERIFY_CLAIMS_TIMEOUT = 90
+
+
+def _model_verify_claims_unavailable_result() -> str:
+    return (
+        "VERIFICATION UNAVAILABLE — the verify_claims check did not complete "
+        f"within {_MODEL_VERIFY_CLAIMS_TIMEOUT}s (the codebase check is taking "
+        "unusually long right now, likely due to the number of distinct claims "
+        "in the answer). Do NOT call verify_claims again this turn — a second "
+        "call will not complete any faster. Proceed with your answer as-is, and "
+        "note explicitly in the final answer that its claims have not been "
+        "automatically verified."
+    )
+
+
 # agno_run/agno_list_teams only make sense triggered from the Claude-Code side (the
 # project MCP); passing them to the coordinator would let it recurse back into this
 # same swarm and deadlock, so they're excluded from the project MCP connection only.
@@ -2685,6 +2730,13 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     if member_model is not None:
                         member_model._tool_choice = None
             return await function(**args)
+
+        if function_name == "verify_claims":
+            try:
+                return await asyncio.wait_for(function(**args), timeout=_MODEL_VERIFY_CLAIMS_TIMEOUT)
+            except Exception as exc:
+                print(f"[team] model-voluntary verify_claims call did not complete in time: {exc}")
+                return _model_verify_claims_unavailable_result()
 
         if function_name not in _CACHEABLE_READ_TOOLS:
             return await function(**args)

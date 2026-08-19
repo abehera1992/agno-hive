@@ -359,9 +359,28 @@ _TEAM_ROLE_DEFAULTS = [
 # doesn't reliably self-correct into a text-only final answer) remains open --
 # see DOCS.md "Reviewer Empty-Completion Loop Root-Caused" for the full
 # investigation and the raw evidence this entry summarizes.
+#
+# parallel-review/PerformanceReviewer's tool_call_limit=45 (2026-08-19, live
+# 7-test groundedness battery, task set including hive-test5-security):
+# confirmed via hive-mcp's own server-side tool log (not just ZGX-side --
+# cross-checked both) that PerformanceReviewer made ~26 distinct search_files
+# calls (one per symbol: auth helpers, tenant-scoping columns per model, GST/
+# stock/voucher fields) between 16:04:01 and 16:07:37, then made ZERO further
+# tool calls of any kind for the rest of the run -- no verify_claims, nothing
+# -- while the client kept receiving raw ModelRequestStarted/empty
+# RunContent/ModelRequestCompleted cycles until the 300s liveness kill. This
+# is the exact same failure signature as the engineering/Reviewer incident
+# above (agno's own tool_call_limit rejection, invisible to every one of
+# team.py's reinforcement hooks) recurring for a role that never got the
+# earlier fix, because that fix was scoped to the one role hit at the time.
+# parallel-review's own security+performance review task requires checking
+# auth/tenant-isolation on every distinct model field across two large
+# routers -- structurally the same "many distinct one-off searches" shape as
+# Reviewer's gap-analysis cross-check, so the same headroom applies here.
 _TEAM_ROLE_POLICY_OVERRIDES: dict[tuple[str, str], dict] = {
     ("engineering", "Coder"): {"max_tokens": 8192},
     ("engineering", "Reviewer"): {"tool_call_limit": 45},
+    ("parallel-review", "PerformanceReviewer"): {"tool_call_limit": 45},
 }
 
 
