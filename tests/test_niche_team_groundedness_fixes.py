@@ -442,11 +442,9 @@ async def test_read_cache_hook_stubs_a_repeated_identical_lightrag_query_call():
     args = {"query": "Find config/config.py", "project_id": "ekam", "mode": "local"}
     first = await hook("lightrag_query", fake_lightrag_query, args)
     second = await hook("lightrag_query", fake_lightrag_query, args)
-    third = await hook("lightrag_query", fake_lightrag_query, args)
 
     assert "central config file" in first
-    assert "central config file" in second  # tolerated (serve 1-2 get real content)
-    assert "Already returned this exact" in third  # serve 3+ gets the stub, not the real content again
+    assert "Already returned this exact" in second  # serve 2+ gets the stub (budget is 1)
 
 
 # ── _member_id: the real agno delegate_task_to_member key (2026-08-15, root cause) ──

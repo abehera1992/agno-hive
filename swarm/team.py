@@ -2130,16 +2130,30 @@ _CACHEABLE_READ_TOOLS = {
 # Researcher cycled the SAME 4 files (774+965-line reads) for 4+ minutes, each
 # re-serve appending another full copy into its own context. That's a self-reinforcing
 # spiral, not just wasted network calls: more context -> the model loses track of
-# what it already has -> it "re-verifies" by reading again -> more context. Serves 1-2
-# of an identical (agent, tool, args) triple still get the real content -- the 2nd
-# tolerated because a second delegate_task_to_member call to the same role may start
-# with fresh context and legitimately need it again. Serve 3+ gets a short stub
+# what it already has -> it "re-verifies" by reading again -> more context. Serve 2+
+# of an identical (agent, DELEGATION GENERATION, tool, args) key gets a short stub
 # instead of the real content: this removes the payoff for repeating the call (the
 # model cannot get the content again by asking again) and stops the bloat at its
 # source, rather than hoping an instruction talks the model out of it -- the same
 # tool-surface-over-instruction lesson this module already has on record elsewhere
 # (_strip_mutating's docstring, 2026-07-31; _COORDINATOR_DISCOVERY_TOOLS, 2026-08-11).
-_MAX_FULL_SERVES_PER_AGENT = 2
+#
+# Lowered 2 -> 1 (2026-08-19, T6 follow-up): the ORIGINAL reason for tolerating a 2nd
+# full serve was "a second delegate_task_to_member call to the same role may start
+# with fresh context and legitimately need it again" -- but a plain (agent, tool,
+# args) key couldn't tell that case apart from a repeat WITHIN the same delegation,
+# so BOTH got the same 2-serve tolerance. Confirmed live: Reviewer repeated its own
+# entire 8-call first read pass verbatim, inside one single delegation, entirely
+# within this tolerance -- both the original and the repeat got full content with
+# zero pushback, silently burning half its tool_call_limit budget on work already
+# done. The serve_key above now also carries the delegation GENERATION (bumped once
+# per delegate_task_to_member(s) call, see delegation_generation below) specifically
+# so the legitimate case this constant used to protect is still protected: a genuinely
+# NEW, separate delegation to the same role starts a fresh generation bucket and so
+# still gets its own full serve at 1, unaffected by an earlier generation's history.
+# Only a repeat WITHIN the same generation (the same delegation instance) is now
+# caught immediately, on its 2nd ask, instead of being silently tolerated once first.
+_MAX_FULL_SERVES_PER_AGENT = 1
 # From serve 5 onward the stub escalates to a stronger, more directive wording -- a
 # model that already ignored two stubs for the identical call needs a harder nudge,
 # not the same sentence a third time.
@@ -2369,8 +2383,45 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # objective fact for the whole run, not per-argument or per-agent context.
     # See _not_found_retry_stub's own docstring for the live incident.
     not_found_counts: dict[str, int] = {}
+    # 2026-08-19 (T6 follow-up -- Reviewer repeated its own entire first read pass
+    # verbatim, 8 calls, within a SINGLE delegate_task_to_member('reviewer', ...)
+    # call, landing exactly on config.tool_call_limit's ceiling with no answer
+    # produced). _MAX_FULL_SERVES_PER_AGENT=2's own comment already explains why
+    # a 2nd full serve is tolerated: "a second delegate_task_to_member call to the
+    # same role may start with fresh context and legitimately need it again" --
+    # but that reasoning is about a SEPARATE, later delegation, not a repeat
+    # inside the SAME one. The live incident had exactly one delegation to
+    # Reviewer; every one of its 25 tool calls happened inside it, so the
+    # existing agent-only key never distinguished "fresh delegation, deserves a
+    # new budget" from "same delegation, asking again for no reason" -- both
+    # looked identical to a plain (agent_key, tool, args) key. Fixed by keying
+    # the serve-count budget on the delegation INSTANCE too, not just the agent:
+    # bumped every time delegate_task_to_member(s) targets a member, read here
+    # (before the cacheable-tool check) so the bump happens exactly once per
+    # delegation call, before any of the delegate's own reads occur inside it.
+    # Combined with lowering _MAX_FULL_SERVES_PER_AGENT to 1 (see its own
+    # comment), this closes the loophole precisely: a repeat WITHIN one
+    # delegation is now stubbed on the 2nd ask, while a genuinely fresh, LATER,
+    # separate delegation to the same role still gets its own full budget, since
+    # it falls into a new generation bucket. "__broadcast__" is a synthetic key
+    # for delegate_task_to_members (plural) -- it targets the whole team with no
+    # single member_id to bump individually (see _make_duplicate_delegation_gate_hook's
+    # own docstring: the plural tool is compared on task text alone, "no
+    # member_id -- it goes to the whole team"), so a broadcast conservatively
+    # bumps every agent's effective generation via the max() below rather than
+    # trying to enumerate the roster here.
+    delegation_generation: dict[str, int] = {}
 
     async def _read_cache_tool_hook(function_name, function, args, agent=None, run_context=None):
+        if function_name in _DELEGATION_TOOL_NAMES:
+            if function_name == "delegate_task_to_member":
+                target = _member_id(str((args or {}).get("member_id", "")).strip())
+                if target:
+                    delegation_generation[target] = delegation_generation.get(target, 0) + 1
+            else:  # delegate_task_to_members -- broadcasts to the whole team, no single target
+                delegation_generation["__broadcast__"] = delegation_generation.get("__broadcast__", 0) + 1
+            return await function(**args)
+
         if function_name not in _CACHEABLE_READ_TOOLS:
             return await function(**args)
         try:
@@ -2379,8 +2430,12 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             return await function(**args)  # non-JSON-serializable args -- skip caching, call through
 
         agent_key = getattr(agent, "name", None) or ""
+        generation = max(
+            delegation_generation.get(_member_id(agent_key), 0) if agent_key else 0,
+            delegation_generation.get("__broadcast__", 0),
+        )
         cache_key = (function_name, args_key)
-        serve_key = (agent_key, function_name, args_key)
+        serve_key = (agent_key, generation, function_name, args_key)
 
         # Checked BEFORE calling the real function (unlike the identical-args
         # cache below, which only avoids a re-call once cache_key repeats

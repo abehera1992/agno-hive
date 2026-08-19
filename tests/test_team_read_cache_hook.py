@@ -45,6 +45,10 @@ async def test_cache_hook_calls_through_on_first_call():
 
 @pytest.mark.asyncio
 async def test_cache_hook_serves_cached_result_on_second_identical_call():
+    """Confirms the underlying network fetch happens only once per distinct
+    (tool, args) pair, however many times it's asked for -- even once the
+    repeat is stubbed by the serve-count budget (see the per-agent stubbing
+    tests below), the real function itself is never called a second time."""
     hook = _make_read_cache_tool_hook()
     calls = []
 
@@ -56,7 +60,7 @@ async def test_cache_hook_serves_cached_result_on_second_identical_call():
     second = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"})
 
     assert first == "content #1"
-    assert second == "content #1"  # cached, NOT "content #2" -- the function was not called again
+    assert second != "content #2"  # the underlying function was NOT called a second time
     assert len(calls) == 1
 
 
@@ -157,8 +161,10 @@ def test_cacheable_read_tools_excludes_every_mutating_tool():
 # Confirmed live: the network-only cache above was not enough on its own -- a
 # Researcher cycled the SAME 4 files for 4+ minutes, each re-serve appending another
 # full copy into its own context (a self-reinforcing bloat spiral, not just wasted
-# hive-mcp round-trips). Serves 1-2 of an identical (agent, tool, args) triple still
-# get the real content; serve 3+ gets a short stub instead.
+# hive-mcp round-trips). Serve 1 of an identical (agent, delegation generation, tool,
+# args) key gets the real content; serve 2+ WITHIN THE SAME delegation instance gets
+# a short stub instead (see the "delegation-generation scoping" section further down
+# for the fresh-budget-per-delegation half of this).
 
 class _FakeAgent:
     def __init__(self, name):
@@ -166,7 +172,7 @@ class _FakeAgent:
 
 
 @pytest.mark.asyncio
-async def test_third_identical_call_from_the_same_agent_gets_a_stub_not_real_content():
+async def test_second_identical_call_from_the_same_agent_gets_a_stub_not_real_content():
     hook = _make_read_cache_tool_hook()
     calls = []
 
@@ -177,12 +183,10 @@ async def test_third_identical_call_from_the_same_agent_gets_a_stub_not_real_con
     researcher = _FakeAgent("Researcher")
     first = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
     second = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
-    third = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
 
     assert first == "x" * 500
-    assert second == "x" * 500  # still real content -- serve 2 is within budget
-    assert third != "x" * 500  # serve 3 is over budget -- stubbed
-    assert "x" * 500 not in third  # the stub must not leak the real content either
+    assert second != "x" * 500  # serve 2 is over budget -- stubbed
+    assert "x" * 500 not in second  # the stub must not leak the real content either
     assert len(calls) == 1  # the underlying tool was only ever actually called once
 
 
@@ -194,8 +198,7 @@ async def test_duplicate_read_stub_names_the_tool_and_repeat_count():
         return "file body"
 
     researcher = _FakeAgent("Researcher")
-    for _ in range(2):
-        await hook("get_file_content", fake_get_file_content, {"relative_path": "models.py"}, agent=researcher)
+    await hook("get_file_content", fake_get_file_content, {"relative_path": "models.py"}, agent=researcher)
     stub = await hook("get_file_content", fake_get_file_content, {"relative_path": "models.py"}, agent=researcher)
 
     assert "get_file_content" in stub
@@ -218,10 +221,11 @@ async def test_duplicate_read_stub_escalates_wording_from_the_fifth_serve():
             await hook("get_file_content", fake_get_file_content, {"relative_path": "models.py"}, agent=researcher)
         )
 
-    # Serves 1-2 are real content ("file body"); 3-4 are the moderate stub;
-    # 5-6 are the escalated stub.
+    # Serve 1 is real content ("file body"); 2-4 are the moderate stub; 5-6 are
+    # the escalated stub (_STUB_ESCALATION_SERVE stays 5, unaffected by the
+    # budget-of-1 change).
     assert stubs[0] == "file body"
-    assert stubs[1] == "file body"
+    assert "STOP calling" not in stubs[1]
     assert "STOP calling" not in stubs[2]
     assert "STOP calling" not in stubs[3]
     assert "STOP calling" in stubs[4]
@@ -284,6 +288,160 @@ async def test_hook_still_works_when_agent_parameter_is_omitted_entirely():
     result = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"})
 
     assert result == "file body"
+
+
+# ── delegation-generation scoping of the serve budget (2026-08-19) ─────────────
+#
+# T6 live incident (task k9732nnic): Reviewer repeated its own entire 8-call
+# first read pass verbatim, ALL within a single delegate_task_to_member('reviewer',
+# ...) call, landing exactly on config.tool_call_limit's ceiling with no answer
+# produced. _MAX_FULL_SERVES_PER_AGENT's old tolerance of 2 full serves existed
+# specifically to protect a genuinely fresh, SEPARATE, later delegation to the
+# same role -- but a plain (agent, tool, args) key couldn't distinguish that
+# case from a repeat WITHIN the same delegation instance, so both got the same
+# free pass. The hook now also tracks a per-member delegation "generation",
+# bumped once per delegate_task_to_member(s) call, folded into the serve-count
+# key -- closing the within-delegation loophole while still protecting the
+# cross-delegation case the original tolerance was for.
+
+@pytest.mark.asyncio
+async def test_repeat_within_the_same_delegation_is_stubbed_immediately():
+    """The exact T6 incident shape: a repeat within ONE delegation instance
+    must not get a second full serve."""
+    hook = _make_read_cache_tool_hook()
+    reviewer = _FakeAgent("Reviewer")
+
+    async def fake_delegate(**kwargs):
+        return "delegated result"
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    await hook("delegate_task_to_member", fake_delegate, {"member_id": "reviewer", "task": "cross-check"})
+    first = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+    second = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+
+    assert first == "file body"
+    assert second != "file body"  # repeat within the SAME delegation -- stubbed
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_separate_delegation_to_the_same_member_gets_its_own_full_budget():
+    """The legitimate case _MAX_FULL_SERVES_PER_AGENT's own comment describes: a
+    second, separate delegate_task_to_member call to the same role may start
+    with fresh context and genuinely need the same file again."""
+    hook = _make_read_cache_tool_hook()
+    reviewer = _FakeAgent("Reviewer")
+
+    async def fake_delegate(**kwargs):
+        return "delegated result"
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    await hook("delegate_task_to_member", fake_delegate, {"member_id": "reviewer", "task": "first sub-task"})
+    first = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+
+    await hook("delegate_task_to_member", fake_delegate, {"member_id": "reviewer", "task": "second sub-task"})
+    second = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+
+    assert first == "file body"
+    assert second == "file body"  # a NEW delegation instance -- fresh budget, real content again
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_within_the_new_delegation_is_still_stubbed():
+    """Confirms the reset is a genuinely fresh 1-serve budget, not an unlimited
+    one -- a second repeat WITHIN the new delegation still gets stubbed."""
+    hook = _make_read_cache_tool_hook()
+    reviewer = _FakeAgent("Reviewer")
+
+    async def fake_delegate(**kwargs):
+        return "delegated result"
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    await hook("delegate_task_to_member", fake_delegate, {"member_id": "reviewer", "task": "first sub-task"})
+    await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+
+    await hook("delegate_task_to_member", fake_delegate, {"member_id": "reviewer", "task": "second sub-task"})
+    first_in_new_generation = await hook(
+        "get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer
+    )
+    repeat_in_new_generation = await hook(
+        "get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer
+    )
+
+    assert first_in_new_generation == "file body"
+    assert repeat_in_new_generation != "file body"
+
+
+@pytest.mark.asyncio
+async def test_delegate_task_to_member_call_itself_is_never_cached_or_stubbed():
+    """The delegation tool call itself always passes straight through -- only
+    the generation counter is bumped as a side effect, never its own result."""
+    hook = _make_read_cache_tool_hook()
+    calls = []
+
+    async def fake_delegate(**kwargs):
+        calls.append(kwargs)
+        return f"result #{len(calls)}"
+
+    first = await hook("delegate_task_to_member", fake_delegate, {"member_id": "reviewer", "task": "x"})
+    second = await hook("delegate_task_to_member", fake_delegate, {"member_id": "reviewer", "task": "x"})
+
+    assert first == "result #1"
+    assert second == "result #2"  # called through both times, never cached
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_broadcast_delegate_task_to_members_resets_every_agents_generation():
+    """delegate_task_to_members (plural) has no single member_id -- it targets
+    the whole team, so it conservatively bumps every agent's effective
+    generation via the synthetic __broadcast__ key rather than trying to
+    enumerate the roster."""
+    hook = _make_read_cache_tool_hook()
+    reviewer = _FakeAgent("Reviewer")
+
+    async def fake_broadcast(**kwargs):
+        return "broadcast result"
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+    await hook("delegate_task_to_members", fake_broadcast, {"task": "re-verify everything"})
+    after_broadcast = await hook(
+        "get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer
+    )
+
+    assert after_broadcast == "file body"  # fresh generation after the broadcast -- real content again
+
+
+@pytest.mark.asyncio
+async def test_delegation_to_a_different_member_does_not_reset_an_unrelated_members_generation():
+    """A fresh delegation to Coder must not reset Reviewer's own budget -- the
+    generation is tracked per member, not globally."""
+    hook = _make_read_cache_tool_hook()
+    reviewer = _FakeAgent("Reviewer")
+
+    async def fake_delegate(**kwargs):
+        return "delegated result"
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    await hook("delegate_task_to_member", fake_delegate, {"member_id": "reviewer", "task": "cross-check"})
+    await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+
+    await hook("delegate_task_to_member", fake_delegate, {"member_id": "coder", "task": "unrelated"})
+    still_stubbed = await hook(
+        "get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer
+    )
+
+    assert still_stubbed != "file body"  # Reviewer's own generation is unaffected by Coder's delegation
 
 
 # ── _build_team wiring: shared hook across coordinator AND every member ────────
@@ -500,8 +658,8 @@ async def test_run_context_with_none_session_state_does_not_crash_the_hook():
 
 @pytest.mark.asyncio
 async def test_max_stub_serve_count_untouched_while_within_the_real_content_budget():
-    """Serves 1-2 are real content, never stubbed -- activity must not be
-    touched until a stub is actually served."""
+    """Serve 1 is real content, never stubbed -- activity must not be touched
+    until a stub is actually served."""
     activity = {}
     hook = _make_read_cache_tool_hook(activity=activity)
     researcher = _FakeAgent("Researcher")
@@ -509,8 +667,7 @@ async def test_max_stub_serve_count_untouched_while_within_the_real_content_budg
     async def fake_get_file_content(**kwargs):
         return "file body"
 
-    for _ in range(2):
-        await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+    await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
 
     assert "max_stub_serve_count" not in activity
 
@@ -524,10 +681,10 @@ async def test_max_stub_serve_count_records_the_first_stubbed_serve():
     async def fake_get_file_content(**kwargs):
         return "file body"
 
-    for _ in range(3):  # serve 3 is the first stub (budget is 2)
+    for _ in range(2):  # serve 2 is the first stub (budget is 1)
         await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
 
-    assert activity["max_stub_serve_count"] == 3
+    assert activity["max_stub_serve_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -605,8 +762,7 @@ async def test_total_stub_serve_count_untouched_while_within_the_real_content_bu
     async def fake_get_file_content(**kwargs):
         return "file body"
 
-    for _ in range(2):
-        await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+    await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
 
     assert "total_stub_serve_count" not in activity
 
@@ -620,10 +776,10 @@ async def test_total_stub_serve_count_increments_once_per_stub_serve():
     async def fake_get_file_content(**kwargs):
         return "file body"
 
-    for _ in range(5):  # serves 1-2 real, 3-5 stubbed -- 3 stub serves
+    for _ in range(5):  # serve 1 real, 2-5 stubbed -- 4 stub serves (budget is 1)
         await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
 
-    assert activity["total_stub_serve_count"] == 3
+    assert activity["total_stub_serve_count"] == 4
 
 
 @pytest.mark.asyncio
@@ -639,12 +795,12 @@ async def test_total_stub_serve_count_sums_ACROSS_different_keys_unlike_the_max_
         return "file body"
 
     for path in ("a.py", "b.py", "c.py"):
-        for _ in range(4):  # serves 1-2 real, 3-4 stubbed -- 2 stub serves each
+        for _ in range(4):  # serve 1 real, 2-4 stubbed -- 3 stub serves each (budget is 1)
             await hook("get_file_content", fake_get_file_content, {"relative_path": path}, agent=researcher)
 
-    # 3 files x 2 stub serves each = 6 total -- no single file's own count (4)
+    # 3 files x 3 stub serves each = 9 total -- no single file's own count (4)
     # comes anywhere near a realistic Tier-2 threshold, but the sum is real.
-    assert activity["total_stub_serve_count"] == 6
+    assert activity["total_stub_serve_count"] == 9
     assert activity["max_stub_serve_count"] == 4  # the per-key signal stays low
 
 
@@ -798,17 +954,25 @@ async def test_not_found_for_different_paths_does_not_cross_contaminate():
 @pytest.mark.asyncio
 async def test_real_content_is_never_mistaken_for_a_not_found_result():
     """A file whose real content happens to start with unrelated text must never
-    trigger this path -- only an exact 'File not found:' prefix does."""
+    trigger the not-found retry-loop guard -- only an exact 'File not found:'
+    prefix does. Checked via a SECOND, different agent's own first read of the
+    same path (its own fresh serve budget, see the delegation-generation tests
+    further down): if the not-found guard had wrongly fired, that read would
+    get the not-found-specific stub regardless of which agent asks (see
+    test_not_found_tracking_is_scoped_to_relative_path_not_agent) instead of
+    real content."""
     hook = _make_read_cache_tool_hook()
+    researcher = _FakeAgent("Researcher")
+    coder = _FakeAgent("Coder")
 
     async def fake_get_file_content(**kwargs):
         return "     1\t# File not found in the usual sense, but this IS real content"
 
-    first = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"})
-    second = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"})
+    first = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+    second = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=coder)
 
     assert "STOP calling get_file_content" not in second
-    assert second == first  # normal cache behavior, not the not-found stub
+    assert second == first  # a different agent's own first read still gets real content
 
 
 @pytest.mark.asyncio
@@ -834,16 +998,18 @@ async def test_not_found_short_circuit_updates_liveness_signals():
 async def test_not_found_stub_is_scoped_to_get_file_content_only():
     """A different cacheable tool returning a string that happens to start with
     'File not found:' must not trigger this -- the check is deliberately gated
-    on function_name == 'get_file_content'."""
+    on function_name == 'get_file_content'. Uses two different agents (each its
+    own fresh serve budget) so the assertion isolates this from the unrelated
+    per-agent duplicate-serve stub."""
     hook = _make_read_cache_tool_hook()
+    researcher = _FakeAgent("Researcher")
+    coder = _FakeAgent("Coder")
 
     async def fake_search_files(**kwargs):
         return "File not found: some/path.py"
 
-    first = await hook("search_files", fake_search_files, {"pattern": "x"})
-    second = await hook("search_files", fake_search_files, {"pattern": "x"})
+    first = await hook("search_files", fake_search_files, {"pattern": "x"}, agent=researcher)
+    second = await hook("search_files", fake_search_files, {"pattern": "x"}, agent=coder)
 
-    # Normal identical-args cache behavior (a plain repeat, not the not-found
-    # path) -- second call is a cache hit, not the STOP-calling stub.
     assert second == first
     assert "STOP calling get_file_content" not in second
