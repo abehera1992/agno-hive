@@ -3433,6 +3433,29 @@ def _make_tool_interception_hook(
     run_task_async) can report "Ns since the last tool call" during a
     stretch where the coordinator is generating text and calling nothing.
 
+    Also updates `activity["last_progress_at"]` (2026-08-19 fix -- see DOCS.md
+    "7-Test Groundedness Battery" liveness false-positive) on every completed
+    call, success or failure. Before this fix, ONLY run_task_async's own
+    top-level team.arun() stream classification touched last_progress_at (a
+    content chunk, or a dict-shaped tool event surfacing at the TEAM level) --
+    this hook, wired onto every DELEGATED member-agent tool call ("most of
+    them" per this docstring's own note above), never fed it. In
+    mode="coordinate" a single delegate_task_to_member call to a Researcher
+    doing 20+ real get_file_content/search_files_batch calls surfaces to the
+    team-level stream as essentially one event at delegation-start and one at
+    delegation-return -- so a delegation running longer than the liveness
+    interval (300s) with no coordinator-level content in between saw
+    last_progress_at frozen at delegation-start, `is_stagnant` going true from
+    the very first heartbeat tick, and the run auto-killed at ~300-330s
+    regardless of how much real, visible work (these same tool_hook log
+    lines) was happening underneath. Confirmed live: 3/3 fresh read-only
+    grounding tasks (RBAC, seller verification, module settings -- all
+    naturally long single-delegation research) killed this way, each with a
+    tool call only 19-66s old at the moment of the "stagnant for 300s" kill.
+    Feeding last_progress_at from here closes the gap using exactly the
+    tracking this hook already does for last_call_at -- no new signal, just
+    wiring the existing one into the check that was blind to it.
+
     Async + must be shared across the coordinator AND every member agent,
     for the same two reasons _make_read_cache_tool_hook's docstring
     documents (re-confirmed here, not re-derived): every MCP-server-backed
@@ -3478,13 +3501,17 @@ def _make_tool_interception_hook(
             elapsed = time.monotonic() - started
             print(f"[team] tool_hook: {function_name}({args}) -> {elapsed:.2f}s", flush=True)
             if activity is not None:
-                activity["last_call_at"] = time.monotonic()
+                now = time.monotonic()
+                activity["last_call_at"] = now
+                activity["last_progress_at"] = now
             return result
         except Exception as exc:
             elapsed = time.monotonic() - started
             print(f"[team] tool_hook: {function_name}({args}) RAISED {type(exc).__name__}: {exc} after {elapsed:.2f}s", flush=True)
             if activity is not None:
-                activity["last_call_at"] = time.monotonic()
+                now = time.monotonic()
+                activity["last_call_at"] = now
+                activity["last_progress_at"] = now
             raise
 
     return _tool_interception_hook

@@ -335,6 +335,60 @@ async def test_hook_updates_activity_dict_on_failure_too():
 
 
 @pytest.mark.asyncio
+async def test_hook_updates_last_progress_at_on_success():
+    """2026-08-19 fix -- see _make_tool_interception_hook's own docstring addendum
+    and DOCS.md's "7-Test Groundedness Battery" section. Before this fix, a
+    delegated member tool call only ever touched last_call_at, never
+    last_progress_at -- the field _run_heartbeat's is_stagnant check actually
+    reads. Live: 3/3 long-running, real, successful research delegations got
+    killed by the liveness watchdog as "stagnant for 300s" despite fresh
+    get_file_content/search_files_batch calls seconds earlier, because none of
+    that activity ever reached last_progress_at."""
+    activity = {"last_call_name": None, "last_call_at": 0.0, "last_progress_at": 0.0}
+    hook = _make_tool_interception_hook(activity=activity)
+
+    async def fake_tool(**kwargs):
+        return "ok"
+
+    await hook("get_file_content", fake_tool, {})
+
+    assert activity["last_progress_at"] > 0.0
+
+
+@pytest.mark.asyncio
+async def test_hook_updates_last_progress_at_on_failure_too():
+    """Symmetric with last_call_at's existing on-failure update -- a delegated
+    call that fails still proves the process is alive and doing something, the
+    same reasoning already applied to last_call_at on this path."""
+    activity = {"last_call_name": None, "last_call_at": 0.0, "last_progress_at": 0.0}
+    hook = _make_tool_interception_hook(activity=activity)
+
+    async def failing_tool(**kwargs):
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        await hook("bad_tool", failing_tool, {})
+
+    assert activity["last_progress_at"] > 0.0
+
+
+@pytest.mark.asyncio
+async def test_hook_still_works_when_activity_dict_lacks_last_progress_at_key():
+    """A caller's activity dict predating this fix (e.g. an older test's literal
+    {"last_call_name": None, "last_call_at": 0.0}) must not crash the hook --
+    the hook only ever assigns the key, never reads it first."""
+    activity = {"last_call_name": None, "last_call_at": 0.0}
+    hook = _make_tool_interception_hook(activity=activity)
+
+    async def fake_tool(**kwargs):
+        return "ok"
+
+    await hook("my_tool", fake_tool, {})
+
+    assert activity["last_progress_at"] > 0.0
+
+
+@pytest.mark.asyncio
 async def test_hook_works_fine_when_no_activity_dict_supplied():
     hook = _make_tool_interception_hook()  # activity=None default, unchanged behavior
 
