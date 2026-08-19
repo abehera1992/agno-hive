@@ -41,6 +41,25 @@ _tracer = trace.get_tracer("agno-hive.team")
 # See test_mcp_timeout_has_headroom_before_liveness_kill for the invariant this relies on.
 _MCP_TIMEOUT = 180  # lightrag_query synthesis ~90-120s; large file reads over Docker bind mounts can be slow — headroom so multi-read tasks don't die mid-read
 
+# 2026-08-19 (T6 follow-up, found live watching task koi6p1bkd): _MCP_TIMEOUT above
+# only governs the AGENT's own MCPTools instance (the persistent session every
+# real tool call goes through) -- it does NOT cover _verify_claims/_fetch_skill_catalog/
+# _fill_count_markers below, each of which opens its OWN separate, one-shot
+# streamablehttp_client(hive_mcp_url) connection with no timeout at all, protected
+# only by a broad `except Exception` that a hung await never reaches. Live-caught
+# via py-spy mid-run: MainThread idle in select() -- the exact same "waiting on a
+# socket that will never deliver another byte" signature as the original T6 hang --
+# during what turned out to be a verify_claims-shaped quiet stretch. That specific
+# run went on to complete successfully (not a confirmed repeat of the hang -- a
+# single idle snapshot proves nothing was running at that instant, not that it was
+# stuck forever), but the underlying gap is real regardless: these three functions
+# have zero defense against a genuine hang, unlike every other MCP path in this
+# file. 90s is generous headroom over the ~45s _verify_claims has been observed
+# taking end-to-end, well under both _MCP_TIMEOUT (180s) and the outer liveness
+# kill (300s) -- a stuck one-shot session now fails with a real, logged
+# asyncio.TimeoutError instead of silently consuming the caller's entire budget.
+_BESPOKE_MCP_SESSION_TIMEOUT = 90
+
 # agno_run/agno_list_teams only make sense triggered from the Claude-Code side (the
 # project MCP); passing them to the coordinator would let it recurse back into this
 # same swarm and deadlock, so they're excluded from the project MCP connection only.
@@ -1216,12 +1235,16 @@ async def _verify_claims(content: str, hive_mcp_url: str | None) -> tuple[str, b
         return "", False
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
-    try:
+
+    async def _call() -> str:
         async with streamablehttp_client(hive_mcp_url) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 res = await session.call_tool("verify_claims", {"answer": content})
-                report = _extract_mcp_text(res)
+                return _extract_mcp_text(res)
+
+    try:
+        report = await asyncio.wait_for(_call(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
     except Exception as exc:
         print(f"[team] verify_claims unavailable ({hive_mcp_url}): {exc}")
         return "", False
@@ -1240,13 +1263,17 @@ async def _fetch_skill_catalog(hive_mcp_url: str | None) -> list[dict]:
         return []
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
-    try:
+
+    async def _call() -> list[dict]:
         async with streamablehttp_client(hive_mcp_url) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 res = await session.call_tool("list_skills", {})
                 text = _extract_mcp_text(res)
                 return json.loads(text)
+
+    try:
+        return await asyncio.wait_for(_call(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
     except Exception as exc:
         print(f"[team] skill catalog unavailable ({hive_mcp_url}): {exc}")
         return []
@@ -2061,7 +2088,8 @@ async def _fill_count_markers(content: str, hive_mcp_url: str | None) -> str:
         return _COUNT_MARKER_ANY.sub("[count unavailable]", content)
 
     cache: dict = {}
-    try:
+
+    async def _resolve_all() -> None:
         async with streamablehttp_client(hive_mcp_url) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
@@ -2078,6 +2106,9 @@ async def _fill_count_markers(content: str, hive_mcp_url: str | None) -> str:
                     except Exception as exc:
                         print(f"[team] count verify failed ({key!r}): {exc}")
                         cache[key] = "[count unavailable]"
+
+    try:
+        await asyncio.wait_for(_resolve_all(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
     except Exception as exc:
         print(f"[team] count-marker guard: hive-mcp unreachable ({hive_mcp_url}): {exc}")
         return _COUNT_MARKER_ANY.sub("[count unavailable]", content)
