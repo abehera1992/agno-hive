@@ -1224,15 +1224,54 @@ def _extract_mcp_text(result) -> str:
     )
 
 
-async def _verify_claims(content: str, hive_mcp_url: str | None) -> tuple[str, bool]:
-    """Run hive-mcp's verify_claims over a draft answer. Returns (report, has_problems).
+# Fail-open vs fail-safe (2026-08-19, T12 re-test, task 738813cb-...): before this
+# fix, a verify_claims failure (exception or the _BESPOKE_MCP_SESSION_TIMEOUT cutoff
+# above) returned ("", False) -- bad=False, IDENTICAL to "ran cleanly, zero problems
+# found." Live-confirmed harm: that same re-test's verify_claims call genuinely hung
+# for the full ~90s window against a degraded hive-mcp, timed out (the timeout fix
+# itself worked correctly), and the run shipped a FALSE claim ("no frontend RTK
+# Query hooks were found" -- 11 real hooks exist in businessApi.ts, found by this
+# same run's own earlier, correctly-scoped pass) with no signal anywhere that
+# verification never actually ran. The safety net built specifically to catch this
+# kind of self-contradiction went silent exactly when it was needed.
+#
+# The fix distinguishes a third state -- `unavailable` -- from `bad`, and BOTH
+# _verified_answer call sites below append _UNVERIFIED_DISCLAIMER instead of
+# shipping silently clean when unavailable=True. Deliberately NOT wired into the
+# existing missing_symbols/bad_citations/lint_violations retry machinery: that
+# path calls _stream_team_run for a full extra pipeline turn, which would (a) most
+# likely hit the SAME degraded hive-mcp session that just failed, wasting another
+# ~90s-plus for no benefit, (b) re-expose the run to the repeat-loop/stub-escalation
+# territory those retries walk through, and (c) burn the aggregate one-retry
+# budget (`len(all_results) > 1`) on a check that was never actually performed --
+# using it up before a REAL fabrication elsewhere in the same answer gets a chance
+# to trigger its own retry. A disclaimer is a pure, local, deterministic string
+# append: it cannot hang, cannot loop, and cannot touch the tool surface at all --
+# same category of fix as every other grep-based mechanism in this file. This
+# leaves genuine verify_claims successes (bad=True) on the existing, unchanged
+# retry path; only the "we could not check" state is new.
+_UNVERIFIED_DISCLAIMER = (
+    "\n\n---\n**⚠️ Automated citation verification was unavailable this run "
+    "(hive-mcp did not respond in time) — the claims above have NOT been "
+    "checked against the repository and may be inaccurate.**"
+)
+
+
+async def _verify_claims(content: str, hive_mcp_url: str | None) -> tuple[str, bool, bool]:
+    """Run hive-mcp's verify_claims over a draft answer.
+
+    Returns (report, has_problems, unavailable). `unavailable=True` means the check
+    was ATTEMPTED and failed (exception or timeout) -- distinct from "not attempted"
+    (no content, or hive_mcp_url unset -- a deliberate configuration choice, not a
+    degradation, so it stays unavailable=False and silent, same as always).
 
     Deterministic grep, no model involved. Never raises: a verifier that breaks the run
     would be worse than the fabrication it is meant to catch, so any failure here is
-    reported as "no problems" and logged.
+    reported as "no problems, but unavailable" (see _UNVERIFIED_DISCLAIMER above for why
+    callers must still surface this rather than treat it as a clean pass) and logged.
     """
     if not content or not hive_mcp_url:
-        return "", False
+        return "", False, False
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
@@ -1247,8 +1286,8 @@ async def _verify_claims(content: str, hive_mcp_url: str | None) -> tuple[str, b
         report = await asyncio.wait_for(_call(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
     except Exception as exc:
         print(f"[team] verify_claims unavailable ({hive_mcp_url}): {exc}")
-        return "", False
-    return report, "could NOT be found" in report
+        return "", False, True
+    return report, "could NOT be found" in report, False
 
 
 async def _fetch_skill_catalog(hive_mcp_url: str | None) -> list[dict]:
@@ -1909,7 +1948,9 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         except Exception as exc:
             print(f"[team] evidence retry failed: {exc}")
 
-    report, bad = await _verify_claims(content, hive_mcp_url)
+    report, bad, unavailable = await _verify_claims(content, hive_mcp_url)
+    if unavailable:
+        return content + _UNVERIFIED_DISCLAIMER + _summarize_actual_writes(*all_results)
     if not bad:
         return content + _summarize_actual_writes(*all_results)
 
@@ -2062,7 +2103,9 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         print("[team] citation-correction retry made ZERO read calls — "
               "it answered from memory/estimation again instead of re-reading")
 
-    report2, still_bad = await _verify_claims(corrected, hive_mcp_url)
+    report2, still_bad, still_unavailable = await _verify_claims(corrected, hive_mcp_url)
+    if still_unavailable:
+        return corrected + _UNVERIFIED_DISCLAIMER + _summarize_actual_writes(*all_results)
     if still_bad:
         # Surface rather than hide: the reader needs to know which claims are unsupported.
         return (f"{corrected}\n\n---\n**Unverified claims flagged automatically "

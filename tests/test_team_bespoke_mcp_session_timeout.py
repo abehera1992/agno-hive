@@ -88,10 +88,11 @@ async def test_verify_claims_times_out_instead_of_hanging_forever(monkeypatch):
     monkeypatch.setattr("mcp.ClientSession", lambda *a, **k: _HangingSession())
     monkeypatch.setattr("mcp.client.streamable_http.streamablehttp_client", lambda url: _FakeStreamCtx())
 
-    report, bad = await team._verify_claims("some answer text", "http://fake/mcp")
+    report, bad, unavailable = await team._verify_claims("some answer text", "http://fake/mcp")
 
     assert report == ""
-    assert bad is False  # degrades to "no problems found" per the function's own contract
+    assert bad is False  # never force bad=True on a check that didn't run -- see the retry-cost comment above _verify_claims
+    assert unavailable is True  # 2026-08-19 fix: this is what callers must check, not `bad`, to know verification never ran
 
 
 @pytest.mark.asyncio
@@ -100,11 +101,24 @@ async def test_verify_claims_still_works_normally_within_the_timeout(monkeypatch
     monkeypatch.setattr("mcp.ClientSession", lambda *a, **k: session)
     monkeypatch.setattr("mcp.client.streamable_http.streamablehttp_client", lambda url: _FakeStreamCtx())
 
-    report, bad = await team._verify_claims("some answer text", "http://fake/mcp")
+    report, bad, unavailable = await team._verify_claims("some answer text", "http://fake/mcp")
 
     assert report == "VERDICT: all claims verified"
     assert bad is False
+    assert unavailable is False
     assert session.called_with == ("verify_claims", {"answer": "some answer text"})
+
+
+@pytest.mark.asyncio
+async def test_verify_claims_no_content_or_no_hive_mcp_url_is_not_unavailable(monkeypatch):
+    """Not attempting the check (no content to verify, or hive-mcp not configured at
+    all) is a deliberate no-op, not a degradation -- must stay unavailable=False so
+    every run without hive_mcp_url configured doesn't grow a disclaimer on every answer."""
+    report, bad, unavailable = await team._verify_claims("", "http://fake/mcp")
+    assert (report, bad, unavailable) == ("", False, False)
+
+    report, bad, unavailable = await team._verify_claims("some answer text", None)
+    assert (report, bad, unavailable) == ("", False, False)
 
 
 # ── _fetch_skill_catalog ─────────────────────────────────────────────────────

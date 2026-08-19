@@ -293,8 +293,8 @@ async def test_verified_answer_retries_on_a_lint_violation_report(monkeypatch):
     async def fake_verify_claims(content, hive_mcp_url):
         call_count["n"] += 1
         if call_count["n"] == 1:
-            return canned_report, True
-        return "VERDICT: every checked claim exists in the project.", False
+            return canned_report, True, False
+        return "VERDICT: every checked claim exists in the project.", False, False
 
     monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
 
@@ -337,8 +337,8 @@ async def test_verified_answer_never_tells_the_model_a_doc_only_symbol_does_not_
     async def fake_verify_claims(content, hive_mcp_url):
         call_count["n"] += 1
         if call_count["n"] == 1:
-            return canned_report, True
-        return "VERDICT: every checked claim exists in the project.", False
+            return canned_report, True, False
+        return "VERDICT: every checked claim exists in the project.", False, False
 
     monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
 
@@ -376,7 +376,7 @@ async def test_verified_answer_ground_truth_survives_a_retry_that_makes_no_new_w
     )
 
     async def fake_verify_claims(content, hive_mcp_url):
-        return canned_report, True  # still bad after the retry too -- it gave up
+        return canned_report, True, False  # still bad after the retry too -- it gave up
 
     monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
 
@@ -415,7 +415,7 @@ async def test_verified_answer_does_not_stack_a_second_retry_after_write_claim_g
     )
 
     async def fake_verify_claims(content, hive_mcp_url):
-        return canned_report, True
+        return canned_report, True, False
 
     monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
 
@@ -447,7 +447,7 @@ async def test_verified_answer_single_guard_still_retries_normally_when_budget_a
     still retry as before -- the aggregate budget must not turn into a blanket
     no-retry-ever regression."""
     async def fake_verify_claims(content, hive_mcp_url):
-        return "VERDICT: every checked claim exists in the project.", False
+        return "VERDICT: every checked claim exists in the project.", False, False
 
     monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
 
@@ -463,3 +463,84 @@ async def test_verified_answer_single_guard_still_retries_normally_when_budget_a
 
     assert len(fake_team.prompts) == 1  # the one guard that fired did retry
     assert out.startswith("The statusBadge class has been added to x.scss.")
+
+
+# ---- verify_claims fail-open fix (2026-08-19) -------------------------------
+# See _UNVERIFIED_DISCLAIMER's own comment in swarm/team.py for the live incident
+# this closes: a verify_claims timeout used to return bad=False, indistinguishable
+# from "checked, zero problems" -- a real false claim shipped with no signal that
+# verification never ran. These tests confirm the disclaimer path fires, and
+# critically that it does NOT trigger the expensive missing_symbols/bad_citations
+# retry machinery (no extra _stream_team_run call, no aggregate-budget consumption).
+
+@pytest.mark.asyncio
+async def test_verified_answer_appends_disclaimer_when_verify_claims_is_unavailable(monkeypatch):
+    async def fake_verify_claims(content, hive_mcp_url):
+        return "", False, True  # unavailable -- the check was attempted and failed
+
+    monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
+
+    original_result = _msgs(_tool_msg("get_file_content", "some_file.py"))
+    content = "This module handles seller onboarding."
+    fake_team = _FakeTeam(retry_result=None)
+
+    out = await team._verified_answer(content, "describe the module", fake_team, "http://fake/mcp", result=original_result)
+
+    assert fake_team.prompts == []  # unavailable must NOT trigger the retry pipeline
+    assert out.startswith(content)
+    assert "was unavailable this run" in out
+    assert "claims above have NOT been checked" in out
+
+
+@pytest.mark.asyncio
+async def test_verified_answer_no_disclaimer_when_verify_claims_succeeds_cleanly(monkeypatch):
+    async def fake_verify_claims(content, hive_mcp_url):
+        return "VERDICT: every checked claim exists in the project.", False, False
+
+    monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
+
+    original_result = _msgs(_tool_msg("get_file_content", "some_file.py"))
+    content = "This module handles seller onboarding."
+    fake_team = _FakeTeam(retry_result=None)
+
+    out = await team._verified_answer(content, "describe the module", fake_team, "http://fake/mcp", result=original_result)
+
+    assert fake_team.prompts == []
+    assert out == content  # clean pass -- no disclaimer, no noise
+    assert "unavailable" not in out
+
+
+@pytest.mark.asyncio
+async def test_verified_answer_disclaimer_fires_on_the_post_retry_verify_claims_call_too(monkeypatch):
+    """The second _verify_claims call (line ~2065, after a real correction retry for
+    a genuine fabrication) can independently time out too -- must get the same
+    disclaimer treatment as the first call, not a silent clean return."""
+    canned_report = (
+        "SYMBOLS (1 checked):\n"
+        "  NOT FOUND  totallyMadeUpSymbolXyz\n\n"
+        "VERDICT: 1 claim(s) could NOT be found in the project."
+    )
+    call_count = {"n": 0}
+
+    async def fake_verify_claims(content, hive_mcp_url):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return canned_report, True, False  # first call: real fabrication found
+        return "", False, True  # second call (post-retry): verification unavailable
+
+    monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
+
+    original_result = _msgs(_tool_msg("get_file_content", "some_file.py"))
+    content = "Uses totallyMadeUpSymbolXyz."
+    retry_result = SimpleNamespace(
+        content="Uses realSymbolInstead.",
+        messages=[_tool_msg("get_file_content", "some_file.py")],
+    )
+    fake_team = _FakeTeam(retry_result)
+
+    out = await team._verified_answer(content, "describe the symbol", fake_team, "http://fake/mcp", result=original_result)
+
+    assert len(fake_team.prompts) == 1  # the genuine fabrication earned its one retry
+    assert out.startswith("Uses realSymbolInstead.")
+    assert "was unavailable this run" in out  # but the re-check couldn't confirm the fix, so say so
+    assert "NOT FOUND" not in out  # must not show the FIRST call's stale report -- that citation was already retried
