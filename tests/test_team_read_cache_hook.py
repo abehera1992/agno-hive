@@ -23,7 +23,11 @@ import asyncio
 
 import pytest
 
-from swarm.team import _make_read_cache_tool_hook, _build_team, _CACHEABLE_READ_TOOLS
+from swarm.team import (
+    _make_read_cache_tool_hook, _build_team, _CACHEABLE_READ_TOOLS,
+    _collapse_prior_stub_messages, _COLLAPSED_STUB_MARKER,
+    _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS,
+)
 
 
 # ── _make_read_cache_tool_hook: caching behavior ────────────────────────────────
@@ -169,6 +173,7 @@ def test_cacheable_read_tools_excludes_every_mutating_tool():
 class _FakeAgent:
     def __init__(self, name):
         self.name = name
+        self.tool_choice = None  # mirrors the real agno Agent's own default
 
 
 @pytest.mark.asyncio
@@ -442,6 +447,284 @@ async def test_delegation_to_a_different_member_does_not_reset_an_unrelated_memb
     )
 
     assert still_stubbed != "file body"  # Reviewer's own generation is unaffected by Coder's delegation
+
+
+# ── force text-only after consecutive ignored stubs (T12, 2026-08-19) ──────────
+#
+# Live incident: Reviewer called the SAME get_file_content(...) 29 times in a
+# row, each time getting the escalated FORCED STOP warning and calling again
+# immediately anyway -- text alone did not redirect it. These tests confirm the
+# mechanical backstop: once an agent's stub streak (reset by any real fetch)
+# crosses _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS, its own live Agent object's
+# `.tool_choice` is forced to "none" -- agno reads `agent.tool_choice` fresh off
+# the live object on every model call (confirmed by reading agno/agent/_run.py
+# directly), so this actually prevents the very next tool call attempt.
+
+@pytest.mark.asyncio
+async def test_tool_choice_is_forced_to_none_after_enough_consecutive_stubs():
+    hook = _make_read_cache_tool_hook()
+    reviewer = _FakeAgent("Reviewer")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+    assert reviewer.tool_choice is None  # untouched after the one real serve
+
+    for _ in range(_FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS - 1):
+        await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+        assert reviewer.tool_choice is None  # still under the streak threshold
+
+    await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+    assert reviewer.tool_choice == "none"  # streak crossed the threshold
+
+
+@pytest.mark.asyncio
+async def test_stub_streak_resets_on_a_real_fetch_of_a_different_file():
+    """Reading three different NEW files, each individually stubbed once on a
+    legitimate later re-check, is not the same as 3 stubs IN A ROW for the SAME
+    call -- the streak must reset on any real, non-stubbed fetch."""
+    hook = _make_read_cache_tool_hook()
+    reviewer = _FakeAgent("Reviewer")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    for path in ("a.py", "b.py"):
+        await hook("get_file_content", fake_get_file_content, {"relative_path": path}, agent=reviewer)
+        await hook("get_file_content", fake_get_file_content, {"relative_path": path}, agent=reviewer)  # 1 stub each
+
+    assert reviewer.tool_choice is None  # only 1 consecutive stub at a time, streak never built up
+
+
+@pytest.mark.asyncio
+async def test_tool_choice_force_none_only_applies_to_member_agents_not_the_coordinator():
+    """agent=None (the coordinator's own direct calls) has no accessible mutable
+    object here -- the streak is still tracked but never mutates anything."""
+    hook = _make_read_cache_tool_hook()
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    for _ in range(_FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS + 2):
+        result = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=None)
+
+    assert result != "file body"  # still stubs correctly
+    # No object to assert on for the coordinator -- this test's real point is
+    # that the call above doesn't raise (agent=None must be handled safely).
+
+
+@pytest.mark.asyncio
+async def test_tool_choice_is_reset_on_a_fresh_delegation_to_the_same_member():
+    """A brand-new delegation deserves a clean slate -- same principle the
+    generation-scoped serve budget already uses."""
+    hook = _make_read_cache_tool_hook()
+    reviewer = _FakeAgent("Reviewer")
+
+    async def fake_delegate(**kwargs):
+        return "delegated result"
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    await hook("delegate_task_to_member", fake_delegate, {"member_id": "reviewer", "task": "first"})
+    for _ in range(_FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS + 1):  # +1: the 1st call is a real serve, not a stub
+        await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+    assert reviewer.tool_choice == "none"
+
+    await hook("delegate_task_to_member", fake_delegate, {"member_id": "reviewer", "task": "second"})
+    assert reviewer.tool_choice is None  # restored for the fresh delegation
+
+
+@pytest.mark.asyncio
+async def test_tool_choice_is_reset_for_everyone_on_a_broadcast_delegation():
+    hook = _make_read_cache_tool_hook()
+    reviewer = _FakeAgent("Reviewer")
+
+    async def fake_delegate(**kwargs):
+        return "delegated result"
+
+    async def fake_broadcast(**kwargs):
+        return "broadcast result"
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    await hook("delegate_task_to_member", fake_delegate, {"member_id": "reviewer", "task": "first"})
+    for _ in range(_FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS + 1):  # +1: the 1st call is a real serve, not a stub
+        await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+    assert reviewer.tool_choice == "none"
+
+    await hook("delegate_task_to_members", fake_broadcast, {"task": "re-verify everything"})
+    assert reviewer.tool_choice is None  # broadcast resets every known agent's tool_choice too
+
+
+# ── context pruning: collapse prior stub messages (T12, 2026-08-19) ────────────
+#
+# Each ignored repeat left another near-identical stub message in the agent's
+# own conversation history -- by the 10th repeat, recent context was
+# increasingly dominated by that same repeated block, plausibly reinforcing the
+# exact degenerate-loop tendency the whole safeguard section exists to break.
+# _collapse_prior_stub_messages mutates (never removes -- agno's RunContext.messages
+# is a shallow-copied list, protected against .clear()/.append(), but the
+# Message objects inside it are the real shared references) any EARLIER stub
+# message for the SAME (tool_name, args) pair down to a short marker.
+
+class _FakeMessage:
+    def __init__(self, role, content, tool_name=None, tool_args=None):
+        self.role = role
+        self.content = content
+        self.tool_name = tool_name
+        self.tool_args = tool_args
+
+
+class _FakeRunContextWithMessages:
+    def __init__(self, messages):
+        self.messages = messages
+        self.session_state = {}
+
+
+def test_collapse_prior_stub_messages_collapses_a_matching_duplicate_stub():
+    prior_stub = _FakeMessage(
+        "tool", "Already returned this exact get_file_content(...) result to Reviewer 1 time(s) already this run.",
+        tool_name="get_file_content", tool_args={"relative_path": "x.py"},
+    )
+    run_context = _FakeRunContextWithMessages([prior_stub])
+
+    collapsed = _collapse_prior_stub_messages(run_context, "get_file_content", '{"relative_path": "x.py"}')
+
+    assert collapsed == 1
+    assert prior_stub.content == _COLLAPSED_STUB_MARKER
+
+
+def test_collapse_prior_stub_messages_never_touches_real_content():
+    real_result = _FakeMessage(
+        "tool", "# API/inventory-service/models.py -- lines 0..50 of 774\n...",
+        tool_name="get_file_content", tool_args={"relative_path": "x.py"},
+    )
+    run_context = _FakeRunContextWithMessages([real_result])
+
+    collapsed = _collapse_prior_stub_messages(run_context, "get_file_content", '{"relative_path": "x.py"}')
+
+    assert collapsed == 0
+    assert real_result.content.startswith("# API/inventory-service/models.py")  # untouched
+
+
+def test_collapse_prior_stub_messages_never_touches_a_different_calls_stub():
+    """A stub for a DIFFERENT file must not be collapsed just because the same
+    tool name repeats -- only the exact (tool_name, args) pair currently being
+    re-stubbed qualifies."""
+    other_file_stub = _FakeMessage(
+        "tool", "Already returned this exact get_file_content(...) result to Reviewer 1 time(s) already this run.",
+        tool_name="get_file_content", tool_args={"relative_path": "y.py"},
+    )
+    run_context = _FakeRunContextWithMessages([other_file_stub])
+
+    collapsed = _collapse_prior_stub_messages(run_context, "get_file_content", '{"relative_path": "x.py"}')
+
+    assert collapsed == 0
+    assert other_file_stub.content != _COLLAPSED_STUB_MARKER
+
+
+def test_collapse_prior_stub_messages_never_touches_a_different_tools_stub():
+    other_tool_stub = _FakeMessage(
+        "tool", "STOP calling search_files(...) -- this is repeat #3 of the IDENTICAL call.",
+        tool_name="search_files", tool_args={"relative_path": "x.py"},
+    )
+    run_context = _FakeRunContextWithMessages([other_tool_stub])
+
+    collapsed = _collapse_prior_stub_messages(run_context, "get_file_content", '{"relative_path": "x.py"}')
+
+    assert collapsed == 0
+
+
+def test_collapse_prior_stub_messages_skips_already_collapsed_entries():
+    """An entry already collapsed by an earlier repeat must not be re-counted
+    (its content no longer starts with a stub prefix once collapsed)."""
+    already_collapsed = _FakeMessage(
+        _COLLAPSED_STUB_MARKER, _COLLAPSED_STUB_MARKER,  # role field irrelevant here, content is what matters
+        tool_name="get_file_content", tool_args={"relative_path": "x.py"},
+    )
+    already_collapsed.role = "tool"
+    run_context = _FakeRunContextWithMessages([already_collapsed])
+
+    collapsed = _collapse_prior_stub_messages(run_context, "get_file_content", '{"relative_path": "x.py"}')
+
+    assert collapsed == 0
+
+
+def test_collapse_prior_stub_messages_collapses_multiple_prior_stubs_at_once():
+    stubs = [
+        _FakeMessage(
+            "tool", f"STOP calling get_file_content(...) -- this is repeat #{n} of the IDENTICAL call.",
+            tool_name="get_file_content", tool_args={"relative_path": "x.py"},
+        )
+        for n in range(2, 5)
+    ]
+    run_context = _FakeRunContextWithMessages(stubs)
+
+    collapsed = _collapse_prior_stub_messages(run_context, "get_file_content", '{"relative_path": "x.py"}')
+
+    assert collapsed == 3
+    assert all(msg.content == _COLLAPSED_STUB_MARKER for msg in stubs)
+
+
+def test_collapse_prior_stub_messages_handles_none_run_context():
+    assert _collapse_prior_stub_messages(None, "get_file_content", '{"relative_path": "x.py"}') == 0
+
+
+def test_collapse_prior_stub_messages_handles_empty_messages():
+    run_context = _FakeRunContextWithMessages([])
+    assert _collapse_prior_stub_messages(run_context, "get_file_content", '{"relative_path": "x.py"}') == 0
+
+
+def test_collapse_prior_stub_messages_handles_unserializable_tool_args():
+    class _NotJsonSerializable:
+        pass
+
+    bad_stub = _FakeMessage(
+        "tool", "STOP calling get_file_content(...) -- this is repeat #2 of the IDENTICAL call.",
+        tool_name="get_file_content", tool_args={"weird": _NotJsonSerializable()},
+    )
+    run_context = _FakeRunContextWithMessages([bad_stub])
+
+    # Must not raise -- an unserializable tool_args just never matches.
+    collapsed = _collapse_prior_stub_messages(run_context, "get_file_content", '{"relative_path": "x.py"}')
+    assert collapsed == 0
+
+
+@pytest.mark.asyncio
+async def test_read_cache_hook_actually_collapses_prior_stubs_via_run_context():
+    """End-to-end through the real hook: a repeated call must collapse the
+    EARLIER stub message already sitting in run_context.messages."""
+    hook = _make_read_cache_tool_hook()
+    reviewer = _FakeAgent("Reviewer")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    # Real fetch, then two repeats -- each repeat should collapse any prior
+    # stub for the SAME call already in messages.
+    await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+
+    first_stub_message = _FakeMessage(
+        "tool", "placeholder",  # overwritten with the real stub text below
+        tool_name="get_file_content", tool_args={"relative_path": "x.py"},
+    )
+    run_context = _FakeRunContextWithMessages([first_stub_message])
+    first_stub_text = await hook(
+        "get_file_content", fake_get_file_content, {"relative_path": "x.py"},
+        agent=reviewer, run_context=run_context,
+    )
+    first_stub_message.content = first_stub_text  # simulate agno appending the real stub to history
+
+    second_stub_text = await hook(
+        "get_file_content", fake_get_file_content, {"relative_path": "x.py"},
+        agent=reviewer, run_context=run_context,
+    )
+
+    assert first_stub_message.content == _COLLAPSED_STUB_MARKER  # collapsed by the second repeat
+    assert second_stub_text != _COLLAPSED_STUB_MARKER  # the NEWEST stub is still the real, current warning
 
 
 # ── _build_team wiring: shared hook across coordinator AND every member ────────

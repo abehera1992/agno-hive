@@ -2243,6 +2243,138 @@ def _forced_answer_nudge(agent_key: str, total_stub_count: int) -> str:
     )
 
 
+# ── Runtime harness safeguards for a model that ignores the stub warnings ──────
+#
+# T12 live incident (2026-08-19, task kni9lmkzx): Reviewer called
+# get_file_content('API/inventory-service/router/parties_api.py', offset=0,
+# limit=0) 29 TIMES IN A ROW, roughly every 2 seconds, each time receiving the
+# escalated FORCED STOP warning above and simply calling again immediately --
+# text alone did not redirect it. Confirmed via the same run's own free-text
+# output: right before this, the model's own written answer had ALSO degenerated
+# into repeating the same sentence dozens of times ("The conclusion is that
+# there are no RTK Query hooks...") -- the same underlying LLM failure mode
+# (a model whose own recent context is dominated by a repeated pattern becomes
+# statistically more likely to keep extending that pattern) manifesting as a
+# repeated TOOL CALL instead of repeated prose. The liveness watchdog's
+# max_stub_serve_count Tier-2 signal did eventually kill the run with a clear,
+# accurate reason ("repeated an identical call 18 times despite being told to
+# stop") -- a real improvement over T6/T12's original silent 300s hang -- but
+# 29 wasted calls (~58s) is still 29 more than necessary once the model has
+# unambiguously stopped listening to the text warning.
+#
+# Two complementary, MECHANICAL fixes (matching this file's own established
+# doctrine -- _strip_mutating's docstring, 2026-07-31: "Instructions shape what
+# a model says; only the tool surface constrains what it does"), both wired
+# into _make_read_cache_tool_hook at the point a stub is about to be served:
+#
+# 1. Force text-only after N consecutive ignored stubs (this function): once an
+#    agent has been served _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS stubs IN A
+#    ROW (reset to 0 by any real, non-stubbed fetch), its live agno Agent
+#    object's own `.tool_choice` is set to "none" -- confirmed by reading
+#    agno/agent/_run.py directly: every model-call site reads `agent.tool_choice`
+#    FRESH off the live object on each iteration (not cached at construction),
+#    so mutating it from inside a tool_hook takes effect on that agent's VERY
+#    NEXT model call. tool_choice="none" is the real OpenAI-API-compatible
+#    instruction that structurally PREVENTS the model from calling any tool at
+#    all on its next turn -- it must respond with text -- which is exactly what
+#    the existing _forced_answer_nudge message already asks for in words. This
+#    turns "please stop and answer" from a suggestion into the only option.
+#    Reset back to None (full tool access restored) at the start of the next
+#    FRESH delegation to that member (see _read_cache_tool_hook's
+#    _DELEGATION_TOOL_NAMES branch) -- a new delegation deserves a clean slate,
+#    same principle _MAX_FULL_SERVES_PER_AGENT's own generation-scoping uses.
+#    Only covers delegated MEMBER agents (agent is not None) -- the coordinator's
+#    own direct calls (agent=None) have no accessible mutable object here, same
+#    scoping gap _record_read's docstring already notes for other mechanisms;
+#    the coordinator mostly delegates rather than reading directly, so this is
+#    the common case, not full coverage.
+_FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS = 3
+
+
+def _bump_consecutive_stub_and_maybe_force_text_only(
+    norm_agent_key: str, agent, consecutive_stub_count: dict[str, int],
+) -> None:
+    """Track how many stub responses in a row (not merely total) an agent has
+    been served, and force it into text-only mode once that streak crosses
+    _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS. Any real, non-stubbed fetch resets
+    the streak to 0 (a caller does this directly; this function only ever
+    increments) -- an agent that reads three different NEW files, each stubbed
+    on a legitimate later re-check, is not "stuck" the way 3 stubs IN A ROW for
+    the SAME pattern is."""
+    consecutive_stub_count[norm_agent_key] = consecutive_stub_count.get(norm_agent_key, 0) + 1
+    if consecutive_stub_count[norm_agent_key] >= _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS and agent is not None:
+        agent.tool_choice = "none"
+
+
+# 2. Context pruning (_collapse_prior_stub_messages): the T12 incident's 29
+#    repeats didn't just waste 58s -- each repeat left ANOTHER near-identical
+#    ~250-char "Already returned this exact..."/"STOP calling..." message in the
+#    agent's own conversation history, so by repeat #10 its recent context was
+#    increasingly dominated by that same repeated block -- plausibly reinforcing
+#    the exact degenerate-loop tendency this whole section exists to break,
+#    rather than just being inert waste. `agno.run.base.RunContext.messages` is
+#    documented (confirmed by reading agno/run/base.py directly) as "available
+#    in tool hooks... hooks receive a shallow copy... so accidental list
+#    mutations (.clear(), .append()) won't corrupt the run. Individual Message
+#    objects are shared references -- do not mutate them" -- read literally,
+#    that rules out removing entries (the list itself is protected), but the
+#    live Message objects inside it ARE the real, shared objects the next model
+#    call will actually see. Mutating an EARLIER stub message's own `.content`
+#    in place -- collapsing it to a short marker -- is exactly the mutation
+#    that docstring's own wording doesn't forbid, and is the only lever this
+#    hook actually has for shrinking what's already in history (removing entries
+#    outright is not achievable from here). Only ever touches messages this
+#    file's own stub functions generated (matched by exact known prefix,
+#    _STUB_MESSAGE_PREFIXES) for the SAME (tool_name, args) pair currently being
+#    re-stubbed -- never a genuine tool result, and never a different call.
+_STUB_MESSAGE_PREFIXES = ("Already returned this exact ", "STOP calling ", "FORCED STOP — ")
+_COLLAPSED_STUB_MARKER = (
+    "[collapsed: an earlier duplicate-call warning for this exact call -- "
+    "superseded, see the latest response instead]"
+)
+
+
+def _collapse_prior_stub_messages(run_context, function_name: str, args_key: str) -> int:
+    """Mutate (never remove -- see this section's own comment on why removal
+    isn't available here) any PRIOR message in run_context.messages that is
+    itself one of this file's own stub responses (_duplicate_read_stub /
+    _not_found_retry_stub / _forced_answer_nudge, identified by exact known
+    prefix) for the SAME (function_name, args_key) pair currently being
+    re-stubbed, collapsing its content to a short marker. Returns the number of
+    messages collapsed (0 if run_context/messages is unavailable, or nothing
+    qualified) -- purely a diagnostic count, never load-bearing for the caller.
+
+    Matches on tool_args (re-serialized the SAME way args_key is built
+    elsewhere in this hook) rather than trusting message ordering/position, so
+    an interleaved, unrelated tool call in between two stubs for the same
+    (tool, args) pair doesn't break matching."""
+    if run_context is None:
+        return 0
+    messages = getattr(run_context, "messages", None)
+    if not messages:
+        return 0
+    collapsed = 0
+    for msg in messages:
+        if getattr(msg, "role", None) != "tool":
+            continue
+        if getattr(msg, "tool_name", None) != function_name:
+            continue
+        content = getattr(msg, "content", None)
+        if not isinstance(content, str) or not content.startswith(_STUB_MESSAGE_PREFIXES):
+            continue
+        if content == _COLLAPSED_STUB_MARKER:
+            continue  # already collapsed by an earlier repeat -- don't re-count it
+        try:
+            msg_args_key = json.dumps(getattr(msg, "tool_args", None) or {}, sort_keys=True)
+        except TypeError:
+            continue
+        if msg_args_key != args_key:
+            continue
+        msg.content = _COLLAPSED_STUB_MARKER
+        collapsed += 1
+    return collapsed
+
+
 # Shared session_state (AGNOHive architecture review, Recommendation on
 # share_member_interactions, 2026-08-13): agno's Team AND Agent classes both
 # already support session_state/enable_agentic_state (confirmed via direct source
@@ -2411,6 +2543,14 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # bumps every agent's effective generation via the max() below rather than
     # trying to enumerate the roster here.
     delegation_generation: dict[str, int] = {}
+    # See _bump_consecutive_stub_and_maybe_force_text_only's own section-level
+    # comment (above _duplicate_read_stub's sibling functions) for both of these:
+    # agent_objects lets a later stub-serve reach back into the actual live Agent
+    # object (captured the first time we see it, since delegate_task_to_member's
+    # own args only carry the member_id STRING, never the object) to mutate its
+    # tool_choice; consecutive_stub_count is the streak that decides when to.
+    agent_objects: dict[str, object] = {}
+    consecutive_stub_count: dict[str, int] = {}
 
     async def _read_cache_tool_hook(function_name, function, args, agent=None, run_context=None):
         if function_name in _DELEGATION_TOOL_NAMES:
@@ -2418,8 +2558,17 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 target = _member_id(str((args or {}).get("member_id", "")).strip())
                 if target:
                     delegation_generation[target] = delegation_generation.get(target, 0) + 1
+                    # Fresh delegation -- clean slate, same principle the
+                    # generation-scoped serve budget above already applies.
+                    consecutive_stub_count[target] = 0
+                    member_obj = agent_objects.get(target)
+                    if member_obj is not None:
+                        member_obj.tool_choice = None
             else:  # delegate_task_to_members -- broadcasts to the whole team, no single target
                 delegation_generation["__broadcast__"] = delegation_generation.get("__broadcast__", 0) + 1
+                consecutive_stub_count.clear()
+                for member_obj in agent_objects.values():
+                    member_obj.tool_choice = None
             return await function(**args)
 
         if function_name not in _CACHEABLE_READ_TOOLS:
@@ -2430,8 +2579,11 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             return await function(**args)  # non-JSON-serializable args -- skip caching, call through
 
         agent_key = getattr(agent, "name", None) or ""
+        norm_agent_key = _member_id(agent_key) if agent_key else ""
+        if agent is not None and norm_agent_key:
+            agent_objects[norm_agent_key] = agent
         generation = max(
-            delegation_generation.get(_member_id(agent_key), 0) if agent_key else 0,
+            delegation_generation.get(norm_agent_key, 0),
             delegation_generation.get("__broadcast__", 0),
         )
         cache_key = (function_name, args_key)
@@ -2455,6 +2607,8 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             if activity is not None:
                 activity["max_stub_serve_count"] = max(activity.get("max_stub_serve_count", 0), count)
                 activity["total_stub_serve_count"] = activity.get("total_stub_serve_count", 0) + 1
+            _collapse_prior_stub_messages(run_context, function_name, args_key)
+            _bump_consecutive_stub_and_maybe_force_text_only(norm_agent_key, agent, consecutive_stub_count)
             return _not_found_retry_stub(relative_path, count)
 
         is_fresh_fetch = cache_key not in cache
@@ -2489,9 +2643,12 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 # already-stubbed files, each individually staying under budget).
                 activity["total_stub_serve_count"] = activity.get("total_stub_serve_count", 0) + 1
                 total = activity["total_stub_serve_count"]
+            _collapse_prior_stub_messages(run_context, function_name, args_key)
+            _bump_consecutive_stub_and_maybe_force_text_only(norm_agent_key, agent, consecutive_stub_count)
             if total is not None and total >= _FORCED_ANSWER_AGGREGATE_THRESHOLD:
                 return _forced_answer_nudge(agent_key, total)
             return _duplicate_read_stub(function_name, args, agent_key, count, len(str(result)))
+        consecutive_stub_count[norm_agent_key] = 0
         return result
 
     return _read_cache_tool_hook
