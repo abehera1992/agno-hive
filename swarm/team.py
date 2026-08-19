@@ -2300,16 +2300,48 @@ def _forced_answer_nudge(agent_key: str, total_stub_count: int) -> str:
 #
 # 1. Force text-only after N consecutive ignored stubs (this function): once an
 #    agent has been served _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS stubs IN A
-#    ROW (reset to 0 by any real, non-stubbed fetch), its live agno Agent
-#    object's own `.tool_choice` is set to "none" -- confirmed by reading
-#    agno/agent/_run.py directly: every model-call site reads `agent.tool_choice`
-#    FRESH off the live object on each iteration (not cached at construction),
-#    so mutating it from inside a tool_hook takes effect on that agent's VERY
-#    NEXT model call. tool_choice="none" is the real OpenAI-API-compatible
-#    instruction that structurally PREVENTS the model from calling any tool at
-#    all on its next turn -- it must respond with text -- which is exactly what
-#    the existing _forced_answer_nudge message already asks for in words. This
-#    turns "please stop and answer" from a suggestion into the only option.
+#    ROW (reset to 0 by any real, non-stubbed fetch), we force it into text-only
+#    mode. tool_choice="none" is the real OpenAI-API-compatible instruction that
+#    structurally PREVENTS the model from calling any tool at all on its next
+#    turn -- it must respond with text -- which is exactly what the existing
+#    _forced_answer_nudge message already asks for in words. This turns "please
+#    stop and answer" from a suggestion into the only option.
+#
+#    CORRECTED 2026-08-19 (live T6 re-test, task kcu56j2i3) -- the original
+#    version of this fix mutated `agent.tool_choice` and was WRONG about where
+#    agno reads it from. `agent.tool_choice` is captured ONCE, as a plain
+#    function-call argument, when Agent._run calls
+#    acall_model_with_fallback(..., tool_choice=agent.tool_choice, ...)
+#    (agno/agent/_run.py) -- and the entire repeated tool-call loop for one
+#    delegation happens INSIDE that single call, inside Model.aresponse_stream's
+#    own `while True:` loop (agno/models/base.py), which reuses that same
+#    captured value every iteration via `tool_choice=tool_choice or
+#    self._tool_choice`. A tool_hook mutating `agent.tool_choice` mid-loop was
+#    therefore mutating something that had already been read and passed by
+#    value -- it could only ever affect a FUTURE, separate arun() call (i.e. the
+#    next delegate_task_to_member), never the CURRENT in-flight one where the
+#    repeat was actually happening. And since a fresh delegation resets this
+#    right back to None (see _read_cache_tool_hook's _DELEGATION_TOOL_NAMES
+#    branch, by original design so a new delegation gets a clean slate), the two
+#    halves of the mechanism cancelled each other out and it never functionally
+#    fired. Live-confirmed: Researcher's consecutive-stub streak crossed the
+#    threshold at serve #4, yet calls #5 and #6 still went through identically;
+#    what actually stopped the loop was the pre-existing, unrelated aggregate-
+#    threshold `_forced_answer_nudge` (a soft, in-content nudge, not a hard
+#    API-level constraint).
+#
+#    The real per-iteration value in that `while True:` loop is `self._tool_choice`
+#    -- a private attribute read LIVE off the Model instance (`self`) on every
+#    pass, precisely because `tool_choice or self._tool_choice` only falls
+#    through to it when the captured outer param is falsy (the normal case,
+#    since agent.tool_choice defaults to None). Mutating `agent.model._tool_choice`
+#    from inside a tool_hook DOES reach the current, in-flight loop on its very
+#    next iteration -- `agent.model` is the exact same object bound as `self`
+#    there (get_model() in swarm/agents.py builds one distinct Model instance
+#    per agent, so this mutation cannot leak across roles). This function now
+#    mutates `agent.model._tool_choice` (the fix); `agent.tool_choice` is kept
+#    as a harmless, defensive belt-and-suspenders set in case a future agno
+#    version changes the outer capture to be re-read per iteration too.
 #    Reset back to None (full tool access restored) at the start of the next
 #    FRESH delegation to that member (see _read_cache_tool_hook's
 #    _DELEGATION_TOOL_NAMES branch) -- a new delegation deserves a clean slate,
@@ -2335,6 +2367,9 @@ def _bump_consecutive_stub_and_maybe_force_text_only(
     consecutive_stub_count[norm_agent_key] = consecutive_stub_count.get(norm_agent_key, 0) + 1
     if consecutive_stub_count[norm_agent_key] >= _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS and agent is not None:
         agent.tool_choice = "none"
+        model = getattr(agent, "model", None)
+        if model is not None:
+            model._tool_choice = "none"
 
 
 # 2. Context pruning (_collapse_prior_stub_messages): the T12 incident's 29
@@ -2595,11 +2630,17 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     member_obj = agent_objects.get(target)
                     if member_obj is not None:
                         member_obj.tool_choice = None
+                        member_model = getattr(member_obj, "model", None)
+                        if member_model is not None:
+                            member_model._tool_choice = None
             else:  # delegate_task_to_members -- broadcasts to the whole team, no single target
                 delegation_generation["__broadcast__"] = delegation_generation.get("__broadcast__", 0) + 1
                 consecutive_stub_count.clear()
                 for member_obj in agent_objects.values():
                     member_obj.tool_choice = None
+                    member_model = getattr(member_obj, "model", None)
+                    if member_model is not None:
+                        member_model._tool_choice = None
             return await function(**args)
 
         if function_name not in _CACHEABLE_READ_TOOLS:

@@ -170,10 +170,23 @@ def test_cacheable_read_tools_excludes_every_mutating_tool():
 # a short stub instead (see the "delegation-generation scoping" section further down
 # for the fresh-budget-per-delegation half of this).
 
+class _FakeModel:
+    """Stand-in for agno's Model instance bound to `agent.model`. Only
+    `_tool_choice` matters here -- see _bump_consecutive_stub_and_maybe_force_text_only's
+    2026-08-19 correction: this is the attribute Model.aresponse_stream's own
+    `while True:` loop actually re-reads on every iteration (`tool_choice or
+    self._tool_choice`), unlike `agent.tool_choice` which agno only captures
+    once, by value, before that loop starts."""
+
+    def __init__(self):
+        self._tool_choice = None
+
+
 class _FakeAgent:
     def __init__(self, name):
         self.name = name
         self.tool_choice = None  # mirrors the real agno Agent's own default
+        self.model = _FakeModel()  # mirrors the real agno Agent's own .model
 
 
 @pytest.mark.asyncio
@@ -455,10 +468,25 @@ async def test_delegation_to_a_different_member_does_not_reset_an_unrelated_memb
 # row, each time getting the escalated FORCED STOP warning and calling again
 # immediately anyway -- text alone did not redirect it. These tests confirm the
 # mechanical backstop: once an agent's stub streak (reset by any real fetch)
-# crosses _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS, its own live Agent object's
-# `.tool_choice` is forced to "none" -- agno reads `agent.tool_choice` fresh off
-# the live object on every model call (confirmed by reading agno/agent/_run.py
-# directly), so this actually prevents the very next tool call attempt.
+# crosses _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS, we force it into text-only
+# mode.
+#
+# CORRECTED 2026-08-19 (live T6 re-test, task kcu56j2i3): the original version
+# only set `agent.tool_choice = "none"` and a live re-test showed this had NO
+# effect -- Researcher's streak crossed the threshold at serve #4, yet calls #5
+# and #6 still fired identically. Root cause: `agent.tool_choice` is captured
+# ONCE, by value, when Agent._run calls acall_model_with_fallback(...); the
+# entire repeated tool-call loop for one delegation happens INSIDE that single
+# call, inside Model.aresponse_stream's own `while True:` loop (agno/models/base.py),
+# which reuses that same captured value every iteration. Mutating
+# `agent.tool_choice` mid-loop was mutating something already read and passed
+# by value -- it could only affect a FUTURE, separate delegation, which the
+# fresh-delegation reset below immediately undoes anyway. The value actually
+# re-read fresh on every loop iteration is `self._tool_choice` on the MODEL
+# instance itself (`tool_choice or self._tool_choice`, `self` being `agent.model`)
+# -- these tests now assert on `reviewer.model._tool_choice`, the attribute that
+# actually reaches the in-flight loop; `reviewer.tool_choice` is still asserted
+# too since the fix keeps setting it as a harmless defensive belt-and-suspenders.
 
 @pytest.mark.asyncio
 async def test_tool_choice_is_forced_to_none_after_enough_consecutive_stubs():
@@ -469,14 +497,15 @@ async def test_tool_choice_is_forced_to_none_after_enough_consecutive_stubs():
         return "file body"
 
     await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
-    assert reviewer.tool_choice is None  # untouched after the one real serve
+    assert reviewer.model._tool_choice is None  # untouched after the one real serve
 
     for _ in range(_FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS - 1):
         await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
-        assert reviewer.tool_choice is None  # still under the streak threshold
+        assert reviewer.model._tool_choice is None  # still under the streak threshold
 
     await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
-    assert reviewer.tool_choice == "none"  # streak crossed the threshold
+    assert reviewer.model._tool_choice == "none"  # streak crossed the threshold -- the real, load-bearing mutation
+    assert reviewer.tool_choice == "none"  # defensive belt-and-suspenders, kept alongside
 
 
 @pytest.mark.asyncio
@@ -494,7 +523,7 @@ async def test_stub_streak_resets_on_a_real_fetch_of_a_different_file():
         await hook("get_file_content", fake_get_file_content, {"relative_path": path}, agent=reviewer)
         await hook("get_file_content", fake_get_file_content, {"relative_path": path}, agent=reviewer)  # 1 stub each
 
-    assert reviewer.tool_choice is None  # only 1 consecutive stub at a time, streak never built up
+    assert reviewer.model._tool_choice is None  # only 1 consecutive stub at a time, streak never built up
 
 
 @pytest.mark.asyncio
@@ -530,10 +559,11 @@ async def test_tool_choice_is_reset_on_a_fresh_delegation_to_the_same_member():
     await hook("delegate_task_to_member", fake_delegate, {"member_id": "reviewer", "task": "first"})
     for _ in range(_FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS + 1):  # +1: the 1st call is a real serve, not a stub
         await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
-    assert reviewer.tool_choice == "none"
+    assert reviewer.model._tool_choice == "none"
 
     await hook("delegate_task_to_member", fake_delegate, {"member_id": "reviewer", "task": "second"})
-    assert reviewer.tool_choice is None  # restored for the fresh delegation
+    assert reviewer.model._tool_choice is None  # restored for the fresh delegation
+    assert reviewer.tool_choice is None
 
 
 @pytest.mark.asyncio
@@ -553,10 +583,11 @@ async def test_tool_choice_is_reset_for_everyone_on_a_broadcast_delegation():
     await hook("delegate_task_to_member", fake_delegate, {"member_id": "reviewer", "task": "first"})
     for _ in range(_FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS + 1):  # +1: the 1st call is a real serve, not a stub
         await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
-    assert reviewer.tool_choice == "none"
+    assert reviewer.model._tool_choice == "none"
 
     await hook("delegate_task_to_members", fake_broadcast, {"task": "re-verify everything"})
-    assert reviewer.tool_choice is None  # broadcast resets every known agent's tool_choice too
+    assert reviewer.model._tool_choice is None  # broadcast resets every known agent's tool_choice too
+    assert reviewer.tool_choice is None
 
 
 # ── context pruning: collapse prior stub messages (T12, 2026-08-19) ────────────
