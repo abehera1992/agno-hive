@@ -1677,6 +1677,53 @@ def _count_read_calls(result, tool_names: set[str] = _READ_TOOLS) -> int:
     return n if recognised else -1
 
 
+# agno's own wording when it refuses a call past tool_call_limit -- see
+# create_tool_call_limit_error_result in the installed agno package
+# (agno/models/base.py): "Tool call limit reached. Tool call {name} not executed.
+# Don't try to execute it again."
+_TOOL_LIMIT_MARKER = "tool call limit reached"
+
+
+def _tools_refused_for_limit(result) -> list[str]:
+    """Tool names agno REFUSED to run this turn because tool_call_limit was hit.
+
+    This is the one failure in this file that no tool hook can ever see. Reading
+    agno/models/base.py directly: once current_function_call_count exceeds the limit it
+    appends create_tool_call_limit_error_result(fc) and `continue`s, so the call never
+    enters function_calls_to_run and NO tool event is yielded for it. Every reinforcement
+    this codebase has -- the duplicate-read stub, the forced-answer nudge, the
+    tool_choice="none" escalation, stub collapsing -- hangs off tool hooks, which only
+    fire for calls that actually run. A refused call is invisible to all of them, which
+    is exactly why the gap was recorded as "bypasses every one of this file's
+    reinforcement hooks entirely" and left open.
+
+    What IS reachable is the refusal message itself: agno adds it to the run's messages
+    as a normal tool-role message with tool_call_error=True, so it can be read after the
+    fact even though it was never announced as an event.
+
+    Production evidence for why this matters (30-day log review, 2026-08-20): a run whose
+    Researcher exhausted its budget spent its remaining turns narrating "I'm encountering
+    a persistent tool call limit that's preventing me from retrieving the
+    utility_ai_client file. Let me try to get the file content directly from the project
+    structure instead" over and over -- agno had already told it "Don't try to execute it
+    again" and it kept trying -- until the repetition detector killed the run. Another
+    ended with RunCompleted content "No context retrieved. Tool call limits exceeded."
+    In both cases the answer rested on evidence the run was never able to gather, and
+    nothing said so.
+    """
+    refused: list[str] = []
+    for m in (getattr(result, "messages", None) or []):
+        if getattr(m, "role", None) != "tool":
+            continue
+        if not getattr(m, "tool_call_error", False):
+            continue
+        if _TOOL_LIMIT_MARKER in str(getattr(m, "content", "") or "").lower():
+            name = getattr(m, "tool_name", None) or "<unknown tool>"
+            if name not in refused:
+                refused.append(name)
+    return refused
+
+
 def _count_delegations(team) -> int:
     """How many real delegations the coordinator made this run. -1 = undeterminable.
 
@@ -2368,6 +2415,29 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"the running database, and may not reflect its actual current state.**"
                 + _summarize_actual_writes(*all_results)
             )
+
+    # Tool-budget-exhausted check. Unlike every other guard here this one cannot force a
+    # retry: a re-run would hit the same ceiling, and agno has already told the model
+    # "Don't try to execute it again". Disclosure is the whole remedy -- the answer may
+    # rest on evidence the run was refused, and previously nothing said so. Checked
+    # across ALL attempts, not just the last: an earlier attempt exhausting its budget
+    # still shaped the answer that survived.
+    refused_tools: list[str] = []
+    for r in all_results:
+        for name in _tools_refused_for_limit(r):
+            if name not in refused_tools:
+                refused_tools.append(name)
+    if refused_tools:
+        named = ", ".join(f"`{t}`" for t in refused_tools[:6])
+        print(f"[team] tool_call_limit refused {len(refused_tools)} tool(s): {named} — "
+              f"answer may rest on evidence the run could not gather")
+        content = (
+            f"{content}\n\n---\n**Tool budget exhausted — this run hit its "
+            f"`tool_call_limit` and agno REFUSED to execute: {named}. Those calls never "
+            f"ran, so anything above that depended on them is unsupported rather than "
+            f"verified. Treat this answer as partial: re-run the narrower question on "
+            f"its own, or raise that role's budget via `/admin/model-routes`.**"
+        )
 
     # Coordinator-authored-alone check. The mechanical gates this codebase relies on
     # (decompose-first, search-before-browse) are wired onto the RESEARCHER's tool calls,
