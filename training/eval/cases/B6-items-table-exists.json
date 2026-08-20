@@ -1,0 +1,10 @@
+{
+  "id": "B6-items-table-exists",
+  "kind": "grounding",
+  "provenance": "Live probe 2026-08-20: asked for a live-DB row count on the items table, a run answered 'The `items` table does not exist in the codebase' -- it does, as inventory.items. Root cause of that class of miss is that __tablename__ and __table_args__ schema are declared on SEPARATE lines, so a grep for the joined string 'inventory.items' finds nothing in the model file. Excerpt verified verbatim against API/inventory-service/models.py:140-147 on 2026-08-20.",
+  "scorers": ["grounding", "citation"],
+  "prompt": "Numbered excerpt from API/inventory-service/models.py:\n\n   140|class Item(Base):\n   141|    __tablename__ = \"items\"\n   142|    __table_args__ = {\"schema\": \"inventory\"}\n   143|\n   144|    item_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   145|    tenant_id = Column(UUID(as_uuid=True), nullable=False)\n   146|    name = Column(String(200), nullable=False)\n   147|    description = Column(Text, nullable=True)\n\nDoes a table named `items` exist in this project, and what is its fully schema-qualified name?",
+  "required_facts": ["items", "inventory"],
+  "forbidden_facts": ["does not exist", "no such table", "not exist in the codebase", "public.items"],
+  "correct_lines": [141, 142]
+}

@@ -1,0 +1,10 @@
+{
+  "id": "B7-item-categories-sku-prefix",
+  "kind": "grounding",
+  "provenance": "The one live probe of 2026-08-20 that PASSED cleanly (78.98s, no verify_claims timeout) -- kept as a regression guard so a future change that breaks dotted ORM attribute grounding shows up here rather than only in a live run. Also the shape behind the earlier SPLIT-FOUND fallback in verify.py: 'item_categories.sku_prefix' never appears as one joined string because table name and column are declared on different lines. Excerpt verified verbatim against API/inventory-service/models.py:116-129 on 2026-08-20.",
+  "scorers": ["grounding", "citation"],
+  "prompt": "Numbered excerpt from API/inventory-service/models.py:\n\n   116|class ItemCategory(Base):\n   117|    __tablename__ = \"item_categories\"\n   118|    __table_args__ = {\"schema\": \"inventory\"}\n   119|\n   120|    category_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   121|    tenant_id = Column(UUID(as_uuid=True), nullable=False)\n   122|    name = Column(String(100), nullable=False)\n   123|    default_gst_rate = Column(Numeric(5, 2), nullable=True)\n   124|    hsn_prefix = Column(String(8), nullable=True)\n   125|    description = Column(Text, nullable=True)\n   126|    ondc_domain_code = Column(String(10), nullable=True)\n   127|    gst_verified = Column(Boolean, nullable=False, server_default=sa.text(\"false\"))\n   128|    is_active = Column(Boolean, nullable=False, server_default=sa.text(\"true\"))\n   129|    sku_prefix = Column(String(8), nullable=True)\n\nDoes the item_categories table have a sku_prefix column? If so, give its line number and its column type.",
+  "required_facts": ["sku_prefix", "String(8)"],
+  "forbidden_facts": ["does not exist", "no sku_prefix", "hsn_prefix column named sku_prefix"],
+  "correct_lines": [129]
+}

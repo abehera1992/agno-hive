@@ -1,0 +1,78 @@
+{
+  "id": "A-tool-13-db_query",
+  "kind": "tool_call",
+  "provenance": "Live probe 2026-08-20: a task saying 'You must use the live database (db_query/db_schema), not a file grep or a guess' was answered entirely off a models.py grep, produced no row count at all, and fabricated 'the items table does not exist'. hive-mcp's tool log confirms zero db_query/db_schema calls that run despite HIVE_DB_URL being configured and both tools granted. This case isolates the tool-choice half of that failure: with file-search tools sitting right next to the DB tools, a live-row-count question must reach for the DB. The schema-qualified table name is given in the prompt so a legitimate db_schema-first call is not needed and cannot be scored as wrong.",
+  "scorers": ["tool_call"],
+  "prompt": "The table is `inventory.items`. How many rows does it contain right now, broken down by is_active? Use the live database — do not infer from source files.",
+  "expect_tool": "db_query",
+  "expect_args": ["sql"],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "db_query",
+        "description": "Run ONE read-only SQL query against the configured database and return the rows. Use this to VERIFY any fact that lives in the database - counts, totals, the current value of a column - instead of grepping files.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "sql": {
+              "type": "string"
+            }
+          },
+          "required": ["sql"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "db_schema",
+        "description": "Inspect the database structure. No argument lists every schema.table; with a table name, lists its columns, types, and nullability.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "table": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_files",
+        "description": "Regex search across project source files.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "glob_filter": {
+              "type": "string"
+            }
+          },
+          "required": ["pattern"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_file_content",
+        "description": "Read a file from the project by relative path.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "relative_path": {
+              "type": "string"
+            }
+          },
+          "required": ["relative_path"]
+        }
+      }
+    }
+  ]
+}

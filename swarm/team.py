@@ -59,6 +59,9 @@ _MCP_TIMEOUT = 180  # lightrag_query synthesis ~90-120s; large file reads over D
 # kill (300s) -- a stuck one-shot session now fails with a real, logged
 # asyncio.TimeoutError instead of silently consuming the caller's entire budget.
 _BESPOKE_MCP_SESSION_TIMEOUT = 90
+# Pause between verify_claims' two attempts -- long enough to let a briefly-saturated
+# hive-mcp drain, short enough to be irrelevant next to the timeouts themselves.
+_VERIFY_RETRY_PAUSE_S = 2
 
 # 2026-08-19 (live 7-test groundedness battery, tasks hive-test1-groundedness and
 # hive-test6-gstpropagation): _BESPOKE_MCP_SESSION_TIMEOUT above only protects
@@ -1341,12 +1344,42 @@ async def _verify_claims(content: str, hive_mcp_url: str | None) -> tuple[str, b
                 res = await session.call_tool("verify_claims", {"answer": content})
                 return _extract_mcp_text(res)
 
-    try:
-        report = await asyncio.wait_for(_call(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
-    except Exception as exc:
-        print(f"[team] verify_claims unavailable ({hive_mcp_url}): {exc}")
-        return "", False, True
-    return report, "could NOT be found" in report, False
+    # One retry on failure, added 2026-08-20. This check is a deterministic grep with no
+    # model involved, so a failure here is essentially always transient -- a busy or
+    # briefly-unreachable hive-mcp, not a wrong answer -- and retrying is cheap.
+    #
+    # It matters because the check was disabling itself exactly when it was most needed.
+    # Measured that day across three live groundedness probes: the two LONG runs (128s and
+    # 138s, both heavy enough to be backgrounded by the caller) both came back carrying
+    # "Automated citation verification was unavailable this run", and both shipped a real
+    # fabrication uncaught -- a scrambled function/line-range attribution in one, and
+    # "the items table does not exist" (it exists, as inventory.items) in the other. The
+    # one SHORT run (79s) verified cleanly and was also the only clean answer. A verifier
+    # whose availability is inversely correlated with the complexity of the run is close
+    # to no verifier at all on the cases that matter.
+    #
+    # Second attempt gets a SHORTER budget so the worst case (135s) stays comfortably
+    # under config.liveness_silence_threshold_s -- the same do-not-race-the-watchdog
+    # invariant that drove _MCP_TIMEOUT down to 180. Deliberately not a longer first
+    # timeout: the observed failures were hive-mcp not answering at all, which a longer
+    # wait does not fix, and a fresh connection might.
+    last_exc = None
+    for attempt, budget in enumerate((_BESPOKE_MCP_SESSION_TIMEOUT,
+                                      _BESPOKE_MCP_SESSION_TIMEOUT // 2), start=1):
+        try:
+            report = await asyncio.wait_for(_call(), timeout=budget)
+            if attempt > 1:
+                print(f"[team] verify_claims succeeded on attempt {attempt}")
+            return report, "could NOT be found" in report, False
+        except Exception as exc:
+            last_exc = exc
+            print(f"[team] verify_claims attempt {attempt}/2 failed "
+                  f"({hive_mcp_url}): {exc}")
+            if attempt == 1:
+                await asyncio.sleep(_VERIFY_RETRY_PAUSE_S)
+
+    print(f"[team] verify_claims unavailable after 2 attempts ({hive_mcp_url}): {last_exc}")
+    return "", False, True
 
 
 async def _fetch_skill_catalog(hive_mcp_url: str | None) -> list[dict]:
@@ -1476,6 +1509,20 @@ def _count_read_calls(result, tool_names: set[str] = _READ_TOOLS) -> int:
         n += sum(1 for entry in read_log if isinstance(entry, dict) and entry.get("tool") in tool_names)
 
     return n if recognised else -1
+
+
+def _count_delegations(team) -> int:
+    """How many real delegations the coordinator made this run. -1 = undeterminable.
+
+    Reads the closure-local counter _make_delegation_log_hook attaches to the team in
+    _build_team. -1 (not 0) when the attribute is absent -- a team built by another path
+    or a test double must never be read as "delegated nothing", the same rule
+    _count_read_calls follows for an unrecognised message shape.
+    """
+    state = getattr(team, "_delegation_state", None)
+    if not isinstance(state, dict) or "count" not in state:
+        return -1
+    return state["count"]
 
 
 def _more_grounded(original_result, retry_result) -> bool:
@@ -2154,6 +2201,39 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"the running database, and may not reflect its actual current state.**"
                 + _summarize_actual_writes(*all_results)
             )
+
+    # Coordinator-authored-alone check. The mechanical gates this codebase relies on
+    # (decompose-first, search-before-browse) are wired onto the RESEARCHER's tool calls,
+    # so an answer the coordinator writes itself, without ever delegating, is subject to
+    # none of them. Documented as a still-open finding on the "Groundedness & Reliability
+    # Hardening" page (2026-08-15): a coordinator-authored retry "repeated the exact
+    # wrong-service mistake Phase 6 fixed ... producing a confidently WRONG answer that
+    # overwrote Researcher's correct one as the final result."
+    #
+    # Both external references for this architecture say the same thing: LangGraph's
+    # supervisor pattern is defined by the supervisor NOT executing tasks itself, and
+    # Cognition's 2026 write-up concludes multi-agent works only when the extra agents
+    # "contribute intelligence rather than actions". A coordinator that both orchestrates
+    # and authors is the case neither design allows for.
+    #
+    # Scoped to multi-part tasks ONLY, matching the decompose-first gate's own scope: a
+    # single bounded question ("is X present in Y") answered directly by the coordinator
+    # is legitimate and explicitly encouraged ("stop once answered"), so flagging it would
+    # be pure noise. Surfaces rather than retries -- the retry would be coordinator-
+    # authored too, which is the very thing being flagged. -1 (undeterminable) never trips
+    # it, same rule as everywhere else in this file.
+    delegations = _count_delegations(team)
+    if delegations == 0 and _is_multi_part_task(task) and _CLAIMY_RE.search(content or ""):
+        print("[team] multi-part task answered with ZERO delegations — coordinator "
+              "authored it alone, bypassing the researcher-scoped gates")
+        content = (
+            f"{content}\n\n---\n**Answered by the coordinator alone — this multi-part "
+            f"task was never delegated to a specialist agent, so the decompose-first and "
+            f"search-before-browse gates that normally constrain this kind of answer "
+            f"never applied to it. Treat its coverage as unaudited: the known failure "
+            f"mode here is a confident answer that silently examines the wrong "
+            f"service/module.**"
+        )
 
     report, bad, unavailable = await _verify_claims(content, hive_mcp_url)
     if unavailable:
@@ -3562,12 +3642,31 @@ def _make_delegation_log_hook():
     only make the fact that it happened visible as structured state. Registered
     in the SAME tool_hooks list as read_cache_hook/interception_hook -- position
     in that list doesn't matter for this hook specifically, since every non-
-    delegation call already passes straight through via the early return."""
+    delegation call already passes straight through via the early return.
+
+    The returned hook carries a `.state` dict whose `["count"]` is a CLOSURE-LOCAL
+    delegation counter. Exposed as an ATTRIBUTE rather than a second return value so the
+    function's signature is unchanged and every existing caller/test keeps working.
+    deliberately not derived from session_state["delegations_made"] below: agno
+    constructs a genuinely NEW RunContext -- and therefore a new, empty
+    session_state -- for each separate delegate_task_to_members call within one
+    run (root-caused with direct instrumentation 2026-08-16, see
+    _make_duplicate_delegation_gate_hook's docstring), so that list is unreliable
+    for answering "did this run delegate at all". The closure sidesteps agno's
+    session_state threading entirely, which is the same reason the duplicate-
+    delegation gate abandoned session_state for its own local log. The
+    session_state write is left in place unchanged -- it may still be meaningful
+    for delegate_task_to_member (singular) and for the coordinator's own rendered
+    context; nothing new depends on it.
+    """
+    state = {"count": 0}
+
     async def _delegation_log_hook(function_name, function, args, run_context=None):
         if function_name not in _DELEGATION_TOOL_NAMES:
             return await function(**args)
 
         result = await function(**args)
+        state["count"] += 1
 
         if run_context is not None and run_context.session_state is not None:
             logged_args = dict(args or {})
@@ -3581,6 +3680,7 @@ def _make_delegation_log_hook():
 
         return result
 
+    _delegation_log_hook.state = state
     return _delegation_log_hook
 
 
@@ -3834,7 +3934,7 @@ def _build_team(
     )) + [
         request_clarification, update_session_state,
     ]
-    return Team(
+    team = Team(
         name=name,
         description=description,
         mode=mode,
@@ -3879,6 +3979,15 @@ def _build_team(
         tool_call_limit=config.tool_call_limit,
         tool_hooks=tool_hooks,
     )
+    # Expose the delegation hook's closure-local counter on the team object so
+    # _verified_answer can ask "did the coordinator delegate at all this run?" after
+    # the run completes. Attribute rather than a changed return signature: every
+    # existing caller of _build_team keeps working untouched, and a team built by
+    # some other path (or a test double) simply has no attribute, which the reader
+    # treats as "unknown" rather than "did not delegate" -- same -1-is-not-zero rule
+    # _count_read_calls follows.
+    team._delegation_state = delegation_log_hook.state
+    return team
 
 
 _CONTENT_EVENT_TYPES = {"TeamRunContent", "RunContent"}
