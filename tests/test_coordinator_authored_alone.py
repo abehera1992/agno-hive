@@ -304,6 +304,82 @@ def test_count_markers_are_a_noop_with_no_markers_present():
     assert _run(_fill_count_markers(text, "http://x/mcp", _FakeMCPTools(_CountSession()))) == text
 
 
+# ── hive-mcp identification (was positional, silently picked the wrong server) ──
+
+
+HIVE = "http://100.87.159.86:9003/mcp"
+PROJECT = "http://100.87.159.86:9000/mcp"
+
+
+def _lightrag_url():
+    from config.config import config
+    return config.lightrag_mcp_url
+
+
+def test_hive_url_picked_over_lightrag_and_project_mcp():
+    from swarm.team import _pick_hive_mcp_url
+
+    urls = [HIVE, _lightrag_url(), PROJECT]
+    assert _pick_hive_mcp_url(urls, PROJECT) == HIVE
+
+
+def test_hive_url_is_none_when_only_lightrag_and_project_are_connected():
+    """The exact 2026-08-20 finding: with no mcp_urls passed, the list collapsed to
+    [lightrag, project-mcp] and position 0 became LightRAG -- which has no list_skills,
+    producing 17 opaque 'unhandled errors in a TaskGroup' failures. None is the honest
+    answer here; a wrong url is not."""
+    from swarm.team import _pick_hive_mcp_url
+
+    assert _pick_hive_mcp_url([_lightrag_url(), PROJECT], PROJECT) is None
+    assert _pick_hive_mcp_url([_lightrag_url()], PROJECT) is None
+    assert _pick_hive_mcp_url([], PROJECT) is None
+    assert _pick_hive_mcp_url(None, PROJECT) is None
+
+
+def test_hive_url_survives_lightrag_being_ordered_first():
+    """Ordering must not decide the answer -- that was the whole defect."""
+    from swarm.team import _pick_hive_mcp_url
+
+    assert _pick_hive_mcp_url([_lightrag_url(), HIVE, PROJECT], PROJECT) == HIVE
+
+
+def _tools_with(*names):
+    return SimpleNamespace(functions={n: object() for n in names})
+
+
+def test_hive_mcp_identified_by_capability_not_position():
+    from swarm.team import _pick_hive_mcp
+
+    mcp_by_url = {
+        _lightrag_url(): _tools_with("lightrag_query"),
+        PROJECT: _tools_with("get_context_section", "agno_run"),
+        HIVE: _tools_with("verify_claims", "count_matches", "get_file_content"),
+    }
+    url, tools = _pick_hive_mcp(mcp_by_url, "verify_claims")
+    assert url == HIVE and tools is mcp_by_url[HIVE]
+
+    url, tools = _pick_hive_mcp(mcp_by_url, "count_matches")
+    assert url == HIVE
+
+
+def test_pick_hive_mcp_returns_none_when_no_server_has_the_tool():
+    """Reported, not papered over: the caller logs that groundedness checking is off."""
+    from swarm.team import _pick_hive_mcp
+
+    assert _pick_hive_mcp({PROJECT: _tools_with("agno_run")}, "verify_claims") == (None, None)
+    assert _pick_hive_mcp({}, "verify_claims") == (None, None)
+    assert _pick_hive_mcp(None, "verify_claims") == (None, None)
+
+
+def test_pick_hive_mcp_tolerates_an_unexpected_functions_shape():
+    """A bookkeeping helper must never be the thing that breaks a run."""
+    from swarm.team import _pick_hive_mcp
+
+    odd = SimpleNamespace(functions=None)
+    good = _tools_with("verify_claims")
+    assert _pick_hive_mcp({"a": odd, HIVE: good}, "verify_claims")[0] == HIVE
+
+
 def test_retry_pause_is_short_enough_to_be_irrelevant():
     """Worst case must stay well under the liveness watchdog -- the same
     do-not-race-the-watchdog invariant that drove _MCP_TIMEOUT down to 180."""

@@ -1448,6 +1448,60 @@ async def _verify_claims(content: str, hive_mcp_url: str | None,
     return "", False, True
 
 
+def _pick_hive_mcp_url(all_mcp_urls: list[str] | None,
+                       project_mcp_url: str | None = None) -> str | None:
+    """hive-mcp's URL out of the connected set, or None when it isn't there.
+
+    Every hive-mcp-specific guard used to take `all_mcp_urls[0]` and ASSUME it was
+    hive-mcp. Usually true by caller convention -- _resolve_mcp_urls APPENDS the
+    LightRAG url, and callers put hive-mcp first -- but nothing enforced it, and when
+    a caller passed no mcp_urls at all the list collapsed to [lightrag, project-mcp]
+    and position 0 silently became LightRAG.
+
+    That is not hypothetical: all 17 "skill catalog unavailable" failures in the 30
+    days to 2026-08-20 were against http://localhost:9002/mcp -- LightRAG, which has
+    no list_skills tool -- reported as an opaque "unhandled errors in a TaskGroup".
+    16 of them fell in one afternoon, so that whole session ran with no skill catalog
+    and nothing said so. The same positional assumption also feeds verify_claims and
+    the count-marker guard, where the consequence would be worse: a groundedness check
+    silently aimed at a server that cannot answer it, degrading to "unavailable"
+    without ever naming the real cause.
+
+    Exclusion-based because this runs BEFORE any MCPTools are connected (the skill
+    catalog is needed to build the team's instructions), so no tool list exists to
+    interrogate yet. Both excluded urls are known independently: LightRAG's from
+    config, the project MCP's from the caller. Post-connection callers should prefer
+    _pick_hive_mcp below, which identifies hive-mcp by capability instead of by
+    elimination.
+    """
+    for u in all_mcp_urls or []:
+        if u == config.lightrag_mcp_url:
+            continue
+        if project_mcp_url and u == project_mcp_url:
+            continue
+        return u
+    return None
+
+
+def _pick_hive_mcp(mcp_by_url: dict | None, required_tool: str = "verify_claims"):
+    """(url, MCPTools) of the connected server that actually exposes `required_tool`.
+
+    Definitive rather than positional: agno populates MCPTools.functions as a dict
+    keyed by tool name, so "which server can run verify_claims" is answerable directly
+    instead of inferred from ordering. Returns (None, None) when no connected server
+    has it -- a real condition (hive-mcp down or never passed) that the caller should
+    report, not paper over.
+    """
+    for url, mcp in (mcp_by_url or {}).items():
+        funcs = getattr(mcp, "functions", None) or {}
+        try:
+            if required_tool in funcs:
+                return url, mcp
+        except TypeError:      # an unexpected functions shape must never break a run
+            continue
+    return None, None
+
+
 async def _fetch_skill_catalog(hive_mcp_url: str | None) -> list[dict]:
     """Fetch the L1 skill catalog once per run via hive-mcp's list_skills tool.
 
@@ -4499,7 +4553,7 @@ async def run_task_stream(
         await asyncio.gather(
             load_failure_context(project_id, current_task=task),
             _load_session_context(),
-            _fetch_skill_catalog(all_mcp_urls[0] if all_mcp_urls else None),
+            _fetch_skill_catalog(_pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)),
         )
     )
 
@@ -4632,10 +4686,9 @@ async def run_task_stream(
                 # Tier-3 guard: fill [[COUNT ...]] markers in the final content (streamed
                 # chunks above are pre-substitution; the done-sentinel content is corrected).
                 try:
-                    _hive_url = all_mcp_urls[0] if all_mcp_urls else None
+                    _cm_url, _cm_tools = _pick_hive_mcp(mcp_by_url, "count_matches")
                     combined = await _fill_count_markers(
-                        combined, _hive_url,
-                        hive_mcp_tools=mcp_by_url.get(_hive_url) if _hive_url else None)
+                        combined, _cm_url, hive_mcp_tools=_cm_tools)
                 except Exception as exc:
                     print(f"[team] count-marker guard warning: {exc}")
                 tokens = _extract_tokens(final_run_output)
@@ -4998,7 +5051,7 @@ async def run_task_async(
         await asyncio.gather(
             load_failure_context(project_id, current_task=task),
             _load_session_context(),
-            _fetch_skill_catalog(all_mcp_urls[0] if all_mcp_urls else None),
+            _fetch_skill_catalog(_pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)),
         )
     )
 
@@ -5252,21 +5305,30 @@ async def run_task_async(
                     return content, tokens, clarification
                 # Tier-3 guard: fill any [[COUNT ...]] markers with deterministic counts.
                 try:
-                    _cm_url = all_mcp_urls[0] if all_mcp_urls else None
+                    _cm_url, _cm_tools = _pick_hive_mcp(mcp_by_url, "count_matches")
                     content = await _fill_count_markers(
-                        content, _cm_url,
-                        hive_mcp_tools=mcp_by_url.get(_cm_url) if _cm_url else None)
+                        content, _cm_url, hive_mcp_tools=_cm_tools)
                 except Exception as exc:
                     print(f"[team] count-marker guard warning: {exc}")
                 # Tier-4 guard: grep the draft's claims; one correction round if any are
                 # unsupported. Instruction-level verification was tried first and the
                 # model ignored it, so this is enforced outside the model.
                 try:
-                    _hive_url = all_mcp_urls[0] if all_mcp_urls else None
+                    _hive_url, _hive_tools = _pick_hive_mcp(mcp_by_url, "verify_claims")
+                    if _hive_url is None:
+                        # Say so explicitly. _verify_claims treats "no url" as a
+                        # deliberate config choice and stays silent, which is right for
+                        # an operator who turned it off and wrong for hive-mcp simply
+                        # not being connected -- the case that previously showed up
+                        # only as an opaque failure against whichever server happened
+                        # to sit at position 0.
+                        print("[team] no connected MCP exposes verify_claims — "
+                              "groundedness checking is DISABLED for this run "
+                              "(is hive-mcp connected?)")
                     content = await _verified_answer(
                         content, task, team, _hive_url,
                         final_run_output, liveness_path=liveness_path,
-                        hive_mcp_tools=mcp_by_url.get(_hive_url) if _hive_url else None)
+                        hive_mcp_tools=_hive_tools)
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
                 tokens = _extract_tokens(final_run_output)
