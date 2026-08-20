@@ -1363,22 +1363,42 @@ async def _verify_claims(content: str, hive_mcp_url: str | None) -> tuple[str, b
     # invariant that drove _MCP_TIMEOUT down to 180. Deliberately not a longer first
     # timeout: the observed failures were hive-mcp not answering at all, which a longer
     # wait does not fix, and a fresh connection might.
+    # Failures are logged with the exception TYPE and elapsed seconds, not just str(exc).
+    # The old log line was `unavailable (url): {exc}` -- and an asyncio.TimeoutError
+    # stringifies to the EMPTY STRING, so every real timeout was recorded as
+    # "unavailable (http://...:9003/mcp): " with nothing after the colon. Two such lines
+    # on 2026-08-20 were the only server-side trace of two probes that shipped
+    # fabrications uncaught, and they could not be told apart from a connection refusal.
+    # Elapsed time is what separates the two causes: ~90s means the call hung waiting,
+    # ~0s means it never connected.
+    #
+    # That distinction already paid for itself. hive-mcp's own tool log for that window
+    # shows only 2 verify_claims calls, taking 18.6s and 22.4s -- while agno-api logged 2
+    # SEPARATE unavailable events. So the failing calls never reached hive-mcp at all:
+    # a client-side hang before any bytes hit the wire, NOT a slow grep. Exactly the
+    # signature already documented for _MCP_TIMEOUT ("hive-mcp's own docker logs showed
+    # the request never arriving"). Raising the budget would not have helped; a fresh
+    # connection might, which is what the retry above is.
     last_exc = None
     for attempt, budget in enumerate((_BESPOKE_MCP_SESSION_TIMEOUT,
                                       _BESPOKE_MCP_SESSION_TIMEOUT // 2), start=1):
+        started = time.monotonic()
         try:
             report = await asyncio.wait_for(_call(), timeout=budget)
             if attempt > 1:
-                print(f"[team] verify_claims succeeded on attempt {attempt}")
+                print(f"[team] verify_claims succeeded on attempt {attempt} "
+                      f"after {time.monotonic() - started:.1f}s")
             return report, "could NOT be found" in report, False
         except Exception as exc:
             last_exc = exc
-            print(f"[team] verify_claims attempt {attempt}/2 failed "
-                  f"({hive_mcp_url}): {exc}")
+            print(f"[team] verify_claims attempt {attempt}/2 failed after "
+                  f"{time.monotonic() - started:.1f}s (budget {budget}s) "
+                  f"({hive_mcp_url}): {type(exc).__name__}: {exc or '<no message>'}")
             if attempt == 1:
                 await asyncio.sleep(_VERIFY_RETRY_PAUSE_S)
 
-    print(f"[team] verify_claims unavailable after 2 attempts ({hive_mcp_url}): {last_exc}")
+    print(f"[team] verify_claims unavailable after 2 attempts ({hive_mcp_url}): "
+          f"{type(last_exc).__name__}: {last_exc or '<no message>'}")
     return "", False, True
 
 
