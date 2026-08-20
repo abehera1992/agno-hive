@@ -54,6 +54,78 @@ async def _interactive() -> None:
             print(result)
 
 
+# Substrings that mark an exception as describing HOW a run unwound, not WHY it failed.
+_TEARDOWN_ERROR_MARKERS = (
+    "cancel scope",
+    "unhandled errors in a taskgroup",
+    "during closing of asynchronous generator",
+    "generatorexit",
+)
+
+
+def _is_teardown_artifact(exc: BaseException) -> bool:
+    """True for an exception that only describes HOW a dying run unwound, never WHY.
+
+    anyio raises these while tearing down a task group or finalizing an async
+    generator whose owning task has already gone away. They carry no information
+    about the failure that started the unwind, and because Python lets an exception
+    raised during `__aexit__` REPLACE the in-flight one, they routinely end up being
+    the only thing the caller ever sees.
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _TEARDOWN_ERROR_MARKERS)
+
+
+def _iter_related(exc: BaseException, _seen: set[int] | None = None):
+    """Walk an exception's full related set: __cause__, __context__, and the
+    sub-exceptions of any BaseExceptionGroup (anyio wraps failures in these)."""
+    _seen = set() if _seen is None else _seen
+    if exc is None or id(exc) in _seen:
+        return
+    _seen.add(id(exc))
+    yield exc
+    for sub in getattr(exc, "exceptions", None) or ():
+        yield from _iter_related(sub, _seen)
+    for nxt in (exc.__cause__, exc.__context__):
+        if nxt is not None:
+            yield from _iter_related(nxt, _seen)
+
+
+def _describe_failure(exc: BaseException) -> str:
+    """The most diagnostic description available for a failed run.
+
+    A run that dies mid-flight tears down its MCP connections, and anyio's teardown
+    can raise an exception that REPLACES the real cause -- so the worker's old
+    `f"{type(exc).__name__}: {exc}"` reported the symptom and discarded the diagnosis.
+
+    Measured 2026-08-20: a run hit
+    `litellm.ContextWindowExceededError: ... maximum context length is 262144 tokens
+    ... your prompt contains at least 258049 input tokens` after a run_docker('logs
+    ekamapp-postgres-1') returned 1.7M chars. What reached the caller was
+    `RuntimeError: Attempted to exit a cancel scope that isn't the current tasks's
+    current cancel scope` -- true, useless, and with the actual cause nowhere in it.
+    Confirmed from the same run's logs that no RunError/TeamRunError stream event was
+    emitted, so _BackendRunError's fail-fast path never engaged and this teardown
+    exception was genuinely the only one that escaped.
+
+    Prefers the first related exception that is NOT a teardown artifact, searching
+    __cause__/__context__ and BaseExceptionGroup members. When the chain holds nothing
+    better -- which happens when the real error died in a different task and was never
+    chained -- it still reports the teardown error, but LABELLED as such so the reader
+    knows to look upstream in the logs rather than treating it as the diagnosis.
+    """
+    related = list(_iter_related(exc))
+    informative = next((e for e in related if not _is_teardown_artifact(e)), None)
+
+    if informative is not None and informative is not exc:
+        return (f"{type(informative).__name__}: {informative} "
+                f"(surfaced during teardown as {type(exc).__name__})")
+    if informative is not None:
+        return f"{type(informative).__name__}: {informative}"
+    return (f"{type(exc).__name__}: {exc} — this is a teardown artifact, not the "
+            f"root cause; the real failure is earlier in this run's logs")
+
+
 async def _run_worker() -> dict:
     """Worker-process entrypoint for /run's process-boundary execution (see
     DOCS.md "Process-Boundary Cancellation" for the full design). Reads a
@@ -109,7 +181,7 @@ async def _run_worker() -> dict:
         )
         return {"content": content, "tokens": tokens, "clarification": clarification}
     except Exception as exc:
-        return {"error": f"{type(exc).__name__}: {exc}"}
+        return {"error": _describe_failure(exc)}
 
 
 def _run_worker_main() -> None:
