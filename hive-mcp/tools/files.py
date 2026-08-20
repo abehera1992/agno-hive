@@ -138,6 +138,31 @@ _WRITE_CMD_RE = re.compile(
     r"|\bdd\b.*of="
 )
 
+# Commands that mutate the ENVIRONMENT rather than a file. _WRITE_CMD_RE above only
+# ever matched file-writing syntax, so run_command's documented "READ-ONLY use only"
+# was true of files and false of everything else.
+#
+# Live-verified 2026-08-20 against the running hive-mcp: `pip install` and
+# `apt-get install` both executed unblocked, while the `echo hi > file` control was
+# correctly blocked -- so the guard worked exactly as written, just far narrower than
+# the docstring claimed. It matters because the container runs as root (uid 0), and a
+# read-only groundedness probe was observed doing `pip install psycopg2-binary` and
+# `apt-get update && apt-get install -y postgresql-client` (5.24s -- a real install)
+# while trying to answer a question about row counts.
+#
+# Scoped to mutating SUBCOMMANDS so the read-only uses this tool exists for keep
+# working: `pip show`, `pip list`, `npm test`, `npm run lint`, `apt-get --version`,
+# `pytest`, `git status` all still pass. run_shell is deliberately NOT given this
+# guard -- it is the tool explicitly documented for environment changes, and pushing
+# genuine installs there is the point.
+_MUTATING_CMD_RE = re.compile(
+    r"\b(?:apt|apt-get|apk|yum|dnf)\s+(?:install|remove|purge|upgrade|dist-upgrade)\b"
+    r"|\bpip3?\s+(?:install|uninstall)\b"
+    r"|\b(?:npm|pnpm|yarn)\s+(?:install|add|remove|uninstall|ci)\b"
+    r"|\bsystemctl\s+(?:start|stop|restart|enable|disable)\b",
+    re.IGNORECASE,
+)
+
 
 def _proposed_path(target: Path) -> Path:
     return target.with_name(target.name + _PROPOSED_SUFFIX)
@@ -421,6 +446,8 @@ def run_command(command: str, timeout: int = 120) -> str:
     READ-ONLY use only: tests, linters, build checks, grep, git status.
     NEVER use to write files — no >, >>, sed -i, tee, perl -i.
     Use apply_diff() or write_file() for ALL file modifications.
+    Installing packages or changing services is NOT read-only — use run_shell()
+    for anything that modifies the environment (pip/npm/apt install, systemctl).
 
     Args:
         command: Shell command (e.g. 'pytest tests/ -v', 'npm run lint', 'git status')
@@ -432,6 +459,13 @@ def run_command(command: str, timeout: int = 120) -> str:
         return (
             "blocked: run_command cannot write files when WRITE_REVIEW is enabled. "
             "Use apply_diff() to edit an existing file or write_file() to create a new one."
+        )
+    if WRITE_REVIEW and _MUTATING_CMD_RE.search(command):
+        return (
+            "blocked: run_command is read-only and cannot install packages or change "
+            "services. If this task genuinely requires modifying the environment, use "
+            "run_shell(). If you are answering a question, it almost certainly does not "
+            "— re-read the task and use a read-only tool instead."
         )
     try:
         result = subprocess.run(
