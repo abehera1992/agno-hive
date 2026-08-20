@@ -14,6 +14,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import PROJECT_ROOT, WRITE_REVIEW
 
+from .scratch import maybe_offload
+
 # Same write-detection pattern as run_command in files.py
 _WRITE_CMD_RE = re.compile(
     r"\s>>?\s"
@@ -26,6 +28,26 @@ _WRITE_CMD_RE = re.compile(
 
 
 def _run(cmd: list[str], timeout: int = 60, cwd=None) -> str:
+    """Shared runner for run_shell / run_docker / list_processes.
+
+    Oversized output is offloaded to .hive_scratch/ exactly as run_command (files.py)
+    has done since 2026-08-14. That fix was scoped to run_command alone and never
+    reached this module, leaving run_shell and run_docker able to return output of
+    unbounded size straight into the model's context.
+
+    Root-caused from production logs 2026-08-20. A live-DB probe ("how many rows in
+    the items table") never called db_query; it improvised -- pip show, pip install
+    psycopg2-binary, apt-get install postgresql-client, psql with guessed credentials
+    -- and finally ran `run_docker('logs ekamapp-postgres-1')`. That returned the
+    postgres container's ENTIRE log, and the next model call died with
+    litellm.ContextWindowExceededError at 258,049 input tokens against a 262,144
+    limit. The run then tore down abnormally, producing the anyio
+    "Attempted to exit cancel scope in a different task" RuntimeError that surfaced
+    to the caller as an opaque 500 -- with the real cause nowhere in it.
+
+    Applied in _run rather than per-tool so every current and future caller is
+    covered by construction; `docker logs` is simply the easiest way to hit it.
+    """
     try:
         r = subprocess.run(
             cmd,
@@ -42,7 +64,7 @@ def _run(cmd: list[str], timeout: int = 60, cwd=None) -> str:
         if err:
             parts.append(f"[stderr] {err}")
         parts.append(f"[exit {r.returncode}]")
-        return "\n".join(parts)
+        return maybe_offload("\n".join(parts), hint=" ".join(cmd[:3]))
     except subprocess.TimeoutExpired:
         return f"timed out after {timeout}s"
     except FileNotFoundError as e:
@@ -91,7 +113,12 @@ def run_shell(command: str, timeout: int = 120) -> str:
         if r.stderr.strip():
             parts.append(f"[stderr]\n{r.stderr.strip()}")
         parts.append(f"[exit {r.returncode}]")
-        return "\n".join(parts)
+        # run_shell does NOT go through _run() -- it needs shell=True and its own
+        # WRITE_REVIEW guard -- so it needs the size cap applied separately. Capping
+        # only _run() left this path uncovered, which a test caught before deploy.
+        # This is the tool explicitly documented for `npm install` / build runs, i.e.
+        # the one most likely to produce a very large log in the first place.
+        return maybe_offload("\n".join(parts), hint=command)
     except subprocess.TimeoutExpired:
         return f"timed out after {timeout}s"
     except Exception as e:
