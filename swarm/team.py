@@ -121,7 +121,16 @@ def _model_verify_claims_unavailable_result() -> str:
 # in one place. With that done, excluding names the project MCP no longer serves
 # would break its whole tool list (see the comment at the call site below) -- so
 # this reverts back to its original, narrower scope.
-_PROJECT_MCP_EXCLUDE_TOOLS = ["agno_run", "agno_list_teams"]
+_PROJECT_MCP_EXCLUDE_TOOLS = [
+    "agno_run", "agno_list_teams",
+    # memory_search/memory_store removed 2026-08-20: verified against EkamApp MCP's
+    # own container logs (5-day window, 191 tool calls) and the claude_flow.embeddings
+    # table itself (36 rows total, none since 2026-04-27) that neither tool has ever
+    # actually been called by a hive agent, despite being connected. hive's real
+    # pattern-recall path is lightrag_query; project MCP is Claude Code/Cline's tool,
+    # not hive's — keep the two stacks separate rather than leaving a dead fallback wired.
+    "memory_search", "memory_store",
+]
 
 _COORDINATOR_INSTRUCTIONS = [
     "── Tool restrictions ────────────────────────────────────────────",
@@ -1369,7 +1378,7 @@ _READ_TOOLS = {
     "get_file_content", "search_files", "find_files", "count_matches",
     "list_directory", "list_directory_tree", "get_project_context",
     "get_context_section", "list_recent_files", "search_knowledge_graph",
-    "lightrag_query", "memory_search", "db_query", "db_schema",
+    "lightrag_query", "db_query", "db_schema",
     "git_diff", "git_status", "git_log", "git_log_file", "git_blame",
     "notion_get_page", "notion_query_database", "notion_search",
     "notion_get_item_with_relations", "notion_find_work_item", "notion_items_in_sprint",

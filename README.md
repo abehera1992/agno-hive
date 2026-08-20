@@ -35,7 +35,7 @@ AGNOHive is a swarm of specialized agents — whatever roster your team YAML def
 flowchart LR
     subgraph Client["💻 Client Machine"]
         HM["🐳 hive-mcp<br/>apply_diff · write_file<br/>run_shell · run_docker<br/>bash_session_start · bash_run · bash_job_status<br/>git_* · index_project<br/>scan_project_context → hive.md<br/>web_search / web_fetch"]
-        PM["🔌 Project MCP<br/>get_file_content · find_files<br/>search_files · memory_search"]
+        PM["🔌 Project MCP<br/>get_context_section · search_knowledge_graph<br/>list_recent_files · app-specific tools<br/>(memory_search/memory_store excluded — Claude Code/Cline only)"]
     end
 
     subgraph Host["🖥️ Inference Host — any machine you point it at"]
@@ -61,7 +61,7 @@ flowchart LR
     COORD -.->|OTel| OBS
 ```
 
-**Two MCP connections per run:** `hive-mcp` (primary — all reads/writes/shell/git/web) and your **project MCP** (supplementary — app-specific tools like `memory_search`). If hive-mcp is unreachable, agents fall back to project MCP automatically; if both are down, the run fails with a clear error.
+**Two MCP connections per run:** `hive-mcp` (primary — all reads/writes/shell/git/web) and your **project MCP** (supplementary — app-specific workflow tools only; any `memory_search`/`memory_store`-style tool a project MCP registers is explicitly excluded from the agent connection, keeping that store scoped to the host IDE rather than the swarm). If hive-mcp is unreachable, agents fall back to project MCP automatically; if both are down, the run fails with a clear error.
 
 1. Coordinator's first action is `get_file_content('hive.md')` — grounded context loaded on demand, not pre-injected (prevents models from answering without tool calls)
 2. Failure context from past runs is injected into the coordinator's instructions

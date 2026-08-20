@@ -165,7 +165,7 @@ _MCP_TOOL_NAMES = {
     "notion_update_content", "run_migration", "db_query", "db_schema",
     "delegate_task_to_member", "delegate_task_to_members", "get_member_information",
     "agno_run", "agno_list_teams", "get_context_section", "list_recent_files",
-    "search_knowledge_graph", "get_graph_report", "memory_search", "memory_store",
+    "search_knowledge_graph", "get_graph_report",
     "lightrag_query",
 }
 

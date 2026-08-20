@@ -42,10 +42,17 @@
 
 | Tool | Purpose | Required |
 |---|---|---|
-| `memory_search(query)` | pgvector semantic search over project history | Optional |
 | `get_context_section(topic)` | Targeted DOCS.md section by keyword | Optional |
 | `search_knowledge_graph(query)` | Graph search (graphify) | Optional |
 | Any other project-specific tools | App workflows, custom context | Optional |
+
+> `memory_search`/`memory_store` are registered on project MCP (EkamApp) but
+> excluded from every hive agent's connection since 2026-08-20
+> (`_PROJECT_MCP_EXCLUDE_TOOLS` in `swarm/team.py`) — verified never actually
+> called by a hive agent (EkamApp MCP's own logs, 5-day window, 191 tool calls,
+> zero of them `memory_search`/`memory_store`), and the underlying pgvector
+> table hadn't been written to since 2026-04-27. That tool is Claude Code/Cline's,
+> not hive's — use `lightrag_query` for hive's equivalent pattern-recall need.
 
 > Agents use hive-mcp for all reads and writes. Project MCP is only consulted for tools not present in hive-mcp. If project MCP is unavailable, agents continue with hive-mcp alone. If hive-mcp is unavailable, agents fall back to project MCP for reads. If both are down, the run fails with a clear error.
 
