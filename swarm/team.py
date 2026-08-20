@@ -1286,6 +1286,34 @@ def _extract_mcp_text(result) -> str:
     )
 
 
+def _mcp_error_text(result) -> str | None:
+    """The error text when an MCP call came back isError=True, else None.
+
+    An MCP tool call can FAIL WITHOUT RAISING. The protocol reports a tool-level
+    failure as a perfectly normal response carrying isError=True and the message as
+    ordinary text content -- so every caller that only reads .content treats the error
+    STRING as if it were the tool's answer.
+
+    Confirmed by direct probe 2026-08-20 against the LightRAG MCP: calling list_skills
+    there returns `isError=True, content=[TextContent(text='Unknown tool:
+    list_skills')]`, no exception. That is LightRAG behaving CORRECTLY -- it never
+    claimed to have skills. Every consequence was on this side:
+      * _fetch_skill_catalog then ran json.loads('Unknown tool: list_skills'), and the
+        resulting JSONDecodeError -- raised inside the streamablehttp_client task group
+        -- surfaced as the opaque "unhandled errors in a TaskGroup (1 sub-exception)"
+        seen 17 times in 30 days.
+      * _verify_claims is worse: it returns `"could NOT be found" in report` as its
+        `bad` flag, so an error string simply does not match and the call reports
+        bad=False, unavailable=False -- INDISTINGUISHABLE FROM A CLEAN VERIFICATION.
+        The answer ships with no disclaimer, as though its claims had been checked.
+        That is the same fail-open trap the 2026-08-19 timeout fix closed for
+        exceptions, reachable by a second route that fix never covered.
+    """
+    if result is not None and getattr(result, "isError", False):
+        return _extract_mcp_text(result) or "tool reported an error with no message"
+    return None
+
+
 # Fail-open vs fail-safe (2026-08-19, T12 re-test, task 738813cb-...): before this
 # fix, a verify_claims failure (exception or the _BESPOKE_MCP_SESSION_TIMEOUT cutoff
 # above) returned ("", False) -- bad=False, IDENTICAL to "ran cleanly, zero problems
@@ -1350,18 +1378,16 @@ async def _verify_claims(content: str, hive_mcp_url: str | None,
         open at this point -- verified by call-site nesting, not assumed.
         """
         session = await hive_mcp_tools.get_session_for_run()
-        res = await session.call_tool("verify_claims", {"answer": content})
-        return _extract_mcp_text(res)
+        return await session.call_tool("verify_claims", {"answer": content})
 
-    async def _call_on_fresh_connection() -> str:
+    async def _call_on_fresh_connection():
         from mcp import ClientSession
         from mcp.client.streamable_http import streamablehttp_client
 
         async with streamablehttp_client(hive_mcp_url) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                res = await session.call_tool("verify_claims", {"answer": content})
-                return _extract_mcp_text(res)
+                return await session.call_tool("verify_claims", {"answer": content})
 
     # One retry on failure, added 2026-08-20. This check is a deterministic grep with no
     # model involved, so a failure here is essentially always transient -- a busy or
@@ -1424,7 +1450,16 @@ async def _verify_claims(content: str, hive_mcp_url: str | None,
     for n, (label, call, budget) in enumerate(attempts, start=1):
         started = time.monotonic()
         try:
-            report = await asyncio.wait_for(call(), timeout=budget)
+            res = await asyncio.wait_for(call(), timeout=budget)
+            # isError checked OUTSIDE the connection context manager on purpose: an
+            # exception raised inside it gets rewritten by anyio into "unhandled errors
+            # in a TaskGroup", discarding the message that says what actually went
+            # wrong. The inner helpers therefore return the raw result and the decision
+            # is made here, where the text survives.
+            err = _mcp_error_text(res)
+            if err:
+                raise RuntimeError(f"verify_claims tool returned an error: {err}")
+            report = _extract_mcp_text(res)
             # Logged on EVERY success, including the first attempt. Previously only
             # attempt 2+ logged, so a successful run produced no line at all and the
             # path actually taken was unobservable -- "no failure lines" was equally
@@ -1515,18 +1550,29 @@ async def _fetch_skill_catalog(hive_mcp_url: str | None) -> list[dict]:
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
-    async def _call() -> list[dict]:
+    async def _call():
         async with streamablehttp_client(hive_mcp_url) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                res = await session.call_tool("list_skills", {})
-                text = _extract_mcp_text(res)
-                return json.loads(text)
+                return await session.call_tool("list_skills", {})
 
     try:
-        return await asyncio.wait_for(_call(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        res = await asyncio.wait_for(_call(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        # isError decided out here, not inside the context manager -- see the same
+        # note in _verify_claims. Previously the raw error TEXT was fed straight to
+        # json.loads(), and the JSONDecodeError it raised inside the task group was
+        # rewritten as "unhandled errors in a TaskGroup (1 sub-exception)", hiding
+        # both the real message and which server produced it.
+        err = _mcp_error_text(res)
+        if err:
+            print(f"[team] skill catalog unavailable — {hive_mcp_url} rejected "
+                  f"list_skills: {err}. Agents run without skill instructions this "
+                  f"run (is this hive-mcp?)")
+            return []
+        return json.loads(_extract_mcp_text(res))
     except Exception as exc:
-        print(f"[team] skill catalog unavailable ({hive_mcp_url}): {exc}")
+        print(f"[team] skill catalog unavailable ({hive_mcp_url}): "
+              f"{type(exc).__name__}: {exc or '<no message>'}")
         return []
 
 
@@ -2578,6 +2624,14 @@ async def _fill_count_markers(content: str, hive_mcp_url: str | None,
                 res = await session.call_tool(
                     "count_matches", {"pattern": key[0], "glob_filter": key[1]}
                 )
+                err = _mcp_error_text(res)
+                if err:
+                    # Deliberately does NOT set resolved_any: a tool-level rejection
+                    # (wrong server, tool missing) must still count as "this session
+                    # produced nothing", so the fresh-connection fallback fires.
+                    print(f"[team] count_matches rejected ({key!r}): {err}")
+                    cache[key] = "[count unavailable]"
+                    continue
                 m = re.search(r"TOTAL:\s*(\d+)", _extract_mcp_text(res))
                 cache[key] = m.group(1) if m else "[count unavailable]"
                 resolved_any["ok"] = True

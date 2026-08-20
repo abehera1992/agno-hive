@@ -304,6 +304,120 @@ def test_count_markers_are_a_noop_with_no_markers_present():
     assert _run(_fill_count_markers(text, "http://x/mcp", _FakeMCPTools(_CountSession()))) == text
 
 
+# ── isError responses (a tool can FAIL without raising) ──────────────────────
+
+
+def _err_result(text="Unknown tool: verify_claims"):
+    """The real shape LightRAG returns for an unknown tool -- confirmed by direct
+    probe 2026-08-20: isError=True, message as ordinary text content, NO exception."""
+    return SimpleNamespace(isError=True,
+                           content=[SimpleNamespace(type="text", text=text)])
+
+
+def test_mcp_error_text_detects_a_tool_level_failure():
+    from swarm.team import _mcp_error_text
+
+    assert _mcp_error_text(_err_result()) == "Unknown tool: verify_claims"
+    assert _mcp_error_text(
+        SimpleNamespace(isError=False,
+                        content=[SimpleNamespace(type="text", text="all good")])
+    ) is None
+    assert _mcp_error_text(None) is None
+
+
+def test_mcp_error_text_handles_an_error_with_no_message():
+    from swarm.team import _mcp_error_text
+
+    assert _mcp_error_text(SimpleNamespace(isError=True, content=[])) is not None
+
+
+class _ErroringSession:
+    def __init__(self, text="Unknown tool: verify_claims"):
+        self.text, self.calls = text, 0
+
+    async def call_tool(self, name, args):
+        self.calls += 1
+        return _err_result(self.text)
+
+
+def test_verify_claims_isError_is_never_read_as_a_clean_pass(monkeypatch):
+    """The highest-severity variant of this whole class. _verify_claims returns
+    `"could NOT be found" in report` as its `bad` flag, so before this fix an error
+    STRING simply failed to match and the call reported bad=False, unavailable=False --
+    identical to a genuine clean verification. The answer would ship with no
+    disclaimer, as though its claims had actually been checked."""
+    import swarm.team as team_mod
+
+    monkeypatch.setattr(team_mod, "_VERIFY_RETRY_PAUSE_S", 0)
+
+    def fresh(*a, **k):
+        raise RuntimeError("no fallback available")
+
+    _patch_client(monkeypatch, fresh)
+    tools = _FakeMCPTools(_ErroringSession())
+
+    report, bad, unavailable = _run(
+        _verify_claims("a `symbol` claim", "http://x/mcp", tools)
+    )
+
+    assert unavailable is True, "an isError response must fail SAFE, not read as clean"
+    assert report == ""
+
+
+def test_verify_claims_isError_falls_back_before_giving_up(monkeypatch):
+    """A wrong/degraded first server must not end the check while another can answer."""
+    import swarm.team as team_mod
+
+    monkeypatch.setattr(team_mod, "_VERIFY_RETRY_PAUSE_S", 0)
+    calls = {"n": 0}
+
+    class _OkCM:
+        async def __aenter__(self):
+            calls["n"] += 1
+            raise RuntimeError("fresh path exercised")
+
+        async def __aexit__(self, *a):
+            return False
+
+    _patch_client(monkeypatch, lambda *a, **k: _OkCM())
+    tools = _FakeMCPTools(_ErroringSession())
+
+    _, _, unavailable = _run(_verify_claims("claim `x`", "http://x/mcp", tools))
+
+    assert tools.session.calls == 1
+    assert calls["n"] == 1, "isError on the live session must still try the fallback"
+    assert unavailable is True
+
+
+def test_count_markers_isError_does_not_count_as_resolved(monkeypatch):
+    """A tool-level rejection must leave resolved_any False so the fallback still fires
+    -- otherwise a wrong-server response would look like a completed resolution."""
+    from swarm.team import _fill_count_markers
+
+    fresh_used = {"n": 0}
+
+    def fresh(*a, **k):
+        fresh_used["n"] += 1
+        raise RuntimeError("fresh down")
+
+    _patch_client(monkeypatch, fresh)
+
+    class _ErrCountSession:
+        def __init__(self):
+            self.calls = 0
+
+        async def call_tool(self, name, args):
+            self.calls += 1
+            return _err_result("Unknown tool: count_matches")
+
+    tools = _FakeMCPTools(_ErrCountSession())
+    out = _run(_fill_count_markers(
+        "Found [[COUNT pattern=`foo` glob=`**/*.py`]] hits.", "http://x/mcp", tools))
+
+    assert fresh_used["n"] == 1, "an isError count must still trigger the fallback"
+    assert "[count unavailable]" in out
+
+
 # ── hive-mcp identification (was positional, silently picked the wrong server) ──
 
 
