@@ -604,6 +604,11 @@ _COORDINATOR_INSTRUCTIONS = [
     "── General rules ──────────────────────────────────────────────",
     "  - Base answers on file contents, not assumptions",
     "  - Synthesise member outputs into one coherent response",
+    "  - When citing lines for several different functions/symbols, cite each one's own",
+    "    line separately (e.g. 'get_party: line 112', 'delete_party: line 193') rather",
+    "    than bundling them under one range ('lines 91-235'). A bundled range spanning",
+    "    multiple functions is where a function gets attributed to the wrong line range",
+    "    without anything catching it — a real citation must map ONE name to ONE line.",
     "",
     "── External docs vs project code (CRITICAL) ─────────────────",
     "  When asked to compare this project against framework docs, external libraries,",
@@ -1400,9 +1405,27 @@ _CLAIMY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Tools that answer a "live database" question. See the DB-evidence guard below.
+_DB_TOOLS = {"db_query", "db_schema"}
+# Phrases that mean the task itself demands a live-DB check, not a file grep. Deliberately
+# narrow -- a false positive here just means "checked for db_query evidence when the task
+# didn't strictly need it" (cheap); a false negative means a fabricated schema claim ships
+# unretried, which is the exact failure this guard exists to catch (see 2026-08-20 note below).
+_DB_TASK_RE = re.compile(
+    r"\blive database\b|\bdb_query\b|\bdb_schema\b|\brow count\b|\bhow many rows\b",
+    re.IGNORECASE,
+)
 
-def _count_read_calls(result) -> int:
+
+def _count_read_calls(result, tool_names: set[str] = _READ_TOOLS) -> int:
     """Count evidence-gathering tool calls in a run. Returns -1 when undeterminable.
+
+    tool_names defaults to _READ_TOOLS (the generic "did it read anything" check).
+    Pass a narrower set (e.g. {"db_query", "db_schema"}) to check for a SPECIFIC
+    tool having been called, not just any evidence-gathering tool -- added 2026-08-20
+    after a task explicitly requiring db_query/db_schema was answered from a plain
+    file grep instead; the generic check (reads>0) didn't catch it because a file
+    read did happen, just not the one the task demanded.
 
     -1 (not 0) when the message shape is unrecognised: "we could not tell" must never be
     treated as "it did not read". Reading absence as evidence of absence produced several
@@ -1438,19 +1461,19 @@ def _count_read_calls(result) -> int:
                 recognised = True
                 fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", None)
                 name = (fn or {}).get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
-                if name in _READ_TOOLS:
+                if name in tool_names:
                     n += 1
             if getattr(m, "role", None) == "tool":
                 recognised = True
                 name = getattr(m, "tool_name", None) or getattr(m, "name", None)
-                if name in _READ_TOOLS:
+                if name in tool_names:
                     n += 1
 
     session_state = getattr(result, "session_state", None) or {}
     read_log = session_state.get("read_log") if isinstance(session_state, dict) else None
     if read_log:
         recognised = True
-        n += sum(1 for entry in read_log if isinstance(entry, dict) and entry.get("tool") in _READ_TOOLS)
+        n += sum(1 for entry in read_log if isinstance(entry, dict) and entry.get("tool") in tool_names)
 
     return n if recognised else -1
 
@@ -2001,6 +2024,33 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 content, result = retried, retry
         except Exception as exc:
             print(f"[team] evidence retry failed: {exc}")
+
+    # DB-evidence guard: a task explicitly demanding a live-database check must show at
+    # least one db_query/db_schema call, not just any read. The generic no-evidence guard
+    # above only checks "did it read ANYTHING" -- a task that greps model files instead of
+    # querying the live DB still counts as reads>0 and slips through untouched. Measured
+    # 2026-08-20: a task saying "you must use the live database (db_query/db_schema), not
+    # a file grep or a guess" got answered entirely from a models.py grep, which also
+    # fabricated "the items table does not exist" (it does, as inventory.items) -- the
+    # live DB was never touched and the generic guard had nothing to catch.
+    db_reads = _count_read_calls(result, tool_names=_DB_TOOLS)
+    if db_reads == 0 and _DB_TASK_RE.search(task or ""):
+        print("[team] task explicitly required a live-DB check but made zero db_query/db_schema calls — retrying")
+        try:
+            retried, retry = await _stream_team_run(
+                team,
+                f"{task}\n\n"
+                f"IMPORTANT: a previous attempt answered this without calling db_query or "
+                f"db_schema, even though the task explicitly requires a live-database check. "
+                f"Call db_query/db_schema now and base your answer on their actual output — "
+                f"do not answer from a file grep or a guess about what the schema contains.",
+                liveness_path=liveness_path,
+            )
+            all_results.append(retry)
+            if retried:
+                content, result = retried, retry
+        except Exception as exc:
+            print(f"[team] db-evidence retry failed: {exc}")
 
     report, bad, unavailable = await _verify_claims(content, hive_mcp_url)
     if unavailable:

@@ -74,7 +74,13 @@ _FILE_LINE_RE = re.compile(r"([A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6}):(\d{1,6})")
 # requiring one exact label phrasing, since models write this a dozen different ways
 # ("in `x` at line N", "File: `x`, Line: N", "`x`, line N") and enumerating every
 # phrasing is a losing game; proximity to a real path is the only reliable signal.
-_LABELED_LINE_RE = re.compile(r"\bline[:\s]*\**\s*(\d{1,6})\b", re.IGNORECASE)
+# Widened 2026-08-20: "**Lines**: 91–135" (plural, a range) never matched the singular
+# form below either -- a live groundedness re-test cited a 3-function-spanning range this
+# way and it went unchecked even on a run where verify_claims otherwise ran cleanly. Now
+# captures an optional second number so both range endpoints get registered as citations.
+_LABELED_LINE_RE = re.compile(
+    r"\blines?[:\s]*\**\s*(\d{1,6})(?:\s*[-–—]\s*(\d{1,6}))?\b", re.IGNORECASE
+)
 _BACKTICK_PATH_RE = re.compile(r"`([A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6})`")
 # How far back (chars) to look for the path a labeled line number belongs to. Wide
 # enough to span a markdown table cell or a short sentence, narrow enough that it
@@ -865,13 +871,17 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                 nearest = p
         if nearest is None:
             continue
-        pair = (nearest.group(1), int(m.group(1)))
-        if pair not in file_lines:
-            file_lines.append(pair)
-        if pair not in content_claims:
-            quoted = _find_nearby_quote(answer, m.end())
-            if quoted:
-                content_claims[pair] = quoted
+        line_nums = [int(m.group(1))]
+        if m.group(2):
+            line_nums.append(int(m.group(2)))
+        for num in line_nums:
+            pair = (nearest.group(1), num)
+            if pair not in file_lines:
+                file_lines.append(pair)
+            if pair not in content_claims:
+                quoted = _find_nearby_quote(answer, m.end())
+                if quoted:
+                    content_claims[pair] = quoted
 
     routes: list[str] = []
     if _ROUTE_RE is not None:

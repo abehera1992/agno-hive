@@ -34,6 +34,7 @@ agents:
       - "      Pass ALL results to Researcher. Do not summarise or answer yourself."
       - "  - 'How does X work' / feature questions: call search_files(X, '**/*') to find all occurrences across the codebase."
       - "  - Specific file/symbol questions: call find_files() or search_files() directly."
+      - "  - Live database / row count questions ('how many rows', 'check the live database', task explicitly names db_query/db_schema): call db_query() or db_schema() directly if available — do NOT answer from a file grep of model definitions."
       - "  - Past task or lesson questions: call lightrag_query() if available."
       - "  - Thematic/cross-module questions: call lightrag_query() with broad keywords if available."
       - "  - User shares a URL or GitHub link → call web_fetch(url) immediately (if web_fetch is available)."
