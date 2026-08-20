@@ -143,6 +143,100 @@ def test_verify_claims_skips_silently_when_not_configured():
     assert (report, bad, unavailable) == ("", False, False)
 
 
+class _FakeSession:
+    """Minimal stand-in for an mcp ClientSession already held open by the run."""
+
+    def __init__(self, text="verify_claims: every checked claim exists", boom=None):
+        self.text, self.boom, self.calls = text, boom, 0
+
+    async def call_tool(self, name, args):
+        self.calls += 1
+        if self.boom:
+            raise self.boom
+        return SimpleNamespace(content=[SimpleNamespace(type="text", text=self.text)])
+
+
+class _FakeMCPTools:
+    def __init__(self, session):
+        self.session, self.get_session_calls = session, 0
+
+    async def get_session_for_run(self, **kwargs):
+        self.get_session_calls += 1
+        return self.session
+
+
+def test_verify_claims_uses_the_runs_live_session_and_never_opens_a_connection(monkeypatch):
+    """The whole point of the reuse: opening a NEW streamablehttp_client while the run's
+    own connections to the same server are open is the step that was hanging. If the live
+    session works, the fresh-connection path must never be touched."""
+    opened = {"n": 0}
+
+    def _must_not_be_called(*a, **k):
+        opened["n"] += 1
+        raise AssertionError("opened a fresh connection despite a live session")
+
+    _patch_client(monkeypatch, _must_not_be_called)
+    tools = _FakeMCPTools(_FakeSession())
+
+    report, bad, unavailable = _run(
+        _verify_claims("a `symbol` claim", "http://x/mcp", tools)
+    )
+
+    assert tools.session.calls == 1
+    assert opened["n"] == 0
+    assert unavailable is False
+    assert bad is False
+    assert "every checked claim exists" in report
+
+
+def test_verify_claims_falls_back_to_a_fresh_connection_when_the_live_session_fails(monkeypatch):
+    """A dead/stale live session must degrade to the old behaviour, not to no check."""
+    import swarm.team as team_mod
+
+    monkeypatch.setattr(team_mod, "_VERIFY_RETRY_PAUSE_S", 0)
+    tried = {"n": 0}
+
+    def fresh(*a, **k):
+        tried["n"] += 1
+        raise RuntimeError("fresh connection also down")
+
+    _patch_client(monkeypatch, fresh)
+    tools = _FakeMCPTools(_FakeSession(boom=RuntimeError("session closed")))
+
+    report, bad, unavailable = _run(
+        _verify_claims("a `symbol` claim", "http://x/mcp", tools)
+    )
+
+    assert tools.session.calls == 1, "live session should have been tried first"
+    assert tried["n"] == 1, "should have fallen back to a fresh connection exactly once"
+    assert unavailable is True
+
+
+def test_verify_claims_still_works_with_no_tools_passed(monkeypatch):
+    """Backward compatibility: every existing caller passes only (content, url)."""
+    import swarm.team as team_mod
+
+    monkeypatch.setattr(team_mod, "_VERIFY_RETRY_PAUSE_S", 0)
+    attempts = {"n": 0}
+
+    def flaky(*a, **k):
+        attempts["n"] += 1
+        raise RuntimeError("down")
+
+    _patch_client(monkeypatch, flaky)
+    _, _, unavailable = _run(_verify_claims("claim `x`", "http://x/mcp"))
+    assert attempts["n"] == 2, "url-only callers keep the two fresh-connection attempts"
+    assert unavailable is True
+
+
+def test_verify_claims_runs_with_tools_but_no_url():
+    """A live session alone is sufficient -- no url means no fallback, not no check."""
+    tools = _FakeMCPTools(_FakeSession())
+    report, _, unavailable = _run(_verify_claims("claim `x`", None, tools))
+    assert unavailable is False
+    assert tools.session.calls == 1
+
+
 def test_retry_pause_is_short_enough_to_be_irrelevant():
     """Worst case must stay well under the liveness watchdog -- the same
     do-not-race-the-watchdog invariant that drove _MCP_TIMEOUT down to 180."""

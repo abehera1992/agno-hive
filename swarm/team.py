@@ -1319,8 +1319,13 @@ _UNVERIFIED_DISCLAIMER = (
 )
 
 
-async def _verify_claims(content: str, hive_mcp_url: str | None) -> tuple[str, bool, bool]:
+async def _verify_claims(content: str, hive_mcp_url: str | None,
+                         hive_mcp_tools=None) -> tuple[str, bool, bool]:
     """Run hive-mcp's verify_claims over a draft answer.
+
+    `hive_mcp_tools` is the live agno MCPTools instance for hive-mcp, when the caller
+    has one. Optional and defaulting to None so every existing caller and test keeps
+    working unchanged; when present it is TRIED FIRST (see the attempt list below).
 
     Returns (report, has_problems, unavailable). `unavailable=True` means the check
     was ATTEMPTED and failed (exception or timeout) -- distinct from "not attempted"
@@ -1332,12 +1337,26 @@ async def _verify_claims(content: str, hive_mcp_url: str | None) -> tuple[str, b
     reported as "no problems, but unavailable" (see _UNVERIFIED_DISCLAIMER above for why
     callers must still surface this rather than treat it as a clean pass) and logged.
     """
-    if not content or not hive_mcp_url:
+    if not content or not (hive_mcp_url or hive_mcp_tools):
         return "", False, False
-    from mcp import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
 
-    async def _call() -> str:
+    async def _call_on_live_session() -> str:
+        """Reuse the connection the run is already holding.
+
+        get_session_for_run() is agno's supported accessor: with no header_provider
+        configured (this codebase never sets one) it returns the MCPTools instance's
+        own live ClientSession, already initialized. _verified_answer runs INSIDE the
+        AsyncExitStack that entered these MCPTools, so the session is guaranteed still
+        open at this point -- verified by call-site nesting, not assumed.
+        """
+        session = await hive_mcp_tools.get_session_for_run()
+        res = await session.call_tool("verify_claims", {"answer": content})
+        return _extract_mcp_text(res)
+
+    async def _call_on_fresh_connection() -> str:
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
         async with streamablehttp_client(hive_mcp_url) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
@@ -1379,26 +1398,47 @@ async def _verify_claims(content: str, hive_mcp_url: str | None) -> tuple[str, b
     # signature already documented for _MCP_TIMEOUT ("hive-mcp's own docker logs showed
     # the request never arriving"). Raising the budget would not have helped; a fresh
     # connection might, which is what the retry above is.
+    # Attempt order: the run's OWN live session first, a brand-new connection only as
+    # the fallback. Added 2026-08-20 after the evidence showed the failures were never
+    # slow greps but connections that never reached hive-mcp at all -- opening a fresh
+    # streamablehttp_client, while the run's existing MCPTools connections to the SAME
+    # server are still open, is the step that was hanging. Reusing the already-
+    # established session skips that step entirely rather than retrying through it.
+    attempts: list[tuple[str, object, int]] = []
+    if hive_mcp_tools is not None:
+        attempts.append(("live-session", _call_on_live_session,
+                         _BESPOKE_MCP_SESSION_TIMEOUT))
+    if hive_mcp_url:
+        attempts.append(("fresh-connection", _call_on_fresh_connection,
+                         _BESPOKE_MCP_SESSION_TIMEOUT if not attempts
+                         else _BESPOKE_MCP_SESSION_TIMEOUT // 2))
+        if hive_mcp_tools is None:
+            # No live session to try first, so the two fresh-connection attempts added
+            # earlier on 2026-08-20 are the only retry this caller gets -- keep both.
+            # Dropping the second here would silently regress every url-only caller
+            # back to the original single-shot give-up, which is what a test caught.
+            attempts.append(("fresh-connection-retry", _call_on_fresh_connection,
+                             _BESPOKE_MCP_SESSION_TIMEOUT // 2))
+
     last_exc = None
-    for attempt, budget in enumerate((_BESPOKE_MCP_SESSION_TIMEOUT,
-                                      _BESPOKE_MCP_SESSION_TIMEOUT // 2), start=1):
+    for n, (label, call, budget) in enumerate(attempts, start=1):
         started = time.monotonic()
         try:
-            report = await asyncio.wait_for(_call(), timeout=budget)
-            if attempt > 1:
-                print(f"[team] verify_claims succeeded on attempt {attempt} "
+            report = await asyncio.wait_for(call(), timeout=budget)
+            if n > 1:
+                print(f"[team] verify_claims succeeded via {label} on attempt {n} "
                       f"after {time.monotonic() - started:.1f}s")
             return report, "could NOT be found" in report, False
         except Exception as exc:
             last_exc = exc
-            print(f"[team] verify_claims attempt {attempt}/2 failed after "
-                  f"{time.monotonic() - started:.1f}s (budget {budget}s) "
+            print(f"[team] verify_claims attempt {n}/{len(attempts)} ({label}) failed "
+                  f"after {time.monotonic() - started:.1f}s (budget {budget}s) "
                   f"({hive_mcp_url}): {type(exc).__name__}: {exc or '<no message>'}")
-            if attempt == 1:
+            if n < len(attempts):
                 await asyncio.sleep(_VERIFY_RETRY_PAUSE_S)
 
-    print(f"[team] verify_claims unavailable after 2 attempts ({hive_mcp_url}): "
-          f"{type(last_exc).__name__}: {last_exc or '<no message>'}")
+    print(f"[team] verify_claims unavailable after {len(attempts)} attempt(s) "
+          f"({hive_mcp_url}): {type(last_exc).__name__}: {last_exc or '<no message>'}")
     return "", False, True
 
 
@@ -1908,7 +1948,8 @@ def _ends_with_unfinished_intent(content: str) -> bool:
 
 
 async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | None,
-                           result=None, liveness_path: str | None = None) -> str:
+                           result=None, liveness_path: str | None = None,
+                           hive_mcp_tools=None) -> str:
     """Check the draft's claims and, if any are unverifiable, give the team ONE chance
     to correct itself against the evidence.
 
@@ -2255,7 +2296,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"service/module.**"
         )
 
-    report, bad, unavailable = await _verify_claims(content, hive_mcp_url)
+    report, bad, unavailable = await _verify_claims(content, hive_mcp_url, hive_mcp_tools)
     if unavailable:
         return content + _UNVERIFIED_DISCLAIMER + _summarize_actual_writes(*all_results)
     if not bad:
@@ -2425,7 +2466,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         if citations_unread else ""
     )
 
-    report2, still_bad, still_unavailable = await _verify_claims(corrected, hive_mcp_url)
+    report2, still_bad, still_unavailable = await _verify_claims(
+        corrected, hive_mcp_url, hive_mcp_tools)
     if still_unavailable:
         return (corrected + _UNVERIFIED_DISCLAIMER + unread_note
                 + _summarize_actual_writes(*all_results))
@@ -4452,6 +4494,11 @@ async def run_task_stream(
 
     async with AsyncExitStack() as stack:
         mcp_list = []
+        # url -> live MCPTools, so a post-run check (verify_claims) can reuse the
+        # connection this run already holds instead of opening a new one. Keyed by url
+        # rather than trusting mcp_list order: a server that fails to connect is skipped
+        # above, so mcp_list[0] is not necessarily all_mcp_urls[0].
+        mcp_by_url: dict[str, object] = {}
         # exclude_tools only for project-mcp — it exposes agno_run/agno_list_teams (which
         # would recurse) and duplicates six hive-mcp tool names (see
         # _PROJECT_MCP_EXCLUDE_TOOLS above). hive-mcp does not have any of these names —
@@ -4465,6 +4512,7 @@ async def run_task_stream(
                     MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=_exclude)
                 )
                 mcp_list.append(mcp)
+                mcp_by_url[url] = mcp
                 print(f"[team] MCP connected: {url} ({len(mcp.functions)} tools)")
             except Exception as e:
                 print(f"[team] MCP unavailable, skipping ({url}): {e}")
@@ -4944,6 +4992,11 @@ async def run_task_async(
 
     async with AsyncExitStack() as stack:
         mcp_list = []
+        # url -> live MCPTools, so a post-run check (verify_claims) can reuse the
+        # connection this run already holds instead of opening a new one. Keyed by url
+        # rather than trusting mcp_list order: a server that fails to connect is skipped
+        # above, so mcp_list[0] is not necessarily all_mcp_urls[0].
+        mcp_by_url: dict[str, object] = {}
         # exclude_tools only for project-mcp — it exposes agno_run/agno_list_teams (which
         # would recurse) and duplicates six hive-mcp tool names (see
         # _PROJECT_MCP_EXCLUDE_TOOLS above). hive-mcp does not have any of these names —
@@ -4957,6 +5010,7 @@ async def run_task_async(
                     MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=_exclude)
                 )
                 mcp_list.append(mcp)
+                mcp_by_url[url] = mcp
                 print(f"[team] MCP connected: {url} ({len(mcp.functions)} tools)")
             except Exception as e:
                 print(f"[team] MCP unavailable, skipping ({url}): {e}")
@@ -5162,9 +5216,11 @@ async def run_task_async(
                 # unsupported. Instruction-level verification was tried first and the
                 # model ignored it, so this is enforced outside the model.
                 try:
+                    _hive_url = all_mcp_urls[0] if all_mcp_urls else None
                     content = await _verified_answer(
-                        content, task, team, all_mcp_urls[0] if all_mcp_urls else None,
-                        final_run_output, liveness_path=liveness_path)
+                        content, task, team, _hive_url,
+                        final_run_output, liveness_path=liveness_path,
+                        hive_mcp_tools=mcp_by_url.get(_hive_url) if _hive_url else None)
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
                 tokens = _extract_tokens(final_run_output)

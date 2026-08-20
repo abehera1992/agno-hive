@@ -290,7 +290,7 @@ async def test_verified_answer_retries_on_a_lint_violation_report(monkeypatch):
     )
     call_count = {"n": 0}
 
-    async def fake_verify_claims(content, hive_mcp_url):
+    async def fake_verify_claims(content, hive_mcp_url, hive_mcp_tools=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             return canned_report, True, False
@@ -334,7 +334,7 @@ async def test_verified_answer_never_tells_the_model_a_doc_only_symbol_does_not_
     )
     call_count = {"n": 0}
 
-    async def fake_verify_claims(content, hive_mcp_url):
+    async def fake_verify_claims(content, hive_mcp_url, hive_mcp_tools=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             return canned_report, True, False
@@ -375,7 +375,7 @@ async def test_verified_answer_ground_truth_survives_a_retry_that_makes_no_new_w
         "VERDICT: 1 claim(s) could NOT be found in the project."
     )
 
-    async def fake_verify_claims(content, hive_mcp_url):
+    async def fake_verify_claims(content, hive_mcp_url, hive_mcp_tools=None):
         return canned_report, True, False  # still bad after the retry too -- it gave up
 
     monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
@@ -414,7 +414,7 @@ async def test_verified_answer_does_not_stack_a_second_retry_after_write_claim_g
         "VERDICT: 1 claim(s) could NOT be found in the project."
     )
 
-    async def fake_verify_claims(content, hive_mcp_url):
+    async def fake_verify_claims(content, hive_mcp_url, hive_mcp_tools=None):
         return canned_report, True, False
 
     monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
@@ -446,7 +446,7 @@ async def test_verified_answer_single_guard_still_retries_normally_when_budget_a
     """Regression guard for the fix above: a run that trips exactly ONE guard must
     still retry as before -- the aggregate budget must not turn into a blanket
     no-retry-ever regression."""
-    async def fake_verify_claims(content, hive_mcp_url):
+    async def fake_verify_claims(content, hive_mcp_url, hive_mcp_tools=None):
         return "VERDICT: every checked claim exists in the project.", False, False
 
     monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
@@ -475,7 +475,7 @@ async def test_verified_answer_single_guard_still_retries_normally_when_budget_a
 
 @pytest.mark.asyncio
 async def test_verified_answer_appends_disclaimer_when_verify_claims_is_unavailable(monkeypatch):
-    async def fake_verify_claims(content, hive_mcp_url):
+    async def fake_verify_claims(content, hive_mcp_url, hive_mcp_tools=None):
         return "", False, True  # unavailable -- the check was attempted and failed
 
     monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
@@ -494,7 +494,7 @@ async def test_verified_answer_appends_disclaimer_when_verify_claims_is_unavaila
 
 @pytest.mark.asyncio
 async def test_verified_answer_no_disclaimer_when_verify_claims_succeeds_cleanly(monkeypatch):
-    async def fake_verify_claims(content, hive_mcp_url):
+    async def fake_verify_claims(content, hive_mcp_url, hive_mcp_tools=None):
         return "VERDICT: every checked claim exists in the project.", False, False
 
     monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
@@ -522,7 +522,7 @@ async def test_verified_answer_disclaimer_fires_on_the_post_retry_verify_claims_
     )
     call_count = {"n": 0}
 
-    async def fake_verify_claims(content, hive_mcp_url):
+    async def fake_verify_claims(content, hive_mcp_url, hive_mcp_tools=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             return canned_report, True, False  # first call: real fabrication found
