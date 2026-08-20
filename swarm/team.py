@@ -1478,6 +1478,61 @@ def _count_read_calls(result, tool_names: set[str] = _READ_TOOLS) -> int:
     return n if recognised else -1
 
 
+def _more_grounded(original_result, retry_result) -> bool:
+    """True when a retry gathered at least as much evidence as the draft it would replace.
+
+    Every guard in _verified_answer below re-runs the pipeline and then adopts whatever
+    comes back UNCONDITIONALLY (`content, result = retried, retry`). That assumes a retry
+    is always an improvement. It is not: the retry re-sends the whole original task and
+    re-runs the full agent pipeline from scratch, so it can land anywhere -- including on
+    a LESS grounded answer than the draft that triggered it.
+
+    Confirmed twice. (1) The 2026-08-15 write-up of the still-open coordinator
+    zero-read-calls finding: a retry "repeated the exact wrong-service mistake ...
+    producing a confidently WRONG answer that overwrote Researcher's correct one as the
+    final result", with verify_claims flagging it too late to block, the one retry budget
+    already spent. (2) A 2026-08-20 live groundedness probe on parties_api.py: the draft
+    tripped the no-evidence guard, and the retry ALSO made zero read calls -- adopted
+    anyway, shipping an answer that missed _check_party_limit, the per-query tenant-
+    ownership filtering, and the primary/default uniqueness enforcement entirely, while
+    citing line numbers it never opened a file to obtain.
+
+    Read count is the scoring signal because it is already computed, deterministic, and
+    free -- no extra model round, no second verify_claims call. It deliberately does NOT
+    judge answer quality: a retry that reads MORE and is still wrong is still adopted,
+    exactly as before. This only ever rejects a retry that is demonstrably less grounded
+    than what it replaces, which is the one case where the old unconditional adopt was
+    strictly destructive.
+
+    -1 from either side means "could not tell" -- never treated as "did not read" (see
+    _count_read_calls' own docstring on why that distinction matters), so an
+    undeterminable comparison keeps the original always-adopt behaviour.
+    """
+    before = _count_read_calls(original_result)
+    after = _count_read_calls(retry_result)
+    if before < 0 or after < 0:
+        return True
+    return after >= before
+
+
+def _adopt_retry(label: str, content: str, result, retried: str, retry):
+    """Adopt a guard's retry only when it is at least as grounded as the current draft.
+
+    Returns the (content, result) pair to carry forward. Falsy `retried` (an empty
+    completion) keeps the original, matching every call site's pre-existing `if retried:`
+    check -- this helper absorbs that check so the call sites stay one line each.
+    """
+    if not retried:
+        return content, result
+    if _more_grounded(result, retry):
+        return retried, retry
+    print(
+        f"[team] {label}: retry gathered LESS evidence than the draft it would replace "
+        f"-- keeping the original draft"
+    )
+    return content, result
+
+
 # Tools that WRITE to the project. A "done" claim resting on one of these needs the
 # tool's OWN response to actually say so -- a FAILED apply_diff call is still a tool
 # call by name, and _count_read_calls-style presence checking cannot tell the two apart.
@@ -1859,7 +1914,9 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                         f"never taken. Treat this as INCOMPLETE.**"
                         + _summarize_actual_writes(*all_results)
                     )
-                content, result = retried, retry
+                content, result = _adopt_retry(
+                    "unfinished-intent", content, result, retried, retry
+                )
         except Exception as exc:
             print(f"[team] unfinished-intent retry failed: {exc}")
 
@@ -1912,7 +1969,9 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                         f"succeeded — treat this as NOT applied.**"
                         + _summarize_actual_writes(*all_results)
                     )
-                content, result = retried, retry
+                content, result = _adopt_retry(
+                    "write-claim", content, result, retried, retry
+                )
         except Exception as exc:
             print(f"[team] write-claim retry failed: {exc}")
 
@@ -1982,7 +2041,9 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                         f"absent.**"
                         + _summarize_actual_writes(*all_results)
                     )
-                content, result = retried, retry
+                content, result = _adopt_retry(
+                    "search-claim", content, result, retried, retry
+                )
         except Exception as exc:
             print(f"[team] search-claim retry failed: {exc}")
 
@@ -2020,10 +2081,38 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 liveness_path=liveness_path,
             )
             all_results.append(retry)
-            if retried:
-                content, result = retried, retry
+            content, result = _adopt_retry("no-evidence", content, result, retried, retry)
         except Exception as exc:
             print(f"[team] evidence retry failed: {exc}")
+
+        # Retry-COMPLIANCE check. Every guard in this function re-runs the pipeline with a
+        # corrective instruction and then carries the result forward -- but none of them
+        # ever check that the retry actually DID the thing it was retried for. Measured
+        # live 2026-08-20 on a parties_api.py groundedness probe: the draft tripped this
+        # guard (zero reads), the corrective retry above ran, the retry ALSO made zero read
+        # calls, and its answer was carried forward as final anyway. hive-mcp's own tool log
+        # for that window confirms it: zero get_file_content/search_files calls across the
+        # whole run, yet the answer cited specific line numbers. Two happened to be right,
+        # which is precisely why silent adoption is dangerous -- a confident, correctly-
+        # formatted, entirely ungrounded answer is indistinguishable from a real one
+        # downstream. verify_claims caught only a fabricated symbol name (a symptom), never
+        # the root fact that nothing was read.
+        #
+        # Deliberately a hard surface, not a second retry: the one-retry aggregate budget
+        # exists because each re-run re-triggers the whole pipeline (see this function's
+        # docstring), and a model that ignored an explicit "READ the file first" instruction
+        # once has already demonstrated the instruction is not landing. -1 (undeterminable)
+        # is not 0 and never trips this -- same rule as everywhere else in this file.
+        if _count_read_calls(result) == 0 and _CLAIMY_RE.search(content or ""):
+            return (
+                f"{content}\n\n---\n**UNGROUNDED — this answer states code facts, and "
+                f"NEITHER the original attempt NOR the corrective retry opened a single "
+                f"file this run. Any file, line number, or symbol named above came from "
+                f"the model's own priors, not from this codebase. Treat every specific "
+                f"claim as unverified until checked by hand — including ones that look "
+                f"plausible.**"
+                + _summarize_actual_writes(*all_results)
+            )
 
     # DB-evidence guard: a task explicitly demanding a live-database check must show at
     # least one db_query/db_schema call, not just any read. The generic no-evidence guard
@@ -2047,10 +2136,24 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 liveness_path=liveness_path,
             )
             all_results.append(retry)
-            if retried:
-                content, result = retried, retry
+            content, result = _adopt_retry("db-evidence", content, result, retried, retry)
         except Exception as exc:
             print(f"[team] db-evidence retry failed: {exc}")
+
+        # Same retry-compliance rule as the no-evidence guard above: surface loudly rather
+        # than silently accept an answer whose corrective retry ignored the correction.
+        # A DB question answered without ever touching the DB is the failure that motivated
+        # this whole guard (2026-08-20: "the items table does not exist in the codebase" --
+        # it exists as inventory.items, models.py:141-142 -- answered off a models.py grep).
+        if _count_read_calls(result, tool_names=_DB_TOOLS) == 0:
+            return (
+                f"{content}\n\n---\n**NOT VERIFIED AGAINST THE LIVE DATABASE — this task "
+                f"asked for a live-DB check, and neither the original attempt nor the "
+                f"corrective retry called db_query/db_schema. Any row count, column, or "
+                f"table-existence claim above is inferred from source files, not read from "
+                f"the running database, and may not reflect its actual current state.**"
+                + _summarize_actual_writes(*all_results)
+            )
 
     report, bad, unavailable = await _verify_claims(content, hive_mcp_url)
     if unavailable:
@@ -2198,24 +2301,41 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     if not corrected:
         return content + _summarize_actual_writes(*all_results)
 
-    # Diagnostic visibility, not a hard gate — going back for a SECOND retry would
-    # break the "bounded at ONE retry" design below. Confirmed live 2026-08-04 that
-    # a citation-correction retry can silently skip re-reading; this makes that
-    # visible in logs immediately instead of requiring hours of manual log
-    # archaeology (which is what it took to first notice it).
-    if bad_citations and _count_read_calls(retry) == 0:
+    # Still not a second retry -- that would break the "bounded at ONE retry" design
+    # documented above. But as of 2026-08-20 this is no longer ONLY a log line.
+    #
+    # Confirmed live 2026-08-04 that a citation-correction retry can silently skip
+    # re-reading, and this printed it so the fact stopped requiring hours of log
+    # archaeology to notice. What it did NOT do was tell the person reading the ANSWER.
+    # A 2026-08-20 probe showed why that gap matters: a run corrected its citations
+    # without opening a single file, and the corrected line numbers happened to be right,
+    # so verify_claims' grep passed them cleanly and the answer shipped looking fully
+    # verified. Grep-checking proves a citation RESOLVES; it cannot prove the citation was
+    # DERIVED from the file rather than recalled. Only the read count separates those two,
+    # and the reader is the one who needs to know which they are holding.
+    citations_unread = bool(bad_citations) and _count_read_calls(retry) == 0
+    if citations_unread:
         print("[team] citation-correction retry made ZERO read calls — "
               "it answered from memory/estimation again instead of re-reading")
+    unread_note = (
+        "\n\n---\n**Citations were corrected WITHOUT re-opening any file — the retry that "
+        "produced them made zero read calls, so every line number above is recalled, not "
+        "re-derived. Ones that resolve correctly may do so by coincidence; verify any you "
+        "intend to act on.**"
+        if citations_unread else ""
+    )
 
     report2, still_bad, still_unavailable = await _verify_claims(corrected, hive_mcp_url)
     if still_unavailable:
-        return corrected + _UNVERIFIED_DISCLAIMER + _summarize_actual_writes(*all_results)
+        return (corrected + _UNVERIFIED_DISCLAIMER + unread_note
+                + _summarize_actual_writes(*all_results))
     if still_bad:
         # Surface rather than hide: the reader needs to know which claims are unsupported.
         return (f"{corrected}\n\n---\n**Unverified claims flagged automatically "
                 f"(these could not be found in the repository):**\n```\n{report2}\n```"
+                + unread_note
                 + _summarize_actual_writes(*all_results))
-    return corrected + _summarize_actual_writes(*all_results)
+    return corrected + unread_note + _summarize_actual_writes(*all_results)
 
 
 async def _fill_count_markers(content: str, hive_mcp_url: str | None) -> str:

@@ -78,8 +78,14 @@ _FILE_LINE_RE = re.compile(r"([A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6}):(\d{1,6})")
 # form below either -- a live groundedness re-test cited a 3-function-spanning range this
 # way and it went unchecked even on a run where verify_claims otherwise ran cleanly. Now
 # captures an optional second number so both range endpoints get registered as citations.
+#
+# The separator class is [\s:*]* (mixed), not [:\s]*\**\s* (ordered). The ordered form
+# silently assumed the colon always precedes the bold markers -- true of "**Line:** 389"
+# (the 2026-08-03 case it was written for) and false of "**Lines**: 91-135", the exact
+# 2026-08-20 case this widening exists to catch. Caught by these tests before the second
+# version shipped; the first version deployed that morning would have matched nothing.
 _LABELED_LINE_RE = re.compile(
-    r"\blines?[:\s]*\**\s*(\d{1,6})(?:\s*[-–—]\s*(\d{1,6}))?\b", re.IGNORECASE
+    r"\blines?[\s:*]*(\d{1,6})(?:\s*[-–—]\s*(\d{1,6}))?\b", re.IGNORECASE
 )
 _BACKTICK_PATH_RE = re.compile(r"`([A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6})`")
 # How far back (chars) to look for the path a labeled line number belongs to. Wide
