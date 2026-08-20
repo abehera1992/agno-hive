@@ -237,6 +237,73 @@ def test_verify_claims_runs_with_tools_but_no_url():
     assert tools.session.calls == 1
 
 
+class _CountSession:
+    """Session stand-in for count_matches. `boom=True` simulates a dead live session."""
+
+    def __init__(self, total=7, boom=False):
+        self.total, self.boom, self.calls = total, boom, 0
+
+    async def call_tool(self, name, args):
+        self.calls += 1
+        if self.boom:
+            raise RuntimeError("session closed")
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=f"TOTAL: {self.total}")]
+        )
+
+
+def test_count_markers_resolved_on_the_live_session_without_a_new_connection(monkeypatch):
+    """_fill_count_markers runs post-run, in the same place and for the same reason as
+    verify_claims -- so it must reuse the run's session rather than open a new one."""
+    from swarm.team import _fill_count_markers
+
+    def _must_not_be_called(*a, **k):
+        raise AssertionError("opened a fresh connection despite a live session")
+
+    _patch_client(monkeypatch, _must_not_be_called)
+    tools = _FakeMCPTools(_CountSession(total=7))
+
+    out = _run(_fill_count_markers(
+        "There are [[COUNT pattern=`foo` glob=`**/*.py`]] matches.",
+        "http://x/mcp", tools))
+
+    assert "7" in out and "[[COUNT" not in out
+    assert tools.session.calls == 1
+
+
+def test_count_markers_fall_back_to_a_fresh_connection_when_the_live_session_is_dead(monkeypatch):
+    """The subtle case: the per-marker try/except swallows a dead-session error into
+    '[count unavailable]' instead of raising, so a session-level failure can never reach
+    the outer handler. Without the resolved_any signal the fallback would never fire and
+    every count would silently degrade."""
+    from swarm.team import _fill_count_markers
+
+    fresh_used = {"n": 0}
+
+    def fresh(*a, **k):
+        fresh_used["n"] += 1
+        raise RuntimeError("fresh also down")
+
+    _patch_client(monkeypatch, fresh)
+    tools = _FakeMCPTools(_CountSession(boom=True))
+
+    out = _run(_fill_count_markers(
+        "There are [[COUNT pattern=`foo` glob=`**/*.py`]] matches.",
+        "http://x/mcp", tools))
+
+    assert tools.session.calls == 1, "live session should have been tried first"
+    assert fresh_used["n"] == 1, "a dead live session must trigger the fresh-connection fallback"
+    assert "[count unavailable]" in out
+
+
+def test_count_markers_are_a_noop_with_no_markers_present():
+    """Unchanged behaviour: no markers means no connection of either kind is opened."""
+    from swarm.team import _fill_count_markers
+
+    text = "A perfectly ordinary answer with no markers."
+    assert _run(_fill_count_markers(text, "http://x/mcp", _FakeMCPTools(_CountSession()))) == text
+
+
 def test_retry_pause_is_short_enough_to_be_irrelevant():
     """Worst case must stay well under the liveness watchdog -- the same
     do-not-race-the-watchdog invariant that drove _MCP_TIMEOUT down to 180."""

@@ -1425,9 +1425,15 @@ async def _verify_claims(content: str, hive_mcp_url: str | None,
         started = time.monotonic()
         try:
             report = await asyncio.wait_for(call(), timeout=budget)
-            if n > 1:
-                print(f"[team] verify_claims succeeded via {label} on attempt {n} "
-                      f"after {time.monotonic() - started:.1f}s")
+            # Logged on EVERY success, including the first attempt. Previously only
+            # attempt 2+ logged, so a successful run produced no line at all and the
+            # path actually taken was unobservable -- "no failure lines" was equally
+            # consistent with live-session reuse and with a fresh connection, which is
+            # exactly the ambiguity that made verifying the 2026-08-20 reuse fix harder
+            # than it should have been (settled only by reading hive-mcp's raw HTTP log
+            # for a missing POST/GET handshake).
+            print(f"[team] verify_claims ok via {label} (attempt {n}) in "
+                  f"{time.monotonic() - started:.1f}s")
             return report, "could NOT be found" in report, False
         except Exception as exc:
             last_exc = exc
@@ -2480,13 +2486,21 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     return corrected + unread_note + _summarize_actual_writes(*all_results)
 
 
-async def _fill_count_markers(content: str, hive_mcp_url: str | None) -> str:
+async def _fill_count_markers(content: str, hive_mcp_url: str | None,
+                              hive_mcp_tools=None) -> str:
     """Replace [[COUNT pattern=`..` glob=`..`]] markers with the exact count from
     hive-mcp's count_matches tool. The number is ALWAYS tool-derived. Malformed or
-    unresolvable markers become '[count unavailable]'. No-op when there are no markers."""
+    unresolvable markers become '[count unavailable]'. No-op when there are no markers.
+
+    Like _verify_claims, prefers the run's own live MCP session (`hive_mcp_tools`) and
+    only opens a fresh connection as a fallback -- this runs post-run, in the same place
+    and for the same reason: opening a new streamablehttp_client while the run's existing
+    connections to the same server are open is the step confirmed to hang on 2026-08-20.
+    Optional and defaulting to None, so any caller without a live handle is unaffected.
+    """
     if not content or "[[COUNT" not in content:
         return content
-    if not hive_mcp_url:
+    if not (hive_mcp_url or hive_mcp_tools):
         return _COUNT_MARKER_ANY.sub("[count unavailable]", content)
 
     from mcp import ClientSession
@@ -2497,30 +2511,56 @@ async def _fill_count_markers(content: str, hive_mcp_url: str | None) -> str:
         return _COUNT_MARKER_ANY.sub("[count unavailable]", content)
 
     cache: dict = {}
+    resolved_any = {"ok": False}
 
-    async def _resolve_all() -> None:
+    async def _resolve_with(session) -> None:
+        for mt in matches:
+            key = (mt.group(1), mt.group(2))
+            # Skip only keys already resolved to a REAL count, so a fallback attempt
+            # re-tries the ones a dead session turned into '[count unavailable]'.
+            if cache.get(key, "[count unavailable]") != "[count unavailable]":
+                continue
+            try:
+                res = await session.call_tool(
+                    "count_matches", {"pattern": key[0], "glob_filter": key[1]}
+                )
+                m = re.search(r"TOTAL:\s*(\d+)", _extract_mcp_text(res))
+                cache[key] = m.group(1) if m else "[count unavailable]"
+                resolved_any["ok"] = True
+            except Exception as exc:
+                print(f"[team] count verify failed ({key!r}): {exc}")
+                cache[key] = "[count unavailable]"
+
+    async def _resolve_on_live_session() -> None:
+        await _resolve_with(await hive_mcp_tools.get_session_for_run())
+
+    async def _resolve_on_fresh_connection() -> None:
         async with streamablehttp_client(hive_mcp_url) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                for mt in matches:
-                    key = (mt.group(1), mt.group(2))
-                    if key in cache:
-                        continue
-                    try:
-                        res = await session.call_tool(
-                            "count_matches", {"pattern": key[0], "glob_filter": key[1]}
-                        )
-                        m = re.search(r"TOTAL:\s*(\d+)", _extract_mcp_text(res))
-                        cache[key] = m.group(1) if m else "[count unavailable]"
-                    except Exception as exc:
-                        print(f"[team] count verify failed ({key!r}): {exc}")
-                        cache[key] = "[count unavailable]"
+                await _resolve_with(session)
 
-    try:
-        await asyncio.wait_for(_resolve_all(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
-    except Exception as exc:
-        print(f"[team] count-marker guard: hive-mcp unreachable ({hive_mcp_url}): {exc}")
-        return _COUNT_MARKER_ANY.sub("[count unavailable]", content)
+    # The per-marker try/except above swallows a dead-session error into
+    # '[count unavailable]' rather than raising, so a session-level failure would never
+    # reach the outer handler. resolved_any is what distinguishes "the session is gone"
+    # (nothing resolved) from "these specific patterns genuinely have no matches", and
+    # is the trigger for falling back to a fresh connection.
+    if hive_mcp_tools is not None:
+        try:
+            await asyncio.wait_for(_resolve_on_live_session(),
+                                   timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:
+            print(f"[team] count-marker guard: live session failed "
+                  f"({type(exc).__name__}: {exc or '<no message>'})")
+
+    if not resolved_any["ok"] and hive_mcp_url:
+        try:
+            await asyncio.wait_for(_resolve_on_fresh_connection(),
+                                   timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:
+            print(f"[team] count-marker guard: hive-mcp unreachable ({hive_mcp_url}): "
+                  f"{type(exc).__name__}: {exc or '<no message>'}")
+            return _COUNT_MARKER_ANY.sub("[count unavailable]", content)
 
     out = content
     for mt in matches:
@@ -4592,7 +4632,10 @@ async def run_task_stream(
                 # Tier-3 guard: fill [[COUNT ...]] markers in the final content (streamed
                 # chunks above are pre-substitution; the done-sentinel content is corrected).
                 try:
-                    combined = await _fill_count_markers(combined, all_mcp_urls[0] if all_mcp_urls else None)
+                    _hive_url = all_mcp_urls[0] if all_mcp_urls else None
+                    combined = await _fill_count_markers(
+                        combined, _hive_url,
+                        hive_mcp_tools=mcp_by_url.get(_hive_url) if _hive_url else None)
                 except Exception as exc:
                     print(f"[team] count-marker guard warning: {exc}")
                 tokens = _extract_tokens(final_run_output)
@@ -5209,7 +5252,10 @@ async def run_task_async(
                     return content, tokens, clarification
                 # Tier-3 guard: fill any [[COUNT ...]] markers with deterministic counts.
                 try:
-                    content = await _fill_count_markers(content, all_mcp_urls[0] if all_mcp_urls else None)
+                    _cm_url = all_mcp_urls[0] if all_mcp_urls else None
+                    content = await _fill_count_markers(
+                        content, _cm_url,
+                        hive_mcp_tools=mcp_by_url.get(_cm_url) if _cm_url else None)
                 except Exception as exc:
                     print(f"[team] count-marker guard warning: {exc}")
                 # Tier-4 guard: grep the draft's claims; one correction round if any are
