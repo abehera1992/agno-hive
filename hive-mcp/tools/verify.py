@@ -92,6 +92,18 @@ _BACKTICK_PATH_RE = re.compile(r"`([A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6})`")
 # enough to span a markdown table cell or a short sentence, narrow enough that it
 # won't grab an unrelated path mentioned several claims earlier.
 _LABELED_LINE_WINDOW = 200
+# How far FORWARD to look for the path when NO backticked path precedes the line number.
+# "defined at line 102 in `models.py`" puts the path a few characters AFTER the number,
+# and the backward-only search below skipped that citation entirely -- `nearest is None`
+# meant `continue`, i.e. never checked at all.
+#
+# Live-caught 2026-08-20: an answer said "`sku_prefix` ... is defined at line 102 in
+# `API/inventory-service/models.py`" (real line: 129; line 102 is an unrelated `name`
+# column). verify_claims RAN on that answer and reported clean, because this exact
+# phrasing produced zero checkable citations. Deliberately much tighter than the backward
+# window -- the path in this construction is adjacent, so a wide forward reach would only
+# risk pairing a number with the NEXT claim's path.
+_LABELED_LINE_FORWARD_WINDOW = 80
 # How far FORWARD (chars) to look, after a citation, for the quoted content the
 # answer says lives there. Real answers write the citation then the quote right
 # after it ("models.py, line 450 -- `\"\"\"docstring\"\"\"`"); this has to be short
@@ -875,6 +887,13 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                 break  # only paths mentioned BEFORE this line-number claim count
             if line_start - p.end() <= _LABELED_LINE_WINDOW:
                 nearest = p
+        if nearest is None:
+            # No path BEFORE this line number -- try the adjacent one after it
+            # ("line 102 in `models.py`"). See _LABELED_LINE_FORWARD_WINDOW.
+            for p in backtick_paths:
+                if p.start() >= m.end() and p.start() - m.end() <= _LABELED_LINE_FORWARD_WINDOW:
+                    nearest = p
+                    break
         if nearest is None:
             continue
         line_nums = [int(m.group(1))]

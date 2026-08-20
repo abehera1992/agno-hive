@@ -35,6 +35,7 @@ agents:
       - "  - 'How does X work' / feature questions: call search_files(X, '**/*') to find all occurrences across the codebase."
       - "  - Specific file/symbol questions: call find_files() or search_files() directly."
       - "  - Live database / row count questions ('how many rows', 'check the live database', task explicitly names db_query/db_schema): call db_query() or db_schema() directly if available — do NOT answer from a file grep of model definitions."
+      - "      EXCEPTION: if the question asks for a LINE NUMBER or names a source file, this is NOT a database question — use search_files(), which returns real file:line matches, and pass them on. db_schema reports no line numbers at all and gives Postgres type names (character varying) rather than the source's own (String(8)), so routing a file question there leaves the line number with nowhere to come from but invention."
       - "  - Past task or lesson questions: call lightrag_query() if available."
       - "  - Thematic/cross-module questions: call lightrag_query() with broad keywords if available."
       - "  - User shares a URL or GitHub link → call web_fetch(url) immediately (if web_fetch is available)."
