@@ -265,3 +265,58 @@ async def test_a_bound_role_wins_over_a_missing_agent_object():
     # Executor's real budget is config's 25, not the Coordinator's 60 — the exact
     # mis-attribution that let a 67-call run sail past the guard.
     assert f"of its {config.tool_call_limit} tool calls" in notices[0]
+
+
+# ── the coordinator must actually be forced, not just detected ────────────────
+
+class _Team:
+    def __init__(self):
+        self.tool_choice = "auto"
+        self.model = type("M", (), {"_tool_choice": "auto"})()
+
+
+@pytest.mark.asyncio
+async def test_the_coordinator_is_actually_forced_via_the_team(monkeypatch):
+    """Live failure, 2026-08-21: detection worked and the actuator was a no-op.
+
+        [team] Coordinator reached 59/60 tool calls - forcing text-only ...
+        [budget] Coordinator: call 110/60 (list_processes)
+
+    110 calls against a 60 limit, then a 300s liveness kill. _force_text_only returned
+    early on `agent is None`, which is exactly how a coordinator's own calls arrive
+    (agno passes function._agent, unset for a Team-owned function). agno reads
+    team.tool_choice fresh at every model-call site in team/_run.py, so the Team is the
+    object to flip."""
+    monkeypatch.setattr("swarm.team._resolve_tool_call_limit", lambda t, r: 2)
+    hook = _make_tool_budget_guard_hook("engineering")
+    team = _Team()
+
+    await hook("list_processes", _fn, {}, agent=None, team=team)
+
+    assert team.tool_choice == "none", "coordinator was detected but never forced"
+    assert team.model._tool_choice == "none"
+
+
+@pytest.mark.asyncio
+async def test_an_agent_still_wins_over_the_team(monkeypatch):
+    """A member's own call must flip the MEMBER, not the whole team — forcing the team
+    text-only would stop it delegating and strand the run."""
+    monkeypatch.setattr("swarm.team._resolve_tool_call_limit", lambda t, r: 2)
+    hook = _make_tool_budget_guard_hook("engineering")
+    agent, team = _Agent("Researcher"), _Team()
+
+    await hook("get_file_content", _fn, {}, agent=agent, team=team)
+
+    assert agent.tool_choice == "none"
+    assert team.tool_choice == "auto", "the team must not be disabled by a member's budget"
+
+
+def test_the_hook_declares_team_so_agno_supplies_it():
+    """agno's _build_hook_args passes ONLY parameters the hook names. Dropping `team`
+    from the signature silently reverts this fix with no error anywhere."""
+    import inspect
+
+    from swarm.team import _make_tool_budget_guard_hook as f
+
+    hook = f("engineering")
+    assert "team" in inspect.signature(hook).parameters

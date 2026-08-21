@@ -3378,18 +3378,31 @@ _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS = 3
 _TOOL_BUDGET_RESERVE = 1
 
 
-def _force_text_only(agent) -> None:
-    """Flip an agent (or the coordinator's own model) into text-only mode.
+def _force_text_only(agent, team=None) -> None:
+    """Flip an agent OR the coordinator into text-only mode on its next model call.
 
-    Same two-line mutation _bump_consecutive_stub_and_maybe_force_text_only performs,
-    factored out so the budget guard below reuses the proven form rather than a second
-    copy of it. agno re-reads agent.tool_choice off the live object on every model call,
-    so this takes effect on the very next turn.
+    agno re-reads `tool_choice` off the live object at every model-call site -- both
+    `agent.tool_choice` (agent/_run.py) and `team.tool_choice` (team/_run.py, five
+    sites) -- so mutating it from inside a tool hook takes effect on the very next turn.
+
+    The `team` fallback was missing until 2026-08-21 and the omission was total for the
+    coordinator: its own tool calls arrive at a hook with `agent=None` (agno passes
+    `function._agent`, which is unset for a Team-owned function), so the early return
+    fired every time and NOTHING was ever forced. Measured live, with the budget guard
+    correctly detecting the threshold and then failing to act on it:
+
+        [team] Coordinator reached 59/60 tool calls - forcing text-only ...
+        [budget] Coordinator: call 110/60 (list_processes)
+
+    110 calls against a limit of 60, and the run then stalled into the 300s liveness
+    kill. Detection was never the gap; the actuator was a no-op for the one caller that
+    needed it most.
     """
-    if agent is None:
+    target = agent if agent is not None else team
+    if target is None:
         return
-    agent.tool_choice = "none"
-    model = getattr(agent, "model", None)
+    target.tool_choice = "none"
+    model = getattr(target, "model", None)
     if model is not None:
         model._tool_choice = "none"
 
@@ -3432,7 +3445,11 @@ def _make_tool_budget_guard_hook(
     counts: dict[str, int] = {}
     fired: set[str] = set()
 
-    async def _tool_budget_guard_hook(function_name, function, args, agent=None, run_context=None):
+    # `team` is declared so agno SUPPLIES it -- _build_hook_args (tools/function.py)
+    # only passes a parameter the hook actually names. Without it the coordinator's
+    # own calls had no object to flip and the guard was a no-op for them.
+    async def _tool_budget_guard_hook(function_name, function, args, agent=None,
+                                      team=None, run_context=None):
         # Counted BEFORE any early return: the budget agno enforces covers EVERY tool
         # call, not just the cacheable reads the read-cache hook filters down to.
         # `role` is bound at construction, not discovered from `agent` (2026-08-21).
@@ -3468,7 +3485,7 @@ def _make_tool_budget_guard_hook(
             return result
 
         fired.add(who)
-        _force_text_only(agent)
+        _force_text_only(agent, team)
         if activity is not None:
             activity["tool_budget_forced"] = sorted(fired)
         print(f"[team] {who} reached {count}/{limit} tool calls — forcing text-only "
