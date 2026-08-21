@@ -835,16 +835,53 @@ def _find_anchor_symbol(answer: str, pos: int) -> str | None:
     if heading is not None:
         window = window[heading.end():]
 
-    best = None
+    found = _find_anchor_symbols(answer, pos)
+    return found[0] if found else None
+
+
+def _find_anchor_symbols(answer: str, pos: int) -> list[str]:
+    """EVERY backticked identifier a citation could be about, nearest FIRST.
+
+    Nearest-wins (the original single-anchor rule) is right most of the time and
+    wrong exactly when a sentence names the containing type as well as the thing
+    being located. Live, 2026-08-21, on an answer that was CORRECT in every detail:
+
+        The `sku_prefix` column on the `ItemCategory` model is defined at line 129
+
+    Line 129 really is `sku_prefix = Column(String(8), nullable=True)` -- the report
+    printed that matching line -- and the citation was still reported MISMATCH,
+    because the nearest identifier is `ItemCategory`, which lives at lines 116 and
+    208. The citation's SUBJECT is sku_prefix; ItemCategory is a qualifier. Word
+    order does not reliably separate the two, and guessing which is which from
+    grammar is not something a deterministic grep-based checker should attempt.
+
+    So the caller gets all candidates and asks the FILE instead: if any of them sits
+    within tolerance of the cited line, the citation is anchored and verified. Only
+    when none does is it a MISMATCH. That keeps every true positive -- a citation
+    naming symbols that are all genuinely elsewhere still fails -- while removing a
+    whole class of false alarms, which matters because a checker that flags correct
+    answers gets ignored, taking its true positives with it.
+    """
+    lo, _ = _citation_bounds(answer, pos)
+    start = max(0, pos - _LABELED_LINE_WINDOW, lo)
+    window = answer[start:pos]
+    heading = None
+    for h in _MD_HEADING_RE.finditer(window):
+        heading = h
+    if heading is not None:
+        window = window[heading.end():]
+
+    found: list[str] = []
     for m in _BACKTICK_RE.finditer(window):
         tok = m.group(1).strip()
         if _PATHLIKE_RE.match(tok):          # a path is the citation's file, not its subject
             continue
         if tok.lower() in _NOISE:
             continue
-        if _IDENT_RE.match(tok) or _DOTTED_RE.match(tok):
-            best = tok                       # keep the LAST (nearest) match
-    return best
+        if (_IDENT_RE.match(tok) or _DOTTED_RE.match(tok)) and tok not in found:
+            found.append(tok)
+    found.reverse()                          # nearest first
+    return found
 
 
 def _symbol_line_numbers(rel_path: str, symbol: str, limit: int = 200) -> list[int]:
@@ -974,9 +1011,12 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
 
     file_lines: list[tuple[str, int]] = []
     content_claims: dict[tuple[str, int], str] = {}
-    # Fallback anchor for citations that quote nothing -- the identifier the citation is
-    # ABOUT. See _find_anchor_symbol and the CITATIONS loop's use of it.
-    symbol_claims: dict[tuple[str, int], str] = {}
+    # Fallback anchors for citations that quote nothing -- the identifiers the citation
+    # could be ABOUT, nearest first. A LIST, not one symbol (2026-08-21): a sentence
+    # naming both the thing located and its containing type gives two candidates, and
+    # word order does not reliably say which is the subject. See _find_anchor_symbols
+    # and the CITATIONS loop, which resolves it by asking the file.
+    symbol_claims: dict[tuple[str, int], list[str]] = {}
     for m in _FILE_LINE_RE.finditer(answer):
         path, num = m.group(1), int(m.group(2))
         pair = (path, num)
@@ -987,9 +1027,9 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             if quoted:
                 content_claims[pair] = quoted
         if pair not in symbol_claims:
-            anchor = _find_anchor_symbol(answer, m.start())
-            if anchor:
-                symbol_claims[pair] = anchor
+            anchors = _find_anchor_symbols(answer, m.start())
+            if anchors:
+                symbol_claims[pair] = anchors
 
     # Labeled prose citations ("**File:** `x`, **Line:** 389") that never use the
     # compact path:line form above, and so never matched _FILE_LINE_RE at all. Pair
@@ -1026,9 +1066,9 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                 if quoted:
                     content_claims[pair] = quoted
             if pair not in symbol_claims:
-                anchor = _find_anchor_symbol(answer, m.start())
-                if anchor:
-                    symbol_claims[pair] = anchor
+                anchors = _find_anchor_symbols(answer, m.start())
+                if anchors:
+                    symbol_claims[pair] = anchors
 
     routes: list[str] = []
     if _ROUTE_RE is not None:
@@ -1203,20 +1243,39 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                     # away: an absent symbol is the SYMBOLS section's job, and treating it
                     # as citation evidence here would manufacture a MISMATCH whenever the
                     # backward anchor guessed wrong.
-                    anchor = symbol_claims.get((path, num))
-                    if anchor:
-                        hits = _symbol_line_numbers(resolved, anchor)
-                        if hits and not any(abs(h - num) <= _LINE_TOLERANCE for h in hits):
-                            problems += 1
-                            near = ", ".join(str(h) for h in hits[:5])
-                            out.append(
-                                f"  MISMATCH   {resolved}:{num} <-- `{anchor}` is not "
-                                f"within {_LINE_TOLERANCE} lines of {num}; it actually "
-                                f"appears at line(s) {near}"
-                            )
-                        elif hits:
-                            out.append(f"             `{anchor}` verified within "
-                                       f"{_LINE_TOLERANCE} lines")
+                    # Ask the FILE which candidate the citation is about, rather than
+                    # guessing from word order (2026-08-21). A sentence like "the
+                    # `sku_prefix` column on the `ItemCategory` model is defined at line
+                    # 129" offers two anchors; nearest-wins picks ItemCategory (lines
+                    # 116/208) and reports MISMATCH on a citation that is exactly right.
+                    # If ANY candidate sits within tolerance, the citation is anchored.
+                    anchors = symbol_claims.get((path, num)) or []
+                    anchored_by = next(
+                        (a for a in anchors
+                         if any(abs(h - num) <= _LINE_TOLERANCE
+                                for h in _symbol_line_numbers(resolved, a))),
+                        None,
+                    )
+                    if anchored_by:
+                        out.append(f"             `{anchored_by}` verified within "
+                                   f"{_LINE_TOLERANCE} lines")
+                    else:
+                        # No candidate is near the cited line. Report the nearest one
+                        # that EXISTS in the file at all -- a candidate absent entirely
+                        # is the SYMBOLS section's business, and treating it as citation
+                        # evidence would manufacture a MISMATCH whenever the backward
+                        # scan picked up an unrelated identifier.
+                        for a in anchors:
+                            hits = _symbol_line_numbers(resolved, a)
+                            if hits:
+                                problems += 1
+                                near = ", ".join(str(h) for h in hits[:5])
+                                out.append(
+                                    f"  MISMATCH   {resolved}:{num} <-- `{a}` is not "
+                                    f"within {_LINE_TOLERANCE} lines of {num}; it actually "
+                                    f"appears at line(s) {near}"
+                                )
+                                break
         out.append("")
 
     # ── routes ────────────────────────────────────────────────────────────────
