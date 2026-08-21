@@ -3337,12 +3337,25 @@ def _make_tool_budget_guard_hook(team_name: str | None, activity: dict | None = 
         role = getattr(agent, "name", None) or "Coordinator"
         counts[role] = counts.get(role, 0) + 1
         count = counts[role]
+        limit = _resolve_tool_call_limit(team_name, role)
+
+        # Low-noise permanent diagnostic (2026-08-21): the first call per role, then
+        # every 10th. Added after this guard demonstrably did NOT fire on a live run
+        # where one role made 67 calls against a limit of 25 -- while firing correctly
+        # in isolation against the same deployed code. Registration, hook ordering,
+        # _build_hook_args supplying `agent`, construction order, and
+        # _safe_hook_call_async not swallowing exceptions were all verified correct, so
+        # the remaining unknown is whether this hook is reached at all and under what
+        # role name. Silence in the log is itself the answer. Kept rather than removed
+        # once diagnosed: "which roles are spending budget, and how fast" is worth a
+        # handful of lines per run on its own.
+        if count == 1 or count % 10 == 0:
+            print(f"[budget] {role}: call {count}/{limit} ({function_name})")
 
         result = await function(**args)
 
         if role in fired:
             return result
-        limit = _resolve_tool_call_limit(team_name, role)
         if count < max(limit - _TOOL_BUDGET_RESERVE, 1):
             return result
 
