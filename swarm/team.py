@@ -793,9 +793,25 @@ def _strip_mutating(specs: list, tool_names: list[str] | None) -> tuple[list, li
         if getattr(s2, "tools", None):
             s2.tools = [t for t in s2.tools if not _is_mutating(t)]
         out.append(s2)
-    if tool_names:
+    # `is not None`, NOT truthiness (fixed 2026-08-21). An EXPLICITLY EMPTY allowlist is
+    # a deliberate disarm and must survive read_only stripping; only an ABSENT one means
+    # "resolve against the live MCP surface". Under the old truthy test, [] fell through
+    # to None and _scope_coordinator_tools took its unrestricted branch.
+    #
+    # This silently voided engineering's coordinator disarm (coordinator_tools: [],
+    # 2026-08-20) for EVERY read_only run -- which is every question-answering call.
+    # Measured 2026-08-21 by logging the resolved surface: 25 tools, including
+    # get_file_content, list_processes, check_port, db_query and db_schema -- the exact
+    # tools that disarm removed. The YAML said [], _load_team returned [], the worker
+    # payload carried [], and _build_team produced [] when called directly; only the
+    # read_only path in between turned it into None, so every static check passed.
+    #
+    # Fourth instance of empty-vs-absent in this file, and the costliest: the same
+    # conflation was fixed in _scope_coordinator_tools (early return for []) and twice
+    # in api/server.py's _load_team (per-agent tools:, coordinator_tools:).
+    if tool_names is not None:
         return out, [t for t in tool_names if not _is_mutating(t)]
-    return out, None   # resolved against the live MCP surface in _scope_coordinator_tools
+    return out, None   # absent, not empty -- resolved against the live MCP surface
 
 
 # Discovery tools the coordinator must never call directly -- always resolved out of
