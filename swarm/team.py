@@ -1605,6 +1605,28 @@ _CORRECT_LINE_RE = re.compile(
     r"it actually appears at line\(s\) ([\d, ]+)"
 )
 
+def _resolve_coordinator_allowlist(coordinator_tools: list[str] | None) -> list[str] | None:
+    """Honour `coordinator_tools: []` only when the disarm is enabled (2026-08-21).
+
+    Applied at BOTH run paths' entry, before _strip_mutating, so the flag governs
+    read_only and normal runs identically. That matters: _strip_mutating only runs on
+    the read_only path, so until 2026-08-21 the disarm was silently active for normal
+    runs and silently void for read-only ones -- the inconsistency that hid the bug for
+    a day. Gating in one place removes the split entirely.
+
+    OFF (default) maps [] -> None, i.e. the pre-2026-08-20 "resolve against the live MCP
+    surface" behavior. ON passes [] through to _scope_coordinator_tools' early return.
+    An absent allowlist (None) and a populated one are untouched either way.
+
+    See config.enforce_coordinator_disarm for the measured reason the default is OFF:
+    the disarm works, but the groundedness guards around it currently cannot see a
+    delegated member's reads, so correct answers get retried into wrong ones.
+    """
+    if coordinator_tools is not None and not coordinator_tools and not config.enforce_coordinator_disarm:
+        return None
+    return coordinator_tools
+
+
 def _resolve_tool_call_limit(team_name: str | None, role_name: str) -> int:
     """This (team, role)'s real tool-call budget, DB override first.
 
@@ -5207,8 +5229,11 @@ async def run_task_stream(
 
         # read_only strips mutating tools from both the agents and the coordinator, so a
         # read-only run cannot write regardless of what the model decides to do.
-        _specs, _ctools = (_strip_mutating(agent_specs, coordinator_tools) if read_only
-                           else (agent_specs, coordinator_tools))
+        # Flag-gated BEFORE the read_only split, so both paths agree (see
+        # _resolve_coordinator_allowlist -- they did not, and that hid a real bug).
+        _allowlist = _resolve_coordinator_allowlist(coordinator_tools)
+        _specs, _ctools = (_strip_mutating(agent_specs, _allowlist) if read_only
+                           else (agent_specs, _allowlist))
         # DB-backed model routing (AGNOHive 2.3.2 addendum) — get_model() (called
         # inside _build_team, below) only ever reads model_routing's in-process
         # cache, never the DB directly. This covers BOTH the FastAPI server path
@@ -5724,8 +5749,11 @@ async def run_task_async(
 
         # read_only strips mutating tools from both the agents and the coordinator, so a
         # read-only run cannot write regardless of what the model decides to do.
-        _specs, _ctools = (_strip_mutating(agent_specs, coordinator_tools) if read_only
-                           else (agent_specs, coordinator_tools))
+        # Flag-gated BEFORE the read_only split, so both paths agree (see
+        # _resolve_coordinator_allowlist -- they did not, and that hid a real bug).
+        _allowlist = _resolve_coordinator_allowlist(coordinator_tools)
+        _specs, _ctools = (_strip_mutating(agent_specs, _allowlist) if read_only
+                           else (agent_specs, _allowlist))
         # DB-backed model routing (AGNOHive 2.3.2 addendum) — get_model() (called
         # inside _build_team, below) only ever reads model_routing's in-process
         # cache, never the DB directly. This covers BOTH the FastAPI server path
