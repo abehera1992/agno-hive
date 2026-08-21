@@ -4640,6 +4640,15 @@ def _build_team(
     )) + [
         request_clarification, update_session_state,
     ]
+    # One line per run (2026-08-21). The coordinator's OWN tool surface is the single
+    # most consequential thing _build_team decides and the hardest to confirm from
+    # outside: engineering deliberately runs it disarmed (coordinator_tools: []), and a
+    # live [budget] trace attributed get_file_content -- which a disarmed coordinator
+    # cannot call -- to the Coordinator. Every link in the chain (YAML -> _load_team ->
+    # worker payload -> _scope_coordinator_tools) reads correct statically, so log the
+    # resolved truth rather than re-deriving it.
+    print(f"[team] coordinator surface ({len(coordinator_tools_list)}): "
+          f"{[getattr(t, 'name', type(t).__name__) for t in coordinator_tools_list]}")
     team = Team(
         name=name,
         description=description,
