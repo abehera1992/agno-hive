@@ -241,7 +241,17 @@ def test_the_real_shipped_config_is_clean():
     team_config._tool_registry_cache.update(n for (_, _, n) in seed_tools)
     team_config._tool_registry_cache.add(_NOT_IN_SEED)
 
-    assert team_config.check_config_health() == []
+    findings = team_config.check_config_health()
+
+    # Exactly one, and it is TRUE: engineering's coordinator became intentionally
+    # unrestricted on 2026-08-21 when the `coordinator_tools: []` disarm was removed
+    # (see test_engineering_yaml_has_NO_coordinator_tools_key for the measurements).
+    # The check cannot know that intent, and surfacing it is right rather than noise --
+    # an unrestricted coordinator IS the fail-open state and should stay visible even
+    # when it is the deliberate choice. Pinned to exactly one so any OTHER regression
+    # in the shipped config still fails this test.
+    assert len(findings) == 1, findings
+    assert "engineering/Coordinator resolves to UNRESTRICTED" in findings[0]
 
 
 def test_clean_config_reports_nothing(tmp_path, monkeypatch):

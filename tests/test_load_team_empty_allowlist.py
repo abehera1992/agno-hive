@@ -120,21 +120,18 @@ def test_empty_agent_skills_is_not_overridden_by_db_rows(load_team):
     assert agents[0].skills == []
 
 
-def test_engineering_coordinator_allowlist_survives_a_db_grant(monkeypatch):
-    """End-to-end on the real YAML: the disarm holds even if someone grants
-    (engineering, Coordinator) rows tomorrow. Without the `is None` fix this
-    returns the granted list instead of [].
+def test_an_explicit_empty_allowlist_survives_a_db_grant(load_team):
+    """Retargeted 2026-08-21. This used to run against engineering.yaml, whose
+    `coordinator_tools: []` was removed that day (see
+    test_engineering_yaml_has_NO_coordinator_tools_key for the evidence).
 
-    engineering.yaml omits every agent's model:, resolving it from
-    team_role_models at load time — stubbed here so this stays a test about the
-    allowlist rather than about model routing."""
-    from api import server
-    from swarm import model_routing
+    The PROPERTY it pins is unchanged and still matters for any team that declares an
+    empty allowlist: `[]` is a deliberate disarm and a DB grant must not silently
+    re-arm it. Only the fixture moved from the real YAML to a synthetic team, so the
+    test survives engineering's own configuration changing again."""
+    _, _, _, coordinator_tools = load_team(
+        {"agents": [_agent()], "coordinator_tools": []},
+        grants={"Coordinator": ["db_schema"]},
+    )
 
-    monkeypatch.setattr(model_routing, "get_default_model", lambda *a: "stub-model")
-    team_config._tools_cache[("engineering", "Coordinator")] = {"db_schema"}
-    try:
-        _, _, _, coordinator_tools = server._load_team("engineering")
-        assert coordinator_tools == []
-    finally:
-        team_config._tools_cache.pop(("engineering", "Coordinator"), None)
+    assert coordinator_tools == []

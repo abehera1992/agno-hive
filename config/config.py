@@ -238,34 +238,6 @@ class Config:
     # default -- this changes real behavior (forces delegation on every write-shaped task),
     # not a passive diagnostic like the logging added earlier that day.
     coordinator_no_direct_writes: bool = os.getenv("COORDINATOR_NO_DIRECT_WRITES", "false").lower() == "true"
-    # Whether an EXPLICITLY EMPTY `coordinator_tools: []` actually disarms the
-    # coordinator (2026-08-21). Default OFF -- [] is treated as absent, i.e. the
-    # pre-2026-08-20 unrestricted surface.
-    #
-    # The disarm itself is correct and is the intended architecture: the coordinator
-    # delegates and aggregates, members hold the tools (which is where the SQLite
-    # team_role_tools mapping puts them). Live-confirmed working once the read_only
-    # path stopped discarding the empty list -- coordinator surface went 25 tools -> 2,
-    # and a run delegated to context-router then researcher exactly as designed.
-    #
-    # It is OFF anyway because turning it on measurably made ANSWERS worse, and that
-    # regression is not in the disarm -- it is in machinery calibrated around a
-    # coordinator that did its own reads. With every read now happening inside a
-    # delegated member, _count_read_calls sees none of them and the groundedness guard
-    # fires on correct answers. Measured 2026-08-21, same prompts, same hour:
-    #     armed   -> T1 correct 3/3; T3 correct, no disclaimer
-    #     disarmed-> T1 line 127/String(10) (truth 129/String(8)); T3 cited
-    #                "API/parties-service/" -- a service that does not exist; and ALL
-    #                answers carried the UNGROUNDED disclaimer, including a correct one
-    # _count_read_calls' own docstring already records why that is dangerous rather than
-    # merely noisy: a false "ungrounded" verdict forces a retry, and "that retry's
-    # fresh, un-grounded re-run then produced a WRONG answer, overwriting the right
-    # one" -- which is exactly what T1 and T3 did.
-    #
-    # Flip this ON once a delegated member's reads are visible to _count_read_calls
-    # (neither result.messages nor session_state["read_log"] currently surfaces them),
-    # and re-run the T1-T13 battery before trusting it.
-    enforce_coordinator_disarm: bool = os.getenv("ENFORCE_COORDINATOR_DISARM", "false").lower() == "true"
 
     # Member-agent sampling caps -- the SAME repetition-loop/unbounded-completion failure
     # diagnosed for the coordinator above (2026-08-10) and fixed there via

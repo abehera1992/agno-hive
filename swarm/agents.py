@@ -1,5 +1,3 @@
-import copy
-
 from agno.agent import Agent
 from agno.run import RunContext
 from agno.tools import tool as agno_tool
@@ -271,28 +269,7 @@ def make_agent_from_spec(
         all_funcs: dict = {}
         for mcp in mcps:
             all_funcs.update(mcp.functions)
-        # copy.copy per agent, NOT the shared Function object (2026-08-21). An MCPTools'
-        # `functions` dict is shared across the Team and every member that lists the same
-        # tool name, and agno stores caller identity ON the Function: agent/_tools.py sets
-        # `_func._agent = agent` at run registration, team/_tools.py sets only `_func._team`.
-        # One slot, many registrants -- so `agent` in a tool hook reflected whoever
-        # registered last, which live-measured as None for every call.
-        #
-        # Measured consequence: EVERY tool call arrived at the hooks with agent=None.
-        # `get_file_content` calls, which engineering's coordinator cannot make at all
-        # (coordinator_tools: [] -- verified live, it has zero MCP tools), were attributed
-        # to "Coordinator". Three mechanisms key on that identity and were all degraded:
-        #   * the tool-budget guard counted every role into one bucket against the
-        #     Coordinator's 60, while members were being refused at their real 25;
-        #   * the duplicate-read cache's per-agent serve counting collapsed to one shared
-        #     bucket, so "the Coder's first read of a file the Researcher already read
-        #     five times still gets the real content" no longer held;
-        #   * the search-before-browse gate compares agent_key != "Researcher", so with
-        #     agent None it early-returned on every call and gated nothing.
-        # A shallow copy is enough and is safe: it shares the entrypoint (same underlying
-        # MCP call) while giving each agent its own `_agent` and `tool_hooks` slots --
-        # verified against a live MCPTools before relying on it.
-        scoped = [copy.copy(all_funcs[t]) for t in spec.tools if t in all_funcs]
+        scoped = [all_funcs[t] for t in spec.tools if t in all_funcs]
         agent_tools = scoped if scoped else list(mcps)
     else:
         agent_tools = list(mcps)

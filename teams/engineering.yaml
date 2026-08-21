@@ -1,23 +1,34 @@
 name: engineering
 description: Full engineering team — routes context, researches codebase, plans, implements, executes, and reviews.
 
-# Coordinator calls NO MCP tool directly — pure orchestration. An explicitly EMPTY list
-# means exactly that (see _scope_coordinator_tools); omitting the key instead would mean
-# "every tool minus the discovery blocklist", which is what this replaces.
+# NO coordinator_tools: key — the coordinator resolves against the live MCP surface
+# minus _COORDINATOR_DISCOVERY_TOOLS. Removed 2026-08-21, and the history matters
+# because the obvious reading of that removal is wrong.
 #
-# It still holds delegate_task_to_member(s) and get_member_information (agno adds those
-# itself, independent of tools=) plus request_clarification/update_session_state, so it
-# can orchestrate — it simply cannot execute.
+# A `coordinator_tools: []` disarm was added 2026-08-20 for one measured failure: asked
+# which line defines a column, the coordinator called db_schema itself and answered with
+# ZERO delegations — db_schema has no line numbers, so the cited line could only be
+# invented, and it was (102, then 123 on a re-run; real line 129).
 #
-# Why: _COORDINATOR_DISCOVERY_TOOLS had been growing one tool at a time, each entry added
-# after a live incident where the coordinator used that tool directly instead of
-# delegating (find_files/search_files/..., then lightrag_query/get_context_section
-# 2026-08-15, then get_graph_report a commit later). 2026-08-20 produced the next one:
-# asked which line defines a column, the coordinator called db_schema itself and answered
-# in two turns with ZERO delegations — db_schema has no line numbers, so the cited line
-# could only be invented, and it was (line 102, then 123 on a re-run; real line 129).
-# A denylist that needs a new entry per incident is the wrong shape; this inverts it.
-coordinator_tools: []
+# Two things were then established:
+#   1. It never took effect on read_only runs — i.e. every question-answering call.
+#      _strip_mutating tested `if tool_names:`, falsy for [], and returned None, which
+#      means "unrestricted" downstream. Measured 2026-08-21: the coordinator's resolved
+#      surface was 25 tools, not 0.
+#   2. The failure it targeted is gone anyway, fixed by other means — the bounded-read
+#      citation retry, the symbol-anchor citation check, and the verify_claims work.
+#      That same probe now returns line 129 / Column(String(8), nullable=True),
+#      correctly and repeatably, with the coordinator armed.
+#
+# And enabling it for real made answers WORSE: the column question came back off by ten
+# lines, and "which file defines delete_party" invented API/parties-service/ with
+# is_deleted/deleted_at fields that exist nowhere. Delegation itself worked and members
+# found the right data — verify_claims printed the correct file from in-run evidence —
+# but the coordinator's aggregation step was not faithful to what came back.
+#
+# So this is not "the coordinator should hold tools". It is: the disarm was solving a
+# problem that no longer exists, was never actually active on the path that mattered,
+# and the aggregation-fidelity question it exposed is open and tracked separately.
 # Coordinator benchmark 2026-06-11 (same task, full 7-agent pipeline, Ollama 0.30.6):
 #   ibm/granite4.1:30b   217s — hallucinated service purposes from dir names
 #   qwen3:30b-a3b        318s — accurate but ~1K hidden thinking tokens/turn

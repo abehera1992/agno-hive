@@ -265,15 +265,3 @@ async def test_a_bound_role_wins_over_a_missing_agent_object():
     # Executor's real budget is config's 25, not the Coordinator's 60 — the exact
     # mis-attribution that let a 67-call run sail past the guard.
     assert f"of its {config.tool_call_limit} tool calls" in notices[0]
-
-
-def test_member_tools_are_per_agent_copies():
-    """The change that makes per-agent hooks possible at all. With shared Function
-    objects, `tool_hooks` is one slot and the last agent to register wins - so binding
-    a role per agent would silently collapse back to whichever list was written last."""
-    import inspect
-
-    from swarm import agents
-
-    src = inspect.getsource(agents.make_agent_from_spec)
-    assert "copy.copy(all_funcs[t])" in src

@@ -63,18 +63,33 @@ def test_a_nonempty_allowlist_still_scopes_normally(mcp_list):
     assert [f.name for f in scoped] == ["get_file_content"]
 
 
-def test_engineering_yaml_declares_an_empty_coordinator_allowlist():
-    """The config half of the change -- asserted here so a later edit that drops the key
-    (reverting to 'everything minus the blocklist') fails loudly rather than quietly
-    re-arming the coordinator."""
-    import yaml
+def test_engineering_yaml_has_NO_coordinator_tools_key():
+    """Inverted 2026-08-21. This asserted `coordinator_tools: []` — the disarm — and
+    that has been removed, deliberately, for two measured reasons:
+
+      1. It never took effect on read_only runs (every question-answering call):
+         _strip_mutating tested `if tool_names:`, falsy for [], returning None, which
+         means UNRESTRICTED downstream. The coordinator's resolved surface was 25 tools.
+      2. The failure it targeted is gone anyway, fixed by other means — the bounded-read
+         citation retry, the symbol-anchor check, and the verify_claims work. The same
+         probe now returns line 129 / Column(String(8), nullable=True) repeatably, with
+         the coordinator armed.
+
+    Enabling it for real made answers WORSE (a column question off by ten lines; an
+    invented API/parties-service/ with is_deleted/deleted_at). The aggregation-fidelity
+    question that exposed is open and tracked separately.
+
+    Asserting ABSENCE rather than deleting the test: a future `coordinator_tools: []`
+    added without revisiting that evidence should fail here and be made to justify
+    itself."""
     from pathlib import Path
+
+    import yaml
 
     data = yaml.safe_load(
         (Path(__file__).parent.parent / "teams" / "engineering.yaml").read_text(encoding="utf-8")
     )
-    assert "coordinator_tools" in data, "key must be present, not omitted"
-    assert data["coordinator_tools"] == []
+    assert "coordinator_tools" not in data
 
 
 def test_researcher_owns_the_db_tools_the_coordinator_gave_up():
