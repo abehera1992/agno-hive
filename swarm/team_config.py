@@ -4,7 +4,7 @@ its own precedence:
     own tools:/skills:, when present, still wins outright (same "pin it back
     here to take it out of DB control" escape hatch model: already has), but
     all 4 shipped teams/*.yaml have had those fields removed, so the DB
-    supplies them by default (see _DEFAULT_TOOL_GRANTS/_DEFAULT_SKILL_GRANTS
+    supplies them by default (see _load_seed_grants()/seeds/team_config.yaml
     below and api/server.py's _load_team()). Changed 2026-08-18 from an
     earlier additive-union design specifically to make the DB the primary
     source rather than a YAML-plus-extras layer.
@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 
+import yaml
 from sqlalchemy import select
 from sqlalchemy.sql import func
 
@@ -281,249 +283,154 @@ async def reset_cache_for_tests() -> None:
 # _GATE_ENABLED_TEAMS/_SEARCH_GATE_ENABLED_TEAMS sets already define until an
 # admin explicitly overrides one).
 #
-# 2026-08-18 follow-up: this used to be parsed live from each teams/*.yaml's
-# tools:/skills: content at seed time. Once the DB became the actual runtime
-# source (api/server.py's _load_team() now reads a role's tools/skills from
-# here whenever the YAML omits the field — see that function's Tier 1 comment)
-# and teams/*.yaml had those fields removed accordingly, there was nothing left
-# in the YAML for a fresh deployment to seed FROM — the static snapshot below
-# is what the YAML content actually was at migration time, captured once and
-# now the sole source of truth for a first-run seed. Editing an EXISTING
-# deployment's grants goes through the admin API below, not this snapshot.
+# 2026-08-18: this used to be parsed live from each teams/*.yaml's tools:/skills:
+# content at seed time. Once the DB became the actual runtime source and those
+# fields were removed from the YAMLs, there was nothing left to seed FROM, so a
+# static snapshot of that former YAML content became the seed — first as Python
+# literals in this module, and since 2026-08-21 as seeds/team_config.yaml.
 #
-# tool_registry/skill_registry are seeded from the union of every name below —
-# a reasonable, honest bootstrap (everything here was in active use at
-# migration time, so definitely a real, valid name) — NOT a substitute for
-# refresh_registry()'s live-MCP-sourced refresh, which is the real source of
-# truth once available. A name granted via the admin API that isn't yet in the
-# registry (a brand-new hive-mcp tool that hasn't been through a
-# refresh_registry() call yet) is correctly rejected until the registry is
-# refreshed — fail loud, not silently accept an unverifiable name.
+# The literals moved OUT of this module deliberately (see that file's own header):
+# sitting in swarm/ next to the live cache, they read like editable runtime config
+# and invited exactly the wrong edit. They are data, they are read once, and they
+# now live somewhere that says so. What did NOT change: the seed is still
+# REQUIRED — see check_config_health() for what a missing one actually costs.
 
-_DEFAULT_TOOL_GRANTS: set[tuple[str, str, str]] = {
-    ("engineering", "Coder", "apply_diff"),
-    ("engineering", "Coder", "find_files"),
-    ("engineering", "Coder", "get_file_content"),
-    ("engineering", "Coder", "lightrag_insert"),
-    ("engineering", "Coder", "lightrag_query"),
-    ("engineering", "Coder", "list_directory"),
-    ("engineering", "Coder", "load_skill"),
-    ("engineering", "Coder", "run_command"),
-    ("engineering", "Coder", "search_files"),
-    ("engineering", "Coder", "search_knowledge_graph"),
-    ("engineering", "Coder", "write_file"),
-    ("engineering", "ContextRouter", "find_files"),
-    ("engineering", "ContextRouter", "lightrag_query"),
-    ("engineering", "ContextRouter", "list_directory"),
-    ("engineering", "ContextRouter", "list_directory_tree"),
-    ("engineering", "ContextRouter", "load_skill"),
-    ("engineering", "ContextRouter", "notion_get_page"),
-    ("engineering", "ContextRouter", "notion_search"),
-    ("engineering", "ContextRouter", "search_files"),
-    ("engineering", "ContextRouter", "search_knowledge_graph"),
-    ("engineering", "ContextRouter", "web_fetch"),
-    ("engineering", "ContextRouter", "web_search"),
-    ("engineering", "Executor", "bash_job_kill"),
-    ("engineering", "Executor", "bash_job_status"),
-    ("engineering", "Executor", "bash_run"),
-    ("engineering", "Executor", "bash_session_close"),
-    ("engineering", "Executor", "bash_session_start"),
-    ("engineering", "Executor", "check_port"),
-    ("engineering", "Executor", "get_env_info"),
-    ("engineering", "Executor", "get_file_content"),
-    ("engineering", "Executor", "git_blame"),
-    ("engineering", "Executor", "git_diff"),
-    ("engineering", "Executor", "git_log"),
-    ("engineering", "Executor", "git_log_file"),
-    ("engineering", "Executor", "git_status"),
-    ("engineering", "Executor", "list_processes"),
-    ("engineering", "Executor", "load_skill"),
-    ("engineering", "Executor", "run_command"),
-    ("engineering", "Executor", "run_docker"),
-    ("engineering", "Executor", "run_shell"),
-    # db_query/db_schema granted 2026-08-20, together with engineering.yaml's
-    # `coordinator_tools: []`. They had been granted to NO role in ANY team (confirmed
-    # against the live data/model_routing.db), reaching the coordinator only because it
-    # received everything outside _COORDINATOR_DISCOVERY_TOOLS -- so a DB question was
-    # structurally un-delegatable and the coordinator always answered it alone.
-    # Researcher is the right owner: it already holds get_file_content/search_files, so
-    # it is the one agent that can choose between reading the source and querying the
-    # live DB with both options actually in hand.
-    ("engineering", "Researcher", "db_query"),
-    ("engineering", "Researcher", "db_schema"),
-    ("engineering", "Researcher", "find_files"),
-    ("engineering", "Researcher", "get_file_content"),
-    ("engineering", "Researcher", "lightrag_query"),
-    ("engineering", "Researcher", "list_directory"),
-    ("engineering", "Researcher", "list_directory_tree"),
-    ("engineering", "Researcher", "load_skill"),
-    ("engineering", "Researcher", "notion_get_page"),
-    ("engineering", "Researcher", "notion_search"),
-    ("engineering", "Researcher", "search_files"),
-    ("engineering", "Researcher", "search_knowledge_graph"),
-    ("engineering", "Researcher", "web_fetch"),
-    ("engineering", "Researcher", "web_search"),
-    ("engineering", "Reviewer", "find_files"),
-    ("engineering", "Reviewer", "get_file_content"),
-    ("engineering", "Reviewer", "git_diff"),
-    ("engineering", "Reviewer", "git_status"),
-    ("engineering", "Reviewer", "lightrag_insert"),
-    ("engineering", "Reviewer", "lightrag_query"),
-    ("engineering", "Reviewer", "load_skill"),
-    ("engineering", "Reviewer", "search_files"),
-    ("engineering", "Reviewer", "search_knowledge_graph"),
-    ("parallel-review", "Coordinator", "find_files"),
-    ("parallel-review", "Coordinator", "get_context_section"),
-    ("parallel-review", "Coordinator", "get_file_content"),
-    ("parallel-review", "Coordinator", "lightrag_query"),
-    ("parallel-review", "Coordinator", "list_directory"),
-    ("parallel-review", "Coordinator", "list_directory_tree"),
-    ("parallel-review", "Coordinator", "load_skill"),
-    ("parallel-review", "Coordinator", "search_files"),
-    ("parallel-review", "Coordinator", "search_knowledge_graph"),
-    ("parallel-review", "PerformanceReviewer", "find_files"),
-    ("parallel-review", "PerformanceReviewer", "get_file_content"),
-    ("parallel-review", "PerformanceReviewer", "lightrag_query"),
-    ("parallel-review", "PerformanceReviewer", "load_skill"),
-    ("parallel-review", "PerformanceReviewer", "search_files"),
-    ("parallel-review", "Researcher", "find_files"),
-    ("parallel-review", "Researcher", "get_file_content"),
-    ("parallel-review", "Researcher", "lightrag_query"),
-    ("parallel-review", "Researcher", "list_directory_tree"),
-    ("parallel-review", "Researcher", "load_skill"),
-    ("parallel-review", "Researcher", "search_files"),
-    ("parallel-review", "SecurityReviewer", "find_files"),
-    ("parallel-review", "SecurityReviewer", "get_file_content"),
-    ("parallel-review", "SecurityReviewer", "git_diff"),
-    ("parallel-review", "SecurityReviewer", "lightrag_query"),
-    ("parallel-review", "SecurityReviewer", "load_skill"),
-    ("parallel-review", "SecurityReviewer", "search_files"),
-    ("planning", "ContextRouter", "find_files"),
-    ("planning", "ContextRouter", "get_file_content"),
-    ("planning", "ContextRouter", "lightrag_query"),
-    ("planning", "ContextRouter", "list_directory"),
-    ("planning", "ContextRouter", "list_directory_tree"),
-    ("planning", "ContextRouter", "notion_get_page"),
-    ("planning", "ContextRouter", "notion_search"),
-    ("planning", "ContextRouter", "search_files"),
-    ("planning", "ContextRouter", "search_knowledge_graph"),
-    ("planning", "ContextRouter", "web_fetch"),
-    ("planning", "ContextRouter", "web_search"),
-    ("planning", "Coordinator", "find_files"),
-    ("planning", "Coordinator", "get_context_section"),
-    ("planning", "Coordinator", "get_file_content"),
-    ("planning", "Coordinator", "lightrag_query"),
-    ("planning", "Coordinator", "list_directory"),
-    ("planning", "Coordinator", "list_directory_tree"),
-    ("planning", "Coordinator", "notion_get_page"),
-    ("planning", "Coordinator", "notion_search"),
-    ("planning", "Coordinator", "search_files"),
-    ("planning", "Coordinator", "search_knowledge_graph"),
-    ("planning", "Planner", "find_files"),
-    ("planning", "Planner", "get_file_content"),
-    ("planning", "Planner", "lightrag_query"),
-    ("planning", "Planner", "notion_get_page"),
-    ("planning", "Planner", "notion_search"),
-    ("planning", "Planner", "search_files"),
-    ("planning", "Planner", "search_knowledge_graph"),
-    ("planning", "Researcher", "find_files"),
-    ("planning", "Researcher", "get_file_content"),
-    ("planning", "Researcher", "lightrag_query"),
-    ("planning", "Researcher", "list_directory"),
-    ("planning", "Researcher", "list_directory_tree"),
-    ("planning", "Researcher", "notion_get_page"),
-    ("planning", "Researcher", "notion_search"),
-    ("planning", "Researcher", "search_files"),
-    ("planning", "Researcher", "search_knowledge_graph"),
-    ("planning", "Researcher", "web_fetch"),
-    ("planning", "Researcher", "web_search"),
-    ("sprint-master", "BacklogResearcher", "find_files"),
-    ("sprint-master", "BacklogResearcher", "get_file_content"),
-    ("sprint-master", "BacklogResearcher", "load_skill"),
-    ("sprint-master", "BacklogResearcher", "notion_find_work_item"),
-    ("sprint-master", "BacklogResearcher", "notion_get_database_schema"),
-    ("sprint-master", "BacklogResearcher", "notion_get_item_with_relations"),
-    ("sprint-master", "BacklogResearcher", "notion_get_page"),
-    ("sprint-master", "BacklogResearcher", "notion_items_in_sprint"),
-    ("sprint-master", "BacklogResearcher", "notion_query_database"),
-    ("sprint-master", "BacklogResearcher", "notion_search"),
-    ("sprint-master", "Coordinator", "find_files"),
-    ("sprint-master", "Coordinator", "get_file_content"),
-    ("sprint-master", "Coordinator", "load_skill"),
-    ("sprint-master", "Coordinator", "notion_append_blocks"),
-    ("sprint-master", "Coordinator", "notion_append_markdown"),
-    ("sprint-master", "Coordinator", "notion_create_page"),
-    ("sprint-master", "Coordinator", "notion_delete_block"),
-    ("sprint-master", "Coordinator", "notion_find_work_item"),
-    ("sprint-master", "Coordinator", "notion_get_database_schema"),
-    ("sprint-master", "Coordinator", "notion_get_item_with_relations"),
-    ("sprint-master", "Coordinator", "notion_get_page"),
-    ("sprint-master", "Coordinator", "notion_items_in_sprint"),
-    ("sprint-master", "Coordinator", "notion_query_database"),
-    ("sprint-master", "Coordinator", "notion_replace_section"),
-    ("sprint-master", "Coordinator", "notion_search"),
-    ("sprint-master", "Coordinator", "notion_trash_page"),
-    ("sprint-master", "Coordinator", "notion_update_block"),
-    ("sprint-master", "Coordinator", "notion_update_content"),
-    ("sprint-master", "Coordinator", "notion_update_page_props"),
-    ("sprint-master", "StoryWriter", "get_file_content"),
-    ("sprint-master", "StoryWriter", "load_skill"),
-    ("sprint-master", "StoryWriter", "notion_append_blocks"),
-    ("sprint-master", "StoryWriter", "notion_append_markdown"),
-    ("sprint-master", "StoryWriter", "notion_create_page"),
-    ("sprint-master", "StoryWriter", "notion_delete_block"),
-    ("sprint-master", "StoryWriter", "notion_get_database_schema"),
-    ("sprint-master", "StoryWriter", "notion_get_page"),
-    ("sprint-master", "StoryWriter", "notion_query_database"),
-    ("sprint-master", "StoryWriter", "notion_replace_section"),
-    ("sprint-master", "StoryWriter", "notion_search"),
-    ("sprint-master", "StoryWriter", "notion_trash_page"),
-    ("sprint-master", "StoryWriter", "notion_update_block"),
-    ("sprint-master", "StoryWriter", "notion_update_content"),
-    ("sprint-master", "StoryWriter", "notion_update_page_props"),
-}
+_SEED_PATH = Path(__file__).resolve().parent.parent / "seeds" / "team_config.yaml"
 
-_DEFAULT_SKILL_GRANTS: set[tuple[str, str, str]] = {
-    ("engineering", "Coder", "code-conventions"),
-    ("engineering", "Coder", "counting-marker"),
-    ("engineering", "Coder", "file-write-review"),
-    ("engineering", "Coder", "verification-discipline"),
-    ("engineering", "ContextRouter", "verification-discipline"),
-    ("engineering", "Executor", "bash-sessions"),
-    ("engineering", "Executor", "file-write-review"),
-    ("engineering", "Executor", "verification-discipline"),
-    ("engineering", "Researcher", "chain-tracing-discipline"),
-    ("engineering", "Researcher", "codebase-enumeration-discipline"),
-    ("engineering", "Researcher", "external-framework-verification"),
-    ("engineering", "Researcher", "external-web-research"),
-    ("engineering", "Researcher", "notion-reference-discovery"),
-    ("engineering", "Researcher", "path-not-found-recovery"),
-    ("engineering", "Researcher", "verification-discipline"),
-    ("engineering", "Reviewer", "file-write-review"),
-    ("engineering", "Reviewer", "verification-discipline"),
-    ("parallel-review", "PerformanceReviewer", "verification-discipline"),
-    ("parallel-review", "Researcher", "verification-discipline"),
-    ("parallel-review", "SecurityReviewer", "verification-discipline"),
-    ("sprint-master", "BacklogResearcher", "notion-grounding"),
-    ("sprint-master", "BacklogResearcher", "verification-discipline"),
-    ("sprint-master", "StoryWriter", "file-write-review"),
-    ("sprint-master", "StoryWriter", "notion-grounding"),
-}
+
+def _load_seed_grants() -> tuple[set[tuple[str, str, str]], set[tuple[str, str, str]]]:
+    """Read seeds/team_config.yaml into (tool_grants, skill_grants) triples.
+
+    A missing or unreadable seed file returns empty sets rather than raising:
+    seeding is best-effort by design (load_cache() runs on the startup path, and
+    a broken seed must not make the service unbootable). The resulting empty-DB
+    state is NOT silent — check_config_health() reports it as the highest-
+    severity finding precisely because it fails OPEN, not closed.
+    """
+    try:
+        raw = yaml.safe_load(_SEED_PATH.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return set(), set()
+
+    def flatten(section: str) -> set[tuple[str, str, str]]:
+        out: set[tuple[str, str, str]] = set()
+        for team, roles in (raw.get(section) or {}).items():
+            for role, names in (roles or {}).items():
+                for name in names or []:
+                    out.add((team, role, name))
+        return out
+
+    return flatten("tools"), flatten("skills")
+
+
+_TEAMS_DIR = Path(__file__).resolve().parent.parent / "teams"
+
+
+def check_config_health() -> list[str]:
+    """Sync, cache-only. Startup/admin diagnostic: what is actually WRONG with
+    this deployment's team config, ordered most-severe first. Empty list = clean.
+
+    Deliberately NOT a seed-vs-DB diff. Divergence from seeds/team_config.yaml is
+    the admin API working as intended — a check that warned on it would fire on
+    every healthy deployment that ever changed a grant, and a warning that is
+    usually wrong gets ignored when it is finally right. So this reports only
+    states that are broken on their own terms, whatever the seed says.
+
+    Follows check_coordinator_readiness()'s contract exactly: never raises, never
+    blocks startup, and stays silent when it cannot reach a conclusion. A wrong
+    warning is a nuisance; a false-negative silence is acceptable; blocking on a
+    diagnostic is not.
+
+    The findings, in severity order:
+      1. No grants at all — the seed never ran, or the table was wiped. Not
+         "no tools": every role falls through to unrestricted (api/server.py
+         _load_team()), so every agent sees apply_diff and run_command. This
+         fails OPEN, which is why it outranks everything else here.
+      2. A role that resolves to unrestricted — same fail-open, one role at a
+         time. An explicitly empty allowlist (`tools: []`, `coordinator_tools: []`)
+         is a deliberate disarm and is NOT flagged; only a genuinely absent field
+         with no DB rows behind it is.
+      3. A grant naming a tool missing from tool_registry — unreachable via the
+         admin API's own write-time validation, so almost certainly a stale name
+         left behind by a rename.
+      4. A tool_registry that has never been refreshed from a live MCP
+         enumeration — every name in it traces back to the seed, so the write-time
+         validation in (3) is checking against a bootstrap, not against what
+         hive-mcp currently exposes.
+    """
+    findings: list[str] = []
+    try:
+        if not _tools_cache:
+            return [
+                "No team_role_tools grants loaded — the first-run seed never ran, or the "
+                "table was emptied. This does NOT disable tools: every role falls through "
+                "to UNRESTRICTED and sees the full connected surface, apply_diff and "
+                f"run_command included. Check that {_SEED_PATH} exists and is readable, "
+                "then restart; or restore grants via POST /admin/team-config/tools."
+            ]
+
+        seed_tools, _ = _load_seed_grants()
+
+        for path in sorted(_TEAMS_DIR.glob("*.yaml")):
+            try:
+                data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            except (OSError, yaml.YAMLError):
+                continue
+            team = path.stem
+            roles = [(a.get("name"), a.get("tools")) for a in (data.get("agents") or []) if a.get("name")]
+            roles.append(("Coordinator", data.get("coordinator_tools")))
+            for role, yaml_tools in roles:
+                # `is None`, not falsiness: an explicitly empty list is a
+                # deliberate disarm (engineering's coordinator), not an omission.
+                if yaml_tools is not None:
+                    continue
+                if _tools_cache.get((team, role)):
+                    continue
+                findings.append(
+                    f"{team}/{role} resolves to UNRESTRICTED — no tools: in {path.name} and no "
+                    f"team_role_tools rows, so it sees every connected tool including write and "
+                    f"shell ones. Grant it an explicit list via POST /admin/team-config/tools, or "
+                    f"pin `tools: []` in the YAML if it is meant to hold none."
+                )
+
+        unregistered = sorted(
+            {n for names in _tools_cache.values() for n in names} - _tool_registry_cache
+        )
+        if unregistered:
+            findings.append(
+                f"{len(unregistered)} granted tool(s) are absent from tool_registry and would be "
+                f"rejected if re-granted today: {', '.join(unregistered[:10])}"
+                f"{'...' if len(unregistered) > 10 else ''}. Usually a rename left behind. Run "
+                "POST /admin/team-config/registry/refresh with a live enumeration to confirm."
+            )
+
+        if _tool_registry_cache and _tool_registry_cache <= {n for (_, _, n) in seed_tools}:
+            findings.append(
+                "tool_registry contains only names from the first-run seed — it appears never to "
+                "have been refreshed from a live MCP enumeration, so grant validation is checking "
+                "against a bootstrap rather than what hive-mcp currently exposes. Run "
+                "POST /admin/team-config/registry/refresh."
+            )
+    except Exception as e:  # diagnostic only — never the reason a startup or request fails
+        return [f"team config health check could not complete ({type(e).__name__}: {e})"]
+
+    return findings
 
 
 async def _seed_defaults(conn) -> None:
-    all_tools = {name for (_, _, name) in _DEFAULT_TOOL_GRANTS}
-    all_skills = {name for (_, _, name) in _DEFAULT_SKILL_GRANTS}
+    tool_grants, skill_grants = _load_seed_grants()
+    all_tools = {name for (_, _, name) in tool_grants}
+    all_skills = {name for (_, _, name) in skill_grants}
 
-    if _DEFAULT_TOOL_GRANTS:
+    if tool_grants:
         await conn.execute(
             db.team_role_tools.insert(),
-            [{"team_name": t, "role_name": r, "tool_name": n} for (t, r, n) in _DEFAULT_TOOL_GRANTS],
+            [{"team_name": t, "role_name": r, "tool_name": n} for (t, r, n) in tool_grants],
         )
-    if _DEFAULT_SKILL_GRANTS:
+    if skill_grants:
         await conn.execute(
             db.team_role_skills.insert(),
-            [{"team_name": t, "role_name": r, "skill_name": n} for (t, r, n) in _DEFAULT_SKILL_GRANTS],
+            [{"team_name": t, "role_name": r, "skill_name": n} for (t, r, n) in skill_grants],
         )
     if all_tools:
         await conn.execute(db.tool_registry.insert(), [{"tool_name": t} for t in sorted(all_tools)])

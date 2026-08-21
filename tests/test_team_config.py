@@ -28,7 +28,7 @@ async def test_load_cache_seeds_tool_and_skill_grants_from_static_snapshot():
         skill_rows = (await conn.execute(sa.select(db.team_role_skills))).mappings().all()
     assert len(tool_rows) > 0
     assert len(skill_rows) > 0
-    # Spot-check a real, known grant from _DEFAULT_TOOL_GRANTS (the former
+    # Spot-check a real, known grant from seeds/team_config.yaml (the former
     # teams/engineering.yaml content, captured 2026-08-18 when tools:/skills:
     # were removed from the YAML in favor of the DB as the runtime source)
     assert any(

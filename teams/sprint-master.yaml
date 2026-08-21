@@ -17,8 +17,8 @@ description: Generic, platform-agnostic PM team — reads and writes backlog/spr
 # thrashed ~400s then gave up). Giving the coordinator the board write tools makes the path
 # robust; the WRITE_REVIEW gate, not tool restriction, is what keeps writes safe.
 # coordinator_tools:/each agent's tools:/skills: are DB-managed (AGNOHive
-# 2.3.3, 2026-08-18) — see swarm/team_config.py's _DEFAULT_TOOL_GRANTS/
-# _DEFAULT_SKILL_GRANTS and api/server.py's _load_team() Tier 1 comment. Set
+# 2.3.3, 2026-08-18) — see seeds/team_config.yaml (first-run seed only) and
+# api/server.py's _load_team() Tier 1 comment. Set
 # any back here to pin a list and take it out of DB control again, same
 # override rule as model: above.
 

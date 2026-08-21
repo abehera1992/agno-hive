@@ -115,11 +115,18 @@ def _load_team(name: str) -> tuple[list[AgentSpec], str, str, list[str] | None]:
         # "unrestricted, sees every connected tool" (make_agent_from_spec's own
         # `if spec.tools:` truthy check) -- unchanged for a role that was never
         # migrated into the DB (e.g. engineering's coordinator, below).
-        if not a.get("tools"):
+        #
+        # `is None`, NOT falsiness (fixed 2026-08-21): an explicitly empty
+        # `tools: []` is a deliberate disarm and must WIN, exactly like a
+        # non-empty list does. Under the old truthy check it was
+        # indistinguishable from an omitted field, so the DB silently overrode
+        # it and re-armed the role -- the same empty-vs-absent conflation
+        # _scope_coordinator_tools() had to grow an early return for.
+        if a.get("tools") is None:
             db_tools = team_config.get_extra_tools(name, a["name"])
             if db_tools:
                 a["tools"] = db_tools
-        if not a.get("skills"):
+        if a.get("skills") is None:
             db_skills = team_config.get_extra_skills(name, a["name"])
             if db_skills:
                 a["skills"] = db_skills
@@ -139,12 +146,19 @@ def _load_team(name: str) -> tuple[list[AgentSpec], str, str, list[str] | None]:
     # the existing behavior, preserved for teams like `engineering` that need write access.
     coordinator_tools = data.get("coordinator_tools")
     # Same override-with-DB-fallback rule as per-agent tools above, applied to
-    # the coordinator's own allowlist -- a team with NO coordinator_tools: (e.g.
-    # engineering, unrestricted by design, with no DB rows either) is left
-    # alone; a team whose YAML omitted coordinator_tools: but has DB rows
+    # the coordinator's own allowlist -- a team with NO coordinator_tools: is
+    # left alone; a team whose YAML omitted coordinator_tools: but has DB rows
     # (sprint-master/planning/parallel-review, all migrated 2026-08-18) gets
     # its allowlist from the DB instead.
-    if not coordinator_tools:
+    #
+    # `is None`, NOT falsiness (fixed 2026-08-21) -- and this one was load-
+    # bearing, not hypothetical: engineering.yaml's `coordinator_tools: []`
+    # (2026-08-20, the fix that stopped the coordinator answering db_schema
+    # questions itself instead of delegating) is falsy, so the old check fell
+    # through to the DB lookup. It survived only because no (engineering,
+    # Coordinator) rows happen to exist -- one admin POST or a re-seed would
+    # have silently re-armed the coordinator with no error anywhere.
+    if coordinator_tools is None:
         db_coordinator_tools = team_config.get_extra_tools(name, "Coordinator")
         if db_coordinator_tools:
             coordinator_tools = db_coordinator_tools
@@ -218,6 +232,12 @@ async def _load_model_routing_cache():
     warning = await model_routing.check_coordinator_readiness()
     if warning:
         print(f"[readiness] WARNING: {warning}")
+    # Same contract, for team config (2026-08-21). Answers "is this deployment
+    # actually configured, or is it silently fail-open?" at the one moment
+    # someone is watching the log — see check_config_health()'s docstring for
+    # why it reports broken states rather than seed drift.
+    for finding in team_config.check_config_health():
+        print(f"[readiness] WARNING: {finding}")
 
 
 @app.on_event("startup")
@@ -1368,6 +1388,26 @@ async def refresh_team_config_registry(body: RegistryRefreshRequest):
     with an explicit list for bootstrapping/testing."""
     await team_config.refresh_registry(body.tool_names, body.skill_names)
     return {"tool_names_refreshed": len(body.tool_names), "skill_names_refreshed": len(body.skill_names)}
+
+
+@app.get("/admin/team-config/health")
+async def team_config_health():
+    """What is actually misconfigured about this deployment's team config —
+    the same findings printed once at startup, queryable at any time.
+
+    Exists because the startup print is a single line in a log nobody scrolls
+    back to, and because the interesting states here appear AFTER startup: an
+    admin write that empties a role's grants, a tool renamed out from under a
+    live grant. `healthy: true` with an empty list means clean, so this is
+    usable as an actual check rather than something to eyeball.
+
+    Cache-only and non-authoritative by the same rule as the check itself: it
+    reports on what the running process currently believes, which is what the
+    agents will actually get. If someone changed the DB without calling
+    /admin/team-config/reload, this correctly reflects the stale cache the
+    agents are running on — that IS the honest answer, not a bug."""
+    findings = team_config.check_config_health()
+    return {"healthy": not findings, "findings": findings, "finding_count": len(findings)}
 
 
 @app.post("/admin/team-config/reload", response_model=TeamConfigReloadResponse)

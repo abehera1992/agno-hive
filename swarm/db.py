@@ -161,9 +161,8 @@ team_role_models = Table(
 # own list) to this replace-or-fallback design, specifically so the DB is the
 # actual runtime source of a role's tools/skills rather than a YAML-plus-extras
 # layer -- all 4 shipped teams/*.yaml have had their tools:/skills: fields
-# removed accordingly, with swarm/team_config.py's _DEFAULT_TOOL_GRANTS/
-# _DEFAULT_SKILL_GRANTS (a static snapshot of the former YAML content) seeding
-# these tables on a fresh deployment. A team YAML deliberately hardcoding a
+# removed accordingly, with seeds/team_config.yaml (a static snapshot of the
+# former YAML content) seeding these tables on a fresh deployment. A team YAML deliberately hardcoding a
 # full roster (e.g. a future engineering-cloud.yaml-style reference team) stays
 # unaffected as long as it keeps an explicit tools:/skills: list.
 team_role_tools = Table(

@@ -12,7 +12,7 @@ description: Plan-only team — routes context, researches codebase, and produce
 # engineering.yaml's own per-agent grant — needed so the coordinator can itself read a spec
 # a task names, not only via delegation.
 # coordinator_tools:/each agent's tools: are DB-managed (AGNOHive 2.3.3,
-# 2026-08-18) — see swarm/team_config.py's _DEFAULT_TOOL_GRANTS and
+# 2026-08-18) — see seeds/team_config.yaml (first-run seed only) and
 # api/server.py's _load_team() Tier 1 comment. Set either back here to pin a
 # list and take it out of DB control again, same override rule as model: above.
 

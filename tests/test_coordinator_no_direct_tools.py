@@ -80,7 +80,8 @@ def test_engineering_yaml_declares_an_empty_coordinator_allowlist():
 def test_researcher_owns_the_db_tools_the_coordinator_gave_up():
     """Both halves must ship together: with the coordinator disarmed and no member
     holding db_query/db_schema, the database would be unreachable by anyone."""
-    from swarm.team_config import _DEFAULT_TOOL_GRANTS
+    from swarm.team_config import _load_seed_grants
 
+    tool_grants, _ = _load_seed_grants()
     for tool in ("db_query", "db_schema"):
-        assert ("engineering", "Researcher", tool) in _DEFAULT_TOOL_GRANTS
+        assert ("engineering", "Researcher", tool) in tool_grants

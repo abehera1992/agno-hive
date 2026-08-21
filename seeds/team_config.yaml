@@ -1,0 +1,255 @@
+# First-run seed for team_role_tools / team_role_skills -- NOT live config.
+#
+# Read ONCE, only when team_role_tools is completely empty (swarm/team_config.py's
+# load_cache() -> _seed_defaults()). Editing this file does NOT change a deployment
+# that has already been seeded: use the admin API instead, which is the only thing
+# that alters a running system's grants.
+#
+#     GET/POST/DELETE /admin/team-config/tools
+#     POST            /admin/team-config/reload
+#
+# It lives here, outside swarm/, precisely so it cannot be mistaken for the runtime
+# source. It is still REQUIRED: teams/*.yaml had their tools:/skills: fields removed
+# on 2026-08-18 when the DB became the runtime source, so this snapshot of that
+# former YAML content is the only thing a fresh clone can seed from. Delete it and a
+# fresh deployment seeds nothing -- which does not mean "no tools", it means every
+# role falls through to unrestricted and sees the FULL tool surface, apply_diff and
+# run_command included (api/server.py _load_team()'s `is None` fallback).
+#
+# tool_registry/skill_registry are also bootstrapped from the union of the names
+# below. That is an honest starting point (every name here was in real use at
+# migration time), not a substitute for refresh_registry()'s live-MCP enumeration,
+# which is the real source of truth once a swarm run has supplied one.
+
+tools:
+  engineering:
+    Coder:
+      - apply_diff
+      - find_files
+      - get_file_content
+      - lightrag_insert
+      - lightrag_query
+      - list_directory
+      - load_skill
+      - run_command
+      - search_files
+      - search_knowledge_graph
+      - write_file
+    ContextRouter:
+      - find_files
+      - lightrag_query
+      - list_directory
+      - list_directory_tree
+      - load_skill
+      - notion_get_page
+      - notion_search
+      - search_files
+      - search_knowledge_graph
+      - web_fetch
+      - web_search
+    Executor:
+      - bash_job_kill
+      - bash_job_status
+      - bash_run
+      - bash_session_close
+      - bash_session_start
+      - check_port
+      - get_env_info
+      - get_file_content
+      - git_blame
+      - git_diff
+      - git_log
+      - git_log_file
+      - git_status
+      - list_processes
+      - load_skill
+      - run_command
+      - run_docker
+      - run_shell
+    Researcher:
+      - db_query
+      - db_schema
+      - find_files
+      - get_file_content
+      - lightrag_query
+      - list_directory
+      - list_directory_tree
+      - load_skill
+      - notion_get_page
+      - notion_search
+      - search_files
+      - search_knowledge_graph
+      - web_fetch
+      - web_search
+    Reviewer:
+      - find_files
+      - get_file_content
+      - git_diff
+      - git_status
+      - lightrag_insert
+      - lightrag_query
+      - load_skill
+      - search_files
+      - search_knowledge_graph
+  parallel-review:
+    Coordinator:
+      - find_files
+      - get_context_section
+      - get_file_content
+      - lightrag_query
+      - list_directory
+      - list_directory_tree
+      - load_skill
+      - search_files
+      - search_knowledge_graph
+    PerformanceReviewer:
+      - find_files
+      - get_file_content
+      - lightrag_query
+      - load_skill
+      - search_files
+    Researcher:
+      - find_files
+      - get_file_content
+      - lightrag_query
+      - list_directory_tree
+      - load_skill
+      - search_files
+    SecurityReviewer:
+      - find_files
+      - get_file_content
+      - git_diff
+      - lightrag_query
+      - load_skill
+      - search_files
+  planning:
+    ContextRouter:
+      - find_files
+      - get_file_content
+      - lightrag_query
+      - list_directory
+      - list_directory_tree
+      - notion_get_page
+      - notion_search
+      - search_files
+      - search_knowledge_graph
+      - web_fetch
+      - web_search
+    Coordinator:
+      - find_files
+      - get_context_section
+      - get_file_content
+      - lightrag_query
+      - list_directory
+      - list_directory_tree
+      - notion_get_page
+      - notion_search
+      - search_files
+      - search_knowledge_graph
+    Planner:
+      - find_files
+      - get_file_content
+      - lightrag_query
+      - notion_get_page
+      - notion_search
+      - search_files
+      - search_knowledge_graph
+    Researcher:
+      - find_files
+      - get_file_content
+      - lightrag_query
+      - list_directory
+      - list_directory_tree
+      - notion_get_page
+      - notion_search
+      - search_files
+      - search_knowledge_graph
+      - web_fetch
+      - web_search
+  sprint-master:
+    BacklogResearcher:
+      - find_files
+      - get_file_content
+      - load_skill
+      - notion_find_work_item
+      - notion_get_database_schema
+      - notion_get_item_with_relations
+      - notion_get_page
+      - notion_items_in_sprint
+      - notion_query_database
+      - notion_search
+    Coordinator:
+      - find_files
+      - get_file_content
+      - load_skill
+      - notion_append_blocks
+      - notion_append_markdown
+      - notion_create_page
+      - notion_delete_block
+      - notion_find_work_item
+      - notion_get_database_schema
+      - notion_get_item_with_relations
+      - notion_get_page
+      - notion_items_in_sprint
+      - notion_query_database
+      - notion_replace_section
+      - notion_search
+      - notion_trash_page
+      - notion_update_block
+      - notion_update_content
+      - notion_update_page_props
+    StoryWriter:
+      - get_file_content
+      - load_skill
+      - notion_append_blocks
+      - notion_append_markdown
+      - notion_create_page
+      - notion_delete_block
+      - notion_get_database_schema
+      - notion_get_page
+      - notion_query_database
+      - notion_replace_section
+      - notion_search
+      - notion_trash_page
+      - notion_update_block
+      - notion_update_content
+      - notion_update_page_props
+
+skills:
+  engineering:
+    Coder:
+      - code-conventions
+      - counting-marker
+      - file-write-review
+      - verification-discipline
+    ContextRouter:
+      - verification-discipline
+    Executor:
+      - bash-sessions
+      - file-write-review
+      - verification-discipline
+    Researcher:
+      - chain-tracing-discipline
+      - codebase-enumeration-discipline
+      - external-framework-verification
+      - external-web-research
+      - notion-reference-discovery
+      - path-not-found-recovery
+      - verification-discipline
+    Reviewer:
+      - file-write-review
+      - verification-discipline
+  parallel-review:
+    PerformanceReviewer:
+      - verification-discipline
+    Researcher:
+      - verification-discipline
+    SecurityReviewer:
+      - verification-discipline
+  sprint-master:
+    BacklogResearcher:
+      - notion-grounding
+      - verification-discipline
+    StoryWriter:
+      - file-write-review
+      - notion-grounding
