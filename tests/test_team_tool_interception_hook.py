@@ -274,9 +274,10 @@ def test_build_team_registers_the_interception_hook_alongside_the_cache_hook(mon
     # interception hook + search-before-browse gate hook (2026-08-15) + read-cache
     # hook + decompose-first gate hook (Engineering Team 2.0 Phase 2, 2026-08-14) +
     # duplicate-delegation gate hook (2026-08-15, T2c groundedness incident) +
-    # delegation-log hook (shared session_state, 2026-08-13) -- six, not five, as
-    # of the duplicate-delegation gate addition.
-    assert len(result.tool_hooks) == 6
+    # delegation-log hook (shared session_state, 2026-08-13) + tool-budget guard hook
+    # (2026-08-21, forces text-only before tool_call_limit is reached) -- seven, not
+    # six, as of the tool-budget guard addition.
+    assert len(result.tool_hooks) == 7
     # interception hook is listed FIRST (2026-08-11: order changed deliberately so it
     # is the OUTERMOST wrapper -- agno reduces hooks from the innermost outward, so
     # hooks[0] wraps everything else. This makes it always run and always log, even

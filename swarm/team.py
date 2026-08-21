@@ -1589,6 +1589,32 @@ _CORRECT_LINE_RE = re.compile(
     r"it actually appears at line\(s\) ([\d, ]+)"
 )
 
+def _resolve_tool_call_limit(team_name: str | None, role_name: str) -> int:
+    """This (team, role)'s real tool-call budget, DB override first.
+
+    Added 2026-08-21. `swarm/team.py`'s Team(...) construction passed
+    `config.tool_call_limit` unconditionally, so the per-role overrides in
+    `team_role_models` — engineering Coordinator 60, Researcher 50 — reached member
+    Agents (`agents.py`) but never the Team itself. Raising the Coordinator's budget
+    through /admin/model-routes silently did nothing: a knob that looked like it
+    worked and didn't.
+
+    TWO independent None cases, both real, both falling back to config:
+      * no row for this (team, role) at all — get_role_policy returns None;
+      * a row that exists with the column NULL — RolePolicy.tool_call_limit is
+        itself `int | None`, and NULL means "no override, use the global default"
+        (see RolePolicy's own docstring).
+    `team_name` is also `str | None`: the request.agents path builds a team with no
+    name at all, so that is checked before the lookup rather than passed through.
+    """
+    if not team_name:
+        return config.tool_call_limit
+    policy = model_routing.get_role_policy(team_name, role_name)
+    if policy is None or policy.tool_call_limit is None:
+        return config.tool_call_limit
+    return policy.tool_call_limit
+
+
 _MAX_HANDED_OVER_LOCATIONS = 4
 
 
@@ -1756,6 +1782,29 @@ _DB_TOOLS = {"db_query", "db_schema"}
 # unretried, which is the exact failure this guard exists to catch (see 2026-08-20 note below).
 _DB_TASK_RE = re.compile(
     r"\blive database\b|\bdb_query\b|\bdb_schema\b|\brow count\b|\bhow many rows\b",
+    re.IGNORECASE,
+)
+
+
+# Tools that actually ENUMERATE a directory, as opposed to reading one thing out of it.
+# find_files counts: a glob genuinely lists what matches, which is a real enumeration.
+_ENUM_TOOLS = {"list_directory", "list_directory_tree", "find_files"}
+# Task shapes that demand a real listing rather than recall. Same narrowness rule as
+# _DB_TASK_RE above, and the same asymmetry: a false positive costs one extra evidence
+# check on a task that didn't need it; a false negative ships a confidently wrong
+# inventory. Measured 2026-08-21 -- across four probes needing enumeration,
+# list_directory was called ZERO times, including one whose prompt named the tool
+# outright. Produced "the directory holds one file" (six), "3 router files" (24), and
+# "the entire Parties frontend is missing" (it exists) -- all stated with no hedging.
+_ENUM_TASK_RE = re.compile(
+    r"\blist (?:every|all|each)\b|\bhow many\b.{0,40}\b(?:files?|modules?|routers?|services?)\b"
+    r"|\bevery (?:file|module|router|service)\b|\bwhat(?:'s| is) in (?:the )?(?:dir|directory|folder)\b"
+    r"|\blist_directory\b|\bdirectory listing\b|\benumerate\b"
+    # "name what router files DO exist in that directory" — T11's real wording, and the
+    # shape an absence question takes when it asks for the alternatives. Requires the
+    # interrogative, so a bare single-file "does X exist?" (T11's own first half) stays
+    # out: that one needs no listing to answer.
+    r"|\bwhat\b[^.]{0,40}\b(?:files?|modules?|routers?|services?)\b[^.]{0,25}\bexist\b",
     re.IGNORECASE,
 )
 
@@ -2560,6 +2609,51 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 + _summarize_actual_writes(*all_results)
             )
 
+    # Enumeration-evidence check (2026-08-21). Exact same shape as the db-evidence guard
+    # above, for the same reason on a different axis: a tool hook cannot catch this,
+    # because the failure is the model ANSWERING without calling anything -- and
+    # answering is not a tool call. Only an answer-time check sees it.
+    #
+    # Why this outranks the stalls it sits beside: a stall fails loudly and the watchdog
+    # catches it. This ships a confident, well-formatted, WRONG inventory. In the worst
+    # 2026-08-21 case verify_claims even printed the contradicting evidence
+    # (FOUND Parties -> inventoryApi.ts:244) in its own report and the answer shipped
+    # anyway, asserting the whole feature was missing.
+    enum_reads = _count_read_calls(result, tool_names=_ENUM_TOOLS)
+    if enum_reads == 0 and _ENUM_TASK_RE.search(task or ""):
+        print("[team] task asked for an enumeration but made zero list_directory/"
+              "find_files calls — retrying with evidence required")
+        try:
+            retried, retry = await _stream_team_run(
+                team,
+                f"{task}\n\n"
+                f"IMPORTANT: a previous attempt answered this WITHOUT ever listing the "
+                f"directory — it answered from memory, and produced a list that was "
+                f"missing most of the real files. Call list_directory (or find_files "
+                f"with a glob) on the exact path NOW and enumerate from that tool's own "
+                f"output. Do not name files you remember; name the ones the tool "
+                f"returned. If the path does not exist, say so plainly rather than "
+                f"listing what you expect to be there.",
+                liveness_path=liveness_path,
+            )
+            all_results.append(retry)
+            content, result = _adopt_retry("enumeration", content, result, retried, retry)
+        except Exception as exc:
+            print(f"[team] enumeration-evidence retry failed: {exc}")
+
+        # Same retry-compliance rule as the two guards above: surface loudly rather than
+        # silently accept an answer whose corrective retry ignored the correction.
+        if _count_read_calls(result, tool_names=_ENUM_TOOLS) == 0:
+            return (
+                f"{content}\n\n---\n**NOT VERIFIED BY A DIRECTORY LISTING — this task "
+                f"asked what a directory contains, and neither the original attempt nor "
+                f"the corrective retry called list_directory or find_files. Any file "
+                f"list, count, or \"no such file\" claim above is recalled rather than "
+                f"enumerated, and has been wrong by a factor of 6-8x on this exact "
+                f"failure before.**"
+                + _summarize_actual_writes(*all_results)
+            )
+
     # Tool-budget-exhausted check. Unlike every other guard here this one cannot force a
     # retry: a re-run would hit the same ceiling, and agno has already told the model
     # "Don't try to execute it again". Disclosure is the whole remedy -- the answer may
@@ -3176,6 +3270,99 @@ def _forced_answer_nudge(agent_key: str, total_stub_count: int) -> str:
 #    the coordinator mostly delegates rather than reading directly, so this is
 #    the common case, not full coverage.
 _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS = 3
+
+
+# How many calls of an agent's budget to leave unspent when forcing it to answer.
+# 1, not 0: the guard fires AFTER the call that reaches (limit - reserve) returns, so
+# with 1 the agent still holds one unused call at the moment tool_choice flips. That
+# margin is what guarantees agno never has to refuse anything -- the whole point.
+_TOOL_BUDGET_RESERVE = 1
+
+
+def _force_text_only(agent) -> None:
+    """Flip an agent (or the coordinator's own model) into text-only mode.
+
+    Same two-line mutation _bump_consecutive_stub_and_maybe_force_text_only performs,
+    factored out so the budget guard below reuses the proven form rather than a second
+    copy of it. agno re-reads agent.tool_choice off the live object on every model call,
+    so this takes effect on the very next turn.
+    """
+    if agent is None:
+        return
+    agent.tool_choice = "none"
+    model = getattr(agent, "model", None)
+    if model is not None:
+        model._tool_choice = "none"
+
+
+def _make_tool_budget_guard_hook(team_name: str | None, activity: dict | None = None):
+    """Force an answer just BEFORE tool_call_limit is reached, rather than trying to
+    react to the refusal after it (2026-08-21).
+
+    This closes the gap this file has carried as "agno's own tool_call_limit rejection
+    bypasses every one of this file's reinforcement hooks entirely". Both reactive
+    routes are provably closed, each confirmed by reading source rather than assuming:
+
+      * A tool hook never fires for a refused call -- agno appends
+        create_tool_call_limit_error_result(fc) and `continue`s, so it never enters
+        function_calls_to_run and no tool event is emitted (see
+        _tools_refused_for_limit's docstring).
+      * A stream-loop watcher never sees it either -- during streaming agno yields only
+        lightweight Event objects with no .messages; the TeamRunOutput that carries them
+        arrives once, at the end (see _stream_team_run's docstring). By then the run is
+        over and there is no "next iteration" to steer.
+
+    So this does not observe the refusal at all. It counts the calls that DO succeed --
+    which hooks see perfectly -- against the same budget agno is counting toward, and
+    forces text-only one call early. There is then no refusal to detect, because the
+    model has no tool call left to make.
+
+    Measured cost of not having this: two stalled runs, each making exactly 25 calls
+    (config.tool_call_limit), after which the model re-emitted the same refused call at
+    ~2/s for 300s until the liveness watchdog killed the run -- no answer, no diagnostic,
+    a 97.9% prefix-cache hit rate confirming the prompt never advanced. The completing
+    branch of the same condition already produces an honest partial answer via
+    _tools_refused_for_limit; this makes the hanging branch produce one too.
+
+    Counted per (agent, role) with its own resolved budget, since limits differ per role
+    (engineering: Coordinator 60, Researcher 50, Reviewer 45, others config's 25). The
+    coordinator's own calls arrive with agent=None and are counted under "Coordinator".
+    """
+    counts: dict[str, int] = {}
+    fired: set[str] = set()
+
+    async def _tool_budget_guard_hook(function_name, function, args, agent=None, run_context=None):
+        # Counted BEFORE any early return: the budget agno enforces covers EVERY tool
+        # call, not just the cacheable reads the read-cache hook filters down to.
+        role = getattr(agent, "name", None) or "Coordinator"
+        counts[role] = counts.get(role, 0) + 1
+        count = counts[role]
+
+        result = await function(**args)
+
+        if role in fired:
+            return result
+        limit = _resolve_tool_call_limit(team_name, role)
+        if count < max(limit - _TOOL_BUDGET_RESERVE, 1):
+            return result
+
+        fired.add(role)
+        _force_text_only(agent)
+        if activity is not None:
+            activity["tool_budget_forced"] = sorted(fired)
+        print(f"[team] {role} reached {count}/{limit} tool calls — forcing text-only "
+              f"before agno starts refusing calls silently")
+        # Appended to the REAL result, never replacing it: this call was within budget
+        # and its content is legitimately needed for the answer the agent must now write.
+        return (
+            f"{result}\n\n---\nTOOL BUDGET REACHED: {role} has used {count} of its "
+            f"{limit} tool calls for this run and cannot make any more. Do NOT attempt "
+            f"another tool call — it will be refused silently and you will loop. Answer "
+            f"NOW using what you already have, and say plainly which parts you could not "
+            f"determine."
+        )
+
+    return _tool_budget_guard_hook
 
 
 def _bump_consecutive_stub_and_maybe_force_text_only(
@@ -4378,9 +4565,13 @@ def _build_team(
     # delegation_log_hook no longer matters for correctness (delegation_log_hook's own
     # session_state write is independent and may still be observed elsewhere in a member's
     # context, unaffected by this hook's now-separate bookkeeping).
+    # tool_budget_guard_hook goes LAST: it counts every call that actually executes, so
+    # it must not count one the gates above are about to block/stub (those return their
+    # own message without calling `function`, so the chain stops before reaching this).
     tool_hooks = [
         interception_hook, search_before_browse_gate_hook, read_cache_hook,
         decompose_first_gate_hook, duplicate_delegation_gate_hook, delegation_log_hook,
+        _make_tool_budget_guard_hook(team_name, activity),
     ]
     if agent_specs:
         members = [
@@ -4420,6 +4611,7 @@ def _build_team(
             temperature=config.coordinator_temperature, max_tokens=config.coordinator_max_tokens,
             frequency_penalty=config.coordinator_frequency_penalty,
             repetition_penalty=config.coordinator_repetition_penalty,
+            min_p=config.coordinator_min_p,
         ),
         members=members,
         tools=coordinator_tools_list,
@@ -4453,7 +4645,10 @@ def _build_team(
         # run specifically can't need the full pipeline's iteration budget (no
         # Coder/Executor phase is even reachable once writes are stripped).
         max_iterations=(config.read_only_max_iterations if read_only else config.max_iterations),
-        tool_call_limit=config.tool_call_limit,
+        # The Coordinator's OWN budget, DB override honoured (2026-08-21) -- this was
+        # config.tool_call_limit unconditionally, which is why engineering's
+        # Coordinator=60 row never took effect. See _resolve_tool_call_limit.
+        tool_call_limit=_resolve_tool_call_limit(team_name, "Coordinator"),
         tool_hooks=tool_hooks,
     )
     # Expose the delegation hook's closure-local counter on the team object so

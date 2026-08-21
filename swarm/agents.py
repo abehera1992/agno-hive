@@ -7,10 +7,37 @@ from config.config import config
 from swarm import model_routing
 
 
+def _vllm_extra_body(repetition_penalty: float | None, min_p: float | None) -> dict | None:
+    """vLLM-native sampling params that OpenAIChat has no field for, or None.
+
+    Returning None rather than {} when nothing is set matters: agno omits the key
+    entirely, so a deployment with neither configured sends byte-for-byte the same
+    request it sent before either existed.
+
+    `min_p` added 2026-08-21 and verified accepted by the served model before being
+    wired (direct probe: `min_p: 0.06` -> 200 OK, finish_reason "stop", vLLM
+    0.23.1rc1) -- the same check that established `repetition_penalty` is supported
+    and `no_repeat_ngram_size` is not. Both default to None (disabled).
+
+    Deliberately NOT enabled by default. `frequency_penalty` was tuned 0.4 -> 0.15
+    live after the higher value backfired, and that history is the standing argument
+    against switching on a second, unmeasured sampling lever -- especially two at
+    once, whose combined effect at a given threshold is not the sum of their
+    separate ones. Enable behind a real A/B, not a default flip.
+    """
+    body = {}
+    if repetition_penalty is not None:
+        body["repetition_penalty"] = repetition_penalty
+    if min_p is not None:
+        body["min_p"] = min_p
+    return body or None
+
+
 def get_model(
     model_id: str, host: str,
     temperature: float | None = None, max_tokens: int | None = None,
     frequency_penalty: float | None = None, repetition_penalty: float | None = None,
+    min_p: float | None = None,
 ):
     """Build the model object for an agent, honoring INFERENCE_BACKEND.
 
@@ -111,11 +138,12 @@ def get_model(
             id=served, base_url=config.vllm_gateway_url, api_key="EMPTY",
             temperature=temperature, max_tokens=max_tokens, frequency_penalty=frequency_penalty,
             timeout=config.model_request_timeout_s,
-            # extra_body only, not a native OpenAIChat field -- see this function's own
-            # docstring. Only wired on the vLLM path: repetition_penalty is a vLLM-native
-            # SamplingParams field, not something the cloud branch above's arbitrary
-            # third-party provider is confirmed to support.
-            extra_body=({"repetition_penalty": repetition_penalty} if repetition_penalty is not None else None),
+            # extra_body only, not native OpenAIChat fields -- see this function's own
+            # docstring. Only wired on the vLLM path: both are vLLM-native SamplingParams
+            # fields, not something the cloud branch above's arbitrary third-party
+            # provider is confirmed to support. Omitted entirely when both are None, so
+            # the default remains byte-for-byte the prior request shape.
+            extra_body=_vllm_extra_body(repetition_penalty, min_p),
         )
     return OllamaToolFix(id=model_id, host=host)
 
@@ -288,6 +316,7 @@ def make_agent_from_spec(
             temperature=temperature, max_tokens=max_tokens,
             frequency_penalty=config.member_frequency_penalty,
             repetition_penalty=config.member_repetition_penalty,
+            min_p=config.member_min_p,
         ),
         tools=agent_tools + [update_session_state],
         instructions=instructions,
@@ -323,6 +352,7 @@ def make_coder(*mcps: MCPTools, tool_hooks: list | None = None) -> Agent:
             temperature=config.member_temperature, max_tokens=config.coder_max_tokens,
             frequency_penalty=config.member_frequency_penalty,
             repetition_penalty=config.member_repetition_penalty,
+            min_p=config.member_min_p,
         ),
         tools=list(mcps) + [update_session_state],
         tool_hooks=tool_hooks,
@@ -350,6 +380,7 @@ def make_reviewer(*mcps: MCPTools, tool_hooks: list | None = None) -> Agent:
             temperature=config.member_temperature, max_tokens=config.member_max_tokens,
             frequency_penalty=config.member_frequency_penalty,
             repetition_penalty=config.member_repetition_penalty,
+            min_p=config.member_min_p,
         ),
         tools=list(mcps) + [update_session_state],
         tool_hooks=tool_hooks,
@@ -374,6 +405,7 @@ def make_researcher(*mcps: MCPTools) -> Agent:
             temperature=config.member_temperature, max_tokens=config.member_max_tokens,
             frequency_penalty=config.member_frequency_penalty,
             repetition_penalty=config.member_repetition_penalty,
+            min_p=config.member_min_p,
         ),
         tools=list(mcps) + [update_session_state],
         description="Codebase investigation specialist. Read real files and ground every claim in file content — never describe from directory names alone.",
@@ -398,6 +430,7 @@ def make_executor(*mcps: MCPTools) -> Agent:
             temperature=config.member_temperature, max_tokens=config.member_max_tokens,
             frequency_penalty=config.member_frequency_penalty,
             repetition_penalty=config.member_repetition_penalty,
+            min_p=config.member_min_p,
         ),
         tools=list(mcps) + [update_session_state],
         description="Execution and validation specialist. Run commands and report exact stdout/stderr — never paraphrase errors.",
@@ -421,6 +454,7 @@ def make_context_router(*mcps: MCPTools) -> Agent:
             temperature=config.member_temperature, max_tokens=config.member_max_tokens,
             frequency_penalty=config.member_frequency_penalty,
             repetition_penalty=config.member_repetition_penalty,
+            min_p=config.member_min_p,
         ),
         tools=list(mcps) + [update_session_state],
         description="Lightweight query router. Pick the fastest retrieval path and return raw results — never interpret or answer yourself.",

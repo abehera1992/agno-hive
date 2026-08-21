@@ -274,6 +274,21 @@ class Config:
         float(os.environ["MEMBER_REPETITION_PENALTY"])
         if os.getenv("MEMBER_REPETITION_PENALTY") else None
     )
+    # min_p (2026-08-21) -- vLLM-native nucleus-style floor: drop any token whose
+    # probability is below min_p x (top token's probability). Proposed as a lever against
+    # the degenerate-repetition failure this file's other penalties also target, since a
+    # loop is a low-entropy state and min_p prunes exactly the flat tail that sustains it.
+    # Verified accepted by the served model before wiring (min_p: 0.06 -> 200 OK, vLLM
+    # 0.23.1rc1); 0.05-0.1 is the commonly-cited starting range. BOTH default to None
+    # (disabled) for the same reason repetition_penalty does: frequency_penalty had to be
+    # walked back 0.4 -> 0.15 after the higher value backfired live, so a second unmeasured
+    # sampling lever gets an A/B, not a default flip.
+    coordinator_min_p: float | None = (
+        float(os.environ["COORDINATOR_MIN_P"]) if os.getenv("COORDINATOR_MIN_P") else None
+    )
+    member_min_p: float | None = (
+        float(os.environ["MEMBER_MIN_P"]) if os.getenv("MEMBER_MIN_P") else None
+    )
     # Output-length cap for every member agent EXCEPT Coder (see coder_max_tokens below) --
     # same rationale as coordinator_max_tokens: bounds a repetition loop's worst case to a few
     # minutes instead of tens, while staying generous for a normal prose analysis, plan, or

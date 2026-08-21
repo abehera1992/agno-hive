@@ -207,6 +207,29 @@ def _filter_relevant_failures(
 
 # ── Context loader ────────────────────────────────────────────────────────────
 
+# Corrections that assert something is ABSENT. Flagged specially at injection time
+# (2026-08-21) because absence is the claim class that rots: a correction saying "X does
+# not exist" is true until someone adds X, and nothing here notices when they do.
+#
+# Live case: a stored correction read "Do not mention useGetParty, useGetParties,
+# useCreateParty, useUpdateParty, useDeleteParty, useAddRegistration — they do not exist
+# in this codebase." It was injected into a delegation verbatim, and the model asserted
+# the nonexistence it had been handed. The real hooks exist and simply carry Query/
+# Mutation suffixes (useGetPartiesQuery / useCreatePartyMutation,
+# inventoryApi.ts:933-935). The answer declared an entire shipped frontend missing.
+#
+# Deliberately NOT doing full symbol-resolution here: load_failure_context() runs at run
+# start, on the hot path, and resolving every cited symbol would add a tool round-trip
+# per entry to EVERY run. Tagging is free and addresses the observed failure directly.
+# Resolution-based expiry stays open as the follow-on.
+_ABSENCE_CLAIM_RE = re.compile(
+    r"\b(?:do(?:es)?\s+not\s+exist|don'?t\s+exist|doesn'?t\s+exist|no\s+such\s+"
+    r"(?:file|function|hook|method|class|table|column)|never\s+existed|is\s+not\s+"
+    r"(?:present|defined)|are\s+not\s+(?:present|defined))\b",
+    re.IGNORECASE,
+)
+
+
 async def load_failure_context(project_id: str, limit: int | None = None, current_task: str = "") -> str:
     """Return a formatted string of recent, RELEVANT failures to inject into
     coordinator instructions.
@@ -267,10 +290,24 @@ async def load_failure_context(project_id: str, limit: int | None = None, curren
         if not failures:
             return ""
 
-        lines = ["── Past failures (USER FEEDBACK) — read every point before writing code ──"]
+        lines = [
+            "── Past failures (USER FEEDBACK) — read every point before writing code ──",
+            "  These are PRIOR OBSERVATIONS, not current facts. They were true when",
+            "  recorded and the code may have changed since. Treat each as a hypothesis",
+            "  to check with a tool, never as evidence in its own right, and never cite",
+            "  one as the basis for a claim about what the codebase currently contains.",
+        ]
         for task_text, err_type, err_msg in failures:
             lines.append(f"  Task:  {task_text[:300]}")
             lines.append(f"  Correction: {err_msg[:800]}")
+            if _ABSENCE_CLAIM_RE.search(err_msg or ""):
+                lines.append(
+                    "    ⚠ STALENESS RISK — this correction asserts something does NOT "
+                    "exist. That is the class most likely to have gone false, and the "
+                    "most damaging when it has. Confirm with search_files/find_files "
+                    "before repeating it; if the thing DOES exist now, ignore this "
+                    "correction entirely and say what you actually found."
+                )
             lines.append("")
         return "\n".join(lines)
     except Exception as exc:

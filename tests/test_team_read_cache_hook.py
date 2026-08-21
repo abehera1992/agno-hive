@@ -777,9 +777,10 @@ def test_build_team_registers_a_tool_hook_on_the_coordinator(monkeypatch):
     # read-cache hook (Detour fix) + decompose-first gate hook (Engineering Team 2.0
     # Phase 2, 2026-08-14) + duplicate-delegation gate hook (2026-08-15, T2c
     # groundedness incident) + delegation-log hook (shared session_state, 2026-08-13)
-    # -- all six shared
+    # + tool-budget guard hook (2026-08-21, pre-empts tool_call_limit)
+    # -- all seven shared
     assert result.tool_hooks is not None
-    assert len(result.tool_hooks) == 6
+    assert len(result.tool_hooks) == 7
 
 
 def test_interception_hook_is_listed_first_so_it_is_outermost(monkeypatch):
