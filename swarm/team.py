@@ -3295,7 +3295,9 @@ def _force_text_only(agent) -> None:
         model._tool_choice = "none"
 
 
-def _make_tool_budget_guard_hook(team_name: str | None, activity: dict | None = None):
+def _make_tool_budget_guard_hook(
+    team_name: str | None, activity: dict | None = None, role: str | None = None,
+):
     """Force an answer just BEFORE tool_call_limit is reached, rather than trying to
     react to the refusal after it (2026-08-21).
 
@@ -3334,10 +3336,17 @@ def _make_tool_budget_guard_hook(team_name: str | None, activity: dict | None = 
     async def _tool_budget_guard_hook(function_name, function, args, agent=None, run_context=None):
         # Counted BEFORE any early return: the budget agno enforces covers EVERY tool
         # call, not just the cacheable reads the read-cache hook filters down to.
-        role = getattr(agent, "name", None) or "Coordinator"
-        counts[role] = counts.get(role, 0) + 1
-        count = counts[role]
-        limit = _resolve_tool_call_limit(team_name, role)
+        # `role` is bound at construction, not discovered from `agent` (2026-08-21).
+        # agno stores caller identity on the Function object, which is shared across
+        # every agent that lists the same tool -- live-measured as None for every call,
+        # so discovery attributed member calls to "Coordinator" and counted a whole team
+        # into one bucket against the wrong ceiling. Each agent now gets its own hook
+        # instance with its own counter, which is also what "per-role budget" should have
+        # meant all along. The getattr fallback stays for callers that don't bind one.
+        who = role or getattr(agent, "name", None) or "Coordinator"
+        counts[who] = counts.get(who, 0) + 1
+        count = counts[who]
+        limit = _resolve_tool_call_limit(team_name, who)
 
         # Low-noise permanent diagnostic (2026-08-21): the first call per role, then
         # every 10th. Added after this guard demonstrably did NOT fire on a live run
@@ -3350,25 +3359,25 @@ def _make_tool_budget_guard_hook(team_name: str | None, activity: dict | None = 
         # once diagnosed: "which roles are spending budget, and how fast" is worth a
         # handful of lines per run on its own.
         if count == 1 or count % 10 == 0:
-            print(f"[budget] {role}: call {count}/{limit} ({function_name})")
+            print(f"[budget] {who}: call {count}/{limit} ({function_name})")
 
         result = await function(**args)
 
-        if role in fired:
+        if who in fired:
             return result
         if count < max(limit - _TOOL_BUDGET_RESERVE, 1):
             return result
 
-        fired.add(role)
+        fired.add(who)
         _force_text_only(agent)
         if activity is not None:
             activity["tool_budget_forced"] = sorted(fired)
-        print(f"[team] {role} reached {count}/{limit} tool calls — forcing text-only "
+        print(f"[team] {who} reached {count}/{limit} tool calls — forcing text-only "
               f"before agno starts refusing calls silently")
         # Appended to the REAL result, never replacing it: this call was within budget
         # and its content is legitimately needed for the answer the agent must now write.
         return (
-            f"{result}\n\n---\nTOOL BUDGET REACHED: {role} has used {count} of its "
+            f"{result}\n\n---\nTOOL BUDGET REACHED: {who} has used {count} of its "
             f"{limit} tool calls for this run and cannot make any more. Do NOT attempt "
             f"another tool call — it will be refused silently and you will loop. Answer "
             f"NOW using what you already have, and say plainly which parts you could not "
@@ -4581,23 +4590,39 @@ def _build_team(
     # tool_budget_guard_hook goes LAST: it counts every call that actually executes, so
     # it must not count one the gates above are about to block/stub (those return their
     # own message without calling `function`, so the chain stops before reaching this).
+    # Shared across every agent -- these are genuinely run-wide (one cache, one delegation
+    # log, one interception trace).
     tool_hooks = [
         interception_hook, search_before_browse_gate_hook, read_cache_hook,
         decompose_first_gate_hook, duplicate_delegation_gate_hook, delegation_log_hook,
-        _make_tool_budget_guard_hook(team_name, activity),
     ]
+
+    def _hooks_for(role: str) -> list:
+        """Shared hooks plus a budget guard bound to THIS role (2026-08-21).
+
+        Per-agent, not shared, because the budget it guards is per-agent: agno resets
+        tool_call_limit per arun() and each Agent carries its own. One shared instance
+        counted the whole team into a single bucket -- and, worse, keyed that bucket off
+        `agent`, which is None here (agno stores identity on the Function object, shared
+        across every agent listing the same tool). Binding the role at construction
+        removes the discovery step entirely. Safe to give each agent its own hook list
+        only because make_agent_from_spec now hands each agent its own Function copies;
+        with shared Functions, `tool_hooks` is one shared slot and the last writer won.
+        """
+        return tool_hooks + [_make_tool_budget_guard_hook(team_name, activity, role=role)]
+
     if agent_specs:
         members = [
             make_agent_from_spec(
-                spec, *mcp_list, skill_catalog=skill_catalog, tool_hooks=tool_hooks,
-                project_id=project_id,
+                spec, *mcp_list, skill_catalog=skill_catalog,
+                tool_hooks=_hooks_for(spec.name), project_id=project_id,
             )
             for spec in agent_specs
         ]
     else:
         members = [
-            make_coder(*mcp_list, tool_hooks=tool_hooks),
-            make_reviewer(*mcp_list, tool_hooks=tool_hooks),
+            make_coder(*mcp_list, tool_hooks=_hooks_for("Coder")),
+            make_reviewer(*mcp_list, tool_hooks=_hooks_for("Reviewer")),
         ]
     # request_clarification is always available, regardless of read_only/allowlist scoping --
     # it's a local tool (not MCP-derived, so name-based allowlisting doesn't apply to it) with
@@ -4662,7 +4687,7 @@ def _build_team(
         # config.tool_call_limit unconditionally, which is why engineering's
         # Coordinator=60 row never took effect. See _resolve_tool_call_limit.
         tool_call_limit=_resolve_tool_call_limit(team_name, "Coordinator"),
-        tool_hooks=tool_hooks,
+        tool_hooks=_hooks_for("Coordinator"),
     )
     # Expose the delegation hook's closure-local counter on the team object so
     # _verified_answer can ask "did the coordinator delegate at all this run?" after

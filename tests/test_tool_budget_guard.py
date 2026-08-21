@@ -214,18 +214,66 @@ async def test_activity_records_which_roles_were_forced(monkeypatch):
     assert activity["tool_budget_forced"] == ["Researcher"]
 
 
-def test_the_guard_is_the_innermost_hook():
-    """Ordering is load-bearing and non-obvious: agno reverses tool_hooks and reduces
-    from the entrypoint outward, so tool_hooks[0] is OUTERMOST and the last entry is
-    innermost. The guard must be last so it never counts a call an outer gate is about
-    to block or stub — those return their own message without calling `function`."""
+def test_the_guard_is_appended_last_and_bound_per_role():
+    """Two properties in one place, both load-bearing.
+
+    ORDERING: agno reverses tool_hooks and reduces from the entrypoint outward, so
+    tool_hooks[0] is OUTERMOST and the last entry is innermost. The guard must be last
+    so it never counts a call an outer gate is about to block or stub - those return
+    their own message without calling `function`.
+
+    BINDING: each agent gets its OWN instance with its role bound at construction. The
+    first version discovered the role from `agent`, which agno stores on the Function
+    object - shared across every agent listing the same tool, and live-measured as None
+    for every call. That attributed member calls to "Coordinator" and counted a whole
+    team into one bucket against the wrong ceiling, which is why the guard never fired
+    on a run that made 67 calls against a limit of 25.
+    """
     import inspect
 
     from swarm import team
 
     src = inspect.getsource(team._build_team)
-    start = src.index("tool_hooks = [")
-    block = src[start:src.index("]", start)]
+    shared = src[src.index("tool_hooks = ["):]
+    shared_block = shared[:shared.index("]")]
 
-    assert "_make_tool_budget_guard_hook" in block
-    assert block.rindex("_make_tool_budget_guard_hook") > block.rindex("delegation_log_hook")
+    # The guard is NOT in the shared list - it is appended per agent by _hooks_for.
+    assert "_make_tool_budget_guard_hook" not in shared_block
+    assert "return tool_hooks + [_make_tool_budget_guard_hook(" in src, "must be appended LAST"
+    assert "role=role" in src, "role must be bound at construction, not discovered"
+
+    for site in ('_hooks_for(spec.name)', '_hooks_for("Coder")',
+                 '_hooks_for("Reviewer")', '_hooks_for("Coordinator")'):
+        assert site in src, f"missing bound hook list: {site}"
+
+
+@pytest.mark.asyncio
+async def test_a_bound_role_wins_over_a_missing_agent_object():
+    """The exact production shape: agno hands the hook agent=None (identity lives on a
+    Function object shared by every agent), so discovery would say "Coordinator" for a
+    member's call and charge it to the wrong budget."""
+    hook = _make_tool_budget_guard_hook("engineering", role="Executor")
+
+    # Collected, not just the last: the notice fires ONCE (see test_it_fires_once_per_role),
+    # so checking only the final call would look like a failure when it worked.
+    outs = [await hook("list_processes", _fn, {}, agent=None) for _ in range(30)]
+    notices = [o for o in outs if "TOOL BUDGET REACHED" in o]
+
+    assert len(notices) == 1, "should fire exactly once"
+    assert "Executor has used" in notices[0], \
+        "must count against Executor's budget, not the Coordinator's"
+    # Executor's real budget is config's 25, not the Coordinator's 60 — the exact
+    # mis-attribution that let a 67-call run sail past the guard.
+    assert f"of its {config.tool_call_limit} tool calls" in notices[0]
+
+
+def test_member_tools_are_per_agent_copies():
+    """The change that makes per-agent hooks possible at all. With shared Function
+    objects, `tool_hooks` is one slot and the last agent to register wins - so binding
+    a role per agent would silently collapse back to whichever list was written last."""
+    import inspect
+
+    from swarm import agents
+
+    src = inspect.getsource(agents.make_agent_from_spec)
+    assert "copy.copy(all_funcs[t])" in src

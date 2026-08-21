@@ -833,7 +833,13 @@ def test_build_team_shares_the_same_hook_instance_between_coordinator_and_fallba
 
     for member in result.members:
         assert member.tool_hooks is not None
-        assert member.tool_hooks == result.tool_hooks  # same objects, not just equal
+        # The RUN-WIDE hooks must be the same objects -- one cache, one delegation log.
+        # Since 2026-08-21 each agent additionally carries its OWN tool-budget guard
+        # (bound to its role), so the lists share a prefix rather than being equal:
+        # the budget it guards is per-agent, and one shared instance counted the whole
+        # team into a single bucket against the wrong ceiling.
+        assert member.tool_hooks[:-1] == result.tool_hooks[:-1]
+        assert member.tool_hooks[-1] is not result.tool_hooks[-1], "budget guard must be per-agent"
 
 
 # ── _record_read: mechanical read_log in shared session_state (2026-08-13) ─────
@@ -1158,7 +1164,10 @@ def test_build_team_shares_the_same_hook_instance_with_spec_based_members(monkey
     )
 
     assert len(result.members) == 1
-    assert result.members[0].tool_hooks == result.tool_hooks
+    # Shared prefix identical; per-agent budget guard distinct (see the fallback-path
+    # test above for why the last element deliberately differs).
+    assert result.members[0].tool_hooks[:-1] == result.tool_hooks[:-1]
+    assert result.members[0].tool_hooks[-1] is not result.tool_hooks[-1]
 
 
 # ── "File not found" pagination-retry short-circuit (2026-08-18 live incident) ──
