@@ -1557,6 +1557,32 @@ def _pick_hive_mcp(mcp_by_url: dict | None, required_tool: str = "verify_claims"
     return None, None
 
 
+async def _sync_tool_registry(mcp_list: list, skill_catalog: list[dict] | None) -> None:
+    """Keep tool_registry/skill_registry current from this run's own live MCP
+    enumeration — see team_config.sync_registry_from_live() for why a swarm run
+    is the right place for this and a server's own bootstrap is not.
+
+    `mcp.functions` is the connected surface as agno enumerated it, before any
+    read_only stripping (that happens later, on the scoped per-agent lists, not
+    on this dict), so a read-only run reports the same surface as any other.
+
+    Never raises and never blocks the run: the registry is write-time grant
+    validation, not something a task depends on. A failure here means the next
+    attempt to grant a brand-new tool gets a 400 — annoying and self-explanatory
+    — which does not justify failing a task that was otherwise fine.
+    """
+    try:
+        tool_names = sorted({name for mcp in mcp_list for name in mcp.functions})
+        skill_names = sorted({s["name"] for s in (skill_catalog or []) if s.get("name")})
+        added = await team_config.sync_registry_from_live(tool_names, skill_names)
+        if added:
+            print(f"[registry] synced from live MCP — added "
+                  f"{len(added['tools_added'])} tool(s) {added['tools_added']}, "
+                  f"{len(added['skills_added'])} skill(s) {added['skills_added']}")
+    except Exception as exc:
+        print(f"[registry] sync skipped ({type(exc).__name__}: {exc or '<no message>'})")
+
+
 async def _fetch_skill_catalog(hive_mcp_url: str | None) -> list[dict]:
     """Fetch the L1 skill catalog once per run via hive-mcp's list_skills tool.
 
@@ -4768,6 +4794,10 @@ async def run_task_stream(
         # CLI one-shot path, which never runs the FastAPI startup event.
         await model_routing.ensure_cache_loaded()
         await team_config.ensure_cache_loaded()
+        # After the cache is loaded (it is what the no-op path compares against)
+        # and before any agent is built. Writes only when hive-mcp's surface
+        # actually gained a name.
+        await _sync_tool_registry(mcp_list, skill_catalog)
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
             read_only=read_only, skill_catalog=skill_catalog, task=task, team_name=team_name,
@@ -5268,6 +5298,10 @@ async def run_task_async(
         # CLI one-shot path, which never runs the FastAPI startup event.
         await model_routing.ensure_cache_loaded()
         await team_config.ensure_cache_loaded()
+        # After the cache is loaded (it is what the no-op path compares against)
+        # and before any agent is built. Writes only when hive-mcp's surface
+        # actually gained a name.
+        await _sync_tool_registry(mcp_list, skill_catalog)
         # Fed by the interception hook on every tool call (coordinator or member);
         # the heartbeat task below reads it to report time-since-last-tool-call as a
         # backstop signal independent of the content-chunk logging below (2026-08-10) --

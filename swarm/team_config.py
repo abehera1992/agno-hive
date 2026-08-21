@@ -260,6 +260,44 @@ async def refresh_registry(tool_names: list[str], skill_names: list[str]) -> Non
                 )
 
 
+async def sync_registry_from_live(tool_names: list[str], skill_names: list[str]) -> dict | None:
+    """Upsert the registry from a LIVE enumeration, but only when it carries a
+    name the registry doesn't already have. Returns what was added, or None when
+    there was nothing to do.
+
+    This is how the registry is meant to stay current (2026-08-21).
+    refresh_registry()'s admin endpoint was the bootstrapping stand-in; the real
+    source is a swarm run, which already connects to every MCP server and already
+    holds `MCPTools.functions` — the exact list, keyed by name — before it builds
+    a single agent. Nothing else in the system has that list at a moment when it
+    is known to be REACHABLE, which is the property the registry actually needs:
+    it exists to validate grants, and a grant is only meaningful if the swarm can
+    reach the tool. A server self-reporting at its own bootstrap would instead
+    record what it HAS, which stays true right up until the moment it stops being
+    reachable and the registry stops being able to tell you.
+
+    Runs on every swarm run, so the no-change path must cost nothing: two set
+    differences against the in-process cache, no connection, no query. When
+    something IS new, the full lists go to refresh_registry() rather than just the
+    new names — so last_seen_at is refreshed across the board exactly when the
+    surface changed, which is when its value as a staleness signal matters, and
+    never on the common path.
+
+    Only ever ADDS. refresh_registry() upserts rather than wiping, deliberately
+    (see its docstring), so a run connected to fewer servers than usual — or one
+    whose enumeration is momentarily partial — cannot de-register a real tool.
+    """
+    new_tools = sorted(set(tool_names) - _tool_registry_cache)
+    new_skills = sorted(set(skill_names) - _skill_registry_cache)
+    if not new_tools and not new_skills:
+        return None
+
+    await refresh_registry(sorted(set(tool_names)), sorted(set(skill_names)))
+    _tool_registry_cache.update(new_tools)
+    _skill_registry_cache.update(new_skills)
+    return {"tools_added": new_tools, "skills_added": new_skills}
+
+
 async def reset_cache_for_tests() -> None:
     """Test-only: mirrors swarm/model_routing.reset_cache_for_tests()."""
     global _cache_loaded
