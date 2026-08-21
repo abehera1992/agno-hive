@@ -347,6 +347,33 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
     except Exception as e:
         return f"Could not read {relative_path}: {e}"
 
+    # An EXISTING but EMPTY file must not return an empty string (2026-08-21).
+    # _numbered_lines([]) is "", which is byte-identical to what a caller would infer
+    # "nothing here" from -- and a model reading an empty result reasons its way to the
+    # only explanation it has: the file is missing.
+    #
+    # Live case: asked to list API/business-service/router/, a run called
+    # get_file_content on that package's __init__.py (a real, normal, 0-byte file),
+    # got "", and answered "`router/__init__.py` does not exist in the codebase. This
+    # is confirmed by multiple attempts to read it, including with progressively larger
+    # line limits". All six files were there. It then spent its whole tool_call_limit
+    # re-reading a file whose content could never change with offset/limit.
+    #
+    # Stated before the ranged branch so it wins for every offset/limit combination --
+    # the retry loop above is exactly what happens when only the whole-file path says
+    # so. Mirrors the "File not found" branch's own anti-retry wording, for the same
+    # reason: naming the wrong next action is what stops it.
+    if not data:
+        return (
+            f"# {relative_path} EXISTS and is EMPTY (0 bytes).\n"
+            f"# This is NOT 'file not found' — the file is present in the project and has\n"
+            f"# no content. Do NOT retry with a different offset/limit: an empty file has\n"
+            f"# no content at any offset, so changing those will never return anything\n"
+            f"# else. An empty __init__.py, .gitkeep or placeholder module is normal and\n"
+            f"# usually means the package/directory exists — use list_directory() or\n"
+            f"# find_files() if you need to know what else is beside it."
+        )
+
     # Explicit line-range read — exact and bounded, takes precedence.
     if offset or limit:
         lines = data.splitlines()

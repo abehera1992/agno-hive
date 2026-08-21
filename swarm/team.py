@@ -1580,6 +1580,56 @@ def _pick_hive_mcp(mcp_by_url: dict | None, required_tool: str = "verify_claims"
     return None, None
 
 
+# verify_claims' symbol-anchored MISMATCH ends with the symbol's REAL location, which
+# _symbol_line_numbers computed by reading the file: "`sku_prefix` is not within 5 lines
+# of 142; it actually appears at line(s) 129". Captures (symbol, lines) so the citation
+# retry can be handed the answer instead of being sent to rediscover it.
+_CORRECT_LINE_RE = re.compile(
+    r"`([^`\n]{1,120})` is not within \d+ lines of \d+; "
+    r"it actually appears at line\(s\) ([\d, ]+)"
+)
+
+_MAX_HANDED_OVER_LOCATIONS = 4
+
+
+def _citation_retry_hint(corrected_lines: list[tuple[str, str]]) -> str:
+    """The HOW half of the citation-correction retry: what kind of tool call to make.
+
+    Named rather than inlined so a test can exercise the real string instead of a
+    parallel reimplementation that can drift from it.
+
+    Demands a NARROW read. The previous wording said "call get_file_content on the
+    exact file(s) involved"; the logs show the model complied exactly and reproduced
+    the same unbounded read that produced the wrong number. Not a compliance failure
+    -- the instruction prescribed the wrong remedy.
+
+    `corrected_lines` are (symbol, "129" | "116, 208") pairs harvested from
+    verify_claims' own symbol-anchored MISMATCH, which computed them by reading the
+    real file. Handing them over converts the retry from a rediscovery into a
+    correction. Capped: past a handful this stops being a hint and becomes another
+    wall of text for a model already struggling to locate one line.
+    """
+    hint = (
+        "Do NOT re-read the whole file — that is exactly what produced the wrong "
+        "number. Either call search_files for the symbol and use the file:line it "
+        "reports, or call get_file_content with offset/limit for a SMALL window "
+        "(about 10-20 lines) around the candidate line, and read the number off "
+        "the tool's own numbered output. "
+    )
+    if corrected_lines:
+        found = "; ".join(
+            f"{sym} is at line(s) {lines}"
+            for sym, lines in corrected_lines[:_MAX_HANDED_OVER_LOCATIONS]
+        )
+        hint += (
+            f"A repository grep has ALREADY located them for you: {found}. Verify "
+            f"with a small windowed read around those lines and cite what you see "
+            f"there — do not cite a different number than the grep found unless the "
+            f"tool output you just read plainly contradicts it. "
+        )
+    return hint
+
+
 _MODEL_DIRECTED_VERDICT_RE = re.compile(
     r"\s*Fix the answer before returning it[^\n]*", re.IGNORECASE
 )
@@ -2622,6 +2672,13 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                         if (t := _claim_token(ln, ("NOT FOUND",)))]
     bad_citations = [t for ln in report.splitlines()
                       if (t := _claim_token(ln, ("BAD", "AMBIGUOUS", "MISMATCH")))]
+    # verify_claims' symbol-anchored MISMATCH already KNOWS the right answer -- its own
+    # message ends "...it actually appears at line(s) 116, 208", computed by
+    # _symbol_line_numbers reading the real file. Until 2026-08-21 that was printed and
+    # thrown away: the retry was told only that the citation was wrong, never where the
+    # symbol actually is, so it had to rediscover a fact the checker had in hand.
+    # Harvesting it turns the retry from a guess into a correction.
+    corrected_lines = _CORRECT_LINE_RE.findall(report)
     # verify_claims' CONVENTIONS section (CODE_LINT_FORBID/REQUIRE, and the SCSS
     # namespace-consistency check) uses its own "VIOLATION" prefix, which
     # _claim_token above was never taught to recognise -- confirmed live
@@ -2658,6 +2715,24 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         )
     if bad_citations:
         named = ", ".join(bad_citations[:6])
+        # A BOUNDED re-read, not a whole-file one (2026-08-21). Root-caused live: the
+        # previous wording said "call get_file_content on the exact file(s) involved",
+        # the model complied exactly, and reproduced the SAME unbounded read that
+        # produced the wrong number in the first place. Not a compliance failure --
+        # the instruction prescribed the wrong remedy.
+        #
+        # Measured on API/inventory-service/models.py (774 lines, 32KB, well under the
+        # skeleton threshold so the real numbered content IS returned):
+        #   get_file_content(offset=124, limit=12)  -> "129\tsku_prefix = Column(
+        #       String(8), nullable=True)" reproduced EXACTLY
+        #   get_file_content(whole file)            -> "line 142 ... String(10)" one
+        #       run, "line 142 ... String(20)" the next; the truth is line 129
+        # Same file, same model, same run config -- only the read shape differed. In a
+        # 774-line numbered dump the model interpolates a plausible line number rather
+        # than copying one, which is why the wrong value changes every run. Numbered
+        # output made citations copyable; it cannot make a model copy instead of
+        # estimate, and a narrow window is what removes the opportunity to estimate.
+        window_hint = _citation_retry_hint(corrected_lines)
         # Imperative FIRST/THEN, mirroring the reads==0 branch above (proven wording,
         # not a new pattern). A prior version phrased this as one soft "re-read the
         # file and copy the exact line number" sentence — measured live 2026-08-04,
@@ -2667,14 +2742,14 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         # reissuing a read. Making the read step syntactically first and separate
         # from the answering step is a cheaper lever than trusting prose compliance.
         instructions.append(
-            f"these file:line citations were wrong or unresolvable: {named}. FIRST call "
-            f"get_file_content on the exact file(s) involved — do not rely on a read from "
-            f"earlier in this conversation, the file may have scrolled out of context or "
-            f"your memory of its line numbers may be wrong. THEN answer using the line "
-            f"number exactly as printed in that tool's own numbered output — never a "
-            f"recalled, estimated, or rounded number. If a filename is shared by more "
-            f"than one file in the project, cite the full repo-relative path instead of "
-            f"the bare filename."
+            f"these file:line citations were wrong or unresolvable: {named}. FIRST make a "
+            f"fresh, NARROW tool call to locate them — do not rely on a read from earlier "
+            f"in this conversation, your memory of its line numbers may be wrong. "
+            f"{window_hint}"
+            f"THEN answer using the line number exactly as printed in that tool's own "
+            f"numbered output — never a recalled, estimated, or rounded number. If a "
+            f"filename is shared by more than one file in the project, cite the full "
+            f"repo-relative path instead of the bare filename."
         )
     if lint_violations:
         named = "; ".join(lint_violations[:4])
