@@ -124,15 +124,24 @@ def _model_verify_claims_unavailable_result() -> str:
 # in one place. With that done, excluding names the project MCP no longer serves
 # would break its whole tool list (see the comment at the call site below) -- so
 # this reverts back to its original, narrower scope.
+# ONLY names project MCP genuinely still serves. Excluding a name the server does
+# NOT have makes agno fail the whole toolkit and return ZERO tools for it (see the
+# connect loop's comment) — the entire server silently vanishes from the run.
+#
+# Live proof, 2026-08-21: memory_search/memory_store were added here on 2026-08-20,
+# the same day those two tools were DELETED from EkamApp MCP. Either change alone is
+# fine; together they took project MCP from 4 usable tools to 0. Every run since
+# logged "MCP connected: ...:9000/mcp (0 tools)" and lost get_context_section,
+# get_graph_report, list_recent_files and search_knowledge_graph, with no error
+# beyond that count. Measured directly against the live server:
+#   exclude=None                          -> 6 tools
+#   exclude=[agno_run, agno_list_teams]    -> 4 tools
+#   exclude=[... , memory_search, memory_store] -> 0 tools + "Failed to initialize"
+#
+# So: a tool that no longer EXISTS needs no exclusion, and adding one is actively
+# harmful. Only list names the server actually serves and agents must not call.
 _PROJECT_MCP_EXCLUDE_TOOLS = [
     "agno_run", "agno_list_teams",
-    # memory_search/memory_store removed 2026-08-20: verified against EkamApp MCP's
-    # own container logs (5-day window, 191 tool calls) and the claude_flow.embeddings
-    # table itself (36 rows total, none since 2026-04-27) that neither tool has ever
-    # actually been called by a hive agent, despite being connected. hive's real
-    # pattern-recall path is lightrag_query; project MCP is Claude Code/Cline's tool,
-    # not hive's — keep the two stacks separate rather than leaving a dead fallback wired.
-    "memory_search", "memory_store",
 ]
 
 _COORDINATOR_INSTRUCTIONS = [
@@ -4777,7 +4786,20 @@ async def run_task_stream(
                 )
                 mcp_list.append(mcp)
                 mcp_by_url[url] = mcp
-                print(f"[team] MCP connected: {url} ({len(mcp.functions)} tools)")
+                if mcp.functions:
+                    print(f"[team] MCP connected: {url} ({len(mcp.functions)} tools)")
+                else:
+                    # A server that connects but serves nothing is a silent, total
+                    # loss of that server -- and the most likely cause is an
+                    # exclude_tools entry naming a tool it no longer has, which agno
+                    # reports only as "Failed to initialize MCP toolkit" plus a zero
+                    # count. Say so where someone will read it (2026-08-21, after
+                    # exactly that went unnoticed for a day).
+                    print(f"[team] MCP connected but served 0 TOOLS: {url} — every tool "
+                          f"from this server is unavailable this run. Most likely an "
+                          f"exclude_tools entry naming a tool it does not have "
+                          f"(excluded here: {_exclude}); agno drops the whole toolkit "
+                          f"when one name does not resolve.")
             except Exception as e:
                 print(f"[team] MCP unavailable, skipping ({url}): {e}")
         if not mcp_list:
@@ -5281,7 +5303,20 @@ async def run_task_async(
                 )
                 mcp_list.append(mcp)
                 mcp_by_url[url] = mcp
-                print(f"[team] MCP connected: {url} ({len(mcp.functions)} tools)")
+                if mcp.functions:
+                    print(f"[team] MCP connected: {url} ({len(mcp.functions)} tools)")
+                else:
+                    # A server that connects but serves nothing is a silent, total
+                    # loss of that server -- and the most likely cause is an
+                    # exclude_tools entry naming a tool it no longer has, which agno
+                    # reports only as "Failed to initialize MCP toolkit" plus a zero
+                    # count. Say so where someone will read it (2026-08-21, after
+                    # exactly that went unnoticed for a day).
+                    print(f"[team] MCP connected but served 0 TOOLS: {url} — every tool "
+                          f"from this server is unavailable this run. Most likely an "
+                          f"exclude_tools entry naming a tool it does not have "
+                          f"(excluded here: {_exclude}); agno drops the whole toolkit "
+                          f"when one name does not resolve.")
             except Exception as e:
                 print(f"[team] MCP unavailable, skipping ({url}): {e}")
         if not mcp_list:
