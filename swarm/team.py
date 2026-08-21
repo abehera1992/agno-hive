@@ -3404,6 +3404,18 @@ def _force_text_only(agent, team=None) -> None:
     target.tool_choice = "none"
     model = getattr(target, "model", None)
     if model is not None:
+        # Set on the MODEL too, not only the agent/team (2026-08-21). This is what
+        # VLLMToolFix._sanitize_forced_text reads to know the harness took the tool
+        # away deliberately -- without it, that layer would "recover" the leaked
+        # <tool_call> tags back INTO a call and undo the forcing. The two changes only
+        # work as a pair: tool_choice="none" stops the runaway, and the model-side flag
+        # is what stops the model's fallback syntax from becoming the user's answer.
+        #
+        # Measured with a controlled probe (one variable changed, served model):
+        #   tool_choice omitted -> finish_reason "tool_calls", content ""
+        #   tool_choice "none"  -> finish_reason "stop", content "<tool_call>{...}"
+        # This model does not stop WANTING the tool; it writes the Hermes tags it was
+        # trained on as prose, and agno sees an ordinary text reply made of syntax.
         model._tool_choice = "none"
 
 

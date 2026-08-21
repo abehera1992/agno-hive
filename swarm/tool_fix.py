@@ -158,10 +158,58 @@ class _ToolCallRecoveryMixin:
                 })
         return result
 
+    # Text this model emits INSTEAD of a structured call once tool_choice="none"
+    # removes the structured channel. It still wants the tool, so it writes the Hermes
+    # tags it was trained on as prose.
+    _FORCED_TAG_RE = re.compile(r"<tool_call>.*?</tool_call>|<\|python_tag\|>.*", re.DOTALL)
+
+    def _sanitize_forced_text(self, model_response) -> bool:
+        """Strip leaked tool-call syntax when the model was forced text-only.
+
+        Returns True if it handled the response, meaning the caller must NOT run the
+        normal recovery below.
+
+        The distinction matters and is the whole reason this is separate: normal
+        recovery turns stranded tags back INTO a tool call, which is right when the
+        model simply failed to structure one -- and exactly wrong here, where the
+        harness has deliberately taken the tool away (a budget ceiling, or a repeated
+        ignored stub). Recovering it would re-arm the call the forcing just removed.
+
+        Measured 2026-08-21 with a controlled probe against the served model, one
+        variable changed:
+            tool_choice omitted -> finish_reason "tool_calls", content ""
+            tool_choice "none"  -> finish_reason "stop", content
+                                   '<tool_call>\\n{"name": "list_directory", ...}</tool_call>'
+        Two live runs (T9, T11) returned exactly that as their FINAL ANSWER. From
+        agno's side nothing looked wrong -- finish_reason was "stop", so it is an
+        ordinary text reply, just one made of syntax.
+
+        Substitutes an honest sentence rather than empty content: an empty answer would
+        trip the groundedness guards into a retry, which is the loop this whole path
+        exists to end.
+        """
+        if getattr(self, "_tool_choice", None) != "none":
+            return False
+        content = model_response.content or ""
+        if "<tool_call>" not in content and "<|python_tag|>" not in content:
+            return False
+
+        stripped = self._FORCED_TAG_RE.sub("", content).strip()
+        model_response.content = stripped or (
+            "I attempted another tool call, but this run's tool budget is exhausted so "
+            "no further tool calls can be made. Answering from what was already "
+            "gathered: I could not complete the remaining lookup, so treat anything "
+            "not already established above as undetermined rather than assumed."
+        )
+        return True
+
     def _parse_provider_response(self, response: dict) -> ModelResponse:
         model_response = super()._parse_provider_response(response)
 
         if model_response.tool_calls:
+            return model_response
+
+        if self._sanitize_forced_text(model_response):
             return model_response
 
         if model_response.content:
@@ -178,6 +226,9 @@ class _ToolCallRecoveryMixin:
         model_response = super()._parse_provider_response_delta(response)
 
         if model_response.tool_calls:
+            return model_response
+
+        if self._sanitize_forced_text(model_response):
             return model_response
 
         if model_response.content:
