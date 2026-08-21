@@ -755,6 +755,60 @@ def _find_nearby_quote(answer: str, pos: int) -> str | None:
     return quoted
 
 
+def _find_anchor_symbol(answer: str, pos: int) -> str | None:
+    """The backticked IDENTIFIER a citation is about, when it quotes no content.
+
+    Real answers overwhelmingly name the thing before locating it -- "The `sku_prefix`
+    column ... is defined at line 123 in `models.py`" -- so the identifier sits BEHIND
+    the line number while _find_nearby_quote looks ahead for content. Searching backward
+    for the nearest backticked token that is an identifier (never a path) gives a second
+    anchor for citations that carry no quote at all, which is the overwhelming majority
+    of them.
+
+    Bounded by the same window as the path pairing, and stops at a markdown heading for
+    the same reason _find_nearby_quote does: past a heading the prose is about something
+    else, and an identifier borrowed from there would anchor the citation to a claim it
+    never made.
+    """
+    start = max(0, pos - _LABELED_LINE_WINDOW)
+    window = answer[start:pos]
+    heading = None
+    for h in _MD_HEADING_RE.finditer(window):
+        heading = h
+    if heading is not None:
+        window = window[heading.end():]
+
+    best = None
+    for m in _BACKTICK_RE.finditer(window):
+        tok = m.group(1).strip()
+        if _PATHLIKE_RE.match(tok):          # a path is the citation's file, not its subject
+            continue
+        if tok.lower() in _NOISE:
+            continue
+        if _IDENT_RE.match(tok) or _DOTTED_RE.match(tok):
+            best = tok                       # keep the LAST (nearest) match
+    return best
+
+
+def _symbol_line_numbers(rel_path: str, symbol: str, limit: int = 200) -> list[int]:
+    """Every line number in `rel_path` where `symbol` appears, whole-word.
+
+    Deterministic and file-local -- no ripgrep subprocess, since the file is already
+    known and small enough to scan. Returns [] when the file cannot be read or the
+    symbol is absent; an absent symbol is deliberately NOT treated as evidence against
+    the citation (the SYMBOLS section already checks existence, and a false anchor must
+    never manufacture a MISMATCH).
+    """
+    p = PROJECT_ROOT / rel_path
+    bare = symbol.split(".")[-1]
+    pattern = re.compile(rf"(?<!\w){re.escape(bare)}(?!\w)")
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return []
+    return [i for i, line in enumerate(lines, 1) if pattern.search(line)][:limit]
+
+
 def _read_window(rel_path: str, center_line: int, span: int) -> str:
     """Real file text within `span` lines of center_line, for a location check."""
     p = PROJECT_ROOT / rel_path
@@ -863,6 +917,9 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
 
     file_lines: list[tuple[str, int]] = []
     content_claims: dict[tuple[str, int], str] = {}
+    # Fallback anchor for citations that quote nothing -- the identifier the citation is
+    # ABOUT. See _find_anchor_symbol and the CITATIONS loop's use of it.
+    symbol_claims: dict[tuple[str, int], str] = {}
     for m in _FILE_LINE_RE.finditer(answer):
         path, num = m.group(1), int(m.group(2))
         pair = (path, num)
@@ -872,6 +929,10 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             quoted = _find_nearby_quote(answer, m.end())
             if quoted:
                 content_claims[pair] = quoted
+        if pair not in symbol_claims:
+            anchor = _find_anchor_symbol(answer, m.start())
+            if anchor:
+                symbol_claims[pair] = anchor
 
     # Labeled prose citations ("**File:** `x`, **Line:** 389") that never use the
     # compact path:line form above, and so never matched _FILE_LINE_RE at all. Pair
@@ -907,6 +968,10 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                 quoted = _find_nearby_quote(answer, m.end())
                 if quoted:
                     content_claims[pair] = quoted
+            if pair not in symbol_claims:
+                anchor = _find_anchor_symbol(answer, m.start())
+                if anchor:
+                    symbol_claims[pair] = anchor
 
     routes: list[str] = []
     if _ROUTE_RE is not None:
@@ -1065,6 +1130,36 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                             f"found within {_LINE_TOLERANCE} lines; citation and quoted "
                             f"content do not point at the same place"
                         )
+                else:
+                    # No quoted content -- fall back to the identifier the citation is
+                    # ABOUT. Closes the gap this file's own docstring named ("NOT caught
+                    # for claims with no quoted content"), which is most citations.
+                    #
+                    # Live-caught 2026-08-20: "`sku_prefix` ... is defined at line 123 in
+                    # `API/inventory-service/models.py`" (real line 129; 123 is an
+                    # unrelated `name` column). Line 123 exists in a 700-line file, so the
+                    # bounds check passed and, with nothing quoted, there was nothing else
+                    # to check -- verify_claims reported clean on a line the run had
+                    # invented, having answered from db_schema without reading the file.
+                    #
+                    # Silent unless the symbol is genuinely present and genuinely far
+                    # away: an absent symbol is the SYMBOLS section's job, and treating it
+                    # as citation evidence here would manufacture a MISMATCH whenever the
+                    # backward anchor guessed wrong.
+                    anchor = symbol_claims.get((path, num))
+                    if anchor:
+                        hits = _symbol_line_numbers(resolved, anchor)
+                        if hits and not any(abs(h - num) <= _LINE_TOLERANCE for h in hits):
+                            problems += 1
+                            near = ", ".join(str(h) for h in hits[:5])
+                            out.append(
+                                f"  MISMATCH   {resolved}:{num} <-- `{anchor}` is not "
+                                f"within {_LINE_TOLERANCE} lines of {num}; it actually "
+                                f"appears at line(s) {near}"
+                            )
+                        elif hits:
+                            out.append(f"             `{anchor}` verified within "
+                                       f"{_LINE_TOLERANCE} lines")
         out.append("")
 
     # ── routes ────────────────────────────────────────────────────────────────

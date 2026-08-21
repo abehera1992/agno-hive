@@ -959,6 +959,26 @@ def _scope_coordinator_tools(
     write access is sprint-master-only by design now, not something any
     other team's YAML/DB grant can re-enable.
     """
+    # An EXPLICIT empty allowlist means "this coordinator calls no MCP tool at all" --
+    # pure orchestration, every tool call delegated to a member that owns the tool.
+    # Distinguished from `None` (no allowlist configured -> everything minus the
+    # discovery blocklist), which is what `if not tool_names` below still handles.
+    #
+    # This distinction has to be made HERE, ahead of everything else, because all three
+    # branches below end in `scoped or mcp_list` -- a fallback that exists so a typo'd
+    # allowlist naming only unknown tools fails OPEN rather than leaving the coordinator
+    # toolless. That fallback is right for a misconfiguration and exactly wrong for a
+    # deliberate empty list: without this early return, `coordinator_tools: []` would
+    # hand the coordinator every tool from every connected MCP, silently doing the
+    # opposite of what it says.
+    #
+    # Safe because the coordinator is never actually toolless: _build_team appends
+    # request_clarification/update_session_state unconditionally, and agno adds
+    # delegate_task_to_member(s) + get_member_information itself in
+    # agno/team/_tools.py (`_tools.append(delegate_task_func)`), independent of `tools=`.
+    if tool_names is not None and len(tool_names) == 0:
+        return []
+
     all_funcs: dict = {}
     for mcp in mcp_list:
         all_funcs.update(mcp.functions)

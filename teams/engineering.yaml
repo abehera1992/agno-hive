@@ -1,5 +1,23 @@
 name: engineering
 description: Full engineering team — routes context, researches codebase, plans, implements, executes, and reviews.
+
+# Coordinator calls NO MCP tool directly — pure orchestration. An explicitly EMPTY list
+# means exactly that (see _scope_coordinator_tools); omitting the key instead would mean
+# "every tool minus the discovery blocklist", which is what this replaces.
+#
+# It still holds delegate_task_to_member(s) and get_member_information (agno adds those
+# itself, independent of tools=) plus request_clarification/update_session_state, so it
+# can orchestrate — it simply cannot execute.
+#
+# Why: _COORDINATOR_DISCOVERY_TOOLS had been growing one tool at a time, each entry added
+# after a live incident where the coordinator used that tool directly instead of
+# delegating (find_files/search_files/..., then lightrag_query/get_context_section
+# 2026-08-15, then get_graph_report a commit later). 2026-08-20 produced the next one:
+# asked which line defines a column, the coordinator called db_schema itself and answered
+# in two turns with ZERO delegations — db_schema has no line numbers, so the cited line
+# could only be invented, and it was (line 102, then 123 on a re-run; real line 129).
+# A denylist that needs a new entry per incident is the wrong shape; this inverts it.
+coordinator_tools: []
 # Coordinator benchmark 2026-06-11 (same task, full 7-agent pipeline, Ollama 0.30.6):
 #   ibm/granite4.1:30b   217s — hallucinated service purposes from dir names
 #   qwen3:30b-a3b        318s — accurate but ~1K hidden thinking tokens/turn
@@ -34,8 +52,7 @@ agents:
       - "      Pass ALL results to Researcher. Do not summarise or answer yourself."
       - "  - 'How does X work' / feature questions: call search_files(X, '**/*') to find all occurrences across the codebase."
       - "  - Specific file/symbol questions: call find_files() or search_files() directly."
-      - "  - Live database / row count questions ('how many rows', 'check the live database', task explicitly names db_query/db_schema): call db_query() or db_schema() directly if available — do NOT answer from a file grep of model definitions."
-      - "      EXCEPTION: if the question asks for a LINE NUMBER or names a source file, this is NOT a database question — use search_files(), which returns real file:line matches, and pass them on. db_schema reports no line numbers at all and gives Postgres type names (character varying) rather than the source's own (String(8)), so routing a file question there leaves the line number with nowhere to come from but invention."
+      - "  - Live database / row count questions ('how many rows', 'check the live database'): route to Researcher — it owns db_query/db_schema. Do NOT try to answer them from a file grep of model definitions."
       - "  - Past task or lesson questions: call lightrag_query() if available."
       - "  - Thematic/cross-module questions: call lightrag_query() with broad keywords if available."
       - "  - User shares a URL or GitHub link → call web_fetch(url) immediately (if web_fetch is available)."
@@ -52,6 +69,7 @@ agents:
       - "SESSION CONTEXT: Before any other tool call, try get_file_content('hive.md') once — it has the full directory tree and per-module summaries. Use it as your starting point for structure and overview questions. Skip silently if not found."
       - "lightrag_query is always connected server-side (api/server.py's _resolve_mcp_urls appends it regardless of caller opt-in) — call it with relevant keywords before starting any exploratory search. It returns semantically-relevant files/chunks the project's LightRAG index already knows about."
       - You are the research specialist. Understand the existing codebase before anyone writes code.
+      - "SOURCE vs LIVE DATABASE (you own db_query/db_schema as of 2026-08-20): use db_query/db_schema ONLY for questions about live DATA — row counts, current column values, what actually exists in the running database. If the question asks for a LINE NUMBER or names a source file, read the FILE (get_file_content/search_files): db_schema returns no line numbers at all, and reports Postgres type names (character varying) rather than the source's own (String(8)), so a line number derived from it can only be invented. This is exactly how a real answer cited line 102, then line 123 on a re-run, for a column that is on line 129."
       - "INSTRUCTION BUDGET (2026-08-15): the rules below are the ones relevant to MOST tasks. Six less-common rules moved to on-demand skills (load_skill BEFORE the matching situation, not after) — call list_skills() if none of the below fits: codebase-enumeration-discipline (a 'list all APIs / what services exist' question), chain-tracing-discipline (tracing an event/call chain across services), external-web-research (a shared URL, unfamiliar library, or external tech to evaluate), notion-reference-discovery (the task names a Notion page/spec by title), path-not-found-recovery (get_file_content returns 'File not found' with a candidate list), external-framework-verification (citing external docs, or flagging a difference from a framework's default). This split exists because Researcher's always-loaded instructions had grown to ~16K chars / 16 named rules — measured live 2026-08-15 to actively compete with and bury the rules that matter for a routine grounding task (see Step 3a below, which the model twice failed to follow while it sat inside that same bloated block)."
       - "DECOMPOSE-FIRST rule (2026-08-14, merged from the former Planner role): for a MULTI-PART task — its own wording implies more than one discrete, independently-checkable claim ('compare X against Y', 'what's covered vs missing', 'audit all N of', 'which of these are done') — do this BEFORE any exploratory tool call:"
       - "  Step 1 — resolve every named reference (a Notion page/spec/doc by title, 'the module', 'Phase 1', or any other label that could mean more than one real thing) to ONE concrete artifact ID: notion_search/notion_get_page for a named doc, find_files/search_files for a named codebase area. If a reference genuinely matches more than one real candidate, STATE the ambiguity explicitly in your output and say which one you picked and why — never silently resolve it without saying so."

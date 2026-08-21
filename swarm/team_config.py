@@ -341,6 +341,16 @@ _DEFAULT_TOOL_GRANTS: set[tuple[str, str, str]] = {
     ("engineering", "Executor", "run_command"),
     ("engineering", "Executor", "run_docker"),
     ("engineering", "Executor", "run_shell"),
+    # db_query/db_schema granted 2026-08-20, together with engineering.yaml's
+    # `coordinator_tools: []`. They had been granted to NO role in ANY team (confirmed
+    # against the live data/model_routing.db), reaching the coordinator only because it
+    # received everything outside _COORDINATOR_DISCOVERY_TOOLS -- so a DB question was
+    # structurally un-delegatable and the coordinator always answered it alone.
+    # Researcher is the right owner: it already holds get_file_content/search_files, so
+    # it is the one agent that can choose between reading the source and querying the
+    # live DB with both options actually in hand.
+    ("engineering", "Researcher", "db_query"),
+    ("engineering", "Researcher", "db_schema"),
     ("engineering", "Researcher", "find_files"),
     ("engineering", "Researcher", "get_file_content"),
     ("engineering", "Researcher", "lightrag_query"),
