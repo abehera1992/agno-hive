@@ -1847,6 +1847,29 @@ _ENUM_TASK_RE = re.compile(
 )
 
 
+def _run_read_count(team, tool_names: set[str] = _READ_TOOLS) -> int:
+    """Real reads recorded anywhere in this run, INCLUDING inside delegated members.
+
+    Deliberately separate from _count_read_calls rather than folded into it, because
+    the two answer different questions and only one of them is run-scoped:
+
+      * _count_read_calls(result) is PER-ATTEMPT -- _more_grounded compares an original
+        draft against its retry, and a run-scoped total would be identical for both
+        (it includes each other's reads), silently breaking that comparison.
+      * this is PER-RUN, which is exactly right for "did this answer's team read
+        anything at all before asserting code facts".
+
+    Returns -1 when undeterminable (no team, or a team built by some path that never
+    attached the state), matching _count_read_calls' own convention so a caller can
+    tell "nothing was read" from "cannot say" -- the distinction that keeps a missing
+    signal from being read as evidence of fabrication.
+    """
+    state = getattr(team, "_read_state", None)
+    if not isinstance(state, dict) or "reads" not in state:
+        return -1
+    return sum(1 for r in state["reads"] if r.get("tool") in tool_names)
+
+
 def _count_read_calls(result, tool_names: set[str] = _READ_TOOLS) -> int:
     """Count evidence-gathering tool calls in a run. Returns -1 when undeterminable.
 
@@ -2549,7 +2572,15 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # Only fires when the answer actually makes a checkable claim (a backticked symbol or
     # a path:line). Conversational replies and "I could not determine" answers legitimately
     # need no reads and must not be retried.
-    reads = _count_read_calls(result)
+    # Both sources, because neither alone is sufficient (2026-08-21): result.messages
+    # holds only the COORDINATOR's own calls, and the run-scoped closure log is the only
+    # thing that sees a delegated member's. Once the coordinator is disarmed and
+    # everything is delegated, the first is always 0 while real reads are happening --
+    # measured live, with Researcher reading models.py (call 10/50) and this guard still
+    # reporting "ZERO read calls", then retrying a correct answer into a wrong one.
+    # max(), not sum(): a coordinator read appears in BOTH, and inflating the count would
+    # distort nothing here (this only tests == 0) but would mislead any future caller.
+    reads = max(_count_read_calls(result), _run_read_count(team))
     if reads == 0 and _CLAIMY_RE.search(content or "") and len(all_results) > 1:
         # Aggregate retry budget already spent -- surface rather than re-run again.
         return (
@@ -2614,7 +2645,9 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # a file grep or a guess" got answered entirely from a models.py grep, which also
     # fabricated "the items table does not exist" (it does, as inventory.items) -- the
     # live DB was never touched and the generic guard had nothing to catch.
-    db_reads = _count_read_calls(result, tool_names=_DB_TOOLS)
+    # Both sources -- a delegated member's db_query is invisible to result.messages.
+    db_reads = max(_count_read_calls(result, tool_names=_DB_TOOLS),
+                   _run_read_count(team, tool_names=_DB_TOOLS))
     if db_reads == 0 and _DB_TASK_RE.search(task or ""):
         print("[team] task explicitly required a live-DB check but made zero db_query/db_schema calls — retrying")
         try:
@@ -2637,7 +2670,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         # A DB question answered without ever touching the DB is the failure that motivated
         # this whole guard (2026-08-20: "the items table does not exist in the codebase" --
         # it exists as inventory.items, models.py:141-142 -- answered off a models.py grep).
-        if _count_read_calls(result, tool_names=_DB_TOOLS) == 0:
+        if max(_count_read_calls(result, tool_names=_DB_TOOLS),
+               _run_read_count(team, tool_names=_DB_TOOLS)) == 0:
             return (
                 f"{content}\n\n---\n**NOT VERIFIED AGAINST THE LIVE DATABASE — this task "
                 f"asked for a live-DB check, and neither the original attempt nor the "
@@ -2657,7 +2691,10 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # 2026-08-21 case verify_claims even printed the contradicting evidence
     # (FOUND Parties -> inventoryApi.ts:244) in its own report and the answer shipped
     # anyway, asserting the whole feature was missing.
-    enum_reads = _count_read_calls(result, tool_names=_ENUM_TOOLS)
+    # Both sources -- see the generic reads check above for why messages alone is 0
+    # once the coordinator delegates instead of reading.
+    enum_reads = max(_count_read_calls(result, tool_names=_ENUM_TOOLS),
+                     _run_read_count(team, tool_names=_ENUM_TOOLS))
     if enum_reads == 0 and _ENUM_TASK_RE.search(task or ""):
         print("[team] task asked for an enumeration but made zero list_directory/"
               "find_files calls — retrying with evidence required")
@@ -2681,7 +2718,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
 
         # Same retry-compliance rule as the two guards above: surface loudly rather than
         # silently accept an answer whose corrective retry ignored the correction.
-        if _count_read_calls(result, tool_names=_ENUM_TOOLS) == 0:
+        if max(_count_read_calls(result, tool_names=_ENUM_TOOLS),
+               _run_read_count(team, tool_names=_ENUM_TOOLS)) == 0:
             return (
                 f"{content}\n\n---\n**NOT VERIFIED BY A DIRECTORY LISTING — this task "
                 f"asked what a directory contains, and neither the original attempt nor "
@@ -2908,6 +2946,10 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"violation named above and nothing else."
         )
     retry_prompt = f"{task}\n\nIMPORTANT: " + " Also, ".join(instructions)
+    # Snapshotted so the retry's OWN reads can be measured as a delta (2026-08-21).
+    # The run-scoped log is cumulative, so comparing its total would always look like
+    # "the retry read something" -- the original attempt's reads are in there too.
+    _reads_before_retry = _run_read_count(team)
     try:
         corrected, retry = await _stream_team_run(
             team, retry_prompt, liveness_path=liveness_path,
@@ -2931,7 +2973,14 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # verified. Grep-checking proves a citation RESOLVES; it cannot prove the citation was
     # DERIVED from the file rather than recalled. Only the read count separates those two,
     # and the reader is the one who needs to know which they are holding.
-    citations_unread = bool(bad_citations) and _count_read_calls(retry) == 0
+    # Delta, not total: did THIS retry read, at any delegation depth. result.messages
+    # alone sees only the coordinator's own calls, so once everything is delegated it
+    # reports zero on a retry that genuinely re-read -- the same blindness that made the
+    # generic groundedness guard retry correct answers into wrong ones.
+    _retry_reads = _run_read_count(team)
+    _retry_delta = (_retry_reads - _reads_before_retry
+                    if _retry_reads >= 0 and _reads_before_retry >= 0 else -1)
+    citations_unread = bool(bad_citations) and max(_count_read_calls(retry), _retry_delta) == 0
     if citations_unread:
         print("[team] citation-correction retry made ZERO read calls — "
               "it answered from memory/estimation again instead of re-reading")
@@ -3688,6 +3737,23 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # tool_choice; consecutive_stub_count is the streak that decides when to.
     agent_objects: dict[str, object] = {}
     consecutive_stub_count: dict[str, int] = {}
+    # Closure-local record of every REAL (fresh, non-stubbed) read this run, at any
+    # delegation depth (2026-08-21). This hook instance is shared across the coordinator
+    # and every member, so its closure sees all of them -- which session_state does not.
+    #
+    # _record_read already writes the same facts into session_state["read_log"], and
+    # _count_read_calls already reads that specifically to catch delegated reads
+    # (2026-08-18). It does not work once ALL reads are delegated: agno hands a member
+    # `copy(run_context.session_state)` and merges it back afterwards
+    # (team/_default_tools.py:561,532), and a live trace showed Researcher reading
+    # models.py (call 10/50) while the guard still reported "ZERO read calls".
+    #
+    # Same escalation _make_delegation_log_hook already made for the same reason -- its
+    # docstring: "The closure sidesteps agno's session_state threading entirely, which is
+    # the same reason the duplicate-delegation gate abandoned session_state for its own
+    # local log." session_state writes are LEFT IN PLACE and unchanged; this is a second,
+    # independent source, so nothing that reads the old one regresses.
+    read_state: dict = {"reads": []}
 
     async def _read_cache_tool_hook(function_name, function, args, agent=None, run_context=None):
         if function_name in _DELEGATION_TOOL_NAMES:
@@ -3770,6 +3836,8 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
 
         if is_fresh_fetch:
             _record_read(run_context, function_name, args, agent_key, len(str(result)))
+            # Second, independent source -- survives delegation, unlike session_state.
+            read_state["reads"].append({"tool": function_name, "read_by": agent_key or "coordinator"})
 
         if (
             function_name == "get_file_content"
@@ -3801,6 +3869,10 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         consecutive_stub_count[norm_agent_key] = 0
         return result
 
+    # Exposed as an attribute rather than a second return value, so every existing
+    # caller and test keeps working untouched -- same convention _make_delegation_log_hook
+    # uses for its own closure-local counter.
+    _read_cache_tool_hook.state = read_state
     return _read_cache_tool_hook
 
 
@@ -4744,6 +4816,9 @@ def _build_team(
     # treats as "unknown" rather than "did not delegate" -- same -1-is-not-zero rule
     # _count_read_calls follows.
     team._delegation_state = delegation_log_hook.state
+    # Run-scoped read log, visible to _verified_answer's groundedness guards regardless
+    # of delegation depth (2026-08-21) -- see the hook's own read_state comment.
+    team._read_state = read_cache_hook.state
     return team
 
 
