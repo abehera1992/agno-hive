@@ -716,6 +716,41 @@ def _read_line(rel_path: str, lineno: int) -> str | None:
 _MD_HEADING_RE = re.compile(r"(?:^|\n)[ \t]{0,3}#{1,6}[ \t]")
 
 
+def _citation_bounds(answer: str, pos: int) -> tuple[int, int]:
+    """(start, end) of the region belonging to the citation at `pos` — bounded by its
+    neighbouring citations rather than by a fixed character count.
+
+    Both scans around a citation used a fixed window (_CONTENT_QUOTE_WINDOW forward,
+    _LABELED_LINE_WINDOW backward), and a character count cannot express the thing
+    that actually bounds a citation's subject matter: the next citation. Live case,
+    2026-08-21, on an answer that was CORRECT in every particular:
+
+        The `delete_party` function is defined in `.../parties_api.py` at line 194.
+        It performs a soft delete by setting `party.is_active = False` on line 205.
+
+    Line 194 really is `async def delete_party(`; line 205 really is
+    `party.is_active = False`. Both citations were reported MISMATCH:
+      * 194's forward quote-scan ran 200 chars and swallowed 205's quote, then
+        checked `party.is_active = False` against line 194.
+      * 205's backward anchor-scan skipped that same span (not a bare identifier)
+        and kept walking back to `delete_party`, anchoring 205 to the function.
+
+    Clamping both to the neighbouring citation fixes both, because it encodes the
+    real rule: prose after the next citation begins is about that citation, and
+    prose before the previous one is about the previous one. This matters more than
+    a tuning change — a checker that flags correct answers gets ignored, taking its
+    true positives with it.
+    """
+    lo, hi = 0, len(answer)
+    for rx in (_FILE_LINE_RE, _LABELED_LINE_RE):
+        for m in rx.finditer(answer):
+            if m.end() <= pos:
+                lo = max(lo, m.end())        # nearest citation ending before this one
+            elif m.start() > pos:
+                hi = min(hi, m.start())      # nearest citation starting after it
+    return lo, hi
+
+
 def _find_nearby_quote(answer: str, pos: int) -> str | None:
     """The quoted content, if any, that a file:line citation is claiming lives there.
 
@@ -743,7 +778,10 @@ def _find_nearby_quote(answer: str, pos: int) -> str | None:
     """
     if answer[pos:pos + 1] == "`":
         return None
-    window = answer[pos: pos + _CONTENT_QUOTE_WINDOW]
+    # Clamped to the NEXT citation as well as the char window (2026-08-21) -- see
+    # _citation_bounds. The char cap still applies; whichever is tighter wins.
+    _, hi = _citation_bounds(answer, pos)
+    window = answer[pos: min(pos + _CONTENT_QUOTE_WINDOW, hi)]
     m = _BACKTICK_RE.search(window)
     if not m:
         return None
@@ -752,6 +790,20 @@ def _find_nearby_quote(answer: str, pos: int) -> str | None:
     quoted = m.group(1).strip()
     if len(quoted) < 4 or quoted.lower() in _NOISE or _PATHLIKE_RE.match(quoted):
         return None
+    # A quote can precede its OWN citation ("...setting `x = False` on line 205"),
+    # so being inside this citation's forward window is not enough to own it: the
+    # clamp above cannot help when the span sits before the next line number rather
+    # than after it. Whichever citation is NEARER owns the span (2026-08-21).
+    #
+    # This is the half of the live T3 false positive the boundary clamp alone does
+    # not fix. Measured on that answer: citation 194 sits ~38 chars before the span,
+    # citation 205 only ~4 chars after it -- so the span is 205's, and pairing it
+    # with 194 reported MISMATCH on a citation that was exactly right.
+    if hi < len(answer):
+        gap_to_next = hi - (pos + m.end())
+        gap_from_this = m.start()
+        if gap_to_next < gap_from_this:
+            return None
     return quoted
 
 
@@ -770,7 +822,12 @@ def _find_anchor_symbol(answer: str, pos: int) -> str | None:
     else, and an identifier borrowed from there would anchor the citation to a claim it
     never made.
     """
-    start = max(0, pos - _LABELED_LINE_WINDOW)
+    # Clamped to the PREVIOUS citation as well as the char window (2026-08-21) -- see
+    # _citation_bounds. Without this, a citation whose own subject is a non-identifier
+    # span (`party.is_active = False`) walks past it and anchors to whatever identifier
+    # the PRIOR citation was about.
+    lo, _ = _citation_bounds(answer, pos)
+    start = max(0, pos - _LABELED_LINE_WINDOW, lo)
     window = answer[start:pos]
     heading = None
     for h in _MD_HEADING_RE.finditer(window):

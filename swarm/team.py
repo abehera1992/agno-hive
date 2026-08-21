@@ -1580,6 +1580,31 @@ def _pick_hive_mcp(mcp_by_url: dict | None, required_tool: str = "verify_claims"
     return None, None
 
 
+_MODEL_DIRECTED_VERDICT_RE = re.compile(
+    r"\s*Fix the answer before returning it[^\n]*", re.IGNORECASE
+)
+
+
+def _reader_facing_report(report: str) -> str:
+    """Strip the model-directed imperative from a verify_claims report before it is
+    shown to a human.
+
+    The report has two audiences. During the correction retry the model reads it and
+    "Fix the answer before returning it — a NOT FOUND symbol or a BAD citation is
+    fabrication, not a near miss" is exactly the right thing to say. When the retry
+    budget is gone the SAME text is appended to the final answer (see the two call
+    sites below, deliberately: "surface rather than hide" — the reader does need to
+    know which claims are unsupported). There it reads as an instruction the pipeline
+    was given and visibly ignored, which is both confusing and worse than the truth:
+    the check ran, it found something, and there was no retry left to spend.
+
+    Observed twice in one T1-T13 re-run, 2026-08-21. Only that one sentence is
+    removed — every finding line, and the factual half of the VERDICT, stays exactly
+    as it was, because those are what the reader actually needs.
+    """
+    return _MODEL_DIRECTED_VERDICT_RE.sub("", report).rstrip()
+
+
 async def _sync_tool_registry(mcp_list: list, skill_catalog: list[dict] | None) -> None:
     """Keep tool_registry/skill_registry current from this run's own live MCP
     enumeration — see team_config.sync_registry_from_live() for why a swarm run
@@ -2620,7 +2645,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         return (f"{content}\n\n---\n**Unverified claims flagged automatically "
                 f"(these could not be found in the repository, and this run's one "
                 f"correction retry was already used by an earlier check):**\n"
-                f"```\n{report}\n```"
+                f"```\n{_reader_facing_report(report)}\n```"
                 + _summarize_actual_writes(*all_results))
     instructions = []
     if missing_symbols:
@@ -2719,7 +2744,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     if still_bad:
         # Surface rather than hide: the reader needs to know which claims are unsupported.
         return (f"{corrected}\n\n---\n**Unverified claims flagged automatically "
-                f"(these could not be found in the repository):**\n```\n{report2}\n```"
+                f"(these could not be found in the repository):**\n```\n{_reader_facing_report(report2)}\n```"
                 + unread_note
                 + _summarize_actual_writes(*all_results))
     return corrected + unread_note + _summarize_actual_writes(*all_results)
@@ -2850,6 +2875,34 @@ _CACHEABLE_READ_TOOLS = {
     # run (a web page's content or a search result set does not change
     # mid-task), so the same duplicate-serve escalation applies cleanly.
     "web_search", "web_fetch",
+    # The zero/low-argument catalog + context tools, added 2026-08-21 -- the FOURTH
+    # and FIFTH instances of this identical pattern, both caught in one T1-T13 re-run:
+    #
+    #   T7 ("does API/loyalty-service exist?"): the coordinator called list_skills({})
+    #   about TWENTY times, ~1/second, byte-identical empty args, exhausting its
+    #   tool_call_limit in ~22s. Past that agno's own run_function_calls silently
+    #   rejects further calls with zero stream events, so the model generated
+    #   contentless turns for 300s until the liveness auto-kill fired. It never once
+    #   looked for the directory it was asked about.
+    #
+    #   T9: an engineering run cycled get_project_context({}) -> get_file_content(
+    #   docs/frontend.md, offset 232, limit 10) -> get_project_context({}) three times
+    #   identically. get_file_content was already cached and correctly stubbed;
+    #   get_project_context was not, so the loop kept its footing on the uncached half.
+    #
+    # A no-argument tool is the WORST case for this failure, not an edge case: every
+    # call is trivially byte-identical, so a model that loses track of what it already
+    # has can re-issue it indefinitely at zero prompt cost. All five here are read-only
+    # and fixed for the life of a run -- a skill's text, the project context blob, a
+    # DOCS.md section and the recent-git-activity list do not change mid-task.
+    #
+    # Deliberately NOT added: list_processes/check_port/get_env_info (genuinely change
+    # between calls, so a repeat is legitimate), the git_* family (git_status changes
+    # the moment any write lands), and db_query/db_schema (a migration mid-run would
+    # make a cached answer wrong). Caching those would trade a repetition loop for a
+    # stale answer, which is the worse failure.
+    "list_skills", "load_skill", "get_project_context",
+    "get_context_section", "list_recent_files",
 }
 
 # The network-only cache below (skip the hive-mcp round-trip, still hand back the
