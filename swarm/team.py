@@ -142,6 +142,20 @@ def _model_verify_claims_unavailable_result() -> str:
 # harmful. Only list names the server actually serves and agents must not call.
 _PROJECT_MCP_EXCLUDE_TOOLS = [
     "agno_run", "agno_list_teams",
+    # graphify's graph.json is Claude Code/Cline's stack, not hive's — hive's
+    # equivalent is lightrag_query (Qdrant/AGE), and keeping the two separate is a
+    # standing project decision. Both tools remain REGISTERED on project MCP for the
+    # clients that should use them; this excludes them from the swarm only, which is
+    # exactly what this list is for.
+    #
+    # Not merely redundant-with-lightrag_query — actively harmful. Live, 2026-08-21:
+    # an agent asked to call search_knowledge_graph('auth guards') reported "content
+    # retrieved successfully" with a detailed guard chain and a redirect path. The
+    # real call returns matched_nodes: 0 (matching is substring, not semantic, so any
+    # multi-word natural-language query misses) and carries no edges at all, so the
+    # answer could not have come from the tool. A tool that returns an empty result
+    # for the way a model naturally queries it is a fabrication generator.
+    "search_knowledge_graph", "get_graph_report",
 ]
 
 _COORDINATOR_INSTRUCTIONS = [

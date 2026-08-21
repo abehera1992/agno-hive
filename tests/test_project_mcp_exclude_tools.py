@@ -58,6 +58,32 @@ def test_the_recursion_guards_are_still_excluded():
     assert "agno_list_teams" in team._PROJECT_MCP_EXCLUDE_TOOLS
 
 
+def test_graphify_tools_are_excluded_from_the_swarm():
+    """Stack separation (2026-08-21): graphify's graph.json belongs to Claude
+    Code/Cline; hive's equivalent is lightrag_query. Both tools stay REGISTERED
+    on project MCP for the clients that should use them — this is the correct use
+    of the exclude list, and the exact inverse of the memory_search mistake above,
+    where names were excluded AFTER being deleted from the server."""
+    assert "search_knowledge_graph" in team._PROJECT_MCP_EXCLUDE_TOOLS
+    assert "get_graph_report" in team._PROJECT_MCP_EXCLUDE_TOOLS
+
+
+def test_the_graphify_exclusions_name_tools_the_server_still_has():
+    """The distinction that decides whether an exclusion is safe or catastrophic:
+    these must remain in the served set, or excluding them takes project MCP to 0
+    tools exactly as memory_search did."""
+    assert {"search_knowledge_graph", "get_graph_report"} <= _PROJECT_MCP_TOOLS
+
+
+def test_project_mcp_still_serves_the_two_tools_hive_should_use():
+    """Excluding four of six leaves get_context_section and list_recent_files.
+    If this ever reaches zero, agno drops the whole server and hive silently
+    loses project MCP again."""
+    remaining = _PROJECT_MCP_TOOLS - set(team._PROJECT_MCP_EXCLUDE_TOOLS)
+    assert remaining == {"get_context_section", "list_recent_files"}, remaining
+    assert remaining, "excluding every served tool returns 0 tools for the server"
+
+
 def test_excluding_everything_would_be_caught():
     """The guard is only useful if it can fail — proves it is not vacuously true."""
     unknown = {"a_tool_that_does_not_exist"} - _PROJECT_MCP_TOOLS
