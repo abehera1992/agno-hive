@@ -20,7 +20,7 @@ the db-evidence guard exactly.
 """
 import pytest
 
-from swarm.team import _ENUM_TASK_RE, _ENUM_TOOLS
+from swarm.team import _ENUM_TOOLS, _is_enumeration_task
 
 
 # ── trigger: the real failing prompts must match ──────────────────────────────
@@ -34,7 +34,7 @@ from swarm.team import _ENUM_TASK_RE, _ENUM_TOOLS
     "what is in the directory API/inventory-service/router/",
 ])
 def test_real_enumeration_prompts_trigger(task):
-    if not _ENUM_TASK_RE.search(task):
+    if not _is_enumeration_task(task):
         pytest.fail(f"missed an enumeration prompt: {task!r}")
 
 
@@ -49,7 +49,7 @@ def test_real_enumeration_prompts_trigger(task):
 def test_non_enumeration_prompts_do_not_trigger(task):
     """Narrowness matters as much as coverage. Every one of these PASSED the battery
     on its own path; a false positive here spends a whole extra pipeline turn."""
-    assert not _ENUM_TASK_RE.search(task), f"false positive on: {task!r}"
+    assert not _is_enumeration_task(task), f"false positive on: {task!r}"
 
 
 # ── the tool set ──────────────────────────────────────────────────────────────
@@ -88,7 +88,7 @@ def test_the_guard_mirrors_the_db_evidence_guard():
     src = inspect.getsource(team._verified_answer)
     guard = src[src.index("Enumeration-evidence check"):]
 
-    assert "_ENUM_TASK_RE.search" in guard
+    assert "_is_enumeration_task(task)" in guard
     assert "_adopt_retry(\"enumeration\"" in guard
     assert "NOT VERIFIED BY A DIRECTORY LISTING" in guard
 
@@ -104,3 +104,38 @@ def test_the_disclaimer_names_the_real_measured_error():
 
     assert "recalled rather than" in src
     assert "6-8x" in src
+
+
+# ── file-contents questions must NOT demand a directory listing ───────────────
+
+@pytest.mark.parametrize("task", [
+    "How many @router endpoints are defined in API/inventory-service/router/uom_api.py?",
+    "list every function defined in swarm/team.py",
+    "how many tests are in tests/test_verify.py",
+])
+def test_a_file_contents_question_is_not_an_enumeration_task(task):
+    """Live false positive, 2026-08-21. The uom_api.py prompt matched on "how many"
+    and the guard demanded list_directory/find_files evidence — but this asks what is
+    IN A FILE, where get_file_content is correct and sufficient and a directory listing
+    proves nothing. A correct answer (3 endpoints, exact methods and paths, read from
+    the file) shipped carrying "NOT VERIFIED BY A DIRECTORY LISTING".
+
+    Not merely noisy: the guard also forces a RETRY, so a false positive spends a
+    pipeline turn and risks the documented case where an un-grounded re-run overwrites
+    a correct answer."""
+    assert not _is_enumeration_task(task)
+
+
+def test_a_directory_question_still_counts_even_when_a_filename_appears():
+    """T11's real shape — a single-file existence check AND a directory enumeration in
+    one prompt. The filename must not suppress the directory half."""
+    task = ("Does the file API/inventory-service/router/gst_api.py exist? If no, say so "
+            "plainly and name what router files DO exist in that directory.")
+    assert _is_enumeration_task(task)
+
+
+def test_a_bare_extension_mention_is_not_a_file_target():
+    """"report the EXACT number of .py files" names no file — requiring a name part
+    before the dot is what keeps this a directory question."""
+    task = "Call list_directory on API/inventory-service/router/ and report the EXACT number of .py files"
+    assert _is_enumeration_task(task)

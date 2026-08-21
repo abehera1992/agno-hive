@@ -1823,6 +1823,40 @@ _ENUM_TASK_RE = re.compile(
     r"|\bwhat\b[^.]{0,40}\b(?:files?|modules?|routers?|services?)\b[^.]{0,25}\bexist\b",
     re.IGNORECASE,
 )
+# A concrete FILE the task names -- needs a name part before the dot, so a bare ".py
+# files" mention is not mistaken for a path.
+_FILE_TARGET_RE = re.compile(r"\b[\w./\\-]+\.(?:py|ts|tsx|js|jsx|md|ya?ml|json|scss|sql|toml)\b")
+# Words that mean the question really is about a DIRECTORY, even when a filename also
+# appears somewhere in the prompt.
+_DIRECTORY_WORD_RE = re.compile(r"\b(?:director(?:y|ies)|folder|list_directory)\b|/\s*(?:$|and\b)", re.IGNORECASE)
+
+
+def _is_enumeration_task(task: str | None) -> bool:
+    """Does this task require a DIRECTORY listing as evidence?
+
+    Narrowed 2026-08-21 after a live false positive. "How many @router endpoints are
+    defined in API/inventory-service/router/uom_api.py?" matched _ENUM_TASK_RE on "how
+    many ... " and the guard then demanded list_directory/find_files evidence -- but
+    that is a question about a FILE's CONTENTS, where get_file_content is the correct
+    and sufficient tool and a directory listing proves nothing. A correct answer (3
+    endpoints, exact methods and paths, read straight from the file) shipped carrying
+    "NOT VERIFIED BY A DIRECTORY LISTING".
+
+    That matters beyond the noise: this guard also forces a RETRY, so a false positive
+    spends a pipeline turn and risks the documented failure where an un-grounded re-run
+    overwrites a correct answer.
+
+    Rule: an enumeration-shaped task that names a concrete FILE and never mentions a
+    directory is a file-contents question, not a listing question. A task that mentions
+    a directory stays in scope even if a filename also appears -- T11 ("does gst_api.py
+    exist? ... name what router files DO exist in that directory") is exactly that shape
+    and must still be checked.
+    """
+    if not task or not _ENUM_TASK_RE.search(task):
+        return False
+    if _FILE_TARGET_RE.search(task) and not _DIRECTORY_WORD_RE.search(task):
+        return False
+    return True
 
 
 def _run_read_count(team, tool_names: set[str] = _READ_TOOLS) -> int:
@@ -2673,7 +2707,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # once the coordinator delegates instead of reading.
     enum_reads = max(_count_read_calls(result, tool_names=_ENUM_TOOLS),
                      _run_read_count(team, tool_names=_ENUM_TOOLS))
-    if enum_reads == 0 and _ENUM_TASK_RE.search(task or ""):
+    if enum_reads == 0 and _is_enumeration_task(task):
         print("[team] task asked for an enumeration but made zero list_directory/"
               "find_files calls — retrying with evidence required")
         try:
