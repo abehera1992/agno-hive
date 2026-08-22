@@ -1859,6 +1859,54 @@ def _is_enumeration_task(task: str | None) -> bool:
     return True
 
 
+# The coordinator narrating that it is about to call a tool it does not have. This is a
+# reliable, greppable signal and it appears VERBATIM before the loop starts -- measured
+# 2026-08-21, where the coordinator emitted "the environment shows that list_directory is
+# available. I will now call list_directory directly on the requested path" four times in
+# a row and then leaked a raw <tool_call> tag, never once delegating.
+_NARRATED_TOOL_INTENT_RE = re.compile(
+    r"\b(?:I(?:'ll| will| am going to)?\s+(?:now\s+)?(?:call|use|invoke|run)|"
+    r"let me\s+(?:now\s+)?(?:call|use|invoke|run)|"
+    r"next(?:,)?\s+I(?:'ll| will)\s+(?:call|use|invoke|run))\b[^.\n]{0,40}?"
+    r"\b(find_files|search_files|list_directory_tree|list_directory|"
+    r"search_knowledge_graph|lightrag_query|get_context_section|get_graph_report|"
+    r"web_search|web_fetch)\b",
+    re.IGNORECASE,
+)
+
+
+def _narrated_unreachable_tool(content: str | None) -> str | None:
+    """The blocked tool the coordinator says it is about to call, if any.
+
+    Only reports a tool that is actually on _COORDINATOR_DISCOVERY_TOOLS -- narrating
+    a tool it CAN call is just normal prose and must not trigger anything.
+    """
+    if not content:
+        return None
+    m = _NARRATED_TOOL_INTENT_RE.search(content)
+    if not m:
+        return None
+    tool = m.group(m.lastindex)
+    return tool if tool in _COORDINATOR_DISCOVERY_TOOLS else None
+
+
+def _member_holding(team, tool_name: str) -> tuple[str, str] | None:
+    """(member_id, display name) of a member that actually holds `tool_name`.
+
+    Read off the live team rather than any static map, so it cannot drift from what
+    the members were really built with. Returns None when nothing holds it, in which
+    case the caller must NOT invent a delegation target -- naming a member that does
+    not have the tool would send the coordinator into the exact "member resolution
+    failure" spiral documented for _member_id (2026-08-15).
+    """
+    for m in getattr(team, "members", None) or []:
+        for t in getattr(m, "tools", None) or []:
+            if getattr(t, "name", None) == tool_name:
+                name = getattr(m, "name", "") or ""
+                return _member_id(name), name
+    return None
+
+
 def _run_read_count(team, tool_names: set[str] = _READ_TOOLS) -> int:
     """Real reads recorded anywhere in this run, INCLUDING inside delegated members.
 
@@ -2692,6 +2740,48 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"the running database, and may not reflect its actual current state.**"
                 + _summarize_actual_writes(*all_results)
             )
+
+    # Narrated-unreachable-tool check (2026-08-21). Direction 2 of the "removing a tool
+    # does not induce delegation" finding: the coordinator reliably ANNOUNCES the tool it
+    # wants before it starts looping, so that announcement is an intercept point nothing
+    # else uses.
+    #
+    # Measured: "the environment shows that list_directory is available. I will now call
+    # list_directory directly on the requested path" -- four times verbatim, then a raw
+    # <tool_call> tag, zero delegations. The model knew the tool and the path; what it
+    # never did was route through a member. It is not ignorance either: the roster
+    # preamble names list_directory against ContextRouter/Researcher/Coder explicitly.
+    #
+    # So the retry does the one thing the surface restriction could not: it names the
+    # member id to call and the exact delegate_task_to_member shape to use. Removing the
+    # tool told the model what it CANNOT do; this tells it what to do instead.
+    narrated = _narrated_unreachable_tool(content)
+    if narrated and len(all_results) == 1:
+        holder = _member_holding(team, narrated)
+        if holder is not None:
+            member_id, member_name = holder
+            print(f"[team] coordinator narrated an unreachable tool ({narrated}) — "
+                  f"retrying with an explicit delegation to {member_id}")
+            try:
+                retried, retry = await _stream_team_run(
+                    team,
+                    f"{task}\n\n"
+                    f"IMPORTANT: a previous attempt said it would call `{narrated}` "
+                    f"directly and then never did — you do NOT have that tool, which is "
+                    f"why the attempt stalled and repeated itself. `{member_name}` DOES "
+                    f"have it. Call exactly this, once, as your FIRST action:\n"
+                    f"    delegate_task_to_member(member_id='{member_id}', "
+                    f"task='call {narrated} on the exact path in the question and return "
+                    f"its raw output verbatim')\n"
+                    f"Then answer using ONLY what that member returns. Do not attempt "
+                    f"`{narrated}` yourself again, and do not substitute reading "
+                    f"documentation for it — that is what produced the wrong answer.",
+                    liveness_path=liveness_path,
+                )
+                all_results.append(retry)
+                content, result = _adopt_retry("narrated-tool", content, result, retried, retry)
+            except Exception as exc:
+                print(f"[team] narrated-tool retry failed: {exc}")
 
     # Enumeration-evidence check (2026-08-21). Exact same shape as the db-evidence guard
     # above, for the same reason on a different axis: a tool hook cannot catch this,
