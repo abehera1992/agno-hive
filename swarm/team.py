@@ -2063,9 +2063,32 @@ def _run_read_count(team, tool_names: set[str] = _READ_TOOLS) -> int:
     signal from being read as evidence of fabrication.
     """
     state = getattr(team, "_read_state", None)
-    if not isinstance(state, dict) or "reads" not in state:
+    from_cache = (
+        sum(1 for r in state["reads"] if r.get("tool") in tool_names)
+        if isinstance(state, dict) and "reads" in state else -1
+    )
+    # Second source (2026-08-22). The read log above is written by
+    # _make_read_cache_tool_hook, which returns early for anything outside
+    # _CACHEABLE_READ_TOOLS -- so db_query/db_schema/the git readers, all of them in
+    # _READ_TOOLS, are never recorded there. Live consequence: a Researcher that
+    # grounded an answer entirely in the database (db_schema, then db_query returning
+    # the correct count of 0) had that answer stamped "UNGROUNDED -- neither the
+    # original attempt nor the corrective retry opened a single file this run". The
+    # answer was right and the banner slandered it, which erodes the banner everywhere
+    # it IS deserved. Same member-read blindness fixed in _more_grounded earlier the
+    # same day, in a second place that was missed.
+    #
+    # _tool_outcomes is recorded off the stream events for EVERY tool, so it sees what
+    # the cache hook cannot. Successful calls only: a failed read is an attempt, not
+    # evidence, and must not count toward "did this answer ground itself".
+    outcomes = getattr(team, "_tool_outcomes", None)
+    from_stream = (
+        sum(v.get("ok", 0) for name, v in outcomes.items() if name in tool_names)
+        if isinstance(outcomes, dict) else -1
+    )
+    if from_cache < 0 and from_stream < 0:
         return -1
-    return sum(1 for r in state["reads"] if r.get("tool") in tool_names)
+    return max(from_cache, from_stream)
 
 
 def _count_read_calls(result, tool_names: set[str] = _READ_TOOLS) -> int:
