@@ -861,6 +861,25 @@ _COORDINATOR_DISCOVERY_TOOLS = {
     "find_files", "search_files", "list_directory", "list_directory_tree",
     "search_knowledge_graph", "web_search", "web_fetch",
     "lightrag_query", "get_context_section",
+    # search_files_batch / count_matches / get_files_batch added 2026-08-21 -- holes,
+    # not new tools. search_files was blocked from the start; search_files_batch does
+    # the SAME job across several globs in one call and postdates this list, so it was
+    # never added. count_matches and get_files_batch are the same oversight.
+    #
+    # Why it mattered more than a missing entry usually would: the coordinator could
+    # still search (search_files_batch), count (count_matches) and read
+    # (get_file_content, get_files_batch), so it never entered delegation mode at all.
+    # The ONE thing it genuinely could not do was list a directory -- and rather than
+    # delegate for that single tool, it improvised by browsing docs and answering from
+    # recall. Measured live: asked to list a 24-file directory it read eight unrelated
+    # docs/*.md files and answered "1 file", then "3 files", never once calling
+    # list_directory, which returns all 24 correctly when called directly.
+    #
+    # Corroborated by a separate trace: a run doing its own discovery called
+    # search_files_batch({'pattern': 'bulk_generate|create_vouchers|...'}) directly --
+    # exactly the behaviour blocking search_files was meant to prevent, straight through
+    # the hole beside it.
+    "search_files_batch", "count_matches", "get_files_batch",
     # get_graph_report added 2026-08-15, same live validation pass -- missed when
     # get_context_section was added right above it. Same graphify/knowledge-graph
     # reference-lookup category; live-observed the coordinator calling it directly
