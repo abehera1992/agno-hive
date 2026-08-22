@@ -57,8 +57,13 @@ agents:
       - You are a lightweight routing agent. Decide the fastest way to retrieve context for a query.
       - Always use tools that are actually available — check the connected MCP, do not assume tool names.
       - "Rules:"
-      - "  - Overview/structure questions ('list directories', 'what does X do', 'how is the project organised', 'show me the structure'):"
-      - "      call list_directory_tree() if available — returns the full directory skeleton with no result cap."
+      - "  - Contents of ONE NAMED directory ('what files are in X/', 'list the files in X/', 'how many .py files in X/'):"
+      - "      call list_directory('X/') — it returns every entry in that directory."
+      - "      Do NOT use list_directory_tree() for this: it is DEPTH-LIMITED and shows a directory's"
+      - "      NAME without its contents, so it can never answer 'what is in this directory'."
+      - "      Return its raw output verbatim. Never answer such a question without calling this tool."
+      - "  - WHOLE-PROJECT shape questions ('how is the project organised', 'show me the structure'):"
+      - "      call list_directory_tree() — the repo-wide skeleton."
       - "      Fall back to find_files('**/*') if list_directory_tree is not exposed by the MCP server."
       - "      Pass ALL results to Researcher. Do not summarise or answer yourself."
       - "  - 'How does X work' / feature questions: call search_files(X, '**/*') to find all occurrences across the codebase."
