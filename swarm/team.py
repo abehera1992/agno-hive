@@ -3072,6 +3072,27 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             + _summarize_actual_writes(*all_results)
         )
 
+    # Under-answered enumeration check (2026-08-22). See _under_answered_enumeration
+    # for why this is its own guard rather than a case of the count check above: the
+    # facts are right, the reads happened, nothing is invented -- the answer just does
+    # not show the list it was asked for, which makes it unverifiable without redoing
+    # the work. Disclosure, not a retry: the enumeration is already sitting in the run's
+    # own tool output, so the reader can be pointed at it for the cost of one line
+    # instead of a 60-100s re-run.
+    missing_enum = _under_answered_enumeration(content, task, getattr(team, "_listings", None))
+    if missing_enum is not None:
+        print(f"[team] enumeration task answered without a list "
+              f"({missing_enum} items were available) — flagging", flush=True)
+        return (
+            f"{content}\n\n---\n**ASKED FOR A LIST, ANSWERED WITHOUT ONE — this task "
+            f"asked for an enumeration and a directory listing in this run returned "
+            f"{missing_enum} entries, but the answer above shows no itemised list. The "
+            f"underlying facts may well be correct; they simply cannot be checked "
+            f"without redoing the work. Ask again for the items themselves if you need "
+            f"to verify them.**"
+            + _summarize_actual_writes(*all_results)
+        )
+
     # Capability-claim check (2026-08-22). Sibling of the bare-absence search guard
     # above, on infrastructure instead of symbols: an answer that declares a whole
     # capability unavailable, where the run's own tool record says otherwise. See
@@ -4781,6 +4802,7 @@ def _make_duplicate_delegation_gate_hook():
     """
     log: list[dict] = []
     issued_job_ids: set[str] = set()
+    repeats: dict[str, int] = {}   # consecutive exact-duplicate delegations per member
 
     async def _duplicate_delegation_gate_hook(function_name, function, args,
                                               run_context=None, team=None):
@@ -4871,6 +4893,43 @@ def _make_duplicate_delegation_gate_hook():
             ]
             for entry in prior_entries:
                 if _normalize_delegation_task((entry.get("args") or {}).get("task")) == task_text:
+                    # Serve the result, don't scold (2026-08-22). The old message said
+                    # "use that result instead of delegating it again" and did NOT
+                    # include the result -- unfollowable if the coordinator has lost it
+                    # from context, so the only move left is to ask again. Measured: 54
+                    # identical delegations to 'researcher' for the same invented path,
+                    # 54 identical refusals, run killed by the liveness watchdog after
+                    # 13 minutes with nothing to show. The gate was advisory; it
+                    # returned a string and hoped.
+                    #
+                    # Escalation mirrors the duplicate-READ cache's proven shape (serve,
+                    # then stub, then force): hand back the real result first, warn on
+                    # the second, and on the third stop asking and make the coordinator
+                    # answer with what it has.
+                    repeats[member_id] = repeats.get(member_id, 0) + 1
+                    n = repeats[member_id]
+                    prior = (getattr(team, "_member_results", None) or {}).get(member_id)
+                    print(f"[team] duplicate delegation to {member_id!r} (#{n}) — "
+                          f"{'serving prior result' if prior else 'no prior result captured'}",
+                          flush=True)
+                    if n >= 3:
+                        _force_text_only(None, team=team)
+                        return (
+                            f"STOP: you have now asked {member_id!r} for this same task "
+                            f"{n} times and been given the answer each time. No further "
+                            f"delegation will run. Write your final answer now using what "
+                            f"you already have."
+                            + (f"\n\nThe result, once more:\n{prior}" if prior else "")
+                        )
+                    if prior:
+                        tail = ("" if n == 1 else
+                                "\n\nThis is the last time this will be served — use it "
+                                "and answer; asking again will not run anything.")
+                        return (
+                            f"ALREADY DONE — {member_id!r} was given this exact task "
+                            f"earlier this run and returned:\n\n{prior}\n\n"
+                            f"Use this. Do not delegate it again." + tail
+                        )
                     return (
                         f"REDIRECTED: this exact task was already delegated to {member_id!r} "
                         f"earlier this run — use that result instead of delegating it again. "
@@ -5387,6 +5446,13 @@ _TOOL_END_EVENT_TYPES = {"TeamToolCallCompleted", "ToolCallCompleted"}
 # auto-kill eventually cleaned it up 5+ minutes later. See _BackendRunError's
 # own comment for the fix this classification enables.
 _ERROR_EVENT_TYPES = {"TeamRunError", "RunError"}
+# A MEMBER finishing its delegated run, carrying that member's full answer in
+# .content -- deliberately NOT "TeamRunCompleted", which is the coordinator's own
+# final answer and must never be mistaken for a member result. Previously fell into
+# the unclassified bucket, which is why the duplicate-delegation gate had nothing to
+# hand back: it could tell the coordinator "use that result instead of delegating it
+# again" but had no copy of the result to give. See _make_duplicate_delegation_gate_hook.
+_MEMBER_RESULT_EVENT_TYPES = {"RunCompleted"}
 
 
 class _BackendRunError(RuntimeError):
@@ -5476,6 +5542,16 @@ def _stream_event_to_chunk(event) -> str | dict | None:
             "listing": (_summarize_listing(result)
                         if tool.tool_name == "list_directory" else None),
         }
+    if event_type in _MEMBER_RESULT_EVENT_TYPES:
+        content = getattr(event, "content", None)
+        agent_name = getattr(event, "agent_name", "") or ""
+        if isinstance(content, str) and content.strip() and agent_name:
+            return {
+                "__member_result__": True,
+                "agent_name": agent_name,
+                "content": content,
+            }
+        return None
     if event_type in _ERROR_EVENT_TYPES:
         message = getattr(event, "content", None)
         return {
@@ -6068,6 +6144,13 @@ def _record_stream_artifacts(team, out: dict) -> None:
     """
     if not isinstance(out, dict):
         return
+    if out.get("__member_result__"):
+        # Keyed by _member_key so 'context-router' and 'contextrouter' land in one
+        # bucket, the same normalisation the delegation gate matches on.
+        if not isinstance(getattr(team, "_member_results", None), dict):
+            team._member_results = {}
+        team._member_results[_member_key(out.get("agent_name", ""))] = out["content"]
+        return
     if out.get("listing"):
         if not isinstance(getattr(team, "_listings", None), list):
             team._listings = []
@@ -6163,6 +6246,35 @@ def _unsupported_capability_claim(content: str, outcomes: dict | None):
         if not err:
             return family, "untried", sorted(tools)
     return None
+
+
+_LIST_LINE_RE = re.compile(r"^\s*(?:[-*+•]|\d{1,3}[.)])\s+\S", re.MULTILINE)
+
+
+def _under_answered_enumeration(content: str, task: str, listings: list | None) -> int | None:
+    """An answer that was asked to enumerate and returned only a conclusion.
+
+    Returns the number of items the run demonstrably had in hand, or None.
+
+    Not fabrication -- and that is exactly why it needs its own check. In T2, T6 and
+    T13 every underlying fact checked out by hand: T2's six endpoints are real, T13's
+    four voucher flows and two GST tables verified exactly, T6's count of 24 was right.
+    What each omitted was the enumeration it was asked for, which leaves the conclusion
+    unverifiable without redoing the work. No existing guard covers this: the reads
+    happened, the count (where given) was right, nothing was invented.
+
+    The false positive to avoid is a genuine one- or two-item answer. Gating on a tool
+    having actually RETURNED >= 3 items this run is what prevents it -- the guard only
+    fires when the run can prove there was more to show than the answer shows.
+    """
+    if not content or not _is_enumeration_task(task):
+        return None
+    available = max((l.get("items", 0) for l in (listings or [])), default=0)
+    if available < 3:
+        return None
+    if len(_LIST_LINE_RE.findall(content)) >= 2:
+        return None
+    return available
 
 
 _STATED_COUNT_RE = re.compile(
