@@ -4555,9 +4555,11 @@ def _make_duplicate_delegation_gate_hook():
             ]
             for entry in prior_entries:
                 if _normalize_delegation_task((entry.get("args") or {}).get("task")) == task_text:
-                    print("[team] EXPERIMENT: exact-duplicate delegation to "
-                          f"{member_id!r} allowed through instead of REDIRECTED", flush=True)
-                    return await function(**args)
+                    return (
+                        f"REDIRECTED: this exact task was already delegated to {member_id!r} "
+                        f"earlier this run — use that result instead of delegating it again. "
+                        f"This delegate_task_to_member call was NOT executed."
+                    )
             if prior_entries:
                 audit = _parse_delegation_audit(raw_task)
                 if audit is None:
