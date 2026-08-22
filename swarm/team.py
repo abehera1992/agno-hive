@@ -4719,7 +4719,39 @@ def _make_duplicate_delegation_gate_hook():
     """
     log: list[dict] = []
 
-    async def _duplicate_delegation_gate_hook(function_name, function, args, run_context=None):
+    async def _duplicate_delegation_gate_hook(function_name, function, args,
+                                              run_context=None, team=None):
+        # Clarification gate (2026-08-22). A REGRESSION introduced the same day by
+        # coordinator_tools: [] -- with its own tool surface down to
+        # request_clarification + update_session_state, the coordinator started
+        # reaching for the only tool it had left. Asked for "the OS, the Python
+        # version, and the current working directory" it came back in 4.2s, zero
+        # delegations, asking WHICH OF THE THREE was wanted; re-run, it asked whether
+        # to include virtualenv details. Both are questions its own team could have
+        # answered by calling a tool.
+        #
+        # _COORDINATOR_INSTRUCTIONS already carries a "READ THIS BEFORE YOU WRITE A
+        # QUESTION MARK" block whose first rule is exactly "NOT something a tool call
+        # could resolve". It did not hold, consistent with everything else measured
+        # this week about prose versus mechanism.
+        #
+        # Zero delegations is the discriminator: before delegating even once, the
+        # coordinator cannot know whether a tool would have answered the question, so
+        # it is in no position to decide the human must. After one real delegation it
+        # can ask freely -- a genuine design choice ("Redis or in-process caching")
+        # survives contact with the codebase and is still askable on the next turn.
+        if function_name == "request_clarification" and _count_delegations(team) == 0:
+            print("[team] request_clarification before any delegation — redirected",
+                  flush=True)
+            return (
+                "REDIRECTED: you have not delegated to a single member yet, so you "
+                "cannot yet know whether this question needs a human at all. Ask a "
+                "member first — the roster lists what each one can do — and only ask "
+                "the human about something no tool can settle. If the task names "
+                "several things to report, report all of them rather than asking which "
+                "one was meant. This request_clarification call was NOT executed; you "
+                "may call it again after a real delegation."
+            )
         if function_name not in _DELEGATION_TOOL_NAMES:
             return await function(**args)
 
