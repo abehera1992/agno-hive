@@ -1875,18 +1875,44 @@ _NARRATED_TOOL_INTENT_RE = re.compile(
 )
 
 
-def _narrated_unreachable_tool(content: str | None) -> str | None:
-    """The blocked tool the coordinator says it is about to call, if any.
+# Any mention of a blocked tool by name, whatever the surrounding wording.
+_BLOCKED_TOOL_MENTION_RE = re.compile(
+    r"\b(find_files|search_files_batch|search_files|list_directory_tree|list_directory|"
+    r"search_knowledge_graph|lightrag_query|get_context_section|get_graph_report|"
+    r"web_search|web_fetch)\b"
+)
 
-    Only reports a tool that is actually on _COORDINATOR_DISCOVERY_TOOLS -- narrating
-    a tool it CAN call is just normal prose and must not trigger anything.
+
+def _narrated_unreachable_tool(content: str | None, delegations: int = -1) -> str | None:
+    """A blocked tool the coordinator is stuck on, or None.
+
+    Widened 2026-08-21, immediately after the intent-phrasing version proved too
+    narrow live. It matched "I will now call list_directory directly" -- the phrasing
+    actually observed -- and then two consecutive re-runs produced neither that nor
+    anything like it:
+
+        run 1: answered "exactly one .py file: vouchers_api.py" with no narration at all
+        run 2: "The `list_directory` tool cannot be used without `git` or a valid file
+                system state. No further action can be taken."
+
+    Three runs, three different framings of the same underlying event. Matching intent
+    phrasing is the denylist treadmill in another costume, so the signal moved to
+    something the model cannot phrase its way around:
+
+        the answer NAMES a tool the coordinator cannot call
+        AND the run made ZERO delegations
+
+    A run that legitimately delegated is untouched no matter what it names, and a run
+    that never mentions a blocked tool is untouched too. `delegations == -1`
+    (undeterminable) is treated as "do not fire" -- the same rule _count_read_calls and
+    _count_delegations already follow, so a missing signal never becomes evidence.
     """
-    if not content:
+    if not content or delegations != 0:
         return None
-    m = _NARRATED_TOOL_INTENT_RE.search(content)
+    m = _BLOCKED_TOOL_MENTION_RE.search(content)
     if not m:
         return None
-    tool = m.group(m.lastindex)
+    tool = m.group(1)
     return tool if tool in _COORDINATOR_DISCOVERY_TOOLS else None
 
 
@@ -2755,7 +2781,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # So the retry does the one thing the surface restriction could not: it names the
     # member id to call and the exact delegate_task_to_member shape to use. Removing the
     # tool told the model what it CANNOT do; this tells it what to do instead.
-    narrated = _narrated_unreachable_tool(content)
+    narrated = _narrated_unreachable_tool(content, _count_delegations(team))
     if narrated and len(all_results) == 1:
         holder = _member_holding(team, narrated)
         if holder is not None:
