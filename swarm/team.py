@@ -173,6 +173,15 @@ _COORDINATOR_INSTRUCTIONS = [
     "  This is the single most common cause of a wrong answer from this team: asked to",
     "  list a 24-file directory, coordinators that improvised answered '1 file' and",
     "  '3 files'; the one that delegated returned all 24 correctly, in 24 seconds.",
+    "  NOT holding a tool is NORMAL and means nothing is broken. Never diagnose the",
+    "  environment because a tool is missing from YOUR list: get_env_info, list_processes,",
+    "  check_port, bash_job_status and list_recent_files can tell you NOTHING about a file",
+    "  or directory question, and reaching for them is always the wrong move there.",
+    "  Measured live: asked to list one directory, a coordinator ran list_recent_files,",
+    "  get_env_info and list_processes(filter_str='git') four times, then answered 'the git",
+    "  command is not available in this environment — I cannot proceed'. git was fine and",
+    "  irrelevant; the answer was one delegation away. If you find yourself about to report",
+    "  that the environment is broken, you have skipped the delegation — do that instead.",
     "── Tool restrictions ────────────────────────────────────────────",
     "  NEVER call the `agno_run` tool — you are the top-level coordinator;",
     "  calling agno_run would recurse back into this same swarm and deadlock.",
@@ -1853,6 +1862,35 @@ _FILE_TARGET_RE = re.compile(r"\b[\w./\\-]+\.(?:py|ts|tsx|js|jsx|md|ya?ml|json|s
 _DIRECTORY_WORD_RE = re.compile(r"\b(?:director(?:y|ies)|folder|list_directory)\b|/\s*(?:$|and\b)", re.IGNORECASE)
 
 
+_TASK_PATH_RE = re.compile(r"[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]+)+/?")
+
+
+def _first_path_in(task: str | None) -> str | None:
+    """The first real-looking file/directory path in the task text, or None.
+
+    Exists because the narrated-unreachable-tool retry used to delegate the literal
+    words "call list_directory on the exact path in the question" -- and a member
+    never sees "the question". It receives only the task string the coordinator
+    hands it. Confirmed live 2026-08-22 on a probe about
+    `API/inventory-service/router/`: the Researcher, given that phrasing, guessed
+    and ran list_directory('API/business-service') instead. It did everything right
+    with the only information it had; the delegation simply never carried the path.
+
+    Rejects the incidental slash ("and/or", "read/write") by requiring a path to
+    end in '/', carry an extension in its last segment, or have 3+ segments.
+    """
+    if not task:
+        return None
+    # Drop URLs wholesale first: the path pattern would otherwise match the part AFTER
+    # the scheme ('example.com/a/b/c'), which a startswith('http') check never sees.
+    for match in _TASK_PATH_RE.finditer(re.sub(r"https?://\S+", " ", task)):
+        candidate = match.group(0)
+        segments = candidate.rstrip("/").split("/")
+        if candidate.endswith("/") or "." in segments[-1] or len(segments) >= 3:
+            return candidate
+    return None
+
+
 def _is_enumeration_task(task: str | None) -> bool:
     """Does this task require a DIRECTORY listing as evidence?
 
@@ -2100,7 +2138,7 @@ def _count_delegations(team) -> int:
     return state["count"]
 
 
-def _more_grounded(original_result, retry_result) -> bool:
+def _more_grounded(original_result, retry_result, member_reads: int = 0) -> bool:
     """True when a retry gathered at least as much evidence as the draft it would replace.
 
     Every guard in _verified_answer below re-runs the pipeline and then adopts whatever
@@ -2134,19 +2172,42 @@ def _more_grounded(original_result, retry_result) -> bool:
     after = _count_read_calls(retry_result)
     if before < 0 or after < 0:
         return True
-    return after >= before
+    return (after + max(member_reads, 0)) >= before
 
 
-def _adopt_retry(label: str, content: str, result, retried: str, retry):
+def _member_reads_delta(team, reads_before: int) -> int:
+    """Reads performed by MEMBERS between a snapshot and now. 0 when undeterminable.
+
+    _run_read_count is per-RUN and cumulative, which its own docstring correctly warns
+    would break _more_grounded if passed in raw -- both sides would see the same total.
+    A before/after delta is the part that is specific to the retry.
+    """
+    reads_after = _run_read_count(team)
+    if reads_before < 0 or reads_after < 0:
+        return 0
+    return max(reads_after - reads_before, 0)
+
+
+def _adopt_retry(label: str, content: str, result, retried: str, retry, member_reads: int = 0):
     """Adopt a guard's retry only when it is at least as grounded as the current draft.
 
     Returns the (content, result) pair to carry forward. Falsy `retried` (an empty
     completion) keeps the original, matching every call site's pre-existing `if retried:`
     check -- this helper absorbs that check so the call sites stay one line each.
+
+    `member_reads` (2026-08-22) is how many reads MEMBERS did during the retry, which
+    _count_read_calls cannot see -- the same blindness that already forced the
+    enumeration guard to take max(_count_read_calls, _run_read_count). Without it this
+    helper punished exactly the behaviour the whole team design is built to encourage.
+    Live: a coordinator answered "the git command is not available in this environment"
+    off 4 list_processes + get_env_info calls; the retry delegated, the Researcher ran a
+    real list_directory, and the retry was DISCARDED as "LESS evidence" -- the
+    coordinator's environment-probing counted as reads and the member's actual directory
+    listing counted as nothing. Callers that pass nothing keep the old behaviour exactly.
     """
     if not retried:
         return content, result
-    if _more_grounded(result, retry):
+    if _more_grounded(result, retry, member_reads=member_reads):
         return retried, retry
     print(
         f"[team] {label}: retry gathered LESS evidence than the draft it would replace "
@@ -2810,6 +2871,15 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             member_id, member_name = holder
             print(f"[team] coordinator narrated an unreachable tool ({narrated}) — "
                   f"retrying with an explicit delegation to {member_id}")
+            # Inline the LITERAL path. "the exact path in the question" is unresolvable
+            # for the member, which only ever receives this task string -- see
+            # _first_path_in's docstring for the live run where that phrasing sent the
+            # Researcher to a directory nobody asked about.
+            target_path = _first_path_in(task)
+            target_clause = (
+                f"on {target_path}" if target_path else "on the exact path in the question"
+            )
+            reads_before = _run_read_count(team)
             try:
                 retried, retry = await _stream_team_run(
                     team,
@@ -2819,15 +2889,21 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                     f"why the attempt stalled and repeated itself. `{member_name}` DOES "
                     f"have it. Call exactly this, once, as your FIRST action:\n"
                     f"    delegate_task_to_member(member_id='{member_id}', "
-                    f"task='call {narrated} on the exact path in the question and return "
+                    f"task='call {narrated} {target_clause} and return "
                     f"its raw output verbatim')\n"
                     f"Then answer using ONLY what that member returns. Do not attempt "
                     f"`{narrated}` yourself again, and do not substitute reading "
-                    f"documentation for it — that is what produced the wrong answer.",
+                    f"documentation for it — that is what produced the wrong answer. "
+                    f"Do NOT investigate the environment (git, processes, ports) — "
+                    f"nothing is broken; you simply do not hold this tool, and "
+                    f"`{member_name}` does.",
                     liveness_path=liveness_path,
                 )
                 all_results.append(retry)
-                content, result = _adopt_retry("narrated-tool", content, result, retried, retry)
+                content, result = _adopt_retry(
+                    "narrated-tool", content, result, retried, retry,
+                    member_reads=_member_reads_delta(team, reads_before),
+                )
             except Exception as exc:
                 print(f"[team] narrated-tool retry failed: {exc}")
 
