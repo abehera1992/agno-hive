@@ -3008,6 +3008,36 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 + _summarize_actual_writes(*all_results)
             )
 
+    # Listing-count check (2026-08-22). The one failure that survived the
+    # air-traffic-control fix, and the only guard here aimed at ARITHMETIC rather than
+    # grounding: the listing was fetched correctly and the answer then miscounted it.
+    # A 24-entry directory of 24 .py files was reported as 23 on one run and 25 on
+    # another, both times off a correct list_directory result. verify_claims passed all
+    # of them -- a bare number carries no citation to check, so nothing ever looked.
+    #
+    # Deliberately a DISCLOSURE, not a retry or a silent rewrite. Rewriting the number
+    # would mean picking which reading of the listing the task wanted (total entries?
+    # .py files? modules excluding __init__?), which _miscounted_listing explicitly
+    # refuses to adjudicate; and a retry costs a full 60-100s round trip to re-derive
+    # something already sitting in the tool output. Stating the tool's own counts next
+    # to the claim lets the reader settle it in one glance.
+    miscount = _miscounted_listing(content, getattr(team, "_listings", None))
+    if miscount is not None:
+        stated, listing = miscount
+        by_ext = ", ".join(f"{n} .{ext}" for ext, n in sorted(listing["by_ext"].items()))
+        print(f"[team] answer states {stated} but list_directory({listing['path']}) "
+              f"returned {listing['items']} items — flagging the discrepancy")
+        return (
+            f"{content}\n\n---\n**COUNT DISAGREES WITH THE DIRECTORY LISTING — the "
+            f"answer above states {stated}, but the list_directory call this run "
+            f"actually returned {listing['items']} entries for `{listing['path']}` "
+            f"({listing['files']} files, {listing['dirs']} directories"
+            f"{'; ' + by_ext if by_ext else ''}). The listing itself was fetched "
+            f"correctly; the count stated above is not any reading of it. Trust the "
+            f"tool's numbers here, not the sentence.**"
+            + _summarize_actual_writes(*all_results)
+        )
+
     # Tool-budget-exhausted check. Unlike every other guard here this one cannot force a
     # retry: a re-run would hit the same ceiling, and agno has already told the model
     # "Don't try to execute it again". Disclosure is the whole remedy -- the answer may
@@ -5309,6 +5339,11 @@ def _stream_event_to_chunk(event) -> str | dict | None:
             "name": tool.tool_name,
             "result_preview": result[:200] if isinstance(result, str) else None,
             "agent_name": getattr(event, "agent_name", "") or "",
+            # Counts, not the body: this is the only point the FULL listing exists
+            # (result_preview truncates at 200 chars, well inside a 24-entry listing),
+            # and the count guard downstream needs the whole thing to count it.
+            "listing": (_summarize_listing(result)
+                        if tool.tool_name == "list_directory" else None),
         }
     if event_type in _ERROR_EVENT_TYPES:
         message = getattr(event, "content", None)
@@ -5889,6 +5924,102 @@ async def _run_heartbeat(
                 print(f"[team] liveness write warning: {exc}", flush=True)
 
 
+_STATED_COUNT_RE = re.compile(
+    r"\b(?:there are|there is|contains|returned|total of|exactly)\s+"
+    r"(?:exactly\s+)?(\d{1,4})\b",
+    re.IGNORECASE,
+)
+
+
+def _miscounted_listing(content: str, listings: list | None) -> tuple[int, dict] | None:
+    """A stated count that matches NO defensible reading of the one listing this run.
+
+    Returns (stated, listing) on a real mismatch, else None.
+
+    Only fires when exactly one distinct directory was listed. With two listings in
+    play, a number that matches neither is ambiguous rather than wrong -- the answer
+    could be describing either, or a sum -- and this must never guess which.
+
+    Every plausible reading counts as agreement: total entries, files only, dirs only,
+    and any single extension's file count. The task's wording decides which one is
+    correct and this deliberately does not adjudicate that; it only catches a number
+    that cannot be derived from the listing at all. That is exactly the live failure:
+    a 24-entry directory of 24 .py files answered as 23, and separately as 25 --
+    neither is any reading of that listing.
+    """
+    if not listings:
+        return None
+    by_path = {l["path"]: l for l in listings if l.get("path")}
+    if len(by_path) != 1:
+        return None
+    listing = next(iter(by_path.values()))
+    match = _STATED_COUNT_RE.search(content or "")
+    if match is None:
+        return None
+    stated = int(match.group(1))
+    defensible = {listing["items"], listing["files"], listing["dirs"]}
+    defensible |= set(listing["by_ext"].values())
+    # "N modules besides __init__.py" is a legitimate reading and is not derivable from
+    # the counts above -- but allowing files-1 unconditionally swallowed the actual live
+    # failure, which was a bare "There are 23 Python files" against a 24-file listing.
+    # Only honour it when the answer SAYS it is excluding something; an off-by-one that
+    # announces no exclusion is an off-by-one.
+    if re.search(r"\b(?:excluding|besides|apart from|other than|not counting)\b|__init__",
+                 content or "", re.IGNORECASE):
+        defensible.add(max(listing["files"] - 1, 0))
+    return None if stated in defensible else (stated, listing)
+
+
+_LISTING_HEADER_RE = re.compile(r"^(?P<path>.*?)\s{2}\((?P<items>\d+) items\):$")
+
+
+def _summarize_listing(result) -> dict | None:
+    """Turn a list_directory result into the counts an answer could legitimately state.
+
+    Format is fixed by hive-mcp/tools/context.py's own return:
+        API/inventory-service/router/  (24 items):
+        [FILE] __init__.py
+        [DIR]  subpkg
+
+    Exists because the ONE failure that survived the air-traffic-control fix is
+    arithmetic, not grounding: list_directory returned the correct 24-entry listing
+    and the answer said 23 (and 25 on another run), while verify_claims passed it
+    every time -- a bare number carries no citation to check, so nothing looked at it.
+    The count is right there in the tool's own output.
+
+    Returns every defensible reading rather than one "true" number, because the task's
+    wording decides which is correct and this must not adjudicate that: total entries,
+    files only, dirs only, and a per-extension file count. "24 items" and "24 .py
+    files" and "23 files excluding __init__" are different questions, and a check that
+    picked one would fire on correct answers to the others.
+    """
+    if not isinstance(result, str):
+        return None
+    lines = result.splitlines()
+    if not lines:
+        return None
+    header = _LISTING_HEADER_RE.match(lines[0].strip())
+    if header is None:
+        return None
+    files, dirs, by_ext = 0, 0, {}
+    for line in lines[1:]:
+        entry = line.strip()
+        if entry.startswith("[DIR]"):
+            dirs += 1
+        elif entry.startswith("[FILE]"):
+            files += 1
+            name = entry[len("[FILE]"):].strip()
+            if "." in name:
+                by_ext[name.rsplit(".", 1)[1].lower()] = by_ext.get(name.rsplit(".", 1)[1].lower(), 0) + 1
+    return {
+        "path": header.group("path").strip(),
+        "items": int(header.group("items")),
+        "files": files,
+        "dirs": dirs,
+        "by_ext": by_ext,
+    }
+
+
 _LEAKED_TOOL_TAG_RE = re.compile(
     r"<tool_call>\s*(?P<a>\{.*?\})\s*(?:</tool_call>|\Z)"
     r"|<\|python_tag\|>\s*(?P<b>\{.*?\})\s*$",
@@ -6106,6 +6237,13 @@ async def _stream_team_run(
                 raise _BackendRunError(out["message"])
             elif isinstance(out, dict):
                 activity["last_progress_at"] = time.monotonic()
+                # Stash listing counts on the team, alongside _read_state, so the
+                # answer-time count guard can reach them. Accumulates across a run's
+                # retries exactly like _read_state does.
+                if out.get("listing"):
+                    if not isinstance(getattr(team, "_listings", None), list):
+                        team._listings = []
+                    team._listings.append(out["listing"])
                 print(f"[{log_label}] stream tool event: {out}", flush=True)
                 last_segment_start = len(full_content)
             else:
