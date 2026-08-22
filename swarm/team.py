@@ -898,6 +898,33 @@ _COORDINATOR_DISCOVERY_TOOLS = {
     # (repeatedly, ~40s apart, heading toward another 300s liveness auto-kill)
     # immediately after get_context_section's own direct calls in the same run.
     "get_graph_report",
+    # Environment introspection added 2026-08-22 -- not a discovery tool, but the
+    # identical escape-hatch pattern this whole set exists for, and by far the most
+    # destructive instance measured. Asked to list ONE directory, the coordinator
+    # ran list_recent_files, get_env_info and list_processes(filter_str='git'), read
+    # hive-mcp's (real, since-fixed) zombie git processes as proof the environment
+    # was broken, and answered "the git command is not available in this environment
+    # -- I cannot proceed". git was working; the answer was one delegation away.
+    #
+    # Every softer fix was tried first and each only moved the behaviour: reaping the
+    # zombies corrected the payload and the run still fired the same call 56 times;
+    # adding these tools to _CACHEABLE_READ_TOOLS cut that to 3 and the coordinator
+    # promptly looped check_port instead; an explicit _COORDINATOR_INSTRUCTIONS block
+    # naming these exact tools and quoting the failure had no measurable effect at all
+    # -- the third time this module has recorded prose failing where the tool surface
+    # worked (see _strip_mutating's "instructions shape what a model says; only the
+    # tool surface constrains what it does", and the 2026-08-11 discovery-tool note
+    # above).
+    #
+    # Nothing is lost. A coordinator has no legitimate use for these: it does not run
+    # shell work, and Executor holds get_env_info/check_port/list_processes/
+    # bash_job_status in teams/engineering.yaml for the tasks that genuinely need
+    # them. list_recent_files stays reachable through Researcher. And unlike
+    # 2026-08-11, the narration that removal provokes is now caught --
+    # _narrated_unreachable_tool converts it into a real delegation carrying the
+    # literal path.
+    "get_env_info", "list_processes", "check_port", "bash_job_status",
+    "list_recent_files",
 }
 # Notion READ/discovery tools added 2026-08-15, same incident class as the set
 # above, found live on `engineering` (which -- unlike parallel-review/planning --
