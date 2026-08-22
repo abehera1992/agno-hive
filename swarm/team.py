@@ -6181,7 +6181,12 @@ def _miscounted_listing(content: str, listings: list | None) -> tuple[int, dict]
     # failure, which was a bare "There are 23 Python files" against a 24-file listing.
     # Only honour it when the answer SAYS it is excluding something; an off-by-one that
     # announces no exclusion is an off-by-one.
-    if re.search(r"\b(?:excluding|besides|apart from|other than|not counting)\b|__init__",
+    # An EXCLUSION PHRASE only. Matching a bare "__init__" was wrong and cost a live
+    # miss: an answer that said "exactly 23 .py files" and then LISTED all 24, including
+    # __init__.py, was treated as declaring an exclusion it never made. Naming a file in
+    # a list is not excluding it. "23 modules besides __init__.py" still matches on
+    # "besides", which is the case this allowance exists for.
+    if re.search(r"\b(?:excluding|besides|apart from|other than|not counting|except)\b",
                  content or "", re.IGNORECASE):
         defensible.add(max(listing["files"] - 1, 0))
     return None if stated in defensible else (stated, listing)
