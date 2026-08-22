@@ -2870,7 +2870,18 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         # docstring), and a model that ignored an explicit "READ the file first" instruction
         # once has already demonstrated the instruction is not landing. -1 (undeterminable)
         # is not 0 and never trips this -- same rule as everywhere else in this file.
-        if _count_read_calls(result) == 0 and _CLAIMY_RE.search(content or ""):
+        # max(), same as the entry condition above and for the same reason its comment
+        # gives: result.messages holds only the COORDINATOR's calls, and with the
+        # coordinator disarmed that is ALWAYS 0 while members read normally. This branch
+        # was left on the bare _count_read_calls when the entry condition was fixed on
+        # 2026-08-21, so it kept doing exactly what that fix was for. Live 2026-08-22: a
+        # Researcher grounded an answer in db_schema + db_query (correct count of 0) and
+        # a second in search_files + find_files + two get_file_content reads, and both
+        # shipped stamped "UNGROUNDED -- neither the original attempt nor the corrective
+        # retry opened a single file this run". Marking correct, grounded answers as
+        # fabricated erodes the banner everywhere it IS deserved.
+        if max(_count_read_calls(result), _run_read_count(team)) == 0 \
+                and _CLAIMY_RE.search(content or ""):
             return (
                 f"{content}\n\n---\n**UNGROUNDED — this answer states code facts, and "
                 f"NEITHER the original attempt NOR the corrective retry opened a single "
