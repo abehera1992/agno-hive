@@ -727,6 +727,20 @@ def _team_roster_preamble(agent_specs: list | None) -> list[str]:
     Planner, BacklogResearcher is NOT single-word and IS affected) hid this for
     so long. Now shows the real member_id form as the primary value.
 
+    Correction (2026-08-22): every version until now printed only each member's id,
+    display name and role text -- NO tools. Meanwhile _COORDINATOR_INSTRUCTIONS told
+    the coordinator, in the MISSING A TOOL block, "the member roster above lists each
+    member's tools by name". That was simply false, and it is the missing half of an
+    entire day of failures: asked to list one directory, the coordinator investigated
+    git, paged a file in 10-line slices, and looped list_processes 56 times rather than
+    delegating -- not because it ignored a routing table, but because it never had one.
+    It could not know that `researcher` holds list_directory or `executor` holds
+    run_shell. Four rounds of removing tools from its surface treated the symptom (it
+    could still do the work itself) while leaving the cause (it had no idea who else
+    could) untouched. The roster now carries `spec.tools`, the same source the
+    per-member surface log prints, so the instruction is true and capability routing is
+    possible at all.
+
     Returns [] for agent_specs=None/empty (the default Coder+Reviewer fallback
     path, which predates team YAMLs) -- unaffected either way, since that path's
     own two-name roster happens to already be a subset of the hardcoded example.
@@ -737,11 +751,22 @@ def _team_roster_preamble(agent_specs: list | None) -> list[str]:
         "── Your team's actual members — delegate_task_to_member's member_id argument "
         "MUST be the exact id shown below (NOT the display name in parentheses; "
         "a multi-word display name gets a dash inserted at each word boundary "
-        "and is lowercased for its real id, e.g. 'FooBarAgent' -> 'foo-bar-agent') ──"
+        "and is lowercased for its real id, e.g. 'FooBarAgent' -> 'foo-bar-agent'). "
+        "The `tools:` line under each member is what that member CAN DO — route by it: "
+        "pick the member that holds the tool the task needs, and delegate to it ──"
     ]
     for spec in agent_specs:
-        label = spec.description or spec.role
+        label = spec.description or spec.role or ""
+        # Long role paragraphs push the tools line out of view; the full text still
+        # reaches the member itself via its own description/instructions.
+        if len(label) > 300:
+            label = label[:300].rstrip() + "…"
         lines.append(f"  {_member_id(spec.name)}  (display name: {spec.name}) — {label}")
+        tools = sorted(getattr(spec, "tools", None) or [])
+        lines.append(
+            f"      tools: {', '.join(tools)}" if tools
+            else "      tools: every tool on the connected MCP servers"
+        )
     lines.append("")
     return lines
 

@@ -1,9 +1,24 @@
 name: engineering
 description: Full engineering team — routes context, researches codebase, plans, implements, executes, and reviews.
 
-# NO coordinator_tools: key — the coordinator resolves against the live MCP surface
-# minus _COORDINATOR_DISCOVERY_TOOLS. Removed 2026-08-21, and the history matters
-# because the obvious reading of that removal is wrong.
+# RE-ENABLED 2026-08-22 as `coordinator_tools: []` — pure air-traffic-control: the
+# coordinator holds NO low-level tool and every tool call goes to the member that owns
+# the tool. Read the history below first; it was tried once before and made things
+# worse, and this is not a reversal of that finding but a retest under a condition that
+# did not hold then.
+#
+# What changed: until today the member roster the coordinator receives
+# (_team_roster_preamble) listed each member's id, display name and role text and NO
+# TOOLS AT ALL, while _COORDINATOR_INSTRUCTIONS told it "the member roster above lists
+# each member's tools by name". The disarm below was therefore previously measured
+# against a coordinator that had been stripped of its own tools AND had no way to learn
+# which member held the tool it needed. Both halves of the air-traffic-control design
+# were required and only one was ever in place. The roster now carries real per-member
+# tool lists, so this retest is of a different configuration, not a re-run of the same
+# one. If aggregation fidelity degrades again the way it did before, revert THIS key and
+# keep the roster change — they are independent.
+#
+# Prior history (2026-08-20/21) — why the obvious reading of the earlier removal is wrong:
 #
 # A `coordinator_tools: []` disarm was added 2026-08-20 for one measured failure: asked
 # which line defines a column, the coordinator called db_schema itself and answered with
@@ -26,9 +41,13 @@ description: Full engineering team — routes context, researches codebase, plan
 # found the right data — verify_claims printed the correct file from in-run evidence —
 # but the coordinator's aggregation step was not faithful to what came back.
 #
-# So this is not "the coordinator should hold tools". It is: the disarm was solving a
-# problem that no longer exists, was never actually active on the path that mattered,
-# and the aggregation-fidelity question it exposed is open and tracked separately.
+# So that removal was not "the coordinator should hold tools". It was: the disarm was
+# solving a problem that no longer exists, was never actually active on the path that
+# mattered, and the aggregation-fidelity question it exposed is open and tracked
+# separately. What the 2026-08-22 retest adds is the roster half of the design, absent
+# for every measurement above.
+coordinator_tools: []
+
 # Coordinator benchmark 2026-06-11 (same task, full 7-agent pipeline, Ollama 0.30.6):
 #   ibm/granite4.1:30b   217s — hallucinated service purposes from dir names
 #   qwen3:30b-a3b        318s — accurate but ~1K hidden thinking tokens/turn
