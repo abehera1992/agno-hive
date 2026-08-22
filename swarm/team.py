@@ -4782,6 +4782,15 @@ def _make_tool_interception_hook(
             result = await function(**args)
             elapsed = time.monotonic() - started
             print(f"[team] tool_hook: {function_name}({args}) -> {elapsed:.2f}s", flush=True)
+            # A delegation to context-router never emits RunStarted while an identical one to
+            # researcher does, though both ids resolve and both members are armed. Awaiting the
+            # delegate function returns before the member runs, so the hook's timing says
+            # nothing -- but its RETURN VALUE distinguishes "agno refused the target" (a plain
+            # error string) from "the run was handed back to be iterated" (a generator).
+            if function_name.startswith("delegate_task_to_member"):
+                _preview = result if isinstance(result, str) else ""
+                print(f"[team] delegate result: {type(result).__name__} "
+                      f"{_preview[:200]!r}", flush=True)
             if activity is not None:
                 now = time.monotonic()
                 activity["last_call_at"] = now
