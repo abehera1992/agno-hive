@@ -3929,7 +3929,10 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     async def _read_cache_tool_hook(function_name, function, args, agent=None, run_context=None):
         if function_name in _DELEGATION_TOOL_NAMES:
             if function_name == "delegate_task_to_member":
-                target = _member_id(str((args or {}).get("member_id", "")).strip())
+                # _member_key, not _member_id: this is a BUCKETING key, so two
+                # spellings of the same member must land in one bucket (see
+                # _member_key's docstring for the live 'contextrouter' case).
+                target = _member_key(str((args or {}).get("member_id", "")).strip())
                 if target:
                     delegation_generation[target] = delegation_generation.get(target, 0) + 1
                     # Fresh delegation -- clean slate, same principle the
@@ -4050,6 +4053,36 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
 _DELEGATION_TOOL_NAMES = {"delegate_task_to_member", "delegate_task_to_members"}
 _MAX_LOGGED_TASK_CHARS = 300
 _MAX_DELEGATION_LOG_ENTRIES = 200
+
+def _member_key(name: str) -> str:
+    """A separator-insensitive key for deciding whether two spellings mean the SAME
+    member. Strips every non-alphanumeric and lowercases:
+
+        ContextRouter / context-router / contextrouter / context_router
+        Context Router / CONTEXT-ROUTER              -> "contextrouter"
+        BacklogResearcher / backlog-researcher       -> "backlogresearcher"
+
+    Universal by construction, so a member added later with any number of words needs
+    no entry here and no new rule -- which is the point. _member_id already derives the
+    REAL id from agno's own url_safe_string, and _team_roster_preamble already prints
+    that id per member and states the dash rule. Both are automatic for a new agent.
+
+    What was NOT automatic was COMPARISON. _member_id only inserts a dash at a
+    camelCase boundary, so url_safe_string('contextrouter') == 'contextrouter' -- an
+    all-lowercase misspelling has no boundary to find and normalizes to itself. Two
+    delegations to the same member, one spelled 'context-router' and one
+    'contextrouter', therefore looked like two DIFFERENT targets and the duplicate
+    gate never fired. Live 2026-08-21: exactly that, both carrying byte-identical task
+    text, costing a wasted delegation round-trip.
+
+    USE FOR EQUALITY ONLY -- never to build a member_id to send to agno. agno's
+    _find_member_by_id compares with a plain `==` against url_safe_string's output, so
+    'contextrouter' is genuinely invalid there and must keep failing: the decompose
+    gate deliberately rejects the no-dash form to teach the correct one, and making it
+    valid would teach an id agno will never match.
+    """
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
 
 def _member_id(display_name: str) -> str:
     """The real, canonical value a delegate_task_to_member(member_id=...) call must
@@ -4511,11 +4544,14 @@ def _make_duplicate_delegation_gate_hook():
             return await function(**args)
 
         if function_name == "delegate_task_to_member":
-            member_id = _member_id(str((args or {}).get("member_id", "")).strip())
+            # _member_key on BOTH sides -- separator-insensitive, so 'context-router'
+            # and 'contextrouter' dedupe as one target. _member_id left the two looking
+            # distinct and the gate never fired (live 2026-08-21, byte-identical tasks).
+            member_id = _member_key(str((args or {}).get("member_id", "")).strip())
             prior_entries = [
                 entry for entry in log
                 if entry.get("tool") == "delegate_task_to_member"
-                and _member_id(str((entry.get("args") or {}).get("member_id", "")).strip()) == member_id
+                and _member_key(str((entry.get("args") or {}).get("member_id", "")).strip()) == member_id
             ]
             for entry in prior_entries:
                 if _normalize_delegation_task((entry.get("args") or {}).get("task")) == task_text:
