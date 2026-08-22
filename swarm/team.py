@@ -159,6 +159,20 @@ _PROJECT_MCP_EXCLUDE_TOOLS = [
 ]
 
 _COORDINATOR_INSTRUCTIONS = [
+    "── MISSING A TOOL? DELEGATE — never improvise ───────────────────",
+    "  If a task needs a tool you do not have, a TEAM MEMBER has it. Delegate to that",
+    "  member. Do NOT substitute a different tool, do NOT read documentation instead,",
+    "  and do NOT answer from memory. Any of those produces a confidently wrong answer.",
+    "  Example — you cannot call list_directory, ContextRouter and Researcher can:",
+    "    delegate_task_to_member(member_id='context-router',",
+    "                            task='call list_directory on <exact path> and return",
+    "                                  its raw output verbatim')",
+    "  Then answer using ONLY what the member returns. If unsure who holds a tool, the",
+    "  member roster above lists each member's tools by name, and get_member_information",
+    "  will tell you.",
+    "  This is the single most common cause of a wrong answer from this team: asked to",
+    "  list a 24-file directory, coordinators that improvised answered '1 file' and",
+    "  '3 files'; the one that delegated returned all 24 correctly, in 24 seconds.",
     "── Tool restrictions ────────────────────────────────────────────",
     "  NEVER call the `agno_run` tool — you are the top-level coordinator;",
     "  calling agno_run would recurse back into this same swarm and deadlock.",
