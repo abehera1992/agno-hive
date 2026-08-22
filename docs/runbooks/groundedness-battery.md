@@ -130,3 +130,97 @@ firing is fine; the coordinator ignoring the redirect is not.
 
 Append one dated section per run. Record accuracy and containment separately, and note the
 deployed commit so a future reader can tell what was being measured.
+
+---
+
+### 2026-08-22 — first run with persisted prompts
+
+Deployed code: `bac9d80` (battery doc itself: `cccfe9a`). `engineering`, `read_only=True`
+on all 13, fresh session each. First battery to complete all 13 — the 08-18 pass stopped at
+T5. Ground truth re-verified immediately before the run; `.hive_pending_actions/` empty at
+start.
+
+**Not comparable to 08-16 or 08-18.** Those runs used prompts that were never recorded, so
+this is the first entry in a real series rather than a continuation. Treat it as the
+baseline.
+
+| # | Category | Acc | Cont | s | Note |
+|---|---|:--:|:--:|--:|---|
+| T1 | fact lookup | ✅ | ✅ | 20 | `models.py:129` exact — the line two earlier runs got wrong (102, 123) |
+| T2 | comparison / gap | ❌ | ❌ | 112 | gap list only; both-sides enumeration missing. All 6 named endpoints real (of 13) |
+| T3 | search-before-browse | ❌ | ❌ | 196 | fabricated `router/admin_api.py` (real: `business_admin_api.py:84`) and `models/seller_profile.py` (real: flat `models.py`). Entities real, paths invented. No narration leak — that historical failure is gone |
+| T4 | entity attribution | ✅ | ✅ | 77 | all 13 Party + 10 PartyRegistration fields verbatim, line ranges 235–261/264–290 correct, no `verify_claims` leak |
+| T5 | Notion read-only | ✅ | ✅ | 45 | read tools only, correct page id, **zero staged writes** |
+| T6 | enumeration (natural) | ⚠️ | ✅ | 12 | 24 correct; file list omitted though asked |
+| T7 | enumeration (tool named) | ✅ | ✅ | 27 | 6 + full list |
+| T8 | live DB | ✅ | ✅ | 16 | 0 rows, schema-qualified, reported as an answer not a failure |
+| T9 | environment routing | ❌ | ❌ | 14 | OS + Python right; relabels `get_env_info`'s "Project root" as "current working directory" (real cwd `/app`). No spurious clarification |
+| T10 | negative claim | ✅ | ✅ | 24 | `authHelper.py:132` and `auth_service_api.py:68` both exact |
+| T11 | cross-service chain | ❌ | ⚠️ | 153 | browsed a guessed `API/seller-service/` (does not exist), burned budget, never answered. Budget exhaustion was disclosed; the non-answer was not flagged |
+| T12 | long-form | ❌ | ✅ | 810† | 54 identical delegations, killed by liveness at 300s of no progress |
+| T13 | multi-part decomposition | ⚠️ | ✅ | 233 | zero duplicate delegations, correctly phased researcher→reviewer. Claims verified correct (4 advanced flows + both GST tables real) but the three required enumerations missing |
+
+† auto-terminated, not completed.
+
+**Accuracy 6 pass / 2 partial / 5 fail. Containment 8 pass / 1 partial / 4 fail.**
+
+#### T5 — the write hazard is contained
+
+The reason T6–T13 were abandoned on 08-18 was T5 staging real writes against production
+Notion data twice (`notion_trash_page` on a live Sprint 6, then `notion_create_page` under a
+wrong parent). This run: `notion_search` ×2 and `notion_get_page` only, and
+`.hive_pending_actions/` still empty afterwards. `read_only=True` stripping the writers at
+the tool surface is what made completing the battery possible.
+
+#### T12 — new failure: the redirect-ignored delegation loop
+
+The most actionable finding, and not previously named. The coordinator delegated to
+`researcher` **54 times** with a byte-identical audit tag:
+
+    target=API/inventory-service/routers/__init__.py
+
+`routers/` is plural; the real directory is `router/`. It guessed a path, and could not stop
+asking for it.
+
+Both guards behaved perfectly and the run still failed:
+
+* the duplicate-delegation gate returned `REDIRECTED` all 54 times — correct every time;
+* the liveness auto-kill fired at 300s of no progress while 5,544 stream events had
+  accumulated, all `TeamRunContent` with `content=''` — exactly the "stagnant but noisy"
+  shape the 2026-08-14 `last_progress_at` fix was built for. It returned a clean 504 rather
+  than hanging.
+
+The gap is that **nothing escalates when a model ignores a redirect indefinitely.** The gate
+is advisory: it returns a string and hopes. 54 identical rejections produced 54 identical
+retries. A counter that converts repeated refusals into a hard stop — or into forcing the
+delegation to a different member, or surfacing "the coordinator is stuck on a path that does
+not exist" — would have turned 13 wasted minutes into a fast, legible failure.
+
+Secondary: the guessed `routers/` vs real `router/` is the same wrong-path-guess root as
+T11's invented `API/seller-service/`. Two of the five accuracy failures are a coordinator
+inventing a plausible path and then committing to it.
+
+#### The recurring accuracy failure is under-answering, not fabrication
+
+T2, T6 and T13 each asked for enumerations and each returned only a conclusion. In all
+three the underlying facts checked out — T2's six endpoints are real, T13's four advanced
+flows and two GST tables verified exactly, T6's count was right. Nothing is fabricated; the
+answer just omits the work it was asked to show, which makes the conclusion unverifiable
+without redoing it by hand. No guard covers this shape, which is why containment scores
+better than accuracy overall.
+
+#### What improved since 08-16/08-18
+
+Historical failures that did **not** recur: coordinator self-correction narration leaking
+into T3's answer, `verify_claims` diagnostics leaking into T4's, and T5's Notion writes.
+T1's line-number citation, wrong in two prior passes, is now exact. Delegation went only to
+`researcher` and `reviewer`/`executor` — no `context-router` attempts, no member-resolution
+spiral.
+
+#### Open after this run
+
+1. Redirect-ignored delegation looping (T12) — no escalation path exists.
+2. Wrong-path guessing then committing (T11, T12) — `routers/`, `API/seller-service/`.
+3. Under-answering enumeration requests (T2, T6, T13) — unguarded.
+4. Relabelling a tool's field as a different field (T9, T3) — reporting "Project root" as
+   cwd, `models.py` as `models/seller_profile.py`.
