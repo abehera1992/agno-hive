@@ -6055,6 +6055,30 @@ async def _run_heartbeat(
                 print(f"[team] liveness write warning: {exc}", flush=True)
 
 
+def _record_stream_artifacts(team, out: dict) -> None:
+    """Record a tool event's listing counts and success/failure onto the team.
+
+    Called from BOTH stream-consuming loops. run_task_async has its own copy of the
+    dict-event branch rather than sharing _stream_team_run's, so the first attempt of
+    every run drains through one and each corrective retry through the other -- a split
+    that is easy to miss and did cost a live miss: with only _stream_team_run
+    instrumented, the listing-count guard saw nothing on any first attempt and stayed
+    silent on an answer that said "5 Python files" and then listed 6. One helper, two
+    call sites, so a third divergence is not possible.
+    """
+    if not isinstance(out, dict):
+        return
+    if out.get("listing"):
+        if not isinstance(getattr(team, "_listings", None), list):
+            team._listings = []
+        team._listings.append(out["listing"])
+    if out.get("__tool_event__") == "end" and out.get("name"):
+        if not isinstance(getattr(team, "_tool_outcomes", None), dict):
+            team._tool_outcomes = {}
+        bucket = team._tool_outcomes.setdefault(out["name"], {"ok": 0, "err": 0})
+        bucket["err" if _looks_like_tool_error(out.get("result_preview")) else "ok"] += 1
+
+
 _JOB_HANDLE_TOOL_NAMES = {"bash_job_status", "bash_job_kill"}
 # bash.py's _start_background_job returns "job_id: <12 hex>\nstatus: running"
 _JOB_ID_RE = re.compile(r"job_id:\s*([0-9a-f]{6,32})")
@@ -6462,17 +6486,7 @@ async def _stream_team_run(
                 # Stash listing counts on the team, alongside _read_state, so the
                 # answer-time count guard can reach them. Accumulates across a run's
                 # retries exactly like _read_state does.
-                if out.get("listing"):
-                    if not isinstance(getattr(team, "_listings", None), list):
-                        team._listings = []
-                    team._listings.append(out["listing"])
-                if out.get("__tool_event__") == "end" and out.get("name"):
-                    if not isinstance(getattr(team, "_tool_outcomes", None), dict):
-                        team._tool_outcomes = {}
-                    bucket = team._tool_outcomes.setdefault(
-                        out["name"], {"ok": 0, "err": 0})
-                    bucket["err" if _looks_like_tool_error(out.get("result_preview"))
-                           else "ok"] += 1
+                _record_stream_artifacts(team, out)
                 print(f"[{log_label}] stream tool event: {out}", flush=True)
                 last_segment_start = len(full_content)
             else:
@@ -6782,6 +6796,7 @@ async def run_task_async(
                                 raise _BackendRunError(out["message"])
                             elif isinstance(out, dict):
                                 activity["last_progress_at"] = time.monotonic()
+                                _record_stream_artifacts(team, out)
                                 print(f"[team] stream tool event: {out}", flush=True)
                                 last_segment_start = len(full_content)
                             else:
