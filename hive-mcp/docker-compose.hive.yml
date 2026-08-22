@@ -32,6 +32,16 @@ services:
     image: ghcr.io/abehera1992/hive-mcp:latest
     container_name: hive-mcp
     restart: unless-stopped
+    # Reap orphaned grandchildren (2026-08-22). main.py runs as PID 1, and PID 1 is
+    # what orphaned processes re-parent to -- but Python only ever waits on children
+    # it holds a subprocess object for, so anything git spawns and outlives becomes a
+    # permanent zombie. 23 `[git] <defunct>` entries had accumulated in 22 hours.
+    # Harmless in themselves; the damage is that list_processes(filter_str='git')
+    # truthfully reported ONLY defunct git processes, and a coordinator asked to list
+    # a directory read that and answered "the git command is not available in this
+    # environment -- I cannot proceed" (git was 2.47.3 and working). tini as PID 1
+    # reaps them; no image rebuild needed.
+    init: true
     ports:
       - "${HIVE_MCP_PORT:-9003}:9000"
     volumes:
@@ -58,6 +68,7 @@ services:
     image: ghcr.io/abehera1992/hive-mcp:latest
     container_name: hive-mcp-agno
     restart: unless-stopped
+    init: true                       # same zombie-reaping reason as the primary instance
     profiles: ["agno"]
     ports:
       - "9004:9000"

@@ -3337,6 +3337,25 @@ _CACHEABLE_READ_TOOLS = {
     # proven duplicate-serve escalation (2 full serves, then an escalating stub,
     # then the aggregate forced-answer nudge) instead of a bespoke fix.
     "lightrag_query",
+    # Environment introspection added 2026-08-22 -- the same self-reinforcing loop,
+    # measured this time from hive-mcp's own logs rather than inferred: ONE run fired
+    # list_processes(filter_str='git') 56 times with byte-identical arguments, each
+    # answered in 0.00s with a byte-identical payload, until the 60-call coordinator
+    # budget ran out and the run returned nothing usable. The transport was never the
+    # problem (hive-mcp is sub-millisecond over Tailscale) -- the model simply kept
+    # re-asking a question it already held the answer to, which is exactly what this
+    # cache's serve-twice-then-escalate path exists to break.
+    #
+    # get_env_info takes no arguments and is static; list_recent_files reads git
+    # history that cannot change mid-run; list_processes is not strictly constant, but
+    # nothing a coordinator legitimately does depends on watching it change within one
+    # run -- and lightrag_query above set the precedent for admitting a tool on
+    # "deterministic enough within a run, and looping on it is the real risk".
+    #
+    # check_port and bash_job_status are deliberately NOT here: both are genuine
+    # pollers whose whole purpose is to return a CHANGED value on a later call, and
+    # stubbing them would break background-job polling outright.
+    "list_processes", "get_env_info", "list_recent_files",
     # search_knowledge_graph added 2026-08-15, same day, same pattern: a planning-
     # team run cycled the SAME set of ~6 search_knowledge_graph queries
     # ({'query': 'parties form', 'limit': 10}, 'parties page', 'parties
