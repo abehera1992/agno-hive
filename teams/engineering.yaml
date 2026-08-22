@@ -45,37 +45,19 @@ description: Full engineering team — routes context, researches codebase, plan
 # pin it and take that one field out of DB control, same override rule as model:.
 
 agents:
-  - name: ContextRouter
-    description: Lightweight query router. Pick the fastest retrieval path and return raw results — never interpret or answer yourself.
-    role: Routing agent that retrieves the right context from the right backend.
-    # tools:/skills: are DB-managed (AGNOHive 2.3.3, 2026-08-18) — see
-    # seeds/team_config.yaml (first-run seed only) and
-    # api/server.py's _load_team() Tier 1 comment. Set either back here to pin
-    # this role's list and take it out of DB control again, same override rule
-    # as model: above.
-    instructions:
-      - You are a lightweight routing agent. Decide the fastest way to retrieve context for a query.
-      - Always use tools that are actually available — check the connected MCP, do not assume tool names.
-      - "Rules:"
-      - "  - Contents of ONE NAMED directory ('what files are in X/', 'list the files in X/', 'how many .py files in X/'):"
-      - "      call list_directory('X/') — it returns every entry in that directory."
-      - "      Do NOT use list_directory_tree() for this: it is DEPTH-LIMITED and shows a directory's"
-      - "      NAME without its contents, so it can never answer 'what is in this directory'."
-      - "      Return its raw output verbatim. Never answer such a question without calling this tool."
-      - "  - WHOLE-PROJECT shape questions ('how is the project organised', 'show me the structure'):"
-      - "      call list_directory_tree() — the repo-wide skeleton."
-      - "      Fall back to find_files('**/*') if list_directory_tree is not exposed by the MCP server."
-      - "      Pass ALL results to Researcher. Do not summarise or answer yourself."
-      - "  - 'How does X work' / feature questions: call search_files(X, '**/*') to find all occurrences across the codebase."
-      - "  - Specific file/symbol questions: call find_files() or search_files() directly."
-      - "  - Live database / row count questions ('how many rows', 'check the live database'): route to Researcher — it owns db_query/db_schema. Do NOT try to answer them from a file grep of model definitions."
-      - "  - Past task or lesson questions: call lightrag_query() if available."
-      - "  - Thematic/cross-module questions: call lightrag_query() with broad keywords if available."
-      - "  - User shares a URL or GitHub link → call web_fetch(url) immediately (if web_fetch is available)."
-      - "  - User asks about an external tool, library, or repo → web_search(name) then web_fetch on best result."
-      - "  - Task references a Notion page, spec, or doc by name/title ('the Notion page X', 'per the spec Y') → call notion_search(title) if available to find the page id, then notion_get_page(page_id) to read it. Pass the full content to Researcher/Planner, do not summarise it yourself."
-      - Return only the retrieved context. Do not answer the question yourself.
-      - "Tool call limit: 1 for specific lookups. Up to 3 for overview/structure queries to ensure complete coverage."
+# ContextRouter was REMOVED from this roster on 2026-08-22. It is still defined for the
+# planning team; only engineering dropped it. Reason, measured live over 24 probe runs:
+# 105 delegations to context-router produced ZERO tool events and ZERO RunStarted, while
+# every one of the 3 delegations that reached researcher ran correctly. The delegation is
+# accepted (agno's "Member with ID ... not found" string never appears), resolves to the
+# right id, and hands back an async generator that is simply never iterated for this one
+# member. Ruled out by direct measurement, not reasoning: member id, tool grants
+# (context-router held 11 tools including list_directory, limit 25), tool_call_limit,
+# agno's member lookup, our own duplicate-delegation gate (falsified by allowing the
+# duplicates through -- same result), and the model (swapping it onto the coordinator's
+# own qwen3-coder:30b changed nothing; both ids already alias to vllm_served_as
+# 'local-shared', i.e. the same served weights). Researcher holds a superset of its tools
+# plus get_file_content, so no retrieval capability is lost by routing through it instead.
 
   - name: Researcher
     description: Codebase investigation AND task decomposition specialist (merged with the former Planner role, 2026-08-14 — see the "AgnoHive - Engineering Team 2.0 Update" Notion plan). Read real files and ground every claim in file content — never describe from directory names alone. For a multi-part task, decompose into a literal checklist BEFORE exploring; for an implementation task, also break it into steps naming the responsible agent.

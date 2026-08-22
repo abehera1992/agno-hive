@@ -297,7 +297,8 @@ _CLOUD_MODELS = [
 # (see get_default_model()'s docstring / api/server.py's _load_team()).
 _TEAM_ROLE_DEFAULTS = [
     ("engineering", "Coordinator", "qwen3-coder:30b"),
-    ("engineering", "ContextRouter", "llama3.1:8b"),
+    # No engineering/ContextRouter row — that role was dropped from the roster
+    # 2026-08-22 (see teams/engineering.yaml's own note). planning still has one.
     ("engineering", "Researcher", "qwen2.5-coder:32b"),
     ("engineering", "Coder", "qwen2.5-coder:32b"),
     ("engineering", "Executor", "llama3.1:8b"),
