@@ -3038,6 +3038,34 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             + _summarize_actual_writes(*all_results)
         )
 
+    # Capability-claim check (2026-08-22). Sibling of the bare-absence search guard
+    # above, on infrastructure instead of symbols: an answer that declares a whole
+    # capability unavailable, where the run's own tool record says otherwise. See
+    # _unsupported_capability_claim for the three live instances this generalises.
+    # Disclosure rather than retry, same reasoning as the count guard: the
+    # contradicting evidence is already in hand, and re-running costs a minute to
+    # re-derive it.
+    capability = _unsupported_capability_claim(content, getattr(team, "_tool_outcomes", None))
+    if capability is not None:
+        family, kind, tools = capability
+        print(f"[team] answer claims {family} unavailable but its tools were "
+              f"{kind} this run — flagging", flush=True)
+        detail = (
+            f"a {family} tool ({', '.join(tools)}) RETURNED SUCCESSFULLY in this same "
+            f"run, so the answer is contradicted by its own evidence. A valid empty or "
+            f"zero result is an ANSWER, not a failure."
+            if kind == "contradicted" else
+            f"no {family} tool ({', '.join(tools)}) was called at all this run, so the "
+            f"claim is an unverified negative — the same thing the NEGATIVE-CLAIM rule "
+            f"forbids for symbols and files."
+        )
+        return (
+            f"{content}\n\n---\n**{family.upper()} AVAILABILITY CLAIM NOT SUPPORTED BY "
+            f"THIS RUN — {detail} Do not act on the claim that the {family} is down "
+            f"without checking by hand.**"
+            + _summarize_actual_writes(*all_results)
+        )
+
     # Tool-budget-exhausted check. Unlike every other guard here this one cannot force a
     # retry: a re-run would hit the same ceiling, and agno has already told the model
     # "Don't try to execute it again". Disclosure is the whole remedy -- the answer may
@@ -4718,6 +4746,7 @@ def _make_duplicate_delegation_gate_hook():
     first place.
     """
     log: list[dict] = []
+    issued_job_ids: set[str] = set()
 
     async def _duplicate_delegation_gate_hook(function_name, function, args,
                                               run_context=None, team=None):
@@ -4752,8 +4781,44 @@ def _make_duplicate_delegation_gate_hook():
                 "one was meant. This request_clarification call was NOT executed; you "
                 "may call it again after a real delegation."
             )
+
+        # Fabricated background-job handle (2026-08-22). Executor, asked for the git
+        # branch, invented TWELVE job ids it had never started -- 'kill-git-1',
+        # 'kill-git-urgent', 'kill-git-final-override' -- and polled bash_job_status on
+        # each, then reported the repository unreadable. It never called bash_run once.
+        #
+        # hive-mcp answers an unknown id with "unknown job_id: ... (finished and reaped,
+        # or never created)", which is ambiguous in exactly the wrong direction: it reads
+        # as "that job existed and is gone", inviting another guess. The same
+        # retry-with-variations loop is on record for lightrag_query (9+ identical calls)
+        # and get_context_section (~25 across irrelevant topics); this is its handle-
+        # shaped form, and unlike those it is fully decidable -- a job id this run never
+        # issued cannot refer to anything.
+        if function_name in _JOB_HANDLE_TOOL_NAMES:
+            job_id = str((args or {}).get("job_id", "")).strip()
+            if job_id and job_id not in issued_job_ids:
+                print(f"[team] {function_name}({job_id!r}) — never issued by bash_run "
+                      f"this run, blocked", flush=True)
+                started = (", ".join(sorted(issued_job_ids)) if issued_job_ids
+                           else "none — you have not started any background job")
+                return (
+                    f"REDIRECTED: no background job with id {job_id!r} was ever started "
+                    f"in this run, so there is nothing to poll — you cannot reach a job "
+                    f"by inventing a plausible-looking id. Jobs started so far: "
+                    f"{started}. To run something in the background, call "
+                    f"bash_run(command=..., background=True) FIRST and use the job_id it "
+                    f"returns. To run something now, call bash_run without background. "
+                    f"This {function_name} call was NOT executed."
+                )
+
         if function_name not in _DELEGATION_TOOL_NAMES:
-            return await function(**args)
+            result = await function(**args)
+            # Record real handles so the gate above can tell issued from invented.
+            if function_name == "bash_run" and isinstance(result, str):
+                match = _JOB_ID_RE.search(result)
+                if match:
+                    issued_job_ids.add(match.group(1))
+            return result
 
         raw_task = (args or {}).get("task")
         task_text = _normalize_delegation_task(raw_task)
@@ -5956,6 +6021,92 @@ async def _run_heartbeat(
                 print(f"[team] liveness write warning: {exc}", flush=True)
 
 
+_JOB_HANDLE_TOOL_NAMES = {"bash_job_status", "bash_job_kill"}
+# bash.py's _start_background_job returns "job_id: <12 hex>\nstatus: running"
+_JOB_ID_RE = re.compile(r"job_id:\s*([0-9a-f]{6,32})")
+
+
+# Error markers every hive-mcp tool family returns verbatim on failure -- read off
+# their own source: db.py's _err ("db error: ..."), git.py's three failure returns,
+# shell.py's timeout/not-found/failed returns, context.py's not-found returns.
+_TOOL_ERROR_PREFIXES = (
+    "db error:", "git error:", "git timed out", "git not found in PATH",
+    "timed out after", "command not found:", "failed:", "Not found:",
+    "unknown job_id:", "list_directory failed:", "list_directory blocked:",
+)
+
+
+def _looks_like_tool_error(preview) -> bool:
+    """Whether a tool result is a failure, by its own documented error prefix."""
+    if not isinstance(preview, str):
+        return False
+    return preview.lstrip().startswith(_TOOL_ERROR_PREFIXES)
+
+
+# A claim that a whole capability is unavailable, and the tools that would prove or
+# disprove it. Both halves are needed: the claim alone is not wrong, and the tool
+# record alone says nothing about what the answer asserted.
+_CAPABILITY_FAMILIES = {
+    "database": (
+        re.compile(
+            r"\b(?:database|db|postgres|postgresql|sql)\b[^.]{0,60}?\b(?:is |are |was |were )?"
+            r"(?:not running|not available|unavailable|not accessible|inaccessible|"
+            r"is down|cannot be (?:queried|reached|executed|accessed)|must be started)",
+            re.IGNORECASE),
+        {"db_query", "db_schema"},
+    ),
+    "git": (
+        re.compile(
+            r"\bgit\b[^.]{0,60}?\b(?:is |are |was |were )?"
+            r"(?:not available|not installed|unavailable|not accessible|inaccessible|"
+            r"cannot be (?:used|executed|run)|could not be executed)",
+            re.IGNORECASE),
+        {"git_status", "git_log", "git_diff", "git_blame", "git_log_file"},
+    ),
+}
+
+
+def _unsupported_capability_claim(content: str, outcomes: dict | None):
+    """An "X is unavailable" claim the run's own tool record does not support.
+
+    Returns (family, kind, tools) where kind is:
+      "contradicted" — a tool in that family SUCCEEDED this run, so the answer is
+                       refuted by its own evidence;
+      "untried"      — no tool in that family was called at all, so the claim is an
+                       unverified negative (the NEGATIVE-CLAIM rule members already
+                       carry, applied to infrastructure instead of symbols).
+    None when the claim is absent, or when the family's tools were tried and only
+    ever failed -- there the claim is properly grounded and must NOT be flagged.
+
+    Three live instances in one day, three different tools, all the same shape: a
+    true-but-partial observation inflated into a false systemic conclusion.
+      * list_processes showed only zombie git entries -> "the git command is not
+        available in this environment"; git was 2.47.3 and working.
+      * a hung D-state git -> "repository state inaccessible"; git status returned
+        the branch and a clean tree seconds later.
+      * db_query returned `count\\n0\\n[1 row(s)]` -- the correct answer, 0 -- and the
+        answer became "the live database is not running", after a check_port(5432)
+        that was the wrong port (postgres publishes 5433).
+    The last is the sharpest: a valid zero was read as a failure, then a cause was
+    hunted for it. Zero is a legitimate answer to a great many questions, and
+    treating it as absence corrupts counts, gap analyses and "is X used anywhere"
+    well beyond this probe.
+    """
+    if not content:
+        return None
+    outcomes = outcomes if isinstance(outcomes, dict) else {}
+    for family, (pattern, tools) in _CAPABILITY_FAMILIES.items():
+        if not pattern.search(content):
+            continue
+        ok = sum(outcomes.get(t, {}).get("ok", 0) for t in tools)
+        err = sum(outcomes.get(t, {}).get("err", 0) for t in tools)
+        if ok:
+            return family, "contradicted", sorted(tools)
+        if not err:
+            return family, "untried", sorted(tools)
+    return None
+
+
 _STATED_COUNT_RE = re.compile(
     r"\b(?:there are|there is|contains|returned|total of|exactly)\s+"
     r"(?:exactly\s+)?(\d{1,4})\b",
@@ -6276,6 +6427,13 @@ async def _stream_team_run(
                     if not isinstance(getattr(team, "_listings", None), list):
                         team._listings = []
                     team._listings.append(out["listing"])
+                if out.get("__tool_event__") == "end" and out.get("name"):
+                    if not isinstance(getattr(team, "_tool_outcomes", None), dict):
+                        team._tool_outcomes = {}
+                    bucket = team._tool_outcomes.setdefault(
+                        out["name"], {"ok": 0, "err": 0})
+                    bucket["err" if _looks_like_tool_error(out.get("result_preview"))
+                           else "ok"] += 1
                 print(f"[{log_label}] stream tool event: {out}", flush=True)
                 last_segment_start = len(full_content)
             else:
