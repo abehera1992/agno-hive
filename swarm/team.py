@@ -5742,6 +5742,65 @@ async def _run_heartbeat(
                 print(f"[team] liveness write warning: {exc}", flush=True)
 
 
+_LEAKED_TOOL_TAG_RE = re.compile(
+    r"<tool_call>\s*(?P<a>\{.*?\})\s*(?:</tool_call>|\Z)"
+    r"|<\|python_tag\|>\s*(?P<b>\{.*?\})\s*$",
+    re.DOTALL,
+)
+
+_BUDGET_EXHAUSTED_ANSWER = (
+    "I attempted another tool call, but this run's tool budget is exhausted so no "
+    "further tool calls can be made. I could not complete the remaining lookup — "
+    "treat anything not already established above as undetermined rather than assumed."
+)
+
+
+def _strip_leaked_tool_tags(content: str) -> str:
+    """Remove Hermes tool-call syntax that reached the FINAL answer as prose.
+
+    VLLMToolFix._sanitize_forced_text already does this, but only ever on the
+    non-streaming path. Confirmed live 2026-08-22: content streams through
+    `_parse_provider_response_delta` in fragments as small as ONE CHARACTER
+    (`[team] content: +1 chars (1 total)`), and that method's own guard is
+    `"<tool_call>" not in content` -- an 11-character tag split across 11 deltas
+    matches on none of them. So the delta path is structurally blind to the very
+    string it exists to catch, which is why the same fix cleared T11 (buffered)
+    and never touched T9 (streamed). This runs at the one place the fragments are
+    rejoined, where the tag is whole again.
+
+    NOT gated on tool_choice=="none". Forcing was confirmed active for both
+    leaking runs, so the flag was never the gap -- and gating here would re-open
+    the same hole for any leak that arrives without forcing. A final, user-facing
+    answer made of tool-call syntax is never correct regardless of how it got there.
+
+    Only strips a tag whose body actually parses as a tool call (JSON with a
+    "name"). An answer that merely QUOTES these tags -- reviewing this very file,
+    say -- keeps them: this codebase's own source is a realistic hive question, and
+    silently eating a correct quotation would be its own fabrication.
+    """
+    if "<tool_call>" not in content and "<|python_tag|>" not in content:
+        return content
+
+    def _replace(match: re.Match) -> str:
+        body = match.group("a") or match.group("b") or ""
+        try:
+            payload = json.loads(body)
+        except (ValueError, TypeError):
+            return match.group(0)          # not a real call -- a quotation, keep it
+        if not isinstance(payload, dict) or not payload.get("name"):
+            return match.group(0)
+        return ""
+
+    stripped = _LEAKED_TOOL_TAG_RE.sub(_replace, content)
+    if stripped == content:
+        return content
+
+    remaining = stripped.strip()
+    print(f"[team] stripped leaked tool-call syntax from the final answer "
+          f"({len(content)} -> {len(remaining)} chars)", flush=True)
+    return remaining or _BUDGET_EXHAUSTED_ANSWER
+
+
 async def _stream_team_run(
     team, prompt: str, *, log_label: str = "verify-retry", liveness_path: str | None = None
 ) -> tuple[str, "TeamRunOutput | None"]:
@@ -5912,7 +5971,7 @@ async def _stream_team_run(
     final_segment = "".join(full_content[last_segment_start:]).strip()
     fallback_content = final_segment if final_segment else accumulated
     content = final_run_output.content if final_run_output and final_run_output.content else fallback_content
-    return content, final_run_output
+    return _strip_leaked_tool_tags(content), final_run_output
 
 
 async def run_task_async(
