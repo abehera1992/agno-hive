@@ -4941,6 +4941,21 @@ def _build_team(
             make_coder(*mcp_list, tool_hooks=_hooks_for("Coder")),
             make_reviewer(*mcp_list, tool_hooks=_hooks_for("Reviewer")),
         ]
+    # Same reasoning as the coordinator-surface line below, for members (2026-08-22). 27
+    # delegations to context-router across 8 runs produced ZERO tool events while 3 to
+    # researcher produced 6 -- the member id is right, the model is right, and the DB grants
+    # are right, so what a member actually holds at construction is the only link left that
+    # nothing observes. Log the id agno will match delegations against, not just the name.
+    try:                                        # agno's own resolver, not our mirror of it
+        from agno.team._tools import get_member_id as _agno_member_id
+    except Exception:                           # pragma: no cover - agno layout drift
+        def _agno_member_id(m):                 # type: ignore[misc]
+            return _member_id(getattr(m, "name", "") or "")
+    for _m in members:
+        print(f"[team] member surface {_agno_member_id(_m)!r} ({len(getattr(_m, 'tools', []) or [])}): "
+              f"{[getattr(t, 'name', type(t).__name__) for t in (getattr(_m, 'tools', []) or [])]} "
+              f"tool_call_limit={getattr(_m, 'tool_call_limit', None)}", flush=True)
+
     # request_clarification is always available, regardless of read_only/allowlist scoping --
     # it's a local tool (not MCP-derived, so name-based allowlisting doesn't apply to it) with
     # no side effects, safe for every team including read-only ones (planning, parallel-review).
