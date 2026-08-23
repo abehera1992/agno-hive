@@ -137,7 +137,26 @@ _PATHLIKE_RE = re.compile(r"^[A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6}$")
 # they fire when a tool is CALLED with a wrong path, and T12 never called one -- it
 # asserted the structure from the model's priors and invented filenames to match. An
 # answer-time existence check is the only point that sees it.
-_ASSERTED_PATH_RE = re.compile(r"`([A-Za-z0-9_\-.]+(?:/[A-Za-z0-9_\-.]+)+/?)`")
+_ASSERTED_PATH_RE = re.compile(
+    # Backticked, OR bare in prose. The bare form was added 2026-08-23 after battery
+    # T11 fabricated THREE paths and none was checked, because it wrote them as bold
+    # prose headings -- "**File**: Client/.../DocUploadSection.tsx" -- and the check
+    # only ever looked inside backticks:
+    #     Client/EcommClient-Web/ekamweb/src/components/DocUploadSection.tsx
+    #     API/storage-service/router/upload.py
+    #     Client/.../admin/SellerDetailsDialog.tsx
+    # none of which exist, under a closing line claiming "All components are verified
+    # via file:line citations".
+    #
+    # The bare alternative REQUIRES a file extension, where the backticked one does not.
+    # Backticks are an explicit signal that the author means a path, so a directory
+    # ("API/x/routers/") is fair game there; in running prose an extension is what
+    # distinguishes a path from ordinary text containing a slash. Combined with the
+    # suppressors already in place -- MIME types, external URLs, suffix shorthands,
+    # negated claims, proposed-new-file claims -- this stays narrow enough to trust.
+    r"`([A-Za-z0-9_\-.]+(?:/[A-Za-z0-9_\-.]+)+/?)`"
+    r"|(?<![`\w/])([A-Za-z0-9_\-.]+(?:/[A-Za-z0-9_\-.]+)+\.[A-Za-z0-9]{1,6})(?![\w`])"
+)
 
 
 # MIME types look exactly like two-segment paths ("application/pdf", "text/csv"),
@@ -1203,7 +1222,9 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     asserted_paths: list[str] = []
     negated_paths: list[str] = []
     for m in _ASSERTED_PATH_RE.finditer(answer):
-        p = m.group(1)
+        p = m.group(1) or m.group(2)      # backticked, or bare-in-prose
+        if not p:
+            continue
         if p.startswith(_EXTERNAL_PATH_PREFIXES) or p in asserted_paths:
             continue
         if p.lower().startswith(_MIME_PREFIXES):

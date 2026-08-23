@@ -239,6 +239,49 @@ register_executor("notion", _execute)
 
 # ── Read tools (no approval required) ────────────────────────────────────────
 
+def _result_title(r: dict) -> str:
+    """Best-effort title of a Notion search result, '' when it has none."""
+    try:
+        return r["properties"]["title"]["title"][0]["plain_text"]
+    except Exception:
+        pass
+    try:
+        return r["title"][0]["plain_text"]
+    except Exception:
+        return ""
+
+
+def _rank_by_title(results: list, query: str) -> list:
+    """Re-rank search results so title matches come first, order otherwise preserved.
+
+    Notion's relevance ranking is not title-first: an exact title match for
+    "eKam - Delivery Board" sat at position 94 of 100 on this workspace, behind pages
+    that merely shared a word and had been edited more recently. Truncating that order
+    at 10 hid the page completely, and an agent then reported it as nonexistent.
+
+    Ranking is deliberately simple and total: exact title (case-insensitive) first,
+    then title-contains-query, then query-contains-title (for a short title searched
+    with a longer phrase), then everything else in Notion's original order. Nothing is
+    dropped -- a result that matches nothing still appears, just lower.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return results
+
+    def rank(item: tuple) -> tuple:
+        idx, r = item
+        t = _result_title(r).strip().lower()
+        if t and t == q:
+            return (0, idx)
+        if t and q in t:
+            return (1, idx)
+        if t and t in q:
+            return (2, idx)
+        return (3, idx)
+
+    return [r for _, r in sorted(enumerate(results), key=rank)]
+
+
 def notion_search(query: str, filter_type: str = "") -> str:
     """
     Search Notion pages and databases by title or content.
@@ -248,12 +291,27 @@ def notion_search(query: str, filter_type: str = "") -> str:
         query:       Search terms
         filter_type: Optional — 'page' or 'database' to narrow results
     """
-    body: dict = {"query": query, "page_size": 10}
+    # Fetch wide, then re-rank locally by title match (2026-08-23).
+    #
+    # Notion's own relevance order is not title-first, and page_size=10 silently hid an
+    # EXACT title match. Measured on this workspace: searching the literal string
+    # "eKam - Delivery Board" returned the page at RANK 94 --
+    #   page_size=10  -> absent
+    #   page_size=50  -> absent
+    #   page_size=100 -> found, position 94
+    # so the top 10 were entirely unrelated pages that happened to be edited recently.
+    #
+    # This produced a real, repeated wrong answer, and a nasty one: an agent asked to
+    # find that page reported "the page does not exist in the workspace" and offered a
+    # different page as the closest match. It was reading the tool faithfully -- the
+    # tool was the thing that was wrong. A retrieval tool whose ranking can bury an
+    # exact title match teaches agents to assert absence.
+    body: dict = {"query": query, "page_size": 100}
     if filter_type in ("page", "database"):
         body["filter"] = {"value": filter_type, "property": "object"}
     try:
         data    = _request("POST", "/search", body)
-        results = data.get("results", [])
+        results = _rank_by_title(data.get("results", []), query)[:10]
         if not results:
             return f"notion: no results for '{query}'"
         lines = [f"notion search — {len(results)} result(s) for '{query}':"]
