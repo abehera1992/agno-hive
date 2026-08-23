@@ -272,8 +272,13 @@ _NEGATION_BEFORE_RE = re.compile(
     # a normal, frequent answer shape ("there is no rate-limiting middleware", "no such
     # directory"), and flagging those as fabrication is precisely what teaches readers to
     # ignore this tool along with its true positives.
-    r"\b(no|not|isn't|aren't|never|unlike|instead of|rather than|as opposed to)"
-    r"\s*[:,]?\s*$",
+    r"\b(no|not|isn't|aren't|never|unlike|instead of|rather than|as opposed to)\b"
+    # Allow a few words between the negation and the token. Anchoring the negation
+    # immediately before it missed the commonest phrasing of all: "does not have a
+    # `sku_prefix` column" -- live on battery T1, where the answer denied a column
+    # that exists at models.py:129 and nothing flagged it. "have a" was enough to
+    # break the match.
+    r"[\w\s,'-]{0,25}$",
     re.IGNORECASE,
 )
 _NEGATION_AFTER_RE = re.compile(
@@ -1052,6 +1057,9 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     # below, never counted toward the fabrication verdict. See _is_proposed_new_claim
     # and the have_staged comment just below for the two ways a symbol lands here.
     proposed_idents: list[str] = []
+    # Claims that something does NOT exist. Collected rather than discarded so the
+    # opposite check can run -- see the ABSENCE CLAIMS section.
+    negated_idents: list[str] = []
     for m in _BACKTICK_RE.finditer(answer):
         span = m.group(1)
         tok = span.strip().rstrip("()").strip()
@@ -1059,6 +1067,11 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             if tok in _MCP_TOOL_NAMES:
                 continue
             if _is_negated_claim(answer, m.start(), m.end()):
+                # NOT skipped any more -- inverted. See the ABSENCE section below:
+                # "X does not exist" is a checkable claim, and checking it is the
+                # opposite grep, not no grep at all.
+                if tok not in negated_idents:
+                    negated_idents.append(tok)
                 continue
             if _is_proposed_new_claim(answer, m.start()):
                 if tok not in idents and tok not in proposed_idents:
@@ -1159,6 +1172,7 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     # the one question nothing else asked, "does this path exist at all", which is
     # exactly where today's most frequent failure lived. See _ASSERTED_PATH_RE.
     asserted_paths: list[str] = []
+    negated_paths: list[str] = []
     for m in _ASSERTED_PATH_RE.finditer(answer):
         p = m.group(1)
         if p.startswith(_EXTERNAL_PATH_PREFIXES) or p in asserted_paths:
@@ -1168,7 +1182,11 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
         if any(p == f for f, _ in file_lines):
             continue
         if _is_negated_claim(answer, m.start(), m.end()):
-            continue          # "there is no routers/ directory" is a correct statement
+            # Inverted, same as negated identifiers: a claim that a path is ABSENT is
+            # checked by testing whether it in fact exists.
+            if p not in negated_paths:
+                negated_paths.append(p)
+            continue
         if _is_proposed_new_claim(answer, m.start()):
             continue          # "create API/x/new_file.py" describes future work
         asserted_paths.append(p)
@@ -1177,7 +1195,8 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     # path ("the routers live in `API/x/routers/items.py`") used to exit here as
     # "nothing to check", which made the path check inert on exactly the answers it
     # was built for. Found by calling verify_claims directly in the container.
-    if (not (idents or file_lines or routes or proposed_idents or asserted_paths)
+    if (not (idents or file_lines or routes or proposed_idents or asserted_paths
+             or negated_idents or negated_paths)
             and not _lint_code(answer)):
         return ("verify_claims: no checkable claims found (no backticked symbols, "
                 "code-block attribute references, file:line citations, API routes, "
@@ -1372,6 +1391,47 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                                     f"appears at line(s) {near}"
                                 )
                                 break
+        out.append("")
+
+    # ── absence claims ────────────────────────────────────────────────────────
+    # The mirror of every other check on this page. Those ask "you said X exists --
+    # does it?"; this asks "you said X does NOT exist -- are you sure?"
+    #
+    # Added 2026-08-23 after a battery run where THREE of the first five probes
+    # confidently denied something real:
+    #   * "The ItemCategory model does not have a sku_prefix column" (models.py:129)
+    #   * "No evidence of a seller verification feature exists"
+    #     (business_admin_api.py:84, verify_seller())
+    #   * "The page does not exist" -- after notion_search returned 2,259 chars of hits
+    # None was flagged, and the reason is uncomfortable: the negation suppressor added
+    # the same afternoon (so a CORRECT absence claim would stop being reported as
+    # fabrication) meant every absence claim now bypassed checking entirely. Right fix,
+    # missing half. Suppressing a check is not the same as running the opposite one.
+    #
+    # An unverified negative is the more expensive error of the two: a fabricated
+    # symbol gets caught the moment someone looks for it, while "that feature does not
+    # exist" ends the search. It is also how T3 failed -- a literal-string miss for
+    # "seller verification" became proof the whole feature was absent.
+    if negated_idents or negated_paths:
+        checked = negated_idents[:_MAX_CLAIMS] + negated_paths[:_MAX_CLAIMS]
+        out.append(f"ABSENCE CLAIMS ({len(checked)} checked):")
+        for tok in negated_idents[:_MAX_CLAIMS]:
+            hits = _rg(tok, fixed=True, glob_filter=glob_filter,
+                       whole_word="." not in tok)
+            code_hits = [h for h in hits
+                         if not h.split(":", 1)[0].lower().endswith(_DOC_EXTS)]
+            if code_hits:
+                problems += 1
+                out.append(f"  CONTRADICTED  {tok:<34} <-- claimed ABSENT but exists: "
+                           f"{code_hits[0].split(chr(10))[0][:90]}")
+            else:
+                out.append(f"  ABSENT OK     {tok:<34} (no code match — the claim holds)")
+        for p in negated_paths[:_MAX_CLAIMS]:
+            if (PROJECT_ROOT / p.rstrip("/")).exists():
+                problems += 1
+                out.append(f"  CONTRADICTED  {p:<34} <-- claimed ABSENT but the path exists")
+            else:
+                out.append(f"  ABSENT OK     {p:<34} (no such path — the claim holds)")
         out.append("")
 
     # ── asserted paths (extracted above, before the early-exit) ──────────────
