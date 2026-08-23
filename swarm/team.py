@@ -4838,6 +4838,29 @@ def _make_duplicate_delegation_gate_hook():
                 "may call it again after a real delegation."
             )
 
+        # Context budget (2026-08-22). Stop BEFORE the model call that would overflow,
+        # not after. Battery T12 died with litellm.ContextWindowExceededError at
+        # 258,049 of 262,144 tokens, ten minutes into real work, and the whole run was
+        # lost -- every member answer already gathered went down with it. Refusing the
+        # next delegation instead leaves the coordinator holding all of that and simply
+        # requires it to answer now.
+        #
+        # Checked only for delegations, because member results are what accumulate in
+        # the coordinator's context; a member's own reads live in its own.
+        if function_name in _DELEGATION_TOOL_NAMES:
+            spent = getattr(team, "_member_result_chars", 0)
+            if spent >= _RUN_MEMBER_RESULT_CHAR_BUDGET:
+                print(f"[team] context budget exhausted ({spent:,} chars) — refusing "
+                      f"further delegation, forcing an answer", flush=True)
+                _force_text_only(None, team=team)
+                return (
+                    f"STOP — CONTEXT BUDGET REACHED: members have already returned "
+                    f"{spent:,} characters of results this run, which is as much as can "
+                    f"be carried without overflowing the model's context window. No "
+                    f"further delegation will run. Write your final answer NOW from what "
+                    f"you already have, and say plainly which parts you could not cover."
+                )
+
         # Fabricated background-job handle (2026-08-22). Executor, asked for the git
         # branch, invented TWELVE job ids it had never started -- 'kill-git-1',
         # 'kill-git-urgent', 'kill-git-final-override' -- and polled bash_job_status on
@@ -6165,6 +6188,14 @@ def _record_stream_artifacts(team, out: dict) -> None:
         if not isinstance(getattr(team, "_member_results", None), dict):
             team._member_results = {}
         team._member_results[_member_key(out.get("agent_name", ""))] = out["content"]
+        # Running total of what has landed in the COORDINATOR's context. Every member
+        # result is appended there verbatim, so this is the quantity that actually
+        # grows toward the model's context limit -- see _delegation_budget_exhausted.
+        team._member_result_chars = (
+            getattr(team, "_member_result_chars", 0) + len(out.get("content") or "")
+        )
+        print(f"[team] context budget: {team._member_result_chars:,} chars of member "
+              f"results so far ({_RUN_MEMBER_RESULT_CHAR_BUDGET:,} budget)", flush=True)
         return
     if out.get("listing"):
         if not isinstance(getattr(team, "_listings", None), list):
@@ -6176,6 +6207,26 @@ def _record_stream_artifacts(team, out: dict) -> None:
         bucket = team._tool_outcomes.setdefault(out["name"], {"ok": 0, "err": 0})
         bucket["err" if _looks_like_tool_error(out.get("result_preview")) else "ok"] += 1
 
+
+# How many characters of MEMBER RESULTS one run may accumulate before the coordinator
+# is made to answer with what it has.
+#
+# Every delegated member's answer is appended verbatim to the coordinator's own
+# context, so this is the quantity that actually grows toward the model's limit. Live
+# 2026-08-22, battery T12 ("write a detailed architectural overview…"): ~15 distinct
+# delegations, each returning a substantial answer, ended in
+# litellm.ContextWindowExceededError at 258,049 input tokens against a 262,144 limit --
+# after ten minutes of real work that was then thrown away entirely.
+#
+# hive-mcp caps any SINGLE file at _MAX_FULL_BYTES (200 KB) and skeletonises past it,
+# but nothing has ever bounded the CUMULATIVE total across a run. A budget is the
+# missing half of that pair.
+#
+# 400,000 chars is roughly 100-115k tokens on this codebase's mix of prose and Python,
+# leaving generous room for instructions, the roster, tool schemas and the final answer
+# inside 262,144. Deliberately conservative: overshooting costs a whole run, while
+# stopping early still yields an answer built on everything gathered so far.
+_RUN_MEMBER_RESULT_CHAR_BUDGET = 400_000
 
 _JOB_HANDLE_TOOL_NAMES = {"bash_job_status", "bash_job_kill"}
 # bash.py's _start_background_job returns "job_id: <12 hex>\nstatus: running"
