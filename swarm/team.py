@@ -3768,6 +3768,23 @@ def _forced_answer_nudge(agent_key: str, total_stub_count: int) -> str:
 #    the common case, not full coverage.
 _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS = 3
 
+# How many characters of FRESH reads one agent may accumulate in a single run.
+#
+# Measured, not chosen: battery T12 overflowed at 258,049 of 262,144 tokens, and the
+# cause was one member -- 88 get_file_content calls by Researcher, 40/50 of its own
+# tool budget, on a service whose models.py alone is 32 KB. 500,000 chars is roughly
+# 125-145k tokens on this codebase's Python, which leaves room for the agent's
+# instructions, its task, the tool schemas and its answer inside 262,144.
+#
+# Charged per AGENT, not per run: each member has its own context, and one member
+# reading widely must not starve another that has read nothing.
+_MEMBER_READ_CHAR_BUDGET = 500_000
+
+
+def is_fresh_read_budget_exceeded(read_chars: dict[str, int], agent_key: str) -> bool:
+    """Whether this agent has already consumed its per-run read budget."""
+    return read_chars.get(agent_key, 0) >= _MEMBER_READ_CHAR_BUDGET
+
 
 # How many calls of an agent's budget to leave unspent when forcing it to answer.
 # 1, not 0: the guard fires AFTER the call that reaches (limit - reserve) returns, so
@@ -4176,6 +4193,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # tool_choice; consecutive_stub_count is the streak that decides when to.
     agent_objects: dict[str, object] = {}
     consecutive_stub_count: dict[str, int] = {}
+    read_chars: dict[str, int] = {}   # fresh-read chars per agent, see _MEMBER_READ_CHAR_BUDGET
     # Closure-local record of every REAL (fresh, non-stubbed) read this run, at any
     # delegation depth (2026-08-21). This hook instance is shared across the coordinator
     # and every member, so its closure sees all of them -- which session_state does not.
@@ -4269,6 +4287,35 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             _bump_consecutive_stub_and_maybe_force_text_only(norm_agent_key, agent, consecutive_stub_count)
             return _not_found_retry_stub(relative_path, count)
 
+        # Per-member read budget (2026-08-22). A cache HIT is free -- that content is
+        # already in this agent's context -- so only a genuinely fresh fetch is charged,
+        # and only a fresh fetch is refused.
+        #
+        # This is the accumulator that actually overflows. Battery T12 died with
+        # litellm.ContextWindowExceededError at 258,049 of 262,144 tokens, and the
+        # measured cause was ONE member: 88 get_file_content calls by Researcher,
+        # reaching 40/50 of its own tool budget, on a service whose models.py alone is
+        # 32 KB. A first attempt at this budgeted the coordinator's accumulated MEMBER
+        # RESULTS instead and was measured inert on the next run (5,845 chars against a
+        # 400,000 budget) -- right mechanism, wrong accumulator. Member answers are
+        # summaries; member READS are the bulk.
+        if (
+            is_fresh_read_budget_exceeded(read_chars, norm_agent_key)
+            and cache_key not in cache
+        ):
+            spent = read_chars.get(norm_agent_key, 0)
+            print(f"[team] {agent_key or 'coordinator'} read budget exhausted "
+                  f"({spent:,} chars) — refusing further reads, forcing an answer",
+                  flush=True)
+            if agent is not None:
+                _force_text_only(agent)
+            return (
+                f"READ BUDGET REACHED: you have already read {spent:,} characters this "
+                f"run, which is as much as fits in context alongside your task and your "
+                f"answer. No further reads will run. Answer NOW from what you have "
+                f"read, and state plainly which parts you could not examine."
+            )
+
         is_fresh_fetch = cache_key not in cache
         if is_fresh_fetch:
             result = await function(**args)
@@ -4277,6 +4324,9 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             result = cache[cache_key]
 
         if is_fresh_fetch:
+            read_chars[norm_agent_key] = (
+                read_chars.get(norm_agent_key, 0) + len(str(result))
+            )
             _record_read(run_context, function_name, args, agent_key, len(str(result)))
             # Second, independent source -- survives delegation, unlike session_state.
             read_state["reads"].append({"tool": function_name, "read_by": agent_key or "coordinator"})
@@ -6021,7 +6071,8 @@ async def run_task_stream(
                     elif isinstance(out, dict) and out.get("__run_error__"):
                         raise _BackendRunError(out["message"])
                     elif isinstance(out, dict):
-                        yield out
+                        if _consume_stream_event(team, out):
+                            yield out
                         last_segment_start = len(full_content)
                 accumulated = "".join(full_content) or "(no response)"
                 final_segment = "".join(full_content[last_segment_start:]).strip()
@@ -6170,6 +6221,34 @@ def _stream_event_log_line(out: dict) -> str:
         return (f"member result: {out.get('agent_name', '?')} "
                 f"({len(content)} chars) -- ...{content[:120]!r}")
     return f"stream tool event: {out}"
+
+
+def _consume_stream_event(team, out: dict) -> bool:
+    """Record a stream event's artifacts; return whether it is worth surfacing.
+
+    THE one place a tool-event dict is handled. Three loops consume this stream --
+    run_task_stream (CLI), _stream_team_run (retries) and run_task_async (first
+    attempt) -- each with its own private copy of the dispatch, and that duplication
+    has now caused four separate live defects in a single day:
+
+      * the artifact recorder was wired into one loop, so every guard fed by it was
+        blind on first attempts and stayed silent in production;
+      * the member-result capture had the same gap;
+      * _strip_leaked_tool_tags was installed at one of three answer-assembly points,
+        so a raw <tool_call> tag reached a user hours after the fix "shipped";
+      * run_task_stream never recorded artifacts at all, and would have yielded
+        member-result events -- a member's ENTIRE answer -- straight into the CLI.
+
+    Returning a bool rather than acting keeps the genuinely different halves apart:
+    the CLI yields the event to its client, the other two log it. What must happen on
+    EVERY event now happens in exactly one place.
+
+    Member-result events are bookkeeping, not display: recorded, never surfaced.
+    """
+    if not isinstance(out, dict):
+        return False
+    _record_stream_artifacts(team, out)
+    return not out.get("__member_result__")
 
 
 def _record_stream_artifacts(team, out: dict) -> None:
@@ -6667,8 +6746,8 @@ async def _stream_team_run(
                 # Stash listing counts on the team, alongside _read_state, so the
                 # answer-time count guard can reach them. Accumulates across a run's
                 # retries exactly like _read_state does.
-                _record_stream_artifacts(team, out)
-                print(f"[{log_label}] {_stream_event_log_line(out)}", flush=True)
+                if _consume_stream_event(team, out):
+                    print(f"[{log_label}] {_stream_event_log_line(out)}", flush=True)
                 last_segment_start = len(full_content)
             else:
                 _log_unclassified_stream_event(log_label, event, unrecognized_event_counts)
@@ -6977,8 +7056,8 @@ async def run_task_async(
                                 raise _BackendRunError(out["message"])
                             elif isinstance(out, dict):
                                 activity["last_progress_at"] = time.monotonic()
-                                _record_stream_artifacts(team, out)
-                                print(f"[team] {_stream_event_log_line(out)}", flush=True)
+                                if _consume_stream_event(team, out):
+                                    print(f"[team] {_stream_event_log_line(out)}", flush=True)
                                 last_segment_start = len(full_content)
                             else:
                                 # Diagnostic (2026-08-10, revised): the first version of this
