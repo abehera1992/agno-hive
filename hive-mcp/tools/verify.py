@@ -51,6 +51,7 @@ Treat a clean report as "nothing provably invented", never as "the answer is cor
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 import shutil
@@ -117,6 +118,66 @@ _LINE_TOLERANCE = 5
 # NEXT citation's own path, not content this citation is claiming -- exclude it or
 # every citation "quotes" the following one's filename.
 _PATHLIKE_RE = re.compile(r"^[A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6}$")
+# A backticked path an answer ASSERTS, checked for existence on its own rather than
+# only as an anchor for a line number. Requires a slash, so a bare `models.py` mention
+# is not treated as a path claim; allows a trailing slash and an optional extension so
+# `API/inventory-service/routers/` (a directory) is checked as readily as
+# `routers/items.py`.
+#
+# This is the gap that let today's most frequent failure through. `_BACKTICK_PATH_RE`
+# existed but was only ever used to pair a path with a nearby line number, so a path
+# asserted with NO line number was never verified at all. Live 2026-08-23, battery T12:
+# the answer described four routers -- `API/inventory-service/routers/items.py`,
+# `routers/gst.py`, `routers/ai.py`, `routers/lookup.py` -- none of which exist. The
+# real directory is `router/`, singular. The same one-character slip produced a
+# 54-delegation loop and a confident "no backend API route for seller verification has
+# been implemented" (the route is at business_admin_api.py:84) on other runs.
+#
+# The near-miss suggestions added to list_directory/find_files cannot reach this shape:
+# they fire when a tool is CALLED with a wrong path, and T12 never called one -- it
+# asserted the structure from the model's priors and invented filenames to match. An
+# answer-time existence check is the only point that sees it.
+_ASSERTED_PATH_RE = re.compile(r"`([A-Za-z0-9_\-.]+(?:/[A-Za-z0-9_\-.]+)+/?)`")
+
+
+def _near_miss_hint(rel: str) -> str:
+    """Name the wrong SEGMENT of a non-existent path, and the real one beside it.
+
+    Walks down while the path is real and reports siblings at the first segment that
+    is not -- which is where the mistake is. Checking only the immediate parent finds
+    nothing for `API/inventory-service/routers/items.py`, because that parent
+    (`routers/`) does not exist either; the wrong segment is one level up.
+
+    A bare "does not exist" restates what the model already believed was false.
+    "no 'routers' in API/inventory-service/ -- did you mean router?" is actionable,
+    and this whole check exists because of that one-character plural.
+    """
+    try:
+        parts = [s for s in rel.strip("/").split("/") if s]
+        cursor = PROJECT_ROOT
+        walked: list[str] = []
+        for part in parts:
+            candidate = cursor / part
+            if candidate.exists():
+                cursor, _ = candidate, walked.append(part)
+                continue
+            if not cursor.is_dir():
+                return ""
+            siblings = [c.name for c in cursor.iterdir() if not c.name.startswith(".")]
+            close = difflib.get_close_matches(part, siblings, n=2, cutoff=0.6)
+            if not close:
+                return ""
+            shown = "/".join(walked) or "."
+            return f"  -- no '{part}' in {shown}/; did you mean: {', '.join(close)}?"
+        return ""
+    except Exception:
+        return ""
+# Paths that name something outside the repo and must never be reported as fabricated:
+# URLs, package specifiers, and the docker/registry coordinates answers legitimately cite.
+_EXTERNAL_PATH_PREFIXES = (
+    "http://", "https://", "ghcr.io/", "docker.io/", "@", "/usr/", "/etc/", "/var/",
+    "/opt/", "/home/", "/tmp/", "/app/", "/project/",
+)
 # API routes, asserted constantly and invented almost as often. The prefixes come from
 # config.ROUTE_PREFIXES because "/api" is a convention, not a rule — a project routing
 # under /v1 or /graphql would otherwise have its routes silently skipped, and one routing
@@ -1276,6 +1337,42 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                                     f"appears at line(s) {near}"
                                 )
                                 break
+        out.append("")
+
+    # ── asserted paths ────────────────────────────────────────────────────────
+    # Existence-only, and deliberately so: this says nothing about whether the file
+    # contains what the answer claims -- that is the citation check's job. It answers
+    # the one question nothing else asked, "does this path exist at all", which is
+    # exactly where today's most frequent failure lived. See _ASSERTED_PATH_RE.
+    asserted_paths: list[str] = []
+    for m in _ASSERTED_PATH_RE.finditer(answer):
+        p = m.group(1)
+        if p.startswith(_EXTERNAL_PATH_PREFIXES) or p in asserted_paths:
+            continue
+        # A path already carrying a line number is checked, and checked harder, by the
+        # citation section -- do not report it twice under two headings.
+        if any(p == f for f, _ in file_lines):
+            continue
+        if _is_negated_claim(answer, m.start(), m.end()):
+            continue          # "there is no routers/ directory" is a correct statement
+        if _is_proposed_new_claim(answer, m.start()):
+            continue          # "create API/x/new_file.py" describes future work
+        asserted_paths.append(p)
+
+    if asserted_paths:
+        out.append(f"PATHS ({len(asserted_paths[:_MAX_CLAIMS])} checked):")
+        for p in asserted_paths[:_MAX_CLAIMS]:
+            target = (PROJECT_ROOT / p.rstrip("/"))
+            if target.exists():
+                kind = "dir" if target.is_dir() else "file"
+                out.append(f"  EXISTS     {p:<38} ({kind})")
+                continue
+            problems += 1
+            # Name the near miss when there is one. A bare "does not exist" is what the
+            # model already believed was false; "you meant router/" is actionable, and
+            # this whole check exists because of a one-character plural.
+            hint = _near_miss_hint(p)
+            out.append(f"  NOT FOUND  {p:<38} <-- no such file or directory{hint}")
         out.append("")
 
     # ── routes ────────────────────────────────────────────────────────────────
