@@ -765,9 +765,16 @@ def _did_you_mean_glob(glob_pattern: str) -> str:
                 continue
             if not cursor.is_dir():
                 return ""
+            # Files included, not just directories (fixed 2026-08-23, same day, from a
+            # live miss). A glob segment followed by ** must BE a directory, so it is
+            # tempting to only offer directories -- but the useful answer is often that
+            # the thing is a FILE. Live: find_files('API/business-service/models/**/*.py')
+            # matched nothing and stayed silent because the real `models.py` is a flat
+            # file and was filtered out of the candidates. "Did you mean: models.py?"
+            # is exactly the correction needed, and withholding it left the agent to
+            # keep guessing.
             siblings = [p.name for p in cursor.iterdir()
-                        if p.is_dir() and not p.name.startswith(".")
-                        and p.name not in _IGNORE_DIRS]
+                        if not p.name.startswith(".") and p.name not in _IGNORE_DIRS]
             close = difflib.get_close_matches(part, siblings, n=3, cutoff=0.6)
             if not close:
                 return ""
