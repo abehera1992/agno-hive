@@ -133,6 +133,78 @@ deployed commit so a future reader can tell what was being measured.
 
 ---
 
+### 2026-08-23 (later) — third run, after the glob/fabrication/report fixes
+
+Deployed: agno-hive `f3194eb`, hive-mcp image `14:47:51` (both containers recreated).
+
+**Accuracy 5 pass / 2 partial / 6 fail. Containment 8 pass / 0 partial / 5 fail.**
+
+**This run scored WORSE than the one before it (6/3/4, 9/1/3), and that is the most
+important line in this entry.** Several real fixes shipped between the two runs and two
+long-standing failures were genuinely fixed — yet the totals went down. Three runs of
+accuracy now read 6/2/5, 6/3/4, 5/2/6: flat, inside noise. **Single-run comparisons on
+this battery are not evidence.** Anything claimed from one run's delta should be treated
+as unproven until it repeats.
+
+| # | Prev | Now | Note |
+| --- | :--: | :--: | --- |
+| T1 | ✅ | ❌ | **regressed** — cited line 124; real is 129 (124 is `hsn_prefix`, the neighbouring column). Correct in the two prior runs |
+| T2 | ⚠️ | **✅** | **fixed** — full both-sides enumeration at last: all 13 endpoints and all 16 hooks listed individually, 6 gaps correct, `email-credentials` correctly not flagged |
+| T3 | ✅ | ❌ | stalled: `540s since last tool call (last: (none yet))`, 2,371 stream events — coordinator generated continuously and never called a tool. **Fourth distinct T3 outcome today** |
+| T4 | ✅ | ❌ | tool budget exhausted, no answer (disclosed) |
+| T5 | ❌ | ❌ | zero staged writes ✅, but no summary — narrated "the previous delegation … has already been made and returned results" and stopped |
+| T6 | ⚠️ | ⚠️ | count right, list omitted — enumeration guard fired again |
+| T7 | ✅ | ✅ | 6 + full list |
+| T8 | ✅ | ✅ | 0 rows, 10.9s |
+| T9 | ❌ | ❌ | **worse** — fabricated Python 3.11.6 and cwd `/home/ubuntu/ekam`; `get_env_info` was never called. Previously only mislabelled a real value |
+| T10 | ⚠️ | ✅ | `authHelper.py:132` + `auth_service_api.py:68` exact, no diagnostic dump |
+| T11 | ✅ | ⚠️ | 5 of 6 files real; `src/app/store/api.ts` invented (real slice is under `src/lib/api/services/`) |
+| T12 | ❌ | ❌ | **ran to completion** (no stall, no overflow — real progress) but fabricated its entire Routers section: `routers/items.py`, `routers/gst.py`, `routers/ai.py`, `routers/lookup.py`, none of which exist |
+| T13 | ❌ | **✅** | **fixed** — four gaps (`grn`, `credit-note`, `stock-adjustment`, `stock-transfer`), matching ground truth exactly |
+
+#### The plural-directory error is now the single most common root cause
+
+`routers/` for `router/` appears yet again, in T12, and this time it reached the final
+answer as four invented filenames. The near-miss suggestion cannot help here: it fires
+when a TOOL is called with a wrong path, and T12 never called one — it asserted the
+structure from priors. Across today this one slip has produced a 54-delegation loop, a
+"no backend API route exists" conclusion about a route that exists, and now a fabricated
+router inventory.
+
+#### Two probes claimed work that never happened
+
+T5 ("the previous delegation has already been made and returned results") and T9 ("the
+executor already ran the requested commands") both narrated retrieving a prior result and
+then produced nothing or invented values. The duplicate-delegation gate fired once for
+`executor` in T9's run and served a prior result, and `get_env_info` was never called at
+all.
+
+That wording is a **suspect, not a conclusion**: the gate's "ALREADY DONE — <member> was
+given this exact task earlier this run and returned: …" message may be encouraging the
+coordinator to believe a result exists for a task it never actually ran. Worth an A/B
+before changing it. Candidate mitigation: tell it explicitly that if the served result
+does not answer the task, it should delegate a DIFFERENT, more specific task rather than
+repeat this one.
+
+#### Guards that fired correctly
+
+Enumeration guard (T6), duplicate-delegation gate, `verify_claims` compaction (T10 clean),
+liveness watchdog (T3, T4 — killed and disclosed rather than hanging), and zero staged
+Notion writes on T5. Per-agent read logging worked throughout, peaking at
+`Researcher 151,881/500,000` — the budget never fired, and now we can see it was never
+close.
+
+#### Open after this run
+
+1. **Plural/near-miss paths asserted without a tool call** (T12) — the highest-frequency
+   root cause today, and the one the current fix structurally cannot reach.
+2. **Fabricated environment/tool results** (T9) — `_fabricated_tool_use` did not match,
+   because the claim was "the executor already ran the commands" rather than "X returned".
+3. **Coordinator narrating a retrieval instead of answering** (T5, T9).
+4. **T3 instability** — four different outcomes in one day on one prompt.
+
+---
+
 ### 2026-08-23 — second run, same prompts (first genuinely comparable rerun)
 
 Deployed code: `6c6ba80`. `engineering`, `read_only=True`, fresh session each. Ground truth
