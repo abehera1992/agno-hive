@@ -140,6 +140,35 @@ _PATHLIKE_RE = re.compile(r"^[A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6}$")
 _ASSERTED_PATH_RE = re.compile(r"`([A-Za-z0-9_\-.]+(?:/[A-Za-z0-9_\-.]+)+/?)`")
 
 
+# MIME types look exactly like two-segment paths ("application/pdf", "text/csv"),
+# and a relative fragment ("router/business_api.py") is a normal shorthand for a real
+# file deeper in the tree. Both were reported NOT FOUND in one live report on
+# 2026-08-23 -- two false positives in a single answer, which is how a checker stops
+# being read at all.
+_MIME_PREFIXES = ("application/", "text/", "image/", "audio/", "video/", "multipart/",
+                  "font/", "model/", "message/")
+
+
+def _resolves_as_suffix(rel: str) -> bool:
+    """True when `rel` is a shorthand for a real file deeper in the tree.
+
+    An answer citing `router/business_api.py` means
+    API/business-service/router/business_api.py, and is right to. Only accepted for a
+    multi-segment fragment -- a bare filename would match far too much.
+    """
+    try:
+        parts = [s for s in rel.strip("/").split("/") if s]
+        if len(parts) < 2:
+            return False
+        needle = "/".join(parts)
+        for found in PROJECT_ROOT.rglob(parts[-1]):
+            if found.as_posix().endswith(needle):
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def _near_miss_hint(rel: str) -> str:
     """Name the wrong SEGMENT of a non-existent path, and the real one beside it.
 
@@ -1177,6 +1206,8 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
         p = m.group(1)
         if p.startswith(_EXTERNAL_PATH_PREFIXES) or p in asserted_paths:
             continue
+        if p.lower().startswith(_MIME_PREFIXES):
+            continue          # "application/pdf" is a MIME type, not a path
         # A path already carrying a line number is checked, and checked harder, by the
         # citation section -- do not report it twice under two headings.
         if any(p == f for f, _ in file_lines):
@@ -1439,7 +1470,7 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
         out.append(f"PATHS ({len(asserted_paths[:_MAX_CLAIMS])} checked):")
         for p in asserted_paths[:_MAX_CLAIMS]:
             target = (PROJECT_ROOT / p.rstrip("/"))
-            if target.exists():
+            if target.exists() or _resolves_as_suffix(p):
                 kind = "dir" if target.is_dir() else "file"
                 out.append(f"  EXISTS     {p:<38} ({kind})")
                 continue
