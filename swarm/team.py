@@ -6026,7 +6026,10 @@ async def run_task_stream(
                 accumulated = "".join(full_content) or "(no response)"
                 final_segment = "".join(full_content[last_segment_start:]).strip()
                 fallback_content = final_segment if final_segment else accumulated
-                combined = final_run_output.content if final_run_output and final_run_output.content else fallback_content
+                combined = _strip_leaked_tool_tags(
+                    final_run_output.content if final_run_output and final_run_output.content
+                    else fallback_content
+                )
                 # Tier-3 guard: fill [[COUNT ...]] markers in the final content (streamed
                 # chunks above are pre-substitution; the done-sentinel content is corrected).
                 try:
@@ -6996,7 +6999,10 @@ async def run_task_async(
                 accumulated = "".join(full_content) or "(no response)"
                 final_segment = "".join(full_content[last_segment_start:]).strip()
                 fallback_content = final_segment if final_segment else accumulated
-                content = final_run_output.content if final_run_output and final_run_output.content else fallback_content
+                content = _strip_leaked_tool_tags(
+                    final_run_output.content if final_run_output and final_run_output.content
+                    else fallback_content
+                )
                 # Clarification check runs BEFORE the claim-verification/count-marker
                 # guards below, and short-circuits past both when found: those guards
                 # validate a completed factual answer, and a clarification block is
