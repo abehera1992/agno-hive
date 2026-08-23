@@ -1783,7 +1783,17 @@ def _reader_facing_report(report: str) -> str:
 # Findings a reader must see. Everything else in a verify_claims report is the check
 # showing its work: FOUND lines, echoed citation bodies, PLAUSIBLE route notes,
 # SPLIT-FOUND (explicitly not counted toward the verdict).
-_VERIFY_PROBLEM_MARKERS = ("NOT FOUND", "BAD ", "MISMATCH", "AMBIGUOUS", "DOC ONLY")
+# "CONTRADICTED" added 2026-08-23, the same day the absence check that emits it was
+# built -- and it had to be, because this compactor silently deleted the new finding on
+# its first live run. verify_claims correctly reported
+# "CONTRADICTED sku_prefix <-- claimed ABSENT but exists" and the reader saw nothing.
+#
+# Worth stating as a rule rather than a fix: a new finding TYPE is not shipped until
+# whatever decides which findings are worth showing knows about it. This list is that
+# decider, and it is easy to forget precisely because it lives in a different file from
+# the check.
+_VERIFY_PROBLEM_MARKERS = ("NOT FOUND", "BAD ", "MISMATCH", "AMBIGUOUS", "DOC ONLY",
+                           "CONTRADICTED")
 
 
 def _compact_verify_report(report: str) -> str:
