@@ -3854,15 +3854,26 @@ _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS = 3
 
 # How many characters of FRESH reads one agent may accumulate in a single run.
 #
-# Measured, not chosen: battery T12 overflowed at 258,049 of 262,144 tokens, and the
-# cause was one member -- 88 get_file_content calls by Researcher, 40/50 of its own
-# tool budget, on a service whose models.py alone is 32 KB. 500,000 chars is roughly
-# 125-145k tokens on this codebase's Python, which leaves room for the agent's
-# instructions, its task, the tool schemas and its answer inside 262,144.
-#
 # Charged per AGENT, not per run: each member has its own context, and one member
 # reading widely must not starve another that has read nothing.
-_MEMBER_READ_CHAR_BUDGET = 500_000
+#
+# 300,000 -- RETUNED FROM A MEASURED OVERFLOW, not chosen (2026-08-23). The first
+# value, 500,000, was a guess, and the per-agent read logging added alongside it
+# promptly proved the guess wrong: a live T12 run reached
+#   read budget: Researcher 556,734/500,000
+# the guard fired three times, and the run STILL died with ContextWindowExceededError
+# at 258,049 of 262,144 tokens. Firing at 500k is firing after the run is doomed.
+#
+# The same trace shows why a ceiling alone is not enough: the agent went from 436,663
+# to 556,734 in ONE read -- a single ~120,000-char file. This guard refuses the NEXT
+# read once the line is crossed, so a large enough read carries an agent well past the
+# limit in a single step, and hive-mcp returns up to _MAX_FULL_BYTES (200 KB) for one
+# file. The budget therefore has to leave room for one worst-case read on top of
+# itself:
+#   300,000 (budget) + 200,000 (largest single read) = 500,000 chars
+#   ~143k tokens, plus the ~99k of instructions/schemas/history implied by the failure
+#   above (258k total minus ~159k of read content) = ~242k, inside 262,144 with margin.
+_MEMBER_READ_CHAR_BUDGET = 300_000
 
 
 def is_fresh_read_budget_exceeded(read_chars: dict[str, int], agent_key: str) -> bool:
