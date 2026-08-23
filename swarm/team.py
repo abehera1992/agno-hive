@@ -3072,6 +3072,25 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             + _summarize_actual_writes(*all_results)
         )
 
+    # Coverage-arithmetic check (2026-08-23). A gap analysis whose own stated numbers
+    # contradict each other -- see _coverage_arithmetic_contradiction for the T13
+    # incident. Disclosure only: the numbers are the answer's own, so quoting them back
+    # is enough for a reader to see the problem without re-running anything.
+    coverage = _coverage_arithmetic_contradiction(content)
+    if coverage is not None:
+        total, covered, gaps = coverage
+        print(f"[team] coverage arithmetic does not add up "
+              f"({covered} + {gaps} != {total}) — flagging", flush=True)
+        return (
+            f"{content}\n\n---\n**THE NUMBERS IN THIS ANSWER DO NOT ADD UP — it states "
+            f"{total} items in total, {covered} covered and {gaps} not covered, but "
+            f"{covered} + {gaps} = {covered + gaps}. At least one of the three is wrong, "
+            f"and the enumeration above may be correct while the summary is not — that "
+            f"combination has shipped before. Re-check the gap list item by item against "
+            f"the full list before acting on it.**"
+            + _summarize_actual_writes(*all_results)
+        )
+
     # Under-answered enumeration check (2026-08-22). See _under_answered_enumeration
     # for why this is its own guard rather than a case of the count check above: the
     # facts are right, the reads happened, nothing is invented -- the answer just does
@@ -4327,6 +4346,16 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             read_chars[norm_agent_key] = (
                 read_chars.get(norm_agent_key, 0) + len(str(result))
             )
+            # Log the running total on every fresh read, not only when the budget trips
+            # (2026-08-23). The budget shipped without this and promptly went unmeasured:
+            # battery T12 stalled with Researcher at 40/50 tool calls and the guard
+            # silent, and there was no way to tell whether it had reached 60% of the
+            # ceiling or 6% -- so the threshold could not be tuned from evidence, only
+            # guessed at again. Mirrors the coordinator-side "context budget" line,
+            # which is exactly how THAT hypothesis got falsified within one run.
+            print(f"[team] read budget: {agent_key or 'coordinator'} "
+                  f"{read_chars[norm_agent_key]:,}/{_MEMBER_READ_CHAR_BUDGET:,} chars "
+                  f"(+{len(str(result)):,} {function_name})", flush=True)
             _record_read(run_context, function_name, args, agent_key, len(str(result)))
             # Second, independent source -- survives delegation, unlike session_state.
             read_state["reads"].append({"tool": function_name, "read_by": agent_key or "coordinator"})
@@ -6394,6 +6423,61 @@ def _unsupported_capability_claim(content: str, outcomes: dict | None):
         if not err:
             return family, "untried", sorted(tools)
     return None
+
+
+_COVERAGE_TOTAL_RE = re.compile(
+    r"\btotal\b[^.\n:]{0,40}?[:\s]\s*\**(\d{1,4})\b"
+    r"|\ball\s+(\d{1,4})\s+\w+[^.\n]{0,40}?\b(?:are|is)\b",
+    re.IGNORECASE)
+_COVERAGE_COVERED_RE = re.compile(
+    r"\b(?:with (?:a )?matching|with corresponding|covered|matched|have (?:a )?"
+    r"(?:matching|corresponding))\b[^.\n:]{0,40}?[:\s]\s*\**(\d{1,4})\b",
+    re.IGNORECASE)
+_COVERAGE_GAP_RE = re.compile(
+    r"\b(?:without|missing|no (?:corresponding|matching)|not covered|gaps?)\b"
+    r"[^.\n:]{0,40}?[:\s]\s*\**(\d{1,4})\b",
+    re.IGNORECASE)
+
+
+def _coverage_arithmetic_contradiction(content: str):
+    """A gap-analysis answer whose own stated numbers do not add up.
+
+    Returns (total, covered, gaps) when the answer states all three and
+    covered + gaps != total, else None.
+
+    The shape this targets, live on battery T13: the answer enumerated 9 backend
+    endpoints and 5 frontend hooks correctly, then reported exactly ONE endpoint with
+    no counterpart and closed with "No discrepancies were found. The conclusion is
+    accurate." Ground truth: four endpoints have no counterpart. Everything visible
+    above the conclusion was right, which is what makes this shape so believable and
+    so damaging -- a reader who spot-checks the enumeration finds it correct and
+    trusts the summary.
+
+    Deliberately narrow. It fires ONLY on arithmetic the answer itself asserts, never
+    on a judgement about whether a given item is really covered -- that needs the
+    counterpart file re-grepped, which belongs in verify_claims, not here. An answer
+    that omits any of the three numbers is not checked at all: a guard that guesses
+    at the missing one would flag correct answers, and this file has spent the day
+    learning what a false positive costs.
+    """
+    if not content:
+        return None
+    def _first(pattern):
+        m = pattern.search(content)
+        if not m:
+            return None
+        for g in m.groups():
+            if g:
+                return int(g)
+        return None
+    total, covered, gaps = (_first(_COVERAGE_TOTAL_RE),
+                            _first(_COVERAGE_COVERED_RE),
+                            _first(_COVERAGE_GAP_RE))
+    if total is None or covered is None or gaps is None:
+        return None
+    if covered + gaps == total:
+        return None
+    return total, covered, gaps
 
 
 _LIST_LINE_RE = re.compile(r"^\s*(?:[-*+•]|\d{1,3}[.)])\s+\S", re.MULTILINE)
