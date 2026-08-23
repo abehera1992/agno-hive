@@ -6131,6 +6131,21 @@ async def _run_heartbeat(
                 print(f"[team] liveness write warning: {exc}", flush=True)
 
 
+def _stream_event_log_line(out: dict) -> str:
+    """Compact log form for a stream event dict.
+
+    Member-result events carry a member's ENTIRE answer, so printing the raw dict put
+    8,613-character lines in the journal on the first run after they were introduced.
+    The content is already kept in team._member_results where the gate needs it; the
+    log only needs to show that it arrived and from whom.
+    """
+    if isinstance(out, dict) and out.get("__member_result__"):
+        content = out.get("content") or ""
+        return (f"member result: {out.get('agent_name', '?')} "
+                f"({len(content)} chars) -- ...{content[:120]!r}")
+    return f"stream tool event: {out}"
+
+
 def _record_stream_artifacts(team, out: dict) -> None:
     """Record a tool event's listing counts and success/failure onto the team.
 
@@ -6599,7 +6614,7 @@ async def _stream_team_run(
                 # answer-time count guard can reach them. Accumulates across a run's
                 # retries exactly like _read_state does.
                 _record_stream_artifacts(team, out)
-                print(f"[{log_label}] stream tool event: {out}", flush=True)
+                print(f"[{log_label}] {_stream_event_log_line(out)}", flush=True)
                 last_segment_start = len(full_content)
             else:
                 _log_unclassified_stream_event(log_label, event, unrecognized_event_counts)
@@ -6909,7 +6924,7 @@ async def run_task_async(
                             elif isinstance(out, dict):
                                 activity["last_progress_at"] = time.monotonic()
                                 _record_stream_artifacts(team, out)
-                                print(f"[team] stream tool event: {out}", flush=True)
+                                print(f"[team] {_stream_event_log_line(out)}", flush=True)
                                 last_segment_start = len(full_content)
                             else:
                                 # Diagnostic (2026-08-10, revised): the first version of this
