@@ -263,7 +263,17 @@ _MCP_TOOL_NAMES = {
 # not exist)" is a correct, hedged disclaimer that should never have been checked as
 # a positive claim in the first place.
 _NEGATION_BEFORE_RE = re.compile(
-    r"\b(not|isn't|aren't|never|unlike|instead of|rather than|as opposed to)\s*[:,]?\s*$",
+    # "no" added 2026-08-23. It was missing, so "There is no `API/x/routers/` directory"
+    # -- a CORRECT statement of absence -- was checked as if it asserted the path exists
+    # and reported NOT FOUND. Found by running the new PATHS check against its own most
+    # likely false positive rather than waiting for a live run to produce one.
+    #
+    # This matters more for paths than for symbols: reporting that something is absent is
+    # a normal, frequent answer shape ("there is no rate-limiting middleware", "no such
+    # directory"), and flagging those as fabrication is precisely what teaches readers to
+    # ignore this tool along with its true positives.
+    r"\b(no|not|isn't|aren't|never|unlike|instead of|rather than|as opposed to)"
+    r"\s*[:,]?\s*$",
     re.IGNORECASE,
 )
 _NEGATION_AFTER_RE = re.compile(
@@ -1143,7 +1153,32 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             if r not in routes:
                 routes.append(r)
 
-    if not (idents or file_lines or routes or proposed_idents) and not _lint_code(answer):
+    # ── asserted paths ────────────────────────────────────────────────────────
+    # Existence-only, and deliberately so: this says nothing about whether the file
+    # contains what the answer claims -- that is the citation check's job. It answers
+    # the one question nothing else asked, "does this path exist at all", which is
+    # exactly where today's most frequent failure lived. See _ASSERTED_PATH_RE.
+    asserted_paths: list[str] = []
+    for m in _ASSERTED_PATH_RE.finditer(answer):
+        p = m.group(1)
+        if p.startswith(_EXTERNAL_PATH_PREFIXES) or p in asserted_paths:
+            continue
+        # A path already carrying a line number is checked, and checked harder, by the
+        # citation section -- do not report it twice under two headings.
+        if any(p == f for f, _ in file_lines):
+            continue
+        if _is_negated_claim(answer, m.start(), m.end()):
+            continue          # "there is no routers/ directory" is a correct statement
+        if _is_proposed_new_claim(answer, m.start()):
+            continue          # "create API/x/new_file.py" describes future work
+        asserted_paths.append(p)
+
+    # asserted_paths counts as a checkable claim: an answer whose ONLY assertion is a
+    # path ("the routers live in `API/x/routers/items.py`") used to exit here as
+    # "nothing to check", which made the path check inert on exactly the answers it
+    # was built for. Found by calling verify_claims directly in the container.
+    if (not (idents or file_lines or routes or proposed_idents or asserted_paths)
+            and not _lint_code(answer)):
         return ("verify_claims: no checkable claims found (no backticked symbols, "
                 "code-block attribute references, file:line citations, API routes, "
                 "or convention violations).")
@@ -1339,26 +1374,7 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                                 break
         out.append("")
 
-    # ── asserted paths ────────────────────────────────────────────────────────
-    # Existence-only, and deliberately so: this says nothing about whether the file
-    # contains what the answer claims -- that is the citation check's job. It answers
-    # the one question nothing else asked, "does this path exist at all", which is
-    # exactly where today's most frequent failure lived. See _ASSERTED_PATH_RE.
-    asserted_paths: list[str] = []
-    for m in _ASSERTED_PATH_RE.finditer(answer):
-        p = m.group(1)
-        if p.startswith(_EXTERNAL_PATH_PREFIXES) or p in asserted_paths:
-            continue
-        # A path already carrying a line number is checked, and checked harder, by the
-        # citation section -- do not report it twice under two headings.
-        if any(p == f for f, _ in file_lines):
-            continue
-        if _is_negated_claim(answer, m.start(), m.end()):
-            continue          # "there is no routers/ directory" is a correct statement
-        if _is_proposed_new_claim(answer, m.start()):
-            continue          # "create API/x/new_file.py" describes future work
-        asserted_paths.append(p)
-
+    # ── asserted paths (extracted above, before the early-exit) ──────────────
     if asserted_paths:
         out.append(f"PATHS ({len(asserted_paths[:_MAX_CLAIMS])} checked):")
         for p in asserted_paths[:_MAX_CLAIMS]:
