@@ -725,6 +725,51 @@ def list_directory_tree(max_depth: int = 3) -> str:
     return f"Project directory tree (dirs only, {max_depth} levels deep):\n" + "\n".join(lines)
 
 
+def _did_you_mean(relative_path: str) -> str:
+    """Near-miss suggestions for a path that does not exist, as a trailing clause.
+
+    Returns "" when there is nothing useful to say, so callers can append it blindly.
+
+    Added 2026-08-22 after two live runs died on one-token path guesses. A coordinator
+    asked for `API/inventory-service/routers/__init__.py` -- plural, when the real
+    directory is `router/` -- and, given only "Not found:", re-sent the identical
+    delegation 54 times until the liveness watchdog killed the run 13 minutes in.
+    Another invented `API/seller-service/` outright and burned its budget hunting it.
+    A bare "Not found" is a dead end; the model has nothing to correct toward, so it
+    guesses again. Naming the real sibling turns the dead end into a correction.
+
+    get_file_content already does this for files. list_directory never did.
+    """
+    import difflib
+
+    try:
+        raw = (relative_path or "").strip().strip("/")
+        if not raw:
+            return ""
+        parts = raw.split("/")
+        # Walk down as far as the path IS real, then suggest siblings at the first
+        # segment that isn't -- that is where the mistake actually is.
+        cursor = PROJECT_ROOT
+        for depth, part in enumerate(parts):
+            candidate = cursor / part
+            if candidate.exists():
+                cursor = candidate
+                continue
+            if not cursor.is_dir():
+                return ""
+            siblings = [p.name for p in cursor.iterdir()
+                        if not p.name.startswith(".") and p.name not in _IGNORE_DIRS]
+            close = difflib.get_close_matches(part, siblings, n=3, cutoff=0.6)
+            if not close:
+                return ""
+            shown = "/".join(parts[:depth]) or "."
+            return (f" — no '{part}' in {shown}/. Did you mean: "
+                    + ", ".join(close) + "?")
+        return ""
+    except Exception:
+        return ""      # a suggestion is a nicety; never let it break the real answer
+
+
 def list_directory(relative_path: str = "") -> str:
     """
     List the contents of a directory in the project.
@@ -742,7 +787,7 @@ def list_directory(relative_path: str = "") -> str:
         )
     target = PROJECT_ROOT / relative_path if relative_path else PROJECT_ROOT
     if not target.exists():
-        return f"Not found: {relative_path}"
+        return f"Not found: {relative_path}{_did_you_mean(relative_path)}"
     if not target.is_dir():
         return f"Not a directory: {relative_path}"
 
