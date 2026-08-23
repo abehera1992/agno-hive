@@ -507,7 +507,7 @@ def find_files(glob_pattern: str, max_results: int = 200) -> str:
                     if matches:
                         break
             if not matches:
-                return f"No matches for: {glob_pattern}"
+                return f"No matches for: {glob_pattern}{_did_you_mean_glob(glob_pattern)}"
             return f"{len(matches)} result(s) for '{glob_pattern}':\n" + "\n".join(matches)
         except Exception:
             pass  # fall through to pathlib
@@ -723,6 +723,62 @@ def list_directory_tree(max_depth: int = 3) -> str:
     if not lines:
         return "No directories found."
     return f"Project directory tree (dirs only, {max_depth} levels deep):\n" + "\n".join(lines)
+
+
+def _did_you_mean_glob(glob_pattern: str) -> str:
+    """Near-miss suggestion for a glob whose LITERAL directory prefix does not exist.
+
+    Returns "" when there is nothing useful to say.
+
+    Added 2026-08-23 after the same one-token path slip produced something worse than a
+    dead end. A Researcher searched `API/business-service/routes/**/verification*.py`
+    -- `routes/` plural, when the real directory is `router/` -- got "No matches", and
+    concluded in its final answer that **no backend API route for seller verification
+    has been implemented**. The route exists: business_admin_api.py:84,
+    `@router.post("/verify/{business_id}")`. A wrong directory silently became "the
+    feature does not exist", which is far more damaging than a wrong path, because it
+    reads as a finding rather than a failure.
+
+    list_directory got this treatment a day earlier; globs did not, and globs are what
+    absence claims are usually built on.
+
+    Only the leading LITERAL segments are checked -- everything up to the first segment
+    containing a wildcard. A pattern like `**/*.py` has no literal prefix and is
+    correctly left alone.
+    """
+    import difflib
+
+    try:
+        raw = (glob_pattern or "").strip().strip("/")
+        if not raw or "/" not in raw:
+            return ""
+        segments = raw.split("/")
+        cursor = PROJECT_ROOT
+        walked: list[str] = []
+        for part in segments:
+            if any(ch in part for ch in "*?["):
+                return ""                      # reached the wildcard with everything real
+            candidate = cursor / part
+            if candidate.exists():
+                cursor = candidate
+                walked.append(part)
+                continue
+            if not cursor.is_dir():
+                return ""
+            siblings = [p.name for p in cursor.iterdir()
+                        if p.is_dir() and not p.name.startswith(".")
+                        and p.name not in _IGNORE_DIRS]
+            close = difflib.get_close_matches(part, siblings, n=3, cutoff=0.6)
+            if not close:
+                return ""
+            shown = "/".join(walked) or "."
+            return (f" — the path prefix does not exist: no '{part}' in {shown}/. "
+                    f"Did you mean: {', '.join(close)}? "
+                    f"A glob that matches nothing because its DIRECTORY is wrong is not "
+                    f"evidence that the thing you are looking for is absent.")
+        return ""
+    except Exception:
+        return ""
 
 
 def _did_you_mean(relative_path: str) -> str:

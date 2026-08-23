@@ -1777,7 +1777,54 @@ def _reader_facing_report(report: str) -> str:
     removed — every finding line, and the factual half of the VERDICT, stays exactly
     as it was, because those are what the reader actually needs.
     """
-    return _MODEL_DIRECTED_VERDICT_RE.sub("", report).rstrip()
+    return _compact_verify_report(_MODEL_DIRECTED_VERDICT_RE.sub("", report).rstrip())
+
+
+# Findings a reader must see. Everything else in a verify_claims report is the check
+# showing its work: FOUND lines, echoed citation bodies, PLAUSIBLE route notes,
+# SPLIT-FOUND (explicitly not counted toward the verdict).
+_VERIFY_PROBLEM_MARKERS = ("NOT FOUND", "BAD ", "MISMATCH", "AMBIGUOUS", "DOC ONLY")
+
+
+def _compact_verify_report(report: str) -> str:
+    """Reduce a verify_claims report to its findings plus the verdict.
+
+    The full report is built for the correcting MODEL, which benefits from seeing every
+    claim it checked. Appended verbatim to a human-facing answer it is 30+ lines of
+    mostly-passing detail wrapped around one or two real problems -- observed twice in
+    the 2026-08-23 battery (T3, T10), where a genuine NOT FOUND sat buried under six
+    verified citations echoing their own file contents.
+
+    That is not merely untidy: the guard banners on this codebase only work if people
+    read them, and a wall of passing checks trains readers to skip the block that also
+    carries the failures.
+
+    Keeps a finding line and any indented continuation beneath it, plus VERDICT. If
+    nothing matches (an all-clear report, or a format this does not recognise) the
+    report is returned unchanged rather than emptied -- never destroy the signal to
+    tidy it.
+    """
+    lines = (report or "").splitlines()
+    kept: list[str] = []
+    keeping = False
+    for line in lines:
+        stripped = line.strip()
+        if any(m in stripped for m in _VERIFY_PROBLEM_MARKERS):
+            kept.append(line)
+            keeping = True
+            continue
+        if stripped.upper().startswith("VERDICT"):
+            kept.append(line)
+            keeping = False
+            continue
+        # continuation of a finding: deeper-indented, non-blank
+        if keeping and stripped and line.startswith((" " * 6, "\t")):
+            kept.append(line)
+            continue
+        keeping = False
+    if not any(any(m in k for m in _VERIFY_PROBLEM_MARKERS) for k in kept):
+        return report
+    return "\n".join(kept).rstrip()
 
 
 async def _sync_tool_registry(mcp_list: list, skill_catalog: list[dict] | None) -> None:
@@ -3069,6 +3116,24 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"{'; ' + by_ext if by_ext else ''}). The listing itself was fetched "
             f"correctly; the count stated above is not any reading of it. Trust the "
             f"tool's numbers here, not the sentence.**"
+            + _summarize_actual_writes(*all_results)
+        )
+
+    # Fabricated-tool-use check (2026-08-23). An answer describing a tool result that
+    # never happened -- see _fabricated_tool_use for the T5 incident. Ranked ahead of
+    # the arithmetic and enumeration checks because invented EVIDENCE is worse than a
+    # wrong conclusion: the conclusion can be argued with, the fake quote gets believed
+    # and repeated.
+    fabricated = _fabricated_tool_use(content, getattr(team, "_tool_outcomes", None))
+    if fabricated is not None:
+        print(f"[team] answer describes the result of {fabricated}, which was never "
+              f"called this run — flagging", flush=True)
+        return (
+            f"{content}\n\n---\n**DESCRIBES A TOOL RESULT THAT NEVER HAPPENED — the "
+            f"answer above reports what {fabricated} returned, but no such tool was called "
+            f"at any point in this run. That sentence is invented, and any "
+            f"conclusion resting on it — including a 'not found' — is unsupported. "
+            f"Re-run the lookup before believing either.**"
             + _summarize_actual_writes(*all_results)
         )
 
@@ -6422,6 +6487,63 @@ def _unsupported_capability_claim(content: str, outcomes: dict | None):
             return family, "contradicted", sorted(tools)
         if not err:
             return family, "untried", sorted(tools)
+    return None
+
+
+# An answer asserting that a specific tool RAN and produced something, mapped to the
+# tool names that would prove it. Phrased tightly: it must claim a RESULT, not merely
+# mention the tool ("I could use notion_search" is not a claim that it ran).
+_TOOL_USE_CLAIMS = (
+    # (what the answer claims happened, the tools that would satisfy that claim)
+    #
+    # A SET, not one tool, and that matters: "the search returned N results" is
+    # satisfied by any search-family call. Pinning it to notion_search alone would
+    # accuse an answer whose evidence really came from search_files -- a false
+    # positive on a correct answer, which this file has spent the week learning is
+    # the expensive kind of mistake.
+    (re.compile(r"\bsearch\b[^\n.]{0,60}?\breturned\b"
+                r"|\bsearch results?\b[^\n.]{0,30}?\b(?:returned|showed|contained)\b",
+                re.IGNORECASE),
+     {"notion_search", "search_files", "search_files_batch", "find_files",
+      "lightrag_query"},
+     "a search"),
+    (re.compile(r"\blist_directory\b[^\n.]{0,40}?\breturned\b"
+                r"|\b(?:the )?directory listing\b[^\n.]{0,30}?\b(?:returned|showed)\b",
+                re.IGNORECASE),
+     {"list_directory", "list_directory_tree", "find_files"},
+     "a directory listing"),
+    (re.compile(r"\bdb_query\b[^\n.]{0,40}?\breturned\b"
+                r"|\bquer(?:y|ied)\b[^\n.]{0,30}?\bdatabase\b[^\n.]{0,40}?\breturned\b",
+                re.IGNORECASE),
+     {"db_query", "db_schema"},
+     "a database query"),
+)
+
+
+def _fabricated_tool_use(content: str, outcomes: dict | None):
+    """A claim that a tool ran and returned something, when it was never called.
+
+    Returns the tool name, or None.
+
+    Live on battery T5 (2026-08-23): the answer stated "The search query 'eKam -
+    Delivery Board' returned 10 results, all of which are unrelated" and concluded the
+    page does not exist. The run made ZERO notion_* calls of any kind, and the page is
+    real. The absence guard caught the conclusion; nothing caught the invented
+    evidence supporting it, which is the more dangerous half -- a fabricated tool
+    result reads as primary evidence and is quoted onward as fact.
+
+    Decidable because the run's own tool record is authoritative: if the answer says a
+    tool returned something and that tool has zero calls this run, the sentence
+    describes something that did not happen. Requires the outcomes record to exist at
+    all, so a team built by another path is never accused.
+    """
+    if not content or not isinstance(outcomes, dict) or not outcomes:
+        return None
+    for pattern, tools, label in _TOOL_USE_CLAIMS:
+        calls = sum((outcomes.get(t) or {}).get("ok", 0) + (outcomes.get(t) or {}).get("err", 0)
+                    for t in tools)
+        if calls == 0 and pattern.search(content):
+            return label
     return None
 
 
