@@ -5314,7 +5314,25 @@ def _make_duplicate_delegation_gate_hook():
             "args": dict(args or {}),
             "audit": _parse_delegation_audit(raw_task),
         })
-        if warn_now:
+        # isinstance(str) is load-bearing, not defensive (2026-08-24). delegate_task_to_member
+        # returns an async_generator on the streaming path -- the sibling logger a few
+        # lines up prints `delegate result: async_generator` for exactly that reason and
+        # passes it through untouched. An earlier version of this warn tier wrapped the
+        # result in an f-string unconditionally, which stringified the generator to
+        # "<async_generator object ...>", destroyed the member's actual answer, and handed
+        # agno a str where it was about to iterate. Live: the run hung on delegation #8 --
+        # the warn boundary -- with stream_event_count frozen at 7502 across four
+        # heartbeats.
+        #
+        # The hard limit above is unaffected and needs no such guard: it returns its
+        # string INSTEAD of ever calling the function, which is the shape every other
+        # gate in this hook already uses and which is proven live. Only this tier calls
+        # first and then touches what came back.
+        #
+        # So on the generator path the note cannot ride along, and the print above is the
+        # only warning. The hard stop at _MEMBER_DELEGATION_LIMIT still fires regardless
+        # -- it never depended on the warning being seen.
+        if warn_now and isinstance(result, str):
             remaining = _MEMBER_DELEGATION_LIMIT - _MEMBER_DELEGATION_WARN
             return (
                 f"{result}\n\n"
