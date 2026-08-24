@@ -782,6 +782,72 @@ def list_directory_tree(max_depth: int = 3) -> str:
     return f"Project directory tree (dirs only, {max_depth} levels deep):\n" + "\n".join(lines)
 
 
+# Ceilings for the tree search in _glob_hint_bases. A service directory sits at
+# depth 2 in this layout (API/inventory-service), so 4 covers real cases with room
+# to spare while keeping a miss cheap -- and a miss is the common outcome, since
+# the search only runs when the configured prefixes already failed.
+_HINT_SCAN_MAX_DEPTH = 4
+_HINT_SCAN_DIR_BUDGET = 4000
+
+
+def _glob_hint_bases(first_segment: str):
+    """Directories a prefix-less pattern's first literal segment could refer to.
+
+    Mirrors find_files' own fallback order so the hint can reach the same files the
+    tool itself would have matched: the configured prefixes first, then the "**"
+    fallback resolved as an actual tree search. Without this the hint generator is
+    strictly less capable than the tool it explains -- see _did_you_mean_glob.
+
+    Shallowest first, capped at 3: a repo can hold several directories of the same
+    name (EkamApp has eight `models.py`), and the useful suggestion is the one
+    nearest the root, not an exhaustive list.
+    """
+    bases = []
+    for prefix in _GLOB_FALLBACK_PREFIXES:
+        if prefix == "**":
+            continue
+        candidate = PROJECT_ROOT / prefix / first_segment
+        if candidate.is_dir():
+            bases.append(candidate)
+    if bases:
+        return bases
+
+    # Bounded breadth-first, NOT PROJECT_ROOT.glob("**/name"). pathlib's ** walks the
+    # entire tree before any filter can reject it, so on a repo with node_modules it
+    # descends into all of it -- measured at over 180s for seven lookups here, on a
+    # helper that runs on the failure path of every find_files. Pruning has to happen
+    # during traversal, not after.
+    #
+    # Breadth-first also gives shallowest-first for free, which is the ordering the
+    # caller wants anyway: nearest the root is the useful suggestion.
+    found: list[Path] = []
+    queue: list[tuple[Path, int]] = [(PROJECT_ROOT, 0)]
+    scanned = 0
+    while queue and scanned < _HINT_SCAN_DIR_BUDGET and len(found) < 3:
+        current, depth = queue.pop(0)
+        if depth >= _HINT_SCAN_MAX_DEPTH:
+            continue
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        scanned += 1
+        for entry in entries:
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            if entry.name.startswith(".") or entry.name in _IGNORE_DIRS:
+                continue
+            if entry.name == first_segment:
+                found.append(Path(entry.path))
+                if len(found) >= 3:
+                    break
+            queue.append((Path(entry.path), depth + 1))
+    return found
+
+
 def _did_you_mean_glob(glob_pattern: str) -> str:
     """Near-miss suggestion for a glob whose LITERAL directory prefix does not exist.
 
@@ -805,20 +871,14 @@ def _did_you_mean_glob(glob_pattern: str) -> str:
     """
     import difflib
 
-    try:
-        raw = (glob_pattern or "").strip().strip("/")
-        if not raw or "/" not in raw:
-            return ""
-        segments = raw.split("/")
-        cursor = PROJECT_ROOT
-        walked: list[str] = []
+    def _walk(cursor, segments: list[str], walked: list[str]) -> str:
         for part in segments:
             if any(ch in part for ch in "*?["):
                 return ""                      # reached the wildcard with everything real
             candidate = cursor / part
             if candidate.exists():
                 cursor = candidate
-                walked.append(part)
+                walked = walked + [part]
                 continue
             if not cursor.is_dir():
                 return ""
@@ -840,6 +900,45 @@ def _did_you_mean_glob(glob_pattern: str) -> str:
                     f"Did you mean: {', '.join(close)}? "
                     f"A glob that matches nothing because its DIRECTORY is wrong is not "
                     f"evidence that the thing you are looking for is absent.")
+        return ""
+
+    try:
+        raw = (glob_pattern or "").strip().strip("/")
+        if not raw or "/" not in raw:
+            return ""
+        segments = raw.split("/")
+
+        hint = _walk(PROJECT_ROOT, segments, [])
+        if hint:
+            return hint
+
+        # Resolve the base the way find_files itself does (2026-08-24). find_files
+        # retries a failed pattern under each of _GLOB_FALLBACK_PREFIXES, "**"
+        # included, so 'inventory-service/router/**/*' resolves happily without the
+        # real 'API/' prefix. This helper walked LITERALLY from PROJECT_ROOT, so the
+        # same prefix-less pattern died on segment one -- no 'inventory-service' at
+        # the root, no top-level sibling close enough to suggest -- and returned "".
+        #
+        # That asymmetry is the trap, not the missing prefix: prefix-less patterns
+        # work often enough that an agent never learns its paths are malformed, and
+        # then a genuinely wrong one comes back as a bare dead end with no correction.
+        #
+        # Live cost (T12, 2026-08-24): a Researcher searched
+        # 'inventory-service/models/**/*.py', got "No matches", and reported that the
+        # inventory service HAS NO MODELS and that its data models are all defined in
+        # business-service. API/inventory-service/models.py is 32,437 bytes and
+        # defines 33 SQLAlchemy classes -- Item, ItemCategory, StockLevel, Voucher,
+        # Party and the rest. Handed the fully-qualified pattern, this function
+        # already produced exactly the right correction ("Did you mean: models.py?");
+        # it simply never got the chance.
+        first = segments[0]
+        if any(ch in first for ch in "*?["):
+            return ""
+        for base in _glob_hint_bases(first):
+            hint = _walk(base, segments[1:],
+                         list(base.relative_to(PROJECT_ROOT).parts))
+            if hint:
+                return hint
         return ""
     except Exception:
         return ""
