@@ -4559,6 +4559,20 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             _record_read(run_context, function_name, args, agent_key, len(str(result)))
             # Second, independent source -- survives delegation, unlike session_state.
             read_state["reads"].append({"tool": function_name, "read_by": agent_key or "coordinator"})
+            # Bytes the tools actually handed to members, so the member -> coordinator
+            # loss is visible in one log instead of correlating two by hand
+            # (2026-08-24). Measured on T4: 30,757 chars read, 4,675 relayed -- 6.6:1.
+            # That ratio, not context pressure, is what tracks the failures:
+            #     177 relayed  -> fabricated an entire service
+            #   2,402 relayed  -> real files, invented line number
+            #   4,675 relayed  -> answered a question nobody asked
+            #  29,445 relayed  -> faithful, verbatim quotes
+            # Prompt peaks across those runs were 13-17k of a 262k window, so nothing
+            # was evicted and nothing was forgotten. The coordinator simply never
+            # received the grounding it was asked to write from.
+            read_state["read_chars_total"] = (
+                read_state.get("read_chars_total", 0) + len(str(result))
+            )
 
         if (
             function_name == "get_file_content"
@@ -6751,10 +6765,15 @@ def _record_stream_artifacts(team, out: dict) -> None:
         )
         # Both numbers on one line, because the whole point of the 2026-08-24 finding
         # is that they diverge wildly and only the token figure predicts an overflow.
-        print(f"[team] context budget: {team._member_result_chars:,} chars of member "
+        _rs = getattr(team, "_read_state", None)
+        _read_total = _rs.get("read_chars_total", 0) if isinstance(_rs, dict) else 0
+        _relayed = team._member_result_chars
+        _ratio = (f" | relay {_read_total:,} read -> {_relayed:,} = "
+                  f"{_read_total / _relayed:.1f}:1" if _read_total and _relayed else "")
+        print(f"[team] context budget: {_relayed:,} chars of member "
               f"results so far ({_RUN_MEMBER_RESULT_CHAR_BUDGET:,} budget) | prompt peak "
               f"{peak_input_tokens():,} tokens ({_CONTEXT_TOKEN_BUDGET:,} budget of "
-              f"{_MODEL_CONTEXT_LIMIT_TOKENS:,})", flush=True)
+              f"{_MODEL_CONTEXT_LIMIT_TOKENS:,}){_ratio}", flush=True)
         return
     if out.get("listing"):
         if not isinstance(getattr(team, "_listings", None), list):
