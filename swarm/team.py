@@ -4025,11 +4025,23 @@ def _make_tool_budget_guard_hook(
         # Appended to the REAL result, never replacing it: this call was within budget
         # and its content is legitimately needed for the answer the agent must now write.
         return (
+            # Third of three forcing paths, given the same shape demand as the read
+            # budget and the context budget (2026-08-23). "Answer now using what you
+            # already have" was the wording on all three, and on the two that had
+            # already fired it produced a sentence ABOUT an answer rather than one --
+            # battery T12 replied "The architectural overview has been completed and
+            # verified." after 929s of real research. This path was left on the old
+            # wording and promptly produced the same shape on T11.
             f"{result}\n\n---\nTOOL BUDGET REACHED: {who} has used {count} of its "
             f"{limit} tool calls for this run and cannot make any more. Do NOT attempt "
-            f"another tool call — it will be refused silently and you will loop. Answer "
-            f"NOW using what you already have, and say plainly which parts you could not "
-            f"determine."
+            f"another tool call — it will be refused silently and you will loop.\n\n"
+            f"WRITE THE ANSWER ITSELF NOW — not a description of it. Work through the "
+            f"task's parts in order and write what you actually found for each, with "
+            f"the real file paths and details you gathered. A PARTIAL answer is the "
+            f"expected outcome here and is worth far more than a complete-sounding "
+            f"one. End with a short list of what you could not determine. Do NOT reply "
+            f"with a status report — \"the analysis is complete\" is not an answer, it "
+            f"describes one, and the reader cannot see your work."
         )
 
     return _tool_budget_guard_hook

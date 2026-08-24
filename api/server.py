@@ -324,6 +324,49 @@ def _read_liveness_snapshot(path: "Path") -> dict | None:
         return None
 
 
+# Active swarm worker subprocesses, pid -> metadata. Populated on spawn, removed in
+# the same finally that cleans up the liveness file.
+#
+# Exists because there was NO way to stop a running swarm from outside (2026-08-23).
+# The disconnect poller below is correct and fires on a real client disconnect -- but
+# stopping the CALLER does not necessarily produce one: an agno_run issued through the
+# project MCP leaves ekamapp-mcp-server's own HTTP request to this service open, so
+# is_disconnected() stays False and the worker runs on. Observed live: after the client
+# task was stopped, heartbeats kept climbing (960s, 990s, 1020s, 1050s) with the GPU
+# pinned at 96% and 87 degrees, and only a full service restart freed it.
+#
+# This is a direct control path, deliberately NOT a second disconnect poller -- an
+# uncoordinated second poller previously corrupted an anyio cancel scope, and that
+# lesson stands.
+_ACTIVE_WORKERS: dict[int, dict] = {}
+
+
+@app.get("/runs")
+async def list_active_runs():
+    """Swarm workers running right now, newest first."""
+    now = time.time()
+    return {"runs": [
+        {"pid": pid, "elapsed_s": round(now - m["started_at"], 1),
+         "team": m.get("team"), "task": m.get("task")}
+        for pid, m in sorted(_ACTIVE_WORKERS.items(),
+                             key=lambda kv: kv[1]["started_at"], reverse=True)
+    ]}
+
+
+@app.post("/runs/{pid}/cancel")
+async def cancel_run(pid: int):
+    """Kill one running swarm worker. Frees the GPU immediately."""
+    meta = _ACTIVE_WORKERS.get(pid)
+    if meta is None:
+        raise HTTPException(status_code=404, detail=f"no active run with pid {pid}")
+    proc = meta.get("proc")
+    if proc is not None and proc.returncode is None:
+        proc.kill()
+        print(f"[api] run {pid} cancelled by request — worker killed, GPU work aborted",
+              flush=True)
+    return {"cancelled": pid, "elapsed_s": round(time.time() - meta["started_at"], 1)}
+
+
 async def _run_worker_subprocess(
     http_request, payload: dict, argv: list[str] | None = None
 ) -> tuple[str, dict, dict | None]:
@@ -378,6 +421,12 @@ async def _run_worker_subprocess(
                       # flows straight into this process's own stdout/journald
         cwd=str(_REPO_ROOT),
     )
+    _ACTIVE_WORKERS[proc.pid] = {
+        "proc": proc,
+        "started_at": time.time(),
+        "team": payload.get("team"),
+        "task": (payload.get("task") or "")[:120],
+    }
     liveness_path = Path(tempfile.gettempdir()) / f"agnohive-liveness-{proc.pid}.json"
     worker_payload = {**payload, "liveness_path": str(liveness_path)}
     proc.stdin.write(json.dumps(worker_payload).encode())
@@ -409,6 +458,7 @@ async def _run_worker_subprocess(
         proc.kill()
         raise
     finally:
+        _ACTIVE_WORKERS.pop(proc.pid, None)
         try:
             liveness_path.unlink(missing_ok=True)
         except OSError:
