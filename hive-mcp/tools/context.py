@@ -114,7 +114,29 @@ def get_project_context() -> str:
 
 # Files at or below this size are returned whole. Larger files are reduced (skeleton
 # for code, head+tail for data) so a single read can never overflow the agent context.
-_MAX_FULL_BYTES = 200_000
+#
+# Lowered 200,000 -> 12,000 on 2026-08-23. This threshold governs EXPLORATORY reads
+# only: a call with offset/limit is an explicit, bounded range and returns exactly
+# what was asked for, checked before this branch. So the only reads affected are
+# "give me this whole file", which is where context is actually squandered.
+#
+# 200,000 was effectively no limit for this codebase. Measured across its 468 Python
+# and TypeScript source files:
+#     p50 = 2,290    p75 = 5,730    p90 = 9,574    p95 = 15,182    max = 69,525
+# Every file sat under the old ceiling, so the reduction path never ran and a single
+# architectural-overview task read 309,076 characters of whole files before its budget
+# guard stopped it -- after which the run stalled and was killed. Nine distinct
+# failures on that one probe, all downstream of loading far more than was needed.
+#
+# 12,000 sits between p90 and p95: roughly nine files in ten still come back whole,
+# and only the top decile is skeletonised -- which is exactly the set doing the damage
+# (models.py 31,151, vouchers_api.py 37,113, items_api.py 26,658). Their skeletons run
+# 9-21% of full size while keeping what an overview actually needs: imports, class and
+# function signatures, decorators, first docstring line.
+#
+# Nothing is lost, only deferred: the skeleton response names the exact
+# get_file_content(path, offset=..., limit=...) call to read any part in full.
+_MAX_FULL_BYTES = 12_000
 _CODE_EXT = {
     ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".java", ".go", ".rs",
     ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".kt", ".swift", ".scala",
