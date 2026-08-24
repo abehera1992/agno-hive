@@ -412,8 +412,32 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
         lines = data.splitlines()
         start = max(offset, 0)
         end = start + limit if limit > 0 else len(lines)
+        # Past EOF must SAY so (2026-08-23). Previously an out-of-range offset returned
+        # the header with an empty body -- 72 characters, no error, no hint -- and an
+        # agent paginating a file had no way to know it had run off the end. Live: a
+        # Researcher walked business_api.py (about 600 lines) with offset 14500, 15000,
+        # 15500 ... 20000 in steps of 500, twelve identical empty responses in a row,
+        # then stalled until the liveness watchdog killed the run.
+        #
+        # Self-inflicted: lowering _MAX_FULL_BYTES made large files return skeletons,
+        # and a skeleton response invites exactly this offset/limit pagination. The
+        # invitation shipped without the stop sign.
+        if start >= len(lines):
+            return (
+                f"# {relative_path} — offset {start} is PAST THE END OF THE FILE.\n"
+                f"# This file has {len(lines)} lines total. There is nothing beyond it,\n"
+                f"# and requesting a larger offset will keep returning this message.\n"
+                f"# You have already seen everything this file contains — move on, or\n"
+                f"# re-read an EARLIER range with offset < {len(lines)}."
+            )
         body = _numbered_lines(lines[start:end], start + 1)
-        return f"# {relative_path} — lines {start}..{min(end, len(lines))} of {len(lines)}\n{body}"
+        more = "" if end >= len(lines) else (
+            f"\n# ── {len(lines) - end} more line(s) below; continue with "
+            f"offset={end}, limit={limit or 200} ──"
+        )
+        at_end = "\n# ── END OF FILE ──" if end >= len(lines) else ""
+        return (f"# {relative_path} — lines {start}..{min(end, len(lines))} "
+                f"of {len(lines)}\n{body}{more}{at_end}")
 
     if len(data) <= _MAX_FULL_BYTES:
         return _numbered_lines(data.splitlines(), 1)
