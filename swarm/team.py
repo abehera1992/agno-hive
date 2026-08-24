@@ -2340,6 +2340,30 @@ def _adopt_retry(label: str, content: str, result, retried: str, retry, member_r
     """
     if not retried:
         return content, result
+    # Emptiness has to be judged AFTER stripping, not before (2026-08-24). A retry
+    # consisting of nothing but leaked tool-call syntax is not falsy -- the live one
+    # was 204 characters -- so it sailed past the check above, won adoption, and only
+    # then stripped to nothing at final assembly, leaving _BUDGET_EXHAUSTED_ANSWER as
+    # the run's entire output.
+    #
+    # Cost: a T12 run whose main pass had already produced 30,183 characters of real
+    # content. The bare-absence guard fired ("answer concludes 'not found' with no
+    # search_files()/find_files() call at all -- retrying with a mandatory search"),
+    # the retry came back as one tool-call fragment, and all 30,183 characters were
+    # discarded for it.
+    #
+    # Same class of bug as 74259e5 and the same shape of fix -- that one corrected the
+    # three final-answer assembly sites, which tested `final_segment if final_segment
+    # else accumulated` before stripping. This is the same mistake one layer up, in
+    # deciding whether a retry has anything in it at all. _more_grounded is not the
+    # backstop here: it compares evidence gathered, and a retry that read files before
+    # emitting the fragment can legitimately out-score the draft it destroys.
+    if not _strip_leaked_tool_tags(retried).strip():
+        print(
+            f"[team] {label}: retry produced only tool-call syntax, nothing survives "
+            f"stripping -- keeping the original draft"
+        )
+        return content, result
     if _more_grounded(result, retry, member_reads=member_reads):
         return retried, retry
     print(
