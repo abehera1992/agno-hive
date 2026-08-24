@@ -18,6 +18,7 @@ from .agents import (
 )
 from .feedback import record_success, record_success_bg, record_failure, load_failure_context
 from . import model_routing, team_config
+from .tool_fix import peak_input_tokens
 from config.config import config
 
 _tracer = trace.get_tracer("agno-hive.team")
@@ -5063,6 +5064,32 @@ def _make_duplicate_delegation_gate_hook():
         # Checked only for delegations, because member results are what accumulate in
         # the coordinator's context; a member's own reads live in its own.
         if function_name in _DELEGATION_TOOL_NAMES:
+            # Token budget first: it is the measure that matches the failure. The
+            # char budget below stays as a backstop for the case where no usage has
+            # been reported yet (peak 0), which is also why this cannot simply
+            # replace it -- a run whose very first turns overflow would have nothing
+            # to read.
+            used = peak_input_tokens()
+            if used >= _CONTEXT_TOKEN_BUDGET:
+                print(f"[team] context token budget exhausted ({used:,} of "
+                      f"{_MODEL_CONTEXT_LIMIT_TOKENS:,} tokens, budget "
+                      f"{_CONTEXT_TOKEN_BUDGET:,}) — refusing further delegation, "
+                      f"forcing an answer", flush=True)
+                _force_text_only(None, team=team)
+                return (
+                    f"STOP — CONTEXT WINDOW NEARLY FULL: the prompt has reached "
+                    f"{used:,} of this model's {_MODEL_CONTEXT_LIMIT_TOKENS:,}-token "
+                    f"limit. One more delegation would overflow it, and an overflow "
+                    f"loses the entire run — every member answer gathered so far goes "
+                    f"with it. No further delegation will run.\n\n"
+                    f"WRITE THE ANSWER ITSELF NOW — not a description of it. Work "
+                    f"through the task's parts in order and write what your members "
+                    f"actually reported for each, with their real file paths and "
+                    f"details. A PARTIAL answer is the expected outcome and is worth "
+                    f"far more than a complete-sounding one. End with a short list of "
+                    f"the parts you could not cover. Do NOT reply with a status report: "
+                    f"\"the analysis is complete\" is not an answer, it describes one."
+                )
             spent = getattr(team, "_member_result_chars", 0)
             if spent >= _RUN_MEMBER_RESULT_CHAR_BUDGET:
                 print(f"[team] context budget exhausted ({spent:,} chars) — refusing "
@@ -6549,8 +6576,12 @@ def _record_stream_artifacts(team, out: dict) -> None:
         team._member_result_chars = (
             getattr(team, "_member_result_chars", 0) + len(out.get("content") or "")
         )
+        # Both numbers on one line, because the whole point of the 2026-08-24 finding
+        # is that they diverge wildly and only the token figure predicts an overflow.
         print(f"[team] context budget: {team._member_result_chars:,} chars of member "
-              f"results so far ({_RUN_MEMBER_RESULT_CHAR_BUDGET:,} budget)", flush=True)
+              f"results so far ({_RUN_MEMBER_RESULT_CHAR_BUDGET:,} budget) | prompt peak "
+              f"{peak_input_tokens():,} tokens ({_CONTEXT_TOKEN_BUDGET:,} budget of "
+              f"{_MODEL_CONTEXT_LIMIT_TOKENS:,})", flush=True)
         return
     if out.get("listing"):
         if not isinstance(getattr(team, "_listings", None), list):
@@ -6582,6 +6613,32 @@ def _record_stream_artifacts(team, out: dict) -> None:
 # inside 262,144. Deliberately conservative: overshooting costs a whole run, while
 # stopping early still yields an answer built on everything gathered so far.
 _RUN_MEMBER_RESULT_CHAR_BUDGET = 400_000
+
+# The real ceiling, in the units the failure is actually measured in.
+#
+# The char budget above was written to prevent context overflow and cannot: it
+# counts member RESULTS, which are a small slice of the prompt. Measured on the
+# T12 overflow (2026-08-24) -- 258,049 of 262,144 tokens consumed, while that
+# counter read 42,804 of 400,000. Under 11%. The members' own file reads
+# (319,485 chars for the Researcher alone that run), the tool results and the
+# accumulated turn history make up the rest, and none of it was counted. Raising
+# or lowering a character threshold cannot fix a signal that is measuring the
+# wrong thing; it is left in place as a cheap backstop and is no longer the guard
+# this one is.
+#
+# 190,000 of 262,144 is ~72k of headroom. Sized from the failure itself: the run
+# jumped to 258,049 on a single turn, so the reserve has to absorb one more full
+# delegation round -- a member's answer plus everything it read to produce it --
+# on top of the 4,096 output tokens the request reserves. A budget that only
+# clears the output reservation would be tripped by the very turn it was meant to
+# stop.
+#
+# Reading this as too conservative would be reading it backwards: a run that
+# genuinely needs more than the window is a run that CANNOT finish, so stopping
+# at 190k does not cost an answer that was otherwise coming. It converts a lost
+# run into a partial one built on everything gathered so far.
+_MODEL_CONTEXT_LIMIT_TOKENS = 262_144
+_CONTEXT_TOKEN_BUDGET = 190_000
 
 _JOB_HANDLE_TOOL_NAMES = {"bash_job_status", "bash_job_kill"}
 # bash.py's _start_background_job returns "job_id: <12 hex>\nstatus: running"

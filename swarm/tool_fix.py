@@ -33,6 +33,44 @@ auto-kill (config.liveness_silence_threshold_s) fires with zero answer produced.
 
 # agno team internal tools — do not strip from content, let agno handle natively
 _AGNO_INTERNAL_TOOLS = {"delegate_task_to_member", "delegate_task_to_members", "get_member_information"}
+
+# Largest prompt, in real tokens, that the model server has reported this run.
+#
+# This is the only honest measure of how full the context is. The guard that was
+# supposed to prevent overflow counted CHARACTERS OF MEMBER RESULTS instead, and
+# they are not the same quantity or even close: T12 died at 258,049 of 262,144
+# tokens while that counter sat at 42,804 of a 400,000 budget -- under 11%, never
+# remotely close to firing. Member results are a small slice of the prompt; the
+# members' own file reads, the tool results, and the accumulated turn history are
+# most of it, and none of them were being counted.
+#
+# agno already asks for this: it sends stream_options={"include_usage": True}, so
+# the final chunk of every streamed call carries usage, and _get_metrics maps
+# prompt_tokens -> MessageMetrics.input_tokens. Both parsers below populate
+# model_response.response_usage from it. Nothing new is requested from the server;
+# the number was already arriving and simply never read.
+#
+# Module-level is per-RUN state, not global state: api/server.py runs each task in
+# its own subprocess (_run_worker_subprocess), so this module is freshly imported
+# per run and starts at zero. Peak rather than last-seen, because a run's prompt
+# does not grow monotonically -- a member's own turns are short, and taking the
+# most recent would read as "context freed up" right after a big coordinator turn.
+_peak_input_tokens = 0
+
+
+def peak_input_tokens() -> int:
+    """Largest prompt-token count the model server has reported this run."""
+    return _peak_input_tokens
+
+
+def _record_input_tokens(model_response) -> None:
+    global _peak_input_tokens
+    usage = getattr(model_response, "response_usage", None)
+    if usage is None:
+        return
+    seen = getattr(usage, "input_tokens", 0) or 0
+    if isinstance(seen, (int, float)) and seen > _peak_input_tokens:
+        _peak_input_tokens = int(seen)
 import json
 import re
 from typing import Any
@@ -205,6 +243,10 @@ class _ToolCallRecoveryMixin:
 
     def _parse_provider_response(self, response: dict) -> ModelResponse:
         model_response = super()._parse_provider_response(response)
+        # Before any early return below -- a turn that came back as a tool call has
+        # the same prompt behind it as one that came back as prose, and skipping it
+        # would blind the budget to exactly the tool-heavy runs that overflow.
+        _record_input_tokens(model_response)
 
         if model_response.tool_calls:
             return model_response
@@ -224,6 +266,10 @@ class _ToolCallRecoveryMixin:
 
     def _parse_provider_response_delta(self, response: Any) -> ModelResponse:
         model_response = super()._parse_provider_response_delta(response)
+        # Same placement rationale as the non-streaming parser above. Usage rides
+        # on the FINAL chunk only (stream_options include_usage), so this is a
+        # no-op on the thousands of content deltas and fires once per call.
+        _record_input_tokens(model_response)
 
         if model_response.tool_calls:
             return model_response
