@@ -3191,6 +3191,68 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             + _summarize_actual_writes(*all_results)
         )
 
+    # Completion-claim check (2026-08-24). Runs BEFORE the disclosure-style guards
+    # below: they append a warning to an answer, which is the right move when the
+    # substance is present but suspect. Here there is no substance to annotate, so
+    # this retries instead -- a note explaining that the answer is a status report
+    # leaves the user with a status report.
+    #
+    # The retry is cheap in the way that matters: the coordinator still holds every
+    # member result in context and simply has to write them out, so this is not
+    # re-running the research, only the delivery. _adopt_retry protects the original
+    # if the second pass comes back worse or empty.
+    withheld = _completion_claim_instead_of_answer(
+        content, getattr(team, "_member_result_chars", 0)
+    )
+    if withheld is not None:
+        print(f"[team] answer reports completion instead of delivering it "
+              f"({len(content.strip()):,} chars against {withheld:,} chars of member "
+              f"results) — retrying for the answer itself", flush=True)
+        deliver_note = (
+            f"IMPORTANT: a previous attempt replied that the work was complete instead "
+            f"of presenting it. Members returned {withheld:,} characters of findings "
+            f"this run and the delivered answer was {len(content.strip()):,} "
+            f"characters, so effectively none of it reached the user.\n\n"
+            f"Your visible output IS the deliverable — it is not a status update to "
+            f"the system about whether more delegation is needed. Saying an overview "
+            f"'has been completed' is not the overview.\n\n"
+            f"WRITE THE ANSWER ITSELF NOW. Work through the task's parts in order and "
+            f"write out what your members actually reported for each, with their real "
+            f"file paths, names and details. Everything you need is already in front "
+            f"of you — this needs no further delegation, only writing. A PARTIAL "
+            f"answer built from what you hold is the expected outcome; end with a "
+            f"short list of anything you genuinely could not cover."
+        )
+        try:
+            retried, retry = await _stream_team_run(
+                team, f"{task}\n\n{deliver_note}", liveness_path=liveness_path,
+            )
+            all_results.append(retry)
+            # NOT _adopt_retry here, and the reason is the whole point of this guard.
+            # _adopt_retry scores a retry on READ COUNT via _more_grounded. This retry
+            # is asked to gather nothing and write what is already in context, so it
+            # reads zero and would be rejected as "LESS evidence" every single time --
+            # the guard would fire, do the work, and then discard the answer it just
+            # produced. A delivery retry has to be judged on whether it DELIVERED.
+            #
+            # Three conditions to accept: something survives tag-stripping (the
+            # 74259e5/8a66fc3 lesson -- a leak-only retry is not falsy), it actually
+            # carries more than the status line it replaces, and it does not trip this
+            # same predicate again. Anything else keeps the original, so a failed retry
+            # can never leave the user worse off than the status report did.
+            retried_clean = _strip_leaked_tool_tags(retried or "").strip()
+            if (retried_clean
+                    and len(retried_clean) > len(content.strip())
+                    and _completion_claim_instead_of_answer(retried_clean, withheld) is None):
+                print(f"[team] completion-claim: retry delivered "
+                      f"{len(retried_clean):,} chars — adopted", flush=True)
+                content, result = retried_clean, retry
+            else:
+                print("[team] completion-claim: retry did not deliver an answer "
+                      "either — keeping the original", flush=True)
+        except Exception as exc:
+            print(f"[team] completion-claim retry failed: {exc}")
+
     # Under-answered enumeration check (2026-08-22). See _under_answered_enumeration
     # for why this is its own guard rather than a case of the count check above: the
     # facts are right, the reads happened, nothing is invented -- the answer just does
@@ -6863,6 +6925,75 @@ def _coverage_arithmetic_contradiction(content: str):
 
 
 _LIST_LINE_RE = re.compile(r"^\s*(?:[-*+•]|\d{1,3}[.)])\s+\S", re.MULTILINE)
+
+
+# Phrases that assert the work is finished rather than presenting it. Deliberately
+# narrow: these are TERMINAL completion claims, not the forward-looking process
+# narration ("I'll check X", "Let me examine Y") the _COORDINATOR_INSTRUCTIONS
+# section already covers. That section's examples are all about how an answer OPENS;
+# this is about a summary standing in place of the answer entirely, which none of
+# them reach.
+_COMPLETION_CLAIM_RE = re.compile(
+    r"\b(?:has|have) been (?:completed|provided|delivered|prepared|compiled)\b"
+    r"|\b(?:analysis|overview|review|report|research|investigation|summary|task|work)"
+    r"\s+(?:is|was)\s+(?:now\s+)?(?:fully\s+)?complete\b"
+    r"|\bno further (?:delegation|action|research|investigation|analysis|step)s?\s+"
+    r"(?:is|are)\s+(?:needed|required)\b"
+    r"|\bsuccessfully completed\b",
+    re.IGNORECASE,
+)
+# An answer this short cannot be carrying a run's worth of findings, and the ratio
+# below still has to agree. Both bounds exist so a genuinely terse answer to a narrow
+# question -- where members also returned little -- is never touched.
+_COMPLETION_CLAIM_MAX_ANSWER_CHARS = 1_200
+_COMPLETION_CLAIM_MIN_MEMBER_CHARS = 1_500
+_COMPLETION_CLAIM_MAX_RATIO = 0.25
+
+
+def _completion_claim_instead_of_answer(content: str, member_chars: int) -> int | None:
+    """An answer that reports the work is done instead of delivering it.
+
+    Returns the member-result char count the answer failed to carry, or None.
+
+    Live (T12, 2026-08-24): members returned 6,153 characters of findings and the
+    coordinator delivered 157 -- "The architectural overview of the inventory service
+    has been completed and is fully grounded in real file content. No further
+    delegation is needed." Every fact behind it was real and the reads all happened;
+    none of it reached the user.
+
+    Not covered by any existing guard. The reads occurred, nothing was invented, no
+    count was wrong, no absence was claimed, and there was no enumeration request to
+    under-answer -- so all ten answer-time predicates pass a 157-character non-answer
+    sitting on 6,153 characters of evidence.
+
+    Not covered by the instructions either. "No process narration in your final answer
+    (CRITICAL)" polices how an answer OPENS ("I'll check X", "Let me examine Y", "Now
+    I'll do Z") -- all forward-looking. A terminal completion claim is the mirror image
+    and matches none of its examples. That section is also a fair test of whether prose
+    alone can carry this: it is emphatic, marked CRITICAL, cites six live incidents,
+    and did not hold.
+
+    Note what the live sentence was addressed to. "No further delegation is needed" is
+    a message to the SCHEDULER -- the coordinator treating its user-facing answer as a
+    control channel.
+
+    Three conditions, all required, because the phrasing alone is not enough: a real
+    answer can legitimately end by noting it is complete. It is the combination of
+    completion phrasing, an answer too small to hold the findings, and members having
+    actually returned much more that identifies a summary standing in for the work.
+    """
+    if not content or not member_chars:
+        return None
+    body = content.strip()
+    if len(body) > _COMPLETION_CLAIM_MAX_ANSWER_CHARS:
+        return None
+    if member_chars < _COMPLETION_CLAIM_MIN_MEMBER_CHARS:
+        return None
+    if len(body) >= member_chars * _COMPLETION_CLAIM_MAX_RATIO:
+        return None
+    if not _COMPLETION_CLAIM_RE.search(body):
+        return None
+    return member_chars
 
 
 def _under_answered_enumeration(content: str, task: str, listings: list | None) -> int | None:
