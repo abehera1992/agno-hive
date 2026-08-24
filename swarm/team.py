@@ -1961,7 +1961,20 @@ _ENUM_TASK_RE = re.compile(
     # shape an absence question takes when it asks for the alternatives. Requires the
     # interrogative, so a bare single-file "does X exist?" (T11's own first half) stays
     # out: that one needs no listing to answer.
-    r"|\bwhat\b[^.]{0,40}\b(?:files?|modules?|routers?|services?)\b[^.]{0,25}\bexist\b",
+    r"|\bwhat\b[^.]{0,40}\b(?:files?|modules?|routers?|services?)\b[^.]{0,25}\bexist\b"
+    # "What fields does the Party model have" (T4, 2026-08-24) -- an enumeration ask
+    # that names no file and no directory, so every alternative above missed it and
+    # the answer shipped without ever listing a field.
+    #
+    # Deliberately matching the QUESTION, not the answer, and that distinction is the
+    # whole reason this is an acceptable place for a word list. A question is short,
+    # written by a human, and its interrogative forms are a small closed set. An
+    # answer is written by the model, unbounded in length, and its phrasings are
+    # infinite -- which is exactly why the answer-side phrasing check missed T4 twice
+    # over two words and had to be backed by a structural tier instead.
+    r"|\bwhat\b[^.?]{0,30}\b(?:fields?|columns?|properties|attributes|methods?|"
+    r"endpoints?|hooks?|tables?|parameters?|arguments?)\b[^.?]{0,40}"
+    r"\b(?:does|do|are|is|have|has|exist|defined|contain)\b",
     re.IGNORECASE,
 )
 # A concrete FILE the task names -- needs a name part before the dot, so a bare ".py
@@ -4604,6 +4617,19 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     return _read_cache_tool_hook
 
 
+# A question asking permission to go BEYOND what the task named. The "also/additionally
+# /as well" is load-bearing in every branch -- it is what separates "should I also
+# report X" (widening, never the human's call) from "should I report X or Y"
+# (a genuine either/or the task left open, which must still reach the human).
+_SCOPE_EXPANSION_RE = re.compile(
+    r"\b(?:should|shall|do you want me to|would you like me to|do you want|"
+    r"would you like|can i|may i|shall i)\b[^?]{0,60}?"
+    r"\b(?:also|additionally|as well|too|in addition)\b"
+    r"|\bwould you (?:also )?like (?:me )?to include\b"
+    r"|\b(?:should|do you want) (?:i |me )?(?:to )?include\b[^?]{0,40}\b(?:also|as well|too)\b",
+    re.IGNORECASE,
+)
+
 _DELEGATION_TOOL_NAMES = {"delegate_task_to_member", "delegate_task_to_members"}
 _MAX_LOGGED_TASK_CHARS = 300
 _MAX_DELEGATION_LOG_ENTRIES = 200
@@ -5127,6 +5153,38 @@ def _make_duplicate_delegation_gate_hook():
         # it is in no position to decide the human must. After one real delegation it
         # can ask freely -- a genuine design choice ("Redis or in-process caching")
         # survives contact with the codebase and is still askable on the next turn.
+        # Scope-expansion questions are never legitimate, at any delegation count
+        # (2026-08-24). The zero-delegation rule below catches "I asked before I
+        # looked"; this catches a different thing entirely -- asking permission to do
+        # MORE than the task named. There is no delegation count at which that becomes
+        # a decision only the human can make: the task already said what it wanted, and
+        # anything beyond it is optional by definition.
+        #
+        # T9: asked for the OS, the Python version and the working directory, the
+        # coordinator delegated eight times and then asked "Should I also report the
+        # Docker container image and runtime dependencies (e.g. Node.js, PostgreSQL) if
+        # they are part of the environment?" -- and ended the run on it, having never
+        # called get_env_info once. Three named things, none of them reported.
+        #
+        # Matching the model's own QUESTION, not an answer: short text, a small closed
+        # set of openers, and written to ask permission. That is the same bounded
+        # surface _ENUM_TASK_RE matches on and the opposite of the unbounded
+        # answer-phrasing surface that made the completion-claim word list untenable.
+        if function_name == "request_clarification":
+            question = str((args or {}).get("question", ""))
+            if _SCOPE_EXPANSION_RE.search(question):
+                print(f"[team] request_clarification asks to widen scope — redirected: "
+                      f"{question[:90]!r}", flush=True)
+                return (
+                    "REDIRECTED: this asks whether to report MORE than the task named. "
+                    "That is never a question only the human can settle — the task "
+                    "already stated its scope, so anything beyond it is optional and "
+                    "the answer is simply no. Report exactly what was asked for, in "
+                    "full. If some part of it genuinely cannot be determined, say so "
+                    "for that part and answer the rest. This request_clarification "
+                    "call was NOT executed."
+                )
+
         if function_name == "request_clarification" and _count_delegations(team) == 0:
             print("[team] request_clarification before any delegation — redirected",
                   flush=True)
@@ -6512,6 +6570,37 @@ async def run_task_stream(
                 task_duration.record(time.perf_counter() - t0, {"project_id": project_id})
 
 
+# Cap on the draft carried in the liveness snapshot. Large enough for a real
+# long-form answer (T13's lost draft was 10,594 chars, T12's was 57,389), small
+# enough that a rewrite every heartbeat stays trivial. A draft longer than this is
+# truncated rather than dropped -- a clipped real answer still beats a bare 504.
+_LIVENESS_DRAFT_MAX_CHARS = 120_000
+
+# Best draft seen this run, by length. Module-level rather than per-activity-dict on
+# purpose: a verify-retry builds its OWN activity dict and runs its OWN heartbeat
+# against the SAME liveness file, so a per-dict draft would let a stalling retry
+# overwrite the main pass's good content with its empty content -- which is exactly
+# the T13 shape this whole mechanism exists to survive. Keyed on nothing and never
+# reset because each run is its own subprocess (same reasoning as tool_fix's token
+# peak), so "this run" and "this process" are the same scope.
+#
+# Longest-wins is a deliberately crude ranking. It is not "best answer" in any
+# semantic sense; it is "the most content anyone managed to produce", which is the
+# only judgment available at kill time and is strictly better than losing everything.
+_best_draft = ""
+
+
+def _record_draft(text: str) -> None:
+    global _best_draft
+    if text and len(text) > len(_best_draft):
+        _best_draft = text
+
+
+def best_draft() -> str:
+    """Longest content any pass produced this run, for the liveness snapshot."""
+    return _best_draft
+
+
 async def _run_heartbeat(
     activity: dict, run_started: float, interval: float = 30.0,
     liveness_path: str | None = None,
@@ -6585,6 +6674,24 @@ async def _run_heartbeat(
                     "stagnant_seconds": stagnant_ticks * interval,
                     "max_stub_serve_count": activity.get("max_stub_serve_count", 0),
                     "total_stub_serve_count": activity.get("total_stub_serve_count", 0),
+                    # Durable draft (2026-08-24). The worker is SIGKILLed on a
+                    # liveness stall, so anything it holds in memory dies with it and
+                    # the caller gets a bare 504. That is correct when there was
+                    # nothing to lose and wrong when there was.
+                    #
+                    # T13 lost a real one: the main pass produced 10,594 characters of
+                    # a correct vouchers audit, a guard fired a retry, the RETRY
+                    # stalled on empty turns, and the kill discarded a draft that was
+                    # never at fault. 8a66fc3 covers a retry that RETURNS something
+                    # useless; it cannot help when the retry never returns at all,
+                    # because the kill happens at process level, above every guard.
+                    #
+                    # This file is already an atomic worker->parent channel (temp file
+                    # + os.replace, read by _read_liveness_snapshot), so the draft
+                    # rides the mechanism that already exists rather than needing a
+                    # second one. Up to one heartbeat stale, which is the right
+                    # trade: a 30s-old real answer beats a fresh 504.
+                    "draft": best_draft()[:_LIVENESS_DRAFT_MAX_CHARS],
                 }
                 tmp_path = f"{liveness_path}.tmp"
                 with open(tmp_path, "w") as f:
@@ -6949,6 +7056,38 @@ _COMPLETION_CLAIM_MAX_ANSWER_CHARS = 1_200
 _COMPLETION_CLAIM_MIN_MEMBER_CHARS = 1_500
 _COMPLETION_CLAIM_MAX_RATIO = 0.25
 
+# Structural tier (2026-08-24), added after the phrasing tier above missed twice in
+# one battery. It fires on the SHAPE of a non-delivery -- a large research effort
+# reporting back almost nothing -- and reads no words at all, so no wording can slip
+# past it and no vocabulary needs maintaining.
+#
+# Why the phrasing tier alone was never going to hold. T4 said "the final ANSWER is
+# complete" (my noun list had analysis/overview/report, not answer) and "no further
+# CHANGES are needed" (my list had delegation/action, not changes). Two words, two
+# misses. T3 needed no completion phrasing at all -- it reported a tool failure:
+# "The git status command timed out". Chasing an open-ended generator with a word
+# list is unwinnable; measuring the shape is not.
+#
+# Thresholds, and their honest provenance -- fitted to five observed runs, not
+# derived:
+#     T3  FAIL     ~170 chars / 20,246 gathered  =  0.8%
+#     T4  FAIL     ~950 chars / 13,834 gathered  =  6.9%
+#     T10 PASS     ~450 chars, ~93s run, small evidence base
+#     T1  PASS     ~180 chars, ~22s run, small evidence base
+#     T8  PASS     ~200 chars, ~40s run, small evidence base
+#
+# The separator is not the answer's length -- T1's correct answer is SHORTER than
+# T4's wrong one. It is how much was gathered to produce it. Every pass answered a
+# narrow question off a small evidence base; both failures sat on a large one and
+# reported nearly none of it. Hence a floor on evidence AND a ceiling on ratio: 8,000
+# is comfortably above what a legitimately terse run gathers, and 10% leaves room
+# above both failures without reaching T10.
+#
+# Refit these against a real battery rather than reasoning about them -- five points
+# is enough to separate today's cases and not enough to call a law.
+_NON_DELIVERY_MIN_MEMBER_CHARS = 8_000
+_NON_DELIVERY_MAX_RATIO = 0.10
+
 
 def _completion_claim_instead_of_answer(content: str, member_chars: int) -> int | None:
     """An answer that reports the work is done instead of delivering it.
@@ -6985,6 +7124,17 @@ def _completion_claim_instead_of_answer(content: str, member_chars: int) -> int 
     if not content or not member_chars:
         return None
     body = content.strip()
+
+    # Tier 1 -- structural, reads no words. A large research effort reporting back
+    # almost nothing is a non-delivery whatever sentence it uses to do it.
+    if (member_chars >= _NON_DELIVERY_MIN_MEMBER_CHARS
+            and len(body) < member_chars * _NON_DELIVERY_MAX_RATIO):
+        return member_chars
+
+    # Tier 2 -- the original phrasing check, kept for evidence bases too small for
+    # Tier 1 to judge safely. Narrow by design: below 8,000 gathered chars a short
+    # answer is usually just a short answer, so an explicit completion claim is the
+    # only thing that distinguishes reporting from delivering.
     if len(body) > _COMPLETION_CLAIM_MAX_ANSWER_CHARS:
         return None
     if member_chars < _COMPLETION_CLAIM_MIN_MEMBER_CHARS:
@@ -7343,6 +7493,7 @@ async def _stream_team_run(
                 now = time.monotonic()
                 if now - last_logged_at >= 10:
                     joined = "".join(full_content)
+                    _record_draft(joined)
                     new_segment = joined[last_logged_len:]
                     preview = new_segment[-300:]
                     loop_detected = _looks_like_repetition_loop(new_segment, joined[:last_logged_len])
@@ -7658,6 +7809,7 @@ async def run_task_async(
                                 now = time.monotonic()
                                 if now - last_logged_at >= 10:
                                     joined = "".join(full_content)
+                                    _record_draft(joined)
                                     new_segment = joined[last_logged_len:]
                                     preview = new_segment[-300:]
                                     loop_detected = _looks_like_repetition_loop(new_segment, joined[:last_logged_len])

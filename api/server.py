@@ -453,6 +453,33 @@ async def _run_worker_subprocess(
                         proc.kill()
                         await proc.wait()
                         print(f"[api] run auto-terminated (liveness): {reason}")
+                        # Hand back whatever the run actually produced (2026-08-24).
+                        # The kill is right; throwing away a finished answer to
+                        # report it is not. T13 lost 10,594 characters of a correct
+                        # vouchers audit this way -- the main pass was fine, a
+                        # guard-triggered retry stalled, and the process-level kill
+                        # discarded a draft no guard had objected to.
+                        #
+                        # The worker writes its longest draft into this same snapshot
+                        # each heartbeat (see _run_heartbeat), so it survives SIGKILL
+                        # by virtue of already being on disk. Up to one heartbeat
+                        # stale, which beats a bare 504 every time.
+                        draft = (snapshot.get("draft") or "").strip()
+                        if draft:
+                            print(f"[api] returning the {len(draft):,}-char draft the "
+                                  f"run had already produced")
+                            # Token counts are unavailable -- they are assembled by the
+                            # worker at normal completion and this run never got there.
+                            # Zeros, not estimates: a fabricated count would be worse
+                            # than an obviously-absent one.
+                            return (
+                                f"{draft}\n\n---\n**RUN STOPPED EARLY — {reason}. The "
+                                f"answer above is what had been produced when the run "
+                                f"was stopped, and may be incomplete or unreviewed. "
+                                f"Nothing after this point was generated.**",
+                                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                                None,
+                            )
                         raise HTTPException(status_code=504, detail=f"run auto-terminated: {reason}")
     except asyncio.CancelledError:
         proc.kill()
