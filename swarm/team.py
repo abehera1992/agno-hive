@@ -3204,67 +3204,47 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             + _summarize_actual_writes(*all_results)
         )
 
-    # Completion-claim check (2026-08-24). Runs BEFORE the disclosure-style guards
-    # below: they append a warning to an answer, which is the right move when the
-    # substance is present but suspect. Here there is no substance to annotate, so
-    # this retries instead -- a note explaining that the answer is a status report
-    # leaves the user with a status report.
+    # Non-delivery check (2026-08-24, retry REMOVED same day -- see below).
     #
-    # The retry is cheap in the way that matters: the coordinator still holds every
-    # member result in context and simply has to write them out, so this is not
-    # re-running the research, only the delivery. _adopt_retry protects the original
-    # if the second pass comes back worse or empty.
+    # Fires when a run reports back far less than it gathered. Two tiers: a
+    # structural one that reads no words (a large evidence base with a tiny answer)
+    # and a narrower phrasing one for evidence bases too small to judge structurally.
+    #
+    # DISCLOSURE, NOT RETRY -- and this is the correction, not the original design.
+    # The first version re-ran the coordinator demanding "write what your members
+    # actually reported". Live on battery T5 within an hour of shipping: a 626-char
+    # answer against 11,407 chars of gathered material triggered the retry, and the
+    # retry padded to 2,933 chars by INVENTING a sprint summary, seven work items,
+    # five owner names and two performance statistics -- none of which existed in the
+    # 904 characters the Notion page actually returned. It was adopted because the
+    # acceptance test asked whether it was LONGER, not whether it was TRUE.
+    #
+    # That is exactly what _more_grounded exists to prevent, and it was bypassed on
+    # purpose: _more_grounded scores on read count, and a delivery retry does no
+    # reads, so it would reject every success. The reasoning was right and the
+    # conclusion was wrong -- "delivered more characters" is not "delivered more
+    # truth", and a guard with no groundedness test is an invitation to pad.
+    #
+    # One live firing, one fabrication. A guard that misses is a non-event; a guard
+    # that manufactures content is worse than the failure it was built for. The
+    # signal is real and worth surfacing, so the detection stays and the banner tells
+    # the reader what happened. Recovering the answer needs a groundedness gate
+    # designed deliberately, not a length comparison.
     withheld = _completion_claim_instead_of_answer(
         content, getattr(team, "_member_result_chars", 0)
     )
     if withheld is not None:
-        print(f"[team] answer reports completion instead of delivering it "
+        print(f"[team] answer reports far less than was gathered "
               f"({len(content.strip()):,} chars against {withheld:,} chars of member "
-              f"results) — retrying for the answer itself", flush=True)
-        deliver_note = (
-            f"IMPORTANT: a previous attempt replied that the work was complete instead "
-            f"of presenting it. Members returned {withheld:,} characters of findings "
-            f"this run and the delivered answer was {len(content.strip()):,} "
-            f"characters, so effectively none of it reached the user.\n\n"
-            f"Your visible output IS the deliverable — it is not a status update to "
-            f"the system about whether more delegation is needed. Saying an overview "
-            f"'has been completed' is not the overview.\n\n"
-            f"WRITE THE ANSWER ITSELF NOW. Work through the task's parts in order and "
-            f"write out what your members actually reported for each, with their real "
-            f"file paths, names and details. Everything you need is already in front "
-            f"of you — this needs no further delegation, only writing. A PARTIAL "
-            f"answer built from what you hold is the expected outcome; end with a "
-            f"short list of anything you genuinely could not cover."
+              f"results) — flagging", flush=True)
+        return (
+            f"{content}\n\n---\n**ANSWER REPORTS FAR LESS THAN THIS RUN GATHERED — "
+            f"members returned {withheld:,} characters of findings and the answer "
+            f"above is {len(content.strip()):,} characters. What is here may be "
+            f"correct; most of what was researched is simply not in it. Ask again for "
+            f"the parts you need spelled out.**"
+            + _summarize_actual_writes(*all_results)
         )
-        try:
-            retried, retry = await _stream_team_run(
-                team, f"{task}\n\n{deliver_note}", liveness_path=liveness_path,
-            )
-            all_results.append(retry)
-            # NOT _adopt_retry here, and the reason is the whole point of this guard.
-            # _adopt_retry scores a retry on READ COUNT via _more_grounded. This retry
-            # is asked to gather nothing and write what is already in context, so it
-            # reads zero and would be rejected as "LESS evidence" every single time --
-            # the guard would fire, do the work, and then discard the answer it just
-            # produced. A delivery retry has to be judged on whether it DELIVERED.
-            #
-            # Three conditions to accept: something survives tag-stripping (the
-            # 74259e5/8a66fc3 lesson -- a leak-only retry is not falsy), it actually
-            # carries more than the status line it replaces, and it does not trip this
-            # same predicate again. Anything else keeps the original, so a failed retry
-            # can never leave the user worse off than the status report did.
-            retried_clean = _strip_leaked_tool_tags(retried or "").strip()
-            if (retried_clean
-                    and len(retried_clean) > len(content.strip())
-                    and _completion_claim_instead_of_answer(retried_clean, withheld) is None):
-                print(f"[team] completion-claim: retry delivered "
-                      f"{len(retried_clean):,} chars — adopted", flush=True)
-                content, result = retried_clean, retry
-            else:
-                print("[team] completion-claim: retry did not deliver an answer "
-                      "either — keeping the original", flush=True)
-        except Exception as exc:
-            print(f"[team] completion-claim retry failed: {exc}")
 
     # Under-answered enumeration check (2026-08-22). See _under_answered_enumeration
     # for why this is its own guard rather than a case of the count check above: the
