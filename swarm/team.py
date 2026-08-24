@@ -6331,10 +6331,10 @@ async def run_task_stream(
                         last_segment_start = len(full_content)
                 accumulated = "".join(full_content) or "(no response)"
                 final_segment = "".join(full_content[last_segment_start:]).strip()
-                fallback_content = final_segment if final_segment else accumulated
-                combined = _strip_leaked_tool_tags(
-                    final_run_output.content if final_run_output and final_run_output.content
-                    else fallback_content
+                combined = _first_surviving_answer(
+                    final_run_output.content if final_run_output else None,
+                    final_segment,
+                    accumulated,
                 )
                 # Tier-3 guard: fill [[COUNT ...]] markers in the final content (streamed
                 # chunks above are pre-substitution; the done-sentinel content is corrected).
@@ -6899,6 +6899,18 @@ _LEAKED_TOOL_TAG_RE = re.compile(
     re.DOTALL,
 )
 
+# An opener with no body at all, at the very END of the content. The regex above
+# requires a `{...}` payload, so a call the model began and never wrote -- the
+# stream ending mid-emission -- passed through untouched and could be served as
+# the final answer verbatim. That is the exact tail the T12 log preview caught:
+# "...grounded in actual file content read during this session.<tool_call>".
+#
+# Anchored to end-of-content on purpose. A bare tag followed by prose is someone
+# DISCUSSING the syntax -- a realistic question about this very codebase -- and
+# the docstring's promise to keep quotations depends on not touching that case.
+# Only a dangling opener with nothing after it is truncation rather than mention.
+_DANGLING_TOOL_TAG_RE = re.compile(r"(?:<tool_call>|<\|python_tag\|>)\s*\Z")
+
 _BUDGET_EXHAUSTED_ANSWER = (
     "I attempted another tool call, but this run's tool budget is exhausted so no "
     "further tool calls can be made. I could not complete the remaining lookup — "
@@ -6942,14 +6954,45 @@ def _strip_leaked_tool_tags(content: str) -> str:
             return match.group(0)
         return ""
 
-    stripped = _LEAKED_TOOL_TAG_RE.sub(_replace, content)
+    stripped = _DANGLING_TOOL_TAG_RE.sub("", _LEAKED_TOOL_TAG_RE.sub(_replace, content))
     if stripped == content:
         return content
 
     remaining = stripped.strip()
     print(f"[team] stripped leaked tool-call syntax from the final answer "
           f"({len(content)} -> {len(remaining)} chars)", flush=True)
-    return remaining or _BUDGET_EXHAUSTED_ANSWER
+    return remaining
+
+
+def _first_surviving_answer(*candidates: str | None) -> str:
+    """First candidate that still has content AFTER leaked tool-call syntax is
+    stripped, in the caller's order of preference.
+
+    Exists because every caller used to choose its candidate BEFORE stripping, on
+    plain emptiness -- `final_segment if final_segment else accumulated`. A final
+    segment consisting only of tool-call syntax is not empty, so it won all three
+    of those comparisons, and only then did stripping reduce it to nothing.
+
+    Live cost (T12, 2026-08-24): the model wrote a complete 57,389-char
+    architectural overview, closed it with its own "Missing or Unverified Items"
+    section and "All claims are grounded in actual file content read during this
+    session.", then emitted one trailing `<tool_call>` fragment. That fragment was
+    the entire final segment. It beat `accumulated` on the emptiness test, stripped
+    to nothing, and _BUDGET_EXHAUSTED_ANSWER replaced the whole answer -- the run
+    succeeded and returned a one-sentence apology. Nothing else failed: no
+    watchdog kill, no context overflow (57,378 of a 400,000 budget), no forcing.
+
+    Ordering the candidates and testing each one AFTER stripping is the fix; the
+    canned sentence stays as the last resort it was meant to be, reached only when
+    no candidate survives.
+    """
+    for candidate in candidates:
+        if not candidate:
+            continue
+        cleaned = _strip_leaked_tool_tags(candidate).strip()
+        if cleaned:
+            return cleaned
+    return _BUDGET_EXHAUSTED_ANSWER
 
 
 async def _stream_team_run(
@@ -7124,9 +7167,12 @@ async def _stream_team_run(
             await heartbeat_task
     accumulated = "".join(full_content) or "(no response)"
     final_segment = "".join(full_content[last_segment_start:]).strip()
-    fallback_content = final_segment if final_segment else accumulated
-    content = final_run_output.content if final_run_output and final_run_output.content else fallback_content
-    return _strip_leaked_tool_tags(content), final_run_output
+    content = _first_surviving_answer(
+        final_run_output.content if final_run_output else None,
+        final_segment,
+        accumulated,
+    )
+    return content, final_run_output
 
 
 async def run_task_async(
@@ -7444,10 +7490,10 @@ async def run_task_async(
                             await heartbeat_task
                 accumulated = "".join(full_content) or "(no response)"
                 final_segment = "".join(full_content[last_segment_start:]).strip()
-                fallback_content = final_segment if final_segment else accumulated
-                content = _strip_leaked_tool_tags(
-                    final_run_output.content if final_run_output and final_run_output.content
-                    else fallback_content
+                content = _first_surviving_answer(
+                    final_run_output.content if final_run_output else None,
+                    final_segment,
+                    accumulated,
                 )
                 # Clarification check runs BEFORE the claim-verification/count-marker
                 # guards below, and short-circuits past both when found: those guards
