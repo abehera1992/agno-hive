@@ -790,6 +790,40 @@ _HINT_SCAN_MAX_DEPTH = 4
 _HINT_SCAN_DIR_BUDGET = 4000
 
 
+def _prefix_filtered_matches(part: str, siblings: list[str], n: int = 3) -> list[str]:
+    """Near-miss candidates that share a beginning with what was asked for.
+
+    difflib alone scores on letter overlap wherever it falls, which is how a
+    Researcher looking for `backend/models/parties/` was told "Did you mean:
+    krakend?" (live, T4 2026-08-24). `backend` and `krakend` share the subsequence
+    `akend`, giving ratio 2*5/(7+7) = 0.714, comfortably past the 0.6 cutoff -- and
+    krakend is the API gateway config directory, which has nothing to do with models.
+
+    A suggestion that is confidently wrong is worse than none. The useful half of
+    that message ("no 'backend' in ./") was already correct and stands on its own;
+    the bad guess only teaches the agent to distrust the hint everywhere it IS right.
+
+    The discriminator is not the ratio but WHERE the overlap sits. A real near-miss
+    -- a typo, a plural, an extension -- shares its start:
+
+        routes  -> router      prefix 'rout'   (the 2026-08-23 case)
+        models  -> models.py   prefix 'models' (the 2026-08-24 case)
+        backend -> krakend     prefix ''       (noise)
+
+    Two characters is deliberately shallow: it keeps short real names workable while
+    rejecting a match that shares nothing but its middle. Raising difflib's cutoff
+    instead was the obvious alternative and is wrong -- `backend`/`krakend` at 0.714
+    scores HIGHER than plenty of legitimate near-misses, so any cutoff that excludes
+    it excludes them too.
+    """
+    import difflib
+    candidates = difflib.get_close_matches(part, siblings, n=n * 3, cutoff=0.6)
+    low = (part or "").lower()
+    kept = [c for c in candidates
+            if low[:2] and c.lower().startswith(low[:2])]
+    return kept[:n]
+
+
 def _glob_hint_bases(first_segment: str):
     """Directories a prefix-less pattern's first literal segment could refer to.
 
@@ -892,8 +926,16 @@ def _did_you_mean_glob(glob_pattern: str) -> str:
             # keep guessing.
             siblings = [p.name for p in cursor.iterdir()
                         if not p.name.startswith(".") and p.name not in _IGNORE_DIRS]
-            close = difflib.get_close_matches(part, siblings, n=3, cutoff=0.6)
+            close = _prefix_filtered_matches(part, siblings)
             if not close:
+                # Still "" here, NOT the bare locating message: the caller's next move
+                # is to re-resolve this segment under the fallback prefixes, and that
+                # is where 'inventory-service/models/**' finds API/inventory-service and
+                # produces the good "Did you mean: models.py?" hint. Returning a message
+                # from here short-circuits that -- caught live while making this change,
+                # having turned a correct hint into a useless one. The bare locating
+                # message is emitted once, at the end, only after every resolution has
+                # failed.
                 return ""
             shown = "/".join(walked) or "."
             return (f" — the path prefix does not exist: no '{part}' in {shown}/. "
@@ -939,6 +981,17 @@ def _did_you_mean_glob(glob_pattern: str) -> str:
                          list(base.relative_to(PROJECT_ROOT).parts))
             if hint:
                 return hint
+
+        # Nothing resolved and nothing worth suggesting -- say where the trail died
+        # anyway. "No matches" alone reads as "the thing is absent"; naming the segment
+        # that does not exist says the PATH was wrong, which is a different and far more
+        # actionable statement. This is the half that was always correct in T4's
+        # "no 'backend' in ./. Did you mean: krakend?" -- worth keeping now that the
+        # bad guess beside it is gone.
+        if not (PROJECT_ROOT / first).exists():
+            return (f" — the path prefix does not exist: no '{first}' in ./. "
+                    f"A glob that matches nothing because its DIRECTORY is wrong is not "
+                    f"evidence that the thing you are looking for is absent.")
         return ""
     except Exception:
         return ""
@@ -978,12 +1031,13 @@ def _did_you_mean(relative_path: str) -> str:
                 return ""
             siblings = [p.name for p in cursor.iterdir()
                         if not p.name.startswith(".") and p.name not in _IGNORE_DIRS]
-            close = difflib.get_close_matches(part, siblings, n=3, cutoff=0.6)
-            if not close:
-                return ""
+            close = _prefix_filtered_matches(part, siblings)
             shown = "/".join(parts[:depth]) or "."
-            return (f" — no '{part}' in {shown}/. Did you mean: "
-                    + ", ".join(close) + "?")
+            # Same reasoning as the glob variant above: "no 'backend' in ./" is the
+            # correction, and it survives a dropped suggestion.
+            if close:
+                return f" — no '{part}' in {shown}/. Did you mean: " + ", ".join(close) + "?"
+            return f" — no '{part}' in {shown}/."
         return ""
     except Exception:
         return ""      # a suggestion is a nicety; never let it break the real answer
