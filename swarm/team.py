@@ -4415,10 +4415,32 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             if agent is not None:
                 _force_text_only(agent)
             return (
+                # The SHAPE of the answer has to be demanded, not just its timing
+                # (2026-08-23). The previous wording already said "answer now and state
+                # what you could not examine", and battery T12 responded with
+                # "The architectural overview has been completed and verified." -- one
+                # sentence ABOUT an answer, after 929 seconds and 333,144 characters of
+                # real research, all of it discarded.
+                #
+                # A model told to stop will summarise its situation unless told to
+                # deliver content. So: name the deliverable, forbid the meta-report,
+                # and make partial coverage the expected outcome rather than a failure
+                # to apologise for.
                 f"READ BUDGET REACHED: you have already read {spent:,} characters this "
                 f"run, which is as much as fits in context alongside your task and your "
-                f"answer. No further reads will run. Answer NOW from what you have "
-                f"read, and state plainly which parts you could not examine."
+                f"answer. No further reads will run.\n\n"
+                f"WRITE THE ANSWER ITSELF NOW — not a description of it. Concretely:\n"
+                f"  1. Work through the task's parts in order, and for each one write "
+                f"what you actually found, with the real file paths and details you "
+                f"read this run.\n"
+                f"  2. A PARTIAL answer is the expected outcome here and is worth far "
+                f"more than a complete-sounding one. Cover what you covered.\n"
+                f"  3. End with a short list of the parts you could not examine, so the "
+                f"reader knows exactly what is missing.\n"
+                f"Do NOT reply with a status report. Sentences like \"the overview has "
+                f"been completed\", \"the analysis is finished\" or \"all claims are "
+                f"verified\" are NOT an answer — they describe one. The reader cannot "
+                f"see your work; only what you write here exists."
             )
 
         is_fresh_fetch = cache_key not in cache
@@ -5019,11 +5041,20 @@ def _make_duplicate_delegation_gate_hook():
                       f"further delegation, forcing an answer", flush=True)
                 _force_text_only(None, team=team)
                 return (
+                    # Same shape demand as the per-member read budget above, for the
+                    # same measured reason -- "write your final answer now" alone
+                    # reliably produces a sentence about the answer instead of one.
                     f"STOP — CONTEXT BUDGET REACHED: members have already returned "
                     f"{spent:,} characters of results this run, which is as much as can "
                     f"be carried without overflowing the model's context window. No "
-                    f"further delegation will run. Write your final answer NOW from what "
-                    f"you already have, and say plainly which parts you could not cover."
+                    f"further delegation will run.\n\n"
+                    f"WRITE THE ANSWER ITSELF NOW — not a description of it. Work "
+                    f"through the task's parts in order and write what your members "
+                    f"actually reported for each, with their real file paths and "
+                    f"details. A PARTIAL answer is the expected outcome and is worth "
+                    f"far more than a complete-sounding one. End with a short list of "
+                    f"the parts you could not cover. Do NOT reply with a status report: "
+                    f"\"the analysis is complete\" is not an answer, it describes one."
                 )
 
         # Fabricated background-job handle (2026-08-22). Executor, asked for the git
