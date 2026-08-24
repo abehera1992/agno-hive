@@ -125,7 +125,18 @@ def _py_skeleton(src: str):
     """Structural skeleton of Python source: imports + class/def signatures + the first
     docstring line, with bodies elided. Returns None if the source does not parse."""
     try:
-        tree = ast.parse(src)
+        # Strip a leading UTF-8 BOM before parsing (2026-08-23). ast.parse rejects
+        # U+FEFF outright ("invalid non-printable character U+FEFF"), so this returned
+        # None for EVERY BOM-prefixed file -- and this project's files carry BOMs.
+        # Measured on the four files a T12-style overview reads most:
+        #   items_api.py    26,658 -> 5,470 skeleton  (21%)
+        #   main.py          6,289 -> 1,322 skeleton  (21%)
+        #   models.py       31,151 -> EMPTY   (BOM)
+        #   vouchers_api.py 37,113 -> EMPTY   (BOM)
+        # The two largest files were exactly the ones falling back to full text, so the
+        # size-reduction path was dead where it mattered most and nothing reported it:
+        # a None skeleton silently degrades to returning the whole file.
+        tree = ast.parse(src.lstrip("﻿"))
     except (SyntaxError, ValueError):
         return None
     lines = src.splitlines()
