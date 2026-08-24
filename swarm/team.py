@@ -4521,6 +4521,22 @@ _DELEGATION_TOOL_NAMES = {"delegate_task_to_member", "delegate_task_to_members"}
 _MAX_LOGGED_TASK_CHARS = 300
 _MAX_DELEGATION_LOG_ENTRIES = 200
 
+# Delegation VOLUME ceilings, per member, counting only delegations that actually
+# ran (see _make_duplicate_delegation_gate_hook's volume tier for why these exist
+# and why every other gate in this file missed the failure they close).
+#
+# Sizing. A genuinely multi-part task -- battery T12 asks for routers, models,
+# external dependencies and cross-service integration -- justifies roughly four to
+# six delegations to the one member that reads code. WARN at 8 leaves headroom
+# above that before saying anything; LIMIT at 12 is double the legitimate ceiling.
+# The upper bound that matters is the coordinator's own tool_call_limit (60 for the
+# engineering team, team_role_models): past it agno refuses further tool calls
+# SILENTLY, and the run degrades into empty-content turns no watchdog can read as
+# stalled. Firing at 12 keeps a forced, partial, USABLE answer five times clear of
+# that cliff.
+_MEMBER_DELEGATION_WARN = 8
+_MEMBER_DELEGATION_LIMIT = 12
+
 def _member_key(name: str) -> str:
     """A separator-insensitive key for deciding whether two spellings mean the SAME
     member. Strips every non-alphanumeric and lowercases:
@@ -5112,6 +5128,76 @@ def _make_duplicate_delegation_gate_hook():
         if not task_text:
             return await function(**args)
 
+        # Delegation VOLUME gate (2026-08-24). Every other tier in this hook asks
+        # "is this delegation the SAME as an earlier one" -- by exact text, or by
+        # {target, action} when the wording changed. All of them are about
+        # repetition, and a coordinator can exhaust itself without repeating
+        # anything.
+        #
+        # Live incident (T12, run 3): 57 delegations, every single one to
+        # 'researcher', none blocked -- 57 differently-worded asks are not
+        # duplicates under any tier above, and by design should not be. The
+        # coordinator's tool_call_limit is 60. At 60 agno stops executing tool
+        # calls and says nothing: no exception, no stream event, no log line. The
+        # model kept being invoked (158 LiteLLM round-trips, all 200 OK, vLLM
+        # steady at 26-29 tok/s, ~15,000 tokens generated) and every turn came
+        # back as TeamRunContent with content='' -- tool-call tokens, parsed out,
+        # then dropped. last_progress_at never advanced, so the liveness watchdog
+        # killed a run that was not idle at all. hive-mcp, vLLM, LiteLLM and the
+        # thermal watchdog were each measured and cleared.
+        #
+        # So the ceiling is not the disease. Fifty-seven delegations to one member
+        # is, and raising tool_call_limit only buys a longer loop before the same
+        # silent death. This gate catches volume directly, independent of wording,
+        # and -- critically -- ends with _force_text_only rather than a redirect: a
+        # redirected call still consumes the coordinator's budget, which is exactly
+        # how an earlier version of the duplicate tier produced "54 identical
+        # delegations, 54 identical refusals, run killed after 13 minutes."
+        target_key = (
+            _member_key(str((args or {}).get("member_id", "")).strip())
+            if function_name == "delegate_task_to_member" else "__broadcast__"
+        )
+        executed = sum(
+            1 for entry in log
+            if (_member_key(str((entry.get("args") or {}).get("member_id", "")).strip())
+                if entry.get("tool") == "delegate_task_to_member" else "__broadcast__")
+            == target_key
+        )
+        who = ("the whole team" if target_key == "__broadcast__"
+               else repr(target_key))
+        if executed >= _MEMBER_DELEGATION_LIMIT:
+            print(f"[team] delegation volume limit — {executed} delegations to "
+                  f"{target_key!r} this run, refusing further delegation and "
+                  f"forcing an answer", flush=True)
+            _force_text_only(None, team=team)
+            return (
+                # Same shape demand as the context and read budgets, for the same
+                # measured reason: "write your final answer now" on its own
+                # reliably produces a sentence ABOUT the answer instead of one.
+                f"STOP — DELEGATION LIMIT REACHED: you have delegated to {who} "
+                f"{executed} times this run. That is far past what any task needs, "
+                f"and continuing would exhaust your tool-call budget, after which "
+                f"your calls stop running silently and this run is lost with "
+                f"nothing to show. No further delegation will run.\n\n"
+                f"WRITE THE ANSWER ITSELF NOW — not a description of it. Work "
+                f"through the task's parts in order and write what your members "
+                f"actually reported for each, with their real file paths and "
+                f"details. A PARTIAL answer is the expected outcome and is worth "
+                f"far more than a complete-sounding one. End with a short list of "
+                f"the parts you could not cover. Do NOT reply with a status report: "
+                f"\"the analysis is complete\" is not an answer, it describes one."
+            )
+        # Warned once, and the call still runs -- the warning rides back attached to
+        # the real result (see the bottom of this hook). A print alone would go to
+        # the journal, where the coordinator cannot read it; the point is to let it
+        # converge deliberately while it still has budget, rather than meet the hard
+        # stop cold. An answer written by choice beats the same answer forced four
+        # delegations later.
+        warn_now = executed == _MEMBER_DELEGATION_WARN
+        if warn_now:
+            print(f"[team] delegation volume warning — {executed} delegations to "
+                  f"{target_key!r} this run", flush=True)
+
         if function_name == "delegate_task_to_member":
             # _member_key on BOTH sides -- separator-insensitive, so 'context-router'
             # and 'contextrouter' dedupe as one target. _member_id left the two looking
@@ -5228,6 +5314,17 @@ def _make_duplicate_delegation_gate_hook():
             "args": dict(args or {}),
             "audit": _parse_delegation_audit(raw_task),
         })
+        if warn_now:
+            remaining = _MEMBER_DELEGATION_LIMIT - _MEMBER_DELEGATION_WARN
+            return (
+                f"{result}\n\n"
+                f"── NOTE FROM THE RUN, not from {who} ──\n"
+                f"That was delegation #{_MEMBER_DELEGATION_WARN} to {who} this run. "
+                f"After {remaining} more, delegation stops and you will be required "
+                f"to answer with whatever you hold at that point. Start assembling "
+                f"the final answer now, and spend any remaining delegations only on "
+                f"parts of the task you have nothing at all for."
+            )
         return result
 
     return _duplicate_delegation_gate_hook
