@@ -151,7 +151,21 @@ it means the list was assembled by testing invented names rather than reading ex
 
 **Pass:** all three named files actually read, all 9 endpoints and 3 voucher tables
 enumerated, and the gap list exactly `grn`, `credit-note`, `stock-adjustment`,
-`stock-transfer` — 9 endpoints minus the 5 that have hooks. Reporting 6 gaps is the
+`stock-transfer` — 9 endpoints minus the 5 that have hooks.
+
+> **These four are NOT defects (corrected 2026-08-25).** The Notion page
+> "Inventory-Service Module" places GRN, credit/debit notes, stock adjustment and stock
+> transfer under **Phase 2 — Advanced Vouchers**, planned and not yet started; only
+> Phase 0 (master data, Tally import) is shipped. `docs/inventory.md:21` says the same
+> locally: "Voucher create form (full invoice entry UI)." is listed as pending. So the
+> backend is running AHEAD of a frontend that is not yet due.
+>
+> An answer that lists these four as missing work is misleading even with the count
+> right. The earlier version of this entry recorded them as plain "gaps" and was wrong
+> in framing — the number was never the whole answer. A full pass states the four and
+> attributes them to Phase 2; treat a bare "4 gaps to fix" as partial.
+
+Reporting 6 gaps is the
 historical failure and means `/post` and `/cancel` were wrongly counted as uncovered.
 
 **Ground truth (verified 2026-08-25):** 9 endpoints in `vouchers_api.py`; voucher tables
