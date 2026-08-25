@@ -6629,8 +6629,20 @@ _best_draft = ""
 
 def _record_draft(text: str) -> None:
     global _best_draft
-    if text and len(text) > len(_best_draft):
-        _best_draft = text
+    # Sanitise on the way IN, not on the way out (2026-08-25). The draft is read back
+    # by api/server.py after a SIGKILL and returned to the caller verbatim, so raw
+    # tool-call syntax in it reaches the user. Live on T13 the first time this fix ever
+    # fired: a genuinely good recovered answer -- all 9 endpoints, correct gap list --
+    # was served with '<tool_call>\n{"name": "search_files", ...}</tool_call>' welded to
+    # its front.
+    #
+    # Cleaning here rather than at return also makes the longest-wins comparison honest:
+    # a draft padded with leaked syntax no longer outranks a shorter real one.
+    if not text:
+        return
+    cleaned = _strip_leaked_tool_tags(text).strip()
+    if cleaned and len(cleaned) > len(_best_draft):
+        _best_draft = cleaned
 
 
 def best_draft() -> str:
