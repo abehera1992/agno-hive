@@ -411,6 +411,15 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
     if offset or limit:
         lines = data.splitlines()
         start = max(offset, 0)
+        # Floor an absurdly small page (2026-08-25). A Researcher asked for limit=5
+        # fifteen times in a row on a 906-line file -- offsets 114, 119, 124 ... 184,
+        # ~350 chars each -- spending fifteen round-trips on roughly what one read
+        # returns. Serving more lines than asked is safe in a way serving fewer is not:
+        # the caller gets a superset of what it requested, the extra text is a few
+        # hundred characters, and the alternative is a slow walk that also burns the
+        # tool-call budget the task needs elsewhere.
+        if 0 < limit < _MIN_RANGED_READ_LINES:
+            limit = _MIN_RANGED_READ_LINES
         end = start + limit if limit > 0 else len(lines)
         # Past EOF must SAY so (2026-08-23). Previously an out-of-range offset returned
         # the header with an empty body -- 72 characters, no error, no hint -- and an
@@ -450,7 +459,13 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
             return (
                 f"# {relative_path} is {len(data):,} bytes — too large to return whole.\n"
                 f"# STRUCTURAL SKELETON below (signatures + docstrings; bodies elided as ...).\n"
-                f"# Read a specific part with get_file_content('{relative_path}', offset=<line>, limit=<n>).\n\n"
+                # A concrete limit, not "<n>" (2026-08-25). With no number suggested, a
+                # Researcher picked limit=5 and walked this file in FIFTEEN round-trips
+                # (offsets 114, 119, 124 ... 184) to retrieve about as much text as one
+                # read would have returned. The skeleton invites pagination; it should
+                # say what a sensible page looks like.
+                f"# Read a specific part with get_file_content('{relative_path}', offset=<line>, limit=200).\n"
+                f"# Use limit=200 or more — a small limit means many slow round-trips.\n\n"
                 + skel
             )
     head, tail = data[:8000], data[-4000:]
@@ -786,6 +801,11 @@ def list_directory_tree(max_depth: int = 3) -> str:
 # depth 2 in this layout (API/inventory-service), so 4 covers real cases with room
 # to spare while keeping a miss cheap -- and a miss is the common outcome, since
 # the search only runs when the configured prefixes already failed.
+# Smallest page a ranged read will actually serve. Anything under this costs more in
+# round-trips than the lines are worth; 40 is well below a sensible page (the skeleton
+# hint suggests 200) and well above the limit=5 walk that motivated it.
+_MIN_RANGED_READ_LINES = 40
+
 _HINT_SCAN_MAX_DEPTH = 4
 _HINT_SCAN_DIR_BUDGET = 4000
 

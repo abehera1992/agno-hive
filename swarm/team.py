@@ -3253,7 +3253,11 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # the work. Disclosure, not a retry: the enumeration is already sitting in the run's
     # own tool output, so the reader can be pointed at it for the cost of one line
     # instead of a 60-100s re-run.
-    missing_enum = _under_answered_enumeration(content, task, getattr(team, "_listings", None))
+    _rs_enum = getattr(team, "_read_state", None)
+    missing_enum = _under_answered_enumeration(
+        content, task, getattr(team, "_listings", None),
+        read_items=(_rs_enum.get("max_enumerable", 0) if isinstance(_rs_enum, dict) else 0),
+    )
     if missing_enum is not None:
         print(f"[team] enumeration task answered without a list "
               f"({missing_enum} items were available) — flagging", flush=True)
@@ -4586,6 +4590,20 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             read_state["read_chars_total"] = (
                 read_state.get("read_chars_total", 0) + len(str(result))
             )
+            # Most enumerable items any single read returned (2026-08-25). The
+            # under-answered-enumeration guard could only ever count DIRECTORY entries,
+            # so a task asking to list what is inside a FILE had no evidence source and
+            # the guard stayed silent. T13 asked for the vouchers module's endpoints;
+            # the skeleton it read holds 9 `@router` decorators, one per real endpoint,
+            # and the answer showed none of them.
+            #
+            # Max of a single read, not a sum across reads: the claim being supported is
+            # "one tool call had N items in front of it", which a total across unrelated
+            # files would overstate.
+            if isinstance(result, str) and len(result) < 400_000:
+                found = len(_ENUMERABLE_LINE_RE.findall(result))
+                if found > read_state.get("max_enumerable", 0):
+                    read_state["max_enumerable"] = found
 
         if (
             function_name == "get_file_content"
@@ -7083,6 +7101,47 @@ def _coverage_arithmetic_contradiction(content: str):
 
 _LIST_LINE_RE = re.compile(r"^\s*(?:[-*+•]|\d{1,3}[.)])\s+\S", re.MULTILINE)
 
+# Asks for enumerated OUTPUT. Deliberately NOT _is_enumeration_task, and the two must
+# not be merged (2026-08-25).
+#
+# _is_enumeration_task drives a RETRY that orders the team to "Call list_directory ...
+# NOW", so it has to mean "this needs a DIRECTORY listing" -- which is why it excludes
+# a task naming a concrete file. Widening it to reach T13 would make T2 ("list every
+# endpoint defined in business_api.py") demand a directory listing for a file-contents
+# question, the exact false fire that exclusion was written to stop.
+#
+# This one only asks "did the answer show the list it was asked for", drives no retry,
+# and so can be broader. T13 -- "Audit the vouchers module: list its endpoints, its
+# database tables, and its frontend hooks" -- matched neither pattern before, because
+# _ENUM_TASK_RE requires "list EVERY/ALL/EACH" and this says "list ITS".
+_ASKS_FOR_LIST_RE = re.compile(
+    r"\blist (?:its|their|the|out|every|all|each)\b"
+    r"|\benumerate\b|\bname (?:every|all|each)\b"
+    r"|\bwhat\b[^.?]{0,30}\b(?:fields?|columns?|endpoints?|hooks?|tables?|methods?|"
+    r"properties|routes?|files?)\b[^.?]{0,40}\b(?:does|do|are|is|have|has|exist)\b",
+    re.IGNORECASE,
+)
+
+# Lines that constitute an enumerable item in a tool result -- what the run could have
+# listed. Verified against the real case rather than assumed: the skeleton of
+# vouchers_api.py (37,113 bytes, so a skeleton rather than a full read) contains
+# exactly 9 `@router` decorators, matching the 9 real endpoints T13 was asked to list
+# and reported only in prose.
+_ENUMERABLE_LINE_RE = re.compile(
+    r"^\s*(?:[-*+•]|\d{1,3}[.)])\s+\S"
+    r"|^\s*@\w[\w.]*\("
+    r"|^\s*(?:async\s+)?def\s+\w+"
+    r"|^\s*class\s+\w+"
+    r"|^\s*export\s+(?:const|function|default)\s+\w+"
+    r"|^\s*\[(?:FILE|DIR)\]\s+\S",
+    re.MULTILINE,
+)
+
+
+def _asks_for_list(task: str | None) -> bool:
+    """Whether the task asked for enumerated output. Drives disclosure only."""
+    return bool(task and _ASKS_FOR_LIST_RE.search(task))
+
 
 # Phrases that assert the work is finished rather than presenting it. Deliberately
 # narrow: these are TERMINAL completion claims, not the forward-looking process
@@ -7196,7 +7255,8 @@ def _completion_claim_instead_of_answer(content: str, member_chars: int) -> int 
     return member_chars
 
 
-def _under_answered_enumeration(content: str, task: str, listings: list | None) -> int | None:
+def _under_answered_enumeration(content: str, task: str, listings: list | None,
+                                read_items: int = 0) -> int | None:
     """An answer that was asked to enumerate and returned only a conclusion.
 
     Returns the number of items the run demonstrably had in hand, or None.
@@ -7212,9 +7272,20 @@ def _under_answered_enumeration(content: str, task: str, listings: list | None) 
     having actually RETURNED >= 3 items this run is what prevents it -- the guard only
     fires when the run can prove there was more to show than the answer shows.
     """
-    if not content or not _is_enumeration_task(task):
+    # _asks_for_list, not _is_enumeration_task: this guard only discloses, so it can
+    # use the broader "asked for a list" test. _is_enumeration_task stays bound to the
+    # RETRY that orders a list_directory call, where a false fire would demand a
+    # directory listing for a file-contents question. See _ASKS_FOR_LIST_RE.
+    if not content or not _asks_for_list(task):
         return None
-    available = max((l.get("items", 0) for l in (listings or [])), default=0)
+    # Two evidence sources (read_items added 2026-08-25). Directory entries were the
+    # only one, so a task asking to list what is inside a FILE could never satisfy the
+    # gate -- T13's endpoints came from a file skeleton, not a listing, and the guard
+    # stayed silent while the answer showed no list at all.
+    available = max(
+        max((l.get("items", 0) for l in (listings or [])), default=0),
+        read_items or 0,
+    )
     if available < 3:
         return None
     if len(_LIST_LINE_RE.findall(content)) >= 2:
