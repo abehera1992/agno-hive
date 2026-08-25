@@ -3253,6 +3253,23 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # the work. Disclosure, not a retry: the enumeration is already sitting in the run's
     # own tool output, so the reader can be pointed at it for the cost of one line
     # instead of a 60-100s re-run.
+    # Inferred-item check (2026-08-25). Runs before the other enumeration checks
+    # because it needs nothing from them: the answer has already declared these items
+    # ungrounded, so no evidence gate or search record is consulted.
+    inferred = _inferred_enumeration_items(content)
+    if inferred is not None:
+        shown = "; ".join(inferred[:4])
+        print(f"[team] {len(inferred)} enumerated item(s) self-labelled as inferred "
+              f"— flagging", flush=True)
+        return (
+            f"{content}\n\n---\n**{len(inferred)} ITEM(S) IN THIS LIST WERE INFERRED, "
+            f"NOT READ — the answer marks them so itself: {shown}. An enumeration is "
+            f"meant to report what the tools returned; an item reasoned out from a "
+            f"pattern has not been verified to exist and must not be counted as a "
+            f"finding. Check each one against the file before acting on it.**"
+            + _summarize_actual_writes(*all_results)
+        )
+
     # Guess-driven enumeration check (2026-08-25). Sits before the under-answered
     # check because they describe different faults: that one is "you had a list and did
     # not show it", this one is "the list you showed was assembled by testing names you
@@ -7226,6 +7243,55 @@ def _asks_for_list(task: str | None) -> bool:
 # you did not think of.
 _BARE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _GUESS_SEARCH_MIN = 3
+
+
+# An enumerated line the answer itself marks as not-read: "(inferred from ...)",
+# "(assumed)", "(presumed)". Requires the line to BE a list item, so prose that merely
+# discusses inference ("this cannot be inferred from the schema") is untouched.
+_INFERRED_ITEM_RE = re.compile(
+    r"^\s*(?:[-*+•]|\d{1,3}[.)])\s+.{0,200}?"
+    r"[(\[*_]{1,2}\s*(inferred|assumed|presumed|implied|extrapolated|"
+    r"based on (?:the )?(?:pattern|convention)|by convention)\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+_INFERRED_ITEM_CONTEXT = 90
+
+
+def _inferred_enumeration_items(content: str) -> list[str] | None:
+    """List items the answer itself flags as inferred rather than read.
+
+    Returns the offending lines, or None.
+
+    The model marks these for us, which makes this the rare check needing no judgement
+    about whether a claim is grounded -- the answer already says it is not.
+
+    Live, T13 turn 3 (2026-08-25), chained after a turn that had correctly listed all
+    nine real endpoints:
+
+        6. `GET /vouchers/{voucher_id}/status`  *(inferred from `getVoucher` query)*
+        7. `GET /vouchers/{voucher_id}/history` *(inferred from `getVoucher` query)*
+        8. `GET /vouchers/{voucher_id}/audit`   *(inferred from `getVoucher` query)*
+        9. `GET /vouchers/{voucher_id}/preview` *(inferred from `getVoucher` query)*
+
+    None of the four exists -- 0 occurrences each in vouchers_api.py -- and the answer
+    went on to report them as frontend coverage gaps that "must be addressed". The four
+    real ones it displaced had been established correctly one turn earlier.
+
+    Nothing else catches this. verify_claims checks backticked symbols against the repo
+    and these are URL paths, not identifiers; the guess-driven check reads search
+    arguments and these were never searched for at all; the enumeration check asks
+    whether a list is present, and it was.
+
+    Flagging an inferred item is right even when the inference happens to be correct: an
+    enumeration is supposed to report what the tools returned, and an item that arrived
+    by reasoning about a pattern has a different evidentiary status to one that was read.
+    Saying so costs a sentence; not saying so ships a guess inside a list of facts.
+    """
+    if not content:
+        return None
+    hits = [m.group(0).strip()[:_INFERRED_ITEM_CONTEXT]
+            for m in _INFERRED_ITEM_RE.finditer(content)]
+    return hits or None
 
 
 def _guess_driven_enumeration(task: str, searches: list | None) -> tuple[int, int] | None:
