@@ -320,32 +320,110 @@ _NEGATION_BEFORE_RE = re.compile(
     # a normal, frequent answer shape ("there is no rate-limiting middleware", "no such
     # directory"), and flagging those as fabrication is precisely what teaches readers to
     # ignore this tool along with its true positives.
-    r"\b(no|not|isn't|aren't|never|unlike|instead of|rather than|as opposed to)\b"
+    r"\b(no|not|isn't|aren't|never|unlike|instead of|rather than|as opposed to|"
+    r"lacks?|lacking|missing|absent|without)\b"
     # Allow a few words between the negation and the token. Anchoring the negation
     # immediately before it missed the commonest phrasing of all: "does not have a
     # `sku_prefix` column" -- live on battery T1, where the answer denied a column
     # that exists at models.py:129 and nothing flagged it. "have a" was enough to
     # break the match.
-    r"[\w\s,'-]{0,25}$",
+    #
+    # Punctuation added 2026-08-24. The class was [\w\s,'-], which excludes "(" and
+    # "." -- so "No service function (e.g., `verify_seller()`)" broke on the bracket
+    # and the parenthetical, and T3 shipped "no service function creates or updates a
+    # VerificationCheck" while verify_seller sits at business_admin_api.py:85. The
+    # span is now clause-bounded (see _negation_scope), so allowing punctuation here
+    # cannot reach across a sentence to borrow an unrelated negation.
+    # The backtick is load-bearing: in a LIST of denied items ("No other hooks
+    # (`a`, `b`, etc.) are found") every token after the first has earlier backticked
+    # siblings between it and the negation, so excluding ` matched only the first item
+    # and let the rest through as existence claims. Live on T13, where four of five
+    # real hooks were declared missing.
+    r"[\w\s,.:;'\"`()\[\]/-]{0,60}$",
     re.IGNORECASE,
 )
+# Widened 2026-08-24 from `(does not|doesn't|do not|don't|isn't|aren't) exist`, which
+# only ever caught the single verb "exist". Every miss below used a different one:
+#   T1  "its `sku_prefix` column is not declared"
+#   T13 "No other hooks (`useCreateVoucherMutation`, ...) are found in the codebase"
+# Both are absence claims about things that exist, and both read as EXISTENCE claims
+# to the old pattern, so finding the symbol counted as confirmation rather than
+# contradiction.
 _NEGATION_AFTER_RE = re.compile(
-    r"^\s*[,)]?\s*(does not|doesn't|do not|don't|isn't|aren't)\s+exist\b",
+    r"^\s*[,)\]]*\s*(?:,?\s*etc\.?\s*[,)\]]*\s*)?"
+    # Words may sit between the token and the verb -- "`sku_prefix` COLUMN is not
+    # declared" (T1). Bounded, and no sentence punctuation allowed through, so the
+    # verb still has to belong to the same clause as the token.
+    r"(?:[\w\s,'-]{0,30}?\s)?"
+    r"(?:does not|doesn't|do not|don't|is not|isn't|are not|aren't|was not|wasn't|"
+    r"were not|weren't|cannot be|can't be|could not be|couldn't be)\s+"
+    r"(?:be\s+)?(?:exist|found|present|defined|declared|implemented|located|used|"
+    r"referenced|available|wired|called|invoked)\b",
     re.IGNORECASE,
 )
-_NEGATION_WINDOW = 20
+
+# How far back to look for a negation cue. Was a flat 20 characters, which is why
+# T3's "No service function (e.g., `verify_seller()`)" slipped through -- its "No" is
+# 27 characters before the backtick, outside the window entirely. Widening a flat
+# window is the obvious fix and the wrong one: at 60+ characters an unrelated
+# negation in a neighbouring clause ("There is no caching layer, but `verify_seller`
+# handles it") starts marking real existence claims as negated, and a FOUND result
+# then reports as CONTRADICTED -- a false positive in the direction that does the most
+# damage, since it accuses a correct answer of fabricating.
+#
+# So the span is bounded by MEANING rather than distance: everything back to the
+# nearest sentence end or contrastive conjunction, capped. A negation only counts if
+# it governs the same clause the token sits in.
+_NEGATION_LOOKBACK_CAP = 160
+_CLAUSE_BREAK_RE = re.compile(
+    r"[.!?;]|\n|\b(?:but|however|although|though|whereas|while|yet)\b",
+    re.IGNORECASE,
+)
+
+# Abbreviations whose internal periods are not sentence ends. Stripped before the
+# clause scan rather than guarded with lookbehinds: "e.g." contains TWO periods and a
+# lookbehind only ever protects the second, so the first still split the clause --
+# which is precisely how "No service function (e.g., `verify_seller()`)" lost its
+# "No" and shipped as a false absence claim about a function at
+# business_admin_api.py:85.
+_ABBREVIATIONS_RE = re.compile(r"\b(?:e\.g|i\.e|etc|vs|cf|approx|no)\.", re.IGNORECASE)
+
+
+def _negation_scope(answer: str, start: int) -> str:
+    """Text governing the token at `start`: back to the nearest clause boundary.
+
+    Bounded by meaning rather than distance, so a negation in a neighbouring clause
+    ("There is no caching layer, but `verify_seller` handles it") cannot be borrowed
+    to mark a real existence claim as denied -- a false positive in the direction that
+    does the most damage, since it accuses a correct answer of fabricating.
+    """
+    window = answer[max(0, start - _NEGATION_LOOKBACK_CAP):start]
+    # Same length out as in (periods -> spaces), so offsets stay usable if this ever
+    # needs to report a position.
+    window = _ABBREVIATIONS_RE.sub(lambda m: m.group(0).replace(".", " "), window)
+    last_break = None
+    for m in _CLAUSE_BREAK_RE.finditer(window):
+        last_break = m.end()
+    return window[last_break:] if last_break is not None else window
 
 
 def _is_negated_claim(answer: str, start: int, end: int) -> bool:
     """True if the backticked span answer[start:end] (including the backticks) is
-    being asserted NOT to exist, rather than asserted to exist. Checks a short window
-    on both sides -- a negation word right before the opening backtick ("not `X`") or
-    an explicit non-existence disclaimer right after the closing one ("`X` does not
-    exist")."""
-    before = answer[max(0, start - _NEGATION_WINDOW):start]
-    if _NEGATION_BEFORE_RE.search(before):
+    being asserted NOT to exist, rather than asserted to exist.
+
+    Looks on both sides: a negation governing the same clause ("No service function
+    (e.g., `X`) creates...") or a non-existence disclaimer following it ("`X` is not
+    declared"). Getting this wrong is costly in both directions -- a missed negation
+    turns a false absence claim into a silent pass (T3, T13), and a spurious one
+    accuses a correct answer of fabricating.
+    """
+    if _NEGATION_BEFORE_RE.search(_negation_scope(answer, start)):
         return True
-    after = answer[end:end + _NEGATION_WINDOW + 20]
+    # Past the closing backtick, skip any run of further backticked items and simple
+    # separators before the verb -- "No other hooks (`a`, `b`, etc.) are found" puts
+    # the verb after a LIST, not after the first token in it.
+    after = answer[end:end + 200]
+    after = re.sub(r"^(?:\s*,\s*`[^`]+`)+", "", after)
     return bool(_NEGATION_AFTER_RE.match(after))
 
 
