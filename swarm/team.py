@@ -3676,6 +3676,19 @@ _CACHEABLE_READ_TOOLS = {
     # proven duplicate-serve escalation (2 full serves, then an escalating stub,
     # then the aggregate forced-answer nudge) instead of a bespoke fix.
     "lightrag_query",
+    # DB grounding added 2026-08-24 -- the same loop again, on the last read-only
+    # family that was still outside this set. Battery T13 fired the IDENTICAL
+    # `COUNT(*) FROM inventory.vouchers WHERE voucher_type ...` query THIRTY-TWO
+    # times, each returning the same 18 characters, and spent its budget there
+    # instead of on the frontend-hook enumeration the task actually asked for. It
+    # then found 2 of the 5 real hooks and reported the other three as absent.
+    #
+    # db_query and db_schema qualify on the same grounds lightrag_query did: read-
+    # only and deterministic within a run, so a repeat cannot return anything new.
+    # db_query is genuinely read-only here -- hive-mcp opens it on a hive_ro role in
+    # a read-only transaction, so there is no write whose effect a later identical
+    # SELECT might legitimately observe.
+    "db_query", "db_schema",
     # Environment introspection added 2026-08-22 -- the same self-reinforcing loop,
     # measured this time from hive-mcp's own logs rather than inferred: ONE run fired
     # list_processes(filter_str='git') 56 times with byte-identical arguments, each
@@ -5412,11 +5425,23 @@ def _make_duplicate_delegation_gate_hook():
                             f"earlier this run and returned:\n\n{prior}\n\n"
                             f"Use this. Do not delegate it again." + tail
                         )
-                    return (
-                        f"REDIRECTED: this exact task was already delegated to {member_id!r} "
-                        f"earlier this run — use that result instead of delegating it again. "
-                        f"This delegate_task_to_member call was NOT executed."
-                    )
+                    # No stored result means the earlier delegation produced nothing
+                    # usable -- its answer was tool-call syntax and got discarded (see
+                    # _consume_stream_event). Blocking here is exactly backwards: the
+                    # coordinator is being refused the one action that could still
+                    # rescue the run, on the grounds that it "already has" an answer
+                    # that does not exist.
+                    #
+                    # Live, T3: the Researcher read 138,523 chars and returned
+                    # '<tool_call>{"name"...}'. This branch refused the retry twice,
+                    # then the n>=3 escalation stopped the run outright, and the
+                    # coordinator finished having received 123 characters all run.
+                    #
+                    # Letting it through is still bounded -- `repeats` has already been
+                    # incremented, so the third attempt hits the STOP above regardless.
+                    print(f"[team] duplicate delegation to {member_id!r} but no usable "
+                          f"prior result — allowing the retry", flush=True)
+                    break
             if prior_entries:
                 audit = _parse_delegation_audit(raw_task)
                 if audit is None:
@@ -6752,6 +6777,32 @@ def _record_stream_artifacts(team, out: dict) -> None:
     if not isinstance(out, dict):
         return
     if out.get("__member_result__"):
+        # Sanitise the MEMBER's answer, not just the coordinator's (2026-08-24).
+        # _strip_leaked_tool_tags was applied to the final answer in 74259e5 and to
+        # retry adoption in 8a66fc3; member results were stored raw, so the identical
+        # defect sat unguarded one layer in -- and the duplicate-delegation gate then
+        # amplified it by caching and re-serving the garbage.
+        #
+        # Live, T3: the Researcher paged through business_admin_api.py correctly
+        # (138,523 chars read) and then returned '<tool_call>\n{"name"...}' as its
+        # REPORT. The gate cached that, served it back twice as "ALREADY DONE —
+        # 'researcher' was given this exact task earlier this run and returned: ...",
+        # then hard-stopped the run at three repeats. The coordinator never received
+        # one usable character; relay for that run was 138,523 -> 123 = 1126:1.
+        raw_content = out.get("content") or ""
+        content = _strip_leaked_tool_tags(raw_content).strip()
+        if raw_content and not content:
+            # Nothing survived: this is a FAILED delegation, not an answer. Recording
+            # it would be worse than dropping it -- the duplicate gate cannot tell a
+            # member that answered from one that emitted syntax, so it refuses the
+            # re-delegation that would actually fix the run and escalates to STOP.
+            # Dropping it leaves the coordinator free to ask again.
+            print(f"[team] member result from "
+                  f"{out.get('agent_name', '?')!r} was tool-call syntax only "
+                  f"({len(raw_content)} chars) — discarding, delegation treated as "
+                  f"failed", flush=True)
+            return True
+        out["content"] = content
         # Keyed by _member_key so 'context-router' and 'contextrouter' land in one
         # bucket, the same normalisation the delegation gate matches on.
         if not isinstance(getattr(team, "_member_results", None), dict):
