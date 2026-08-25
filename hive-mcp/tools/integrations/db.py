@@ -34,8 +34,53 @@ except ImportError:  # image without the driver — tools stay registered but re
 _ALLOWED = re.compile(r"^\s*(with|select|explain|table|values|show)\b", re.IGNORECASE)
 
 
-def _err(msg: str) -> str:
-    return f"db error: {msg}"
+_RELATION_MISSING_RE = re.compile(
+    r'relation "([A-Za-z_][A-Za-z0-9_]*)" does not exist', re.IGNORECASE)
+
+
+def _err(msg: str, conn=None) -> str:
+    """Format a db error, adding the schema the table actually lives in when we can.
+
+    Postgres answers an unqualified name against search_path only, so
+    `SELECT COUNT(*) FROM parties` on a database whose table is `inventory.parties`
+    comes back as 'relation "parties" does not exist'. That is technically true and
+    reads as "the table is absent", which is how battery T8 concluded the parties
+    table does not exist in a database where it exists with 0 rows -- a false absence
+    claim faithfully reported from a real tool error.
+
+    The fix belongs here rather than in a prompt: the catalogue knows the answer, and
+    an unqualified miss is exactly when to look it up. Same shape as the filesystem
+    near-miss hints -- a dead end that names the real location instead of implying
+    nothing is there.
+
+    Never raises: a hint is a nicety, and a failure to produce one must not replace a
+    real error message with a traceback.
+    """
+    base = f"db error: {msg}"
+    match = _RELATION_MISSING_RE.search(msg or "")
+    if not match or conn is None:
+        return base
+    table = match.group(1)
+    try:
+        # The failing statement leaves the transaction aborted, so every further query
+        # on this connection errors until it is rolled back. Read-only throughout, so
+        # the rollback discards nothing.
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute(
+                "select table_schema from information_schema.tables "
+                "where table_name = %s order by table_schema limit 3", (table,))
+            schemas = [r[0] for r in cur.fetchall()]
+    except Exception:
+        return base
+    if not schemas:
+        return (f"{base}\n-- no table named '{table}' exists in ANY schema of this "
+                f"database, so this is a genuine absence, not a search_path miss.")
+    qualified = ", ".join(f"{s}.{table}" for s in schemas)
+    return (f"{base}\n-- '{table}' DOES exist, in another schema: {qualified}. The "
+            f"query used an unqualified name, which Postgres resolves against "
+            f"search_path only. Re-run it schema-qualified before concluding "
+            f"anything is missing.")
 
 
 def _connect():
@@ -99,7 +144,9 @@ def db_query(sql: str) -> str:
             truncated = len(rows) > cap
             return _render(cols, rows[:cap], truncated)
     except Exception as e:
-        return _err(str(e).strip())
+        # conn passed so a missing-relation error can name the schema the table is
+        # really in -- see _err.
+        return _err(str(e).strip(), conn)
     finally:
         conn.close()
 

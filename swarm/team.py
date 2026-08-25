@@ -1778,6 +1778,22 @@ def _reader_facing_report(report: str) -> str:
     removed — every finding line, and the factual half of the VERDICT, stays exactly
     as it was, because those are what the reader actually needs.
     """
+    # The repeat short-circuit is ENTIRELY model-directed -- it carries no findings at
+    # all, only "either (a) revise the answer ... or (b) say so plainly". Stripping one
+    # sentence leaves the rest of that instruction intact, so it reached the reader
+    # whole (2026-08-25, battery B2 T10): a correct answer with three exact citations
+    # was served under "Unverified claims flagged automatically" wrapping the raw text
+    # "verify_claims STOPPED: this exact answer text was already checked...". A false
+    # accusation against good work, in the pipeline's internal voice.
+    #
+    # It is deliberately phrased to read as "bad" to swarm-level classification -- see
+    # verify.py's comment on why it contains "could NOT be found" -- so the classifying
+    # must keep working; only what the READER sees changes. What actually happened is
+    # worth stating plainly: the same draft was checked twice unchanged.
+    if "verify_claims STOPPED" in report:
+        return ("The same answer text was submitted for verification twice without "
+                "changing, so the check was not repeated. Whatever the first check "
+                "reported still stands — treat the claims above as unverified.")
     return _compact_verify_report(_MODEL_DIRECTED_VERDICT_RE.sub("", report).rstrip())
 
 
