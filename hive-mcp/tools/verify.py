@@ -349,6 +349,25 @@ _NEGATION_BEFORE_RE = re.compile(
 # Both are absence claims about things that exist, and both read as EXISTENCE claims
 # to the old pattern, so finding the symbol counted as confirmation rather than
 # contradiction.
+# A locative preposition between the negation cue and the token makes the token the
+# PLACE something is missing from, not the thing that is missing.
+#
+#     "absent in the base `Party` model"   -> the FIELDS are absent; Party is where
+#     "missing from `models.py`"           -> models.py is where
+#     "there is no `parties` table"        -> parties IS the thing (no locative)
+#     "lacks a `gstin` field"              -> gstin IS the thing (no locative)
+#
+# Added 2026-08-25 after a regression I introduced the day before: widening the cue
+# list with absent/lacks/missing/without made "...fields which are absent in the base
+# `Party` model" read as a denial of `Party`, and battery B3 T4 -- an otherwise exact
+# answer with every field and both class lines correct -- was stamped
+# "CONTRADICTED Party <-- claimed ABSENT but exists". A false accusation against
+# correct work, which is the failure mode this whole checker most needs to avoid.
+_LOCATIVE_AFTER_CUE_RE = re.compile(
+    r"\b(?:in|from|on|within|inside|under|throughout|across|anywhere in)\b",
+    re.IGNORECASE,
+)
+
 _NEGATION_AFTER_RE = re.compile(
     r"^\s*[,)\]]*\s*(?:,?\s*etc\.?\s*[,)\]]*\s*)?"
     # Words may sit between the token and the verb -- "`sku_prefix` COLUMN is not
@@ -417,7 +436,9 @@ def _is_negated_claim(answer: str, start: int, end: int) -> bool:
     turns a false absence claim into a silent pass (T3, T13), and a spurious one
     accuses a correct answer of fabricating.
     """
-    if _NEGATION_BEFORE_RE.search(_negation_scope(answer, start)):
+    scope = _negation_scope(answer, start)
+    cue = _NEGATION_BEFORE_RE.search(scope)
+    if cue and not _LOCATIVE_AFTER_CUE_RE.search(scope[cue.start():]):
         return True
     # Past the closing backtick, skip any run of further backticked items and simple
     # separators before the verb -- "No other hooks (`a`, `b`, etc.) are found" puts

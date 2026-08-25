@@ -3269,6 +3269,26 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # the work. Disclosure, not a retry: the enumeration is already sitting in the run's
     # own tool output, so the reader can be pointed at it for the cost of one line
     # instead of a 60-100s re-run.
+    # Chain-degradation check (2026-08-25). First of the enumeration family, because it
+    # is the only one that consults the SESSION rather than the repository — a turn can
+    # be perfectly consistent with the codebase as the checker sees it and still
+    # contradict what an earlier turn of the same conversation established.
+    chain_dropped = _chain_contradictions(
+        content, getattr(team, "_session_summary", None)
+    )
+    if chain_dropped is not None:
+        named = ", ".join(f"`{d}`" for d in chain_dropped)
+        print(f"[team] answer denies a category that earlier turns established "
+              f"({named}) — flagging", flush=True)
+        return (
+            f"{content}\n\n---\n**THIS CONTRADICTS AN EARLIER TURN OF THIS SESSION — "
+            f"the answer above denies a category that earlier turns had already "
+            f"established members of: {named}. One of the two is wrong and this check "
+            f"cannot tell which, so treat the denial as unproven and re-check against "
+            f"the file directly rather than against the conversation.**"
+            + _summarize_actual_writes(*all_results)
+        )
+
     # Inferred-item check (2026-08-25). Runs before the other enumeration checks
     # because it needs nothing from them: the answer has already declared these items
     # ungrounded, so no evidence gate or search record is consulted.
@@ -6603,6 +6623,9 @@ async def run_task_stream(
             read_only=read_only, skill_catalog=skill_catalog, task=task, team_name=team_name,
             project_id=project_id,
         )
+        # What earlier turns of this session already established, for the chain-
+        # degradation check at answer time. See _chain_contradictions.
+        team._session_summary = session_summary or ""
 
         full_content: list[str] = []
         # See _stream_team_run's own docstring for the narration-leak incident this
@@ -7308,6 +7331,64 @@ def _inferred_enumeration_items(content: str) -> list[str] | None:
     hits = [m.group(0).strip()[:_INFERRED_ITEM_CONTEXT]
             for m in _INFERRED_ITEM_RE.finditer(content)]
     return hits or None
+
+
+# Backticked identifiers/paths, for comparing a turn against what earlier turns of the
+# same session established.
+_TICKED_RE = re.compile(r"`([^`\n]{2,120})`")
+# A denial of a whole category, with no symbol named that could be checked against the
+# repo -- "there are no exported hooks with Voucher in their name". verify_claims works
+# on named identifiers and has nothing to grab here, which is exactly why the session
+# digest is the only thing that can contradict it.
+_CATEGORY_DENIAL_RE = re.compile(
+    r"\b(?:there (?:are|is) no|no other|none of|not a single|no such)\b[^.?\n]{0,80}"
+    r"\b(?:hooks?|endpoints?|functions?|methods?|routes?|files?|models?|tables?|"
+    r"symbols?|exports?|components?)\b",
+    re.IGNORECASE,
+)
+_CHAIN_MIN_ESTABLISHED = 2
+
+
+def _chain_contradictions(content: str, session_summary: str | None) -> list[str] | None:
+    """Identifiers an earlier turn established that THIS turn denies.
+
+    Returns the contradicted names, or None.
+
+    Chained turns are assumed to build on what came before. Measured over one live
+    session, they can instead move away from it, and each turn degraded further:
+
+        turn 2  listed all nine real endpoints, correctly
+        turn 3  kept five, INVENTED four more, and marked them "(inferred from ...)"
+        turn 4  declared "no exported hooks with Voucher in their name" -- five exist,
+                and turn 3's own table had listed them
+
+    Nothing catches this. verify_claims checks the answer against the REPOSITORY, and
+    turn 4's denial names no symbol to check; the guess-driven check reads search
+    arguments, and these were never searched for. The session's own record is the only
+    authority on what it already established, and until now nothing consulted it.
+
+    Deliberately narrow. Only fires on a CATEGORY denial -- the shape that has no named
+    symbol for the repo-side checks to catch -- and only against identifiers the digest
+    actually carries. An ordinary follow-up that refines, narrows or corrects an earlier
+    turn says nothing of the form "there are no X", so it never reaches this.
+
+    Disclosure only. The contradiction is between two turns and this cannot tell which
+    one is right; saying that plainly is worth more than picking, and a retry here would
+    re-run the reasoning that produced the denial.
+    """
+    if not content or not session_summary:
+        return None
+    if not _CATEGORY_DENIAL_RE.search(content):
+        return None
+    established = {m.group(1).strip() for m in _TICKED_RE.finditer(session_summary)}
+    established = {e for e in established if re.fullmatch(r"[A-Za-z_][\w.\-/]{2,}", e)}
+    if len(established) < _CHAIN_MIN_ESTABLISHED:
+        return None
+    # Named in the earlier turn, absent from this one, while this one denies the
+    # category they belong to.
+    now = {m.group(1).strip() for m in _TICKED_RE.finditer(content)}
+    dropped = sorted(established - now)
+    return dropped[:6] or None
 
 
 def _guess_driven_enumeration(task: str, searches: list | None) -> tuple[int, int] | None:
@@ -8072,6 +8153,9 @@ async def run_task_async(
             read_only=read_only, skill_catalog=skill_catalog, activity=activity, task=task,
             team_name=team_name, project_id=project_id,
         )
+        # See the matching line in run_task_stream: the digest of what earlier turns
+        # established, read back by _chain_contradictions at answer time.
+        team._session_summary = session_summary or ""
 
         span_attrs = {
             "project_id": project_id,
