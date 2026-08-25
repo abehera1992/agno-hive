@@ -3253,6 +3253,29 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # the work. Disclosure, not a retry: the enumeration is already sitting in the run's
     # own tool output, so the reader can be pointed at it for the cost of one line
     # instead of a 60-100s re-run.
+    # Guess-driven enumeration check (2026-08-25). Sits before the under-answered
+    # check because they describe different faults: that one is "you had a list and did
+    # not show it", this one is "the list you showed was assembled by testing names you
+    # invented". An answer can pass that one and still be built on this.
+    _rs_guess = getattr(team, "_read_state", None)
+    guessed = _guess_driven_enumeration(
+        task, _rs_guess.get("searches") if isinstance(_rs_guess, dict) else None
+    )
+    if guessed is not None:
+        total_ident, misses = guessed
+        print(f"[team] enumeration built from {total_ident} exact-name searches, "
+              f"{misses} of which matched nothing — flagging", flush=True)
+        return (
+            f"{content}\n\n---\n**THIS LIST WAS CHECKED, NOT DISCOVERED — the run "
+            f"searched {total_ident} exact names and {misses} of them matched nothing "
+            f"in the codebase. Searching for a name can only confirm one you already "
+            f"had; it cannot surface one you did not think of, so anything real that "
+            f"was never guessed is missing from the list above and any 'not found' "
+            f"here is unproven. Ask again for a pattern-based search of the actual "
+            f"file's exports.**"
+            + _summarize_actual_writes(*all_results)
+        )
+
     _rs_enum = getattr(team, "_read_state", None)
     missing_enum = _under_answered_enumeration(
         content, task, getattr(team, "_listings", None),
@@ -4604,6 +4627,14 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 found = len(_ENUMERABLE_LINE_RE.findall(result))
                 if found > read_state.get("max_enumerable", 0):
                     read_state["max_enumerable"] = found
+            # Search patterns and whether each found anything (2026-08-25), for the
+            # guess-driven-enumeration check. See _guess_driven_enumeration.
+            if function_name in ("search_files", "search_files_batch"):
+                read_state.setdefault("searches", []).append({
+                    "pattern": str((args or {}).get("pattern", "")),
+                    "missed": (isinstance(result, str)
+                               and result.lstrip().startswith("No matches for:")),
+                })
 
         if (
             function_name == "get_file_content"
@@ -7153,6 +7184,55 @@ _ENUMERABLE_LINE_RE = re.compile(
 def _asks_for_list(task: str | None) -> bool:
     """Whether the task asked for enumerated output. Drives disclosure only."""
     return bool(task and _ASKS_FOR_LIST_RE.search(task))
+
+
+# A bare symbol name: no wildcard, no regex metacharacter, no path separator. Searching
+# for one of these can only CONFIRM a name you already had; it cannot DISCOVER a name
+# you did not think of.
+_BARE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_GUESS_SEARCH_MIN = 3
+
+
+def _guess_driven_enumeration(task: str, searches: list | None) -> tuple[int, int] | None:
+    """An enumeration built by testing invented names instead of discovering real ones.
+
+    Returns (identifier_searches, misses) when the run's evidence is guess-shaped, else
+    None.
+
+    Measured on T13 across three runs, from the recorded search arguments rather than
+    inferred. The run searched SIX fully-qualified hook names:
+
+        useGetVouchersQuery                 HIT
+        useCreateVoucherMutation            HIT
+        useCreateStockTransferMutation      MISS -- invented
+        useCreateStockAdjustmentMutation    MISS -- invented
+        useCreateGRNFromPOMutation          MISS -- invented
+        useCreateCreditNoteMutation         MISS -- invented
+
+    It then reported the four misses as proof those features have no frontend. The three
+    hooks that DO exist and were never guessed -- useCancelVoucherMutation,
+    useGetVoucherQuery, usePostVoucherMutation -- were never searched for, because
+    nothing in this shape can surface a name the model did not already think of. Not one
+    discovering pattern was run all three times.
+
+    The miss ratio is what makes this safe to flag. Searching for a handful of symbols
+    you actually read and finding them all is ordinary grounding work and stays silent;
+    a majority of misses means the list being checked came from the model, not the
+    codebase. A wildcard, a regex, or a path is discovery by construction and never
+    counts toward this.
+
+    Disclosure only. A retry here would re-run the same reasoning that produced the
+    guesses, and today's evidence on retries is that they pad rather than correct.
+    """
+    if not _asks_for_list(task) or not searches:
+        return None
+    ident = [s for s in searches if _BARE_IDENTIFIER_RE.match(s.get("pattern", "") or "")]
+    if len(ident) < _GUESS_SEARCH_MIN:
+        return None
+    misses = sum(1 for s in ident if s.get("missed"))
+    if misses * 2 < len(ident):
+        return None
+    return len(ident), misses
 
 
 # Phrases that assert the work is finished rather than presenting it. Deliberately
