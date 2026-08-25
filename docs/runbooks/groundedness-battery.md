@@ -119,12 +119,46 @@ directory name without reading anything in it.
 `repetition DECAY detected` in the log. This is the shape that produced garbled tokens in
 the original T5/T11 incidents.
 
-### T13 — multi-part decomposition without duplicate delegation
+### T13 — SPLIT into T13a and T13b (2026-08-25)
+
+The single T13 conflated two different capabilities and could not tell you which one
+broke. It was the least stable test in the battery — four consecutive runs produced four
+different outcomes — and the reason is that one result had to answer two questions.
+
+Split after a controlled experiment: the same wording run with and without the three
+relevant files named, one variable changed. Naming them fixed the grounding outright —
+all three files read, and the search vocabulary switched from invented hook names
+(`useCreateGRNFromPOMutation`) to the real RTK endpoint names (`cancelVoucher`,
+`postVoucher`, `getVoucher`, `createVoucher`, all four verified present) — while the
+delivery failed anyway, on an out-of-scope clarification question. Grounding and
+delivery are separable, so they are now measured separately.
+
+Note T13a deliberately breaks several of EkamApp's own delegation rules (name 2–4
+reference files, name every file in the import chain, one deliverable per call). That is
+the point of T13a and the reason it is not a fair test of grounding.
+
+#### T13a — decomposition (files NOT named, deliberately)
 > Audit the vouchers module: list its endpoints, its database tables, and its frontend hooks, and identify anything present in the backend with no frontend counterpart.
 
-**Pass:** decomposed into a checklist before exploring, and no duplicate delegation to the
-same member with the same target+action. Check the log for `REDIRECTED` lines — the gate
-firing is fine; the coordinator ignoring the redirect is not.
+**Pass:** decomposed into a checklist before exploring, found the three relevant files
+unaided, and no duplicate delegation to the same member with the same target+action.
+Check the log for `REDIRECTED` lines — the gate firing is fine; the coordinator ignoring
+the redirect is not. A guess-driven enumeration banner is an automatic fail on accuracy:
+it means the list was assembled by testing invented names rather than reading exports.
+
+#### T13b — grounding (files named)
+> Audit the vouchers module: list its endpoints, its database tables, and its frontend hooks, and identify anything present in the backend with no frontend counterpart. Read API/inventory-service/router/vouchers_api.py for the endpoints, API/inventory-service/models.py for the tables, and Client/EcommClient-Web/ekamweb/src/lib/api/services/inventory/inventoryApi.ts for the frontend hooks.
+
+**Pass:** all three named files actually read, all 9 endpoints and 3 voucher tables
+enumerated, and the gap list exactly `grn`, `credit-note`, `stock-adjustment`,
+`stock-transfer` — 9 endpoints minus the 5 that have hooks. Reporting 6 gaps is the
+historical failure and means `/post` and `/cancel` were wrongly counted as uncovered.
+
+**Ground truth (verified 2026-08-25):** 9 endpoints in `vouchers_api.py`; voucher tables
+`vouchers`, `voucher_series`, `voucher_versions`; five hooks — `useGetVouchersQuery`,
+`useGetVoucherQuery`, `useCreateVoucherMutation`, `usePostVoucherMutation`,
+`useCancelVoucherMutation`; and `createStockTransfer` / `createStockAdjustment` /
+`createGRNFromPO` / `createCreditNote` genuinely absent from `inventoryApi.ts`.
 
 ## Result log
 

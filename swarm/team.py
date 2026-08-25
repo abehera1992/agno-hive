@@ -5085,7 +5085,17 @@ def _parse_delegation_audit(task_text) -> dict | None:
     }
 
 
-def _make_duplicate_delegation_gate_hook():
+# A clarification question proposing WORK rather than resolving an ambiguity. Paired
+# with read_only it is decidable without judgement: the run cannot write, so no answer
+# to "should I implement or deprecate this" changes anything it is able to do.
+_ACTION_PROPOSAL_RE = re.compile(
+    r"\b(?:implement|deprecate|remove|delete|add|create|build|refactor|migrate|"
+    r"fix|rewrite|revert|roll ?back|disable|enable)\b",
+    re.IGNORECASE,
+)
+
+
+def _make_duplicate_delegation_gate_hook(read_only: bool = False):
     """Mechanical backstop for _COORDINATOR_INSTRUCTIONS' own prose-only rule
     ("Before delegate_task_to_member(s): check whether an equivalent delegation is
     already listed... use that result instead of delegating the same or a near-
@@ -5228,6 +5238,31 @@ def _make_duplicate_delegation_gate_hook():
         # answer-phrasing surface that made the completion-claim word list untenable.
         if function_name == "request_clarification":
             question = str((args or {}).get("question", ""))
+            # Proposing work during a read-only run (2026-08-25). Decidable without any
+            # judgement about the question's merit: read_only strips every mutating
+            # tool at the surface, so whichever way the human answers, nothing the run
+            # can do changes. It is a question that cannot matter.
+            #
+            # Live on T13-with-files-named: having already produced a correct 2,660-char
+            # coverage table, the coordinator asked "Is StockTransfer functionality still
+            # needed? If yes, implement full CRUD via API and frontend. If no, deprecate
+            # the model." -- and ended the run on it, delivering none of the audit it had
+            # just completed. The scope-expansion gate above correctly did not match:
+            # there is no "also" here, the question is not about widening scope but about
+            # work the task never asked for and this run could not perform.
+            if read_only and _ACTION_PROPOSAL_RE.search(question):
+                print(f"[team] request_clarification proposes work during a read-only "
+                      f"run — redirected: {question[:90]!r}", flush=True)
+                return (
+                    "REDIRECTED: this asks whether to implement, change or remove "
+                    "something, and this run is READ-ONLY — every mutating tool has "
+                    "been stripped, so no answer could change what you are able to do. "
+                    "The task asked you to report on the codebase, not to decide what "
+                    "should be built in it. Write the findings you already have, and "
+                    "state any implement-or-remove question as an OBSERVATION in the "
+                    "answer for the human to weigh later. This request_clarification "
+                    "call was NOT executed."
+                )
             if _SCOPE_EXPANSION_RE.search(question):
                 print(f"[team] request_clarification asks to widen scope — redirected: "
                       f"{question[:90]!r}", flush=True)
@@ -5839,7 +5874,7 @@ def _build_team(
     search_before_browse_gate_hook = _make_search_before_browse_gate_hook(
         task=search_gate_task, researcher_agent_name=researcher_agent_name,
     )
-    duplicate_delegation_gate_hook = _make_duplicate_delegation_gate_hook()
+    duplicate_delegation_gate_hook = _make_duplicate_delegation_gate_hook(read_only=read_only)
     delegation_log_hook = _make_delegation_log_hook()
     interception_hook = _make_tool_interception_hook(activity=activity)
     # Order matters: agno makes the FIRST hook in this list the OUTERMOST wrapper
