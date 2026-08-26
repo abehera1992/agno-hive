@@ -878,6 +878,32 @@ def _proposed_code_block_idents(answer: str) -> set[str]:
 _MAX_CLAIMS = 25   # subprocess per claim; keep the whole check inside a few seconds
 
 
+def _decl_site(rel_path: str, symbol: str) -> tuple[bool, int | None, str]:
+    """Where `symbol` is DECLARED in `rel_path`, per the structural index.
+
+    Returns (found, line, kind). (False, None, "") when the index cannot see the file
+    or does not find a declaration -- the caller keeps its grep-based reporting rather
+    than claiming anything the index cannot support.
+
+    Separate from `declares()` only in being non-fatal: this feeds a message, not a
+    verdict, so an unindexable file must degrade quietly.
+    """
+    # Local import, matching _structural_verdict below -- symbol_index is not imported
+    # at module level, and reaching for it as a global raises NameError on every call.
+    from .symbol_index import declares
+    try:
+        ok, line, kind = declares(rel_path, symbol.split(".")[-1])
+    except (OSError, ValueError, SyntaxError):
+        # Only the failures a real file can cause. A broad `except Exception` here hid
+        # the NameError above through a full green test run -- the guard reported "no
+        # declaration found" for every symbol in the codebase and looked like a
+        # correct quiet degradation.
+        return False, None, ""
+    if ok and line:
+        return True, line, kind or "declaration"
+    return False, None, ""
+
+
 def _structural_verdict(tok: str, asserted_paths: list[str]) -> str | None:
     """Verdict line for `tok` checked against the files the answer named, or None.
 
@@ -1214,6 +1240,46 @@ def _read_window(rel_path: str, center_line: int, span: int) -> str:
     lo = max(0, center_line - 1 - span)
     hi = min(len(lines), center_line - 1 + span)
     return "\n".join(lines[lo:hi])
+
+
+_ELLIPSIS_RE = re.compile(r"\.\.\.|…")
+
+
+def _quote_matches(quoted: str, window: str) -> bool:
+    """Does `quoted` appear in `window`, allowing an elided middle?
+
+    A quote carrying an ellipsis is an abbreviation of real source, not a claim that
+    the literal characters "..." are in the file -- so a substring test on it fails for
+    a citation that is exactly right. Live, twice in one battery: an answer citing
+    `vouchers_api.py:590` quoted `async def create_grn_from_po(...)` against a real
+    signature whose parameters run onto the following lines. Line 590 is
+    `async def create_grn_from_po(` -- the citation was perfect and the checker called
+    it a MISMATCH.
+
+    Cost of the false positive is higher than the miss it guards against: a MISMATCH
+    on correct work trains the reader to discount the whole report, and it feeds the
+    retry loop, which sends the model back to re-derive an answer that was already
+    right.
+
+    Every segment must still be present and in order, so an ellipsis cannot be used to
+    smuggle in content that is not there -- `foo(...)` matches a real `foo(` followed
+    later by `)`, but never a file that lacks `foo(` altogether.
+    """
+    if quoted in window:
+        return True
+    parts = [p.strip() for p in _ELLIPSIS_RE.split(quoted)]
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        # A bare "..." or a quote with nothing either side of it proves nothing; fall
+        # back to the literal result rather than passing everything.
+        return False
+    pos = 0
+    for part in parts:
+        found = window.find(part, pos)
+        if found < 0:
+            return False
+        pos = found + len(part)
+    return True
 
 
 # Detects a stuck retry loop: the exact same answer text checked twice in a row,
@@ -1582,7 +1648,7 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                 out.append(f"             | {line.strip()[:100]}")
                 quoted = content_claims.get((path, num))
                 if quoted is not None:
-                    if quoted in _read_window(resolved, num, _LINE_TOLERANCE):
+                    if _quote_matches(quoted, _read_window(resolved, num, _LINE_TOLERANCE)):
                         out.append(f"             content verified within {_LINE_TOLERANCE} lines")
                     else:
                         problems += 1
@@ -1638,12 +1704,31 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                             hits = _symbol_line_numbers(resolved, a)
                             if hits:
                                 problems += 1
-                                near = ", ".join(str(h) for h in hits[:5])
-                                out.append(
-                                    f"  MISMATCH   {resolved}:{num} <-- `{a}` is not "
-                                    f"within {_LINE_TOLERANCE} lines of {num}; it actually "
-                                    f"appears at line(s) {near}"
-                                )
+                                # Prefer the DECLARATION line from the structural index
+                                # over the grep hits (2026-08-26). A symbol used thirty
+                                # times greps to thirty line numbers, and "appears at
+                                # 12, 44, 91, 158, 203" does not tell the reader where
+                                # it is DEFINED -- which is what a citation means.
+                                #
+                                # This is the T13 shape: the run reads the backend and
+                                # SEARCHES the frontend, then cites both as if read, so
+                                # `useGetVouchersQuery` came back as inventoryApi.ts:600
+                                # when it is declared at 941. The index knows 941
+                                # exactly; grep only knows every line mentioning it.
+                                decl, dline, kind = _decl_site(resolved, a)
+                                if decl and dline:
+                                    out.append(
+                                        f"  MISMATCH   {resolved}:{num} <-- `{a}` is "
+                                        f"declared at line {dline} ({kind}), not within "
+                                        f"{_LINE_TOLERANCE} lines of {num}"
+                                    )
+                                else:
+                                    near = ", ".join(str(h) for h in hits[:5])
+                                    out.append(
+                                        f"  MISMATCH   {resolved}:{num} <-- `{a}` is not "
+                                        f"within {_LINE_TOLERANCE} lines of {num}; it actually "
+                                        f"appears at line(s) {near}"
+                                    )
                                 break
         out.append("")
 

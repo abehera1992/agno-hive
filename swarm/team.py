@@ -3335,15 +3335,20 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         read_items=(_rs_enum.get("max_enumerable", 0) if isinstance(_rs_enum, dict) else 0),
     )
     if missing_enum is not None:
+        recorded = _recorded_listing_block(getattr(team, "_listings", None), missing_enum)
         print(f"[team] enumeration task answered without a list "
-              f"({missing_enum} items were available) — flagging", flush=True)
+              f"({missing_enum} items were available) — flagging"
+              f"{' + rendering the listing' if recorded else ''}", flush=True)
         return (
             f"{content}\n\n---\n**ASKED FOR A LIST, ANSWERED WITHOUT ONE — this task "
             f"asked for an enumeration and a directory listing in this run returned "
             f"{missing_enum} entries, but the answer above shows no itemised list. The "
             f"underlying facts may well be correct; they simply cannot be checked "
-            f"without redoing the work. Ask again for the items themselves if you need "
-            f"to verify them.**"
+            f"without redoing the work."
+            # The rendered list goes OUTSIDE the bold span -- markdown list items
+            # inside `**...**` do not render as a list.
+            + (("**" + recorded) if recorded
+               else " Ask again for the items themselves if you need to verify them.**")
             + _summarize_actual_writes(*all_results)
         )
 
@@ -7583,6 +7588,44 @@ def _under_answered_enumeration(content: str, task: str, listings: list | None,
     return available
 
 
+def _recorded_listing_block(listings: list | None, available: int) -> str:
+    """Render the listing this run actually received, for an answer that dropped it.
+
+    Returns a markdown block, or "" when nothing can be shown.
+
+    The enumeration guard has always known more than it said. To report "24 entries
+    were available" it had to be holding the listing that returned them -- and then it
+    printed only the number, telling the reader an itemised list was possible without
+    providing the one already in hand.
+
+    That gap is the whole of T6. The Researcher gets all 24 filenames from
+    list_directory (658 chars, measured); the coordinator sees only member prose, and
+    the member relays a count. Asking the models to relay better has been tried --
+    _COORDINATOR_INSTRUCTIONS demands verbatim relay and the loss ran 6-9:1 all
+    session. Printing what the process already stored asks nothing of either model.
+
+    Shows names only, no [FILE]/[DIR] prefixes: this is a disclosure appended to
+    someone else's answer, and it should read as a list, not as raw tool output.
+    Capped, because the point is to make the answer checkable, not to paste a
+    thousand-entry directory into it.
+    """
+    match = next((l for l in (listings or [])
+                  if l.get("items") == available and l.get("names")), None)
+    if match is None:
+        return ""
+    names = match["names"]
+    shown = names[:_LISTING_RENDER_CAP]
+    body = "\n".join(f"- `{n}`" for n in shown)
+    if len(names) > len(shown):
+        body += f"\n- …and {len(names) - len(shown)} more"
+    return (f"\n\nThe listing this run received for `{match.get('path', '')}`:\n{body}")
+
+
+# Enough to cover a real service directory (the T6 case is 24) without letting a
+# large directory dominate the answer it is appended to.
+_LISTING_RENDER_CAP = 60
+
+
 _STATED_COUNT_RE = re.compile(
     r"\b(?:there are|there is|contains|returned|total of|exactly)\s+"
     r"(?:exactly\s+)?(\d{1,4})\b",
@@ -7666,6 +7709,7 @@ def _summarize_listing(result) -> dict | None:
     if header is None:
         return None
     files, dirs, by_ext = 0, 0, {}
+    names: list[str] = []
     for line in lines[1:]:
         entry = line.strip()
         if entry.startswith("[DIR]"):
@@ -7673,6 +7717,7 @@ def _summarize_listing(result) -> dict | None:
         elif entry.startswith("[FILE]"):
             files += 1
             name = entry[len("[FILE]"):].strip()
+            names.append(name)
             if "." in name:
                 by_ext[name.rsplit(".", 1)[1].lower()] = by_ext.get(name.rsplit(".", 1)[1].lower(), 0) + 1
     return {
@@ -7681,6 +7726,21 @@ def _summarize_listing(result) -> dict | None:
         "files": files,
         "dirs": dirs,
         "by_ext": by_ext,
+        # The entry NAMES, not just how many (2026-08-26). They were parsed and thrown
+        # away, so the guard could say "24 entries were available" and not show them.
+        #
+        # T6 has been partial in all five batteries for one reason: list_directory
+        # hands the Researcher all 24 filenames (658 chars, verified), the Researcher
+        # relays a count because a count is what its own summary needs, and the
+        # coordinator -- which never sees tool results, only member text -- has nothing
+        # left to print. Measured at 6-9:1 loss on that hop all session.
+        #
+        # Keeping the names means the guard can render the list itself. The data is
+        # already inside the coordinator's process; it simply was not retained. This is
+        # the one repair available that asks no model to behave differently, which
+        # matters because _COORDINATOR_INSTRUCTIONS already demands verbatim relay
+        # ("exact file:line plus the exact verbatim value") and does not get it.
+        "names": names,
     }
 
 
