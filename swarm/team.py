@@ -3183,6 +3183,24 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             + _summarize_actual_writes(*all_results)
         )
 
+    # Self-contradiction check (2026-08-26). Same arithmetic family as the listing
+    # miscount above, but scored against the answer's OWN list rather than a tool
+    # result, so it needs no evidence from the run at all. See
+    # _count_contradicts_own_list for the two live cases.
+    self_contra = _count_contradicts_own_list(content)
+    if self_contra is not None:
+        stated, actual, intro = self_contra
+        print(f"[team] answer says {stated} but lists {actual} — flagging "
+              f"self-contradiction", flush=True)
+        return (
+            f"{content}\n\n---\n**THE COUNT AND THE LIST DISAGREE — the answer says "
+            f"{stated} (\"{intro[:90]}\") and then lists {actual} items. One of the two "
+            f"is wrong and this check cannot tell which: the number and the enumeration "
+            f"come from the same answer, and nothing outside it was consulted. Count the "
+            f"list yourself before relying on either.**"
+            + _summarize_actual_writes(*all_results)
+        )
+
     # Fabricated-tool-use check (2026-08-23). An answer describing a tool result that
     # never happened -- see _fabricated_tool_use for the T5 incident. Ranked ahead of
     # the arithmetic and enumeration checks because invented EVIDENCE is worse than a
@@ -7665,6 +7683,76 @@ _STATED_COUNT_RE = re.compile(
     r"(?:exactly\s+)?(\d{1,4})\b",
     re.IGNORECASE,
 )
+
+
+# A count that INTRODUCES the list right below it: a number, then the rest of its
+# clause, then a colon ending the line.
+#
+# The no-comma rule in the tail is the whole precision story. "Of the 13 endpoints,
+# these lack hooks:" quantifies something OTHER than the list that follows, and
+# comparing 13 against that list would be a false positive on a correct answer. A comma
+# is a cheap, reliable marker of that second clause, and both real failures below are
+# comma-free.
+_COUNT_INTRO_RE = re.compile(r"(?<![\w.])(\d{1,3})\b[^:,\n]{0,120}:[ \t]*\n")
+
+# A number that ORDERS a section rather than counting anything: "### 2. Database
+# Tables:", "2) Endpoints:". Caught before shipping, not in production -- these answers
+# are full of numbered sections with sub-lists, and "2. Database Tables:" above three
+# real tables would have been reported as a contradiction on a perfectly good answer.
+# The ordinal says WHERE the section sits, never how many items are under it.
+_SECTION_ORDINAL_RE = re.compile(r"(?:^|\n)[ \t]*(?:[#>*_`\-]+[ \t]*)*$")
+
+
+def _count_contradicts_own_list(content: str) -> tuple[int, int, str] | None:
+    """A stated count that disagrees with the answer's OWN enumeration right below it.
+
+    Returns (stated, actual, intro_text) or None.
+
+    Sibling of _miscounted_listing, pointed inward: that one checks a stated number
+    against a directory listing the RUN made, this one against a list the ANSWER
+    itself wrote. No tool output, no file access, no model -- the contradiction is
+    entirely inside the text, which is what makes it worth checking deterministically.
+
+    Both live cases came from one battery (2026-08-26):
+
+        T2    "The following 7 endpoints ... have no corresponding hook:"  -> 6 bullets
+        T13b  "The vouchers module has **5 backend-only endpoints** ...:"  -> 7 bullets
+
+    In both the LIST was closer to right than the number (T2's 6 was exactly right;
+    T13b's 7 was wrong too, but not in the way the count claimed). Neither is
+    fabrication and every existing guard passed them: the reads happened, the items are
+    real, and nothing was invented -- the answer simply contradicts itself, and a reader
+    skimming the summary sentence gets a number the list below disproves.
+
+    Deliberately reports rather than adjudicates. Which of the two is correct depends on
+    what the task asked, and this must not guess -- saying "these disagree, count them
+    yourself" is both honest and enough.
+    """
+    if not content:
+        return None
+    for m in _COUNT_INTRO_RE.finditer(content):
+        stated = int(m.group(1))
+        # Below 2 there is no list to speak of; above 100 a hand-written enumeration is
+        # not what is being described.
+        if not 2 <= stated <= 100:
+            continue
+        # An ordinal opening a section counts nothing -- see _SECTION_ORDINAL_RE.
+        if _SECTION_ORDINAL_RE.search(content[:m.start()]):
+            continue
+        actual = 0
+        for line in content[m.end():].splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue        # markdown lists are often blank-line separated
+            if _LIST_LINE_RE.match(stripped):
+                actual += 1
+            else:
+                break           # prose ends the list
+        # Two items minimum: a single line after a count is usually a sentence that
+        # happens to start with a dash, not an enumeration.
+        if actual >= 2 and actual != stated:
+            return stated, actual, m.group(0).strip().rstrip(":")
+    return None
 
 
 def _miscounted_listing(content: str, listings: list | None) -> tuple[int, dict] | None:
