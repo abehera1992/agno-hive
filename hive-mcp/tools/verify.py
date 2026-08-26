@@ -950,9 +950,41 @@ def _structural_verdict(tok: str, asserted_paths: list[str]) -> str | None:
         # One indexable file named, and it does not define this. Only claimed with a
         # single candidate -- with several named files the symbol may legitimately
         # live in one this loop has not concluded on.
+        #
+        # But "not declared here" is not "not here" (2026-08-26). A file calls, imports
+        # and references far more symbols than it declares, and an answer saying so is
+        # correct. Found live in this battery's T10: the same output that correctly
+        # caught a fabricated `redis_client` ALSO flagged
+        # `count_recent_failed_attempts`, which authHelper.py genuinely calls at line
+        # 141 -- it is declared on a service class elsewhere. NOT IN FILE counts toward
+        # `problems` and drives the retry loop, so that would send a model back to
+        # re-derive an answer that was already right.
+        #
+        # Present-but-not-declared is therefore reported as REFERENCED and left OUT of
+        # the verdict, the same hedge SPLIT-FOUND uses. The fabrication case is
+        # untouched: `redis_client` appears nowhere in that file, so it still lands on
+        # NOT IN FILE.
+        if _appears_in_file(indexable[0], tok):
+            return (f"  REFERENCED {tok:35s} <-- used in {indexable[0]} but declared "
+                    f"elsewhere; not a claim this check can settle")
         return (f"  NOT IN FILE {tok:35s} <-- {indexable[0]} does not define it; "
                 f"the answer names no other file that does")
     return None
+
+
+def _appears_in_file(rel_path: str, tok: str) -> bool:
+    """Whole-word textual presence of `tok` in `rel_path`. False if unreadable.
+
+    Deliberately the weakest possible test: it only ever DOWNGRADES a NOT IN FILE to a
+    non-fatal REFERENCED, so a false positive here costs a missed flag, never a wrongly
+    flagged correct answer.
+    """
+    try:
+        src = (PROJECT_ROOT / rel_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    bare = tok.split(".")[-1]
+    return re.search(rf"(?<!\w){re.escape(bare)}(?!\w)", src) is not None
 
 
 def _rg(pattern: str, fixed: bool = True, glob_filter: str = "",
@@ -1078,7 +1110,50 @@ def _citation_bounds(answer: str, pos: int) -> tuple[int, int]:
     return lo, hi
 
 
-def _find_nearby_quote(answer: str, pos: int) -> str | None:
+_PRECEDING_QUOTE_WINDOW = 60
+
+# Only connector text may sit between a quote and the citation it belongs to. Anything
+# else means the span is part of a different clause and is not this citation's content.
+_QUOTE_CONNECTOR_RE = re.compile(
+    r"^[\s,;:()\-–—]*"
+    r"(?:is\s+|was\s+|are\s+)?"
+    r"(?:defined|declared|found|located|implemented|appears|sits|lives|begins)?\s*"
+    r"(?:at|on|in|near)?\s*"
+    r"(?:the\s+)?(?:line|lines)?\s*[:\-–—]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _find_preceding_quote(answer: str, cite_start: int) -> tuple[str, int] | None:
+    """The backticked span immediately BEFORE a citation, with its distance.
+
+    Returns (quote, gap) or None. `gap` is the character distance from the span's end
+    to the citation's start, so the caller can apply nearest-wins against a forward
+    candidate.
+
+    Requires the intervening text to be connector words only -- "at line", "is defined
+    at", ", line" -- so an unrelated backticked span earlier in the sentence cannot be
+    dragged in. Same conservative posture as the forward search: better to return
+    nothing than to pair the wrong span, since a wrong pairing manufactures a MISMATCH
+    on a correct citation.
+    """
+    lo = max(0, cite_start - _PRECEDING_QUOTE_WINDOW)
+    region = answer[lo:cite_start]
+    last = None
+    for m in _BACKTICK_RE.finditer(region):
+        last = m
+    if last is None:
+        return None
+    gap_text = region[last.end():]
+    if not _QUOTE_CONNECTOR_RE.match(gap_text):
+        return None
+    quoted = last.group(1).strip()
+    if len(quoted) < 4 or quoted.lower() in _NOISE or _PATHLIKE_RE.match(quoted):
+        return None
+    return quoted, len(gap_text)
+
+
+def _find_nearby_quote(answer: str, pos: int, cite_start: int | None = None) -> str | None:
     """The quoted content, if any, that a file:line citation is claiming lives there.
 
     Looks forward from the end of the citation match for the next backticked span --
@@ -1105,18 +1180,44 @@ def _find_nearby_quote(answer: str, pos: int) -> str | None:
     """
     if answer[pos:pos + 1] == "`":
         return None
+    # A quote written BEFORE its citation ("`useX` at line 941") is the other half of
+    # the nearest-wins rule below (2026-08-26). That rule could only ever REJECT a
+    # forward span, never pair the backward one, so in a bulleted list every citation
+    # took the NEXT bullet's quote:
+    #
+    #     - `router.post(...)` at line 102      reported: 102 <-- quoted "router.get(...)"
+    #     - `router.get(...)`  at line 115                115 <-- quoted "router.get(...)"
+    #
+    # Live in this battery's T13b. It changed no verdict there (every quote was
+    # fabricated), but on a CORRECT answer in that shape every citation becomes a
+    # false MISMATCH -- and a MISMATCH on correct work both misleads the reader and
+    # sends the retry loop after an answer that was already right.
+    back = _find_preceding_quote(answer, cite_start) if cite_start is not None else None
     # Clamped to the NEXT citation as well as the char window (2026-08-21) -- see
     # _citation_bounds. The char cap still applies; whichever is tighter wins.
     _, hi = _citation_bounds(answer, pos)
     window = answer[pos: min(pos + _CONTENT_QUOTE_WINDOW, hi)]
     m = _BACKTICK_RE.search(window)
     if not m:
-        return None
+        return back[0] if back else None
     if _MD_HEADING_RE.search(window[:m.start()]):
-        return None
+        return back[0] if back else None
     quoted = m.group(1).strip()
     if len(quoted) < 4 or quoted.lower() in _NOISE or _PATHLIKE_RE.match(quoted):
-        return None
+        return back[0] if back else None
+    # Both directions offer a span. Raw distance cannot separate them -- in the live
+    # T13b list the backward span sat 4 chars away (" at ") and the forward one 3
+    # ("\n- "), so the forward span won by a single character while plainly belonging
+    # to the next bullet.
+    #
+    # A LINE BREAK is the signal distance misses: a span on another line belongs to
+    # another clause or list item, while the backward span shares this citation's line
+    # and is joined to it by connector words only. Same-line forward spans still win
+    # on distance, preserving the "`x = False` on line 205" behaviour above.
+    if back is not None and "\n" in window[:m.start()]:
+        return back[0]
+    if back is not None and back[1] <= m.start():
+        return back[0]
     # A quote can precede its OWN citation ("...setting `x = False` on line 205"),
     # so being inside this citation's forward window is not enough to own it: the
     # clamp above cannot help when the span sits before the next line number rather
@@ -1130,7 +1231,9 @@ def _find_nearby_quote(answer: str, pos: int) -> str | None:
         gap_to_next = hi - (pos + m.end())
         gap_from_this = m.start()
         if gap_to_next < gap_from_this:
-            return None
+            # The forward span belongs to the NEXT citation -- but a backward span, if
+            # there is one, still belongs to THIS one.
+            return back[0] if back else None
     return quoted
 
 
@@ -1398,7 +1501,7 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
         if pair not in file_lines:
             file_lines.append(pair)
         if pair not in content_claims:
-            quoted = _find_nearby_quote(answer, m.end())
+            quoted = _find_nearby_quote(answer, m.end(), m.start())
             if quoted:
                 content_claims[pair] = quoted
         if pair not in symbol_claims:
@@ -1437,7 +1540,7 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             if pair not in file_lines:
                 file_lines.append(pair)
             if pair not in content_claims:
-                quoted = _find_nearby_quote(answer, m.end())
+                quoted = _find_nearby_quote(answer, m.end(), m.start())
                 if quoted:
                     content_claims[pair] = quoted
             if pair not in symbol_claims:

@@ -3335,7 +3335,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         read_items=(_rs_enum.get("max_enumerable", 0) if isinstance(_rs_enum, dict) else 0),
     )
     if missing_enum is not None:
-        recorded = _recorded_listing_block(getattr(team, "_listings", None), missing_enum)
+        recorded = _recorded_listing_block(
+            getattr(team, "_listings", None), missing_enum, task)
         print(f"[team] enumeration task answered without a list "
               f"({missing_enum} items were available) — flagging"
               f"{' + rendering the listing' if recorded else ''}", flush=True)
@@ -7588,7 +7589,38 @@ def _under_answered_enumeration(content: str, task: str, listings: list | None,
     return available
 
 
-def _recorded_listing_block(listings: list | None, available: int) -> str:
+_GENERIC_PATH_SEGMENTS = {"src", "api", "app", "lib", "project", "root", "code"}
+
+
+def _listing_matches_task(path: str, task: str) -> bool:
+    """Is this listing plausibly the directory the task asked about?
+
+    Guards against rendering a listing the question never concerned (2026-08-26).
+    Live in this battery's T4: a run asking about the `Party` model drifted, listed the
+    PROJECT ROOT, and the enumeration banner then appended 21 irrelevant root filenames
+    to an already-wrong answer. Disclosure is supposed to make an answer checkable; an
+    unrelated listing just adds noise to a failure.
+
+    Matches on a distinctive path segment appearing in the task text, so both the exact
+    form ("API/inventory-service/router/") and the prose form ("the inventory-service
+    router") pass. Generic segments are excluded -- `src`/`api`/`app` appear in half the
+    paths in this repo and would match almost any task.
+
+    Deliberately permissive: a false match costs a listing the reader can ignore, while
+    a false rejection loses the T6 repair entirely.
+    """
+    segments = [s.strip("()[]{}.,").lower()
+                for s in re.split(r"[/\\]+", path or "") if s.strip("()[]{}.,")]
+    distinctive = [s for s in segments
+                   if len(s) >= 4 and s not in _GENERIC_PATH_SEGMENTS]
+    if not distinctive:
+        return False
+    low = (task or "").lower()
+    return any(s in low for s in distinctive)
+
+
+def _recorded_listing_block(listings: list | None, available: int,
+                            task: str = "") -> str:
     """Render the listing this run actually received, for an answer that dropped it.
 
     Returns a markdown block, or "" when nothing can be shown.
@@ -7612,6 +7644,8 @@ def _recorded_listing_block(listings: list | None, available: int) -> str:
     match = next((l for l in (listings or [])
                   if l.get("items") == available and l.get("names")), None)
     if match is None:
+        return ""
+    if task and not _listing_matches_task(match.get("path", ""), task):
         return ""
     names = match["names"]
     shown = names[:_LISTING_RENDER_CAP]
