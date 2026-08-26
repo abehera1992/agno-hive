@@ -477,12 +477,39 @@ _PROPOSED_NEW_CUE_RE = re.compile(
 )
 
 
+# "creates" said of a RECORD, not of code. An endpoint that creates a row is describing
+# existing runtime behaviour; the cue list cannot tell that from "we should create a new
+# helper", and read the first as the second.
+#
+# Live (T13): "`POST /vouchers/stock-adjustment` creates a `stock_adjustment`" pushed
+# stock_adjustment, payment_receipt, stock_transfer and payment_made into PROPOSED --
+# "not counted toward the verdict below" -- so four symbols were dropped before any
+# check ran, and the answer's verdict read "every checked claim exists" having checked
+# none of them.
+#
+# The discriminator is what sits between the cue and the token: an HTTP verb, a route
+# path, or a call arrow means the sentence is describing behaviour that already runs.
+_RUNTIME_CREATE_CONTEXT_RE = re.compile(
+    r"\b(?:GET|POST|PUT|PATCH|DELETE)\b|/\w|->|→|\bendpoint\b|\breturns?\b",
+    re.IGNORECASE,
+)
+
+
 def _is_proposed_new_claim(answer: str, start: int) -> bool:
     """True if the text shortly before this backticked span frames it as NEW code
     the answer is proposing to add, rather than an assertion that it already exists.
     See _PROPOSED_NEW_CUE_RE's comment for the window-width tradeoff."""
     before = answer[max(0, start - _PROPOSED_NEW_WINDOW):start]
-    return bool(_PROPOSED_NEW_CUE_RE.search(before))
+    cue = _PROPOSED_NEW_CUE_RE.search(before)
+    if not cue:
+        return False
+    # Describing what an existing route does is not a proposal to write one. Searched
+    # across the WHOLE window, not from the cue onward: in "`POST /vouchers/stock-
+    # adjustment` creates a `stock_adjustment`" the route sits BEFORE the verb, and
+    # everything after it is just " a ".
+    if _RUNTIME_CREATE_CONTEXT_RE.search(before):
+        return False
+    return True
 
 
 _CODE_DOTTED_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\b")
@@ -849,6 +876,57 @@ def _proposed_code_block_idents(answer: str) -> set[str]:
 
 
 _MAX_CLAIMS = 25   # subprocess per claim; keep the whole check inside a few seconds
+
+
+def _structural_verdict(tok: str, asserted_paths: list[str]) -> str | None:
+    """Verdict line for `tok` checked against the files the answer named, or None.
+
+    None means "no indexable file the answer named could settle this" and the caller
+    falls back to the repo-wide grep. That fallback is the whole safety story here: a
+    new language, a JSON file, an unparseable module -- all return None, so nothing
+    this index cannot read is ever reported as absent.
+
+    A dotted `Owner.attribute` claim is checked as containment (is `attribute`
+    declared on class `Owner`), which is the shape grep could never verify and the
+    reason SPLIT-FOUND exists as a hedge below. When the attribute is real but lives
+    on a different class, that is said explicitly -- `effective_from` is genuinely in
+    models.py, on HSNCatalogue, and the answer put it on PartyRegistration.
+    """
+    from .symbol_index import declares, field_of
+
+    indexable = [p for p in asserted_paths if p.lower().endswith(
+        (".py", ".ts", ".tsx", ".js", ".jsx"))]
+    if not indexable:
+        return None
+
+    if "." in tok:
+        owner, _, attr = tok.rpartition(".")
+        owner = owner.rsplit(".", 1)[-1]
+        for path in indexable:
+            verdict, detail = field_of(path, owner, attr)
+            if verdict is True:
+                return f"  DECLARED   {tok:36s} <-- {owner}.{attr} in {path}"
+            if verdict is False:
+                extra = f"; {detail}" if detail else ""
+                return (f"  NOT IN FILE {tok:35s} <-- {path} declares no {attr} on "
+                        f"{owner}{extra}")
+        return None
+
+    seen_indexed = False
+    for path in indexable:
+        verdict, line, where = declares(path, tok)
+        if verdict is True:
+            at = f":{line}" if line else ""
+            return f"  DECLARED   {tok:36s} <-- {where} in {path}{at}"
+        if verdict is False:
+            seen_indexed = True
+    if seen_indexed and len(indexable) == 1:
+        # One indexable file named, and it does not define this. Only claimed with a
+        # single candidate -- with several named files the symbol may legitimately
+        # live in one this loop has not concluded on.
+        return (f"  NOT IN FILE {tok:35s} <-- {indexable[0]} does not define it; "
+                f"the answer names no other file that does")
+    return None
 
 
 def _rg(pattern: str, fixed: bool = True, glob_filter: str = "",
@@ -1365,6 +1443,31 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
         out.append(f"SYMBOLS ({len(idents[:_MAX_CLAIMS])} checked):")
         for tok in idents[:_MAX_CLAIMS]:
             dotted = "." in tok
+            # Structural check FIRST, scoped to the files the answer itself named
+            # (2026-08-26). The claims are structural -- symbol S is a field of class
+            # C in file F -- and a repo-wide grep verifies only the weakest of those
+            # three terms. Live: `reg_id` was reported FOUND off
+            # krakend/krakend.json:2909, a URL comment reading "=== Inventory: party
+            # locations ===", while occurring ZERO times in the models.py the answer
+            # cited. The fabrication was not merely missed, it was CERTIFIED, which
+            # is worse -- it converts a guess into evidence.
+            #
+            # Only fires when the index can actually see the file. An unindexable one
+            # (json, md, a language with no walker) returns None and falls straight
+            # through to the grep below: a checker that cannot read a file must never
+            # report its symbols as absent.
+            # Both sources: a path carrying a line number is deliberately kept out of
+            # asserted_paths (the citation section owns it), and those are precisely
+            # the most scoped claims an answer makes -- "models.py:264-290" is a
+            # stronger statement of where to look than a bare mention.
+            structural = _structural_verdict(
+                tok, asserted_paths + [f for f, _ in file_lines]
+            )
+            if structural is not None:
+                out.append(structural)
+                if structural.lstrip().startswith("NOT IN FILE"):
+                    problems += 1
+                continue
             hits = _rg(tok, fixed=True, glob_filter=glob_filter, whole_word=not dotted)
             code_hits = [h for h in hits
                          if not h.split(":", 1)[0].lower().endswith(_DOC_EXTS)]
