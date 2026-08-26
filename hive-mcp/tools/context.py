@@ -257,12 +257,60 @@ def _render_skeleton(items: list[tuple[int | None, str]]) -> str:
     return "\n".join(parts).strip("\n")
 
 
+# A name listed one-per-line inside an `export { ... }` block -- the shape RTK Query
+# slices use for every generated hook:
+#
+#     export {
+#       useGetVouchersQuery,
+#       usePostVoucherMutation,
+#     }
+#
+# Those lines are bare identifiers. They start with no keyword, so every rule in
+# _regex_skeleton below skipped them and the skeleton for inventoryApi.ts contained
+# ZERO of its five voucher hooks (2026-08-26, verified against the live tool).
+#
+# That is the whole of the standing T13a/T13b failure. Both variants were asked to list
+# the frontend hooks, both got a skeleton with none in it, both found only the 2 hooks
+# reachable from page components, and both concluded 6 backend endpoints lacked a
+# counterpart when the real number is 4 -- `/post` and `/cancel` DO have hooks
+# (usePostVoucherMutation, useCancelVoucherMutation). The model never saw them.
+#
+# Same defect class as the unnumbered skeleton: hive-mcp eliding the exact thing the
+# task asked for, and the answer being blamed for it. symbol_index._ts_index already
+# carries this rule for its own export scan; _regex_skeleton simply never got it.
+_EXPORT_BLOCK_NAME_RE = re.compile(r"^[A-Za-z_$][\w$]*\s*,?$")
+
+# Opens such a block. BOTH forms matter and only the second appears in this codebase:
+#   export {                 -- a plain re-export block
+#   export const {           -- destructuring, which is how RTK Query hands back its
+#                               generated hooks (`export const { useX, ... } = api;`)
+# Assuming the first form was why the initial version of this fix matched nothing --
+# inventoryApi.ts:915 is `export const {`, and every hook sits under it.
+#
+# Deliberately requires the brace to CLOSE the line: `export const foo = {` opens an
+# object literal, whose contents are `key: value` pairs, not exported names.
+_EXPORT_BLOCK_OPEN_RE = re.compile(r"^export\s+(?:const|let|var)\s*\{\s*$|^export\s*\{\s*$")
+
+
 def _regex_skeleton(src: str):
     """Best-effort declaration-line skeleton for non-Python code (TS/JS/Go/Java/…)."""
     keep: list[tuple[int | None, str]] = []
+    in_export_block = False
     for lineno, ln in enumerate(src.splitlines(), start=1):
         s = ln.strip()
         if not s:
+            continue
+        # Track `export {` ... `}` so the bare names inside are kept. Only names are
+        # matched, so a stray brace or a comment inside the block is still dropped.
+        if in_export_block:
+            if s.startswith("}"):
+                in_export_block = False
+            elif _EXPORT_BLOCK_NAME_RE.match(s):
+                keep.append((lineno, ln.rstrip()))
+            continue
+        if _EXPORT_BLOCK_OPEN_RE.match(s):
+            in_export_block = True
+            keep.append((lineno, ln.rstrip()))
             continue
         if (s.startswith((
                 "import ", "export ", "from ", "package ", "func ", "function ",
