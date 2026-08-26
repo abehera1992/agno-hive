@@ -307,6 +307,30 @@ def _liveness_kill_reason(snapshot: dict) -> str | None:
             f"served {total_stub_count} duplicate-read stubs across the run despite "
             f"repeated stop instructions"
         )
+    # Tier 4 (2026-08-26): the model is WORKING but nothing it asks for is running.
+    #
+    # Distinct from Tier 1, which waits for silence. Here the stream is not silent at
+    # all -- model requests keep completing, ~1.2s apart -- while zero tools execute,
+    # because agno refused them all once tool_call_limit was hit. agno emits no event
+    # for a refused call (see swarm/team.py's _tools_refused_for_limit), so from the
+    # outside this looks like healthy activity, and Tier 1 only fires after the full
+    # silence threshold has elapsed on a run that will never recover.
+    #
+    # Live case (T2, 13:52:38 -> 13:58:20): the Researcher spent its 50-call budget in
+    # 75s, then looped for 5m42s emitting the same refused call before Tier 1 killed
+    # it. The 25,000 characters of real findings it had already gathered were
+    # discarded and the caller got a bare 504. Catching it on this signature ends the
+    # run while that draft is still returnable.
+    #
+    # Requires BOTH halves: requests advancing AND no tool executing. Either alone is
+    # normal -- a long single generation moves neither counter, and a slow tool moves
+    # only the second.
+    no_tool = snapshot.get("no_tool_progress_seconds", 0)
+    if no_tool > config.liveness_refused_call_threshold_s and snapshot.get("requests_advancing"):
+        return (
+            f"model kept issuing calls for {no_tool:.0f}s but none executed — tool "
+            f"budget is spent and every further call is being refused"
+        )
     return None
 
 

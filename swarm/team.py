@@ -6862,6 +6862,10 @@ async def _run_heartbeat(
             stagnant_ticks += 1
         else:
             stagnant_ticks = 0
+        # Captured BEFORE the reassignment below: the snapshot's requests_advancing
+        # compares this tick's count against the PREVIOUS tick's, and reading
+        # last_event_count after it has already been updated always says "unchanged".
+        prev_event_count = last_event_count
         last_event_count = event_count
         if liveness_path:
             try:
@@ -6869,6 +6873,14 @@ async def _run_heartbeat(
                     "stagnant_seconds": stagnant_ticks * interval,
                     "max_stub_serve_count": activity.get("max_stub_serve_count", 0),
                     "total_stub_serve_count": activity.get("total_stub_serve_count", 0),
+                    # Tier 4 inputs (2026-08-26) -- see _liveness_kill_reason. The pair
+                    # is what identifies a refused-call livelock: the model is clearly
+                    # working (requests completing) while nothing it asks for runs.
+                    # Neither number alone means anything; a long generation freezes the
+                    # first and a slow tool freezes the second.
+                    "no_tool_progress_seconds": since_last_tool,
+                    "requests_advancing": (event_count is not None
+                                           and event_count != prev_event_count),
                     # Durable draft (2026-08-24). The worker is SIGKILLed on a
                     # liveness stall, so anything it holds in memory dies with it and
                     # the caller gets a bare 504. That is correct when there was

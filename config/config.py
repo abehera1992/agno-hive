@@ -368,6 +368,22 @@ class Config:
     # before a 300s silence backstop would.
     liveness_aggregate_stub_threshold: int = int(os.getenv("LIVENESS_AGGREGATE_STUB_THRESHOLD", "15"))
 
+    # Tier 4 (2026-08-26): model requests keep completing while ZERO tools execute --
+    # the signature of a run whose tool_call_limit is spent, since agno refuses further
+    # calls without emitting any event for them.
+    #
+    # 90s, against a measured loop of one refused call every ~1.2s: roughly 75 attempts,
+    # far past any ambiguity, while still ending the run 3.5 minutes sooner than Tier 1's
+    # 300s. That margin is the whole point -- the live T2 case had 25,000 characters of
+    # real findings that the late kill threw away.
+    #
+    # Not lower, because a legitimately slow single tool (a wide search_files, a big
+    # ranged read) can hold the tool counter still for tens of seconds while the model
+    # waits; the paired requests_advancing flag distinguishes those, but the margin
+    # keeps a slow-tool run safe even if that flag ever misreads.
+    liveness_refused_call_threshold_s: float = float(
+        os.getenv("LIVENESS_REFUSED_CALL_THRESHOLD_S", "90"))
+
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))
     session_window: int = int(os.getenv("AGNO_SESSION_WINDOW", "6"))

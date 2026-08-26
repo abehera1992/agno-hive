@@ -162,55 +162,105 @@ def _py_skeleton(src: str):
     except (SyntaxError, ValueError):
         return None
     lines = src.splitlines()
-    out: list[str] = []
+    # (line_number_or_None, text). Numbers come from the AST nodes, which already carry
+    # them -- see _render_skeleton for why they must survive into the output.
+    out: list[tuple[int | None, str]] = []
+
+    def push(start: int | None, text: str):
+        """Append text, numbering each of its lines from `start` when known."""
+        if not text:
+            out.append((None, ""))
+            return
+        for offset, line in enumerate(text.split("\n")):
+            out.append((None if start is None else start + offset, line))
 
     def emit(node, indent):
         pad = "    " * indent
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             seg = ast.get_source_segment(src, node)
             if seg:
-                out.append(seg)
+                push(node.lineno, seg)
             return
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             for dec in node.decorator_list:
                 ds = ast.get_source_segment(src, dec)
                 if ds:
-                    out.append(f"{pad}@{ds}")
+                    push(dec.lineno, f"{pad}@{ds}")
             end = node.body[0].lineno - 1 if node.body else node.end_lineno
             end = max(end, node.lineno)  # guard one-line defs
             header = "\n".join(lines[node.lineno - 1:end]).rstrip()
             if header:
-                out.append(header)
+                push(node.lineno, header)
             doc = ast.get_docstring(node, clean=False)
             if doc:
-                out.append(f'{pad}    """{doc.strip().splitlines()[0][:120]}"""')
+                # The docstring's own line, when the first body statement IS it.
+                doc_line = node.body[0].lineno if node.body else None
+                push(doc_line, f'{pad}    """{doc.strip().splitlines()[0][:120]}"""')
             if isinstance(node, ast.ClassDef):
                 members = [c for c in node.body
                            if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
                 for c in members:
                     emit(c, indent + 1)
                 if not members:
-                    out.append(f"{pad}    ...")
+                    push(None, f"{pad}    ...")
             else:
-                out.append(f"{pad}    ...")
-            out.append("")
+                push(None, f"{pad}    ...")   # elided body: no single real line
+            out.append((None, ""))
         elif indent == 0 and isinstance(node, (ast.Assign, ast.AnnAssign)):
             seg = ast.get_source_segment(src, node)
             if seg:
-                out.append(seg.splitlines()[0][:200])
+                push(node.lineno, seg.splitlines()[0][:200])
 
     mod_doc = ast.get_docstring(tree, clean=False)
     if mod_doc:
-        out.append(f'"""{mod_doc.strip().splitlines()[0][:160]}"""')
+        push(tree.body[0].lineno if tree.body else None,
+             f'"""{mod_doc.strip().splitlines()[0][:160]}"""')
     for node in tree.body:
         emit(node, 0)
-    return "\n".join(out).strip()
+    return _render_skeleton(out)
+
+
+def _render_skeleton(items: list[tuple[int | None, str]]) -> str:
+    """Render (line_number, text) pairs as cat -n output, matching every other read.
+
+    The skeleton was the ONE read path that returned unnumbered text (2026-08-26).
+    Full reads and ranged reads both number their lines; _numbered_lines' own docstring
+    explains why -- "without a real number on every line, a model has to count instead
+    of copy". The skeleton was never wired into it, and that omission is the root of
+    the stall family:
+
+    A Researcher asked to "list every endpoint" got the skeleton, which carried all 13
+    `@router` decorators and all 13 signatures -- everything except a citable position
+    for any of them. This project REQUIRES exact file:line citations (verify_claims
+    flags what it cannot anchor), and `search_files` is the only tool that returns a
+    line number per symbol. So the model re-derived them one grep at a time: 44
+    search_files calls, its 50-call budget gone in 75 seconds, then agno silently
+    refusing further calls while the model re-emitted the same call every ~1.2s until
+    the 300s liveness kill. Four such stalls in two batteries, each losing the run
+    whole -- 25,000 chars of real findings discarded, 504 returned.
+
+    The header hint made it circular: it told the model to re-read with
+    `offset=<line>`, in the one response containing no line numbers to choose from.
+
+    Synthetic lines -- an elided body's `...`, blank separators -- get a blank number
+    field rather than a borrowed one. Claiming a line for text that is not at that line
+    would recreate the exact miscitation this is meant to prevent.
+    """
+    parts = []
+    for lineno, text in items:
+        if not text and lineno is None:
+            parts.append("")
+        elif lineno is None:
+            parts.append(f"{'':>6}\t{text}")
+        else:
+            parts.append(f"{lineno:>6}\t{text}")
+    return "\n".join(parts).strip("\n")
 
 
 def _regex_skeleton(src: str):
     """Best-effort declaration-line skeleton for non-Python code (TS/JS/Go/Java/…)."""
-    keep = []
-    for ln in src.splitlines():
+    keep: list[tuple[int | None, str]] = []
+    for lineno, ln in enumerate(src.splitlines(), start=1):
         s = ln.strip()
         if not s:
             continue
@@ -221,8 +271,8 @@ def _regex_skeleton(src: str):
                 or re.match(r"^(export\s+)?(default\s+)?(async\s+)?function\b", s)
                 or re.match(r"^(export\s+)?(const|let|var)\s+\w+\s*[:=]", s)
                 or re.match(r"^[\w<>,\[\]\s]+\s+\w+\s*\([^)]*\)\s*[:{]?\s*$", s)):
-            keep.append(ln.rstrip())
-    return "\n".join(keep) if keep else None
+            keep.append((lineno, ln.rstrip()))
+    return _render_skeleton(keep) if keep else None
 
 
 def _numbered_lines(lines: list[str], start: int) -> str:
@@ -465,7 +515,15 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
                 # read would have returned. The skeleton invites pagination; it should
                 # say what a sensible page looks like.
                 f"# Read a specific part with get_file_content('{relative_path}', offset=<line>, limit=200).\n"
-                f"# Use limit=200 or more — a small limit means many slow round-trips.\n\n"
+                f"# Use limit=200 or more — a small limit means many slow round-trips.\n"
+                # Say plainly that the numbers are citable (2026-08-26). Until the
+                # skeleton carried line numbers this advice was circular -- "re-read at
+                # offset=<line>" in the one response with no line to choose -- and the
+                # only way to get one was a grep per symbol, which is precisely what
+                # burned the tool budget and stalled the run. The numbers are now real
+                # file lines, so neither the grep nor the guesswork is needed.
+                f"# The numbers below are REAL file line numbers: cite them directly and\n"
+                f"# use them as offsets. Do NOT grep for a symbol that is already listed here.\n\n"
                 + skel
             )
     head, tail = data[:8000], data[-4000:]
