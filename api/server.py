@@ -322,14 +322,36 @@ def _liveness_kill_reason(snapshot: dict) -> str | None:
     # discarded and the caller got a bare 504. Catching it on this signature ends the
     # run while that draft is still returnable.
     #
-    # Requires BOTH halves: requests advancing AND no tool executing. Either alone is
-    # normal -- a long single generation moves neither counter, and a slow tool moves
-    # only the second.
+    # Requires THREE conditions, not two (corrected 2026-08-27). The original pair --
+    # requests advancing AND no tool executing -- rested on the assumption written into
+    # the old comment here, that "a long single generation moves neither counter". It
+    # moves the first one: content chunks ARE stream events, so a model writing a long
+    # final answer looks identical to one emitting refused calls on both axes this was
+    # checking.
+    #
+    # Measured on the chained T12 leg: 100 seconds of pure generation, 6,303 chars of a
+    # correct 10-router answer, and the run was killed with "tool budget is spent and
+    # every further call is being refused" while sitting at 10 of 50 calls. Nothing was
+    # refused. At ~100 chars/sec that condemned any final answer over roughly 9,000
+    # characters -- which is most thorough ones, and explains truncations across several
+    # runs that were being attributed to budget exhaustion.
+    #
+    # `stagnant_seconds` is the discriminator, and it was already in the snapshot:
+    # swarm/team.py's heartbeat derives it from activity["last_progress_at"], which
+    # advances on REAL content as well as tool events. A generating model keeps it near
+    # zero; the refused-call loop this tier exists for produces contentless turns and
+    # lets it climb. Tier 1 already relies on exactly that signal -- Tier 4 ignored it.
+    #
+    # So Tier 4 is now Tier 1's signal at a third of the wait, gated on the extra
+    # evidence that tools are being refused rather than merely unneeded.
     no_tool = snapshot.get("no_tool_progress_seconds", 0)
-    if no_tool > config.liveness_refused_call_threshold_s and snapshot.get("requests_advancing"):
+    if (no_tool > config.liveness_refused_call_threshold_s
+            and stagnant > config.liveness_refused_call_threshold_s
+            and snapshot.get("requests_advancing")):
         return (
-            f"model kept issuing calls for {no_tool:.0f}s but none executed — tool "
-            f"budget is spent and every further call is being refused"
+            f"model kept issuing calls for {no_tool:.0f}s but none executed, and "
+            f"produced no content in that time — tool budget is spent and every "
+            f"further call is being refused"
         )
     return None
 
