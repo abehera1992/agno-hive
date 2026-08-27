@@ -6285,7 +6285,80 @@ _ERROR_EVENT_TYPES = {"TeamRunError", "RunError"}
 # the unclassified bucket, which is why the duplicate-delegation gate had nothing to
 # hand back: it could tell the coordinator "use that result instead of delegating it
 # again" but had no copy of the result to give. See _make_duplicate_delegation_gate_hook.
+# The event agno-hive was waiting on for a member's finished answer. The installed
+# agno NEVER EMITS IT (2026-08-27). Confirmed against the live journal: across 153
+# delegations the only run-shaped events seen were ModelRequestStarted /
+# ModelRequestCompleted / RunStarted / RunContent / RunContentCompleted /
+# TeamRunContent. `member result:` fired zero times, so team._member_results was empty
+# on every run.
+#
+# Everything downstream of it was therefore inert, silently:
+#   * the duplicate-delegation gate's "ALREADY DONE, here is the prior result" path
+#     could never serve anything and always fell through to "no prior result captured"
+#   * the coordinator had no structured record of what any member returned
+#
+# That second one is the root cause of the runaway repetition. Lacking any stored
+# member result, the coordinator restates whatever member text happens to be sitting
+# in its own context -- which is how a 10-file task produced the SAME "Researcher's
+# Final Report" block seven times in 736 seconds.
+#
+# Kept as a set rather than deleted: if a future agno does emit it, the branch below
+# still works and costs nothing.
 _MEMBER_RESULT_EVENT_TYPES = {"RunCompleted"}
+
+# What this agno actually emits when a member finishes. A MARKER -- its own content is
+# None (verified in the journal), so it cannot be used the way RunCompleted was meant
+# to be. The member's text arrives beforehand as RunContent chunks, which is why the
+# capture below accumulates and this event only finalises.
+_MEMBER_RESULT_END_EVENT_TYPES = {"RunContentCompleted"}
+
+# Cap per member so a runaway generation cannot grow this without bound. Well above a
+# real member report (the largest measured relayed 29,445 chars).
+_MEMBER_CHUNK_CAP = 60_000
+
+
+def _accumulate_member_chunk(team, agent_name: str, chunk: str) -> None:
+    """Buffer one streamed content chunk against the member that produced it.
+
+    Deliberately a side effect of _stream_event_to_chunk rather than a change to what
+    it returns. Content events return a bare `str` and three separate loops consume
+    that with `isinstance(out, str)` to build the answer; turning member content into a
+    dict would have diverted it out of the answer entirely. The attribution is what was
+    missing, not the content, so only the attribution is added here.
+
+    Silent on anything unusable -- no team, no agent name (team-level content, which
+    belongs to no member), or a non-string chunk.
+    """
+    if team is None or not agent_name or not isinstance(chunk, str) or not chunk:
+        return
+    if not isinstance(getattr(team, "_member_chunks", None), dict):
+        team._member_chunks = {}
+    key = _member_key(agent_name)
+    buf = team._member_chunks.get(key, "")
+    if len(buf) < _MEMBER_CHUNK_CAP:
+        team._member_chunks[key] = (buf + chunk)[:_MEMBER_CHUNK_CAP]
+
+
+def _finalise_member_chunks(team, agent_name: str) -> None:
+    """Promote a member's buffered chunks to its finished result, and clear the buffer.
+
+    Clearing matters: a member delegated to twice must not have its second answer
+    concatenated onto its first. The buffer is per-member and per-delegation; the
+    result is the latest complete answer that member gave.
+    """
+    if team is None or not agent_name:
+        return
+    chunks = getattr(team, "_member_chunks", None)
+    if not isinstance(chunks, dict):
+        return
+    key = _member_key(agent_name)
+    text = (chunks.pop(key, "") or "").strip()
+    if not text:
+        return
+    if not isinstance(getattr(team, "_member_results", None), dict):
+        team._member_results = {}
+    team._member_results[key] = text
+    print(f"[team] member result captured: {agent_name} ({len(text)} chars)", flush=True)
 
 
 class _BackendRunError(RuntimeError):
@@ -6307,7 +6380,7 @@ class _BackendRunError(RuntimeError):
     already worked for any other exception type before this one did."""
 
 
-def _stream_event_to_chunk(event) -> str | dict | None:
+def _stream_event_to_chunk(event, team=None) -> str | dict | None:
     """Classify one raw agno team.arun(stream=True) event into what run_task_stream
     yields downstream (and, since 2026-08-10, what run_task_async logs for content
     visibility). Duck-typed via getattr since agno event objects vary by type.
@@ -6348,7 +6421,17 @@ def _stream_event_to_chunk(event) -> str | dict | None:
     event_type = getattr(event, "event", "")
     if event_type in _CONTENT_EVENT_TYPES:
         chunk = getattr(event, "content", None)
-        return chunk if isinstance(chunk, str) and chunk else None
+        if isinstance(chunk, str) and chunk:
+            # Attribute the chunk to the member that produced it, as a SIDE EFFECT --
+            # the return value is unchanged (2026-08-27). See _accumulate_member_chunk.
+            _accumulate_member_chunk(team, getattr(event, "agent_name", "") or "", chunk)
+            return chunk
+        return None
+    if event_type in _MEMBER_RESULT_END_EVENT_TYPES:
+        # Marker only: this event carries content=None. It says "that member is done",
+        # which is when its accumulated chunks become a finished result.
+        _finalise_member_chunks(team, getattr(event, "agent_name", "") or "")
+        return None
     if event_type in _TOOL_START_EVENT_TYPES:
         tool = getattr(event, "tool", None)
         if tool is None:
@@ -6832,7 +6915,7 @@ async def run_task_stream(
                         # real TeamRunOutput instance just to satisfy an isinstance check.
                         final_run_output = event
                         continue
-                    out = _stream_event_to_chunk(event)
+                    out = _stream_event_to_chunk(event, team)
                     if isinstance(out, str):
                         full_content.append(out)
                         yield out
@@ -8316,7 +8399,7 @@ async def _stream_team_run(
                 final_run_output = event
                 continue
             activity["stream_event_count"] += 1
-            out = _stream_event_to_chunk(event)
+            out = _stream_event_to_chunk(event, team)
             if isinstance(out, str):
                 # Deliberately NOT updating last_progress_at here on every chunk --
                 # a chunk arriving mid-loop can't yet be told apart from genuine new
@@ -8641,7 +8724,7 @@ async def run_task_async(
                                 final_run_output = event
                                 continue
                             activity["stream_event_count"] += 1
-                            out = _stream_event_to_chunk(event)
+                            out = _stream_event_to_chunk(event, team)
                             if isinstance(out, str):
                                 # See _stream_team_run's identical block for the full
                                 # rationale -- kept in sync deliberately. Deliberately
