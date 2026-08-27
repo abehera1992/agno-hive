@@ -7883,8 +7883,21 @@ def _listing_matches_task(path: str, task: str) -> bool:
     return any(s in low for s in distinctive)
 
 
+# The lookbehind excludes word chars, dots and hyphens -- but NOT a slash. A filename
+# at the end of a path is still a filename (2026-08-27).
+#
+# Excluding `/` made the guard blind to exactly the case it was built for. B11's T11
+# invented three whole services and five files, every one written path-qualified --
+# `API/seller-service/router/document_upload_router.py` -- so the character before each
+# filename was a slash and nothing matched. The guard stayed silent on the worst
+# fabrication of the battery while catching T12's bare-name version, which is the same
+# defect in a different dress.
+#
+# The trailing (?![\w/]) still prevents matching a DIRECTORY component: in
+# `foo.py/bar` the slash after `.py` rejects it, so only a real terminal filename
+# matches.
 _FILENAME_RE = re.compile(
-    r"(?<![\w./-])([\w.-]+\.(?:py|ts|tsx|js|jsx|md|json|ya?ml|sql|scss|css|toml|ini|sh|txt))"
+    r"(?<![\w.-])([\w.-]+\.(?:py|ts|tsx|js|jsx|md|json|ya?ml|sql|scss|css|toml|ini|sh|txt))"
     r"(?![\w/])")
 
 # Names that carry no information about THIS project -- every package has them, and an
