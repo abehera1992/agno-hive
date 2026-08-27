@@ -136,7 +136,32 @@ def get_project_context() -> str:
 #
 # Nothing is lost, only deferred: the skeleton response names the exact
 # get_file_content(path, offset=..., limit=...) call to read any part in full.
-_MAX_FULL_BYTES = 12_000
+#
+# RAISED 12,000 -> 40,000 (2026-08-26). "Only deferred" turned out to have a price the
+# original reasoning could not have seen, because the thing it spends is a budget that
+# did not exist yet.
+#
+# Measured across battery B8: get_file_content was 206 of 421 tool calls, including 11
+# paginated reads of models.py alone. Deferral does not save characters -- the model
+# reads the same bytes either way -- it converts them into CALLS, and the per-agent
+# tool_call_limit is 50. Three runs (T11, T12, T13b) exhausted that budget on
+# legitimate reads and had to be stopped early, while the cumulative read budget sat at
+# 52,430 of 300,000 (17%) and vLLM's KV cache at 7%. The resource the 12,000 threshold
+# protects was never close to scarce; the one it consumes ran out every time.
+#
+# What changed since: _MEMBER_READ_CHAR_BUDGET (swarm/team.py, 2026-08-22) caps
+# CUMULATIVE loading per member at 300,000 chars. When 12,000 was chosen, per-file size
+# was the only brake on context blowout, so it had to be tight. A cumulative cap does
+# that job strictly better -- it bounds the total regardless of how the bytes are split
+# -- which frees the per-file limit to be sized for call efficiency instead.
+#
+# 40,000 against the real distribution (474 source files, median 2,304, p95 15,182):
+# 470 of 474 come back whole, and the four genuine giants (up to 69,525) still
+# skeletonise, so the safety valve is intact. Worst case is ~10K tokens of a 262,144
+# window. Every file the battery reads -- business_api.py 21,820, models.py 32,437,
+# vouchers_api.py 37,852 -- now returns in one call instead of a skeleton plus five
+# pages.
+_MAX_FULL_BYTES = 40_000
 _CODE_EXT = {
     ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".java", ".go", ".rs",
     ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".kt", ".swift", ".scala",
