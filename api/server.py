@@ -344,6 +344,28 @@ def _liveness_kill_reason(snapshot: dict) -> str | None:
     #
     # So Tier 4 is now Tier 1's signal at a third of the wait, gated on the extra
     # evidence that tools are being refused rather than merely unneeded.
+    # Tier 5 (2026-08-27): the repetition detector has fired repeatedly.
+    #
+    # _looks_like_repetition_loop has existed and worked for a while -- 217 firings
+    # across the retained journal. Its only response was to withhold progress credit,
+    # which reaches Tier 1 solely when repetition is CONTINUOUS: one genuine segment in
+    # between refreshes last_progress_at and resets the stall clock entirely.
+    #
+    # Measured: a run emitted the SAME "Researcher's Final Report" block seven times
+    # over 736 seconds. The detector fired 21 times and stopped nothing, because real
+    # new text landed between the duplicates. Detection was never the gap.
+    #
+    # Counting, like the stub-serve tiers, is what closes it. 6 is past any plausible
+    # incidental echo (a templated document repeating section headers trips this once
+    # or twice, per _REPETITION_PREFIX_CHARS' own calibration notes) and well short of
+    # the 21 that run reached -- it would have stopped it around the second duplicate
+    # block instead of the seventh.
+    repeats = snapshot.get("repetition_count", 0)
+    if repeats >= config.liveness_repetition_threshold:
+        return (
+            f"the same content has been regenerated {repeats} times — the model is "
+            f"looping rather than making progress"
+        )
     no_tool = snapshot.get("no_tool_progress_seconds", 0)
     if (no_tool > config.liveness_refused_call_threshold_s
             and stagnant > config.liveness_refused_call_threshold_s

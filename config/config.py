@@ -384,6 +384,16 @@ class Config:
     liveness_refused_call_threshold_s: float = float(
         os.getenv("LIVENESS_REFUSED_CALL_THRESHOLD_S", "90"))
 
+    # Tier 5 (2026-08-27): stop after this many repetition-detector firings.
+    #
+    # 6 sits above the one-or-two incidental echoes a heavily templated document
+    # produces (see _REPETITION_PREFIX_CHARS' calibration notes on section headers)
+    # and far below the 21 reached by the live run that emitted the same block seven
+    # times over 736 seconds -- it would have stopped that one around the second
+    # duplicate rather than the seventh.
+    liveness_repetition_threshold: int = int(
+        os.getenv("LIVENESS_REPETITION_THRESHOLD", "6"))
+
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))
     session_window: int = int(os.getenv("AGNO_SESSION_WINDOW", "6"))

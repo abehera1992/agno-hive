@@ -7102,6 +7102,10 @@ async def _run_heartbeat(
                     # working (requests completing) while nothing it asks for runs.
                     # Neither number alone means anything; a long generation freezes the
                     # first and a slow tool freezes the second.
+                    # Tier 5 input: how many times the repetition detector has fired
+                    # this run. Detection was never the gap -- 217 firings across the
+                    # journal, 21 in one 736s run -- the response was.
+                    "repetition_count": activity.get("repetition_count", 0),
                     "no_tool_progress_seconds": since_last_tool,
                     "requests_advancing": (event_count is not None
                                            and event_count != prev_event_count),
@@ -8424,6 +8428,14 @@ async def _stream_team_run(
                         new_segment, joined[:last_logged_len]
                     )
                     if loop_detected or decay_detected:
+                        # Count it (2026-08-27). Withholding progress credit -- the
+                        # only response until now -- bites solely when repetition is
+                        # CONTINUOUS: any genuine segment in between refreshes
+                        # last_progress_at and resets the stall clock. The live 736s
+                        # run fired this 21 times and was never stopped by it. Tier 5
+                        # counts instead, the same shape as the stub-serve tiers.
+                        activity["repetition_count"] = (
+                            activity.get("repetition_count", 0) + 1)
                         # Leave last_progress_at untouched -- it already reflects the
                         # last time genuinely new content was confirmed, and neither a
                         # repeat nor a local diversity collapse this window changes that.
@@ -8743,6 +8755,14 @@ async def run_task_async(
                                         new_segment, joined[:last_logged_len]
                                     )
                                     if loop_detected or decay_detected:
+                                        # Count it (2026-08-27). Withholding progress credit -- the
+                                        # only response until now -- bites solely when repetition is
+                                        # CONTINUOUS: any genuine segment in between refreshes
+                                        # last_progress_at and resets the stall clock. The live 736s
+                                        # run fired this 21 times and was never stopped by it. Tier 5
+                                        # counts instead, the same shape as the stub-serve tiers.
+                                        activity["repetition_count"] = (
+                                            activity.get("repetition_count", 0) + 1)
                                         # Leave last_progress_at untouched -- see
                                         # _stream_team_run's identical block.
                                         if loop_detected:
