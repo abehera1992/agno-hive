@@ -3347,6 +3347,25 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             + _summarize_actual_writes(*all_results)
         )
 
+    # Answer-time precedent (2026-08-26). Ranked ahead of the enumeration checks below
+    # for the same reason the fabricated-tool-use check outranks them: an invented list
+    # is worse than a missing one. See _unsourced_filenames for the T12 incident.
+    unsourced = _unsourced_filenames(content, getattr(team, "_seen_files", None))
+    if unsourced:
+        named = ", ".join(f"`{n}`" for n in unsourced[:8])
+        more = f" (+{len(unsourced) - 8} more)" if len(unsourced) > 8 else ""
+        print(f"[team] {len(unsourced)} enumerated filename(s) appear in no tool result "
+              f"this run: {named}{more} — flagging", flush=True)
+        return (
+            f"{content}\n\n---\n**NAMES THAT NO TOOL RETURNED — the list above includes "
+            f"{len(unsourced)} filename(s) that appear in NO tool result from this run: "
+            f"{named}{more}. Every other name in it was seen; these were not. They may "
+            f"still exist, but this run gathered no evidence for them, so treat the "
+            f"enumeration as unverified — particularly if it was described as a "
+            f"directory listing.**"
+            + _summarize_actual_writes(*all_results)
+        )
+
     _rs_enum = getattr(team, "_read_state", None)
     missing_enum = _under_answered_enumeration(
         content, task, getattr(team, "_listings", None),
@@ -6238,6 +6257,11 @@ def _stream_event_to_chunk(event) -> str | dict | None:
             # and the count guard downstream needs the whole thing to count it.
             "listing": (_summarize_listing(result)
                         if tool.tool_name == "list_directory" else None),
+            # Every filename this result mentions, for the answer-time precedent check
+            # (2026-08-26). Captured HERE for the same reason `listing` is: this is the
+            # only point the untruncated result exists -- result_preview stops at 200
+            # chars, well inside any real listing. See _unsourced_filenames.
+            "names": _filenames_in(result),
         }
     if event_type in _MEMBER_RESULT_EVENT_TYPES:
         content = getattr(event, "content", None)
@@ -7018,6 +7042,12 @@ def _record_stream_artifacts(team, out: dict) -> None:
         if not isinstance(getattr(team, "_listings", None), list):
             team._listings = []
         team._listings.append(out["listing"])
+    if out.get("names"):
+        # Union of every filename any tool returned this run -- the evidence the
+        # answer-time precedent check compares an enumeration against.
+        if not isinstance(getattr(team, "_seen_files", None), set):
+            team._seen_files = set()
+        team._seen_files.update(out["names"])
     if out.get("__tool_event__") == "end" and out.get("name"):
         if not isinstance(getattr(team, "_tool_outcomes", None), dict):
             team._tool_outcomes = {}
@@ -7647,6 +7677,78 @@ def _listing_matches_task(path: str, task: str) -> bool:
         return False
     low = (task or "").lower()
     return any(s in low for s in distinctive)
+
+
+_FILENAME_RE = re.compile(
+    r"(?<![\w./-])([\w.-]+\.(?:py|ts|tsx|js|jsx|md|json|ya?ml|sql|scss|css|toml|ini|sh|txt))"
+    r"(?![\w/])")
+
+# Names that carry no information about THIS project -- every package has them, and an
+# answer mentioning one is not claiming to have seen a particular file.
+_UBIQUITOUS_FILES = {
+    "__init__.py", "main.py", "index.ts", "index.js", "setup.py", "conftest.py",
+    "README.md", "package.json", "tsconfig.json", "requirements.txt", "Dockerfile",
+    "CLAUDE.md", "DOCS.md", "hive.md", "config.py", "models.py", "schemas.py",
+    "database.py", "utils.py", "types.ts",
+}
+
+# Below this an "enumeration" is just prose that happens to name a couple of files.
+_MIN_ENUMERATED_FILES = 4
+
+
+def _filenames_in(text) -> set[str]:
+    """Every filename-looking token in a tool result. Empty set for non-strings."""
+    if not isinstance(text, str):
+        return set()
+    return set(_FILENAME_RE.findall(text))
+
+
+def _unsourced_filenames(content: str, seen: set | None) -> list[str]:
+    """Filenames an answer ENUMERATES that no tool returned this run.
+
+    Returns the unsourced names (sorted, capped), or [] when there is nothing to say.
+
+    Answer-time precedent: a run may only enumerate what it actually saw. Every other
+    check on this page asks "does this exist?"; this asks the prior question, "did this
+    run have any evidence for it?" -- which is answerable without touching the
+    filesystem, and agno-api has no copy of the project to touch anyway. It reads the
+    repo through MCP, so "does this file exist" is not a question it can answer locally,
+    while "did any tool return this name" is already in hand.
+
+    Built for B9's T12, the worst fabrication measured: an architectural overview
+    enumerated 12 files in `utils/` (which is EMPTY), 47 in `tests/` (6), and 18 in
+    `services/` (5) -- inventing http_client.py, event_bus.py, cache.py, uuid_utils.py
+    and naming each with a description -- then stamped the lot "verbatim from the raw
+    directory output, with no inference or filtering applied". A fabricated grounding
+    claim on top of fabricated content.
+
+    No existing guard could see it. Every enumeration check here fires on UNDER-
+    reporting; T12 over-reported lavishly, and nothing looked at whether a listed item
+    was real.
+
+    Three conditions keep this quiet on honest answers:
+      * only fires on a real enumeration (_MIN_ENUMERATED_FILES in list lines), not on
+        prose that mentions a file or two
+      * only when the run has evidence to compare against -- an empty `seen` means the
+        check knows nothing, not that everything is fabricated
+      * ubiquitous names are skipped; mentioning `__init__.py` claims nothing specific
+
+    Reports rather than rejects, like every sibling here. A name can be real and still
+    unsourced -- read from hive.md, or recalled from the task text -- so the honest
+    statement is "no tool returned this", which is exactly what was checked.
+    """
+    if not content or not isinstance(seen, set) or not seen:
+        return []
+    listed: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not _LIST_LINE_RE.match(stripped):
+            continue
+        listed.extend(_FILENAME_RE.findall(stripped))
+    candidates = [n for n in dict.fromkeys(listed) if n not in _UBIQUITOUS_FILES]
+    if len(candidates) < _MIN_ENUMERATED_FILES:
+        return []
+    return sorted(n for n in candidates if n not in seen)[:20]
 
 
 def _recorded_listing_block(listings: list | None, available: int,
