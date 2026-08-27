@@ -531,32 +531,6 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
         )
 
     # Explicit line-range read — exact and bounded, takes precedence.
-    # A ranged read of a file that FITS WHOLE is a page of a one-page book (2026-08-27).
-    # The floor below already caught limit=5; the model simply moved to limit=40, which
-    # is exactly that floor, and walked an 18,258-byte file in 41 calls -- offsets 100,
-    # 130, 170, 210, 250 ... 410 -- for a file one un-ranged call returns entirely.
-    # Measured in battery B10: 87 read calls across 8 distinct paths in a single run,
-    # 41 of them this one file, and the run died on its 50-call budget.
-    #
-    # Nothing deduped it because each offset is a different args_key, so the read
-    # cache's identical-args stub never applied; and nothing capped it because every
-    # call was individually legitimate.
-    #
-    # Same reasoning as the floor, one step further: serving a superset of what was
-    # asked is safe, and here the superset is the whole file, already under the
-    # threshold that would have returned it whole anyway. The note matters as much as
-    # the content -- the model paginates because it believes more pages exist, so it
-    # has to be told plainly that they do not.
-    if (offset or limit) and len(data) <= _MAX_FULL_BYTES:
-        total = len(data.splitlines())
-        return (
-            f"# {relative_path} — offset/limit ignored: the whole file is {len(data):,} "
-            f"bytes ({total} lines) and fits in one read, so all of it is below.\n"
-            f"# There are NO further pages. Do not call this again with another offset "
-            f"or limit for this file.\n"
-            + _numbered_lines(data.splitlines(), 1)
-        )
-
     if offset or limit:
         lines = data.splitlines()
         start = max(offset, 0)
