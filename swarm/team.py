@@ -5292,7 +5292,11 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
     """
     log: list[dict] = []
     issued_job_ids: set[str] = set()
-    repeats: dict[str, int] = {}   # consecutive exact-duplicate delegations per member
+    # Consecutive duplicate delegations per member -- EXACT task-text repeats and
+    # same-target/same-action repeats that were merely reworded, counted together on
+    # purpose (2026-08-27): a coordinator alternating between the two forms is asking
+    # the same question twice and must not get two budgets.
+    repeats: dict[str, int] = {}
 
     async def _duplicate_delegation_gate_hook(function_name, function, args,
                                               run_context=None, team=None):
@@ -5637,14 +5641,57 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                 for entry in prior_entries:
                     prior_audit = entry.get("audit")
                     if prior_audit and prior_audit["target"] == audit["target"] and prior_audit["action"] == audit["action"]:
-                        return (
-                            f"REDIRECTED: a delegation to {member_id!r} with the same target "
-                            f"({audit['target']!r}) and action ({audit['action']!r}) was already "
-                            f"made earlier this run, just worded differently — use that result "
-                            f"instead of delegating it again. If this is genuinely a different "
-                            f"target or action, correct the audit tag to reflect that. This "
-                            f"delegate_task_to_member call was NOT executed."
-                        )
+                        # Serve and escalate here too (2026-08-27). The 2026-08-22 fix
+                        # above gave the exact-task-text path a real result, a repeat
+                        # counter and a hard stop, and left THIS path -- the same target
+                        # and action reworded -- exactly as it was: a bare refusal with
+                        # no result, no counter, and so no ceiling.
+                        #
+                        # Measured in battery B10: one run made 60 delegations, 58 were
+                        # refused HERE, 57 of them byte-identical ("same target
+                        # ('api/business-service/models.py') and action ('read')"), and 2
+                        # actually executed. The coordinator spent its entire 60-call
+                        # budget being told to use a result this gate never handed it,
+                        # which is unfollowable -- so asking again is the only move left.
+                        # Raising tool_call_limit would only buy more refusals.
+                        #
+                        # Same escalation as the sibling path, for the same reason: hand
+                        # back the real result, warn on the second, stop asking on the
+                        # third. Sharing `repeats` with that path is deliberate -- a
+                        # coordinator alternating between exact and reworded repeats of
+                        # one task is doing the same thing, and must not get two budgets.
+                        repeats[member_id] = repeats.get(member_id, 0) + 1
+                        n = repeats[member_id]
+                        prior = (getattr(team, "_member_results", None) or {}).get(member_id)
+                        print(f"[team] duplicate delegation (reworded) to {member_id!r} "
+                              f"(#{n}) — {'serving prior result' if prior else 'no prior result captured'}",
+                              flush=True)
+                        if n >= 3:
+                            _force_text_only(None, team=team)
+                            return (
+                                f"STOP: you have now asked {member_id!r} for this same "
+                                f"target ({audit['target']!r}) {n} times. No further "
+                                f"delegation will run. Write your final answer now using "
+                                f"what you already have."
+                                + (f"\n\nThe result, once more:\n{prior}" if prior else "")
+                            )
+                        if prior:
+                            tail = ("" if n == 1 else
+                                    "\n\nThis is the last time this will be served — use "
+                                    "it and answer; asking again will not run anything.")
+                            return (
+                                f"ALREADY DONE — {member_id!r} was already asked about "
+                                f"{audit['target']!r} (action {audit['action']!r}) earlier "
+                                f"this run, worded differently, and returned:\n\n{prior}\n\n"
+                                f"Use this. Do not delegate it again." + tail
+                            )
+                        # Nothing usable stored -- refusing would block the one action
+                        # that could still rescue the run, exactly as on the sibling
+                        # path. `repeats` is already incremented, so a third attempt
+                        # still hits the STOP above.
+                        print(f"[team] duplicate delegation (reworded) to {member_id!r} "
+                              f"but no usable prior result — allowing the retry", flush=True)
+                        break
         else:
             prior_entries = [entry for entry in log if entry.get("tool") == "delegate_task_to_members"]
             for entry in prior_entries:
