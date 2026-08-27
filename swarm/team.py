@@ -3784,6 +3784,44 @@ async def _fill_count_markers(content: str, hive_mcp_url: str | None,
     return _COUNT_MARKER_ANY.sub("[count unavailable]", out)  # strip any malformed leftovers
 
 
+# One call per item, whatever the item is. Three tools, one behaviour, measured across
+# three consecutive batteries:
+#
+#   34 x search_files      one endpoint path per call   (B10, T2)
+#   41 x get_file_content  one 40-line page per call    (B10, T2 -- fixed at source)
+#   64 x db_schema         one table per call           (post-restore T12)
+#
+# Fixing the read pagination at the tool did not reduce budget exhaustion; the model
+# simply enumerated something else the same way. Patching a third tool would move it
+# again, so this addresses the shape rather than the instance: after enough calls to
+# ONE tool in a run, say plainly that a batch form exists and what it is.
+#
+# The hints are verified against the real signatures, not assumed. Notably
+# search_files_batch(pattern, glob_filters) batches GLOBS, not patterns -- it does NOT
+# help a run searching 34 different terms, so pointing there would have been useless
+# advice. A single regex alternation does help, and that is what it says instead.
+_BATCH_ALTERNATIVE_HINTS = {
+    "get_file_content":
+        "get_files_batch(paths=[...]) reads MANY files in one call — pass every path "
+        "you still need, at once.",
+    "db_schema":
+        "db_schema() with NO table argument returns every schema.table in the database "
+        "in one call — call it bare instead of once per table.",
+    "search_files":
+        "search_files takes a REGEX: one call with an alternation — "
+        "search_files('first|second|third', glob) — covers many terms at once. "
+        "(search_files_batch batches GLOBS, not patterns, so it will not help here.)",
+    "count_matches":
+        "count_matches takes a REGEX — one alternation pattern counts several terms in "
+        "one call.",
+}
+
+# Nudge at 8, repeat every 8. Above any honest small enumeration (a 6-file service
+# directory, the 9 voucher endpoints) and far below the 34/41/64 runaways, so a
+# well-behaved run never sees it.
+_BATCH_HINT_EVERY = 8
+
+
 _CACHEABLE_READ_TOOLS = {
     "get_file_content", "get_files_batch", "search_files", "search_files_batch",
     "find_files", "list_directory", "list_directory_tree", "count_matches",
@@ -4526,6 +4564,8 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # tool_choice; consecutive_stub_count is the streak that decides when to.
     agent_objects: dict[str, object] = {}
     consecutive_stub_count: dict[str, int] = {}
+    # Fresh calls per (agent, tool) this run, for the one-call-per-item detector.
+    batch_counts: dict[tuple[str, str], int] = {}
     read_chars: dict[str, int] = {}   # fresh-read chars per agent, see _MEMBER_READ_CHAR_BUDGET
     # Closure-local record of every REAL (fresh, non-stubbed) read this run, at any
     # delegation depth (2026-08-21). This hook instance is shared across the coordinator
@@ -4597,6 +4637,10 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         )
         cache_key = (function_name, args_key)
         serve_key = (agent_key, generation, function_name, args_key)
+        # Initialised here, not in the fresh-fetch branch that sets it: the final
+        # `return result` reads it on every path, including a cache hit that never
+        # enters that branch, where a branch-local binding would be a NameError.
+        batch_hint = ""
 
         # Checked BEFORE calling the real function (unlike the identical-args
         # cache below, which only avoids a re-call once cache_key repeats
@@ -4693,6 +4737,26 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                   f"{read_chars[norm_agent_key]:,}/{_MEMBER_READ_CHAR_BUDGET:,} chars "
                   f"(+{len(str(result)):,} {function_name})", flush=True)
             _record_read(run_context, function_name, args, agent_key, len(str(result)))
+            # One-call-per-item detector (2026-08-27). Counts FRESH fetches only -- a
+            # cache hit costs nothing and is not the behaviour being discouraged. See
+            # _BATCH_ALTERNATIVE_HINTS for the three measured runaways this exists for.
+            batch_counts[(norm_agent_key, function_name)] = (
+                batch_counts.get((norm_agent_key, function_name), 0) + 1)
+            n_calls = batch_counts[(norm_agent_key, function_name)]
+            batch_hint = ""
+            if (n_calls % _BATCH_HINT_EVERY == 0
+                    and function_name in _BATCH_ALTERNATIVE_HINTS):
+                print(f"[team] {agent_key or 'coordinator'} has called {function_name} "
+                      f"{n_calls}x this run — suggesting the batch form", flush=True)
+                batch_hint = (
+                    f"\n\n── NOTE FROM THE RUN, not from the tool ──\n"
+                    f"That was call #{n_calls} to {function_name} by "
+                    f"{agent_key or 'the coordinator'} this run, one item at a time. "
+                    f"{_BATCH_ALTERNATIVE_HINTS[function_name]}\n"
+                    f"Your tool budget is per-agent and finite: at this rate it runs out "
+                    f"before the answer is written. Gather the rest in as few calls as "
+                    f"you can, then answer."
+                )
             # Second, independent source -- survives delegation, unlike session_state.
             read_state["reads"].append({"tool": function_name, "read_by": agent_key or "coordinator"})
             # Bytes the tools actually handed to members, so the member -> coordinator
@@ -4760,6 +4824,12 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 return _forced_answer_nudge(agent_key, total)
             return _duplicate_read_stub(function_name, args, agent_key, count, len(str(result)))
         consecutive_stub_count[norm_agent_key] = 0
+        # The batch hint rides back attached to the real result, the same way the
+        # delegation-volume warning does -- a print alone goes to the journal, where the
+        # model cannot read it. Only for str results; a non-str would be corrupted by
+        # concatenation, and the print above still records it either way.
+        if batch_hint and isinstance(result, str):
+            return result + batch_hint
         return result
 
     # Exposed as an attribute rather than a second return value, so every existing
