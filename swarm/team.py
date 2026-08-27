@@ -7807,7 +7807,13 @@ _STATED_COUNT_RE = re.compile(
 # comparing 13 against that list would be a false positive on a correct answer. A comma
 # is a cheap, reliable marker of that second clause, and both real failures below are
 # comma-free.
-_COUNT_INTRO_RE = re.compile(r"(?<![\w.])(\d{1,3})\b[^:,\n]{0,120}:[ \t]*\n")
+# The lookbehind excludes a preceding HYPHEN as well as word chars and dots: a digit
+# inside a hyphenated name is part of that name, not a count. Live false positive
+# 2026-08-26, on a good answer -- "The HSN rate system uses SCD Type-2 semantics. When
+# a rate changes:" followed by 3 steps was reported as "says 2 ... lists 3 items". The
+# 2 belongs to "Type-2". A SLASH is excluded for the same reason -- HTTP/2, Phase-2,
+# base-64 and UTF-8 all name a thing rather than count one.
+_COUNT_INTRO_RE = re.compile(r"(?<![\w./-])(\d{1,3})\b[^:,\n]{0,120}:[ \t]*\n")
 
 # A number that ORDERS a section rather than counting anything: "### 2. Database
 # Tables:", "2) Endpoints:". Caught before shipping, not in production -- these answers
@@ -7815,6 +7821,9 @@ _COUNT_INTRO_RE = re.compile(r"(?<![\w.])(\d{1,3})\b[^:,\n]{0,120}:[ \t]*\n")
 # real tables would have been reported as a contradiction on a perfectly good answer.
 # The ordinal says WHERE the section sits, never how many items are under it.
 _SECTION_ORDINAL_RE = re.compile(r"(?:^|\n)[ \t]*(?:[#>*_`\-]+[ \t]*)*$")
+
+# A capitalised word immediately before the digit -- "OAuth 2", "Python 3", "Phase 2".
+_PROPER_NOUN_BEFORE_RE = re.compile(r"\b[A-Z][A-Za-z]{1,14}[ \t]$")
 
 
 def _count_contradicts_own_list(content: str) -> tuple[int, int, str] | None:
@@ -7852,6 +7861,13 @@ def _count_contradicts_own_list(content: str) -> tuple[int, int, str] | None:
             continue
         # An ordinal opening a section counts nothing -- see _SECTION_ORDINAL_RE.
         if _SECTION_ORDINAL_RE.search(content[:m.start()]):
+            continue
+        # A number right after a capitalised word is part of a NAME, not a count:
+        # "OAuth 2", "Python 3", "Phase 2". Space-separated, so no lookbehind can
+        # separate it from "2 files" -- it has to be checked here. Costs the odd real
+        # detection ("Total 7 items:"), which is the right trade after this check fired
+        # on a correct answer once already today.
+        if _PROPER_NOUN_BEFORE_RE.search(content[:m.start()]):
             continue
         actual = 0
         for line in content[m.end():].splitlines():
