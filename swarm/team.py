@@ -814,11 +814,27 @@ _MUTATING_TOOLS = {
     "write_file", "apply_diff", "run_command", "run_shell", "run_docker",
     "confirm_action", "reject_action", "index_project", "scan_project_context",
     "lightrag_insert", "run_migration",
-    # Persistent bash sessions + background jobs (hive-mcp/tools/bash.py) --
-    # bash_job_status is deliberately NOT here: it's a read-only poll, and a
-    # read-only team can never obtain a job_id anyway since bash_run itself is
-    # stripped for them.
+    # Persistent bash sessions + background jobs (hive-mcp/tools/bash.py). The whole
+    # family goes, INCLUDING the read-only poller bash_job_status.
+    #
+    # It was excluded until 2026-08-28 on the reasoning that a poll mutates nothing and
+    # "a read-only team can never obtain a job_id anyway since bash_run itself is
+    # stripped". Both halves are true and the conclusion still failed, live, on T9:
+    # the Executor's read-only surface was
+    #     bash_job_status, check_port, get_env_info, get_file_content, git_*, ...
+    # -- a job POLLER with no way to START a job. The model did not need a real
+    # job_id; it INVENTED one, called bash_job_status four times, got
+    # "REDIRECTED: no background job" each time, and the coordinator then re-delegated
+    # to executor until the duplicate-delegation gate stopped the run. No answer
+    # shipped, and get_env_info -- the one tool that answers "what OS/Python is this?"
+    # -- sat unused in the same surface.
+    #
+    # The lesson generalises past bash: a tool's PRESENCE advertises a capability.
+    # Leaving a poller without its starter describes a world the agent cannot reach,
+    # and the model will burn its budget trying to reach it. Strip capability families
+    # whole, not by per-tool mutation analysis.
     "bash_session_start", "bash_run", "bash_session_close", "bash_job_kill",
+    "bash_job_status",
 }
 _MUTATING_PREFIXES = (
     "notion_create", "notion_update", "notion_append", "notion_replace",
@@ -1962,6 +1978,41 @@ _DB_TASK_RE = re.compile(
 # Tools that actually ENUMERATE a directory, as opposed to reading one thing out of it.
 # find_files counts: a glob genuinely lists what matches, which is a real enumeration.
 _ENUM_TOOLS = {"list_directory", "list_directory_tree", "find_files"}
+
+# Tools that enumerate a FILE'S CONTENTS -- the fields on a model, the endpoints in a
+# router, the columns on a table. Added 2026-08-28 with _enumeration_kind below.
+#
+# An enumeration ask comes in two kinds and they take DIFFERENT evidence:
+#
+#     "list every Python file in router/"        -> list_directory   (directory)
+#     "what fields does the Party model have"    -> get_file_content (content)
+#
+# Until now one guard demanded directory evidence for both. _is_enumeration_task's own
+# docstring already records this exact bug being found and fixed once, for "how many
+# @router endpoints are defined in uom_api.py" -- a question about a FILE's CONTENTS
+# where a directory listing proves nothing. The `how many` branch was narrowed, then a
+# fields/columns/properties branch was added on 2026-08-24 carrying the same defect.
+#
+# It cost more than a wrong warning. T4 (2026-08-28) asked what fields the Party model
+# has; the guard demanded a directory listing, forced a corrective retry, and the retry
+# spent the tool budget -- the run ended with "this run's tool budget is exhausted" and
+# no answer, under a warning that said the task "asked what a directory contains". It
+# had not. A guard that can spend a run's budget must be right about what it is asking
+# for.
+_CONTENT_ENUM_TOOLS = {
+    "get_file_content", "get_files_batch", "search_files", "search_files_batch",
+    "count_matches", "db_schema",
+}
+
+# Which nouns decide the kind. Deliberately noun-based rather than verb-based: the verb
+# ("list", "enumerate", "how many") is identical across both kinds and carries no signal.
+_DIR_NOUN_RE = re.compile(
+    r"\b(?:files?|directory|directories|folders?|modules?|routers?|services?)\b",
+    re.IGNORECASE)
+_CONTENT_NOUN_RE = re.compile(
+    r"\b(?:fields?|columns?|properties|property|attributes?|methods?|endpoints?|"
+    r"hooks?|tables?|parameters?|arguments?|functions?|classes|class)\b",
+    re.IGNORECASE)
 # Task shapes that demand a real listing rather than recall. Same narrowness rule as
 # _DB_TASK_RE above, and the same asymmetry: a false positive costs one extra evidence
 # check on a task that didn't need it; a false negative ships a confidently wrong
@@ -2056,6 +2107,47 @@ def _is_enumeration_task(task: str | None) -> bool:
     if _FILE_TARGET_RE.search(task) and not _DIRECTORY_WORD_RE.search(task):
         return False
     return True
+
+
+def _enumeration_kind(task: str | None) -> str | None:
+    """Which EVIDENCE an enumeration ask needs: 'directory', 'content', 'both', None.
+
+    Splits what _is_enumeration_task deliberately does not: it answers "does this need
+    enumerated evidence at all", this answers "evidence of WHAT". See _CONTENT_ENUM_TOOLS
+    for the T4 failure that made the distinction load-bearing rather than cosmetic.
+
+    Classified by NOUN, not verb -- "list", "enumerate" and "how many" appear verbatim in
+    both kinds and carry no signal. The nouns do: files/directories/modules on one side,
+    fields/columns/endpoints/hooks on the other.
+
+    'both' is a real and common answer, not a hedge, because a path can supply a
+    directory noun incidentally: "List every endpoint defined in
+    API/business-service/router/business_api.py" is a pure contents question whose PATH
+    contains "router". Accepting either evidence set there is correct -- the question can
+    honestly be answered from the file alone, and demanding a listing on top would
+    recreate exactly the false positive this function exists to prevent.
+
+    Unclassifiable ("enumerate everything") falls back to 'directory', preserving the
+    behaviour that shipped before this split.
+    """
+    if not _is_enumeration_task(task):
+        return None
+    has_dir = bool(_DIR_NOUN_RE.search(task))
+    has_content = bool(_CONTENT_NOUN_RE.search(task))
+    if has_dir and has_content:
+        return "both"
+    if has_content:
+        return "content"
+    return "directory"
+
+
+def _enumeration_evidence_tools(kind: str | None) -> set[str]:
+    """The tool names that count as evidence for this kind of enumeration ask."""
+    if kind == "content":
+        return _CONTENT_ENUM_TOOLS
+    if kind == "both":
+        return _ENUM_TOOLS | _CONTENT_ENUM_TOOLS
+    return _ENUM_TOOLS
 
 
 # The coordinator narrating that it is about to call a tool it does not have. This is a
@@ -3116,23 +3208,40 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # anyway, asserting the whole feature was missing.
     # Both sources -- see the generic reads check above for why messages alone is 0
     # once the coordinator delegates instead of reading.
-    enum_reads = max(_count_read_calls(result, tool_names=_ENUM_TOOLS),
-                     _run_read_count(team, tool_names=_ENUM_TOOLS))
-    if enum_reads == 0 and _is_enumeration_task(task):
-        print("[team] task asked for an enumeration but made zero list_directory/"
-              "find_files calls — retrying with evidence required")
+    # Which evidence this ask actually needs -- a directory listing, or a file read.
+    # Demanding the wrong one forces a retry the answer cannot satisfy; see
+    # _CONTENT_ENUM_TOOLS for the T4 run that died of exactly that.
+    enum_kind = _enumeration_kind(task)
+    enum_evidence = _enumeration_evidence_tools(enum_kind)
+    enum_reads = max(_count_read_calls(result, tool_names=enum_evidence),
+                     _run_read_count(team, tool_names=enum_evidence))
+    if enum_reads == 0 and enum_kind is not None:
+        wanted = ("list_directory or find_files" if enum_kind != "content"
+                  else "get_file_content or search_files")
+        print(f"[team] task asked for a {enum_kind} enumeration but made zero "
+              f"{wanted} calls — retrying with evidence required")
         try:
+            if enum_kind == "content":
+                correction = (
+                    f"IMPORTANT: a previous attempt answered this WITHOUT ever reading "
+                    f"the file — it answered from memory. Call get_file_content (or "
+                    f"search_files) on the exact file NOW and enumerate from that tool's "
+                    f"own output. Do not name fields, columns, endpoints or hooks you "
+                    f"remember; name the ones the tool returned. If the symbol does not "
+                    f"exist, say so plainly rather than listing what you expect."
+                )
+            else:
+                correction = (
+                    f"IMPORTANT: a previous attempt answered this WITHOUT ever listing "
+                    f"the directory — it answered from memory, and produced a list that "
+                    f"was missing most of the real files. Call list_directory (or "
+                    f"find_files with a glob) on the exact path NOW and enumerate from "
+                    f"that tool's own output. Do not name files you remember; name the "
+                    f"ones the tool returned. If the path does not exist, say so plainly "
+                    f"rather than listing what you expect to be there."
+                )
             retried, retry = await _stream_team_run(
-                team,
-                f"{task}\n\n"
-                f"IMPORTANT: a previous attempt answered this WITHOUT ever listing the "
-                f"directory — it answered from memory, and produced a list that was "
-                f"missing most of the real files. Call list_directory (or find_files "
-                f"with a glob) on the exact path NOW and enumerate from that tool's own "
-                f"output. Do not name files you remember; name the ones the tool "
-                f"returned. If the path does not exist, say so plainly rather than "
-                f"listing what you expect to be there.",
-                liveness_path=liveness_path,
+                team, f"{task}\n\n{correction}", liveness_path=liveness_path,
             )
             all_results.append(retry)
             content, result = _adopt_retry("enumeration", content, result, retried, retry)
@@ -3141,15 +3250,17 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
 
         # Same retry-compliance rule as the two guards above: surface loudly rather than
         # silently accept an answer whose corrective retry ignored the correction.
-        if max(_count_read_calls(result, tool_names=_ENUM_TOOLS),
-               _run_read_count(team, tool_names=_ENUM_TOOLS)) == 0:
+        if max(_count_read_calls(result, tool_names=enum_evidence),
+               _run_read_count(team, tool_names=enum_evidence)) == 0:
+            what, tools = (("a FILE READ", "get_file_content or search_files")
+                           if enum_kind == "content"
+                           else ("A DIRECTORY LISTING", "list_directory or find_files"))
             return (
-                f"{content}\n\n---\n**NOT VERIFIED BY A DIRECTORY LISTING — this task "
-                f"asked what a directory contains, and neither the original attempt nor "
-                f"the corrective retry called list_directory or find_files. Any file "
-                f"list, count, or \"no such file\" claim above is recalled rather than "
-                f"enumerated, and has been wrong by a factor of 6-8x on this exact "
-                f"failure before.**"
+                f"{content}\n\n---\n**NOT VERIFIED BY {what} — this task asked for an "
+                f"enumeration, and neither the original attempt nor the corrective retry "
+                f"called {tools}. Any list, count, or \"no such thing\" claim above is "
+                f"recalled rather than enumerated, and has been wrong by a factor of "
+                f"6-8x on this exact failure before.**"
                 + _summarize_actual_writes(*all_results)
             )
 
@@ -7580,8 +7691,33 @@ def _fabricated_tool_use(content: str, outcomes: dict | None):
     return None
 
 
+# Fixed 2026-08-28 after a live false positive on T2. Two defects, one regex:
+#
+#   1. The separator was [:\s], and \s matches a NEWLINE. Against
+#          "### **Backend Endpoints (13 total)**\n1. `POST /business/register` ..."
+#      it walked past "total", crossed the line break, and captured the first list
+#      item's ORDINAL -- total=1. The guard then reported "it states 1 items in total,
+#      8 covered and 5 not covered, but 8 + 5 = 13", which reads as gibberish because
+#      8 + 5 = 13 is exactly right; only the phantom total was wrong.
+#   2. It never matched the number-FIRST phrasing "13 total" at all, which is the form
+#      models actually write. Only "total: 13" was reachable.
+#
+# Worth recording what the correct parse implies: with total=13, 8 + 5 == 13 and this
+# guard stays SILENT -- correctly, since coverage arithmetic is not what T2 got wrong.
+# Its real error was stating "Missing: 5" above a list of SIX.
+#
+# That error is deliberately LEFT UNCAUGHT, which is a decision rather than an omission.
+# _count_contradicts_own_list cannot see it: its intro form is "N ... :" (number before
+# the colon) and T2 wrote "**Missing**: 5" (number after). Adding the "label: N" form to
+# reach it was tried and rejected -- in this very answer the preceding line is
+# "- ✅ **Covered**: 8 endpoints", whose next non-blank line is "- ❌ **Missing**: 5",
+# itself a list item. The new form would count ONE item under a stated 8 and report a
+# false contradiction on a correct line. Catching T2's real error that way costs a false
+# positive on the line directly above it, and this file already carries ten verify-side
+# false positives; adding an eleventh to catch one true one is a bad trade.
 _COVERAGE_TOTAL_RE = re.compile(
-    r"\btotal\b[^.\n:]{0,40}?[:\s]\s*\**(\d{1,4})\b"
+    r"\b(\d{1,4})\s+total\b"                                   # "13 total", "(13 total)"
+    r"|\btotal\b[^.\n:]{0,40}?[:\t ][ \t]*\**(\d{1,4})\b"      # "total: 13" -- same line
     r"|\ball\s+(\d{1,4})\s+\w+[^.\n]{0,40}?\b(?:are|is)\b",
     re.IGNORECASE)
 _COVERAGE_COVERED_RE = re.compile(
