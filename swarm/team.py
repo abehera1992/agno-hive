@@ -3407,6 +3407,26 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             + _summarize_actual_writes(*all_results)
         )
 
+    # Thin-answer tool-evidence check (2026-08-28). Deliberately measured against what
+    # was READ, not against what members RELAYED -- the guard directly above compares
+    # the answer to member results and was blind to T9 for exactly that reason: the
+    # answer (237 chars) was LARGER than the member result (56 chars), so nothing looked
+    # wrong. The 1,547 characters get_env_info actually returned never entered that
+    # comparison, and all three facts in the answer were fabricated. See
+    # _captured_tool_evidence for the full chain.
+    _rs_thin = getattr(team, "_read_state", None)
+    _read_thin = _rs_thin.get("read_chars_total", 0) if isinstance(_rs_thin, dict) else 0
+    _relayed_thin = getattr(team, "_member_result_chars", 0)
+    if (len(content.strip()) < _THIN_ANSWER_CHARS and _read_thin and _relayed_thin
+            and _read_thin / _relayed_thin >= _THIN_ANSWER_MIN_RATIO):
+        tool_evidence = _captured_tool_evidence(team)
+        if tool_evidence:
+            print(f"[team] thin answer ({len(content.strip()):,} chars) over a "
+                  f"{_read_thin / _relayed_thin:.1f}:1 relay collapse "
+                  f"({_read_thin:,} read -> {_relayed_thin:,} relayed) — "
+                  f"surfacing captured tool output", flush=True)
+            return content + tool_evidence + _summarize_actual_writes(*all_results)
+
     # Under-answered enumeration check (2026-08-22). See _under_answered_enumeration
     # for why this is its own guard rather than a case of the count check above: the
     # facts are right, the reads happened, nothing is invented -- the answer just does
@@ -6694,6 +6714,10 @@ def _stream_event_to_chunk(event, team=None) -> str | dict | None:
             "__tool_event__": "end",
             "name": tool.tool_name,
             "result_preview": result[:200] if isinstance(result, str) else None,
+            # Full length alongside the truncated preview: the preview alone cannot tell
+            # a 200-char result (relayed whole) from a 200,000-char one (compressed to
+            # nothing). _captured_tool_evidence needs the real size to know which.
+            "result_chars": len(result) if isinstance(result, str) else 0,
             "agent_name": getattr(event, "agent_name", "") or "",
             # Counts, not the body: this is the only point the FULL listing exists
             # (result_preview truncates at 200 chars, well inside a 24-entry listing),
@@ -7500,6 +7524,21 @@ def _record_stream_artifacts(team, out: dict) -> None:
             team._tool_outcomes = {}
         bucket = team._tool_outcomes.setdefault(out["name"], {"ok": 0, "err": 0})
         bucket["err" if _looks_like_tool_error(out.get("result_preview")) else "ok"] += 1
+        # Keep the preview itself, not just the ok/err tally. This is the ONLY place a
+        # tool's actual returned VALUES survive: _record_read deliberately stores
+        # result_chars and never content, _member_results stores the member's summary of
+        # the content, and the event itself is discarded after this branch. T9 turned
+        # that gap into a fabrication -- see _captured_tool_evidence.
+        if out.get("result_preview"):
+            if not isinstance(getattr(team, "_tool_evidence", None), list):
+                team._tool_evidence = []
+            if len(team._tool_evidence) < _TOOL_EVIDENCE_MAX_ITEMS:
+                team._tool_evidence.append({
+                    "name": out["name"],
+                    "agent": out.get("agent_name") or "",
+                    "preview": out["result_preview"],
+                    "chars": out.get("result_chars") or 0,
+                })
 
 
 # How many characters of MEMBER RESULTS one run may accumulate before the coordinator
@@ -8290,6 +8329,71 @@ def _answer_outruns_evidence(content: str, member_chars: int) -> tuple[int, int]
 
 
 _RECOVERED_FINDINGS_CAP = 12_000   # per member; above this the answer stops being readable
+
+
+# How many tool previews one run retains, and how thin an answer has to be before they
+# are surfaced. Bounded deliberately: 12 x ~200 chars is ~2.4 KB, negligible against
+# _RUN_MEMBER_RESULT_CHAR_BUDGET, and this must never become the context problem that
+# _record_read and _evidence_manifest both refuse to create.
+_TOOL_EVIDENCE_MAX_ITEMS = 12
+_THIN_ANSWER_CHARS = 1_200
+_THIN_ANSWER_MIN_RATIO = 8.0
+
+
+def _captured_tool_evidence(team) -> str:
+    """What the tools actually RETURNED, appended when a thin answer buried it.
+
+    Returns a rendered block, or "".
+
+    The exact mirror of _answer_outruns_evidence: that one catches an answer LONGER than
+    the findings behind it, this one catches an answer that is far SHORTER than the
+    evidence gathered for it -- and is wrong because of what it left out.
+
+    T9, 2026-08-28, is the case this was built from, and it is worth stating precisely
+    because the obvious diagnosis is wrong. The coordinator did not ignore a tool result:
+
+        coordinator -> executor:  "Run 'get_env_info' and return its raw output verbatim"
+        executor    -> get_env_info():  1,547 chars, containing
+                          OS: Linux 6.6.87.2-microsoft-standard-WSL2 (x86_64)
+                          Python: 3.12.14 at /usr/local/bin/python
+                          Project root: /project
+        executor    -> coordinator:  56 chars          (relay 1,547 -> 56 = 27.6:1)
+        coordinator -> answer:  "Ubuntu 22.04.4 LTS / Python 3.11.6 / /home/ubuntu/ekam-app"
+
+    Three facts, three fabrications, and the coordinator never saw any of the real ones.
+    It asked for verbatim output and got a 56-character precis of it. Every existing
+    guard was blind: verify_claims checks file paths and symbols, not OS strings; the
+    expansion check compares lengths and this answer was SHORTER than its evidence;
+    there was no list to count and no citation to resolve.
+
+    Appending rather than substituting, and appending the TOOL's words rather than any
+    member's summary, is the whole point -- _recovered_member_findings would have
+    surfaced the 56-char precis here, which contains none of the three values. This is
+    the only place the returned values still exist in the process.
+
+    Fires narrowly: a short answer, a large gap between what was read and what was
+    relayed, and real captured previews. A substantive answer is left alone even at a
+    high ratio, because compressing 40,000 chars of reading into a good 3,000-char
+    answer is the job working correctly, not a failure.
+    """
+    evidence = getattr(team, "_tool_evidence", None)
+    if not evidence:
+        return ""
+    lines = []
+    for item in evidence:
+        preview = " ".join((item.get("preview") or "").split())
+        if not preview:
+            continue
+        who = f" [{item['agent']}]" if item.get("agent") else ""
+        size = f" ({item['chars']:,} chars)" if item.get("chars") else ""
+        lines.append(f"  {item['name']}{who}{size} -> {preview}")
+    if not lines:
+        return ""
+    return ("\n\n---\n**WHAT THE TOOLS ACTUALLY RETURNED — the answer above is short "
+            "relative to the evidence this run gathered, and the values below reached a "
+            "member but may not have survived its summary on the way to the answer. "
+            "Where the two disagree, these are the tool's own words:**\n```\n"
+            + "\n".join(lines) + "\n```")
 
 
 def _recovered_member_findings(team) -> str:
