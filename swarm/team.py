@@ -3264,6 +3264,22 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # signal is real and worth surfacing, so the detection stays and the banner tells
     # the reader what happened. Recovering the answer needs a groundedness gate
     # designed deliberately, not a length comparison.
+    # Answer running ahead of its evidence (2026-08-28) -- the mirror of the
+    # under-delivery check below. See _answer_outruns_evidence for the leg-3 numbers.
+    outran = _answer_outruns_evidence(content, getattr(team, "_member_result_chars", 0))
+    if outran is not None:
+        wrote, gathered = outran
+        print(f"[team] answer outruns its evidence ({wrote:,} chars written from "
+              f"{gathered:,} chars of member findings) — flagging", flush=True)
+        return (
+            f"{content}\n\n---\n**THE ANSWER IS LONGER THAN ITS EVIDENCE — the members "
+            f"returned {gathered:,} characters of findings and the answer above is "
+            f"{wrote:,}. Most of it therefore does not come from anything this run "
+            f"gathered. Treat specifics — file paths, names, counts — as unverified "
+            f"until checked by hand.**"
+            + _summarize_actual_writes(*all_results)
+        )
+
     withheld = _completion_claim_instead_of_answer(
         content, getattr(team, "_member_result_chars", 0)
     )
@@ -3275,8 +3291,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"{content}\n\n---\n**ANSWER REPORTS FAR LESS THAN THIS RUN GATHERED — "
             f"members returned {withheld:,} characters of findings and the answer "
             f"above is {len(content.strip()):,} characters. What is here may be "
-            f"correct; most of what was researched is simply not in it. Ask again for "
-            f"the parts you need spelled out.**"
+            f"correct; most of what was researched is simply not in it.**"
+            + _recovered_member_findings(team)
             + _summarize_actual_writes(*all_results)
         )
 
@@ -8088,6 +8104,91 @@ def _evidence_manifest(read_state, agent_key: str) -> str:
 _HOOK_FAMILY_RE = re.compile(r"^(use[A-Z]\w*?)(Query|Mutation)$")
 
 _EXPORT_FAMILY_MIN = 3     # below this a "family" is a coincidence, not a set
+
+
+# The mirror of _NON_DELIVERY_MAX_RATIO. That one catches an answer far SHORTER than
+# the evidence behind it (the material arrived and was not passed on). This catches the
+# opposite: an answer far LONGER than its evidence, which is what fabrication looks like
+# from the outside.
+#
+# Leg 3, measured: 118 characters relayed, roughly 2,000 written -- a 17x expansion that
+# invented a directory, two files in it, two Kafka topics and three REST endpoints.
+#
+# 6x, and only above a floor. A short answer on thin evidence is usually just a correct
+# short answer -- T8 reports "0 rows" in about 40 characters and is right -- so the
+# answer must also be substantial before the ratio means anything. Both conditions
+# together describe "wrote a lot from almost nothing", which is the only shape worth
+# reporting.
+_EXPANSION_MIN_ANSWER_CHARS = 1_200
+_EXPANSION_MAX_MEMBER_CHARS = 600
+_EXPANSION_RATIO = 6.0
+
+
+def _answer_outruns_evidence(content: str, member_chars: int) -> tuple[int, int] | None:
+    """An answer much longer than the member findings it rests on.
+
+    Returns (answer_chars, member_chars) or None.
+
+    Disclosure only, deliberately. The ratio says the answer is running ahead of its
+    evidence; it cannot say which parts are invented, and today's record on this file's
+    checks -- eight false positives found by running them -- argues against blocking on
+    a signal this indirect. A reader told "2,000 characters written from 118 gathered"
+    can judge; a run refused on that basis cannot be recovered.
+    """
+    if not content or member_chars <= 0:
+        return None
+    body = content.strip()
+    if len(body) < _EXPANSION_MIN_ANSWER_CHARS:
+        return None
+    if member_chars > _EXPANSION_MAX_MEMBER_CHARS:
+        return None
+    if len(body) < member_chars * _EXPANSION_RATIO:
+        return None
+    return len(body), member_chars
+
+
+_RECOVERED_FINDINGS_CAP = 12_000   # per member; above this the answer stops being readable
+
+
+def _recovered_member_findings(team) -> str:
+    """The members' own findings, appended when the answer failed to carry them.
+
+    Returns a rendered block, or "" when nothing is stored.
+
+    The guard that calls this already knew the answer was thin -- it says so, with both
+    character counts -- and then discarded the findings it was holding and asked the
+    READER to run the task again. Measured on T13 (2026-08-28): the Researcher wrote
+    3,066 characters containing every endpoint with its line number, the frontend hooks,
+    and the correct four-gap analysis; the coordinator returned 459 characters saying
+    "the findings are summarized in the checklist above" with no checklist above it. The
+    work was done, complete, and thrown away at the last step.
+
+    Nothing here is fetched or recomputed. team._member_results is populated in the same
+    process by the stream capture -- the material is already in memory when the warning
+    is printed. This is the same repair as the enumeration guard rendering the listing
+    it had counted, and the delegation gate attaching the result it told the model to
+    reuse.
+
+    Appended, never substituted: the coordinator's summary may be a correct precis, and
+    replacing it would hide what it chose to say. The reader gets both, clearly labelled.
+    """
+    results = getattr(team, "_member_results", None)
+    if not isinstance(results, dict) or not results:
+        return ""
+    parts = []
+    for name, text in results.items():
+        text = (text or "").strip()
+        if len(text) < 200:      # a stub or a one-liner adds noise, not recovery
+            continue
+        body = text[:_RECOVERED_FINDINGS_CAP]
+        if len(text) > len(body):
+            body += f"\n… (+{len(text) - len(body):,} more characters)"
+        parts.append(f"\n\n### From {name}\n{body}")
+    if not parts:
+        return ""
+    return ("\n\n---\n**WHAT THE MEMBERS ACTUALLY REPORTED — recovered from this run "
+            "because the answer above did not carry it. This is their own text, "
+            "unedited, not a re-derivation.**" + "".join(parts))
 
 
 def _hook_family_names(text) -> set[str]:
