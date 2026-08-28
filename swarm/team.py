@@ -4190,7 +4190,13 @@ _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS = 3
 #   300,000 (budget) + 200,000 (largest single read) = 500,000 chars
 #   ~143k tokens, plus the ~99k of instructions/schemas/history implied by the failure
 #   above (258k total minus ~159k of read content) = ~242k, inside 262,144 with margin.
-_MEMBER_READ_CHAR_BUDGET = 300_000
+# Env-tunable (2026-08-28), default unchanged. Every other budget in this stack is
+# adjustable without a code change -- tool_call_limit through the DB, the liveness
+# thresholds through config -- and this one was the exception, so testing whether a
+# task is capacity-bound meant editing and redeploying. Raising it is a real
+# experiment: measured cost of T12's honest reading is ~380,000 chars against this
+# 300,000, and whether that gap is the binding constraint is answerable in one run.
+_MEMBER_READ_CHAR_BUDGET = int(os.getenv("MEMBER_READ_CHAR_BUDGET", "300000"))
 
 
 def is_fresh_read_budget_exceeded(read_chars: dict[str, int], agent_key: str) -> bool:
