@@ -8454,6 +8454,25 @@ _SECTION_ORDINAL_RE = re.compile(r"(?:^|\n)[ \t]*(?:[#>*_`\-]+[ \t]*)*$")
 # A capitalised word immediately before the digit -- "OAuth 2", "Python 3", "Phase 2".
 _PROPER_NOUN_BEFORE_RE = re.compile(r"\b[A-Z][A-Za-z]{1,14}[ \t]$")
 
+# A digit followed by a dash and another digit is a RANGE, not a count: "line 12-45",
+# "pp. 3-7". _COUNT_INTRO_RE's lookbehind already excludes a dash BEFORE the digit
+# (Type-2, HTTP/2); this is that same rule pointed the other way. Live false positive
+# 2026-08-28 on the T12 answer: "**`items_api.py`** (`line 12-45`):" followed by 13
+# bullets was reported as "says 12 ... lists 13 items". Every cited line range in an
+# answer -- and a grounded answer is full of them -- offers its leading number as a
+# count without this. Covers the unicode dashes (U+2010..U+2015) because models emit
+# an en-dash here far more often than an ASCII hyphen.
+_RANGE_AFTER_RE = re.compile(r"^[‐-―\-][0-9]")
+
+# A word naming a LOCATION before the digit -- "line 12", "page 3", "chunk 193",
+# "row 7", "step 4". These address a position, never a quantity. All lowercase in
+# practice, which is exactly why _PROPER_NOUN_BEFORE_RE does not already cover them;
+# it is spelled case-insensitively anyway since a sentence can open with "Line 12:".
+# Catches the no-range form ("see line 45:" above a list) that _RANGE_AFTER_RE misses.
+_LOCATION_WORD_BEFORE_RE = re.compile(
+    r"\b(?:lines?|ln|cols?|columns?|pp|pages?|chunks?|rows?|ports?|steps?|versions?)"
+    r"\.?[ \t]$", re.IGNORECASE)
+
 
 def _count_contradicts_own_list(content: str) -> tuple[int, int, str] | None:
     """A stated count that disagrees with the answer's OWN enumeration right below it.
@@ -8497,6 +8516,12 @@ def _count_contradicts_own_list(content: str) -> tuple[int, int, str] | None:
         # detection ("Total 7 items:"), which is the right trade after this check fired
         # on a correct answer once already today.
         if _PROPER_NOUN_BEFORE_RE.search(content[:m.start()]):
+            continue
+        # "line 12-45" -- a cited range, not a count. Both halves are checked: the dash
+        # that follows the digit, and the location word that precedes it.
+        if _RANGE_AFTER_RE.match(content[m.end(1):m.end(1) + 2]):
+            continue
+        if _LOCATION_WORD_BEFORE_RE.search(content[:m.start()]):
             continue
         actual = 0
         for line in content[m.end():].splitlines():
