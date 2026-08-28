@@ -3347,6 +3347,23 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             + _summarize_actual_writes(*all_results)
         )
 
+    # Under-reported exports (2026-08-28). The T13 shape: the run OPENED the file and
+    # the answer named one sibling of five. See _under_reported_exports.
+    _rs_exp = getattr(team, "_read_state", None)
+    under = _under_reported_exports(content, _rs_exp if isinstance(_rs_exp, dict) else None)
+    if under is not None:
+        path, named, total, missing = under
+        listed = ", ".join(f"`{n}`" for n in missing)
+        print(f"[team] answer names {named} of {total} sibling exports in {path} "
+              f"— flagging", flush=True)
+        return (
+            f"{content}\n\n---\n**NAMED {named} OF {total} — this run opened "
+            f"`{path}` and it declares {total} exports of the same family, but the "
+            f"answer above names only {named}. Not listed: {listed}. Any count or gap "
+            f"analysis resting on the shorter list is wrong by the difference.**"
+            + _summarize_actual_writes(*all_results)
+        )
+
     # Self-contradiction against the run's own lookups (2026-08-27). Ranked ahead of
     # the precedent check below because it is the stronger claim: that guard says "no
     # tool returned this name", this one says "a tool looked for exactly this and came
@@ -4833,6 +4850,15 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             # Kept in a separate list from `searches` so _guess_driven_enumeration's
             # calibration -- which counts bare-identifier CONTENT searches -- is not
             # disturbed by path globs it was never tuned for.
+            # Generated-hook exports per file (2026-08-28), for the under-reported
+            # check. Keyed by path and only for a real file read, so the set is
+            # "what THIS file declares", not "what the run happened to see".
+            if function_name == "get_file_content" and isinstance(args, dict):
+                _p = str(args.get("relative_path") or "")
+                if _p.lower().endswith((".ts", ".tsx", ".js", ".jsx")):
+                    fam = _hook_family_names(result)
+                    if fam:
+                        read_state.setdefault("exports", {}).setdefault(_p, set()).update(fam)
             if function_name == "find_files":
                 read_state.setdefault("globs", []).append({
                     "pattern": str((args or {}).get("glob_pattern", "")),
@@ -5890,7 +5916,33 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                 return result + manifest
         return result
 
-    return _duplicate_delegation_gate_hook
+    async def _gate_with_evidence(function_name, function, args,
+                                  run_context=None, team=None):
+        """Attach the evidence manifest to EVERY str the gate hands back.
+
+        The inner hook has many string exits -- the audit-tag REDIRECT, the reworded
+        ALREADY DONE, the STOP escalation, the clarification gate, the volume warning,
+        and the plain result -- and patching them one at a time missed the ones that
+        actually fire. Measured across T12 and T13 (2026-08-28): every str the
+        coordinator received was a GATE return, and the normal path returned a
+        generator, so the attachment added the day before never once ran.
+
+        Wrapping is the only place that covers all of them at once, and it keeps the
+        generator untouched: appending to that hangs the run, which this file documents
+        from a live incident at delegation #8.
+
+        Idempotent by header check -- the plain-result path above may already have
+        attached, and the manifest must not appear twice.
+        """
+        result = await _duplicate_delegation_gate_hook(
+            function_name, function, args, run_context=run_context, team=team)
+        if not isinstance(result, str) or _EVIDENCE_HEADER in result:
+            return result
+        member_id = _member_key(str((args or {}).get("member_id", "")).strip())
+        manifest = _evidence_manifest(getattr(team, "_read_state", None), member_id)
+        return result + manifest if manifest else result
+
+    return _gate_with_evidence
 
 
 def _make_delegation_log_hook():
@@ -7954,6 +8006,10 @@ def _listing_matches_task(path: str, task: str) -> bool:
 # The trailing (?![\w/]) still prevents matching a DIRECTORY component: in
 # `foo.py/bar` the slash after `.py` rejects it, so only a real terminal filename
 # matches.
+# One header, used both to build the block and to recognise it again, so the wrapper
+# that attaches the manifest to every gate return cannot attach it twice.
+_EVIDENCE_HEADER = "── EVIDENCE FROM THE RUN ITSELF, not from the member ──"
+
 _EVIDENCE_MANIFEST_FILES = 12      # named reads shown; beyond this the list stops helping
 _EVIDENCE_MANIFEST_MISSES = 8      # empty lookups shown -- the half that prevents invention
 
@@ -8004,7 +8060,7 @@ def _evidence_manifest(read_state, agent_key: str) -> str:
     misses = [m for m in dict.fromkeys(misses) if m]
     if not reads and not misses:
         return ""
-    out = ["\n\n── EVIDENCE FROM THE RUN ITSELF, not from the member ──"]
+    out = [f"\n\n{_EVIDENCE_HEADER}"]
     if reads:
         shown = reads[:_EVIDENCE_MANIFEST_FILES]
         out.append("Opened by this member: " + "; ".join(shown)
@@ -8023,6 +8079,69 @@ def _evidence_manifest(read_state, agent_key: str) -> str:
         out.append("Anything not listed above was not opened by this member. If the "
                    "answer needs it, say so plainly rather than filling the gap.")
     return "\n".join(out)
+
+
+# A generated-hook / exported-symbol family: names sharing a prefix AND a suffix, the
+# shape RTK Query, React hooks and most codegen produce. Deliberately not "any export"
+# -- a file exports many unrelated things and only same-family siblings are evidence
+# that an answer naming one should have named the others.
+_HOOK_FAMILY_RE = re.compile(r"^(use[A-Z]\w*?)(Query|Mutation)$")
+
+_EXPORT_FAMILY_MIN = 3     # below this a "family" is a coincidence, not a set
+
+
+def _hook_family_names(text) -> set[str]:
+    """Generated-hook exports visible in a tool result. Empty set for non-strings.
+
+    Extracted HERE, at read time, for the same reason the filename set is: swarm/team.py
+    runs on the API host with no copy of the project and no access to hive-mcp's symbol
+    index, so the only moment these names are reachable is while the file content is
+    passing through.
+    """
+    if not isinstance(text, str):
+        return set()
+    return {m.group(0) for m in re.finditer(r"\buse[A-Z]\w*?(?:Query|Mutation)\b", text)}
+
+
+def _under_reported_exports(content: str, read_state) -> tuple[str, int, int, list[str]] | None:
+    """A file whose sibling exports the answer opened but did not report.
+
+    Returns (path, named, total, missing) or None.
+
+    Distinct from every other enumeration check here, which count DIRECTORY entries or
+    a stated number against a list. This counts what a FILE declares against what the
+    answer says it declares -- the one shape none of them could see.
+
+    T13 is that shape, and it has failed in every battery. The answer reported one
+    frontend hook and concluded eight backend endpoints had no counterpart; the real
+    numbers are five and four. It was not a relay failure and not a budget failure:
+    inventoryApi.ts is 30,541 bytes, under the whole-file threshold, and the run opened
+    it TWICE. All five hooks were in front of the member, which reported one.
+
+    So no amount of passing evidence forward fixes it -- the evidence was already
+    there. What catches it is asking the file. symbol_index knows inventoryApi.ts
+    declares useGetVouchersQuery, useGetVoucherQuery, useCreateVoucherMutation,
+    usePostVoucherMutation and useCancelVoucherMutation at lines 941-945, so "the answer
+    names 1 of 5 siblings" is a fact, not a judgement.
+
+    Silent unless the answer NAMES at least one member of a family, so a response that
+    never discusses exports is untouched, and unless the run actually opened the file --
+    an unread file's exports are not something this answer was expected to list.
+    """
+    if not content or not isinstance(read_state, dict):
+        return None
+    for path, members in (read_state.get("exports") or {}).items():
+        members = sorted(members or [])
+        if len(members) < _EXPORT_FAMILY_MIN:
+            continue
+        named = [n for n in members if n in content]
+        # Silent unless the answer NAMES at least one sibling -- a response that never
+        # discusses this file's exports is not under-reporting them -- and silent when
+        # it names them all, which is the correct outcome.
+        if not named or len(named) == len(members):
+            continue
+        return path, len(named), len(members), sorted(set(members) - set(named))[:8]
+    return None
 
 
 def _contradicted_by_failed_lookup(content: str, globs: list | None) -> list[str]:
