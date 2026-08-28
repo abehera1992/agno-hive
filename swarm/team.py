@@ -3347,6 +3347,26 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             + _summarize_actual_writes(*all_results)
         )
 
+    # Self-contradiction against the run's own lookups (2026-08-27). Ranked ahead of
+    # the precedent check below because it is the stronger claim: that guard says "no
+    # tool returned this name", this one says "a tool looked for exactly this and came
+    # back empty". See _contradicted_by_failed_lookup for the leg-3 incident.
+    _rs_glob = getattr(team, "_read_state", None)
+    contradicted = _contradicted_by_failed_lookup(
+        content, _rs_glob.get("globs") if isinstance(_rs_glob, dict) else None)
+    if contradicted:
+        named = ", ".join(f"`{p}`" for p in contradicted)
+        print(f"[team] answer describes {len(contradicted)} path(s) this run proved "
+              f"absent: {named} — flagging", flush=True)
+        return (
+            f"{content}\n\n---\n**THIS RUN ALREADY PROVED THESE DO NOT EXIST — the "
+            f"answer above describes {named}, but a lookup in this same run searched "
+            f"for that path and came back empty. The run had the disproof and the "
+            f"answer states the opposite, so anything resting on it is unsupported. "
+            f"Check by hand before acting on it.**"
+            + _summarize_actual_writes(*all_results)
+        )
+
     # Answer-time precedent (2026-08-26). Ranked ahead of the enumeration checks below
     # for the same reason the fabricated-tool-use check outranks them: an invented list
     # is worse than a missing one. See _unsourced_filenames for the T12 incident.
@@ -4792,6 +4812,21 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             if function_name in ("search_files", "search_files_batch"):
                 read_state.setdefault("searches", []).append({
                     "pattern": str((args or {}).get("pattern", "")),
+                    "missed": (isinstance(result, str)
+                               and result.lstrip().startswith("No matches for:")),
+                })
+            # find_files misses too (2026-08-27). Only search_files was recorded, and
+            # the disproof that mattered most came from find_files: leg 3 ran
+            # find_files('API/inventory-service/clients/*.py'), got "No matches", and
+            # then described that very directory with two files in it. The run had
+            # PROVED the folder does not exist and nothing carried that forward.
+            #
+            # Kept in a separate list from `searches` so _guess_driven_enumeration's
+            # calibration -- which counts bare-identifier CONTENT searches -- is not
+            # disturbed by path globs it was never tuned for.
+            if function_name == "find_files":
+                read_state.setdefault("globs", []).append({
+                    "pattern": str((args or {}).get("glob_pattern", "")),
                     "missed": (isinstance(result, str)
                                and result.lstrip().startswith("No matches for:")),
                 })
@@ -7896,6 +7931,63 @@ def _listing_matches_task(path: str, task: str) -> bool:
 # The trailing (?![\w/]) still prevents matching a DIRECTORY component: in
 # `foo.py/bar` the slash after `.py` rejects it, so only a real terminal filename
 # matches.
+def _contradicted_by_failed_lookup(content: str, globs: list | None) -> list[str]:
+    """Paths the answer describes that THIS RUN already proved absent.
+
+    Returns the contradicted path prefixes, or [].
+
+    The sharpest evidence a run can hold is a lookup that came back empty, and it is
+    the first thing a summary throws away -- nobody summarises "I looked and found
+    nothing". So the disproof never reaches the coordinator, and the gap gets filled
+    with invention.
+
+    Measured on the chained leg 3: find_files('API/inventory-service/clients/*.py')
+    returned "No matches", and the answer then described that directory containing
+    kafka_client.py and event_producer.py, plus two Kafka topics and three REST
+    endpoints hanging off them. Neither the folder nor anything in it exists. The run
+    gathered 23,689 characters, relayed 118, and the one fact that would have stopped
+    the fabrication -- the empty result -- was in the discarded 23,571.
+
+    Distinct from _unsourced_filenames, which asks "did any tool return this name".
+    This asks the stronger question: "did a tool specifically look for this and come
+    back empty". A name that was never searched for is unsupported; a name under a
+    path that WAS searched and found nothing is contradicted.
+
+    Only flags when the answer states the path as fact. An answer agreeing with the
+    miss -- "there is no clients/ directory" -- is correct and must stay silent, so a
+    negation anywhere in the sentence naming it suppresses the flag.
+    """
+    if not content or not isinstance(globs, list):
+        return []
+    hits: list[str] = []
+    for entry in globs:
+        if not entry.get("missed"):
+            continue
+        pattern = (entry.get("pattern") or "").strip()
+        # The directory the glob was rooted at: everything before the first wildcard.
+        prefix = re.split(r"[*?\[]", pattern)[0].rstrip("/")
+        # Needs a real path shape -- a bare "*.py" carries no location and would match
+        # any answer mentioning any file.
+        if len(prefix) < 8 or "/" not in prefix:
+            continue
+        for line in content.splitlines():
+            if prefix not in line:
+                continue
+            if _ABSENCE_AGREEMENT_RE.search(line):
+                break      # the answer agrees it is missing -- correct, not a defect
+            if prefix not in hits:
+                hits.append(prefix)
+            break
+    return hits[:6]
+
+
+# The answer conceding the thing is absent. Checked on the line naming the path, so an
+# unrelated "not" elsewhere in the answer cannot suppress a real contradiction.
+_ABSENCE_AGREEMENT_RE = re.compile(
+    r"\b(?:no|not|never|absent|missing|does ?n[o']t|is ?n[o']t|nonexistent|"
+    r"could not|couldn't|unable)\b", re.IGNORECASE)
+
+
 _FILENAME_RE = re.compile(
     r"(?<![\w.-])([\w.-]+\.(?:py|ts|tsx|js|jsx|md|json|ya?ml|sql|scss|css|toml|ini|sh|txt))"
     r"(?![\w/])")
