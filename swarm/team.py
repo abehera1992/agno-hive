@@ -4778,7 +4778,16 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     f"you can, then answer."
                 )
             # Second, independent source -- survives delegation, unlike session_state.
-            read_state["reads"].append({"tool": function_name, "read_by": agent_key or "coordinator"})
+            # Path and size added 2026-08-27 so the evidence manifest below can name
+            # what was actually read, not just how many reads happened.
+            read_state["reads"].append({
+                "tool": function_name,
+                "read_by": agent_key or "coordinator",
+                "path": str((args or {}).get("relative_path")
+                            or (args or {}).get("glob_pattern")
+                            or (args or {}).get("pattern") or ""),
+                "chars": len(str(result)),
+            })
             # Bytes the tools actually handed to members, so the member -> coordinator
             # loss is visible in one log instead of correlating two by hand
             # (2026-08-24). Measured on T4: 30,757 chars read, 4,675 relayed -- 6.6:1.
@@ -5864,7 +5873,21 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                 f"to answer with whatever you hold at that point. Start assembling "
                 f"the final answer now, and spend any remaining delegations only on "
                 f"parts of the task you have nothing at all for."
+                + _evidence_manifest(getattr(team, "_read_state", None), member_id)
             )
+        # Attach the evidence manifest to what the coordinator receives (2026-08-27).
+        # See _evidence_manifest for why a manifest rather than the content.
+        #
+        # str path ONLY, and that is not a shortcut: appending to the GENERATOR return
+        # hands agno a str where it was about to iterate, which hung a live run at
+        # delegation #8 with stream_event_count frozen across four heartbeats -- the
+        # incident documented immediately above. Roughly 40% of delegations return str
+        # (622 of 1,548 measured), including 3 of the 4 in the leg-3 fabrication, so
+        # this reaches the case it was built for without touching the path that breaks.
+        if isinstance(result, str):
+            manifest = _evidence_manifest(getattr(team, "_read_state", None), member_id)
+            if manifest:
+                return result + manifest
         return result
 
     return _duplicate_delegation_gate_hook
@@ -7931,6 +7954,77 @@ def _listing_matches_task(path: str, task: str) -> bool:
 # The trailing (?![\w/]) still prevents matching a DIRECTORY component: in
 # `foo.py/bar` the slash after `.py` rejects it, so only a real terminal filename
 # matches.
+_EVIDENCE_MANIFEST_FILES = 12      # named reads shown; beyond this the list stops helping
+_EVIDENCE_MANIFEST_MISSES = 8      # empty lookups shown -- the half that prevents invention
+
+
+def _evidence_manifest(read_state, agent_key: str) -> str:
+    """What a member ACTUALLY read and what it looked for and did not find.
+
+    Returns a compact block to ride back with that member's answer, or "".
+
+    The member summarises its own findings before handing them over, and how much
+    survives that summary tracks fabrication more closely than anything else measured
+    today: 118 chars relayed produced an invented directory, two files in it, two Kafka
+    topics and three endpoints; 2,966 and 6,071 produced clean, accurate answers. The
+    coordinator writes to length regardless of how little it was given, and fills the
+    difference with invention.
+
+    Deliberately a MANIFEST, not the content. Shipping the 23,689 characters a member
+    read would relocate the context problem _record_read's docstring already refuses to
+    create, and would multiply across delegations. The manifest is a few hundred
+    characters and carries the two facts that actually stop fabrication:
+
+      * which files were really opened -- so inventing a filename contradicts a list
+        sitting in the same context
+      * which lookups came back EMPTY -- the disproof a summary always drops, because
+        nobody summarises "I looked and found nothing". Leg 3 ran
+        find_files('API/inventory-service/clients/*.py'), got "No matches", relayed
+        none of it, and then described that directory in detail.
+
+    Scoped to the member being reported on: another member's reads are not evidence for
+    this one's answer.
+    """
+    if not isinstance(read_state, dict):
+        return ""
+    who = _member_key(agent_key or "")
+    reads, seen = [], set()
+    for entry in (read_state.get("reads") or []):
+        if _member_key(entry.get("read_by", "")) != who:
+            continue
+        path = (entry.get("path") or "").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        reads.append(f"{path} ({entry.get('chars', 0):,} chars)")
+    misses = [ (g.get("pattern") or "").strip()
+               for g in (read_state.get("globs") or []) if g.get("missed") ]
+    misses += [ (s.get("pattern") or "").strip()
+                for s in (read_state.get("searches") or []) if s.get("missed") ]
+    misses = [m for m in dict.fromkeys(misses) if m]
+    if not reads and not misses:
+        return ""
+    out = ["\n\n── EVIDENCE FROM THE RUN ITSELF, not from the member ──"]
+    if reads:
+        shown = reads[:_EVIDENCE_MANIFEST_FILES]
+        out.append("Opened by this member: " + "; ".join(shown)
+                   + (f" (+{len(reads) - len(shown)} more)" if len(reads) > len(shown) else ""))
+    if misses:
+        # Run-wide, not member-scoped, and labelled as such. A path proved absent by
+        # ANY member is a fact about the repository; scoping it per member would throw
+        # away the disproof that leg 3 needed and did not get.
+        shown = misses[:_EVIDENCE_MANIFEST_MISSES]
+        out.append("Looked for anywhere in this run and found NOTHING: " + "; ".join(shown)
+                   + (f" (+{len(misses) - len(shown)} more)" if len(misses) > len(shown) else ""))
+        out.append("Those returned empty. Do not describe them as existing.")
+    if reads:
+        # Only claim this when there IS a read list to compare against -- otherwise the
+        # sentence implies a scope the block above does not have.
+        out.append("Anything not listed above was not opened by this member. If the "
+                   "answer needs it, say so plainly rather than filling the gap.")
+    return "\n".join(out)
+
+
 def _contradicted_by_failed_lookup(content: str, globs: list | None) -> list[str]:
     """Paths the answer describes that THIS RUN already proved absent.
 
