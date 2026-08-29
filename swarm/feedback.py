@@ -80,23 +80,43 @@ def experience_namespace(project_id: str) -> str:
 _MIN_RESULT_LENGTH = 120
 
 
-async def record_success(task: str, result: str, project_id: str) -> None:
-    """Insert a successful task outcome into the isolated experience namespace."""
+async def record_success(task: str, result: str, project_id: str,
+                         supersedes: str | None = None) -> str | None:
+    """Insert a successful task outcome into the isolated experience namespace.
+
+    Returns the file_path it indexed under, so the caller can record it and pass it back
+    as `supersedes` next time this same task is verified.
+
+    `supersedes` is the doc_path of a PREVIOUS answer to this same task, deleted before
+    the new one is indexed. Without it, deduping the queue would move the duplication
+    rather than remove it: one row per task in the DB, every version still in the
+    semantic index -- dedupe in the place nothing reads, none where retrieval happens.
+    """
     try:
         # Skip indexing when the result is too short to yield useful entities.
         if len(result.strip()) < _MIN_RESULT_LENGTH:
             print(f"[feedback] skipping short outcome ({len(result)} chars) — not worth indexing")
-            return
+            return None
         from lightrag_mcp.rag import get_rag
         # Isolated namespace — never the project's code namespace (grounding poison).
         rag = get_rag(experience_namespace(project_id))
         await rag.initialize_storages()
-        # Timestamp makes each submission unique so identical task/result pairs
-        # don't collide on the same LightRAG content hash (which causes the
-        # "Duplicate document detected" warning on every re-run).
+        # The timestamp is NO LONGER in the indexed text (2026-08-29). It was added so
+        # "identical task/result pairs don't collide on the same LightRAG content hash
+        # (which causes the 'Duplicate document detected' warning on every re-run)" --
+        # i.e. it defeated a working dedupe in order to silence a correct warning.
+        #
+        # Measured consequence: 400 docs for 310 distinct tasks, 22.5% redundant, one
+        # task stored FOURTEEN times. Retrieval then ranks a task by how often it was
+        # re-run rather than how relevant it is.
+        #
+        # Keeping it out restores content-hash dedupe as a second line of defence behind
+        # the (project, task_hash) uniqueness in task_outcome_queue. It stays in the
+        # FILE PATH below, which must be unique per row -- a shared path is what silently
+        # rejected every insert for 50 days.
         ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         text = (
-            f"Past task outcome (SUCCESS) [{ts}]\n"
+            f"Past task outcome (SUCCESS)\n"
             f"Project: {project_id}\n"
             f"Task: {task}\n"
             f"Result:\n{result[:1500]}"
@@ -118,7 +138,32 @@ async def record_success(task: str, result: str, project_id: str) -> None:
         # the failure invisible: the call succeeded, the data never landed.
         stamp = ts.replace(":", "").replace("-", "")
         digest = hashlib.sha1(f"{task}{ts}".encode()).hexdigest()[:10]
-        await rag.ainsert(text, file_paths=f"task_outcome/{project_id}/{stamp}-{digest}")
+        path = f"task_outcome/{project_id}/{stamp}-{digest}"
+
+        # Remove the answer this one replaces, BEFORE indexing the new one, so the
+        # namespace holds exactly one doc per task. adelete_by_doc_id (not a doc_status
+        # row delete) because it also removes the chunks, entities and relations -- a
+        # bare row delete leaves those orphaned in Qdrant and AGE.
+        if supersedes:
+            try:
+                from sqlalchemy import text as _sql
+                from swarm import db as _db
+                async with _db.get_engine().begin() as conn:
+                    doc_id = (await conn.execute(
+                        _sql("select id from lightrag_doc_status "
+                             "where workspace = :ws and file_path = :fp"),
+                        {"ws": experience_namespace(project_id), "fp": supersedes},
+                    )).scalar()
+                if doc_id:
+                    await rag.adelete_by_doc_id(doc_id)
+                    print(f"[feedback] superseded prior answer for this task "
+                          f"({supersedes})", flush=True)
+            except Exception as exc:
+                # Never block the new insert on failing to clean up the old one.
+                print(f"[feedback] could not delete superseded doc {supersedes}: {exc}")
+
+        await rag.ainsert(text, file_paths=path)
+        return path
     except Exception as exc:
         print(f"[feedback] record_success warning: {exc}")
 

@@ -146,12 +146,42 @@ task_outcome_queue = Table(
     Column("status", Text, nullable=False, default="pending"),
     Column("attempts", Integer, nullable=False, default=0),
     Column("error_message", Text, nullable=True),
+    # sha256 of the normalised task text. The dedupe key (2026-08-29): one row per
+    # (project, task), so re-verifying a task REPLACES its stored answer instead of
+    # adding a second one. Measured need -- the experience namespace had reached 400
+    # docs for 310 distinct tasks, 22.5% redundant, one task present FOURTEEN times.
+    Column("task_hash", Text, nullable=True),
+    # LightRAG's file_path for the doc this row produced, so a replacement can delete
+    # the superseded doc before indexing the new one. Without it the DB would hold one
+    # row per task while the semantic index kept every version -- dedupe in the place
+    # nothing reads, and none in the place retrieval actually happens.
+    Column("doc_path", Text, nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
 # The drain loop's only query: oldest pending first.
 Index("task_outcome_queue_pending_idx",
       task_outcome_queue.c.status, task_outcome_queue.c.created_at)
+# Enforced at the DB, not just in application logic: two callers posting the same task
+# concurrently would both pass a SELECT-then-INSERT check.
+Index("task_outcome_queue_dedupe_idx",
+      task_outcome_queue.c.project_id, task_outcome_queue.c.task_hash, unique=True)
+
+# Columns added after task_outcome_queue was already deployed and populated. Same
+# introspect-then-ALTER treatment as _TEAM_ROLE_MODELS_NEW_COLUMNS below and for the
+# same reason: create_all() never widens an existing table, and a blind ALTER that
+# fails poisons the whole transaction on Postgres.
+_TASK_OUTCOME_QUEUE_NEW_COLUMNS = {
+    "task_hash": "TEXT",
+    "doc_path": "TEXT",
+}
+
+
+def _existing_task_outcome_queue_columns(sync_conn) -> set[str]:
+    insp = inspect(sync_conn)
+    if not insp.has_table("task_outcome_queue"):
+        return set()
+    return {c["name"] for c in insp.get_columns("task_outcome_queue")}
 
 # model_catalog / team_role_models (AGNOHive 2.3.2 addendum) — replaces
 # swarm/agents.py's old _VLLM_MODEL_MAP dict + _CLOUD_ALIASES set. See
@@ -407,6 +437,14 @@ async def ensure_schema() -> None:
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)
+        # task_outcome_queue shipped 2026-08-29 and was widened the same day; an
+        # already-populated deployment needs the ALTERs create_all() will not issue.
+        existing = await conn.run_sync(_existing_task_outcome_queue_columns)
+        if existing:
+            for col_name, col_type in _TASK_OUTCOME_QUEUE_NEW_COLUMNS.items():
+                if col_name not in existing:
+                    await conn.execute(text(
+                        f"ALTER TABLE task_outcome_queue ADD COLUMN {col_name} {col_type}"))
 
 
 async def ensure_routing_schema() -> None:

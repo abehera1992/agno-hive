@@ -39,9 +39,27 @@ to exist permanently regardless of what else is added.
 
 from __future__ import annotations
 
+import hashlib
+import re
+
 import sqlalchemy as sa
 
 from . import db
+
+_WS_RE = re.compile(r"\s+")
+
+
+def task_hash(task: str) -> str:
+    """Dedupe key for a task: sha256 of its whitespace-normalised, lowercased text.
+
+    Normalising means the same question posted twice with different wrapping or casing
+    is recognised as the same task. Deliberately EXACT beyond that -- a genuinely
+    reworded task is a different row, and deciding how similar is "the same" is a
+    judgement this must not make silently. Exact-match dedupe removes the redundancy we
+    can prove (400 docs for 310 tasks, one repeated fourteen times); near-duplicates are
+    left visible rather than merged by a similarity threshold nobody chose.
+    """
+    return hashlib.sha256(_WS_RE.sub(" ", (task or "").strip().lower()).encode()).hexdigest()
 
 # Give up on a row after this many failed drains. Bounded so one poisoned outcome (an
 # extraction model that rejects it, a malformed result) cannot be retried forever and
@@ -81,11 +99,33 @@ class PostgresOutcomeSink(OutcomeSink):
     async def publish(self, task: str, result: str, project_id: str,
                       owner: str | None = None) -> None:
         try:
+            key = task_hash(task)
             async with db.get_engine().begin() as conn:
-                await conn.execute(db.task_outcome_queue.insert().values(
-                    project_id=project_id, task=task, result=result,
-                    owner=owner, status="pending", attempts=0,
-                ))
+                existing = (await conn.execute(
+                    sa.select(db.task_outcome_queue.c.id, db.task_outcome_queue.c.doc_path)
+                    .where(db.task_outcome_queue.c.project_id == project_id,
+                           db.task_outcome_queue.c.task_hash == key)
+                )).first()
+                if existing:
+                    # REPLACE, never accumulate. A second verified answer for the same
+                    # task supersedes the first -- that is the point of re-verifying.
+                    # status back to 'pending' so the drain loop re-indexes; doc_path is
+                    # preserved so it can delete the superseded LightRAG doc first.
+                    await conn.execute(
+                        sa.update(db.task_outcome_queue)
+                        .where(db.task_outcome_queue.c.id == existing.id)
+                        .values(task=task, result=result, owner=owner,
+                                status="pending", attempts=0, error_message=None,
+                                updated_at=sa.func.now())
+                    )
+                    print(f"[outcomes] replaced outcome #{existing.id} for this task "
+                          f"(same project + task hash) — not adding a duplicate",
+                          flush=True)
+                else:
+                    await conn.execute(db.task_outcome_queue.insert().values(
+                        project_id=project_id, task=task, result=result,
+                        owner=owner, status="pending", attempts=0, task_hash=key,
+                    ))
         except Exception as exc:
             # Never let bookkeeping break a completed run: the answer is already correct
             # and already on its way back to the caller. Loud, because the whole reason
@@ -129,12 +169,21 @@ async def claim_pending(limit: int = DRAIN_BATCH) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-async def mark_done(row_id: int) -> None:
+async def mark_done(row_id: int, doc_path: str | None = None) -> None:
+    """Mark indexed, and remember WHICH LightRAG doc this row produced.
+
+    doc_path is what lets the next verification of the same task delete the answer it
+    supersedes. Without storing it, dedupe would stop at the database and the semantic
+    index would keep every version.
+    """
+    values = {"status": "done", "updated_at": sa.func.now()}
+    if doc_path:
+        values["doc_path"] = doc_path
     async with db.get_engine().begin() as conn:
         await conn.execute(
             sa.update(db.task_outcome_queue)
             .where(db.task_outcome_queue.c.id == row_id)
-            .values(status="done", updated_at=sa.func.now())
+            .values(**values)
         )
 
 

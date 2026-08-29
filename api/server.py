@@ -295,8 +295,11 @@ async def _outcome_drain_loop():
             continue
         for row in rows:
             try:
-                await record_success(row["task"], row["result"], row["project_id"])
-                await outcomes.mark_done(row["id"])
+                # doc_path carries the answer this row previously produced, if any, so a
+                # re-verified task REPLACES its old doc instead of adding a second one.
+                path = await record_success(row["task"], row["result"], row["project_id"],
+                                            supersedes=row.get("doc_path"))
+                await outcomes.mark_done(row["id"], doc_path=path)
                 print(f"[outcomes] indexed outcome #{row['id']} "
                       f"({row['project_id']}, {len(row['result']):,} chars)", flush=True)
             except Exception as exc:
