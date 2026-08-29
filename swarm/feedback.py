@@ -383,14 +383,37 @@ async def load_success_context(project_id: str, limit: int = 3, current_task: st
         # Rank by shared tokens between the PAST task and the current one, then keep the
         # paths from the best few. The past task text is used for SCORING only and never
         # reaches the prompt -- see constraint 1 above.
+        # A shared token only counts as evidence of the SAME SUBJECT if it is specific.
+        # _significant_tokens admits any word of 6+ characters, which lets "number",
+        # "report" and "output" qualify -- and they matched across completely unrelated
+        # tasks. Measured on the first populated corpus (2026-08-29): T7 asks for a
+        # listing of API/business-service/router/ and its own verified record shared
+        # EIGHT tokens including the path itself, but that answer listed bare filenames
+        # so no full path could be extracted from it; a different record sharing the
+        # single word "number" then supplied the only path, and T7 was offered
+        # API/inventory-service/models.py -- a different service entirely.
+        #
+        # Worse than useless: the guidance says "here is where to look" and points away.
+        # So a match needs at least one token carrying a separator (path, dotted name,
+        # snake_case identifier) or 8+ characters -- "itemcategory", "sku_prefix",
+        # "api/business-service/router" qualify; "number" and "report" do not.
+        strong = {t for t in wanted
+                  if any(c in t for c in "/._") or len(t) >= 8}
+        if not strong:
+            return ""
         scored = []
         for past_task, result in rows:
-            overlap = len(wanted & _significant_tokens(past_task or ""))
-            if overlap:
-                scored.append((overlap, result or ""))
+            shared = strong & _significant_tokens(past_task or "")
+            if shared:
+                scored.append((len(shared), result or ""))
         if not scored:
             return ""
         scored.sort(key=lambda t: -t[0])
+        # Only matches as strong as the best one contribute paths. Pooling across the
+        # top N let a 1-token match ride along beside an 8-token one on equal footing,
+        # which is precisely how the wrong service's file got injected above.
+        best = scored[0][0]
+        scored = [s for s in scored if s[0] == best]
 
         paths: list[str] = []
         for _, result in scored[:limit]:
