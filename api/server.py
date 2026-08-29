@@ -243,6 +243,11 @@ async def _load_model_routing_cache():
 @app.on_event("startup")
 async def _start_cleanup_loop():
     asyncio.create_task(_session_cleanup_loop())
+    # Same pattern, different queue. Started HERE and not in the worker on purpose:
+    # this process is long-lived, so a 30-60s LightRAG extraction can finish. The worker
+    # cannot host it -- asyncio.run() cancels pending tasks the moment a run returns,
+    # which is the bug _outcome_drain_loop exists to route around.
+    asyncio.create_task(_outcome_drain_loop())
 
 
 @app.on_event("shutdown")
@@ -258,6 +263,47 @@ async def _session_cleanup_loop():
         count = await _cleanup_expired()
         if count:
             print(f"[sessions] cleaned up {count} expired session(s)")
+
+
+async def _outcome_drain_loop():
+    """Index queued task outcomes into the experience namespace, off the response path.
+
+    The worker only ever writes a row (see swarm/outcomes.py for why it cannot do more);
+    the slow half -- LightRAG extraction through vllm-extract, 30-60s -- happens here, in
+    the process that is still alive to finish it.
+
+    Deliberately serial and small-batched. Each outcome costs a real extraction call on
+    the same GPU serving live runs, so draining fast would make answers slower: the exact
+    trade this design exists to avoid.
+
+    Every failure is logged and counted rather than swallowed. The 50-day outage that
+    produced this module was invisible because a cancelled asyncio task leaves nothing
+    behind; a row stuck in `pending` or parked in `failed` is one SELECT away.
+    """
+    from swarm import outcomes
+    from swarm.feedback import record_success
+
+    while True:
+        await asyncio.sleep(config.outcome_drain_interval)
+        try:
+            requeued = await outcomes.requeue_stuck()
+            if requeued:
+                print(f"[outcomes] requeued {requeued} stuck row(s) from a prior run")
+            rows = await outcomes.claim_pending()
+        except Exception as exc:
+            print(f"[outcomes] drain query failed: {exc}", flush=True)
+            continue
+        for row in rows:
+            try:
+                await record_success(row["task"], row["result"], row["project_id"])
+                await outcomes.mark_done(row["id"])
+                print(f"[outcomes] indexed outcome #{row['id']} "
+                      f"({row['project_id']}, {len(row['result']):,} chars)", flush=True)
+            except Exception as exc:
+                attempts = (row.get("attempts") or 0) + 1
+                await outcomes.mark_failed(row["id"], attempts, str(exc))
+                print(f"[outcomes] outcome #{row['id']} failed "
+                      f"(attempt {attempts}/{outcomes.MAX_ATTEMPTS}): {exc}", flush=True)
 
 
 @app.get("/health")

@@ -16,7 +16,8 @@ from .agents import (
     make_coder, make_reviewer, make_agent_from_spec, get_model, format_skill_catalog,
     update_session_state,
 )
-from .feedback import record_success, record_success_bg, record_failure, load_failure_context
+from .feedback import (record_success, record_failure, load_failure_context,
+                       load_success_context)
 from . import model_routing, team_config
 from .tool_fix import peak_input_tokens
 from config.config import config
@@ -1572,7 +1573,7 @@ _GUARD_BANNERS = (
 def _is_success_exemplar(content: str) -> bool:
     """Is this answer clean enough to store as a past-success example?
 
-    record_success_bg fires on every run that returns without raising, and the
+    Outcome recording fires on every run that returns without raising, and the
     task_counter beside it labels that outcome "success" -- but what it measures is that
     the PIPELINE completed, not that the ANSWER was right. Those are different claims,
     and the gap is not academic: on 2026-08-29 alone the runs that would have been
@@ -1598,6 +1599,26 @@ def _is_success_exemplar(content: str) -> bool:
 # Below this an outcome carries no reusable pattern -- and record_success skips shorter
 # ones anyway (_MIN_RESULT_LENGTH), so this only makes the skip visible at the call site.
 _MIN_EXEMPLAR_CHARS = 120
+
+
+async def _queue_outcome(task: str, content: str, project_id: str) -> None:
+    """Hand a clean outcome to the durable queue and return immediately.
+
+    Replaces record_success_bg() at both run-completion sites. That function scheduled
+    the indexing with asyncio.create_task() inside the ephemeral worker subprocess, whose
+    `asyncio.run()` cancels pending tasks the moment the run returns -- so the work was
+    destroyed microseconds after being scheduled, every run, and silently.
+
+    AWAITED, not fire-and-forget, and that is the point: what is awaited here is a ~1ms
+    INSERT, not the 30-60s LightRAG extraction. The row outlives this process; the
+    server's drain loop does the slow part on its own time. Response latency is
+    unchanged, which is what the original background design was protecting.
+    """
+    try:
+        from .outcomes import get_sink
+        await get_sink().publish(task, content, project_id)
+    except Exception as exc:
+        print(f"[feedback] could not queue outcome: {exc}", flush=True)
 
 
 async def _verify_claims(content: str, hive_mcp_url: str | None,
@@ -7138,9 +7159,13 @@ async def run_task_stream(
     # hive-mcp first (primary — full read+write+shell+ripgrep), project-mcp second (supplementary)
     all_mcp_urls = [u for u in (mcp_urls or []) + [effective_mcp_url] if u]
 
-    failure_context, (session_summary, session_messages), skill_catalog = (
+    # Success context rides in the SAME gather, not a second await: it is one indexed
+    # SQL query against task_outcome_queue and must not add a serial hop to run startup.
+    (failure_context, success_context, (session_summary, session_messages),
+     skill_catalog) = (
         await asyncio.gather(
             load_failure_context(project_id, current_task=task),
+            load_success_context(project_id, current_task=task),
             _load_session_context(),
             _fetch_skill_catalog(_pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)),
         )
@@ -7154,6 +7179,10 @@ async def run_task_stream(
         instructions += ["", format_skill_catalog(skill_catalog, None)]
     if failure_context:
         instructions += ["", failure_context]
+    # After failures deliberately: a correction says what NOT to do and should be read
+    # first; this only says where to look.
+    if success_context:
+        instructions += ["", success_context]
     if session_summary:
         is_chain_handoff = session_summary.startswith("── Chain handoff")
         instructions += [
@@ -7311,7 +7340,7 @@ async def run_task_stream(
                 # the pipeline completed, which is not the same claim. See
                 # _is_success_exemplar.
                 if _is_success_exemplar(combined):
-                    record_success_bg(task, combined, project_id)
+                    await _queue_outcome(task, combined, project_id)
                 else:
                     print("[feedback] answer carries a guard warning — not recording as "
                           "a success exemplar", flush=True)
@@ -9368,9 +9397,13 @@ async def run_task_async(
     # hive-mcp first (primary — full read+write+shell+ripgrep), project-mcp second (supplementary)
     all_mcp_urls = [u for u in (mcp_urls or []) + [effective_mcp_url] if u]
 
-    failure_context, (session_summary, session_messages), skill_catalog = (
+    # Success context rides in the SAME gather, not a second await: it is one indexed
+    # SQL query against task_outcome_queue and must not add a serial hop to run startup.
+    (failure_context, success_context, (session_summary, session_messages),
+     skill_catalog) = (
         await asyncio.gather(
             load_failure_context(project_id, current_task=task),
+            load_success_context(project_id, current_task=task),
             _load_session_context(),
             _fetch_skill_catalog(_pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)),
         )
@@ -9384,6 +9417,10 @@ async def run_task_async(
         instructions += ["", format_skill_catalog(skill_catalog, None)]
     if failure_context:
         instructions += ["", failure_context]
+    # After failures deliberately: a correction says what NOT to do and should be read
+    # first; this only says where to look.
+    if success_context:
+        instructions += ["", success_context]
     if session_summary:
         is_chain_handoff = session_summary.startswith("── Chain handoff")
         instructions += [
@@ -9693,7 +9730,7 @@ async def run_task_async(
                 # since `content` here is POST-_verified_answer and therefore carries any
                 # guard banner verbatim into the exemplar store.
                 if _is_success_exemplar(content):
-                    record_success_bg(task, content, project_id)
+                    await _queue_outcome(task, content, project_id)
                 else:
                     print("[feedback] answer carries a guard warning — not recording as "
                           "a success exemplar", flush=True)

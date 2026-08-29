@@ -128,15 +128,35 @@ async def record_success(task: str, result: str, project_id: str) -> None:
 _bg_tasks: set[asyncio.Task] = set()
 
 
-def record_success_bg(task: str, result: str, project_id: str) -> None:
-    """Fire-and-forget record_success — schedules the experience-namespace indexing as a
-    background task so the /run response is NOT blocked by post-run LightRAG extraction.
-    The outcome is still recorded (same namespace, same data); it just no longer pads
-    wall-clock. This is the AUTO post-run recording only — the explicit /feedback endpoint
-    still awaits record_success directly. Tasks are tracked for drain_background_tasks()."""
-    t = asyncio.create_task(record_success(task, result, project_id))
-    _bg_tasks.add(t)
-    t.add_done_callback(_bg_tasks.discard)
+# RETIRED 2026-08-29 — do not reinstate. Replaced by swarm/outcomes.py's durable queue;
+# team.py's _queue_outcome() is the supported path.
+#
+# The docstring below was accurate about intent and wrong about outcome. It scheduled the
+# indexing with asyncio.create_task() so the /run response would not wait ~30-60s for
+# LightRAG extraction. But every run executes in an ephemeral worker subprocess
+# (`main.py --run-worker`) ending in `asyncio.run(_run_worker())`, and asyncio.run()
+# CANCELS pending tasks when its coroutine returns. The task was destroyed microseconds
+# after creation, every run, and the worker exited.
+#
+# drain_background_tasks() below was written for exactly this and is correct -- but it is
+# registered on the SERVER process's shutdown hook, a different process from the worker,
+# so it never ran for the tasks it was meant to protect. Nothing errored, nothing logged.
+#
+# Measured cost: combined with a filename-dedupe bug in record_success, ekam_experience
+# took its last successful insert on 2026-07-09 and accumulated 1,221 rejected rows.
+# Left commented rather than deleted because the failure is invisible by construction --
+# a future caller would reintroduce a silent 50-day outage, and the reasoning has to
+# survive where the function used to be.
+#
+# def record_success_bg(task: str, result: str, project_id: str) -> None:
+#     """Fire-and-forget record_success — schedules the experience-namespace indexing as a
+#     background task so the /run response is NOT blocked by post-run LightRAG extraction.
+#     The outcome is still recorded (same namespace, same data); it just no longer pads
+#     wall-clock. This is the AUTO post-run recording only — the explicit /feedback endpoint
+#     still awaits record_success directly. Tasks are tracked for drain_background_tasks()."""
+#     t = asyncio.create_task(record_success(task, result, project_id))
+#     _bg_tasks.add(t)
+#     t.add_done_callback(_bg_tasks.discard)
 
 
 async def drain_background_tasks(timeout: float = 30.0) -> None:
@@ -245,6 +265,112 @@ _ABSENCE_CLAIM_RE = re.compile(
     r"(?:present|defined)|are\s+not\s+(?:present|defined))\b",
     re.IGNORECASE,
 )
+
+
+# Repo-relative paths cited in a past successful answer. Extensions kept deliberately
+# narrow -- a bare word with a dot is not a path, and over-matching here would inject
+# noise into every run.
+# The segment bound is 12, not the 6 first written: this repo's frontend paths are deep.
+# Client/EcommClient-Web/ekamweb/src/lib/api/services/inventory/inventoryApi.ts is EIGHT
+# directories, so a 6-segment cap silently dropped every frontend file -- exactly the
+# half of the codebase where path guessing is worst (inventoryApi.ts vs a guessed
+# services/inventoryApi.ts). Caught by a test fixture using the real path; a shallower
+# fixture would have passed and shipped the gap.
+_CITED_PATH_RE = re.compile(
+    r"(?<![\w/])((?:[\w.-]+/){1,12}[\w.-]+\.(?:py|ts|tsx|js|jsx|scss|css|sql|ya?ml|json|md))"
+    r"(?![\w/])"
+)
+
+
+async def load_success_context(project_id: str, limit: int = 3, current_task: str = "") -> str:
+    """Files that PAST SUCCESSFUL answers to similar tasks actually cited.
+
+    The mirror of load_failure_context, and deliberately NOT symmetrical in what it
+    injects. Three constraints from this module's own scar tissue decide the shape:
+
+    1. NEVER the prior task text. Proven live 2026-08-21 on the failure side: injecting
+       it made the model execute the OLD task instead of its own -- an A/B on one prompt
+       produced an answer about four voucher symbols when the question asked for the .py
+       files in a directory. The same hazard applies here and is worse, because a past
+       SUCCESS reads as a model answer to imitate.
+
+    2. NEVER the answer body. A failure correction encodes behaviour ("use db_query, do
+       not grep for a schema fact") and ages well. A success answer encodes FACTS --
+       "6 router files", "sku_prefix at line 129" -- which are true until someone adds a
+       router or edits line 100. Injecting those as exemplars would manufacture exactly
+       the confidently-stale citation this project spent 2026-08-28 removing.
+
+    3. So: the PATHS only. They are the durable half of a past success and they attack
+       the measured failure directly. Every fabrication in the 2026-08-28/29 battery was
+       a wrong or invented path -- `routers/` for `router/`, `admin_api.py` for
+       `admin_gst_api.py`, an entire `API/business-service/src/routes/*.ts` tree in a
+       Python service. A list of paths that a verified answer really cited cannot be
+       mistaken for an instruction, cannot be copied as a claim, and goes stale far more
+       slowly than any line number in it.
+
+    Relevance-gated exactly like failures: at least one shared significant token with the
+    current task, no recency-only fallback. Returns "" when nothing matches, which is the
+    normal case and much better than injecting the merely-recent.
+    """
+    try:
+        from sqlalchemy import select
+        from swarm import db
+
+        if not current_task:
+            return ""
+
+        await db.ensure_schema()
+        async with db.get_engine().begin() as conn:
+            rows = (await conn.execute(
+                select(db.task_outcome_queue.c.task, db.task_outcome_queue.c.result)
+                .where(db.task_outcome_queue.c.project_id == project_id,
+                       db.task_outcome_queue.c.status == "done")
+                .order_by(db.task_outcome_queue.c.created_at.desc())
+                .limit(max(limit * 10, 50))
+            )).all()
+        if not rows:
+            return ""
+
+        wanted = _significant_tokens(current_task)
+        if not wanted:
+            return ""
+
+        # Rank by shared tokens between the PAST task and the current one, then keep the
+        # paths from the best few. The past task text is used for SCORING only and never
+        # reaches the prompt -- see constraint 1 above.
+        scored = []
+        for past_task, result in rows:
+            overlap = len(wanted & _significant_tokens(past_task or ""))
+            if overlap:
+                scored.append((overlap, result or ""))
+        if not scored:
+            return ""
+        scored.sort(key=lambda t: -t[0])
+
+        paths: list[str] = []
+        for _, result in scored[:limit]:
+            for p in _CITED_PATH_RE.findall(result):
+                if p not in paths:
+                    paths.append(p)
+        if not paths:
+            return ""
+
+        lines = [
+            "── Files cited by past answers to similar tasks (BACKGROUND ONLY) ──",
+            "  Real repo paths that EARLIER answers on this project cited. They are here",
+            "  only so you do not have to guess a path, which is this swarm's most",
+            "  frequent error.",
+            "  * They are NOT your task and NOT a file list to report.",
+            "  * They may be incomplete, and files may have moved or been renamed since,",
+            "    so OPEN one before citing it — never cite a path from this list as",
+            "    evidence on its own.",
+            "  * If none of them relate to your task, ignore this section entirely.",
+        ]
+        lines += [f"  - {p}" for p in paths[:12]]
+        return "\n".join(lines) + "\n"
+    except Exception as exc:
+        print(f"[feedback] load_success_context warning: {exc}")
+        return ""
 
 
 async def load_failure_context(project_id: str, limit: int | None = None, current_task: str = "") -> str:

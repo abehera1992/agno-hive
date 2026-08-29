@@ -399,6 +399,11 @@ class Config:
     session_window: int = int(os.getenv("AGNO_SESSION_WINDOW", "6"))
     compact_threshold: int = int(os.getenv("AGNO_COMPACT_THRESHOLD", "20"))
     session_cleanup_interval: int = int(os.getenv("SESSION_CLEANUP_INTERVAL", "3600"))
+    # How often the server drains queued task outcomes into the experience namespace.
+    # 60s, not 3600s like the cleanup above: an exemplar is only useful once indexed, and
+    # each pass takes at most DRAIN_BATCH extraction calls, so a short interval keeps the
+    # backlog near zero without ever monopolising vllm-extract.
+    outcome_drain_interval: int = int(os.getenv("OUTCOME_DRAIN_INTERVAL", "60"))
 
     # Self-improvement loop — how many recent failures load_failure_context replays
     # into the coordinator. Previously hard-coded at 3; now tunable per deployment.

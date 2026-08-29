@@ -109,6 +109,50 @@ failure_log = Table(
 )
 Index("failure_log_project_idx", failure_log.c.project_id, failure_log.c.created_at.desc())
 
+# task_outcome_queue (2026-08-29) — durable handoff for post-run experience indexing.
+#
+# Bound to `metadata`, beside failure_log, deliberately: this is the SUCCESS half of the
+# same feedback loop, and the failure half has always been a table. Only the success half
+# used fire-and-forget, and that is exactly the half that silently stopped working.
+#
+# The bug it fixes: record_success_bg() called asyncio.create_task(). Every run executes
+# in an ephemeral worker subprocess (`main.py --run-worker`), which ends with
+# `asyncio.run(_run_worker())` -- and asyncio.run() CANCELS pending tasks when the
+# coroutine returns. The indexing task was destroyed microseconds after creation, every
+# time, in a process that then exited. drain_background_tasks() exists and is correct,
+# but it is registered on the SERVER's shutdown hook: a different process, which never
+# runs the code path it protects.
+#
+# Indexing cannot be inlined instead: it calls vllm-extract for entity extraction and
+# takes 30-60s, which would land on every /run response. So the worker must hand the
+# work off rather than do it or promise it. An INSERT is ~1ms and, once committed,
+# survives the process that wrote it -- which is the whole requirement.
+#
+# `status` is the retry/observability surface. The 50-day outage was invisible precisely
+# because a dropped asyncio task leaves nothing to query; a stuck row here shows up in
+# one SELECT.
+#
+# `owner` is unused today and present on purpose. The experience namespace is per
+# project ({project}_experience), so several users on one project SHARING exemplars is
+# the feature -- but separate tenants would need isolation, and retrofitting an owner
+# column onto a corpus already in use is far worse than carrying a null one now.
+task_outcome_queue = Table(
+    "task_outcome_queue", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("project_id", Text, nullable=False),
+    Column("task", Text, nullable=False),
+    Column("result", Text, nullable=False),
+    Column("owner", Text, nullable=True),
+    Column("status", Text, nullable=False, default="pending"),
+    Column("attempts", Integer, nullable=False, default=0),
+    Column("error_message", Text, nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+# The drain loop's only query: oldest pending first.
+Index("task_outcome_queue_pending_idx",
+      task_outcome_queue.c.status, task_outcome_queue.c.created_at)
+
 # model_catalog / team_role_models (AGNOHive 2.3.2 addendum) — replaces
 # swarm/agents.py's old _VLLM_MODEL_MAP dict + _CLOUD_ALIASES set. See
 # swarm/model_routing.py for the cache + get_model() integration.
