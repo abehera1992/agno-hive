@@ -1573,6 +1573,14 @@ _GUARD_BANNERS = (
 def _is_success_exemplar(content: str) -> bool:
     """Is this answer clean enough to store as a past-success example?
 
+    UNUSED since 2026-08-29 and kept deliberately, as the record of an idea that looked
+    right and was not. It gated auto-recording on "no guard fired" -- and B20's T4 proved
+    that is not a proxy for correctness: an answer claiming an implementation it could not
+    have performed passed every check, was stored, and became the top exemplar for its own
+    question. Guard-silence is evidence the checks we happen to have did not object, which
+    is a much weaker claim than "this answer is right".
+    Recording now requires a human rating through /feedback; see _queue_outcome.
+
     Outcome recording fires on every run that returns without raising, and the
     task_counter beside it labels that outcome "success" -- but what it measures is that
     the PIPELINE completed, not that the ANSWER was right. Those are different claims,
@@ -1602,17 +1610,33 @@ _MIN_EXEMPLAR_CHARS = 120
 
 
 async def _queue_outcome(task: str, content: str, project_id: str) -> None:
-    """Hand a clean outcome to the durable queue and return immediately.
+    """Hand a VERIFIED outcome to the durable queue. Called from /feedback, not from a run.
 
-    Replaces record_success_bg() at both run-completion sites. That function scheduled
-    the indexing with asyncio.create_task() inside the ephemeral worker subprocess, whose
-    `asyncio.run()` cancels pending tasks the moment the run returns -- so the work was
-    destroyed microseconds after being scheduled, every run, and silently.
+    RESCOPED 2026-08-29, hours after it shipped, because auto-recording closed a loop on
+    itself inside one battery.
 
-    AWAITED, not fire-and-forget, and that is the point: what is awaited here is a ~1ms
-    INSERT, not the 30-60s LightRAG extraction. The row outlives this process; the
-    server's drain loop does the slow part on its own time. Response latency is
-    unchanged, which is what the original background design was protecting.
+    It originally ran at both run-completion sites, gated on _is_success_exemplar -- "no
+    guard fired" as a proxy for "the answer was right". B20's T4 answered a READ-ONLY
+    question ("what fields does the Party model have?") with "PartyRegistrationResponse
+    has been successfully implemented in API/inventory-service/schemas.py ... no further
+    changes are needed" -- an implementation it could not have performed, since read_only
+    strips every write tool. No guard caught it, so it was recorded as an exemplar. It
+    then became the ONLY match for its own question, and load_success_context began
+    offering its two invented paths to the next run of the same task.
+
+    A fabrication no guard sees becomes a retrieved exemplar, and retrieval makes it more
+    likely to recur. The failure side never had this property: corrections are rated by a
+    human through /feedback. Successes were the only half labelled by the absence of an
+    automated complaint, which is not evidence of correctness -- it is evidence that the
+    checks we happen to have did not object.
+
+    So the trigger moved to /feedback rating=good. Far fewer rows, each one rated by
+    someone who looked. The queue keeps its whole point -- the ~1ms INSERT still outlives
+    the caller and the slow LightRAG extraction still happens in the drain loop -- it is
+    only the definition of "success" that changed.
+
+    AWAITED, not fire-and-forget: what is awaited is the INSERT, never the 30-60s
+    extraction. See swarm/outcomes.py for why that distinction is the whole design.
     """
     try:
         from .outcomes import get_sink
@@ -7339,11 +7363,9 @@ async def run_task_stream(
                 # Gated on the answer being guard-clean -- "outcome: success" above means
                 # the pipeline completed, which is not the same claim. See
                 # _is_success_exemplar.
-                if _is_success_exemplar(combined):
-                    await _queue_outcome(task, combined, project_id)
-                else:
-                    print("[feedback] answer carries a guard warning — not recording as "
-                          "a success exemplar", flush=True)
+                # Auto-recording RETIRED 2026-08-29 — see _queue_outcome. Outcomes are
+                # now recorded only through /feedback, where a human rated the answer.
+                pass
                 # Save a compact chain-boundary handoff summary so the next chained call
                 # gets a small structured digest instead of the full message history.
                 if session_id:
@@ -9729,11 +9751,9 @@ async def run_task_async(
                 # Gated the same way as the streaming path above -- this one matters more,
                 # since `content` here is POST-_verified_answer and therefore carries any
                 # guard banner verbatim into the exemplar store.
-                if _is_success_exemplar(content):
-                    await _queue_outcome(task, content, project_id)
-                else:
-                    print("[feedback] answer carries a guard warning — not recording as "
-                          "a success exemplar", flush=True)
+                # Auto-recording RETIRED 2026-08-29 — see _queue_outcome. Outcomes are
+                # now recorded only through /feedback, where a human rated the answer.
+                pass
                 # Save a compact chain-boundary handoff summary so the next chained call
                 # gets a small structured digest instead of the full message history.
                 if session_id:

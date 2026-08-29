@@ -19,7 +19,7 @@ from api.models import (
 )
 from fastapi.responses import StreamingResponse
 from swarm.ollama import ensure_models
-from swarm.team import run_task_async, run_task_stream
+from swarm.team import run_task_async, run_task_stream, _queue_outcome
 from swarm.feedback import record_failure, record_success, drain_background_tasks
 from swarm import db, model_routing, team_config
 from config.config import config
@@ -1155,7 +1155,17 @@ async def feedback(request: FeedbackRequest):
             ),
         )
     else:
-        await record_success(request.task, request.notes or "user marked as correct", request.project_id)
+        # Through the QUEUE rather than a direct await (2026-08-29). This is now the ONLY
+        # path that records a success, so it is also the only one that can feed
+        # load_success_context -- auto-recording on run completion was retired the same
+        # day after a fabrication no guard caught became the top retrieved exemplar for
+        # its own question (see swarm/team.py's _queue_outcome).
+        #
+        # Queuing rather than awaiting record_success keeps /feedback fast: the caller
+        # gets a response in milliseconds instead of waiting out a 30-60s LightRAG
+        # extraction, and the row survives a restart in between.
+        await _queue_outcome(
+            request.task, request.notes or "user marked as correct", request.project_id)
         return FeedbackResponse(recorded=True, message="Success pattern recorded to memory")
 
 
