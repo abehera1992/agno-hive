@@ -1506,6 +1506,52 @@ _UNVERIFIED_DISCLAIMER = (
 )
 
 
+async def _verification_block(content: str, hive_mcp_url: str | None,
+                              hive_mcp_tools) -> str:
+    """Citation verification rendered as an APPENDABLE block, for guards that return early.
+
+    Returns "" when everything checks out, so a clean answer is unchanged.
+
+    Exists because of an ordering defect found 2026-08-28, tracing battery B15's T11.
+    Every disclosure guard in the chain returns the moment it fires, and all of them sit
+    ABOVE the _verify_claims call:
+
+        enum-evidence   -> return        under-report -> return
+        thin-answer     -> return        precedent    -> return
+        ...
+        _verify_claims                   <- never reached if any of the above fired
+
+    So the CHEAPEST guard silently suppressed the STRONGEST one. On B15 T11 the
+    precedent check flagged two filenames, returned, and citation verification never
+    ran -- shipping five fabricated function names (`upload_file_endpoint`,
+    `scan_file_for_viruses`, `upload_to_seaweedfs`, `request_reupload`,
+    `purge_expired_files`, none of which exist) inside an answer that carried a warning
+    about something else entirely. B17's T11 tripped no guard, verification ran, and all
+    seven of its symbols were real -- the same checker, the same shape of answer, a
+    different outcome decided purely by whether an unrelated guard fired first.
+
+    Deliberately verifies the ORIGINAL answer, never the guard banner appended to it:
+    the precedent warning QUOTES the bogus filenames it is reporting, and checking that
+    text would flag them a second time as if the answer had claimed them anew.
+
+    No retry from here. The retry path above owns that budget; these callers are already
+    on a degraded path and a second full pipeline re-run is exactly what the aggregate
+    retry guard at the bottom of the chain refuses to do.
+    """
+    try:
+        report, bad, unavailable = await _verify_claims(
+            content, hive_mcp_url, hive_mcp_tools)
+    except Exception as exc:                      # never let a check break the answer
+        print(f"[team] verification block failed: {exc}", flush=True)
+        return ""
+    if unavailable:
+        return _UNVERIFIED_DISCLAIMER
+    if not bad:
+        return ""
+    return (f"\n\n---\n**Unverified claims flagged automatically (these could not be "
+            f"found in the repository):**\n```\n{_reader_facing_report(report)}\n```")
+
+
 async def _verify_claims(content: str, hive_mcp_url: str | None,
                          hive_mcp_tools=None) -> tuple[str, bool, bool]:
     """Run hive-mcp's verify_claims over a draft answer.
@@ -3261,6 +3307,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"called {tools}. Any list, count, or \"no such thing\" claim above is "
                 f"recalled rather than enumerated, and has been wrong by a factor of "
                 f"6-8x on this exact failure before.**"
+                + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
                 + _summarize_actual_writes(*all_results)
             )
 
@@ -3404,6 +3451,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"above is {len(content.strip()):,} characters. What is here may be "
             f"correct; most of what was researched is simply not in it.**"
             + _recovered_member_findings(team)
+            + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
             + _summarize_actual_writes(*all_results)
         )
 
@@ -3423,7 +3471,9 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             print(f"[team] thin answer ({_answer_thin:,} chars) says more than the "
                   f"{_relayed_thin:,} chars relayed to it — surfacing captured tool "
                   f"output", flush=True)
-            return content + tool_evidence + _summarize_actual_writes(*all_results)
+            return (content + tool_evidence
+                    + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
+                    + _summarize_actual_writes(*all_results))
 
     # Under-answered enumeration check (2026-08-22). See _under_answered_enumeration
     # for why this is its own guard rather than a case of the count check above: the
@@ -3545,6 +3595,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"still exist, but this run gathered no evidence for them, so treat the "
             f"enumeration as unverified — particularly if it was described as a "
             f"directory listing.**"
+            + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
             + _summarize_actual_writes(*all_results)
         )
 
