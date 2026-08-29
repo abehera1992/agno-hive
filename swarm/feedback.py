@@ -327,6 +327,26 @@ _CITED_PATH_RE = re.compile(
 )
 
 
+# Long words that are nonetheless generic in THIS domain, so sharing one says nothing
+# about two tasks being on the same subject. Every engineering task in this project is
+# about endpoints, tables or the frontend; matching on those matches everything.
+#
+# Length alone was tried first and is not enough: raising the bar to 8 characters
+# excluded "number" and "report" but still admitted "endpoints"(9) and "frontend"(8),
+# and on the first populated corpus that pointed the VOUCHERS audit (inventory-service)
+# at API/business-service/router/business_api.py. An explicit list is reviewable in a way
+# that a magic length is not -- someone can disagree with an entry and see why it is
+# here, rather than guessing what threshold was tuned against what example.
+_GENERIC_TECH_WORDS = frozenset({
+    "endpoint", "endpoints", "frontend", "backend", "database", "databases",
+    "function", "functions", "component", "components", "interface", "interfaces",
+    "implement", "implemented", "implementation", "response", "responses", "request",
+    "requests", "migration", "migrations", "configuration", "reference", "references",
+    "corresponding", "counterpart", "counterparts", "codebase", "repository",
+    "directory", "directories", "everything", "anything", "something",
+})
+
+
 async def load_success_context(project_id: str, limit: int = 3, current_task: str = "") -> str:
     """Files that PAST SUCCESSFUL answers to similar tasks actually cited.
 
@@ -398,7 +418,8 @@ async def load_success_context(project_id: str, limit: int = 3, current_task: st
         # snake_case identifier) or 8+ characters -- "itemcategory", "sku_prefix",
         # "api/business-service/router" qualify; "number" and "report" do not.
         strong = {t for t in wanted
-                  if any(c in t for c in "/._") or len(t) >= 8}
+                  if any(c in t for c in "/._")
+                  or (len(t) >= 8 and t not in _GENERIC_TECH_WORDS)}
         if not strong:
             return ""
         scored = []
