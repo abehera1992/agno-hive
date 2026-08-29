@@ -8856,7 +8856,19 @@ _STATED_COUNT_RE = re.compile(
 # a rate changes:" followed by 3 steps was reported as "says 2 ... lists 3 items". The
 # 2 belongs to "Type-2". A SLASH is excluded for the same reason -- HTTP/2, Phase-2,
 # base-64 and UTF-8 all name a thing rather than count one.
-_COUNT_INTRO_RE = re.compile(r"(?<![\w./-])(\d{1,3})\b[^:,\n]{0,120}:[ \t]*\n")
+#
+# A COLON is excluded too (2026-08-29), for the third time this same shape has produced a
+# false positive. Live on battery B23 T3: "business_admin_api.py:85` — The `verify_seller`
+# function at this line..." followed by 7 bullets was reported as "says 85 ... lists 7
+# items". The 85 is a LINE NUMBER in a path:line citation, and a grounded answer is full
+# of them -- so the better the citations, the more chances this had to misfire.
+#
+# The family is now: a digit is not a count when it is glued to what precedes it by a
+# word char, dot, hyphen, slash or colon. Only a digit standing free after whitespace can
+# be one. "Total: 7 items:" still matches, because the character immediately before the 7
+# is a SPACE -- the exclusion costs nothing there and only rules out the no-space
+# `name:NN` form, which is never a count.
+_COUNT_INTRO_RE = re.compile(r"(?<![\w.:/-])(\d{1,3})\b[^:,\n]{0,120}:[ \t]*\n")
 
 # A number that ORDERS a section rather than counting anything: "### 2. Database
 # Tables:", "2) Endpoints:". Caught before shipping, not in production -- these answers
