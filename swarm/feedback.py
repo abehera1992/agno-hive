@@ -321,8 +321,20 @@ _ABSENCE_CLAIM_RE = re.compile(
 # half of the codebase where path guessing is worst (inventoryApi.ts vs a guessed
 # services/inventoryApi.ts). Caught by a test fixture using the real path; a shallower
 # fixture would have passed and shipped the gap.
+#
+# The lookbehind excludes a HYPHEN, and a leading slash is consumed OUTSIDE the capture
+# group. Both are needed, and the reason is a live 2026-08-29 case: answers write paths
+# as `/API/storage-service/router/storage_api.py`, with a leading slash. The old
+# lookbehind `(?<![\w/])` blocked a match at "API" (preceded by "/"), so the regex slid
+# forward and matched at "service/router/storage_api.py" -- the tail of a real path,
+# preceded by the "-" the class allowed through.
+#
+# That truncated string is not a file. It scored as a fabrication when measuring, and,
+# worse, this same pattern is what EXTRACTS paths for injection -- so the feature could
+# have offered "service/router/business_api.py" as a real place to look. A hint that
+# points at a path which cannot exist is worse than no hint.
 _CITED_PATH_RE = re.compile(
-    r"(?<![\w/])((?:[\w.-]+/){1,12}[\w.-]+\.(?:py|ts|tsx|js|jsx|scss|css|sql|ya?ml|json|md))"
+    r"(?<![\w.-])/?((?:[\w.-]+/){1,12}[\w.-]+\.(?:py|ts|tsx|js|jsx|scss|css|sql|ya?ml|json|md))"
     r"(?![\w/])"
 )
 
