@@ -12,6 +12,7 @@ Failure path  → structured record in the failure_log table, via SQLAlchemy
 Context load  → queries failure_log before each task, injected into coordinator instructions
 """
 import asyncio
+import hashlib
 import re
 from datetime import datetime
 
@@ -100,8 +101,24 @@ async def record_success(task: str, result: str, project_id: str) -> None:
             f"Task: {task}\n"
             f"Result:\n{result[:1500]}"
         )
-        # Tag with a real file_path so these are identifiable (never "unknown_source").
-        await rag.ainsert(text, file_paths="task_outcome")
+        # Tag with a real file_path so these are identifiable (never "unknown_source"),
+        # and make it UNIQUE per outcome.
+        #
+        # A constant "task_outcome" silently killed this whole loop for 50 days. The
+        # timestamp above was added to defeat LightRAG's CONTENT-hash dedupe, and it
+        # works -- but LightRAG dedupes on FILENAME too, and every outcome ever recorded
+        # shared one. Measured 2026-08-29 on ekam_experience:
+        #
+        #     failed     1221   all "[DUPLICATE:filename] Original document: doc-a0b718..."
+        #     processed   393   last successful insert 2026-07-09
+        #     file_path  'task_outcome' x 1614   <- every row, one value
+        #
+        # So record_success ran on every completed task, logged nothing, and had its
+        # insert rejected each time. Fixing one dedupe axis and leaving the other made
+        # the failure invisible: the call succeeded, the data never landed.
+        stamp = ts.replace(":", "").replace("-", "")
+        digest = hashlib.sha1(f"{task}{ts}".encode()).hexdigest()[:10]
+        await rag.ainsert(text, file_paths=f"task_outcome/{project_id}/{stamp}-{digest}")
     except Exception as exc:
         print(f"[feedback] record_success warning: {exc}")
 

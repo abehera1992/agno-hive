@@ -1552,6 +1552,54 @@ async def _verification_block(content: str, hive_mcp_url: str | None,
             f"found in the repository):**\n```\n{_reader_facing_report(report)}\n```")
 
 
+# Every banner a guard can append. An answer carrying ANY of them is not a success
+# exemplar, whatever the pipeline's own exit status says.
+_GUARD_BANNERS = (
+    "NOT VERIFIED BY",
+    "ANSWER REPORTS FAR LESS",
+    "NAMES THAT NO TOOL RETURNED",
+    "WHAT THE TOOLS ACTUALLY RETURNED",
+    "Unverified claims flagged automatically",
+    "citation verification was unavailable",
+    "THE NUMBERS IN THIS ANSWER DO NOT ADD UP",
+    "THE COUNT AND THE LIST DISAGREE",
+    "ASKED FOR A LIST",
+    "LONGER THAN ITS EVIDENCE",
+    "Answered by the coordinator alone",
+)
+
+
+def _is_success_exemplar(content: str) -> bool:
+    """Is this answer clean enough to store as a past-success example?
+
+    record_success_bg fires on every run that returns without raising, and the
+    task_counter beside it labels that outcome "success" -- but what it measures is that
+    the PIPELINE completed, not that the ANSWER was right. Those are different claims,
+    and the gap is not academic: on 2026-08-29 alone the runs that would have been
+    recorded as successes included an answer inventing a TypeScript/Node architecture
+    for a Python FastAPI service (six symbols and paths flagged), one reporting
+    "Ubuntu 22.04.4 / Python 3.11.6 / /home/ubuntu/ekam-app" for a Debian container at
+    /project, and a whole battery answered with no file tools connected at all.
+
+    Those get retrieved later as exemplars of how to answer well. Recording them is
+    worse than recording nothing.
+
+    The guards already computed this verdict; it was simply never consulted here. A
+    banner means some check found something wrong, so the answer stays out of the
+    experience namespace. Conservative on purpose -- a correct answer wrongly skipped
+    costs one missing exemplar, while a fabrication wrongly stored teaches the failure
+    it demonstrates.
+    """
+    if not content or len(content.strip()) < _MIN_EXEMPLAR_CHARS:
+        return False
+    return not any(marker in content for marker in _GUARD_BANNERS)
+
+
+# Below this an outcome carries no reusable pattern -- and record_success skips shorter
+# ones anyway (_MIN_RESULT_LENGTH), so this only makes the skip visible at the call site.
+_MIN_EXEMPLAR_CHARS = 120
+
+
 async def _verify_claims(content: str, hive_mcp_url: str | None,
                          hive_mcp_tools=None) -> tuple[str, bool, bool]:
     """Run hive-mcp's verify_claims over a draft answer.
@@ -7259,7 +7307,14 @@ async def run_task_stream(
                 tokens = _extract_tokens(final_run_output)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
                 # Fire-and-forget: don't block the response on post-run experience indexing.
-                record_success_bg(task, combined, project_id)
+                # Gated on the answer being guard-clean -- "outcome: success" above means
+                # the pipeline completed, which is not the same claim. See
+                # _is_success_exemplar.
+                if _is_success_exemplar(combined):
+                    record_success_bg(task, combined, project_id)
+                else:
+                    print("[feedback] answer carries a guard warning — not recording as "
+                          "a success exemplar", flush=True)
                 # Save a compact chain-boundary handoff summary so the next chained call
                 # gets a small structured digest instead of the full message history.
                 if session_id:
@@ -9634,7 +9689,14 @@ async def run_task_async(
                 span.set_status(trace.StatusCode.OK)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
                 # Fire-and-forget: don't block the response on post-run experience indexing.
-                record_success_bg(task, content, project_id)
+                # Gated the same way as the streaming path above -- this one matters more,
+                # since `content` here is POST-_verified_answer and therefore carries any
+                # guard banner verbatim into the exemplar store.
+                if _is_success_exemplar(content):
+                    record_success_bg(task, content, project_id)
+                else:
+                    print("[feedback] answer carries a guard warning — not recording as "
+                          "a success exemplar", flush=True)
                 # Save a compact chain-boundary handoff summary so the next chained call
                 # gets a small structured digest instead of the full message history.
                 if session_id:
