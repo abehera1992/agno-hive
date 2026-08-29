@@ -394,10 +394,40 @@ _NEGATION_AFTER_RE = re.compile(
 # nearest sentence end or contrastive conjunction, capped. A negation only counts if
 # it governs the same clause the token sits in.
 _NEGATION_LOOKBACK_CAP = 160
+# The COLON was added 2026-08-28, after battery B17 T4. A colon ends the clause its
+# negation governs -- what follows is a new assertion, not part of the denial:
+#
+#     "These models are not interchangeable: `Party` is the foundational legal entity"
+#
+# Without it the lookback walked past the colon, found "not" in "not interchangeable",
+# and marked `Party` a denied symbol; the checker then found Party (it exists) and
+# stamped an otherwise exact answer "CONTRADICTED Party <-- claimed ABSENT but exists".
+# That is the same false accusation the 2026-08-25 locative fix above was written to
+# stop, arriving through a punctuation mark instead of a preposition. The "not" belongs
+# to "interchangeable"; nothing after the colon is being denied.
 _CLAUSE_BREAK_RE = re.compile(
-    r"[.!?;]|\n|\b(?:but|however|although|though|whereas|while|yet)\b",
+    r"[.!?;:]|\n|\b(?:but|however|although|though|whereas|while|yet)\b",
     re.IGNORECASE,
 )
+
+# A run of backticked siblings in a LIST of denied items, collapsed out of the scope
+# before the cue search. Added 2026-08-28 after battery B17 T13b:
+#
+#     "No mention of non-existent symbols like `series_type`, `next_number`, or
+#      `last_used_at` was made, as confirmed by repository-wide search."
+#
+# 68 characters separate "No" from the LAST item, over the 60-char between-span budget,
+# so the negation was missed and the answer's own statement that these symbols do NOT
+# exist was checked as if it claimed they DO -- reported as "NOT FOUND last_used_at",
+# which agrees with the sentence it is contradicting.
+#
+# Collapsing the siblings rather than widening the budget is deliberate. The budget is
+# what stops a negation being borrowed from an unrelated part of the same clause ("no
+# caching layer and `verify_seller` handles it"); raising it to fit a list would loosen
+# that everywhere to fix one shape. The siblings are not distance in any meaningful
+# sense -- they are the same denial repeated -- so removing them keeps the budget
+# honest. Mirrors the existing list-skip on the AFTER side of _is_negated_claim.
+_BACKTICKED_LIST_RUN_RE = re.compile(r"(?:`[^`]+`\s*,\s*)+(?:or\s+|and\s+)?")
 
 # Abbreviations whose internal periods are not sentence ends. Stripped before the
 # clause scan rather than guarded with lookbehinds: "e.g." contains TWO periods and a
@@ -437,6 +467,10 @@ def _is_negated_claim(answer: str, start: int, end: int) -> bool:
     accuses a correct answer of fabricating.
     """
     scope = _negation_scope(answer, start)
+    # Collapse a list of denied siblings so the between-span budget measures real
+    # distance from the cue, not repetitions of the same denial -- see
+    # _BACKTICKED_LIST_RUN_RE for the B17 T13b miss this fixes.
+    scope = _BACKTICKED_LIST_RUN_RE.sub("", scope)
     cue = _NEGATION_BEFORE_RE.search(scope)
     if cue and not _LOCATIVE_AFTER_CUE_RE.search(scope[cue.start():]):
         return True

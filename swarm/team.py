@@ -3414,17 +3414,15 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # wrong. The 1,547 characters get_env_info actually returned never entered that
     # comparison, and all three facts in the answer were fabricated. See
     # _captured_tool_evidence for the full chain.
-    _rs_thin = getattr(team, "_read_state", None)
-    _read_thin = _rs_thin.get("read_chars_total", 0) if isinstance(_rs_thin, dict) else 0
+    _answer_thin = len(content.strip())
     _relayed_thin = getattr(team, "_member_result_chars", 0)
-    if (len(content.strip()) < _THIN_ANSWER_CHARS and _read_thin and _relayed_thin
-            and _read_thin / _relayed_thin >= _THIN_ANSWER_MIN_RATIO):
+    if (_answer_thin < _THIN_ANSWER_CHARS and _relayed_thin
+            and _answer_thin > _relayed_thin * _THIN_ANSWER_SURPLUS_RATIO):
         tool_evidence = _captured_tool_evidence(team)
         if tool_evidence:
-            print(f"[team] thin answer ({len(content.strip()):,} chars) over a "
-                  f"{_read_thin / _relayed_thin:.1f}:1 relay collapse "
-                  f"({_read_thin:,} read -> {_relayed_thin:,} relayed) — "
-                  f"surfacing captured tool output", flush=True)
+            print(f"[team] thin answer ({_answer_thin:,} chars) says more than the "
+                  f"{_relayed_thin:,} chars relayed to it — surfacing captured tool "
+                  f"output", flush=True)
             return content + tool_evidence + _summarize_actual_writes(*all_results)
 
     # Under-answered enumeration check (2026-08-22). See _under_answered_enumeration
@@ -8337,7 +8335,26 @@ _RECOVERED_FINDINGS_CAP = 12_000   # per member; above this the answer stops bei
 # _record_read and _evidence_manifest both refuse to create.
 _TOOL_EVIDENCE_MAX_ITEMS = 12
 _THIN_ANSWER_CHARS = 1_200
-_THIN_ANSWER_MIN_RATIO = 8.0
+# Retuned 2026-08-28, same day it shipped, after battery B17 fired it on two CORRECT
+# answers. The first cut gated on the read->relay collapse ratio, on the theory that a
+# severe collapse means the answer was written without its evidence. B17's own numbers
+# refute that outright:
+#
+#     T1  (correct, "line 129")   41,535 read ->   305 relayed =  136.2:1
+#     T8  (correct, "0 rows")      3,860 read ->     1 relayed = 3860.0:1
+#     T9  (fabricated env facts)   1,547 read ->    56 relayed =   27.6:1
+#
+# Both correct answers collapsed HARDER than the fabrication. A single-fact lookup reads
+# a 36,811-char file and answers in one line -- that is the system working, and it is
+# indistinguishable from a collapse by ratio or by relayed size.
+#
+# What does separate them is whether the answer says MORE than was relayed to it. T9's
+# 237 characters carried three specific values out of a 56-character precis; T1's 126
+# characters came out of 305 relayed and invented nothing. That is the same principle
+# _answer_outruns_evidence already applies, and this is deliberately its lower band:
+# that guard floors at _EXPANSION_MIN_ANSWER_CHARS (1,200) and never sees an answer this
+# short. Complementary range, one shared idea, no third heuristic.
+_THIN_ANSWER_SURPLUS_RATIO = 2.0
 
 
 def _captured_tool_evidence(team) -> str:
