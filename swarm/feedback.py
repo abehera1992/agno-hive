@@ -456,6 +456,12 @@ async def load_success_context(project_id: str, limit: int = 3, current_task: st
             "  * If none of them relate to your task, ignore this section entirely.",
         ]
         lines += [f"  - {p}" for p in paths[:12]]
+        # Logged so the effect is observable in a run. Without this the block is
+        # invisible: it goes into the coordinator's instructions, which are not printed,
+        # so there is no way to tell an injection that helped from one that never
+        # happened -- and this feature shipped inert once already.
+        print(f"[feedback] success context: injecting {len(paths[:12])} path(s) from "
+              f"{len(scored)} verified answer(s) — {', '.join(paths[:3])}", flush=True)
         return "\n".join(lines) + "\n"
     except Exception as exc:
         print(f"[feedback] load_success_context warning: {exc}")
