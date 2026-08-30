@@ -276,3 +276,59 @@ class TeamConfigReloadResponse(BaseModel):
     gates_changed: list[str]
     tool_registry_size: int
     skill_registry_size: int
+
+
+# ── Chunked runs (Phase 1 harness, 2026-08-30) ────────────────────────────────
+#
+# A monolithic multi-deliverable task exhausts a single run's budget. T12 ("routers,
+# models, external dependencies, AND business-service integration" in one call) was
+# measured dying three different ways: ContextWindowExceededError at 258,049 of 262,144
+# tokens; "tool budget is exhausted" after 454,020 of 450,000 read chars; and once
+# silently dropping two of its four deliverables.
+#
+# The read budget and tool-call limit are per-RUN, so the same work split across chained
+# runs gets a fresh budget each time. Measured 2026-08-30, same task, 2 reps per arm:
+#
+#     monolithic   281s avg   1 of 2 runs covered all four deliverables
+#     3 chunks     483s avg   2 of 2 covered all four, no budget death
+#                             peak per-chunk reads 117,324 / 450,000 (26%)
+#
+# Slower in wall-clock (three pipeline startups) and reliable where the monolith is not.
+#
+# Deliberately a SEPARATE request model and endpoint rather than making RunRequest.task
+# optional: the single-task path is the hot path and stays byte-for-byte unchanged.
+class ChunkedRunRequest(BaseModel):
+    chunks: list[str]                     # run in order, chained on one session
+    project_id: str = "default"
+    team: str | None = None
+    mode: str | None = None
+    mcp_url: str | None = None
+    mcp_urls: list[str] | None = None
+    read_only: bool = False
+    persist: bool = False
+    # OFF by default: a synthesis pass costs an extra run and an extra relay hop, and
+    # the chunk results are the substance. Turn it on for a task whose whole point is
+    # cross-referencing the chunks (a gap analysis), not for one that merely lists.
+    synthesize: bool = False
+
+
+class ChunkResult(BaseModel):
+    index: int
+    task: str
+    result: str | None = None
+    status: str                           # "ok" | "failed"
+    error: str | None = None
+    duration_seconds: float = 0.0
+
+
+class ChunkedRunResponse(BaseModel):
+    chunks: list[ChunkResult]             # every chunk attempted, in order
+    synthesis: str | None = None
+    session_id: str | None = None
+    # "complete" = every chunk ok. "partial" = one failed and the chain stopped there;
+    # earlier chunks are still present and still valid. A partial result is never an
+    # empty one -- losing completed work to a later failure is the specific outcome this
+    # harness exists to prevent.
+    status: str = "complete"
+    failed_at: int | None = None
+    total_duration_seconds: float = 0.0

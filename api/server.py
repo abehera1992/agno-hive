@@ -13,7 +13,7 @@ from api.models import (
     AgentSpec, RunRequest, RunResponse, PlanResponse, ScanRequest, ScanResponse,
     FeedbackRequest, FeedbackResponse, BranchRequest, ForkRequest,
     ModelCatalogEntry, ModelCatalogPatch, TeamRoleModelEntry, ModelRoutesReloadResponse,
-    ClarificationRequest,
+    ClarificationRequest, ChunkedRunRequest, ChunkedRunResponse,
     TeamRoleToolEntry, TeamRoleSkillEntry, InstructionOverlayCreate, InstructionOverlayPatch,
     InstructionOverlayOut, TeamGateFlagEntry, RegistryRefreshRequest, TeamConfigReloadResponse,
 )
@@ -698,6 +698,25 @@ async def run(request: RunRequest, http_request: Request):
     from api.models import SessionMeta
     start = time.perf_counter()
 
+    # Reject a malformed session_id instead of silently running unchained (2026-08-30).
+    # Verified live: posting session_id="{not-a-uuid}" returned HTTP 200 with a normal
+    # result, while get_session threw "invalid input syntax for type uuid" server-side,
+    # the session never formed (turn stayed 0), and append_message therefore persisted
+    # NEITHER the prompt nor the answer. A caller chaining on that id gets a chain that
+    # only looks like one, and loses every response along it. Failing loudly is strictly
+    # better than a 200 that quietly drops the session and the history with it.
+    if request.session_id:
+        import uuid as _uuid
+        try:
+            _uuid.UUID(str(request.session_id))
+        except (ValueError, AttributeError, TypeError):
+            raise HTTPException(
+                status_code=422,
+                detail=f"session_id must be a UUID; got {request.session_id!r}. "
+                       f"If you read it from a previous response, use "
+                       f"session['session_id'] -- `session` is an object, not a string.",
+            )
+
     # Resolve team spec
     # gate_team_name (2026-08-15 gate-scope extension, see swarm/team.py's
     # _GATE_ENABLED_TEAMS) is the underlying team identity _build_team needs to
@@ -816,6 +835,121 @@ async def run(request: RunRequest, http_request: Request):
         output_tokens=tokens.get("output_tokens", 0),
         total_tokens=tokens.get("total_tokens", 0),
         needs_clarification=ClarificationRequest(**clarification) if clarification else None,
+    )
+
+
+# Upper bound on chunks per request. Not a tuning knob -- a guard against a caller
+# turning one request into an unbounded queue of full 6-agent pipeline runs, each of
+# which holds the GPU for minutes. Eight is well above the 3 the T12 experiment needed.
+_MAX_CHUNKS = 8
+
+
+@app.post("/run_chunked", response_model=ChunkedRunResponse)
+async def run_chunked(request: ChunkedRunRequest, http_request: Request):
+    """Run several prompts in order on ONE chained session, returning every result.
+
+    For a task with more deliverables than one run's budget can hold. The read budget and
+    tool-call limit are per-RUN, so N chained runs get N fresh budgets. Measured on T12
+    (routers + models + dependencies + integration in one prompt), 2 reps per arm:
+
+        monolithic   281s avg   1 of 2 runs covered all four deliverables
+        3 chunks     483s avg   2 of 2 covered all four, no budget death
+                                peak per-chunk reads 117,324 / 450,000
+
+    Slower, and reliable where the monolith is not -- the same prompt has also died at
+    258,049 of 262,144 tokens and at 454,020 of 450,000 read chars.
+
+    THE SESSION IS CAPTURED ONCE, from chunk 1, and reused verbatim for every later
+    chunk. Not re-read from each response: `session` is a DICT, and str()-ing it sends
+    "{'session_id': '...', 'turn': 1, ...}" as the id. /run ACCEPTS that and returns 200
+    while get_session throws "invalid input syntax for type uuid" server-side and the
+    session never forms (turn stays 0) -- so the chain silently does not chain, and
+    append_message never persists a thing. Verified live 2026-08-30. Capturing once, and
+    validating it parses as a UUID before reuse, removes the whole class.
+
+    NOTHING COMPLETED IS EVER DISCARDED. Each chunk's prompt and answer are persisted by
+    /run itself (append_message) as it finishes, and every attempted chunk is returned.
+    A failure stops the chain and marks the response `partial` -- it never throws away
+    the chunks that already succeeded, which is the specific loss this exists to prevent.
+    """
+    from api.models import ChunkResult
+    import uuid as _uuid
+
+    if not request.chunks or not all((c or "").strip() for c in request.chunks):
+        raise HTTPException(status_code=422, detail="chunks must be a non-empty list of non-blank prompts")
+    if len(request.chunks) > _MAX_CHUNKS:
+        raise HTTPException(status_code=422,
+                            detail=f"too many chunks ({len(request.chunks)} > {_MAX_CHUNKS})")
+
+    started = time.perf_counter()
+    results: list[ChunkResult] = []
+    session_id: str | None = None
+    failed_at: int | None = None
+
+    for i, chunk in enumerate(request.chunks):
+        t0 = time.perf_counter()
+        sub = RunRequest(
+            task=chunk, project_id=request.project_id, team=request.team,
+            mode=request.mode, mcp_url=request.mcp_url, mcp_urls=request.mcp_urls,
+            read_only=request.read_only, persist=request.persist,
+            session_id=session_id,          # None on chunk 1 -- the server creates it
+        )
+        try:
+            resp = await run(sub, http_request)
+        except Exception as exc:
+            # Record and STOP. Chaining onto a failed run would compound the error, and
+            # the earlier chunks are still good.
+            results.append(ChunkResult(index=i, task=chunk, status="failed",
+                                       error=str(exc)[:500],
+                                       duration_seconds=round(time.perf_counter() - t0, 2)))
+            failed_at = i
+            break
+
+        results.append(ChunkResult(index=i, task=chunk, result=resp.result, status="ok",
+                                   duration_seconds=round(time.perf_counter() - t0, 2)))
+
+        if session_id is None:
+            candidate = resp.session.session_id if resp.session else ""
+            try:
+                _uuid.UUID(str(candidate))
+                session_id = str(candidate)
+            except (ValueError, AttributeError, TypeError):
+                # Do not send a malformed id onward -- /run would accept it, return 200,
+                # and silently run unchained with nothing persisted. Stop with chunk 1's
+                # real result rather than produce a chain that only looks like one.
+                print(f"[chunked] chunk 1 returned an unusable session id "
+                      f"({candidate!r}) — stopping rather than chaining on it", flush=True)
+                failed_at = i + 1 if len(request.chunks) > 1 else None
+                break
+
+    status = "complete" if failed_at is None else "partial"
+    synthesis = None
+    if request.synthesize and status == "complete" and len(results) > 1:
+        # The prior answers go in as literal TEXT, not via the session digest: the
+        # handoff carries ~5 excerpts x 800 chars, and member->coordinator relay was
+        # measured losing 6-9:1 (worst 27.6:1). Text in the prompt bypasses both.
+        sep = chr(10) + chr(10)
+        joined = sep.join(
+            f"--- Result {r.index + 1} ---" + chr(10) + (r.result or "") for r in results)
+        synth_task = (
+            "Combine the findings below into one coherent answer. Use ONLY what they "
+            "contain -- add no file, symbol or number that does not appear in them."
+            + sep + joined
+        )
+        try:
+            synth = await run(RunRequest(
+                task=synth_task, project_id=request.project_id, team=request.team,
+                mcp_url=request.mcp_url, mcp_urls=request.mcp_urls,
+                read_only=True, session_id=session_id), http_request)
+            synthesis = synth.result
+        except Exception as exc:
+            # The chunks are the substance; a failed synthesis must not discard them.
+            print(f"[chunked] synthesis failed: {exc}", flush=True)
+
+    return ChunkedRunResponse(
+        chunks=results, synthesis=synthesis, session_id=session_id,
+        status=status, failed_at=failed_at,
+        total_duration_seconds=round(time.perf_counter() - started, 2),
     )
 
 
