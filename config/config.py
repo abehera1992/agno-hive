@@ -404,10 +404,28 @@ class Config:
     # each pass takes at most DRAIN_BATCH extraction calls, so a short interval keeps the
     # backlog near zero without ever monopolising vllm-extract.
     outcome_drain_interval: int = int(os.getenv("OUTCOME_DRAIN_INTERVAL", "60"))
-    # Task-shape skill injection (swarm/team.py's _TASK_SHAPE_SKILLS). Default ON.
-    # Exists so the feature can be A/B'd without editing code or restarting into a
-    # different build -- the same reason MEMBER_READ_CHAR_BUDGET became env-tunable.
-    skill_injection_enabled: bool = os.getenv("SKILL_INJECTION_ENABLED", "1") != "0"
+    # Task-shape skill injection (swarm/team.py's _TASK_SHAPE_SKILLS). Default OFF as of
+    # 2026-08-30, because it was measured and does not help.
+    #
+    # T13a, 10 reps per arm, same prompt, only this flag differing:
+    #
+    #     arm   perfect(4/4)   mean gaps   mean endpoints   mean secs
+    #     ON       8/10         3.40/4        6.40/8          332
+    #     OFF      8/10         3.40/4        6.50/8          261
+    #
+    # Identical accuracy to two decimals, OFF marginally ahead on enumeration, and ON
+    # 27% slower for the ~4KB it adds to a prompt this project has already measured as
+    # contended (Researcher's instructions at ~16K chars were found burying their own
+    # rules). An earlier 3-rep run showed 3/3 vs 1/3 and looked like a real effect; it
+    # was noise -- T13a fails ~20% of the time in BOTH arms, and the small sample simply
+    # drew two of those failures into one arm.
+    #
+    # Kept rather than deleted: the mechanism is correct and the finding it came from
+    # stands -- load_skill has never once been called for a Researcher task-shape skill
+    # in the system's history, so comparison-discipline was unreachable before this and
+    # is now reachable by flipping one flag. What is disproven is that reaching it
+    # improves the answer.
+    skill_injection_enabled: bool = os.getenv("SKILL_INJECTION_ENABLED", "0") != "0"
 
     # Self-improvement loop — how many recent failures load_failure_context replays
     # into the coordinator. Previously hard-coded at 3; now tunable per deployment.
