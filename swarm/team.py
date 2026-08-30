@@ -2074,6 +2074,95 @@ async def _fetch_skill_catalog(hive_mcp_url: str | None) -> list[dict]:
         return []
 
 
+# Task-shape skills injected MECHANICALLY, keyed by a detector on the task text.
+#
+# Measured 2026-08-30 across hive-mcp's full log history: load_skill was called 17 times
+# against 151 list_skills, and every single call was for an ACTION-triggered skill --
+# file-write-review (9), verification-discipline (5), code-conventions (3). Those fire on
+# a concrete imminent act ("I am about to write a file") and they work; nothing here
+# changes them.
+#
+# The Researcher's TASK-SHAPE skills were loaded ZERO times, ever. Their trigger asks the
+# model to classify the task before it has explored anything -- "is this an enumeration
+# question?", "is this a gap analysis?" -- which is a judgement, and the same judgement
+# DECOMPOSE-FIRST asks for and does not get. Advertising them and hoping has a measured
+# adoption rate of zero, and a fourteenth skill file would inherit it.
+#
+# So the shape is detected here, deterministically, by the same detectors the guards
+# already use, and the skill's TEXT is appended to the Researcher's instructions. No
+# load_skill call, no decision to decline. This is the tool-surface principle applied to
+# instruction delivery: instructions shape what a model says, and only what is actually
+# in the prompt can shape anything at all.
+#
+# Deliberately narrow. Only shapes with a detector that already earns its keep elsewhere,
+# and only for the Researcher, whose skills are the ones with zero adoption.
+_TASK_SHAPE_SKILLS: list[tuple[str, str]] = [
+    ("codebase-enumeration-discipline", "enumeration"),
+    ("comparison-discipline", "comparison"),
+    ("chain-tracing-discipline", "chain"),
+]
+
+
+def _matching_task_shapes(task: str | None) -> list[str]:
+    """Which task-shape skills this task warrants, by deterministic detection."""
+    if not task:
+        return []
+    out = []
+    if _is_enumeration_task(task) or _asks_for_list(task):
+        out.append("codebase-enumeration-discipline")
+    if _COMPARISON_TASK_RE.search(task):
+        out.append("comparison-discipline")
+    if _CHAIN_TASK_RE.search(task):
+        out.append("chain-tracing-discipline")
+    return out
+
+
+# "what's covered vs not", "which have no matching X", "identify anything with no
+# counterpart" -- the gap-analysis shape comparison-discipline was written for, and the
+# shape T13a/T13b have failed on repeatedly.
+_COMPARISON_TASK_RE = re.compile(
+    r"no (?:corresponding|matching|equivalent)|without (?:a )?(?:corresponding|matching)"
+    r"|covered vs|compare.{0,40}against|gap analysis"
+    r"|present in .{0,30} with no|which of these.{0,40}(?:are|have)",
+    re.IGNORECASE)
+
+# "trace X from A to B", "which services are involved end to end", "follow the call chain"
+_CHAIN_TASK_RE = re.compile(
+    r"trace.{0,40}(?:from|through|across)|end to end|end-to-end"
+    r"|call chain|which services are involved|follow the .{0,20}chain",
+    re.IGNORECASE)
+
+
+async def _fetch_skill_text(hive_mcp_url: str | None, name: str) -> str:
+    """Fetch ONE skill's full text via hive-mcp's load_skill. "" on any failure.
+
+    Same degrade-quietly contract as _fetch_skill_catalog: a skill is an enhancement to
+    instruction delivery, never a hard dependency, so an unreachable hive-mcp costs the
+    injection and nothing else.
+    """
+    if not hive_mcp_url or not name:
+        return ""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    async def _call():
+        async with streamablehttp_client(hive_mcp_url) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                return await session.call_tool("load_skill", {"name": name})
+
+    try:
+        res = await asyncio.wait_for(_call(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        err = _mcp_error_text(res)
+        if err:
+            print(f"[skills] load_skill({name}) rejected: {err}", flush=True)
+            return ""
+        return _extract_mcp_text(res) or ""
+    except Exception as exc:
+        print(f"[skills] load_skill({name}) failed: {type(exc).__name__}: {exc}", flush=True)
+        return ""
+
+
 # Tools that gather EVIDENCE. An answer asserting facts about the codebase without one
 # of these has no basis beyond the model's priors and the loaded context.
 _READ_TOOLS = {
@@ -7208,6 +7297,33 @@ async def run_task_stream(
         )
     )
 
+    # Task-shape skills, injected into the RESEARCHER's own instructions rather than
+    # advertised for it to load. See _TASK_SHAPE_SKILLS: load_skill has never once been
+    # called for these across hive-mcp's entire log history, while the action-triggered
+    # ones are used normally. Detected deterministically, fetched only when a shape
+    # actually matches, so a task matching none pays nothing.
+    shapes = _matching_task_shapes(task)
+    if shapes and agent_specs:
+        _hive_for_skills = _pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)
+        injected = []
+        for _name in shapes:
+            _text = await _fetch_skill_text(_hive_for_skills, _name)
+            if not _text:
+                continue
+            for _spec in agent_specs:
+                if _member_key(getattr(_spec, "name", "")) != "researcher":
+                    continue
+                # Appended to the role's own instructions, under a header naming the
+                # skill, so it reads as a rule rather than as loose context.
+                _spec.instructions = list(getattr(_spec, "instructions", None) or []) + [
+                    f"── Skill: {_name} (auto-loaded — this task matches its shape) ──",
+                    _text,
+                ]
+                injected.append(_name)
+        if injected:
+            print(f"[skills] task shape matched {sorted(set(injected))} — injected into "
+                  f"Researcher instructions (not advertised)", flush=True)
+
     instructions = (
         _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
         + list(_COORDINATOR_INSTRUCTIONS)
@@ -9456,6 +9572,33 @@ async def run_task_async(
             _fetch_skill_catalog(_pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)),
         )
     )
+
+    # Task-shape skills, injected into the RESEARCHER's own instructions rather than
+    # advertised for it to load. See _TASK_SHAPE_SKILLS: load_skill has never once been
+    # called for these across hive-mcp's entire log history, while the action-triggered
+    # ones are used normally. Detected deterministically, fetched only when a shape
+    # actually matches, so a task matching none pays nothing.
+    shapes = _matching_task_shapes(task)
+    if shapes and agent_specs:
+        _hive_for_skills = _pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)
+        injected = []
+        for _name in shapes:
+            _text = await _fetch_skill_text(_hive_for_skills, _name)
+            if not _text:
+                continue
+            for _spec in agent_specs:
+                if _member_key(getattr(_spec, "name", "")) != "researcher":
+                    continue
+                # Appended to the role's own instructions, under a header naming the
+                # skill, so it reads as a rule rather than as loose context.
+                _spec.instructions = list(getattr(_spec, "instructions", None) or []) + [
+                    f"── Skill: {_name} (auto-loaded — this task matches its shape) ──",
+                    _text,
+                ]
+                injected.append(_name)
+        if injected:
+            print(f"[skills] task shape matched {sorted(set(injected))} — injected into "
+                  f"Researcher instructions (not advertised)", flush=True)
 
     instructions = (
         _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
