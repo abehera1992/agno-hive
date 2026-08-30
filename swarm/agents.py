@@ -283,9 +283,27 @@ def make_agent_from_spec(
             f"unrecognized value returns empty/no-context results or a hard error, not a helpful failure. ──",
             "",
         ] + instructions
-    catalog_text = format_skill_catalog(skill_catalog or [], getattr(spec, "skills", None))
+    granted = getattr(spec, "skills", None)
+    catalog_text = format_skill_catalog(skill_catalog or [], granted)
     if catalog_text:
         instructions.append(catalog_text)
+    # What this agent was actually SHOWN, logged per agent (2026-08-30).
+    #
+    # There was no logging anywhere on this path, and the chain has four places it can
+    # silently produce nothing: the DB grant (team_role_skills), the catalog fetch
+    # (_fetch_skill_catalog -> list_skills on hive-mcp), the name-filter in
+    # format_skill_catalog, and the agent's own decision to call load_skill. Measured
+    # 2026-08-30: across 5 identical runs the Researcher called list_skills 5 times and
+    # load_skill ZERO times -- and with nothing logged there was no way to tell whether
+    # it had been offered seven skills and declined them, or offered none at all.
+    #
+    # Logs the GRANT and the ADVERTISED count separately because they diverge for real
+    # reasons: a granted name absent from the fetched catalog is silently dropped by the
+    # filter, so grant=7/advertised=5 means two skill files are missing or misnamed.
+    print(f"[skills] {spec.name}: granted={len(granted) if granted else 0} "
+          f"advertised={0 if not catalog_text else catalog_text.count(chr(10) + '  - ')} "
+          f"{sorted(granted) if granted else '(none — DB grant empty or YAML set skills)'}",
+          flush=True)
 
     # Declarative per-role policy (Recommendation #4, 2026-08-13, see DOCS.md
     # "Declarative Per-Role Policy") -- replaces the old hardcoded
