@@ -2120,16 +2120,25 @@ def _matching_task_shapes(task: str | None) -> list[str]:
 # "what's covered vs not", "which have no matching X", "identify anything with no
 # counterpart" -- the gap-analysis shape comparison-discipline was written for, and the
 # shape T13a/T13b have failed on repeatedly.
+# Word boundaries are spelled (?<![A-Za-z]) rather than \b ON PURPOSE. When these
+# two patterns were first written they went through a shell heredoc, where every \b
+# landed in the file as a literal BACKSPACE byte (\x08) instead of a word-boundary
+# assertion. The pattern then required an actual backspace character before "no",
+# which no task text contains, so BOTH detectors silently matched nothing -- and sed
+# renders \x08 invisibly, so the file looked correct on inspection. It took printing
+# repr() of the compiled pattern on the deployed box to find it. Spelling the
+# assertion out means the failure cannot recur through the same route.
 _COMPARISON_TASK_RE = re.compile(
-    r"no (?:corresponding|matching|equivalent)|without (?:a )?(?:corresponding|matching)"
-    r"|covered vs|compare.{0,40}against|gap analysis"
-    r"|present in .{0,30} with no|which of these.{0,40}(?:are|have)",
+    r"(?<![A-Za-z])no (?:corresponding|matching|equivalent)"
+    r"|without (?:a )?(?:corresponding|matching)"
+    r"|covered vs|compare.{0,40}against|gap analysis"
+    r"|present in .{0,30} with no|which of these.{0,40}(?:are|have)",
     re.IGNORECASE)
 
-# "trace X from A to B", "which services are involved end to end", "follow the call chain"
+# "trace X from A to B", "which services are involved end to end", "call chain"
 _CHAIN_TASK_RE = re.compile(
-    r"trace.{0,40}(?:from|through|across)|end to end|end-to-end"
-    r"|call chain|which services are involved|follow the .{0,20}chain",
+    r"(?<![A-Za-z])trace.{0,40}(?:from|through|across)|end.to.end"
+    r"|call chain|which services are involved|follow the .{0,20}chain",
     re.IGNORECASE)
 
 
