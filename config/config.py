@@ -404,6 +404,10 @@ class Config:
     # each pass takes at most DRAIN_BATCH extraction calls, so a short interval keeps the
     # backlog near zero without ever monopolising vllm-extract.
     outcome_drain_interval: int = int(os.getenv("OUTCOME_DRAIN_INTERVAL", "60"))
+    # Task-shape skill injection (swarm/team.py's _TASK_SHAPE_SKILLS). Default ON.
+    # Exists so the feature can be A/B'd without editing code or restarting into a
+    # different build -- the same reason MEMBER_READ_CHAR_BUDGET became env-tunable.
+    skill_injection_enabled: bool = os.getenv("SKILL_INJECTION_ENABLED", "1") != "0"
 
     # Self-improvement loop — how many recent failures load_failure_context replays
     # into the coordinator. Previously hard-coded at 3; now tunable per deployment.

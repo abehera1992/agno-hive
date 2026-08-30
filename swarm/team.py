@@ -2105,7 +2105,7 @@ _TASK_SHAPE_SKILLS: list[tuple[str, str]] = [
 
 def _matching_task_shapes(task: str | None) -> list[str]:
     """Which task-shape skills this task warrants, by deterministic detection."""
-    if not task:
+    if not task or not config.skill_injection_enabled:
         return []
     out = []
     if _is_enumeration_task(task) or _asks_for_list(task):
