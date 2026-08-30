@@ -336,6 +336,9 @@ class ChunkResult(BaseModel):
 
 class ChunkedRunResponse(BaseModel):
     chunks: list[ChunkResult]             # every chunk attempted, in order
+    # Verbatim chunk findings FIRST, then the model's conclusion. Self-contained on
+    # purpose: a consumer reading only this field still has every finding, because a
+    # synthesis was measured dropping 5 of 9 endpoints it had been handed correctly.
     synthesis: str | None = None
     session_id: str | None = None
     # "complete" = every chunk ok. "partial" = one failed and the chain stopped there;

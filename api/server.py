@@ -947,7 +947,27 @@ async def run_chunked(request: ChunkedRunRequest, http_request: Request):
                 mcp_url=request.mcp_url, mcp_urls=request.mcp_urls,
                 read_only=True, session_id=session_id,
                 synthesis_run=True), http_request)
-            synthesis = synth.result
+            # APPENDED, NEVER SUBSTITUTED. `synthesis` carries the verbatim chunk
+            # findings FIRST and the model's conclusion after it, so a consumer reading
+            # only this field still has every finding.
+            #
+            # Measured 2026-08-30, and the reason this is structural rather than a
+            # prompt instruction: chunk 1 returned all 9 voucher endpoints, correctly,
+            # and the synthesis over it listed 4 -- silently dropping the very endpoints
+            # the gap analysis was about, then contradicting itself mid-answer ("no
+            # useCreateVoucherMutation equivalent (though useCreateVoucherMutation
+            # exists, so this is a match)"). Telling the model not to omit things is the
+            # weak form; concatenating the findings it cannot edit is the strong one.
+            #
+            # Same rule as _recovered_member_findings in swarm/team.py: a precis may be
+            # right, and replacing the source with it hides what was dropped. The reader
+            # gets both, clearly labelled.
+            synthesis = (
+                "--- FINDINGS (verbatim, unedited) ---" + sep + joined + sep
+                + "--- SYNTHESIS (derived from the findings above; where the two "
+                  "disagree, the findings are the record) ---" + sep
+                + (synth.result or "")
+            )
         except Exception as exc:
             # The chunks are the substance; a failed synthesis must not discard them.
             print(f"[chunked] synthesis failed: {exc}", flush=True)
