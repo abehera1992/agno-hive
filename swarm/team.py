@@ -2942,7 +2942,7 @@ def _ends_with_unfinished_intent(content: str) -> bool:
 
 async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | None,
                            result=None, liveness_path: str | None = None,
-                           hive_mcp_tools=None) -> str:
+                           hive_mcp_tools=None, synthesis_run: bool = False) -> str:
     """Check the draft's claims and, if any are unverifiable, give the team ONE chance
     to correct itself against the evidence.
 
@@ -3167,6 +3167,18 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # max(), not sum(): a coordinator read appears in BOTH, and inflating the count would
     # distort nothing here (this only tests == 0) but would mislead any future caller.
     reads = max(_count_read_calls(result), _run_read_count(team))
+    # A SYNTHESIS run reasons over findings handed to it in the prompt and is told to use
+    # nothing else, so it opens no files BY CONSTRUCTION. All three zero-read guards below
+    # have their premise ("code facts with zero reads means recalled from priors")
+    # inverted for it, and the middle one would force a RETRY ordering it to go read the
+    # files it was told not to read. Measured 2026-08-30: a synthesis over two verified
+    # chunk results, every symbol traceable to them, shipped stamped UNGROUNDED.
+    # Suppressed at the shared `reads` value rather than per-guard so a fourth guard
+    # added later cannot miss it. Marking correct work as fabricated erodes the banner
+    # everywhere it IS deserved -- the same reason the 2026-08-22 note above narrowed
+    # the third guard's entry condition.
+    if synthesis_run:
+        reads = -1          # sentinel: never equals 0, so no zero-read guard can fire
     if reads == 0 and _CLAIMY_RE.search(content or "") and len(all_results) > 1:
         # Aggregate retry budget already spent -- surface rather than re-run again.
         return (
@@ -3222,7 +3234,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         # shipped stamped "UNGROUNDED -- neither the original attempt nor the corrective
         # retry opened a single file this run". Marking correct, grounded answers as
         # fabricated erodes the banner everywhere it IS deserved.
-        if max(_count_read_calls(result), _run_read_count(team)) == 0 \
+        if not synthesis_run \
+                and max(_count_read_calls(result), _run_read_count(team)) == 0 \
                 and _CLAIMY_RE.search(content or ""):
             return (
                 f"{content}\n\n---\n**UNGROUNDED — this answer states code facts, and "
@@ -9380,6 +9393,7 @@ async def run_task_async(
     read_only: bool = False,
     liveness_path: str | None = None,
     team_name: str | None = None,
+    synthesis_run: bool = False,
 ) -> tuple[str, dict, dict | None]:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer.
 
@@ -9753,7 +9767,7 @@ async def run_task_async(
                     content = await _verified_answer(
                         content, task, team, _hive_url,
                         final_run_output, liveness_path=liveness_path,
-                        hive_mcp_tools=_hive_tools)
+                        hive_mcp_tools=_hive_tools, synthesis_run=synthesis_run)
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
                 tokens = _extract_tokens(final_run_output)

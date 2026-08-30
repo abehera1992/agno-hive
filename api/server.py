@@ -795,6 +795,7 @@ async def run(request: RunRequest, http_request: Request):
         "mode": team_mode,
         "read_only": request.read_only,
         "team_name": gate_team_name,
+        "synthesis_run": request.synthesis_run,
     }
     result, tokens, clarification = await _run_worker_subprocess(http_request, worker_payload)
 
@@ -931,16 +932,21 @@ async def run_chunked(request: ChunkedRunRequest, http_request: Request):
         sep = chr(10) + chr(10)
         joined = sep.join(
             f"--- Result {r.index + 1} ---" + chr(10) + (r.result or "") for r in results)
+        # The caller's OWN intent leads, then the findings. A generic "combine these"
+        # produced exactly a combination: given 9 endpoints and 5 hooks for a gap
+        # analysis it relisted both and found no gap (measured 2026-08-30).
+        intent = (request.synthesis_task or "").strip() or (
+            "Combine the findings below into one coherent answer.")
         synth_task = (
-            "Combine the findings below into one coherent answer. Use ONLY what they "
-            "contain -- add no file, symbol or number that does not appear in them."
-            + sep + joined
+            intent + " Use ONLY the findings below -- add no file, symbol or number "
+            "that does not appear in them." + sep + joined
         )
         try:
             synth = await run(RunRequest(
                 task=synth_task, project_id=request.project_id, team=request.team,
                 mcp_url=request.mcp_url, mcp_urls=request.mcp_urls,
-                read_only=True, session_id=session_id), http_request)
+                read_only=True, session_id=session_id,
+                synthesis_run=True), http_request)
             synthesis = synth.result
         except Exception as exc:
             # The chunks are the substance; a failed synthesis must not discard them.

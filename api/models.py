@@ -46,6 +46,13 @@ class RunRequest(BaseModel):
     mcp_urls: list[str] | None = None     # secondary MCPs — e.g. hive-mcp for host actions
     session_id: str | None = None         # resume existing session
     persist: bool = False                 # mark new session as permanent
+    # This run reasons over text it was GIVEN rather than reading the repo (the
+    # /run_chunked synthesis pass). Suppresses the reads-based groundedness guards only.
+    # Those guards treat "code facts + zero read calls" as recall from priors, which is
+    # right for a normal run and structurally false here: a synthesis call is told to use
+    # only the supplied findings, so it opens no files BY CONSTRUCTION and tripped the
+    # UNGROUNDED banner every single time. See swarm/team.py's _verified_answer.
+    synthesis_run: bool = False
     read_only: bool = False               # strip every mutating tool (write_file, apply_diff,
                                           # run_shell/docker, notion_create/update/delete, ...)
                                           # from the coordinator AND all agents for this run.
@@ -310,6 +317,12 @@ class ChunkedRunRequest(BaseModel):
     # the chunk results are the substance. Turn it on for a task whose whole point is
     # cross-referencing the chunks (a gap analysis), not for one that merely lists.
     synthesize: bool = False
+    # What the combination is FOR. Without it the synthesis prompt was a generic
+    # "combine these into one coherent answer" -- and measured 2026-08-30, that is
+    # exactly what it did: given 9 endpoints and 5 hooks for a GAP ANALYSIS, it
+    # relisted both sets and identified no gap, because nothing ever told it a gap was
+    # the point. The caller's real intent has to travel with the chunks.
+    synthesis_task: str | None = None
 
 
 class ChunkResult(BaseModel):
