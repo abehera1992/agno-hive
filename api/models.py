@@ -323,6 +323,16 @@ class ChunkedRunRequest(BaseModel):
     # relisted both sets and identified no gap, because nothing ever told it a gap was
     # the point. The caller's real intent has to travel with the chunks.
     synthesis_task: str | None = None
+    # Best-of-N (change #6, 2026-08-31). Run each chunk `repeat` times and return every
+    # attempt, flagging whether they agreed. Default 1 = off.
+    #
+    # The only lever measured to touch drift directly, and it does so by spending compute
+    # rather than by fixing anything: T13a fails ~20% of runs, identically with and
+    # without every intervention tried on 2026-08-30/31 (budget raise, success-context
+    # paths, task-shape skills, temperature). Two samples do not make a wrong answer
+    # right -- they make disagreement VISIBLE, which is the difference between a silent
+    # 20% error rate and a flagged one.
+    repeat: int = 1
 
 
 class ChunkResult(BaseModel):
@@ -332,6 +342,12 @@ class ChunkResult(BaseModel):
     status: str                           # "ok" | "failed"
     error: str | None = None
     duration_seconds: float = 0.0
+    # Populated only when repeat > 1: every attempt's text, and whether they agreed.
+    # `agreement` is deliberately a crude signal (normalised-text equality) -- a precise
+    # one would need semantic comparison, which is the judgement this must not make
+    # silently. Unequal does not mean wrong; it means look.
+    attempts: list[str] | None = None
+    agreement: bool | None = None
 
 
 class ChunkedRunResponse(BaseModel):

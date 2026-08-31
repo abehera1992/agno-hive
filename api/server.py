@@ -843,6 +843,9 @@ async def run(request: RunRequest, http_request: Request):
 # turning one request into an unbounded queue of full 6-agent pipeline runs, each of
 # which holds the GPU for minutes. Eight is well above the 3 the T12 experiment needed.
 _MAX_CHUNKS = 8
+# Upper bound on best-of-N. 3 is enough to see disagreement; more multiplies GPU time on
+# a box where one T12 chunk has taken 1,774 seconds.
+_MAX_REPEAT = 3
 
 
 @app.post("/run_chunked", response_model=ChunkedRunResponse)
@@ -897,6 +900,28 @@ async def run_chunked(request: ChunkedRunRequest, http_request: Request):
         )
         try:
             resp = await run(sub, http_request)
+            # Best-of-N (change #6): repeat this chunk and keep every attempt. Extra
+            # attempts reuse the SAME session so they see identical context -- a
+            # different session would vary two things at once and measure neither.
+            attempts_text: list[str] | None = None
+            agreement: bool | None = None
+            reps = max(1, min(int(getattr(request, "repeat", 1) or 1), _MAX_REPEAT))
+            if reps > 1:
+                attempts_text = [resp.result]
+                for _ in range(reps - 1):
+                    try:
+                        again = await run(
+                            RunRequest(**{**sub.model_dump(),
+                                          "session_id": session_id or sub.session_id}),
+                            http_request)
+                        attempts_text.append(again.result)
+                    except Exception as exc2:
+                        print(f"[chunked] repeat attempt failed: {exc2}", flush=True)
+                norm = {" ".join((t or "").split()).lower() for t in attempts_text}
+                agreement = len(norm) == 1
+                if not agreement:
+                    print(f"[chunked] chunk {i + 1}: {len(attempts_text)} attempts "
+                          f"DISAGREED — surfacing all of them", flush=True)
         except Exception as exc:
             # Record and STOP. Chaining onto a failed run would compound the error, and
             # the earlier chunks are still good.
@@ -907,7 +932,8 @@ async def run_chunked(request: ChunkedRunRequest, http_request: Request):
             break
 
         results.append(ChunkResult(index=i, task=chunk, result=resp.result, status="ok",
-                                   duration_seconds=round(time.perf_counter() - t0, 2)))
+                                   duration_seconds=round(time.perf_counter() - t0, 2),
+                                   attempts=attempts_text, agreement=agreement))
 
         if session_id is None:
             candidate = resp.session.session_id if resp.session else ""

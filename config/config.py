@@ -427,6 +427,22 @@ class Config:
     # improves the answer.
     skill_injection_enabled: bool = os.getenv("SKILL_INJECTION_ENABLED", "0") != "0"
 
+    # Bottom-anchor retrieved evidence (change #4, 2026-08-31). Default OFF.
+    #
+    # Evidence (failure corrections, verified paths, session digest) currently goes into
+    # the coordinator's instruction list at the TOP, and generation happens after a long
+    # member-result history -- the classic "lost in the middle" position, where
+    # self-attention decays over a growing middle. Anchoring moves that block to the
+    # BOTTOM of the instruction stack, immediately before generation.
+    #
+    # OFF by default because it is a PROMPT-side intervention, and every prompt-side
+    # intervention measured on 2026-08-30/31 came back null or worse: the read-budget
+    # raise (null), success-context path injection (null on T4 and T11), task-shape
+    # skill injection (null at n=10), and Researcher temperature 0.1 (actively worse --
+    # coverage 2.75/4 vs 3.75/4). Mechanical fixes worked; talking to the model did not.
+    # This ships measurable rather than assumed-good.
+    bottom_anchor_evidence: bool = os.getenv("BOTTOM_ANCHOR_EVIDENCE", "0") != "0"
+
     # Self-improvement loop — how many recent failures load_failure_context replays
     # into the coordinator. Previously hard-coded at 3; now tunable per deployment.
     #

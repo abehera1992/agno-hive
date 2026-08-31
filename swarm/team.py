@@ -3095,7 +3095,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         try:
             retried, retry = await _stream_team_run(
                 team,
-                f"{task}\n\n"
+                f"{task}\n\n" + _checkpoint_block(team) +
                 f"IMPORTANT: a previous attempt stopped mid-task — it described a next "
                 f"step (e.g. 'let me search the codebase for X') but never actually took "
                 f"it, and the response ended there without a real answer. Do not repeat "
@@ -3144,7 +3144,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         try:
             retried, retry = await _stream_team_run(
                 team,
-                f"{task}\n\n"
+                f"{task}\n\n" + _checkpoint_block(team) +
                 f"IMPORTANT: a previous attempt claimed a file was created, modified, "
                 f"applied, or staged for review, but no apply_diff() or write_file() call "
                 f"in that attempt actually succeeded (a successful call's response starts "
@@ -3290,7 +3290,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         try:
             retried, retry = await _stream_team_run(
                 team,
-                f"{task}\n\n"
+                f"{task}\n\n" + _checkpoint_block(team) +
                 f"IMPORTANT: answer this by READING the relevant file(s) first — use "
                 f"get_file_content or search_files. A previous attempt answered without "
                 f"opening anything and named a symbol that exists elsewhere in the "
@@ -3361,7 +3361,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         try:
             retried, retry = await _stream_team_run(
                 team,
-                f"{task}\n\n"
+                f"{task}\n\n" + _checkpoint_block(team) +
                 f"IMPORTANT: a previous attempt answered this without calling db_query or "
                 f"db_schema, even though the task explicitly requires a live-database check. "
                 f"Call db_query/db_schema now and base your answer on their actual output — "
@@ -3422,7 +3422,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             try:
                 retried, retry = await _stream_team_run(
                     team,
-                    f"{task}\n\n"
+                    f"{task}\n\n" + _checkpoint_block(team) +
                     f"IMPORTANT: a previous attempt said it would call `{narrated}` "
                     f"directly and then never did — you do NOT have that tool, which is "
                     f"why the attempt stalled and repeated itself. `{member_name}` DOES "
@@ -4384,6 +4384,29 @@ _CACHEABLE_READ_TOOLS = {
 # still gets its own full serve at 1, unaffected by an earlier generation's history.
 # Only a repeat WITHIN the same generation (the same delegation instance) is now
 # caught immediately, on its 2nd ask, instead of being silently tolerated once first.
+# How many identical FAILURES of the same (agent, tool, args) to allow before
+# collapsing further attempts. 3 -- enough that a transient blip retries normally,
+# few enough that T9's four identical "REDIRECTED: no background job" replies do not
+# all reach the context window.
+_MAX_IDENTICAL_FAILURES = 3
+
+
+def norm_agent_key_for_fail(agent) -> str:
+    """Normalised agent key for the failure counter, tolerant of a missing agent."""
+    name = getattr(agent, "name", None) or ""
+    return _member_id(name) if name else ""
+
+
+def _result_preview_text(out) -> str:
+    """Best-effort string view of a tool result, for error detection only."""
+    if isinstance(out, str):
+        return out
+    try:
+        return str(out)
+    except Exception:
+        return ""
+
+
 _MAX_FULL_SERVES_PER_AGENT = 1
 # From serve 5 onward the stub escalates to a stronger, more directive wording -- a
 # model that already ignored two stubs for the identical call needs a harder nudge,
@@ -4971,6 +4994,9 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # objective fact for the whole run, not per-argument or per-agent context.
     # See _not_found_retry_stub's own docstring for the live incident.
     not_found_counts: dict[str, int] = {}
+    # Identical FAILING calls per (agent, tool, args) -- see the collapse branch below.
+    # Reset on success, so a tool that fails twice then works starts clean.
+    failure_counts: dict[tuple, int] = {}
     # 2026-08-19 (T6 follow-up -- Reviewer repeated its own entire first read pass
     # verbatim, 8 calls, within a SINGLE delegate_task_to_member('reviewer', ...)
     # call, landing exactly on config.tool_call_limit's ceiling with no answer
@@ -5064,7 +5090,43 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 return _model_verify_claims_unavailable_result()
 
         if function_name not in _CACHEABLE_READ_TOOLS:
-            return await function(**args)
+            # Repeated IDENTICAL FAILING call (2026-08-31, change #2). The read cache
+            # below covers repeated SUCCESSFUL reads; nothing covered a call that fails
+            # the same way over and over, because a non-cacheable tool returns here
+            # before any counting happens.
+            #
+            # Measured on T9: the Executor called bash_job_status four times with an
+            # invented job_id, got "REDIRECTED: no background job" every time, and all
+            # four failures sat in the context window competing for attention with the
+            # real evidence. That is the "10 identical status attempts" shape exactly.
+            #
+            # Collapsed rather than blocked: the call is still refused, but the reply
+            # says how many times it has now failed identically, which is the fact the
+            # model needs and never had. Keyed on (agent, tool, args) so a different
+            # argument -- a genuinely new job id, a different path -- is a fresh call.
+            try:
+                fail_key = (norm_agent_key_for_fail(agent), function_name,
+                            json.dumps(args or {}, sort_keys=True))
+            except TypeError:
+                return await function(**args)
+            prior = failure_counts.get(fail_key, 0)
+            if prior >= _MAX_IDENTICAL_FAILURES:
+                print(f"[team] {function_name} has failed identically {prior}x for "
+                      f"this agent — collapsing further attempts", flush=True)
+                return (
+                    f"REPEATED FAILURE COLLAPSED: this exact {function_name} call has "
+                    f"already failed {prior} times this run with the same arguments. It "
+                    f"was NOT executed again. The result will not change by asking "
+                    f"again — either call it with genuinely different arguments, use a "
+                    f"different tool, or answer from what you already have and say "
+                    f"plainly which part you could not determine."
+                )
+            out = await function(**args)
+            if _looks_like_tool_error(_result_preview_text(out)):
+                failure_counts[fail_key] = prior + 1
+            else:
+                failure_counts.pop(fail_key, None)   # a success clears the streak
+            return out
         try:
             args_key = json.dumps(args or {}, sort_keys=True)
         except TypeError:
@@ -5942,8 +6004,36 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
         # next delegation instead leaves the coordinator holding all of that and simply
         # requires it to answer now.
         #
-        # Checked only for delegations, because member results are what accumulate in
-        # the coordinator's context; a member's own reads live in its own.
+        # WIDENED 2026-08-31 (change #1). This block was gated on delegation calls
+        # ONLY, on the reasoning that member results are what accumulate in the
+        # coordinator's context while a member's own reads live in its own. True, and
+        # insufficient: the check then only ever ran BETWEEN delegations and never
+        # DURING one, so a run that crosses the limit mid-delegation reaches the model
+        # call anyway. Measured twice on 2026-08-31, in both arms of the temperature
+        # A/B: T12 died at 258,049 of 262,144 tokens with the guard already deployed and
+        # its threshold (190,000) long since crossed -- it simply never got a turn.
+        #
+        # The token check now runs on EVERY tool call. The char check below stays
+        # delegation-only, because _member_result_chars genuinely only grows on a
+        # delegation and re-checking it elsewhere would cost a lookup to learn nothing.
+        used_any = peak_input_tokens()
+        if used_any >= _CONTEXT_TOKEN_BUDGET and function_name not in _DELEGATION_TOOL_NAMES:
+            print(f"[team] context token budget exhausted ({used_any:,} of "
+                  f"{_MODEL_CONTEXT_LIMIT_TOKENS:,}) on {function_name} — refusing "
+                  f"further tool calls, forcing an answer", flush=True)
+            _force_text_only(None, team=team)
+            return (
+                f"STOP — CONTEXT WINDOW NEARLY FULL: the prompt has reached "
+                f"{used_any:,} of this model's {_MODEL_CONTEXT_LIMIT_TOKENS:,}-token "
+                f"limit. One more tool call would overflow it, and an overflow loses "
+                f"the ENTIRE run — every finding gathered so far goes with it. This "
+                f"{function_name} call was NOT executed.\n\n"
+                f"WRITE THE ANSWER ITSELF NOW — not a description of it — from what "
+                f"you already have, with real file paths and details. A PARTIAL answer "
+                f"is the expected outcome and is worth far more than a complete-"
+                f"sounding one. End with a short list of what you could not cover."
+            )
+
         if function_name in _DELEGATION_TOOL_NAMES:
             # Token budget first: it is the measure that matches the failure. The
             # char budget below stays as a backstop for the case where no usage has
@@ -7339,12 +7429,18 @@ async def run_task_stream(
     )
     if skill_catalog:
         instructions += ["", format_skill_catalog(skill_catalog, None)]
+    # Bottom-anchoring (change #4, 2026-08-31, default OFF -- config.bottom_anchor_
+    # evidence). When enabled, the evidence blocks are held back and appended at the
+    # very END of the instruction list instead of here near the top, so they sit
+    # immediately before generation rather than behind a long member-result history.
+    # The ORDER within the block is preserved either way: a failure correction says
+    # what NOT to do and is read first; success context only says where to look.
+    _anchored: list[str] = []
+    _evidence_sink = _anchored if config.bottom_anchor_evidence else instructions
     if failure_context:
-        instructions += ["", failure_context]
-    # After failures deliberately: a correction says what NOT to do and should be read
-    # first; this only says where to look.
+        _evidence_sink += ["", failure_context]
     if success_context:
-        instructions += ["", success_context]
+        _evidence_sink += ["", success_context]
     if session_summary:
         is_chain_handoff = session_summary.startswith("── Chain handoff")
         instructions += [
@@ -7365,6 +7461,15 @@ async def run_task_stream(
             lines.append(f"[{msg['role']}] {msg['content'][:800]}")
         lines.append("──────────────────────────────────────────────────────────────────")
         instructions += [""] + lines
+
+    # Bottom-anchor flush (change #4). Evidence held back above lands HERE, last in the
+    # instruction list, immediately before generation. Header included so the position
+    # is legible in a dumped prompt rather than looking like a stray trailing block.
+    if _anchored:
+        instructions += [
+            "", "── GROUND TRUTH (read this last, and prefer it over anything above) ──",
+        ] + _anchored
+        print(f"[context] bottom-anchored {len(_anchored)} evidence block(s)", flush=True)
 
     async with AsyncExitStack() as stack:
         mcp_list = []
@@ -8621,6 +8726,11 @@ def _answer_outruns_evidence(content: str, member_chars: int) -> tuple[int, int]
     return len(body), member_chars
 
 
+# Caps on the checkpoint block re-injected into a guard retry (change #5).
+# Bounded because the retry's whole problem was budget: handing back 40KB to
+# save a re-read would spend on the prompt what it saved on tool calls.
+_CHECKPOINT_PER_MEMBER_CHARS = 1_500
+_CHECKPOINT_TOTAL_CHARS = 6_000
 _RECOVERED_FINDINGS_CAP = 12_000   # per member; above this the answer stops being readable
 
 
@@ -8706,6 +8816,41 @@ def _captured_tool_evidence(team) -> str:
             "member but may not have survived its summary on the way to the answer. "
             "Where the two disagree, these are the tool's own words:**\n```\n"
             + "\n".join(lines) + "\n```")
+
+
+def _checkpoint_block(team) -> str:
+    """Findings already gathered this run, for re-injection into a guard RETRY.
+
+    Change #5 (2026-08-31). A guard retry re-ran the task from zero: same prompt plus a
+    correction, with nothing carried over. So the retry re-read what the first attempt
+    had already read, out of the same budget -- and on T4 that is exactly how a run
+    ended with "this run's tool budget is exhausted" and no answer at all, from a guard
+    that had fired on a false positive to begin with.
+
+    The findings are already in memory (team._member_results, populated by the stream
+    capture). This just hands them back, so the retry RESUMES from the checkpoint
+    instead of restarting behind it.
+
+    Deliberately labelled as prior findings to be corrected, not as an answer to repeat:
+    a retry that simply re-emits the draft it was asked to fix defeats the guard that
+    called it.
+    """
+    results = getattr(team, "_member_results", None)
+    if not isinstance(results, dict) or not results:
+        return ""
+    parts = []
+    for name, text in results.items():
+        if not text:
+            continue
+        parts.append(f"  [{name}] {text[:_CHECKPOINT_PER_MEMBER_CHARS]}")
+    if not parts:
+        return ""
+    return (
+        "\n\n── ALREADY GATHERED THIS RUN (do not re-read these; correct and "
+        "build on them) ──\n"
+        + "\n".join(parts)[:_CHECKPOINT_TOTAL_CHARS]
+        + "\n── end of prior findings ──"
+    )
 
 
 def _recovered_member_findings(team) -> str:
@@ -9615,12 +9760,18 @@ async def run_task_async(
     )
     if skill_catalog:
         instructions += ["", format_skill_catalog(skill_catalog, None)]
+    # Bottom-anchoring (change #4, 2026-08-31, default OFF -- config.bottom_anchor_
+    # evidence). When enabled, the evidence blocks are held back and appended at the
+    # very END of the instruction list instead of here near the top, so they sit
+    # immediately before generation rather than behind a long member-result history.
+    # The ORDER within the block is preserved either way: a failure correction says
+    # what NOT to do and is read first; success context only says where to look.
+    _anchored: list[str] = []
+    _evidence_sink = _anchored if config.bottom_anchor_evidence else instructions
     if failure_context:
-        instructions += ["", failure_context]
-    # After failures deliberately: a correction says what NOT to do and should be read
-    # first; this only says where to look.
+        _evidence_sink += ["", failure_context]
     if success_context:
-        instructions += ["", success_context]
+        _evidence_sink += ["", success_context]
     if session_summary:
         is_chain_handoff = session_summary.startswith("── Chain handoff")
         instructions += [
@@ -9643,6 +9794,15 @@ async def run_task_async(
             lines.append(f"[{msg['role']}] {msg['content'][:800]}")
         lines.append("──────────────────────────────────────────────────────────────────")
         instructions += [""] + lines
+
+    # Bottom-anchor flush (change #4). Evidence held back above lands HERE, last in the
+    # instruction list, immediately before generation. Header included so the position
+    # is legible in a dumped prompt rather than looking like a stray trailing block.
+    if _anchored:
+        instructions += [
+            "", "── GROUND TRUTH (read this last, and prefer it over anything above) ──",
+        ] + _anchored
+        print(f"[context] bottom-anchored {len(_anchored)} evidence block(s)", flush=True)
 
     async with AsyncExitStack() as stack:
         mcp_list = []
