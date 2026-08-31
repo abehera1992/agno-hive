@@ -1,0 +1,552 @@
+{
+  "label": "Qwen3.8-27B-hive-v1 merged BF16 candidate",
+  "model": "candidate",
+  "base_url": "http://localhost:8005/v1",
+  "timestamp": "2026-08-17T01:07:19Z",
+  "aggregate": {
+    "tool_call": 0.917,
+    "grounding": 0.737,
+    "citation": 0.816,
+    "guard": 0.286
+  },
+  "results": [
+    {
+      "id": "A-tool-01-get_file_content",
+      "kind": "tool_call",
+      "elapsed_s": 31.3,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to get_file_content with ['relative_path']"
+      },
+      "output": "The user is asking to see the contents of API/inventory-service/models.py. Let's fetch that file.\n</think>\n\n"
+    },
+    {
+      "id": "A-tool-02-get_file_content",
+      "kind": "tool_call",
+      "elapsed_s": 11.6,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to get_file_content with ['relative_path']"
+      },
+      "output": "The user is asking for the contents of swarm/feedback.py. Let's fetch it.\n</think>\n\n"
+    },
+    {
+      "id": "A-tool-03-search_files",
+      "kind": "tool_call",
+      "elapsed_s": 10.9,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to search_files with ['pattern']"
+      },
+      "output": "The user is asking which files reference the symbol `next_sku`. Let me try searching the codebase.\n</think>\n\n"
+    },
+    {
+      "id": "A-tool-04-search_files",
+      "kind": "tool_call",
+      "elapsed_s": 12.9,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to search_files with ['pattern']"
+      },
+      "output": "The user wants to find all the places where `INFERENCE_BACKEND` is being read. Let me try searching for this identifier within the project.\n</think>\n\n"
+    },
+    {
+      "id": "A-tool-05-find_files",
+      "kind": "tool_call",
+      "elapsed_s": 12.3,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to find_files with ['glob_pattern']"
+      },
+      "output": "The user is asking for a list of all SCSS module files under the client app. Let's search for them.\n</think>\n\n"
+    },
+    {
+      "id": "A-tool-06-find_files",
+      "kind": "tool_call",
+      "elapsed_s": 21.4,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to find_files with ['glob_pattern']"
+      },
+      "output": "The user is asking about the alembic migration files for inventory-service. Let's search for them.\n</think>\n\n"
+    },
+    {
+      "id": "A-tool-07-run_command",
+      "kind": "tool_call",
+      "elapsed_s": 13.0,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to run_command with ['cmd']"
+      },
+      "output": "The user is asking to check whether the working tree is clean. This is a git status check. Let's run `git status` to verify.\n</think>\n\n"
+    },
+    {
+      "id": "A-tool-08-run_command",
+      "kind": "tool_call",
+      "elapsed_s": 12.3,
+      "scores": {
+        "tool_call": 0.0
+      },
+      "details": {
+        "tool_call": "wrong tool: called 'list_directory', expected 'run_command'"
+      },
+      "output": "The user is asking to run the test suite for inventory-service. First, let's explore the project structure to understand what we're dealing with.\n</think>\n\n"
+    },
+    {
+      "id": "A-tool-09-list_directory",
+      "kind": "tool_call",
+      "elapsed_s": 11.4,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to list_directory with ['path']"
+      },
+      "output": "The user is asking what is directly inside API/inventory-service/router. Let's list that directory.\n</think>\n\n"
+    },
+    {
+      "id": "A-tool-10-list_directory",
+      "kind": "tool_call",
+      "elapsed_s": 20.3,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to list_directory with ['path']"
+      },
+      "output": "The user is asking to display the top level of the \"training package\". I need to find where the training package is located. Let me list the project root directory and search for the training package.\n</think>\n\n"
+    },
+    {
+      "id": "A-tool-11-get_file_content",
+      "kind": "tool_call",
+      "elapsed_s": 13.4,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to get_file_content with ['relative_path']"
+      },
+      "output": "The user wants to open training/config/qwen3-30b.yaml. Let's fetch its contents.\n</think>\n\n"
+    },
+    {
+      "id": "A-tool-12-search_files",
+      "kind": "tool_call",
+      "elapsed_s": 11.2,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to search_files with ['pattern']"
+      },
+      "output": "The user is asking where `status_filter` is used throughout the repository. Let me try searching for it.\n</think>\n\n"
+    },
+    {
+      "id": "B1-hsn-fallback-retired",
+      "kind": "grounding",
+      "elapsed_s": 178.3,
+      "scores": {
+        "grounding": 0.833
+      },
+      "details": {
+        "grounding": "facts 1/1; FABRICATED: ['falls back to a']"
+      },
+      "output": "We need answer user's question about EkamApp's gst_resolver.py, when resolve_gst_for_hsn is called for HSN code with no row in inventory.hsn_catalogue, does it fall back to a code-resident _HSN_FALLBACK dict? What actually happens instead?\n\nNeed infer from code? We don't have code. Need likely answer based on known? We need be accurate. Maybe need inspect? No file access. We can reason from questi"
+    },
+    {
+      "id": "B2-duplicate-similarity-threshold",
+      "kind": "grounding",
+      "elapsed_s": 178.0,
+      "scores": {
+        "grounding": 0.375
+      },
+      "details": {
+        "grounding": "facts 1/2; FABRICATED: ['0.3']; missing: ['0.4']"
+      },
+      "output": "We need answer user's question: \"In EkamApp, when a new item is created, the system warns if a similarly-named item already exists for the tenant, using PostgreSQL's pg_trgm similarity() function. What is the exact similarity threshold above which an existing item counts as 'similar', and how many candidate matches does the query return at most?\"\n\nWe need know EkamApp specifics. Likely from codeba"
+    },
+    {
+      "id": "B3-admin-gst-mode-watch-only",
+      "kind": "grounding",
+      "elapsed_s": 178.0,
+      "scores": {
+        "grounding": 0.0
+      },
+      "details": {
+        "grounding": "facts 0/1; missing: ['watch']"
+      },
+      "output": "We need answer user's question: \"In EkamApp's admin_gst_api.py, does the GST rate-check endpoint still accept a mode=full query parameter to trigger a manual refresh job? What mode value does it actually accept today?\"\n\nNeed inspect code? We don't have file content. Need likely use tools? We have no explicit file access tool except maybe can reason? Need answer based on knowledge? We need be accur"
+    },
+    {
+      "id": "B4-similar-items-field",
+      "kind": "grounding",
+      "elapsed_s": 178.0,
+      "scores": {
+        "grounding": 0.5,
+        "citation": 0.0
+      },
+      "details": {
+        "grounding": "facts 1/2; missing: ['read']",
+        "citation": "asserted [42, 27, 20, 18, 25]; correct []; FABRICATED [42, 27, 20, 18, 25]"
+      },
+      "output": "We need answer user's question: \"In EkamApp, what type is the `similar_items` field on the ItemResponse Pydantic class, and on what line is it declared?\" Need find in EkamApp code. We don't have direct file access? Need maybe use tools? We only have analysis. Need infer? We need likely answer from codebase. We need be accurate. We need maybe know EkamApp? Could be a project. Need search? No web/se"
+    },
+    {
+      "id": "B5-tenant-ids-endpoint-auth",
+      "kind": "grounding",
+      "elapsed_s": 178.0,
+      "scores": {
+        "grounding": 0.0
+      },
+      "details": {
+        "grounding": "facts 0/1; FABRICATED: ['authorization', 'bearer']; missing: ['x-internal-api-key']"
+      },
+      "output": "We need answer user's question: \"How does EkamApp's internal /internal/tenant-ids-by-users endpoint (business-service calling authentication-service) authenticate the caller? Name the exact HTTP header it checks.\"\n\nNeed infer from some codebase? We don't have context. Need likely answer from known project? EkamApp? Need maybe search memory? We can't browse. Need reason. The question asks exact HTT"
+    },
+    {
+      "id": "C1-gst-resolver-signature",
+      "kind": "citation",
+      "elapsed_s": 28.3,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 3/3",
+        "citation": "asserted [27, 27, 27]; correct [27, 27, 27]; FABRICATED []"
+      },
+      "output": "We need answer user's question. Need identify line declares function and parameter names in order. Excerpt shows line 27: async def resolve_gst_for_hsn(db: AsyncSession, hsn_prefix: str, as_of=None) -> Optional[float]:. So line 27 declares function. Parameters: db, hsn_prefix, as_of. Need final concise. Ensure no extra.\n</think>\n\nThe function is declared on **line 27**. Its three parameter names, "
+    },
+    {
+      "id": "C10-pg-trgm-index-migration",
+      "kind": "citation",
+      "elapsed_s": 64.1,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 0.429
+      },
+      "details": {
+        "grounding": "facts 1/1",
+        "citation": "asserted [23, 24, 22, 23, 24, 23, 24]; correct [24, 24, 24]; FABRICATED [23, 22, 23, 23]"
+      },
+      "output": "We need answer user's question. Need analyze excerpt. User asks: Numbered excerpt from EkamApp alembic migration file:\n21|def upgrade() -> None:\n22|    op.execute(\"CREATE EXTENSION IF NOT EXISTS pg_trgm\")\n23|    op.execute(\n24|        \"CREATE INDEX ix_items_name_trgm ON inventory.items \"\n25|        \"USING gin (name gin_trgm_ops)\"\n26|    )\n\nWhich line(s) create the GIN trigram index, and what is th"
+    },
+    {
+      "id": "C11-voucher-ewb-valid-until",
+      "kind": "citation",
+      "elapsed_s": 176.5,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 0.857
+      },
+      "details": {
+        "grounding": "facts 1/1",
+        "citation": "asserted [383, 386, 386, 386, 386, 386, 386]; correct [386, 386, 386, 386, 386, 386]; FABRICATED [383]"
+      },
+      "output": "We need answer user's question. Need inspect? User gives numbered excerpt from API/inventory-service/models.py lines 383-389. Question: Which line declares the e-way bill expiry field, and does the Voucher model also have a generic expiry_date or valid_until field separate from this one?\n\nWe need answer based on excerpt? It asks which line declares e-way bill expiry field: line 386 ewb_valid_until"
+    },
+    {
+      "id": "C2-tenant-ids-endpoint",
+      "kind": "citation",
+      "elapsed_s": 22.7,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 1/1",
+        "citation": "asserted [255, 255]; correct [255, 255]; FABRICATED []"
+      },
+      "output": "We need answer user's question. Need identify line declares route decorator and status code. Excerpt:\n255|@router.post(\"/internal/tenant-ids-by-users\", status_code=200)\nSo line 255 declares route decorator, status_code=200. Need final concise. Ensure no extra.\n</think>\n\nThe route decorator is declared on **line 255**, and it declares a successful response status code of **200**."
+    },
+    {
+      "id": "C3-router-signature",
+      "kind": "citation",
+      "elapsed_s": 28.5,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 2/2",
+        "citation": "asserted [209, 209]; correct [209, 209]; FABRICATED []"
+      },
+      "output": "We need answer user's question. Need identify line declares parameter whose wire-level name is status. Excerpt:\n206 category...\n207 category_id...\n208 item_type...\n209 status_filter: Literal[...] = Query(\"active\", alias=\"status\"),\n210 tags...\nWire-level name is status due to alias=\"status\". Parameter name is status_filter. Line 209. Need final concise.\n</think>\n\nLine **209** declares it: `status_f"
+    },
+    {
+      "id": "C4-voucher-types-grn",
+      "kind": "citation",
+      "elapsed_s": 49.2,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 1/1",
+        "citation": "asserted [49, 49]; correct [49, 49]; FABRICATED []"
+      },
+      "output": "We need answer user's question. Need use it. User asks: \"Numbered excerpt from API/inventory-service/router/vouchers_api.py:\n\n   46|VOUCHER_TYPES = {\n   47|    \"sales_invoice\", \"purchase_invoice\", \"sales_order\", \"purchase_order\",\n   48|    \"delivery_challan\", \"credit_note\", \"debit_note\", \"stock_adjustment\", \"stock_transfer\",\n   49|    \"grn\",  # Goods Receipt Note -- receives against PO\n   50|}\n\nWh"
+    },
+    {
+      "id": "C5-hsn-migration-revision",
+      "kind": "citation",
+      "elapsed_s": 52.1,
+      "scores": {
+        "grounding": 0.5,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 1/1; FABRICATED: ['078574d36f0f']",
+        "citation": "asserted [22, 22]; correct [22, 22]; FABRICATED []"
+      },
+      "output": "We need answer user's question. Need analyze. User asks: Numbered excerpt from EkamApp alembic migration file:\n21|revision: str = \"078574d36f0f\"\n22|down_revision: Union[str, None] = \"7253d0f70468\"\n23|branch_labels: Union[str, Sequence[str], None] = None\n24|depends_on: Union[str, Sequence[str], None] = None\n\nWhich line declares this migration's parent revision, and what is its exact value?\n\nNeed an"
+    },
+    {
+      "id": "C6-auth-client-signature",
+      "kind": "citation",
+      "elapsed_s": 44.3,
+      "scores": {
+        "grounding": 0.75,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 2/2; FABRICATED: ['tenant_id']",
+        "citation": "asserted [47, 47, 47]; correct [47, 47, 47]; FABRICATED []"
+      },
+      "output": "We need answer user's question. Need analyze. User asks: \"Numbered excerpt from API/utils/service_clients/auth_service_client.py:\n\n   47|async def get_tenant_ids_for_users(\n   48|    user_ids: list[str],\n   49|    internal_api_key: str,\n   50|) -> dict:\n\nWhich line declares the function itself (not its parameters), and what are the two parameter names?\"\n\nNeed answer: line 47 declares function itse"
+    },
+    {
+      "id": "C7-voucher-number-set-on-post",
+      "kind": "citation",
+      "elapsed_s": 72.8,
+      "scores": {
+        "grounding": 0.833,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 1/1; FABRICATED: ['at creation']",
+        "citation": "asserted [358, 358]; correct [358, 358]; FABRICATED []"
+      },
+      "output": "We need answer user's question. Need analyze excerpt. User asks: \"Numbered excerpt from API/inventory-service/models.py:\n\n   356|    voucher_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   357|    tenant_id = Column(UUID(as_uuid=True), nullable=False)\n   358|    voucher_number = Column(String(30), nullable=True)  # set on post\n   359|    voucher_type = Column(String(30), nullab"
+    },
+    {
+      "id": "C8-plan-limits-internal-call",
+      "kind": "citation",
+      "elapsed_s": 48.8,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 0.5
+      },
+      "details": {
+        "grounding": "facts 1/1",
+        "citation": "asserted [165, 166, 167, 166, 167, 167, 166, 167]; correct [167, 167, 167, 167]; FABRICATED [165, 166, 166, 166]"
+      },
+      "output": "We need answer user's question. Need identify line making internal HTTP call to business-service and port. Excerpt lines 165-171. The actual call is `resp = await c.get(...)` on line 166? The URL is on line 167. Question: \"Which line makes the internal HTTP call to business-service, and what port does it target?\" Need likely say line 166 (the `await c.get(` call) makes the HTTP call, targeting por"
+    },
+    {
+      "id": "C9-ekamapp-mcp-tools",
+      "kind": "citation",
+      "elapsed_s": 178.2,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 1/1",
+        "citation": "asserted [24, 24, 24, 24, 24, 24]; correct [24, 24, 24, 24, 24, 24]; FABRICATED []"
+      },
+      "output": "We need answer user's question. Need analyze. User: \"Numbered excerpt from mcp-server/tools/context.py:\n\n   24|def get_context_section(topic: str) -> str:\n\n...\n\n   66|def list_recent_files(limit: int = 30) -> str:\n\nWhich line declares get_context_section, and does EkamApp's own MCP server (as opposed to hive-mcp) also register a generic get_file_content tool?\"\n\nNeed answer likely from some context"
+    },
+    {
+      "id": "D-guard10",
+      "kind": "guard",
+      "elapsed_s": 165.3,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/2"
+      },
+      "output": "We need answer user's request. They say: Project rule: When writing an apply_diff call, old_string must appear exactly once... Write code that follows this rule. Output only code.\n\nWe need produce code? Likely they want a code snippet demonstrating apply_diff usage following rule? Need output only code. Need infer expected. Maybe they want code that enforces rule? \"Write code that follows this rul"
+    },
+    {
+      "id": "D-guard12",
+      "kind": "guard",
+      "elapsed_s": 179.5,
+      "scores": {
+        "guard": 1.0
+      },
+      "details": {
+        "guard": "required 1/1"
+      },
+      "output": "We need answer user's request. Need produce final only code. User: \"Project rule:\nIf `apply_diff()` returns anything starting with `\"apply_diff failed:\"`, the change was NOT made.\nReport the exact error to the coordinator and STOP. Do NOT describe what the change would look\nlike. Do NOT claim `review_pending`. Do NOT continue to the next diff.\n\nThe most common cause is an `old_string` that does no"
+    },
+    {
+      "id": "D-guard14",
+      "kind": "guard",
+      "elapsed_s": 178.0,
+      "scores": {
+        "guard": 1.0
+      },
+      "details": {
+        "guard": "required 1/1"
+      },
+      "output": "We need answer user's request. They say: Project rule: relative_path argument to apply_diff() must always be original file path, never .hive_proposed path. MCP server automatically reads from staged .hive_proposed file when exists \u2014 you do not need to (and must not) reference .hive_proposed path in apply_diff. Write code that follows this rule. Output only code.\n\nNeed produce code only. Need infer"
+    },
+    {
+      "id": "D-guard18",
+      "kind": "guard",
+      "elapsed_s": 174.9,
+      "scores": {
+        "guard": 1.0
+      },
+      "details": {
+        "guard": "required 1/1"
+      },
+      "output": "We need answer user's request. Need produce final only code. User: \"Project rule:\nSQLAlchemy 2.x's `AsyncSession.execute()` does not accept a bare Python string \u2014\nit raises `ObjectNotExecutableError`. Any hand-written SQL (not built via `select()`/`update()`)\nmust be wrapped.\n\nWrite code that follows this rule. Output only code.\"\n\nNeed output code only. Need likely provide a code snippet demonstra"
+    },
+    {
+      "id": "D-guard2",
+      "kind": "guard",
+      "elapsed_s": 137.9,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/1"
+      },
+      "output": "We need answer user's request: \"Project rule:\nWhen building a diff/changelog, always snapshot the current value into a local\nvariable **before** you change it. Reading from the object after mutation gives the new value.\n\nWrite code that follows this rule. Output only code.\"\n\nNeed output only code. Need infer what code? They ask write code that follows this rule. Probably provide a code snippet dem"
+    },
+    {
+      "id": "D-guard20",
+      "kind": "guard",
+      "elapsed_s": 178.2,
+      "scores": {
+        "guard": 0.5
+      },
+      "details": {
+        "guard": "required 1/2"
+      },
+      "output": "We need answer user's request. Need produce code only. User: \"Project rule:\nWhen a Pydantic request schema has extra fields that don't correspond to ORM columns\n(e.g. `override_reason`, `attested` used only for validation logic, not persisted), you\nMUST exclude them before `**model_dump()` into the SQLAlchemy model constructor. SQLAlchemy's\ndeclarative `__init__` checks `hasattr(cls, key)` for eve"
+    },
+    {
+      "id": "D-guard24",
+      "kind": "guard",
+      "elapsed_s": 178.0,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/1"
+      },
+      "output": "We need answer user's request. Need produce final code only. Need infer what code? User: \"Project rule:\nWhen a list endpoint accepts optional filters (`status`, `tenant_id`, etc.), build the\nfiltered `select()` statement once, then derive the count from that same filtered statement\n(e.g. `select(func.count()).select_from(stmt.subquery())`) \u2014 BEFORE appending\n`.order_by()/.offset()/.limit()`. Do no"
+    },
+    {
+      "id": "D-guard26",
+      "kind": "guard",
+      "elapsed_s": 178.0,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/2"
+      },
+      "output": "We need answer user's request. Need produce final only code. Need infer what code? User: \"Project rule: ... Write code that follows this rule. Output only code.\" Likely wants a React handler example demonstrating mutation then refetch, await refetch promise chain completely before finally flips disabled/loading off. Need output only code. Need maybe TypeScript React component. Ensure no prose. Nee"
+    },
+    {
+      "id": "D-guard28",
+      "kind": "guard",
+      "elapsed_s": 178.0,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/2"
+      },
+      "output": "We need answer user's request. Need produce final only code. User: \"Project rule:\nThis schema deliberately gives a tenant and its business(es) separate identifiers \u2014 one tenant\naccount can own multiple businesses, each with its own `business_id`, not necessarily synced\n1:1 with `tenant_id`. Confirmed: **zero** rows in `business.business_profiles` ever have\n`business_id == tenant_id` for their owni"
+    },
+    {
+      "id": "D-guard30",
+      "kind": "guard",
+      "elapsed_s": 169.3,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/2"
+      },
+      "output": "We need to respond to user: \"Project rule:\n\nWrite code that follows this rule. Output only code.\"\n\nWe need to output only code. But what code? The user gives a project rule: \"Write code that follows this rule. Output only code.\" It's meta. Need likely produce code that follows the rule? Maybe they expect a code snippet that implements the rule? Need infer. They say Project rule: Write code that fo"
+    },
+    {
+      "id": "D-guard32",
+      "kind": "guard",
+      "elapsed_s": 169.5,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/1"
+      },
+      "output": "We need to respond to user: \"Project rule:\n\nWrite code that follows this rule. Output only code.\"\n\nWe need to output only code. But what code? The user gives a project rule: \"Write code that follows this rule. Output only code.\" It's meta. Need likely produce code that follows the rule? Maybe they expect a code snippet that implements the rule? Need infer. They say Project rule: Write code that fo"
+    },
+    {
+      "id": "D-guard36",
+      "kind": "guard",
+      "elapsed_s": 178.3,
+      "scores": {
+        "guard": 0.5
+      },
+      "details": {
+        "guard": "required 1/2"
+      },
+      "output": "We need answer user's request. Need produce code only. User: \"Project rule:\nProduced 2026-07-29: asked for a backfill script that \"verifies uniqueness, and if any\nduplicates found, raise an error instead of committing\" \u2014 the Coder wrote\n`await db.commit()` for the item updates, and only ran the duplicate-check query\n**after** that commit had already gone through. The subsequent `raise ValueError(."
+    },
+    {
+      "id": "D-guard4",
+      "kind": "guard",
+      "elapsed_s": 178.0,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 2/2; VIOLATION present: ['Session']"
+      },
+      "output": "We need answer user's request. Need produce final only code. User: \"Project rule:\nThis project uses SQLAlchemy 2.x async throughout. Every DB dependency is\n`AsyncSession = Depends(get_async_db)`. Using sync `Session` will deadlock uvicorn.\n\nWrite code that follows this rule. Output only code.\"\n\nNeed likely provide code snippet demonstrating FastAPI dependency with async SQLAlchemy 2.x. Output only"
+    },
+    {
+      "id": "D-guard6",
+      "kind": "guard",
+      "elapsed_s": 178.0,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/1"
+      },
+      "output": "We need to respond to user: \"Project rule:\nWhen adding a new schema import to a router file, use the exact class name\nfrom `schemas.py`. Do not guess or paraphrase.\n\nWrite code that follows this rule. Output only code.\"\n\nNeed output only code. Need infer likely they want a router file code that imports schema from schemas.py exact class name. But no specific schema class given. Need maybe produce "
+    },
+    {
+      "id": "E1-vouchers-redemption-design-doc",
+      "error": "TimeoutError: timed out",
+      "scores": {}
+    },
+    {
+      "id": "E2-voucher-types-line-precision",
+      "error": "TimeoutError: timed out",
+      "scores": {}
+    }
+  ]
+}

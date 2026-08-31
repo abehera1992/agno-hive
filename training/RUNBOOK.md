@@ -94,6 +94,25 @@ Those are the only prompts where stale-weight fabrication is detectable.
 
 ### 2.5.3 Re-baseline on the widened set
 
+> **The served WEIGHTS are the only thing that distinguishes a baseline run from a
+> candidate run.** The command below is byte-identical to the candidate command apart
+> from `--out`/`--label`: both point at `:8003` and ask for `local-shared`, which is a
+> stable alias whose backing checkpoint has been swapped at least four times
+> (granite4.1:30b → qwen3-coder:30b → Qwen3-30B-A3B-Instruct-2507-FP8 → qwen3-30b-hive-v2-fp8).
+>
+> So **check what `:8003` is actually serving before running this**, or the output is a
+> candidate measurement wearing the baseline filename:
+>
+> ```bash
+> docker inspect vllm-coord --format '{{range .Mounts}}{{.Source}}{{println}}{{end}}'
+> ```
+>
+> Done wrong on 2026-08-31: this command was run while v2 was served, producing
+> candidate scores in `baseline.json` — the file `gate.py` compares every future
+> candidate against. Nothing errored; the numbers simply meant something other than
+> their filename. An untracked file also leaves no trace when overwritten, which is why
+> the eval outputs are now committed (see 2.5.4).
+
 ```bash
 ~/miniforge3/envs/zgx/bin/python -m training.eval.harness \
   --base-url http://localhost:8003/v1 --model local-shared \
@@ -102,6 +121,25 @@ Those are the only prompts where stale-weight fabrication is detectable.
 ```
 
 The 6-case baseline is **superseded** — do not compare a widened candidate against it.
+
+### 2.5.4 Commit the eval output
+
+Eval results are tracked in git (`training/eval/*.json`). They are small (~25 KB), they
+are the only record of how a given checkpoint scored, and leaving them untracked made it
+impossible to answer "did a baseline ever exist?" after one was overwritten.
+
+Two things to know when reading them:
+
+* **Scores move between identical runs.** Two runs of the same 44 cases against the same
+  served model, minutes apart, gave `C 93.3% → 86.7%` and `D 21.4% → 28.6%`. At n=14-15
+  one case flipping is ~7 points, so treat any single-run C/D delta under ~10 points as
+  noise. A/B/E were stable across both.
+* **Axis D's scorer requires literal strings the prompt never states.** D-guard10 gives a
+  rule about `old_string` uniqueness, says "write code that follows this rule", then
+  requires the output to contain `db.add(invite)` and `db.refresh(invite)` — names that
+  appear only in the guard's original example. Cases whose required string IS in the
+  prompt pass; cases whose isn't, fail. D is not a clean measure of rule-following until
+  that is fixed.
 
 ---
 

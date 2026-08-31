@@ -1,0 +1,621 @@
+{
+  "label": "qwen3-30b-hive-v2-fp8 (deployed, served as local-shared)",
+  "model": "local-shared",
+  "base_url": "http://localhost:8003/v1",
+  "timestamp": "2026-08-31T19:53:35Z",
+  "aggregate": {
+    "tool_call": 1.0,
+    "grounding": 0.803,
+    "citation": 0.867,
+    "guard": 0.286,
+    "repetition": 1.0
+  },
+  "results": [
+    {
+      "id": "A-tool-01-get_file_content",
+      "kind": "tool_call",
+      "elapsed_s": 0.5,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to get_file_content with ['relative_path']"
+      },
+      "output": ""
+    },
+    {
+      "id": "A-tool-02-get_file_content",
+      "kind": "tool_call",
+      "elapsed_s": 0.5,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to get_file_content with ['relative_path']"
+      },
+      "output": ""
+    },
+    {
+      "id": "A-tool-03-search_files",
+      "kind": "tool_call",
+      "elapsed_s": 0.6,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to search_files with ['glob_filter', 'pattern']"
+      },
+      "output": ""
+    },
+    {
+      "id": "A-tool-04-search_files",
+      "kind": "tool_call",
+      "elapsed_s": 0.6,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to search_files with ['glob_filter', 'pattern']"
+      },
+      "output": ""
+    },
+    {
+      "id": "A-tool-05-find_files",
+      "kind": "tool_call",
+      "elapsed_s": 0.5,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to find_files with ['glob_pattern']"
+      },
+      "output": ""
+    },
+    {
+      "id": "A-tool-06-find_files",
+      "kind": "tool_call",
+      "elapsed_s": 0.5,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to find_files with ['glob_pattern']"
+      },
+      "output": ""
+    },
+    {
+      "id": "A-tool-07-run_command",
+      "kind": "tool_call",
+      "elapsed_s": 0.5,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to run_command with ['cmd']"
+      },
+      "output": ""
+    },
+    {
+      "id": "A-tool-08-run_command",
+      "kind": "tool_call",
+      "elapsed_s": 0.5,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to run_command with ['cmd']"
+      },
+      "output": ""
+    },
+    {
+      "id": "A-tool-09-list_directory",
+      "kind": "tool_call",
+      "elapsed_s": 0.5,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to list_directory with ['path']"
+      },
+      "output": ""
+    },
+    {
+      "id": "A-tool-10-list_directory",
+      "kind": "tool_call",
+      "elapsed_s": 0.4,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to list_directory with ['path']"
+      },
+      "output": ""
+    },
+    {
+      "id": "A-tool-11-get_file_content",
+      "kind": "tool_call",
+      "elapsed_s": 0.6,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to get_file_content with ['relative_path']"
+      },
+      "output": ""
+    },
+    {
+      "id": "A-tool-12-search_files",
+      "kind": "tool_call",
+      "elapsed_s": 0.5,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to search_files with ['glob_filter', 'pattern']"
+      },
+      "output": ""
+    },
+    {
+      "id": "A-tool-13-db_query",
+      "kind": "tool_call",
+      "elapsed_s": 0.7,
+      "scores": {
+        "tool_call": 1.0
+      },
+      "details": {
+        "tool_call": "well-formed call to db_query with ['sql']"
+      },
+      "output": ""
+    },
+    {
+      "id": "B1-hsn-fallback-retired",
+      "kind": "grounding",
+      "elapsed_s": 7.8,
+      "scores": {
+        "grounding": 1.0
+      },
+      "details": {
+        "grounding": "facts 1/1"
+      },
+      "output": "In `EkamApp/gst_resolver.py`, when `resolve_gst_for_hsn` is called for an HSN code that has no corresponding row in `inventory.hsn_catalogue`, **it does not fall back to a code-resident `_HSN_FALLBACK` dict**.\n\nInstead, what actually happens is:\n\n\ud83d\udc49 **The function raises a `ValueError` (or a custom exception like `HSNResolutionError`) with a descriptive message indicating that the HSN code is not f"
+    },
+    {
+      "id": "B2-duplicate-similarity-threshold",
+      "kind": "grounding",
+      "elapsed_s": 3.6,
+      "scores": {
+        "grounding": 0.5
+      },
+      "details": {
+        "grounding": "facts 1/2; missing: ['0.4']"
+      },
+      "output": "In EkamApp, when a new item is created, the system uses PostgreSQL's `pg_trgm` extension to detect potentially similar existing item names for the current tenant. Based on the typical implementation patterns in such systems:\n\n- The **similarity threshold** is set to **0.7 (70%)**. This means that if the `similarity()` function returns a value greater than or equal to 0.7, the existing item is cons"
+    },
+    {
+      "id": "B3-admin-gst-mode-watch-only",
+      "kind": "grounding",
+      "elapsed_s": 3.7,
+      "scores": {
+        "grounding": 0.0
+      },
+      "details": {
+        "grounding": "facts 0/1; missing: ['watch']"
+      },
+      "output": "As of the current implementation in `admin_gst_api.py` within EkamApp, **the GST rate-check endpoint no longer accepts `mode=full`** to trigger a manual refresh job.\n\nInstead, the endpoint now accepts only **`mode=refresh`** (or `mode=sync`) to initiate a manual refresh of GST rates. The `mode=full` parameter has been deprecated and is no longer functional.\n\n### Summary:\n- \u274c `mode=full` \u2192 **Not su"
+    },
+    {
+      "id": "B4-similar-items-field",
+      "kind": "grounding",
+      "elapsed_s": 1.6,
+      "scores": {
+        "grounding": 0.5,
+        "citation": 0.0
+      },
+      "details": {
+        "grounding": "facts 1/2; missing: ['read']",
+        "citation": "asserted [15]; correct []; FABRICATED [15]"
+      },
+      "output": "In EkamApp, the `similar_items` field on the `ItemResponse` Pydantic class is of type `List[ItemResponse]` (a list of `ItemResponse` objects), and it is declared on **line 15** of the `models.py` file.\n\nThis field is used to represent a list of related or similar items to the current item, enabling features like \"You might also like\" recommendations."
+    },
+    {
+      "id": "B5-tenant-ids-endpoint-auth",
+      "kind": "grounding",
+      "elapsed_s": 1.4,
+      "scores": {
+        "grounding": 0.0
+      },
+      "details": {
+        "grounding": "facts 0/1; missing: ['x-internal-api-key']"
+      },
+      "output": "EkamApp's internal `/internal/tenant-ids-by-users` endpoint authenticates the caller by checking the exact HTTP header:  \n**`X-Auth-Service-Request`**\n\nThis header is used by the business-service when calling the authentication-service internally, and it carries a signed JWT or token that the authentication-service validates to verify the caller's identity and permissions."
+    },
+    {
+      "id": "B6-items-table-exists",
+      "kind": "grounding",
+      "elapsed_s": 1.7,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 2/2",
+        "citation": "no line asserted (prose location) \u2014 correct on a large file"
+      },
+      "output": "Yes, a table named `items` exists in this project.\n\nIts fully schema-qualified name is: **`inventory.items`**.\n\n### Explanation:\n- The `__tablename__ = \"items\"` directive defines the table name as `items`.\n- The `__table_args__ = {\"schema\": \"inventory\"}` directive specifies that the table belongs to the `inventory` schema.\n- Therefore, the full qualified name is `inventory.items`."
+    },
+    {
+      "id": "B7-item-categories-sku-prefix",
+      "kind": "grounding",
+      "elapsed_s": 0.7,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 2/2",
+        "citation": "asserted [129]; correct [129]; FABRICATED []"
+      },
+      "output": "Yes, the `item_categories` table has a `sku_prefix` column.\n\n- **Line number:** 129  \n- **Column type:** `String(8)`"
+    },
+    {
+      "id": "C1-gst-resolver-signature",
+      "kind": "citation",
+      "elapsed_s": 0.8,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 3/3",
+        "citation": "asserted [27]; correct [27]; FABRICATED []"
+      },
+      "output": "The function is declared on **line 27**.\n\nIts three parameter names in order are:  \n1. `db`  \n2. `hsn_prefix`  \n3. `as_of`"
+    },
+    {
+      "id": "C10-pg-trgm-index-migration",
+      "kind": "citation",
+      "elapsed_s": 2.8,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 1/1",
+        "citation": "asserted [25]; correct [25]; FABRICATED []"
+      },
+      "output": "The line that creates the GIN trigram index is:\n\n**Line 25**:  \n`\"CREATE INDEX ix_items_name_trgm ON inventory.items USING gin (name gin_trgm_ops)\"`\n\n### Index Name:\nThe index is named **`ix_items_name_trgm`**.\n\n### Explanation:\n- `CREATE INDEX ix_items_name_trgm` \u2014 defines the name of the index.\n- `ON inventory.items` \u2014 specifies the table.\n- `USING gin (name gin_trgm_ops)` \u2014 creates a GIN (Gener"
+    },
+    {
+      "id": "C11-voucher-ewb-valid-until",
+      "kind": "citation",
+      "elapsed_s": 4.0,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 0.0
+      },
+      "details": {
+        "grounding": "facts 1/1",
+        "citation": "asserted [387]; correct []; FABRICATED [387]"
+      },
+      "output": "The e-way bill expiry field is declared on **line 387**:\n\n```python\n387|    ewb_valid_until = Column(\n388|        DateTime(timezone=True), nullable=True\n389|    )  # IRP e-invoice IRN\n```\n\nThis field, `ewb_valid_until`, specifically tracks the expiry date/time of the e-way bill.\n\nRegarding your second question: **No**, based on the provided excerpt from `models.py`, the `Voucher` model does **not*"
+    },
+    {
+      "id": "C12-parties-delete-vs-add-registration",
+      "kind": "citation",
+      "elapsed_s": 0.4,
+      "scores": {
+        "citation": 1.0,
+        "grounding": 1.0
+      },
+      "details": {
+        "citation": "asserted [194]; correct [194]; FABRICATED []",
+        "grounding": "facts 1/1"
+      },
+      "output": "The `delete_party` endpoint function is defined on line 194."
+    },
+    {
+      "id": "C2-tenant-ids-endpoint",
+      "kind": "citation",
+      "elapsed_s": 1.4,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 1/1",
+        "citation": "asserted [255]; correct [255]; FABRICATED []"
+      },
+      "output": "The route decorator is declared on **line 255**:\n\n```python\n@router.post(\"/internal/tenant-ids-by-users\", status_code=200)\n```\n\nThis line declares a POST route at the path `/internal/tenant-ids-by-users` and specifies that a successful response should return an HTTP status code of **200**."
+    },
+    {
+      "id": "C3-router-signature",
+      "kind": "citation",
+      "elapsed_s": 1.1,
+      "scores": {
+        "grounding": 0.5,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 1/2; missing: ['status_filter']",
+        "citation": "asserted [209]; correct [209]; FABRICATED []"
+      },
+      "output": "Line 209 declares the parameter whose wire-level name is `status`.\n\nThis is indicated by the `alias=\"status\"` argument in the `Query` function, which specifies that the parameter should be exposed as `status` in the API request (i.e., in the query string)."
+    },
+    {
+      "id": "C4-voucher-types-grn",
+      "kind": "citation",
+      "elapsed_s": 0.7,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 1/1",
+        "citation": "asserted [49]; correct [49]; FABRICATED []"
+      },
+      "output": "The `grn` value is declared on **line 49**.\n\nThe trailing comment says it stands for **\"Goods Receipt Note -- receives against PO\"**."
+    },
+    {
+      "id": "C5-hsn-migration-revision",
+      "kind": "citation",
+      "elapsed_s": 0.6,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 1/1",
+        "citation": "asserted [22]; correct [22]; FABRICATED []"
+      },
+      "output": "Line 22 declares this migration's parent revision, and its exact value is `\"7253d0f70468\"`."
+    },
+    {
+      "id": "C6-auth-client-signature",
+      "kind": "citation",
+      "elapsed_s": 0.9,
+      "scores": {
+        "grounding": 0.75,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 2/2; FABRICATED: ['tenant_id']",
+        "citation": "asserted [47]; correct [47]; FABRICATED []"
+      },
+      "output": "The line that declares the function itself is:\n\n**Line 47**: `async def get_tenant_ids_for_users(`\n\nThe two parameter names are:\n\n1. `user_ids`  \n2. `internal_api_key`"
+    },
+    {
+      "id": "C7-voucher-number-set-on-post",
+      "kind": "citation",
+      "elapsed_s": 1.1,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 1/1",
+        "citation": "asserted [358]; correct [358]; FABRICATED []"
+      },
+      "output": "Line 358 declares `voucher_number`.\n\nPer its trailing comment (`# set on post`), `voucher_number` is assigned a value **when the voucher is created (on POST)** \u2014 that is, during the initial creation of a voucher record via an HTTP POST request."
+    },
+    {
+      "id": "C8-plan-limits-internal-call",
+      "kind": "citation",
+      "elapsed_s": 1.7,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 1/1",
+        "citation": "asserted [167]; correct [167]; FABRICATED []"
+      },
+      "output": "The line that makes the internal HTTP call to `business-service` is:\n\n**Line 167**:\n```python\nresp = await c.get(\n    f\"http://business-service:8004/internal/tenant/{tenant_id}/plan-limits\",\n    headers={\"X-Internal-API-Key\": settings.INTERNAL_API_KEY},\n)\n```\n\n- **Target service**: `business-service`\n- **Target port**: `8004`"
+    },
+    {
+      "id": "C9-ekamapp-mcp-tools",
+      "kind": "citation",
+      "elapsed_s": 2.4,
+      "scores": {
+        "grounding": 1.0,
+        "citation": 1.0
+      },
+      "details": {
+        "grounding": "facts 1/1",
+        "citation": "asserted [24]; correct [24]; FABRICATED []"
+      },
+      "output": "The function `get_context_section` is declared on **line 24** of `mcp-server/tools/context.py`.\n\nRegarding your second question: **No**, EkamApp's own MCP server (as opposed to hive-mcp) does **not** register a generic `get_file_content` tool. Instead, it uses a more restricted and context-aware approach\u2014specifically, `get_context_section`\u2014to retrieve content from files, typically within a structu"
+    },
+    {
+      "id": "D-guard10",
+      "kind": "guard",
+      "elapsed_s": 1.9,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/2"
+      },
+      "output": "```python\nasync def apply_diff(target_file, old_string, new_string):\n    with open(target_file, 'r') as f:\n        content = f.read()\n    \n    if content.count(old_string) != 1:\n        raise ValueError(f\"Expected exactly one occurrence of '{old_string}', found {content.count(old_string)}\")\n    \n    updated_content = content.replace(old_string, new_string)\n    \n    with open(target_file, 'w') as f"
+    },
+    {
+      "id": "D-guard12",
+      "kind": "guard",
+      "elapsed_s": 1.5,
+      "scores": {
+        "guard": 1.0
+      },
+      "details": {
+        "guard": "required 1/1"
+      },
+      "output": "def apply_diff(path, old_string, new_string):\n    content = get_file_content(path)\n    if not content.startswith(old_string):\n        return f\"apply_diff failed: expected '{old_string}' at start of {path}, but got '{content[:len(old_string)]}'\"\n    updated_content = new_string + content[len(old_string):]\n    write_file(path, updated_content)\n    return None"
+    },
+    {
+      "id": "D-guard14",
+      "kind": "guard",
+      "elapsed_s": 0.6,
+      "scores": {
+        "guard": 1.0
+      },
+      "details": {
+        "guard": "required 1/1"
+      },
+      "output": "```python\n# Example of correct usage\napply_diff(relative_path=\"src/components/MyComponent.tsx\", diff=diff_content)\n```"
+    },
+    {
+      "id": "D-guard18",
+      "kind": "guard",
+      "elapsed_s": 1.0,
+      "scores": {
+        "guard": 1.0
+      },
+      "details": {
+        "guard": "required 1/1"
+      },
+      "output": "from sqlalchemy import text\nfrom sqlalchemy.ext.asyncio import AsyncSession\n\nasync def execute_raw_sql(session: AsyncSession, query: str, params: dict = None):\n    result = await session.execute(text(query), params or {})\n    return result.fetchall()"
+    },
+    {
+      "id": "D-guard2",
+      "kind": "guard",
+      "elapsed_s": 0.5,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/1"
+      },
+      "output": "const oldValue = obj.property;\nobj.property = newValue;\n// Use `oldValue` for any logic that needs the original value"
+    },
+    {
+      "id": "D-guard20",
+      "kind": "guard",
+      "elapsed_s": 3.2,
+      "scores": {
+        "guard": 0.5
+      },
+      "details": {
+        "guard": "required 1/2"
+      },
+      "output": "```python\nfrom pydantic import BaseModel\nfrom sqlalchemy import Column, Integer, String\nfrom sqlalchemy.ext.declarative import declarative_base\n\nBase = declarative_base()\n\nclass UserORM(Base):\n    __tablename__ = \"users\"\n    id = Column(Integer, primary_key=True)\n    name = Column(String)\n    email = Column(String)\n\nclass UserRequest(BaseModel):\n    name: str\n    email: str\n    override_reason: st"
+    },
+    {
+      "id": "D-guard24",
+      "kind": "guard",
+      "elapsed_s": 2.1,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/1"
+      },
+      "output": "```python\nstmt = select(Model).where(Model.some_column == some_value)\n\nif status:\n    stmt = stmt.where(Model.status == status)\nif tenant_id:\n    stmt = stmt.where(Model.tenant_id == tenant_id)\n\n# Build count from the same filtered statement\ncount_stmt = select(func.count()).select_from(stmt.subquery())\ntotal = session.execute(count_stmt).scalar_one()\n\n# Now apply ordering, pagination\nstmt = stmt."
+    },
+    {
+      "id": "D-guard26",
+      "kind": "guard",
+      "elapsed_s": 1.1,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/2"
+      },
+      "output": "```jsx\nconst handleMutation = async () => {\n  try {\n    await mutate();\n    await refetch(); // await the full promise chain\n  } catch (error) {\n    // handle error\n  } finally {\n    setDisabled(false);\n    setLoading(false);\n  }\n};\n```"
+    },
+    {
+      "id": "D-guard28",
+      "kind": "guard",
+      "elapsed_s": 2.2,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/2"
+      },
+      "output": "```python\nclass TenantBusinessSchema:\n    def __init__(self, tenant_id, business_id):\n        if not tenant_id:\n            raise ValueError(\"tenant_id is required\")\n        if not business_id:\n            raise ValueError(\"business_id is required\")\n        \n        # Ensure business_id is not equal to tenant_id\n        if tenant_id == business_id:\n            raise ValueError(\n                \"bu"
+    },
+    {
+      "id": "D-guard30",
+      "kind": "guard",
+      "elapsed_s": 0.3,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/2"
+      },
+      "output": "```python\ndef project_rule():\n    pass\n```"
+    },
+    {
+      "id": "D-guard32",
+      "kind": "guard",
+      "elapsed_s": 0.3,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/1"
+      },
+      "output": "```python\ndef project_rule():\n    pass\n```"
+    },
+    {
+      "id": "D-guard36",
+      "kind": "guard",
+      "elapsed_s": 3.3,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/2"
+      },
+      "output": "```python\nasync def backfill_with_uniqueness_check(db, items):\n    # First, check for duplicates across all items to be inserted/updated\n    item_keys = [item['key'] for item in items]\n    existing_keys = await db.fetch_column(\"SELECT key FROM target_table WHERE key = ANY($1)\", item_keys)\n    \n    duplicates = set(item_keys) & set(existing_keys)\n    if duplicates:\n        raise ValueError(f\"Duplic"
+    },
+    {
+      "id": "D-guard4",
+      "kind": "guard",
+      "elapsed_s": 0.5,
+      "scores": {
+        "guard": 0.5
+      },
+      "details": {
+        "guard": "required 1/2"
+      },
+      "output": "from sqlalchemy.ext.asyncio import AsyncSession\nfrom fastapi import Depends\n\nAsyncSession = Depends(get_async_db)"
+    },
+    {
+      "id": "D-guard6",
+      "kind": "guard",
+      "elapsed_s": 0.2,
+      "scores": {
+        "guard": 0.0
+      },
+      "details": {
+        "guard": "required 0/1"
+      },
+      "output": "from schemas import UserSchema\nfrom schemas import PostSchema"
+    },
+    {
+      "id": "E1-vouchers-redemption-design-doc",
+      "kind": "repetition",
+      "elapsed_s": 18.3,
+      "scores": {
+        "repetition": 1.0
+      },
+      "details": {
+        "repetition": "no repetition/degeneracy detected"
+      },
+      "output": "**Phase 1: Define the Redemption Audit Trail Model**\n\n*Files to modify:* `models.py` (in inventory-service/)\n\n*Changes and why:* Add a new SQLAlchemy model `VoucherRedemptionAudit` to `models.py` to track each redemption event for `credit_note` and `debit_note` voucher types. The model should include fields: `id` (PK), `voucher_id` (FK to Voucher), `redemption_timestamp`, `redeemed_by_user_id`, `r"
+    },
+    {
+      "id": "E2-voucher-types-line-precision",
+      "kind": "repetition",
+      "elapsed_s": 7.2,
+      "scores": {
+        "repetition": 1.0
+      },
+      "details": {
+        "repetition": "no repetition/degeneracy detected"
+      },
+      "output": "Here is the exact line number for each individual value in `VOUCHER_TYPES`, `STOCK_INCREASING`, and `STOCK_DECREASING`, as they appear in the provided excerpt:\n\n---\n\n**VOUCHER_TYPES values (9 total):**\n\n- `\"sales_invoice\"` \u2192 line 47  \n- `\"purchase_invoice\"` \u2192 line 47  \n- `\"sales_order\"` \u2192 line 47  \n- `\"purchase_order\"` \u2192 line 47  \n- `\"delivery_challan\"` \u2192 line 47  \n- `\"credit_note\"` \u2192 line 47  \n- "
+    }
+  ]
+}
