@@ -1,14 +1,23 @@
 {
   "id": "D-guard30",
   "kind": "guard",
-  "provenance": "ekam-code-generation-guards.md GUARD 30 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "origin": "hand",
+  "provenance": "ekam-code-generation-guards.md GUARD 30 - EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards). Hand-authored; see author_guard_cases.py for why the auto-extracted version was replaced.",
   "scorers": [
-    "guard"
+    "structural"
   ],
-  "prompt": "Project rule:\n\n\nWrite code that follows this rule. Output only code.",
-  "guard_required": [
-    "referent_schema",
-    "source_schema"
+  "prompt": "Project rule:\nIn Alembic, `op.create_foreign_key(...)` does not accept a bare `schema=` kwarg -- it is\nsilently absorbed into **dialect_kw, so the FK targets the wrong schema or fails when the\nmigration runs. Pass `source_schema=` for the table being altered and `referent_schema=`\nfor the table being referenced. Both are required when the two tables live outside public.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
+  "structural": [
+    {
+      "type": "kwarg_present",
+      "call": "create_foreign_key",
+      "kwargs": [
+        "source_schema",
+        "referent_schema"
+      ]
+    }
   ],
-  "guard_forbidden": []
+  "selftest_pass": "op.create_foreign_key(\n    \"fk_name\", \"source_table\", \"referent_table\", [\"col\"], [\"ref_col\"],\n    source_schema=\"business\", referent_schema=\"business\",\n)",
+  "selftest_fail": "op.create_foreign_key(\n    \"fk_name\", \"source_table\", \"referent_table\", [\"col\"], [\"ref_col\"],\n    schema=\"business\",\n)"
 }

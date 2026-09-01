@@ -1,17 +1,22 @@
 {
   "id": "D-guard20",
   "kind": "guard",
-  "provenance": "ekam-code-generation-guards.md GUARD 20 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "origin": "hand",
+  "provenance": "ekam-code-generation-guards.md GUARD 20 - EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards). Hand-authored; see author_guard_cases.py for why the auto-extracted version was replaced.",
   "scorers": [
-    "guard"
+    "structural"
   ],
-  "prompt": "Project rule:\nWhen a Pydantic request schema has extra fields that don't correspond to ORM columns\n(e.g. `override_reason`, `attested` used only for validation logic, not persisted), you\nMUST exclude them before `**model_dump()` into the SQLAlchemy model constructor. SQLAlchemy's\ndeclarative `__init__` checks `hasattr(cls, key)` for every kwarg and raises `TypeError:\ninvalid keyword argument` for anything not a\n\nWrite code that follows this rule. Output only code.",
-  "guard_required": [
-    "Item(",
-    "True"
+  "prompt": "Project rule:\nA Pydantic request schema often carries fields that are not ORM columns (used only\nfor validation, never persisted). Before unpacking `model_dump()` into a SQLAlchemy\nmodel constructor you MUST drop those fields, by passing `exclude={...}` to\n`model_dump()`. SQLAlchemy's declarative __init__ raises\n`TypeError: invalid keyword argument` for any kwarg that is not a mapped column.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
+  "structural": [
+    {
+      "type": "kwarg_present",
+      "call": "model_dump",
+      "kwargs": [
+        "exclude"
+      ]
+    }
   ],
-  "guard_forbidden": [
-    "Item(tenant_id",
-    "True))"
-  ]
+  "selftest_pass": "new_item = Item(\n    tenant_id=tenant_id,\n    **item.model_dump(exclude_unset=True, exclude={\"override_reason\", \"attested\"}),\n)",
+  "selftest_fail": "new_item = Item(tenant_id=tenant_id, **item.model_dump(exclude_unset=True))"
 }

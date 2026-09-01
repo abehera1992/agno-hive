@@ -1,17 +1,19 @@
 {
   "id": "D-guard26",
   "kind": "guard",
-  "provenance": "ekam-code-generation-guards.md GUARD 26 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "origin": "hand",
+  "provenance": "ekam-code-generation-guards.md GUARD 26 - EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards). Hand-authored; see author_guard_cases.py for why the auto-extracted version was replaced.",
   "scorers": [
     "guard"
   ],
-  "prompt": "Project rule:\nIn a React handler that does a mutation then a refetch, `await` the refetch's promise chain\ncompletely before the `finally` block flips `disabled`/`loading` state back off. A\nfire-and-forget refetch (`.then(setState)` without `await`) lets the button re-enable and the\nUI report \"done\" before the displayed data has actually refreshed \u2014 the user can double-click\ninto a stale state.\n\nWrite code that follows this rule. Output only code.",
+  "prompt": "Project rule:\nIn a React handler that mutates then refetches, `await` the refetch completely before the\n`finally` block flips the loading/disabled state back off. A fire-and-forget\n`fetch(...).then(...)` lets the button re-enable and the UI claim it is done before the\ndisplayed data has refreshed, so the user can double-click into a stale state.\nWrite the refetch as `await fetch(...)`, then await reading its json, then set state.\n\nWrite typescript code that follows this rule. Output only code.",
+  "lang": "typescript",
   "guard_required": [
-    "fetch(GET_URL)",
-    "refreshed.json()"
+    "await fetch("
   ],
   "guard_forbidden": [
-    "fetch(GET_URL).then(r",
-    "r.json()).then(setItems)"
-  ]
+    ").then("
+  ],
+  "selftest_pass": "const handleUpdateAll = async () => {\n  setUpdating(true);\n  try {\n    const res = await fetch(POST_URL, { method: \"POST\" });\n    if (res.ok) {\n      const refreshed = await fetch(GET_URL);\n      setItems(refreshed.ok ? await refreshed.json() : []);\n    }\n  } finally {\n    setUpdating(false);\n  }\n};",
+  "selftest_fail": "const handleUpdateAll = async () => {\n  setUpdating(true);\n  try {\n    const res = await fetch(POST_URL, { method: \"POST\" });\n    if (res.ok) {\n      fetch(GET_URL).then(r => r.json()).then(setItems);\n    }\n  } finally {\n    setUpdating(false);\n  }\n};"
 }

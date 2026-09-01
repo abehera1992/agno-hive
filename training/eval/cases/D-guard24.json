@@ -1,15 +1,20 @@
 {
   "id": "D-guard24",
   "kind": "guard",
-  "provenance": "ekam-code-generation-guards.md GUARD 24 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "origin": "hand",
+  "provenance": "ekam-code-generation-guards.md GUARD 24 - EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards). Hand-authored; see author_guard_cases.py for why the auto-extracted version was replaced.",
   "scorers": [
     "guard"
   ],
-  "prompt": "Project rule:\nWhen a list endpoint accepts optional filters (`status`, `tenant_id`, etc.), build the\nfiltered `select()` statement once, then derive the count from that same filtered statement\n(e.g. `select(func.count()).select_from(stmt.subquery())`) \u2014 BEFORE appending\n`.order_by()/.offset()/.limit()`. Do not run a separate unfiltered `func.count()` query;\nthe returned `total` will be wrong whenever any filter\n\nWrite code that follows this rule. Output only code.",
+  "prompt": "Project rule:\nIn a paginated list endpoint that accepts optional filters, the COUNT query must apply\nthe SAME filters as the list query. Build the filtered `select()` statement once, then\nderive the count from that same statement with `select_from(...)` over its `subquery()`,\nBEFORE appending `.order_by()/.offset()/.limit()`. Do not issue a separate unfiltered\n`func.count(Model.id)` query -- the returned total is wrong whenever a filter is used.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
   "guard_required": [
-    "db.execute(select(func.count()).select_from(stmt.subquery()))"
+    "select_from",
+    "subquery()"
   ],
   "guard_forbidden": [
-    "db.execute(select(func.count(Model.id)))"
-  ]
+    "func.count(Model.id)"
+  ],
+  "selftest_pass": "stmt = select(Model)\nif status:\n    stmt = stmt.where(Model.status == status)\ncount_result = await db.execute(select(func.count()).select_from(stmt.subquery()))\ntotal = count_result.scalar_one()\nstmt = stmt.order_by(Model.created_at).offset(offset).limit(limit)",
+  "selftest_fail": "stmt = select(Model)\nif status:\n    stmt = stmt.where(Model.status == status)\ncount_result = await db.execute(select(func.count(Model.id)))\ntotal = count_result.scalar_one()\nstmt = stmt.order_by(Model.created_at).offset(offset).limit(limit)"
 }

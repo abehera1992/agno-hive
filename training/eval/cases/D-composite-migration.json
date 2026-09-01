@@ -1,0 +1,28 @@
+{
+  "id": "D-composite-migration",
+  "kind": "guard",
+  "origin": "hand",
+  "provenance": "COMPOSITE of several EVAL-ONLY guards from ekam-code-generation-guards.md - holds them simultaneously, which is the condition real generated code has to meet and where adherence actually breaks down. Added 2026-08-31 to restore discriminating power after the Axis D repair took the single-rule cases to 100%.",
+  "scorers": [
+    "structural"
+  ],
+  "prompt": "Project rule:\nWrite one Alembic migration body that holds both of these rules at once:\n  1. `ForeignKey(...)` is a POSITIONAL argument to `Column(...)` and must come before\n     any keyword argument such as `nullable=` -- a positional after a keyword is a\n     SyntaxError that stops the models file importing.\n  2. `op.create_foreign_key(...)` takes no bare `schema=` kwarg. Pass `source_schema=`\n     for the table being altered and `referent_schema=` for the one referenced;\n     a bare `schema=` is absorbed into **dialect_kw and targets the wrong schema.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
+  "structural": [
+    {
+      "type": "positional_before_keyword",
+      "call": "Column",
+      "token": "ForeignKey"
+    },
+    {
+      "type": "kwarg_present",
+      "call": "create_foreign_key",
+      "kwargs": [
+        "source_schema",
+        "referent_schema"
+      ]
+    }
+  ],
+  "selftest_pass": "supplier_id = Column(UUID(as_uuid=True), ForeignKey(\"inventory.suppliers.id\"), nullable=False)\n\nop.create_foreign_key(\n    \"fk_items_supplier\", \"items\", \"suppliers\", [\"supplier_id\"], [\"id\"],\n    source_schema=\"inventory\", referent_schema=\"inventory\",\n)",
+  "selftest_fail": "supplier_id = Column(UUID(as_uuid=True), nullable=False)\n\nop.create_foreign_key(\n    \"fk_items_supplier\", \"items\", \"suppliers\", [\"supplier_id\"], [\"id\"],\n    schema=\"inventory\",\n)"
+}

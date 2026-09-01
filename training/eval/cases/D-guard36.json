@@ -1,14 +1,20 @@
 {
   "id": "D-guard36",
   "kind": "guard",
-  "provenance": "ekam-code-generation-guards.md GUARD 36 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "origin": "hand",
+  "provenance": "ekam-code-generation-guards.md GUARD 36 - EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards). Hand-authored; see author_guard_cases.py for why the auto-extracted version was replaced.",
   "scorers": [
-    "guard"
+    "structural"
   ],
-  "prompt": "Project rule:\nProduced 2026-07-29: asked for a backfill script that \"verifies uniqueness, and if any\nduplicates found, raise an error instead of committing\" \u2014 the Coder wrote\n`await db.commit()` for the item updates, and only ran the duplicate-check query\n**after** that commit had already gone through. The subsequent `raise ValueError(...)` on\nfinding duplicates then had nothing to prevent \u2014 the bad data was al\n\nWrite code that follows this rule. Output only code.",
-  "guard_required": [
-    "db.flush()",
-    "db.rollback()"
+  "prompt": "Project rule:\nIn a SQLAlchemy async backfill script, when the task says to verify something and abort\ninstead of committing, the check must run BEFORE the data is made permanent. Call\n`db.flush()` on the AsyncSession so the verification query can see the pending changes,\nrun the check, `db.rollback()` and raise if it fails, and only `db.commit()` once the\ncheck has passed. A commit followed by a check has nothing left to prevent.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
+  "structural": [
+    {
+      "type": "call_order",
+      "first": "flush",
+      "second": "commit"
+    }
   ],
-  "guard_forbidden": []
+  "selftest_pass": "item.sku = new_sku\nawait db.flush()\nduplicates = await check_for_duplicates(db)\nif duplicates:\n    await db.rollback()\n    raise ValueError(\"found dupes\")\nawait db.commit()",
+  "selftest_fail": "item.sku = new_sku\nawait db.commit()\nduplicates = await check_for_duplicates(db)\nif duplicates:\n    raise ValueError(\"found dupes\")"
 }

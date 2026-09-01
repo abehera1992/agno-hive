@@ -1,0 +1,26 @@
+{
+  "id": "D-composite-async-text-dump-count",
+  "kind": "guard",
+  "origin": "hand",
+  "provenance": "COMPOSITE of several EVAL-ONLY guards from ekam-code-generation-guards.md - holds them simultaneously, which is the condition real generated code has to meet and where adherence actually breaks down. Added 2026-08-31 to restore discriminating power after the Axis D repair took the single-rule cases to 100%.",
+  "scorers": [
+    "guard"
+  ],
+  "prompt": "Project rule:\nWrite an async paginated list endpoint plus the create handler beside it, holding ALL of these rules at once:\n  1. The DB dependency is `AsyncSession = Depends(get_async_db)` and queries are awaited via `db.execute(select(...))`. A synchronous `Session` with `Depends(get_db)` and `db.query(...)` blocks the event loop and deadlocks uvicorn.\n  2. Any hand-written SQL string passed to `db.execute()` is wrapped in `text()`; SQLAlchemy 2.x raises ObjectNotExecutableError on a bare string.\n  3. Before unpacking `model_dump()` into a SQLAlchemy model constructor, pass `exclude={...}` to drop fields that are not mapped columns; the declarative `__init__` raises TypeError for any kwarg that is not a column.\n  4. A paginated COUNT applies the same filters as the list query: derive it from the filtered statement with `select_from(...)` over its `subquery()`, before appending `.order_by()/.offset()/.limit()`. Never a separate `func.count(Model.id)`.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
+  "guard_required": [
+    "AsyncSession",
+    "get_async_db",
+    "text(",
+    "exclude=",
+    "select_from",
+    "subquery()"
+  ],
+  "guard_forbidden": [
+    "Depends(get_db)",
+    "db.query(",
+    "func.count(Model.id)"
+  ],
+  "selftest_pass": "# AsyncSession\n# get_async_db\n# text(\n# exclude=\n# select_from\n# subquery()",
+  "selftest_fail": "# Depends(get_db)\n# db.query(\n# func.count(Model.id)"
+}

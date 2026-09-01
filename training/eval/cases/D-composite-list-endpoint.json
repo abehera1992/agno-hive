@@ -1,0 +1,25 @@
+{
+  "id": "D-composite-list-endpoint",
+  "kind": "guard",
+  "origin": "hand",
+  "provenance": "COMPOSITE of several EVAL-ONLY guards from ekam-code-generation-guards.md - holds them simultaneously, which is the condition real generated code has to meet and where adherence actually breaks down. Added 2026-08-31 to restore discriminating power after the Axis D repair took the single-rule cases to 100%.",
+  "scorers": [
+    "guard"
+  ],
+  "prompt": "Project rule:\nWrite one async paginated list endpoint that holds all three of these rules at once:\n  1. The DB dependency is `AsyncSession = Depends(get_async_db)` -- a synchronous\n     `Session` with `Depends(get_db)` deadlocks uvicorn.\n  2. Any hand-written SQL string passed to `db.execute()` is wrapped in `text()`;\n     a bare string raises ObjectNotExecutableError.\n  3. The COUNT applies the same filters as the list query: derive it from the filtered\n     statement with `select_from(...)` over its `subquery()`, before appending\n     `.order_by()/.offset()/.limit()`. Never a separate `func.count(Model.id)`.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
+  "guard_required": [
+    "AsyncSession",
+    "get_async_db",
+    "text(",
+    "select_from",
+    "subquery()"
+  ],
+  "guard_forbidden": [
+    "Depends(get_db)",
+    "func.count(Model.id)",
+    "db.query("
+  ],
+  "selftest_pass": "from sqlalchemy import text\nfrom sqlalchemy.ext.asyncio import AsyncSession\n\nasync def list_items(status: str | None = None, offset: int = 0, limit: int = 50,\n                     db: AsyncSession = Depends(get_async_db)):\n    stmt = select(Item)\n    if status:\n        stmt = stmt.where(Item.status == status)\n    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()\n    await db.execute(text(\"SET LOCAL statement_timeout = '5s'\"))\n    rows = (await db.execute(stmt.order_by(Item.created_at).offset(offset).limit(limit)))\n    return {\"total\": total, \"items\": rows.scalars().all()}",
+  "selftest_fail": "from sqlalchemy.orm import Session\n\ndef list_items(status: str | None = None, db: Session = Depends(get_db)):\n    stmt = select(Item)\n    if status:\n        stmt = stmt.where(Item.status == status)\n    total = db.execute(select(func.count(Item.id))).scalar_one()\n    db.execute(\"SET LOCAL statement_timeout = '5s'\")\n    return {\"total\": total, \"items\": db.query(Item).all()}"
+}

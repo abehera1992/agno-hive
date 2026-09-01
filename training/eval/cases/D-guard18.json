@@ -1,13 +1,17 @@
 {
   "id": "D-guard18",
   "kind": "guard",
-  "provenance": "ekam-code-generation-guards.md GUARD 18 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "origin": "hand",
+  "provenance": "ekam-code-generation-guards.md GUARD 18 - EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards). Hand-authored; see author_guard_cases.py for why the auto-extracted version was replaced.",
   "scorers": [
     "guard"
   ],
-  "prompt": "Project rule:\nSQLAlchemy 2.x's `AsyncSession.execute()` does not accept a bare Python string \u2014\nit raises `ObjectNotExecutableError`. Any hand-written SQL (not built via `select()`/`update()`)\nmust be wrapped.\n\nWrite code that follows this rule. Output only code.",
+  "prompt": "Project rule:\nSQLAlchemy 2.x's `AsyncSession.execute()` does not accept a bare Python string -- it\nraises `ObjectNotExecutableError`. Any hand-written SQL that is not built via\n`select()`/`update()` must be wrapped in `text()`, imported from sqlalchemy, before\nbeing passed to `db.execute()`.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
   "guard_required": [
     "text("
   ],
-  "guard_forbidden": []
+  "guard_forbidden": [],
+  "selftest_pass": "from sqlalchemy import text\nresult = await db.execute(\n    text(\"SELECT task_id FROM inventory.gst_compliance_tasks WHERE tenant_id = :tid\"),\n    {\"tid\": tenant_id},\n)",
+  "selftest_fail": "result = await db.execute(\n    \"SELECT task_id FROM inventory.gst_compliance_tasks WHERE tenant_id = :tid\",\n    {\"tid\": tenant_id},\n)"
 }

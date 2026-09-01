@@ -165,6 +165,18 @@ def grounding_cases(src: Path, target: int, rng: random.Random) -> list[dict]:
 # ── Axis D: guard (EVAL-ONLY guards) ──────────────────────────────────────────
 
 def guard_cases(patterns: Path, target: int) -> tuple[list[dict], list[int]]:
+    """Enumerate eval-held guards. EMITTING cases from here is retired (2026-08-31).
+
+    The token extraction below takes a set difference of code tokens between the guard's
+    WRONG and CORRECT blocks, which measures whether the model reproduced the reference
+    snippet's incidental vocabulary rather than whether it followed the rule. It produced
+    cases requiring the local variable `old_used`, cases with an empty rule, and one case
+    requiring 'False)' while forbidding 'False'. Axis D read 21.4% on the result; the same
+    model scores 100% on the hand-authored replacements in `author_guard_cases.py`.
+
+    The holdout enumeration (`held`) is still correct and still needed by --exclude-guards,
+    so this function stays. Only `--auto-guards` is blocked; see main().
+    """
     out: list[dict] = []
     held: list[int] = []
     mod, rem = EVAL_GUARD_MODULO
@@ -304,10 +316,10 @@ def main() -> None:
     ap.add_argument("--patterns", required=True, help="dir of fetched patterns/*.md")
     ap.add_argument("--per-axis", type=int, default=16)
     ap.add_argument("--auto-guards", type=int, default=0,
-                    help="how many AUTO-GENERATED Axis D cases to emit. Default 0: they "
-                         "require example-specific literals (db.add(invite), old_used) and so "
-                         "test memorisation of the doc example rather than the rule. Axis D is "
-                         "covered by hand-authored token-based cases in captured/ instead.")
+                    help="RETIRED 2026-08-31 - passing a nonzero value is now an error. "
+                         "These cases required example-specific literals (db.add(invite), "
+                         "old_used) and so tested memorisation of the doc example rather "
+                         "than the rule. Axis D is authored by author_guard_cases.py.")
     ap.add_argument("--seed", type=int, default=11)
     a = ap.parse_args()
 
@@ -316,10 +328,15 @@ def main() -> None:
 
     cites = citation_cases(Path(a.src), a.per_axis, rng)
     grounds = grounding_cases(Path(a.src), a.per_axis, rng)
-    guards, held = guard_cases(Path(a.patterns), a.auto_guards) if a.auto_guards else ([], [])
-    if not a.auto_guards:
-        # Holdout list is still needed for --exclude-guards even when not emitting cases.
-        _, held = guard_cases(Path(a.patterns), 99)
+    if a.auto_guards:
+        raise SystemExit(
+            "--auto-guards is retired: the cases it emits score a model on the reference "
+            "snippet's variable names, not on the rule (Axis D read 21.4% because of it; "
+            "the same model scores 100% on the hand-authored set). Run "
+            "`python author_guard_cases.py` instead, then `python validate_cases.py`.")
+    guards: list[dict] = []
+    # Holdout list is still needed for --exclude-guards even though no cases are emitted.
+    _, held = guard_cases(Path(a.patterns), 99)
     tools = tool_cases(a.per_axis)
 
     n_cap = 0

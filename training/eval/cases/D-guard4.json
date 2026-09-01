@@ -1,17 +1,21 @@
 {
   "id": "D-guard4",
   "kind": "guard",
-  "provenance": "ekam-code-generation-guards.md GUARD 4 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "origin": "hand",
+  "provenance": "ekam-code-generation-guards.md GUARD 4 - EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards). Hand-authored; see author_guard_cases.py for why the auto-extracted version was replaced.",
   "scorers": [
     "guard"
   ],
-  "prompt": "Project rule:\nThis project uses SQLAlchemy 2.x async throughout. Every DB dependency is\n`AsyncSession = Depends(get_async_db)`. Using sync `Session` will deadlock uvicorn.\n\nWrite code that follows this rule. Output only code.",
+  "prompt": "Project rule:\nThis project is SQLAlchemy 2.x async throughout. Every DB dependency is declared as\n`AsyncSession = Depends(get_async_db)` and queries are awaited via `db.execute(select(...))`.\nA synchronous `Session` with `Depends(get_db)` and `db.query(...)` blocks the event loop\nand deadlocks uvicorn. Write the endpoint's dependency and query in the async form.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
   "guard_required": [
     "AsyncSession",
-    "Depends(get_async_db))"
+    "get_async_db"
   ],
   "guard_forbidden": [
-    "Depends(get_db))",
-    "Session"
-  ]
+    "Depends(get_db)",
+    "db.query("
+  ],
+  "selftest_pass": "from sqlalchemy.ext.asyncio import AsyncSession\n\nasync def my_endpoint(db: AsyncSession = Depends(get_async_db)):\n    result = await db.execute(select(Model))\n    rows = result.scalars().all()",
+  "selftest_fail": "from sqlalchemy.orm import Session\n\ndef my_endpoint(db: Session = Depends(get_db)):\n    rows = db.query(Model).all()"
 }

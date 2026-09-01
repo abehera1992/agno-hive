@@ -1,0 +1,21 @@
+{
+  "id": "D-guard16",
+  "kind": "guard",
+  "origin": "hand",
+  "provenance": "ekam-code-generation-guards.md GUARD 16 - EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards). Hand-authored; see author_guard_cases.py for why the auto-extracted version was replaced.",
+  "scorers": [
+    "structural"
+  ],
+  "prompt": "Project rule:\nTo INSERT a line after an existing one with `apply_diff` (rather than replace it), the\nanchor line must be present identically in BOTH `old_string` and `new_string`, with the\nnew content following it inside `new_string`. Omit the anchor from `new_string` and the\nanchor is replaced instead of inserted after. Write one `apply_diff(path,\nold_string=..., new_string=...)` call that adds a second hook line after an existing\nhook line.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
+  "structural": [
+    {
+      "type": "kwarg_substring",
+      "call": "apply_diff",
+      "inner": "old_string",
+      "outer": "new_string"
+    }
+  ],
+  "selftest_pass": "apply_diff(\n    path,\n    old_string=\"  const [verify, { isLoading }] = useVerifyAdminSellerMutation();\",\n    new_string=\"  const [verify, { isLoading }] = useVerifyAdminSellerMutation();\\n  const [adminUpdate] = useAdminUpdateUserStatusMutation();\",\n)",
+  "selftest_fail": "apply_diff(\n    path,\n    old_string=\"  const [verify, { isLoading }] = useVerifyAdminSellerMutation();\",\n    new_string=\"  const [adminUpdate] = useAdminUpdateUserStatusMutation();\",\n)"
+}

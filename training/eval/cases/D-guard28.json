@@ -1,17 +1,19 @@
 {
   "id": "D-guard28",
   "kind": "guard",
-  "provenance": "ekam-code-generation-guards.md GUARD 28 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "origin": "hand",
+  "provenance": "ekam-code-generation-guards.md GUARD 28 - EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards). Hand-authored; see author_guard_cases.py for why the auto-extracted version was replaced.",
   "scorers": [
-    "guard"
+    "structural"
   ],
-  "prompt": "Project rule:\nThis schema deliberately gives a tenant and its business(es) separate identifiers \u2014 one tenant\naccount can own multiple businesses, each with its own `business_id`, not necessarily synced\n1:1 with `tenant_id`. Confirmed: **zero** rows in `business.business_profiles` ever have\n`business_id == tenant_id` for their owning tenant.\n\nWrite code that follows this rule. Output only code.",
-  "guard_required": [
-    "False)",
-    "True)"
+  "prompt": "Project rule:\n`tenant_id` and `business_id` are separate identifiers in this schema -- one tenant\naccount can own several businesses. A `tenant_id` column must therefore NEVER carry a\nForeignKey to any business table. Declare it as a plain UUID column, not null.\nTenant identity is a cross-service reference enforced at the application layer.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
+  "structural": [
+    {
+      "type": "absent_call",
+      "call": "ForeignKey"
+    }
   ],
-  "guard_forbidden": [
-    "business.business_profiles.business_id",
-    "sa.ForeignKey("
-  ]
+  "selftest_pass": "sa.Column(\"tenant_id\", postgresql.UUID(as_uuid=True), nullable=False)",
+  "selftest_fail": "sa.Column(\"tenant_id\", postgresql.UUID(as_uuid=True),\n          sa.ForeignKey(\"business.business_profiles.business_id\"), nullable=False)"
 }

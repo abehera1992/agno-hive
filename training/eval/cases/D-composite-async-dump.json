@@ -1,0 +1,22 @@
+{
+  "id": "D-composite-async-dump",
+  "kind": "guard",
+  "origin": "hand",
+  "provenance": "COMPOSITE of several EVAL-ONLY guards from ekam-code-generation-guards.md - holds them simultaneously, which is the condition real generated code has to meet and where adherence actually breaks down. Added 2026-08-31 to restore discriminating power after the Axis D repair took the single-rule cases to 100%.",
+  "scorers": [
+    "guard"
+  ],
+  "prompt": "Project rule:\nWrite an async create endpoint that builds an ORM row from a Pydantic schema, holding ALL of these rules at once:\n  1. The DB dependency is `AsyncSession = Depends(get_async_db)` and queries are awaited via `db.execute(select(...))`. A synchronous `Session` with `Depends(get_db)` and `db.query(...)` blocks the event loop and deadlocks uvicorn.\n  2. Before unpacking `model_dump()` into a SQLAlchemy model constructor, pass `exclude={...}` to drop fields that are not mapped columns; the declarative `__init__` raises TypeError for any kwarg that is not a column.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
+  "guard_required": [
+    "AsyncSession",
+    "get_async_db",
+    "exclude="
+  ],
+  "guard_forbidden": [
+    "Depends(get_db)",
+    "db.query("
+  ],
+  "selftest_pass": "# AsyncSession\n# get_async_db\n# exclude=",
+  "selftest_fail": "# Depends(get_db)\n# db.query("
+}

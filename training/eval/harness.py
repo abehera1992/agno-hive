@@ -177,12 +177,28 @@ def _fact_present(fact: str, body: str) -> bool:
 
     The fix belongs in the case vocabulary, not in the scorer: alternation lets a case
     say "any of these words satisfies me" without the scorer learning case-specific
-    semantics. Plain substring matching is kept deliberately — switching to word-bounded
-    matching here would silently move the B-extract scores too, and this change has to
-    stay attributable to the defect it fixes.
+    semantics.
+
+    Word boundaries added 2026-08-31, matching what `_token_present` has always done and
+    for the same reason. Plain substring had been kept deliberately, on the argument that
+    boundary matching would silently move other scores — but it produced the defect twice
+    in one afternoon on the new absence-trap cases. First a bare "no" alternative matched
+    inside "TenantNotificationPrefs", passing a known-WRONG answer; removing "no" then
+    failed eight answers whose entire text was the word "No". Both are the
+    "Session" ⊂ "AsyncSession" bug the token scorer already guards against. Bare
+    identifiers are matched on word boundaries; anything carrying punctuation
+    ("String(100)", "0.4", "does not") stays plain substring, where boundaries do not
+    apply. The case self-tests in validate_cases.py now cover this either way.
     """
-    return any(alt in body for alt in
-               (a.strip() for a in fact.lower().split("|")) if alt)
+    for alt in (a.strip() for a in fact.lower().split("|")):
+        if not alt:
+            continue
+        if re.fullmatch(r"\w+", alt):
+            if re.search(rf"(?<!\w){re.escape(alt)}(?!\w)", body):
+                return True
+        elif alt in body:
+            return True
+    return False
 
 
 def score_grounding(case: dict, text: str) -> tuple[float, str]:
@@ -304,16 +320,24 @@ def _chk_call_order(tree, spec) -> tuple[bool, str]:
 
 
 def _chk_kwarg_present(tree, spec) -> tuple[bool, str]:
-    """A call to `call` must carry every kwarg in `kwargs`."""
+    """SOME call to `call` must carry every kwarg in `kwargs`.
+
+    Scans every matching call rather than judging the first one. A realistic answer
+    contains several calls to the same constructor and only one of them is the call the
+    rule is about; stopping at the first produced a false failure on correct code.
+    """
+    seen = []
     for name, node in _calls(tree):
         if name != spec["call"]:
             continue
         have = {k.arg for k in node.keywords if k.arg}
         missing = [k for k in spec["kwargs"] if k not in have]
         if not missing:
-            return True, f"{name}(...) has {spec['kwargs']}"
-        return False, f"{name}(...) missing kwarg(s) {missing}; has {sorted(have)}"
-    return False, f"no call to {spec['call']}()"
+            return True, f"{name}(...)@{node.lineno} has {spec['kwargs']}"
+        seen.append(f"@{node.lineno} missing {missing}")
+    if not seen:
+        return False, f"no call to {spec['call']}()"
+    return False, f"no {spec['call']}(...) carries {spec['kwargs']}: {'; '.join(seen)}"
 
 
 def _chk_positional_before_keyword(tree, spec) -> tuple[bool, str]:
@@ -322,18 +346,25 @@ def _chk_positional_before_keyword(tree, spec) -> tuple[bool, str]:
     Python enforces this syntactically, so a violation is a SyntaxError — meaning the
     real test is whether the model emits parseable code at all. Scored via the parse
     plus a check that the token really is positional, not passed as a kwarg.
+
+    Scans every call to `call`, not just the first. A models file legitimately contains
+    many `Column(...)` calls and only one carries the ForeignKey; judging the first one
+    reported "ForeignKey absent" on an answer that had it correctly placed two lines down.
     """
+    n_calls = 0
     for name, node in _calls(tree):
         if name != spec["call"]:
             continue
+        n_calls += 1
         pos_src = " ".join(ast.dump(a) for a in node.args)
         if spec["token"] in pos_src:
-            return True, f"{spec['token']} is positional in {name}(...)"
+            return True, f"{spec['token']} is positional in {name}(...)@{node.lineno}"
         kw_src = " ".join(ast.dump(k.value) for k in node.keywords)
         if spec["token"] in kw_src:
-            return False, f"{spec['token']} passed as a KEYWORD in {name}(...)"
-        return False, f"{spec['token']} absent from {name}(...)"
-    return False, f"no call to {spec['call']}()"
+            return False, f"{spec['token']} passed as a KEYWORD in {name}(...)@{node.lineno}"
+    if not n_calls:
+        return False, f"no call to {spec['call']}()"
+    return False, f"{spec['token']} absent from all {n_calls} {spec['call']}(...) call(s)"
 
 
 def _chk_absent_call(tree, spec) -> tuple[bool, str]:
@@ -343,23 +374,135 @@ def _chk_absent_call(tree, spec) -> tuple[bool, str]:
 
 
 def _chk_assign_before_mutate(tree, spec) -> tuple[bool, str]:
-    """A snapshot must be read into a local BEFORE the attribute is reassigned."""
-    attr = spec["attr"]
-    reads, writes = [], []
+    """A snapshot must be read into a local BEFORE the attribute is reassigned.
+
+    `attr` is OPTIONAL. Omitted, the check applies to every attribute the code
+    reassigns — so a model that picks its own field and variable names still passes.
+    Which names the model chooses is not the rule; the ordering is. Pinning `attr` to
+    one name is what made the token version of this case unpassable: it demanded the
+    reference implementation's own local (`old_used`), a string the prompt never states.
+    """
+    want = spec.get("attr")
+    writes: dict[str, list[int]] = {}
+    reads: dict[str, list[int]] = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for t in node.targets:
-                if isinstance(t, ast.Attribute) and t.attr == attr:
-                    writes.append(node.lineno)
-            src = ast.dump(node.value)
-            if f"attr='{attr}'" in src:
-                reads.append(node.lineno)
+        if not isinstance(node, ast.Assign):
+            continue
+        for t in node.targets:
+            if isinstance(t, ast.Attribute) and (want is None or t.attr == want):
+                writes.setdefault(t.attr, []).append(node.lineno)
+        # A snapshot is `some_local = <expr>.attr` — target must be a plain name.
+        if any(isinstance(t, ast.Name) for t in node.targets):
+            for sub in ast.walk(node.value):
+                if isinstance(sub, ast.Attribute) and (want is None or sub.attr == want):
+                    reads.setdefault(sub.attr, []).append(node.lineno)
     if not writes:
-        return False, f"`.{attr}` is never assigned"
-    if not reads:
-        return False, f"old `.{attr}` never snapshotted before mutation"
-    return (min(reads) < min(writes),
-            f"snapshot@{min(reads)} vs mutation@{min(writes)}")
+        return False, (f"`.{want}` is never assigned" if want
+                       else "no attribute is ever reassigned")
+    bad = []
+    for attr, wl in writes.items():
+        rl = reads.get(attr, [])
+        if not rl:
+            bad.append(f"`.{attr}` mutated@{min(wl)}, never snapshotted first")
+        elif min(rl) >= min(wl):
+            bad.append(f"`.{attr}` snapshot@{min(rl)} not before mutation@{min(wl)}")
+    if bad:
+        return False, "; ".join(bad)
+    return True, "; ".join(f"`.{a}` snapshot@{min(reads[a])} < mutation@{min(writes[a])}"
+                           for a in writes)
+
+
+def _kwarg_str(node: ast.Call, name: str) -> str | None:
+    """The literal string value of `name=` on this call, if it is a plain constant."""
+    for k in node.keywords:
+        if k.arg == name and isinstance(k.value, ast.Constant) \
+                and isinstance(k.value.value, str):
+            return k.value.value
+    return None
+
+
+def _chk_kwarg_substring(tree, spec) -> tuple[bool, str]:
+    """`inner=`'s string must appear inside `outer=`'s string on the same call.
+
+    GUARD 16: inserting with apply_diff means the anchor stays in BOTH old_string and
+    new_string; drop it from new_string and the anchor is REPLACED rather than inserted
+    after. Substring scoring cannot express this at all — it is a relationship between
+    two arguments, not the presence of a token — which is why the guard had no case.
+    """
+    seen = 0
+    for name, node in _calls(tree):
+        if name != spec["call"]:
+            continue
+        inner, outer = _kwarg_str(node, spec["inner"]), _kwarg_str(node, spec["outer"])
+        if inner is None or outer is None:
+            continue
+        seen += 1
+        if inner and inner in outer:
+            return True, (f"{spec['inner']} is preserved inside {spec['outer']} "
+                          f"@{node.lineno}")
+    if not seen:
+        return False, (f"no {spec['call']}() call carries literal {spec['inner']}= and "
+                       f"{spec['outer']}=")
+    return False, (f"{spec['inner']} does not appear inside {spec['outer']} — the anchor "
+                   f"is replaced, not inserted after")
+
+
+def _chk_kwarg_multiline(tree, spec) -> tuple[bool, str]:
+    """`kwarg=`'s string must span more than one line.
+
+    GUARD 10: an apply_diff old_string has to be unique in the target file, and the guard's
+    remedy is "include enough surrounding context". Uniqueness is a property of a file the
+    eval does not have, but the remedy is checkable: a single bare line like
+    `await db.commit()` is what collides, and a multi-line anchor is what fixes it.
+    """
+    seen = 0
+    for name, node in _calls(tree):
+        if name != spec["call"]:
+            continue
+        val = _kwarg_str(node, spec["kwarg"])
+        if val is None:
+            continue
+        seen += 1
+        if "\n" in val:
+            return True, (f"{spec['kwarg']} spans {val.count(chr(10)) + 1} lines "
+                          f"@{node.lineno}")
+    if not seen:
+        return False, f"no {spec['call']}() call carries a literal {spec['kwarg']}="
+    return False, (f"{spec['kwarg']} is a single line — not enough context to be unique "
+                   f"in the target file")
+
+
+def _chk_arg_not_suffix(tree, spec) -> tuple[bool, str]:
+    """The call's path argument must not end with `suffix`.
+
+    GUARD 14: apply_diff takes the ORIGINAL path, never the `.hive_proposed` one — the
+    server reads the staged file itself. A forbidden-substring rule would reject the
+    correct answer, because the correct answer legitimately names `.hive_proposed` on its
+    get_file_content line. Scoping the check to this one call's own argument is exactly
+    what substring matching cannot do.
+    """
+    seen = 0
+    for name, node in _calls(tree):
+        if name != spec["call"]:
+            continue
+        vals = [a.value for a in node.args
+                if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+        kw = _kwarg_str(node, spec.get("kwarg", "")) if spec.get("kwarg") else None
+        if kw is not None:
+            vals.append(kw)
+        seen += 1
+        if not vals:
+            # Path passed as a variable (`apply_diff(path, ...)`). That cannot violate
+            # the rule, so it is a pass, not an unknown. Treating it as a failure marked
+            # a correct composite answer wrong on 2 of 3 checks it had actually satisfied.
+            continue
+        bad = [v for v in vals if v.endswith(spec["suffix"])]
+        if bad:
+            return False, (f"{spec['call']}(...)@{node.lineno} targets {bad[0]!r}, which "
+                           f"ends with {spec['suffix']!r}")
+    if not seen:
+        return False, f"no call to {spec['call']}()"
+    return True, f"no {spec['call']}() call targets a {spec['suffix']!r} path"
 
 
 _STRUCT = {
@@ -368,6 +511,9 @@ _STRUCT = {
     "positional_before_keyword": _chk_positional_before_keyword,
     "absent_call": _chk_absent_call,
     "assign_before_mutate": _chk_assign_before_mutate,
+    "kwarg_substring": _chk_kwarg_substring,
+    "kwarg_multiline": _chk_kwarg_multiline,
+    "arg_not_suffix": _chk_arg_not_suffix,
 }
 
 
@@ -436,7 +582,11 @@ def run_case(case: dict, base_url: str, model: str) -> dict:
 
     return {
         "id": case["id"], "kind": case.get("kind", ""), "elapsed_s": round(elapsed, 1),
-        "scores": scores, "details": details, "output": text[:400],
+        "scores": scores, "details": details,
+        "finish_reason": resp["choices"][0].get("finish_reason"),
+        # 2000, not 400: at 400 a saved answer no longer parses as Python, so re-scoring a
+        # stored result off the report reported a syntax error that the live run never saw.
+        "output": text[:2000],
     }
 
 
@@ -450,9 +600,16 @@ def main() -> None:
     ap.add_argument("--model", default="local-shared")
     ap.add_argument("--out", default="training/eval/baseline.json")
     ap.add_argument("--label", default="untuned baseline")
+    ap.add_argument("--only", default="",
+                    help="run only cases whose id starts with this prefix (e.g. 'D-' for "
+                         "Axis D alone). Aggregates then cover just that subset.")
     a = ap.parse_args()
 
     cases = load_cases()
+    if a.only:
+        cases = [c for c in cases if c["id"].startswith(a.only)]
+        if not cases:
+            raise SystemExit(f"--only {a.only!r} matched no cases")
     print(f"running {len(cases)} case(s) against {a.model} @ {a.base_url}\n")
 
     results = []
@@ -493,6 +650,27 @@ def main() -> None:
     if errs:
         print(f"  !! {len(errs)} case(s) errored")
     print("=" * 62)
+
+    # ── discriminating power ─────────────────────────────────────────────────
+    # A headline average hides which cases are actually doing the measuring. On the
+    # 2026-08-31 widening the generated cases all scored 100% while the hand-authored
+    # ones — each written from a real observed failure — sat at 57%. The aggregate rose
+    # and the information content fell. Printing the split makes that impossible to miss:
+    # if `generated` is saturated, adding more of it is not a measurement improvement.
+    origins: dict[str, list[float]] = {}
+    for r, c in zip(results, cases):
+        vals = list(r.get("scores", {}).values())
+        if vals:
+            origins.setdefault(c.get("origin", "hand"), []).extend(vals)
+    if len(origins) > 1:
+        print("by case origin (all axes pooled):")
+        for name in sorted(origins):
+            v = origins[name]
+            print(f"  {name:22s} {statistics.mean(v)*100:5.1f}%   (n={len(v)})")
+        gen = origins.get("generated", [])
+        if gen and statistics.mean(gen) >= 0.99:
+            print("  ^ generated cases are saturated — they add n, not discrimination.")
+        print("=" * 62)
 
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)

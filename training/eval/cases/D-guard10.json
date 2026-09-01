@@ -1,14 +1,20 @@
 {
   "id": "D-guard10",
   "kind": "guard",
-  "provenance": "ekam-code-generation-guards.md GUARD 10 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "origin": "hand",
+  "provenance": "ekam-code-generation-guards.md GUARD 10 - EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards). Hand-authored; see author_guard_cases.py for why the auto-extracted version was replaced.",
   "scorers": [
-    "guard"
+    "structural"
   ],
-  "prompt": "Project rule:\nWhen writing an `apply_diff` call, the `old_string` must appear **exactly once** in the target file.\nUsing a short string like `await db.commit()` or `return result` that appears in multiple functions\nwill either fail or patch the wrong location.\n\nWrite code that follows this rule. Output only code.",
-  "guard_required": [
-    "db.add(invite)",
-    "db.refresh(invite)"
+  "prompt": "Project rule:\nAn `apply_diff` call's `old_string` must appear EXACTLY ONCE in the target file. A\nshort anchor like `await db.commit()` or `return result` occurs in several functions,\nso the call either fails or patches the wrong place. Include enough surrounding\ncontext to be unique: the anchor should span several consecutive lines of the file,\nnot a single statement. Write one `apply_diff(path, old_string=..., new_string=...)`\ncall that adds an audit-log write after an existing commit.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
+  "structural": [
+    {
+      "type": "kwarg_multiline",
+      "call": "apply_diff",
+      "kwarg": "old_string"
+    }
   ],
-  "guard_forbidden": []
+  "selftest_pass": "apply_diff(\n    path,\n    old_string=\"    db.add(invite)\\n    await db.commit()\\n    await db.refresh(invite)\",\n    new_string=\"    db.add(invite)\\n    await db.commit()\\n    await db.refresh(invite)\\n    db.add(AuditLog())\\n    await db.commit()\",\n)",
+  "selftest_fail": "apply_diff(path, old_string=\"await db.commit()\", new_string=\"await db.commit()\\n    db.add(AuditLog())\")"
 }

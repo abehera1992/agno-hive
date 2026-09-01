@@ -1,13 +1,18 @@
 {
   "id": "D-guard2",
   "kind": "guard",
-  "provenance": "ekam-code-generation-guards.md GUARD 2 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "origin": "hand",
+  "provenance": "ekam-code-generation-guards.md GUARD 2 - EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards). Hand-authored; see author_guard_cases.py for why the auto-extracted version was replaced.",
   "scorers": [
-    "guard"
+    "structural"
   ],
-  "prompt": "Project rule:\nWhen building a diff/changelog, always snapshot the current value into a local\nvariable **before** you change it. Reading from the object after mutation gives the new value.\n\nWrite code that follows this rule. Output only code.",
-  "guard_required": [
-    "old_used"
+  "prompt": "Project rule:\nWhen building a diff/changelog, always snapshot the current value into a local\nvariable BEFORE you change it. Reading the attribute back off the object after\nmutation gives you the new value, so the recorded delta comes out as zero.\nUse any names you like -- what matters is that the read happens before the write.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
+  "structural": [
+    {
+      "type": "assign_before_mutate"
+    }
   ],
-  "guard_forbidden": []
+  "selftest_pass": "old_used = quota.used_bytes\nquota.used_bytes = actual\ndiffs.append(Diff(old_used_bytes=old_used, new_used_bytes=actual,\n                  delta_bytes=actual - old_used))",
+  "selftest_fail": "quota.used_bytes = actual\ndiffs.append(Diff(old_used_bytes=quota.used_bytes, new_used_bytes=actual,\n                  delta_bytes=actual - quota.used_bytes))"
 }

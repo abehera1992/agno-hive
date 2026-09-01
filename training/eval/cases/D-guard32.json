@@ -1,15 +1,20 @@
 {
   "id": "D-guard32",
   "kind": "guard",
-  "provenance": "ekam-code-generation-guards.md GUARD 32 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "origin": "hand",
+  "provenance": "ekam-code-generation-guards.md GUARD 32 - EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards). Hand-authored; see author_guard_cases.py for why the auto-extracted version was replaced.",
   "scorers": [
-    "guard"
+    "structural"
   ],
-  "prompt": "Project rule:\n\n\nWrite code that follows this rule. Output only code.",
-  "guard_required": [
-    "False)"
+  "prompt": "Project rule:\n`ForeignKey(...)` is a POSITIONAL argument to `Column(...)`, like any Column construct\n(`CheckConstraint`, `Sequence`). `nullable=`, `default=`, `primary_key=`,\n`server_default=` are keywords. Python requires every positional argument to come\nbefore the first keyword argument, so a ForeignKey placed after `nullable=` is a\nSyntaxError that stops the whole models file from importing.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
+  "structural": [
+    {
+      "type": "positional_before_keyword",
+      "call": "Column",
+      "token": "ForeignKey"
+    }
   ],
-  "guard_forbidden": [
-    "False"
-  ]
+  "selftest_pass": "item_id = Column(UUID(as_uuid=True), ForeignKey(\"inventory.items.item_id\"), nullable=False)",
+  "selftest_fail": "item_id = Column(UUID(as_uuid=True), nullable=False, ForeignKey(\"inventory.items.item_id\"))"
 }

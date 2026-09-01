@@ -1,0 +1,32 @@
+{
+  "id": "D-composite-apply-diff",
+  "kind": "guard",
+  "origin": "hand",
+  "provenance": "COMPOSITE of several EVAL-ONLY guards from ekam-code-generation-guards.md - holds them simultaneously, which is the condition real generated code has to meet and where adherence actually breaks down. Added 2026-08-31 to restore discriminating power after the Axis D repair took the single-rule cases to 100%.",
+  "scorers": [
+    "structural"
+  ],
+  "prompt": "Project rule:\nWrite one `apply_diff` call that inserts a new hook line after an existing one,\nholding all three of these rules at once:\n  1. The path argument is the ORIGINAL file path, never the `.hive_proposed` one --\n     the server already reads the staged file, and targeting it makes a doubled suffix.\n  2. `old_string` must be unique in the target file, so it spans several consecutive\n     lines rather than one bare statement.\n  3. Because this is an INSERT, the anchor lines must appear identically in BOTH\n     `old_string` and `new_string`, with the new line following them in `new_string`.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
+  "structural": [
+    {
+      "type": "arg_not_suffix",
+      "call": "apply_diff",
+      "suffix": ".hive_proposed",
+      "kwarg": "relative_path"
+    },
+    {
+      "type": "kwarg_multiline",
+      "call": "apply_diff",
+      "kwarg": "old_string"
+    },
+    {
+      "type": "kwarg_substring",
+      "call": "apply_diff",
+      "inner": "old_string",
+      "outer": "new_string"
+    }
+  ],
+  "selftest_pass": "apply_diff(\n    \"src/hooks/useAdmin.ts\",\n    old_string=\"  const [verify] = useVerifyAdminSellerMutation();\\n  const [reject] = useRejectAdminSellerMutation();\",\n    new_string=\"  const [verify] = useVerifyAdminSellerMutation();\\n  const [reject] = useRejectAdminSellerMutation();\\n  const [update] = useAdminUpdateUserStatusMutation();\",\n)",
+  "selftest_fail": "apply_diff(\n    \"src/hooks/useAdmin.ts.hive_proposed\",\n    old_string=\"  const [verify] = useVerifyAdminSellerMutation();\",\n    new_string=\"  const [update] = useAdminUpdateUserStatusMutation();\",\n)"
+}

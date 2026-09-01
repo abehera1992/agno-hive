@@ -1,13 +1,21 @@
 {
   "id": "D-guard14",
   "kind": "guard",
-  "provenance": "ekam-code-generation-guards.md GUARD 14 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "origin": "hand",
+  "provenance": "ekam-code-generation-guards.md GUARD 14 - EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards). Hand-authored; see author_guard_cases.py for why the auto-extracted version was replaced.",
   "scorers": [
-    "guard"
+    "structural"
   ],
-  "prompt": "Project rule:\nThe `relative_path` argument to `apply_diff()` must always be the **original file path**\n(e.g. `src/components/MyComponent.tsx`). Never pass the `.hive_proposed` path.\n\nThe MCP server automatically reads from the staged `.hive_proposed` file when it exists \u2014\nyou do not need to (and must not) reference the `.hive_proposed` path in `apply_diff`.\n\nWrite code that follows this rule. Output only code.",
-  "guard_required": [
-    "MyComponent.tsx"
+  "prompt": "Project rule:\nThe path argument to `apply_diff()` must always be the ORIGINAL file path, e.g.\n`src/components/MyComponent.tsx`. Never pass the `.hive_proposed` path: the MCP server\nalready reads from the staged file when one exists, and targeting it directly creates\na `.hive_proposed.hive_proposed`. Reading the staged file first is fine and expected.\nWrite the read of the staged file followed by the `apply_diff` call.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
+  "structural": [
+    {
+      "type": "arg_not_suffix",
+      "call": "apply_diff",
+      "suffix": ".hive_proposed",
+      "kwarg": "relative_path"
+    }
   ],
-  "guard_forbidden": []
+  "selftest_pass": "get_file_content(\"src/components/MyComponent.tsx.hive_proposed\")\napply_diff(\"src/components/MyComponent.tsx\", old_string=\"a\", new_string=\"b\")",
+  "selftest_fail": "get_file_content(\"src/components/MyComponent.tsx.hive_proposed\")\napply_diff(\"src/components/MyComponent.tsx.hive_proposed\", old_string=\"a\", new_string=\"b\")"
 }

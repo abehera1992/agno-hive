@@ -1,0 +1,17 @@
+{
+  "id": "D-guard8",
+  "kind": "guard",
+  "origin": "hand",
+  "provenance": "ekam-code-generation-guards.md GUARD 8 - EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards). Hand-authored; see author_guard_cases.py for why the auto-extracted version was replaced.",
+  "scorers": [
+    "guard"
+  ],
+  "prompt": "Project rule:\nReact hooks are not globally available. Any hook a component uses -- `useState`,\n`useEffect`, `useCallback` -- must be destructured in the import at the top of the file,\ne.g. `import { useState } from \"react\"`. A default React import alone leaves the hook\nundefined at runtime. Write a small component that holds a string in state.\n\nWrite typescript code that follows this rule. Output only code.",
+  "lang": "typescript",
+  "guard_required": [
+    "{ useState }"
+  ],
+  "guard_forbidden": [],
+  "selftest_pass": "import { useState } from \"react\";\n\nconst MyComponent = () => {\n  const [value, setValue] = useState(\"\");\n  return <input value={value} onChange={(e) => setValue(e.target.value)} />;\n};",
+  "selftest_fail": "import React from \"react\";\n\nconst MyComponent = () => {\n  const [value, setValue] = useState(\"\");\n  return <input value={value} onChange={(e) => setValue(e.target.value)} />;\n};"
+}

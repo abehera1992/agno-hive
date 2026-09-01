@@ -1,15 +1,19 @@
 {
   "id": "D-guard6",
   "kind": "guard",
-  "provenance": "ekam-code-generation-guards.md GUARD 6 \u2014 EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards).",
+  "origin": "hand",
+  "provenance": "ekam-code-generation-guards.md GUARD 6 - EVAL-ONLY (even-numbered guards are excluded from training via patterns_md exclude_guards). Hand-authored; see author_guard_cases.py for why the auto-extracted version was replaced.",
   "scorers": [
     "guard"
   ],
-  "prompt": "Project rule:\nWhen adding a new schema import to a router file, use the exact class name\nfrom `schemas.py`. Do not guess or paraphrase.\n\nWrite code that follows this rule. Output only code.",
+  "prompt": "Project rule:\nUse the exact class name defined in `schemas.py` when adding a schema import to a router.\nDo not guess or paraphrase it. The class in this project's `schemas.py` is spelled\n`SeaweedFSCapacity` -- note the `FS`. Write the import statement for it.\n\nWrite python code that follows this rule. Output only code.",
+  "lang": "python",
   "guard_required": [
     "SeaweedFSCapacity"
   ],
   "guard_forbidden": [
     "SeaweedCapacity"
-  ]
+  ],
+  "selftest_pass": "from schemas import SeaweedFSCapacity",
+  "selftest_fail": "from schemas import SeaweedCapacity"
 }
