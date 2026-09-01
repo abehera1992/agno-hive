@@ -3862,7 +3862,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     _answer_thin = len(content.strip())
     _relayed_thin = getattr(team, "_member_result_chars", 0)
     if (_answer_thin < _THIN_ANSWER_CHARS and _relayed_thin
-            and _answer_thin > _relayed_thin * _THIN_ANSWER_SURPLUS_RATIO):
+            and _answer_thin > _relayed_thin * _THIN_ANSWER_SURPLUS_RATIO
+            and not _answer_supported_by_evidence(content, team)):
         tool_evidence = _captured_tool_evidence(team)
         if tool_evidence:
             print(f"[team] thin answer ({_answer_thin:,} chars) says more than the "
@@ -7254,6 +7255,13 @@ def _stream_event_to_chunk(event, team=None) -> str | dict | None:
             # a 200-char result (relayed whole) from a 200,000-char one (compressed to
             # nothing). _captured_tool_evidence needs the real size to know which.
             "result_chars": len(result) if isinstance(result, str) else 0,
+            # Salient tokens from the WHOLE result, not the 200-char preview. This is the
+            # only point the full text exists, and the thin-answer guard needs to ask
+            # "did this fact come from a tool this run?" -- a question the preview cannot
+            # answer. T1's line number 129 sits ~6,200 chars into a 36,811-char file read,
+            # so a preview-based check could never see it, and the guard fired on a
+            # correct answer. A token set costs a few KB where the text would cost MBs.
+            "result_tokens": _salient_tokens(result) if isinstance(result, str) else None,
             "agent_name": getattr(event, "agent_name", "") or "",
             # Counts, not the body: this is the only point the FULL listing exists
             # (result_preview truncates at 200 chars, well inside a 24-entry listing),
@@ -8130,6 +8138,15 @@ def _record_stream_artifacts(team, out: dict) -> None:
                     "preview": out["result_preview"],
                     "chars": out.get("result_chars") or 0,
                 })
+            # Accumulated from EVERY tool result, not just the first twelve rendered
+            # above: the rendering cap exists to keep a banner readable, and has nothing
+            # to do with what the run is entitled to treat as evidence.
+            toks = out.get("result_tokens")
+            if toks:
+                if not isinstance(getattr(team, "_evidence_tokens", None), set):
+                    team._evidence_tokens = set()
+                if len(team._evidence_tokens) < _EVIDENCE_TOKEN_CEILING:
+                    team._evidence_tokens |= toks
 
 
 # How many characters of MEMBER RESULTS one run may accumulate before the coordinator
@@ -8931,6 +8948,90 @@ _RECOVERED_FINDINGS_CAP = 12_000   # per member; above this the answer stops bei
 # are surfaced. Bounded deliberately: 12 x ~200 chars is ~2.4 KB, negligible against
 # _RUN_MEMBER_RESULT_CHAR_BUDGET, and this must never become the context problem that
 # _record_read and _evidence_manifest both refuse to create.
+# Tokenising every tool result costs one regex pass; capping the input bounds it on the
+# 200KB reads hive-mcp can return. 40k chars covers a whole models.py several times over.
+_SALIENT_SCAN_CHARS = 40_000
+_SALIENT_MAX_TOKENS = 6_000
+_SALIENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{3,}|\d[\d.]{0,15}|[\w./-]+\.[A-Za-z]{2,4}")
+
+
+def _citable(tok: str) -> bool:
+    """Does this token carry evidential weight, or is it ordinary prose?
+
+    A stopword list was tried first and is the wrong instrument: the first real test
+    produced "database", "live", "rows", "operating", "system", "working" as
+    "unsupported facts", and extending the list by hand is the same losing game the
+    premise guard's denial vocabulary already demonstrated -- five live batches, five new
+    phrasings, never converging.
+
+    Shape settles it without a list. A citable token carries a digit, an underscore, a
+    slash or a dot; or it is ALL-CAPS; or it capitalises INTERNALLY, as CamelCase does.
+    Everything else is prose, which is the same rule generate_cases.py applies when
+    deciding whether a token is CODE.
+
+    Title Case is prose, deliberately. "Not all lowercase" was the first cut and it makes
+    every sentence-initial word evidential -- a correct answer opening "Operating system:
+    ..." would have had "Operating" reported as a fact no tool returned. That is a false
+    positive of exactly the kind this change exists to remove.
+    """
+    if any(c.isdigit() or c in "_/." for c in tok):
+        return True
+    if tok.isupper():
+        return True
+    return any(c.isupper() for c in tok[1:])
+
+
+def _salient_tokens(text: str) -> frozenset[str]:
+    """Citable tokens in a tool result: numbers, paths, identifiers. Lowercased.
+
+    Trailing punctuation is stripped. Without it a sentence-final "line 129." yields the
+    token `129.`, which no tool result ever contains, so a correct citation read as
+    unsupported -- measured, not hypothesised.
+    """
+    if not text:
+        return frozenset()
+    out = set()
+    for t in _SALIENT_RE.findall(text[:_SALIENT_SCAN_CHARS]):
+        t = t.strip(".,;:!?()[]{}'\"`")
+        if t and _citable(t):
+            out.add(t.lower())
+        if len(out) >= _SALIENT_MAX_TOKENS:
+            break
+    return frozenset(out)
+
+
+# A whole run's accumulated evidence vocabulary. Bounded so a long run cannot grow it
+# without limit; 200k distinct tokens is far more than any real run produces.
+_EVIDENCE_TOKEN_CEILING = 200_000
+
+def _answer_supported_by_evidence(content: str, team) -> bool:
+    """Is every citable token in the answer one a tool actually returned this run?
+
+    The thin-answer guard's premise is that an answer saying MORE than was relayed to it
+    may be saying things nothing supports. At small sizes that comparison carries no
+    information: T1 (126 chars from a 35-char relay) and T8 (57 chars from a ONE-char
+    relay) are both completely correct, and T8 is already documented beside
+    _THIN_ANSWER_CHARS as a correct answer collapsing 3860:1. The length ratio cannot
+    separate them from T9, whose 237 chars from a 56-char relay were three fabricated
+    environment facts.
+
+    What separates them is provenance, and that is checkable. T1's "129" and T8's "0" are
+    in what the tools returned; T9's "Ubuntu 22.04.4", "3.11.6" and "/home/ubuntu/ekam-app"
+    contradicted get_env_info's own "Linux ... WSL2", "3.12.14" and "/project". So the
+    guard now asks where the facts came from instead of how long the answer is.
+
+    Conservative by construction: with no token set captured this returns False, leaving
+    the previous behaviour untouched rather than silently disabling the guard.
+    """
+    tokens = getattr(team, "_evidence_tokens", None)
+    if not tokens:
+        return False
+    claimed = _salient_tokens(content)
+    if not claimed:
+        return False
+    return claimed <= tokens
+
+
 _TOOL_EVIDENCE_MAX_ITEMS = 12
 _THIN_ANSWER_CHARS = 1_200
 # Retuned 2026-08-28, same day it shipped, after battery B17 fired it on two CORRECT
