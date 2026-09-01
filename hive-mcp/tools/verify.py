@@ -1490,7 +1490,21 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     negated_idents: list[str] = []
     for m in _BACKTICK_RE.finditer(answer):
         span = m.group(1)
-        tok = span.strip().rstrip("()").strip()
+        # Split at the first "(" so a backticked CALL is checked by its NAME.
+        #
+        # `rstrip("()")` alone handled a bare `foo()` and silently dropped every call
+        # carrying a signature: `createGRNFromPO(poId: string)` became
+        # "createGRNFromPO(poId: string", which matches neither _IDENT_RE nor
+        # _DOTTED_RE, so the token was discarded and never grepped. The exemption was
+        # accidental -- `foo()` checked, `foo(x)` not -- not a decision.
+        #
+        # T13b, 2026-09-01, is what it cost. The answer claimed every voucher endpoint
+        # had a frontend hook and named four to prove it --
+        # `createGRNFromPO(poId: string)`, `createCreditNoteFromInvoice(...)`,
+        # `createStockAdjustment(...)`, `createStockTransfer(...)`. All four appear
+        # ZERO times anywhere in the repo. verify_claims ran on that answer, found
+        # nothing to flag, and the fabricated coverage claim shipped clean.
+        tok = span.split("(", 1)[0].strip().rstrip("()").strip()
         if (_IDENT_RE.match(tok) or _DOTTED_RE.match(tok)) and tok.lower() not in _NOISE:
             if tok in _MCP_TOOL_NAMES:
                 continue
