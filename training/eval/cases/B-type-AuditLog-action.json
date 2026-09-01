@@ -1,0 +1,16 @@
+{
+  "id": "B-type-AuditLog-action",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/models.py:182 (verified: the literal 'String(100)' is on that line). Exact-value extraction from provided evidence.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/models.py`:\n\n   176|\n   177|\n   178|class AuditLog(Base):\n   179|    __tablename__ = \"audit_log\"\n   180|    __table_args__ = {\"schema\": \"auth\"}\n   181|    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   182|    action = Column(String(100), nullable=False)\n   183|    user_id = Column(\n   184|        UUID(as_uuid=True),\n   185|        ForeignKey(\"auth.users.user_id\", ondelete=\"SET NULL\"),\n   186|        nullable=True,\n   187|    )\n   188|    performed_by = Column(\n\nIn the `AuditLog` model, what is the declared column type of `action`? Quote it exactly as written. Answer from the excerpt only.",
+  "required_facts": [
+    "String(100)"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "`action` is declared as `String(100)`.",
+  "selftest_fail": "`action` is declared as a plain unsized column."
+}

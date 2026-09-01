@@ -1,0 +1,16 @@
+{
+  "id": "C-boundary-create_role-31",
+  "kind": "citation",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/router/rbac_service_api.py. `get_all_roles` starts at 20 and `create_role` at 31 (verified against the file). Adjacent-definition confusion is the C12 failure mode: a live answer cited a range belonging to the neighbouring function.",
+  "scorers": [
+    "citation"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/router/rbac_service_api.py`:\n\n    20|async def get_all_roles(\n    21|    db: AsyncSession = Depends(get_async_db),\n    22|    current_user=Depends(get_current_user),\n    23|):\n    24|    result = await db.execute(\n    25|        select(TenantRole).where(TenantRole.tenant_id == current_user.tenant_id)\n    26|    )\n    27|    return result.scalars().all()\n    28|\n    29|\n    30|@router.post(\"/roles\", response_model=TenantRoleResponse, status_code=201)\n    31|async def create_role(\n    32|    body: TenantRoleCreate,\n    33|    db: AsyncSession = Depends(get_async_db),\n    34|    current_user=Depends(get_current_user),\n\nOn which line does `create_role` begin? The excerpt also contains `get_all_roles` — do not report that one's line.",
+  "correct_lines": [
+    30,
+    31
+  ],
+  "selftest_pass": "`create_role` begins on line 31.",
+  "selftest_fail": "`create_role` begins on line 20."
+}

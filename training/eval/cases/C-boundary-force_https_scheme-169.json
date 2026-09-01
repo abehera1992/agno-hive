@@ -1,0 +1,16 @@
+{
+  "id": "C-boundary-force_https_scheme-169",
+  "kind": "citation",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/inventory-service/main.py. `add_logging_context` starts at 145 and `force_https_scheme` at 169 (verified against the file). Adjacent-definition confusion is the C12 failure mode: a live answer cited a range belonging to the neighbouring function.",
+  "scorers": [
+    "citation"
+  ],
+  "prompt": "Numbered excerpt from `API/inventory-service/main.py`:\n\n   145|async def add_logging_context(request: Request, call_next):\n   146|    request_id = str(uuid4())\n   147|    structlog.contextvars.clear_contextvars()\n   148|    structlog.contextvars.bind_contextvars(\n   149|        request_id=request_id,\n   150|        method=request.method,\n   151|        path=request.url.path,\n   152|        client_ip=request.client.host if request.client else \"unknown\",\n   153|    )\n   154|    logger.info(\"request_started\")\n   155|    try:\n   156|        response = await call_next(request)\n   157|        response.headers[\"X-Request-ID\"] = request_id\n   158|        logger.info(\"request_finished\", status_code=response.status_code)\n   159|        return response\n   160|    except Exception as e:\n   161|        logger.error(\"request_failed\", error=str(e), exc_info=True)\n   162|        raise e\n   163|\n   164|\n   165|app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=\"*\")\n   166|\n   167|\n   168|@app.middleware(\"http\")\n   169|async def force_https_scheme(request: Request, call_next):\n   170|    if request.headers.get(\"x-forwarded-proto\") == \"https\":\n   171|        request.scope[\"scheme\"] = \"https\"\n   172|    return await call_next(request)\n\nOn which line does `force_https_scheme` begin? The excerpt also contains `add_logging_context` — do not report that one's line.",
+  "correct_lines": [
+    168,
+    169
+  ],
+  "selftest_pass": "`force_https_scheme` begins on line 169.",
+  "selftest_fail": "`force_https_scheme` begins on line 145."
+}

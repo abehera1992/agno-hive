@@ -1,0 +1,16 @@
+{
+  "id": "B-type-User-city",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/models.py:74 (verified: the literal 'String(100)' is on that line). Exact-value extraction from provided evidence.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/models.py`:\n\n    68|    middle_name = Column(String)\n    69|    date_of_birth = Column(Date)\n    70|    gender = Column(sa.Enum(\"Male\", \"Female\", \"None\", name=\"gender\"))\n    71|    aadhar_card_id = Column(String, unique=True, nullable=True)\n    72|    pan_number = Column(String, unique=True, nullable=True)\n    73|    address = Column(String, nullable=True)  # Street / locality line\n    74|    city = Column(String(100), nullable=True)\n    75|    state = Column(String(100), nullable=True)\n    76|    pincode = Column(String(10), nullable=True)\n    77|    country = Column(String(100), nullable=True, default=\"India\")\n    78|    phone_number = Column(String, nullable=True)\n    79|    is_active = Column(sa.Boolean, nullable=False, server_default=sa.text(\"true\"))\n    80|    mfa_enabled = Column(sa.Boolean, nullable=False, server_default=sa.text(\"false\"))\n\nIn the `User` model, what is the declared column type of `city`? Quote it exactly as written. Answer from the excerpt only.",
+  "required_facts": [
+    "String(100)"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "`city` is declared as `String(100)`.",
+  "selftest_fail": "`city` is declared as a plain unsized column."
+}

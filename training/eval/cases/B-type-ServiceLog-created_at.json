@@ -1,0 +1,16 @@
+{
+  "id": "B-type-ServiceLog-created_at",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/utility-service/models.py:63 (verified: the literal 'DateTime(timezone=True)' is on that line). Exact-value extraction from provided evidence.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/utility-service/models.py`:\n\n    57|    level = Column(SAEnum(LogLevel, schema=\"utility\"), nullable=False)\n    58|    service_name = Column(String(100), nullable=False)  # e.g. ekam-auth-service\n    59|    message = Column(Text, nullable=False)\n    60|    extra_data = Column(JSON, nullable=True)  # extra context dict\n    61|    trace_id = Column(String(100), nullable=True)  # OTEL trace id\n    62|    span_id = Column(String(100), nullable=True)  # OTEL span id\n    63|    created_at = Column(DateTime(timezone=True), server_default=func.now())\n    64|\n    65|\n    66|# ──────────────────────────────────────────────\n    67|# EMAIL TEMPLATES\n    68|# ──────────────────────────────────────────────\n    69|\n\nIn the `ServiceLog` model, what is the declared column type of `created_at`? Quote it exactly as written. Answer from the excerpt only.",
+  "required_facts": [
+    "DateTime(timezone=True)"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "`created_at` is declared as `DateTime(timezone=True)`.",
+  "selftest_fail": "`created_at` is declared as a plain unsized column."
+}

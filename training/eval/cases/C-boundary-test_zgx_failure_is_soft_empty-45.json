@@ -1,0 +1,16 @@
+{
+  "id": "C-boundary-test_zgx_failure_is_soft_empty-45",
+  "kind": "citation",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/utility-service/tests/test_ai_router.py. `test_generate_ok` starts at 32 and `test_zgx_failure_is_soft_empty` at 45 (verified against the file). Adjacent-definition confusion is the C12 failure mode: a live answer cited a range belonging to the neighbouring function.",
+  "scorers": [
+    "citation"
+  ],
+  "prompt": "Numbered excerpt from `API/utility-service/tests/test_ai_router.py`:\n\n    32|def test_generate_ok():\n    33|    respx.post(\"http://zgx:11434/api/generate\").mock(\n    34|        return_value=httpx.Response(200, json={\"response\": \"hi-there\"})\n    35|    )\n    36|    client = TestClient(_build_app())\n    37|    r = client.post(\"/ai/generate\",\n    38|                    headers={\"X-Internal-API-Key\": \"test\"},\n    39|                    json={\"scope\": {\"tenant_id\": \"t1\"}, \"prompt\": \"hi\", \"json_mode\": True})\n    40|    assert r.status_code == 200\n    41|    assert r.json() == {\"text\": \"hi-there\", \"cache\": \"miss\", \"outcome\": \"ok\"}\n    42|\n    43|\n    44|@respx.mock\n    45|def test_zgx_failure_is_soft_empty():\n    46|    respx.post(\"http://zgx:11434/api/generate\").mock(return_value=httpx.Response(500))\n    47|    client = TestClient(_build_app())\n    48|    r = client.post(\"/ai/generate\",\n\nOn which line does `test_zgx_failure_is_soft_empty` begin? The excerpt also contains `test_generate_ok` — do not report that one's line.",
+  "correct_lines": [
+    44,
+    45
+  ],
+  "selftest_pass": "`test_zgx_failure_is_soft_empty` begins on line 45.",
+  "selftest_fail": "`test_zgx_failure_is_soft_empty` begins on line 32."
+}

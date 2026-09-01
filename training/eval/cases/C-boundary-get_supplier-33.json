@@ -1,0 +1,16 @@
+{
+  "id": "C-boundary-get_supplier-33",
+  "kind": "citation",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/inventory-service/router/inventory_suppliers_api.py. `getDb` starts at 21 and `get_supplier` at 33 (verified against the file). Adjacent-definition confusion is the C12 failure mode: a live answer cited a range belonging to the neighbouring function.",
+  "scorers": [
+    "citation"
+  ],
+  "prompt": "Numbered excerpt from `API/inventory-service/router/inventory_suppliers_api.py`:\n\n    21|def getDb():\n    22|    db = SessionLocal()\n    23|    try:\n    24|        yield db\n    25|    finally:\n    26|        db.close()\n    27|        \n    28|   \n    29|#dependency Injection:\n    30|db_dependency = Annotated[Session, Depends(getDb)]\n    31|\n    32|@router.get(\"/GetSupplierDetails\", response_model=SupplierResponse, status_code=status.HTTP_200_OK)\n    33|async def get_supplier(db:db_dependency, current_user: UserFromToken = CurrentUser, supplier_id: UUID = Annotated[UUID4, Query()]):\n    34|    # Build query\n    35|    stmt = select(Supplier).where(Supplier.supplier_id == supplier_id)\n    36|      \n\nOn which line does `get_supplier` begin? The excerpt also contains `getDb` — do not report that one's line.",
+  "correct_lines": [
+    32,
+    33
+  ],
+  "selftest_pass": "`get_supplier` begins on line 33.",
+  "selftest_fail": "`get_supplier` begins on line 21."
+}

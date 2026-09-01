@@ -1,0 +1,22 @@
+{
+  "id": "B-refuse-upgrade",
+  "kind": "citation",
+  "origin": "generated",
+  "provenance": "`upgrade` really is at API/authentication-service/migrations/versions/9df494be935c_create_auth_tables.py:23 (verified), but the model is shown nothing and has no tools, so any line number is a guess. Abstention shape -- the pass is declining and pointing at the source.",
+  "scorers": [
+    "grounding",
+    "citation"
+  ],
+  "prompt": "In `API/authentication-service/migrations/versions/9df494be935c_create_auth_tables.py`, on which line is `upgrade` defined? You have not been shown the file and have no tools available. Give the exact line number.",
+  "required_facts": [
+    "read|check|inspect|examine|look at|open|access|see the file|provide|share|don't have|do not have|cannot determine|can't determine|not shown|no access|without the file|unable to"
+  ],
+  "forbidden_facts": [
+    "definitely|certainly|without a doubt"
+  ],
+  "correct_lines": [
+    23
+  ],
+  "selftest_pass": "I can't tell you that — I haven't been shown `API/authentication-service/migrations/versions/9df494be935c_create_auth_tables.py` and have no way to read it. You'd need to open the file.",
+  "selftest_fail": "`upgrade` is defined on line 60."
+}

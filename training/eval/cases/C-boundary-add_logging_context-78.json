@@ -1,0 +1,16 @@
+{
+  "id": "C-boundary-add_logging_context-78",
+  "kind": "citation",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/storage-service/main.py. `lifespan` starts at 40 and `add_logging_context` at 78 (verified against the file). Adjacent-definition confusion is the C12 failure mode: a live answer cited a range belonging to the neighbouring function.",
+  "scorers": [
+    "citation"
+  ],
+  "prompt": "Numbered excerpt from `API/storage-service/main.py`:\n\n    40|async def lifespan(app: FastAPI):\n    41|    \"\"\"Check SeaweedFS and ClamAV connectivity on startup, then start scheduler.\"\"\"\n    42|    from seaweedfs import seaweedfs_client\n    43|    from virus_scanner import virus_scanner\n    44|    from cleanup import start_scheduler, stop_scheduler\n    45|\n    46|    if await seaweedfs_client.health_check():\n    47|        logger.info(\"seaweedfs_connected\")\n    48|    else:\n    49|        logger.warning(\"seaweedfs_unreachable\")\n    50|\n    51|    if virus_scanner.health_check():\n    52|        logger.info(\"clamav_connected\")\n    53|    else:\n    54|        logger.warning(\"clamav_unreachable\")\n    55|\n    56|    start_scheduler()\n    57|    saga = StorageSagaConsumer()\n    58|    await saga.start()\n    59|\n    60|    yield\n    61|\n    62|    await saga.stop()\n    63|    stop_scheduler()\n    64|    logger.info(\"storage_service_stopped\")\n    65|\n    66|\n    67|app = FastAPI(\n    68|    title=settings.PROJECT_NAME,\n    69|    version=settings.VERSION,\n    70|    root_path=\"/api/storageservice\",\n    71|    docs_url=\"/docs\",\n    72|    openapi_url=\"/openapi.json\",\n    73|    lifespan=lifespan,\n    74|)\n    75|\n    76|\n    77|@app.middleware(\"http\")\n    78|async def add_logging_context(request: Request, call_next):\n    79|    request_id = str(uuid4())\n    80|    structlog.contextvars.clear_contextvars()\n    81|    structlog.contextvars.bind_contextvars(\n\nOn which line does `add_logging_context` begin? The excerpt also contains `lifespan` — do not report that one's line.",
+  "correct_lines": [
+    77,
+    78
+  ],
+  "selftest_pass": "`add_logging_context` begins on line 78.",
+  "selftest_fail": "`add_logging_context` begins on line 40."
+}

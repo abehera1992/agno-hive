@@ -1,0 +1,16 @@
+{
+  "id": "B-type-Tenant-plan",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/models.py:24 (verified: the literal 'String(length=20)' is on that line). Exact-value extraction from provided evidence.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/models.py`:\n\n    18|\n    19|class Tenant(Base):\n    20|    __tablename__ = \"tenants\"\n    21|    __table_args__ = {\"schema\": \"auth\"}\n    22|    tenant_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n    23|    name = Column(String, nullable=False)\n    24|    plan = Column(String(length=20), nullable=False, default=\"shared\")\n    25|    status = Column(String(length=20), nullable=False, default=\"active\")\n    26|    config = Column(JSONB, nullable=True)\n    27|    created_at = Column(DateTime, default=datetime.utcnow)\n    28|    updated_at = Column(DateTime(timezone=True), nullable=True)\n    29|    updated_by = Column(\n    30|        UUID(as_uuid=True),\n\nIn the `Tenant` model, what is the declared column type of `plan`? Quote it exactly as written. Answer from the excerpt only.",
+  "required_facts": [
+    "String(length=20)"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "`plan` is declared as `String(length=20)`.",
+  "selftest_fail": "`plan` is declared as a plain unsized column."
+}

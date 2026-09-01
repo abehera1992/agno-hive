@@ -1,0 +1,15 @@
+{
+  "id": "C-boundary-downgrade-54",
+  "kind": "citation",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/migrations/versions/7450153b0edf_implement_hybrid_roles_for_global_and_.py. `upgrade` starts at 21 and `downgrade` at 54 (verified against the file). Adjacent-definition confusion is the C12 failure mode: a live answer cited a range belonging to the neighbouring function.",
+  "scorers": [
+    "citation"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/migrations/versions/7450153b0edf_implement_hybrid_roles_for_global_and_.py`:\n\n    21|def upgrade():\n    22|         # Drop existing unique constraint on role_name\n    23|         op.drop_constraint('roles_role_name_key', 'roles', schema='auth', type_='unique')\n    24|\n    25|         # Add partial unique constraint for global roles (tenant_id IS NULL)\n    26|         op.execute(\"\"\"\n    27|             CREATE UNIQUE INDEX roles_global_role_name_key\n    28|             ON auth.roles (role_name)\n    29|             WHERE tenant_id IS NULL\n    30|         \"\"\")\n    31|\n    32|         # Add unique constraint for tenant-specific roles (role_name, tenant_id)\n    33|         op.create_unique_constraint(\n    34|             'roles_role_name_tenant_id_key',\n    35|             'roles',\n    36|             ['role_name', 'tenant_id'],\n    37|             schema='auth'\n    38|         )\n    39|\n    40|         # Update existing Tenant Admin, Tenant Staff roles to tenant-specific\n    41|         # Assuming a default tenant exists or assign to NULL for global roles\n    42|         op.execute(\"\"\"\n    43|             UPDATE auth.roles\n    44|             SET tenant_id = NULL\n    45|             WHERE role_name = 'App Admin' AND tenant_id IS NULL\n    46|         \"\"\")\n    47|         # Remove or reassign Tenant Admin, Tenant Staff if they should not be global\n    48|         op.execute(\"\"\"\n    49|             DELETE FROM auth.roles\n    50|             WHERE role_name IN ('Tenant Admin', 'Tenant Staff')\n    51|             AND tenant_id IS NULL\n    52|         \"\"\")\n    53|\n    54|def downgrade():\n    55|         # Drop new constraints\n    56|         op.drop_constraint('roles_role_name_tenant_id_key', 'roles', schema='auth', type_='unique')\n    57|         op.execute(\"DROP INDEX IF EXISTS auth.roles_global_role_name_key\")\n\nOn which line does `downgrade` begin? The excerpt also contains `upgrade` — do not report that one's line.",
+  "correct_lines": [
+    54
+  ],
+  "selftest_pass": "`downgrade` begins on line 54.",
+  "selftest_fail": "`downgrade` begins on line 21."
+}

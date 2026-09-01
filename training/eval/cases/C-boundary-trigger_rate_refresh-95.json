@@ -1,0 +1,16 @@
+{
+  "id": "C-boundary-trigger_rate_refresh-95",
+  "kind": "citation",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/inventory-service/router/admin_gst_api.py. `get_active_refresh` starts at 57 and `trigger_rate_refresh` at 95 (verified against the file). Adjacent-definition confusion is the C12 failure mode: a live answer cited a range belonging to the neighbouring function.",
+  "scorers": [
+    "citation"
+  ],
+  "prompt": "Numbered excerpt from `API/inventory-service/router/admin_gst_api.py`:\n\n    57|async def get_active_refresh(db: AsyncSession):\n    58|    \"\"\"Get any active (running) refresh job.\"\"\"\n    59|    # Since we don't have a proper model for this table yet, we'll query it manually\n    60|    result = await db.execute(\n    61|        text(\"SELECT * FROM inventory.hsn_rate_refresh_log WHERE status = 'running' LIMIT 1\")\n    62|    )\n    63|    row = result.fetchone()\n    64|    return row\n    65|\n    66|logger = structlog.get_logger(__name__)\n    67|tracer = trace.get_tracer(__name__)\n    68|router = APIRouter(tags=[\"GST Admin\"])\n    69|\n    70|# The agent must return ONLY a JSON array — each element is one proposal. We instruct it to\n    71|# avoid prose/file-writes so the reply parses cleanly.\n    72|_AGENT_TASK = (\n    73|    \"Research the CURRENT official Indian GST rate (percentage) for each of these HSN codes: \"\n    74|    \"{codes}. Use only authoritative sources (cbic-gst.gov.in and official GST Council \"\n    75|    \"notifications). Return ONLY a JSON array and nothing else - no prose, no file writes. \"\n    76|    'Each element must be an object with these keys: {{\"code\": \"<hsn>\", '\n    77|    '\"proposed_rate\": <number>, \"source_url\": \"<url>\", '\n    78|    '\"citation\": \"<short notification reference or quote>\", '\n    79|    '\"confidence\": <number between 0 and 1>}}.'\n    80|)\n    81|\n    82|\n    83|class RateRefreshRequest(BaseModel):\n    84|    # Omit or leave empty to check ALL system HSN codes (same scope as the nightly run).\n    85|    codes: Optional[list[str]] = None\n    86|\n    87|\n    88|class RateRefreshResponse(BaseModel):\n    89|    job_id: str\n    90|    status: str\n    91|    code_count: int\n    92|\n    93|\n    94|@router.post(\"/admin/hsn/rate-refresh\", response_model=RateRefreshResponse, status_code=202)\n    95|async def trigger_rate_refresh(\n    96|    body: RateRefreshRequest,\n    97|    background_tasks: BackgroundTasks,\n    98|    current_user: TokenUser = Depends(get_current_app_admin),\n\nOn which line does `trigger_rate_refresh` begin? The excerpt also contains `get_active_refresh` — do not report that one's line.",
+  "correct_lines": [
+    94,
+    95
+  ],
+  "selftest_pass": "`trigger_rate_refresh` begins on line 95.",
+  "selftest_fail": "`trigger_rate_refresh` begins on line 57."
+}

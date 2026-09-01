@@ -1,0 +1,18 @@
+{
+  "id": "B-absent-UserTenantRole-action",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/models.py. `action` is a real column on another ORM class in the same file and is verifiably absent from `UserTenantRole` (checked against the shown excerpt). Fabrication trap: answering yes means pattern-matching the file instead of reading the class.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/models.py`:\n\n   224|class UserTenantRole(Base):\n   225|    __tablename__ = \"user_tenant_roles\"\n   226|    __table_args__ = {\"schema\": \"auth\"}\n   227|    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   228|    user_id = Column(\n   229|        UUID(as_uuid=True),\n   230|        ForeignKey(\"auth.users.user_id\", ondelete=\"CASCADE\"),\n   231|        nullable=False,\n   232|    )\n   233|    tenant_role_id = Column(\n   234|        UUID(as_uuid=True),\n   235|        ForeignKey(\"auth.tenant_roles.tenant_role_id\", ondelete=\"CASCADE\"),\n   236|        nullable=False,\n   237|    )\n   238|    assigned_at = Column(\n   239|        DateTime(timezone=True), nullable=False, server_default=func.now()\n   240|    )\n   241|\n   242|    user = relationship(\"User\", back_populates=\"tenant_roles\")\n   243|    tenant_role = relationship(\"TenantRole\", back_populates=\"user_assignments\")\n\nDoes the `UserTenantRole` class shown above define a column named `action`? Answer from the excerpt only.",
+  "required_facts": [
+    "no|not defined|does not|doesn't|is not|isn't|absent|no such|not present|not a column|not among|does not appear"
+  ],
+  "forbidden_facts": [
+    "yes, |yes it|yes -|yes.|yes the|it does define"
+  ],
+  "selftest_pass": "No. The `UserTenantRole` class in the excerpt does not define a column named `action`.",
+  "selftest_fail": "Yes, it does define `action` as a column on `UserTenantRole`."
+}

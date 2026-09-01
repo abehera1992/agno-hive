@@ -1,0 +1,16 @@
+{
+  "id": "B-type-TenantRole-role_name",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/models.py:212 (verified: the literal 'String(100)' is on that line). Exact-value extraction from provided evidence.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/models.py`:\n\n   206|    tenant_role_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   207|    tenant_id = Column(\n   208|        UUID(as_uuid=True),\n   209|        ForeignKey(\"auth.tenants.tenant_id\", ondelete=\"CASCADE\"),\n   210|        nullable=False,\n   211|    )\n   212|    role_name = Column(String(100), nullable=False)\n   213|    description = Column(String, nullable=True)\n   214|    created_at = Column(\n   215|        DateTime(timezone=True), nullable=False, server_default=func.now()\n   216|    )\n   217|\n   218|    tenant = relationship(\"Tenant\")\n\nIn the `TenantRole` model, what is the declared column type of `role_name`? Quote it exactly as written. Answer from the excerpt only.",
+  "required_facts": [
+    "String(100)"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "`role_name` is declared as `String(100)`.",
+  "selftest_fail": "`role_name` is declared as a plain unsized column."
+}

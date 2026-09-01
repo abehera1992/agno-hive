@@ -1,9 +1,18 @@
 {
   "id": "B1-hsn-fallback-retired",
   "kind": "grounding",
-  "provenance": "EK-247 (2026-07-26) eliminated the code-resident _HSN_FALLBACK dict, moving all 1121 codes into inventory.hsn_catalogue. A GENUINE trap: gst_resolver.py's own comment directly above the function (lines 24-26) still says 'Static fallback for when the DB catalogue has no entry...' -- stale prose left in place after the refactor -- so a model reading only the comment, or answering from generic memory, is likely to confidently describe a fallback dict that no longer exists in the code below it. Verified directly against the real file 2026-08-16.",
-  "scorers": ["grounding"],
-  "prompt": "In EkamApp's gst_resolver.py, when resolve_gst_for_hsn is called for an HSN code that has no row in inventory.hsn_catalogue, does it fall back to a code-resident _HSN_FALLBACK dict? What actually happens instead?",
-  "required_facts": ["no|does not|removed|eliminated"],
-  "forbidden_facts": ["falls back to a", "_HSN_FALLBACK dict is used", "yes, it falls back"]
+  "origin": "hand",
+  "provenance": "EkamApp gst_resolver.py. Deliberately hard: the comment block directly above the function still describes a 'Static fallback ... dict' that was removed when EK-247 seeded those 1121 headings into hsn_catalogue. The code returns None. A model that reads the comment instead of the body answers yes. Replaces the pre-2026-08-31 version, which asked the same question with no excerpt and no tools and scored recall of the answer. Excerpt API/inventory-service/gst_resolver.py:23-59, cut and verified at generation time.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/inventory-service/gst_resolver.py`:\n\n    23|\n    24|# Static fallback for when the DB catalogue has no entry for a 4-digit HSN heading.\n    25|# Covers all ~1 200 headings (HS 2022 schedule) using Indian GST rates effective 2025-09-22.\n    26|# Codes already seeded in hsn_catalogue never reach this dict — the DB row wins.\n    27|async def resolve_gst_for_hsn(db: AsyncSession, hsn_prefix: str, as_of=None) -> Optional[float]:\n    28|    \"\"\"\n    29|    Resolve the GST rate for an HSN heading. Returns the rate as a float, or None if not found.\n    30|\n    31|    Resolves the row effective at `as_of` (default now): filters HSNCatalogue on code == hsn_prefix\n    32|    with effective_from <= as_of and (effective_to IS NULL or effective_to > as_of), ordered by\n    33|    is_system descending (system default first) then effective_from descending, limit 1 — the same\n    34|    effective-dating shape as the GET /hsn-lookup/{code} endpoint (EK-86).\n    35|\n    36|    Args:\n    37|        db:         Async database session.\n    38|        hsn_prefix: The HSN code / heading to look up.\n    39|        as_of:      Optional point-in-time (effective-dating) — resolves the rate effective at that point in time\n    40|                    (a row is effective when effective_from <= as_of and effective_to is NULL or > as_of);\n    41|                    defaults to now() when as_of is None.\n    42|    \"\"\"\n    43|    with tracer.start_as_current_span(\"gst.resolve_hsn_rate\") as span:\n    44|        at = as_of or datetime.now(timezone.utc)\n    45|        result = await db.execute(\n    46|            select(HSNCatalogue)\n    47|            .where(HSNCatalogue.code == hsn_prefix)\n    48|            .where(HSNCatalogue.effective_from <= at)\n    49|            .where(or_(HSNCatalogue.effective_to.is_(None), HSNCatalogue.effective_to > at))\n    50|            .order_by(HSNCatalogue.is_system.desc(), HSNCatalogue.effective_from.desc())\n    51|            .limit(1)\n    52|        )\n    53|        entry = result.scalar_one_or_none()\n    54|        resolved_rate = float(entry.gst_rate) if entry and entry.gst_rate is not None else None\n    55|        span.set_attribute(\"hsn_prefix\", hsn_prefix)\n    56|        span.set_attribute(\"as_of\", at.isoformat())\n    57|        if resolved_rate is None:\n    58|            span.set_attribute(\"gst.rate_found\", False)\n    59|        else:\n\nWhen `resolve_gst_for_hsn` is called for an HSN code that has no row in `hsn_catalogue`, does it fall back to a code-resident `_HSN_FALLBACK` dict? What does it return instead? Answer from the excerpt only.",
+  "required_facts": [
+    "none"
+  ],
+  "forbidden_facts": [
+    "falls back to a|falls back to the|yes, it falls"
+  ],
+  "selftest_pass": "No. There is no `_HSN_FALLBACK` dict in this code — the function queries HSNCatalogue and returns None when no row is effective.",
+  "selftest_fail": "Yes, when `resolve_gst_for_hsn` is called for an HSN code that has no row in `hsn_catalogue`, it falls back to a code-resident `_HSN_FALLBACK` dict."
 }

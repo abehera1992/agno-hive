@@ -1,0 +1,18 @@
+{
+  "id": "B-absent-RefreshToken-can_view",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/models.py. `can_view` is a real column on another ORM class in the same file and is verifiably absent from `RefreshToken` (checked against the shown excerpt). Fabrication trap: answering yes means pattern-matching the file instead of reading the class.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/models.py`:\n\n   135|class RefreshToken(Base):\n   136|    __tablename__ = \"refresh_tokens\"\n   137|    __table_args__ = {\"schema\": \"auth\"}\n   138|    token_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   139|    user_id = Column(\n   140|        UUID(as_uuid=True),\n   141|        ForeignKey(\"auth.users.user_id\", ondelete=\"CASCADE\"),\n   142|        nullable=False,\n   143|    )\n   144|    token = Column(String, nullable=False)\n   145|    expires_at = Column(DateTime, nullable=False)\n   146|    created_at = Column(DateTime(timezone=True), server_default=func.now())\n   147|    user_agent = Column(String(500), nullable=True)\n   148|\n   149|    user = relationship(\"User\", back_populates=\"refresh_tokens\")\n\nDoes the `RefreshToken` class shown above define a column named `can_view`? Answer from the excerpt only.",
+  "required_facts": [
+    "no|not defined|does not|doesn't|is not|isn't|absent|no such|not present|not a column|not among|does not appear"
+  ],
+  "forbidden_facts": [
+    "yes, |yes it|yes -|yes.|yes the|it does define"
+  ],
+  "selftest_pass": "No. The `RefreshToken` class in the excerpt does not define a column named `can_view`.",
+  "selftest_fail": "Yes, it does define `can_view` as a column on `RefreshToken`."
+}

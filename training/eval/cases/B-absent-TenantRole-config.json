@@ -1,0 +1,18 @@
+{
+  "id": "B-absent-TenantRole-config",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/models.py. `config` is a real column on another ORM class in the same file and is verifiably absent from `TenantRole` (checked against the shown excerpt). Fabrication trap: answering yes means pattern-matching the file instead of reading the class.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/models.py`:\n\n   203|class TenantRole(Base):\n   204|    __tablename__ = \"tenant_roles\"\n   205|    __table_args__ = {\"schema\": \"auth\"}\n   206|    tenant_role_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   207|    tenant_id = Column(\n   208|        UUID(as_uuid=True),\n   209|        ForeignKey(\"auth.tenants.tenant_id\", ondelete=\"CASCADE\"),\n   210|        nullable=False,\n   211|    )\n   212|    role_name = Column(String(100), nullable=False)\n   213|    description = Column(String, nullable=True)\n   214|    created_at = Column(\n   215|        DateTime(timezone=True), nullable=False, server_default=func.now()\n   216|    )\n   217|\n   218|    tenant = relationship(\"Tenant\")\n   219|    user_assignments = relationship(\n\nDoes the `TenantRole` class shown above define a column named `config`? Answer from the excerpt only.",
+  "required_facts": [
+    "no|not defined|does not|doesn't|is not|isn't|absent|no such|not present|not a column|not among|does not appear"
+  ],
+  "forbidden_facts": [
+    "yes, |yes it|yes -|yes.|yes the|it does define"
+  ],
+  "selftest_pass": "No. The `TenantRole` class in the excerpt does not define a column named `config`.",
+  "selftest_fail": "Yes, it does define `config` as a column on `TenantRole`."
+}

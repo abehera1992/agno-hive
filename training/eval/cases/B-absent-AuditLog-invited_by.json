@@ -1,0 +1,18 @@
+{
+  "id": "B-absent-AuditLog-invited_by",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/models.py. `invited_by` is a real column on another ORM class in the same file and is verifiably absent from `AuditLog` (checked against the shown excerpt). Fabrication trap: answering yes means pattern-matching the file instead of reading the class.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/models.py`:\n\n   178|class AuditLog(Base):\n   179|    __tablename__ = \"audit_log\"\n   180|    __table_args__ = {\"schema\": \"auth\"}\n   181|    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   182|    action = Column(String(100), nullable=False)\n   183|    user_id = Column(\n   184|        UUID(as_uuid=True),\n   185|        ForeignKey(\"auth.users.user_id\", ondelete=\"SET NULL\"),\n   186|        nullable=True,\n   187|    )\n   188|    performed_by = Column(\n   189|        UUID(as_uuid=True),\n   190|        ForeignKey(\"auth.users.user_id\", ondelete=\"SET NULL\"),\n   191|        nullable=True,\n   192|    )\n   193|    tenant_id = Column(UUID(as_uuid=True), nullable=True)\n   194|    details = Column(JSONB, nullable=True)\n   195|    timestamp = Column(\n   196|        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()\n   197|    )\n   198|\n   199|    user = relationship(\"User\", back_populates=\"audit_logs\", foreign_keys=[user_id])\n   200|    performed_by_user = relationship(\"User\", foreign_keys=[performed_by])\n\nDoes the `AuditLog` class shown above define a column named `invited_by`? Answer from the excerpt only.",
+  "required_facts": [
+    "no|not defined|does not|doesn't|is not|isn't|absent|no such|not present|not a column|not among|does not appear"
+  ],
+  "forbidden_facts": [
+    "yes, |yes it|yes -|yes.|yes the|it does define"
+  ],
+  "selftest_pass": "No. The `AuditLog` class in the excerpt does not define a column named `invited_by`.",
+  "selftest_fail": "Yes, it does define `invited_by` as a column on `AuditLog`."
+}

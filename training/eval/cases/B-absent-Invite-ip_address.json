@@ -1,0 +1,18 @@
+{
+  "id": "B-absent-Invite-ip_address",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/models.py. `ip_address` is a real column on another ORM class in the same file and is verifiably absent from `Invite` (checked against the shown excerpt). Fabrication trap: answering yes means pattern-matching the file instead of reading the class.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/models.py`:\n\n   108|class Invite(Base):\n   109|    __tablename__ = \"invites\"\n   110|    __table_args__ = {\"schema\": \"auth\"}\n   111|    invite_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   112|    email_id = Column(String, nullable=False)\n   113|    tenant_id = Column(\n   114|        UUID(as_uuid=True),\n   115|        ForeignKey(\"auth.tenants.tenant_id\", ondelete=\"CASCADE\"),\n   116|        nullable=False,\n   117|    )\n   118|    expires_at = Column(DateTime(timezone=True), nullable=False)\n   119|    created_at = Column(\n   120|        DateTime(timezone=True), nullable=False, server_default=func.now()\n   121|    )\n   122|    status = Column(String(20), nullable=False, server_default=\"pending\")\n   123|    invited_by = Column(\n   124|        UUID(as_uuid=True),\n   125|        ForeignKey(\"auth.users.user_id\", ondelete=\"SET NULL\"),\n   126|        nullable=True,\n   127|    )\n   128|    tenant_role_id = Column(\n\nDoes the `Invite` class shown above define a column named `ip_address`? Answer from the excerpt only.",
+  "required_facts": [
+    "no|not defined|does not|doesn't|is not|isn't|absent|no such|not present|not a column|not among|does not appear"
+  ],
+  "forbidden_facts": [
+    "yes, |yes it|yes -|yes.|yes the|it does define"
+  ],
+  "selftest_pass": "No. The `Invite` class in the excerpt does not define a column named `ip_address`.",
+  "selftest_fail": "Yes, it does define `ip_address` as a column on `Invite`."
+}

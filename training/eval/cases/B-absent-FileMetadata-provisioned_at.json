@@ -1,0 +1,18 @@
+{
+  "id": "B-absent-FileMetadata-provisioned_at",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/storage-service/models.py. `provisioned_at` is a real column on another ORM class in the same file and is verifiably absent from `FileMetadata` (checked against the shown excerpt). Fabrication trap: answering yes means pattern-matching the file instead of reading the class.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/storage-service/models.py`:\n\n    35|class FileMetadata(Base):\n    36|    __tablename__ = \"file_metadata\"\n    37|    __table_args__ = {\"schema\": \"storage\"}\n    38|\n    39|    file_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n    40|    tenant_id = Column(UUID(as_uuid=True), nullable=True)\n    41|    user_id = Column(UUID(as_uuid=True), nullable=False)\n    42|    tier = Column(\n    43|        sa.Enum(StorageTier, name=\"storage_tier\", schema=\"storage\", create_type=True,\n    44|                values_callable=lambda obj: [e.value for e in obj]),\n    45|        nullable=False,\n    46|    )\n    47|    filer_path = Column(String, unique=True, nullable=False)\n    48|    original_filename = Column(String, nullable=False)\n    49|    file_size = Column(BigInteger, nullable=False)\n    50|    mime_type = Column(String, nullable=True)\n    51|    is_public = Column(Boolean, nullable=False, default=False)\n    52|    context = Column(String, nullable=True)\n    53|    ttl_seconds = Column(Integer, nullable=True)\n    54|    expires_at = Column(DateTime(timezone=True), nullable=True)\n    55|    uploaded_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())\n\nDoes the `FileMetadata` class shown above define a column named `provisioned_at`? Answer from the excerpt only.",
+  "required_facts": [
+    "no|not defined|does not|doesn't|is not|isn't|absent|no such|not present|not a column|not among|does not appear"
+  ],
+  "forbidden_facts": [
+    "yes, |yes it|yes -|yes.|yes the|it does define"
+  ],
+  "selftest_pass": "No. The `FileMetadata` class in the excerpt does not define a column named `provisioned_at`.",
+  "selftest_fail": "Yes, it does define `provisioned_at` as a column on `FileMetadata`."
+}

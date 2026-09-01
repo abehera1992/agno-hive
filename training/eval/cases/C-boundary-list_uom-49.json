@@ -1,0 +1,16 @@
+{
+  "id": "C-boundary-list_uom-49",
+  "kind": "citation",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/inventory-service/router/uom_api.py. `ensure_default_uoms` starts at 22 and `list_uom` at 49 (verified against the file). Adjacent-definition confusion is the C12 failure mode: a live answer cited a range belonging to the neighbouring function.",
+  "scorers": [
+    "citation"
+  ],
+  "prompt": "Numbered excerpt from `API/inventory-service/router/uom_api.py`:\n\n    22|async def ensure_default_uoms(db: AsyncSession, tenant_id: UUID) -> None:\n    23|    # Check if tenant already has any UoM rows\n    24|    count_result = await db.execute(\n    25|        select(UoMMaster).where(UoMMaster.tenant_id == tenant_id)\n    26|    )\n    27|    if count_result.scalars().first():\n    28|        # Tenant already has UoMs, return early\n    29|        return\n    30|    \n    31|    # Insert default UoM rows for this tenant\n    32|    default_uoms = [\n    33|        UoMMaster(name=\"Piece\", symbol=\"pcs\", is_default=True, tenant_id=tenant_id),\n    34|        UoMMaster(name=\"Kilogram\", symbol=\"kg\", is_default=False, tenant_id=tenant_id),\n    35|        UoMMaster(name=\"Gram\", symbol=\"g\", is_default=False, tenant_id=tenant_id),\n    36|        UoMMaster(name=\"Ounce\", symbol=\"oz\", is_default=False, tenant_id=tenant_id),\n    37|        UoMMaster(name=\"Millilitre\", symbol=\"ml\", is_default=False, tenant_id=tenant_id),\n    38|        UoMMaster(name=\"Litre\", symbol=\"l\", is_default=False, tenant_id=tenant_id),\n    39|        UoMMaster(name=\"Dozen\", symbol=\"dz\", is_default=False, tenant_id=tenant_id),\n    40|    ]\n    41|    \n    42|    db.add_all(default_uoms)\n    43|    # Commit so the seed PERSISTS with stable uom_ids — get_async_db does not auto-commit,\n    44|    # and this runs from a GET route that otherwise wouldn't commit (only fires on first seed).\n    45|    await db.commit()\n    46|\n    47|\n    48|@router.get(\"/uom\")\n    49|async def list_uom(\n    50|    current_user: TokenUser = Depends(get_current_seller),\n    51|    db: AsyncSession = Depends(get_async_db),\n    52|):\n\nOn which line does `list_uom` begin? The excerpt also contains `ensure_default_uoms` — do not report that one's line.",
+  "correct_lines": [
+    48,
+    49
+  ],
+  "selftest_pass": "`list_uom` begins on line 49.",
+  "selftest_fail": "`list_uom` begins on line 22."
+}

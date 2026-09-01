@@ -1,0 +1,16 @@
+{
+  "id": "B-type-EmailPreference-email_type",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/utility-service/models.py:102 (verified: the literal 'String(100)' is on that line). Exact-value extraction from provided evidence.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/utility-service/models.py`:\n\n    96|    __tablename__ = \"email_preferences\"\n    97|    __table_args__ = {\"schema\": \"utility\"}\n    98|\n    99|    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   100|    user_id = Column(UUID(as_uuid=True), nullable=False)\n   101|    tenant_id = Column(UUID(as_uuid=True), nullable=True)\n   102|    email_type = Column(String(100), nullable=False)  # e.g. marketing, transactional\n   103|    is_subscribed = Column(Boolean, default=True)\n   104|    updated_at = Column(\n   105|        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()\n   106|    )\n   107|\n   108|\n\nIn the `EmailPreference` model, what is the declared column type of `email_type`? Quote it exactly as written. Answer from the excerpt only.",
+  "required_facts": [
+    "String(100)"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "`email_type` is declared as `String(100)`.",
+  "selftest_fail": "`email_type` is declared as a plain unsized column."
+}

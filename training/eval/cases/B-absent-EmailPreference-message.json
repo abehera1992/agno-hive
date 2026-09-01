@@ -1,0 +1,18 @@
+{
+  "id": "B-absent-EmailPreference-message",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/utility-service/models.py. `message` is a real column on another ORM class in the same file and is verifiably absent from `EmailPreference` (checked against the shown excerpt). Fabrication trap: answering yes means pattern-matching the file instead of reading the class.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/utility-service/models.py`:\n\n    93|class EmailPreference(Base):\n    94|    \"\"\"Per user/tenant email opt-in preferences\"\"\"\n    95|\n    96|    __tablename__ = \"email_preferences\"\n    97|    __table_args__ = {\"schema\": \"utility\"}\n    98|\n    99|    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   100|    user_id = Column(UUID(as_uuid=True), nullable=False)\n   101|    tenant_id = Column(UUID(as_uuid=True), nullable=True)\n   102|    email_type = Column(String(100), nullable=False)  # e.g. marketing, transactional\n   103|    is_subscribed = Column(Boolean, default=True)\n   104|    updated_at = Column(\n\nDoes the `EmailPreference` class shown above define a column named `message`? Answer from the excerpt only.",
+  "required_facts": [
+    "no|not defined|does not|doesn't|is not|isn't|absent|no such|not present|not a column|not among|does not appear"
+  ],
+  "forbidden_facts": [
+    "yes, |yes it|yes -|yes.|yes the|it does define"
+  ],
+  "selftest_pass": "No. The `EmailPreference` class in the excerpt does not define a column named `message`.",
+  "selftest_fail": "Yes, it does define `message` as a column on `EmailPreference`."
+}

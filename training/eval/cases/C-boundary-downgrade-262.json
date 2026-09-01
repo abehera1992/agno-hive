@@ -1,0 +1,15 @@
+{
+  "id": "C-boundary-downgrade-262",
+  "kind": "citation",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/inventory-service/migrations/versions/078574d36f0f_seed_hsn_fallback_full_ek247.py. `upgrade` starts at 236 and `downgrade` at 262 (verified against the file). Adjacent-definition confusion is the C12 failure mode: a live answer cited a range belonging to the neighbouring function.",
+  "scorers": [
+    "citation"
+  ],
+  "prompt": "Numbered excerpt from `API/inventory-service/migrations/versions/078574d36f0f_seed_hsn_fallback_full_ek247.py`:\n\n   236|def upgrade() -> None:\n   237|    conn = op.get_bind()\n   238|    existing = {\n   239|        row[0]\n   240|        for row in conn.execute(\n   241|            sa.text(\"SELECT code FROM inventory.hsn_catalogue WHERE is_system = true\")\n   242|        )\n   243|    }\n   244|    rows = [\n   245|        {\n   246|            \"hsn_id\": str(uuid.uuid4()),\n   247|            \"code\": code,\n   248|            \"description\": None,\n   249|            \"gst_rate\": rate,\n   250|            \"item_type\": \"product\",\n   251|            \"is_system\": True,\n   252|            \"effective_from\": _EFFECTIVE,\n   253|            \"source_url\": _SOURCE,\n   254|        }\n   255|        for code, rate in _SEED\n   256|        if code not in existing\n   257|    ]\n   258|    if rows:\n   259|        op.bulk_insert(_hsn, rows)\n   260|\n   261|\n   262|def downgrade() -> None:\n   263|    op.execute(\n   264|        sa.text(\n   265|            \"DELETE FROM inventory.hsn_catalogue WHERE is_system = true AND source_url = :src\"\n\nOn which line does `downgrade` begin? The excerpt also contains `upgrade` — do not report that one's line.",
+  "correct_lines": [
+    262
+  ],
+  "selftest_pass": "`downgrade` begins on line 262.",
+  "selftest_fail": "`downgrade` begins on line 236."
+}

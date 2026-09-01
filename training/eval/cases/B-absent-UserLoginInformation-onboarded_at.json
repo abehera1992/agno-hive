@@ -1,0 +1,18 @@
+{
+  "id": "B-absent-UserLoginInformation-onboarded_at",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/models.py. `onboarded_at` is a real column on another ORM class in the same file and is verifiably absent from `UserLoginInformation` (checked against the shown excerpt). Fabrication trap: answering yes means pattern-matching the file instead of reading the class.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/models.py`:\n\n   251|class UserLoginInformation(Base):\n   252|    __tablename__ = \"user_login_information\"\n   253|    __table_args__ = {\"schema\": \"auth\"}\n   254|\n   255|    login_id = Column(\n   256|        UUID(as_uuid=True),\n   257|        primary_key=True,\n   258|        default=uuid4,\n   259|        server_default=func.gen_random_uuid(),\n   260|    )\n   261|    user_id = Column(\n   262|        UUID(as_uuid=True),\n   263|        ForeignKey(\"auth.users.user_id\", ondelete=\"SET NULL\"),\n   264|        nullable=True,\n   265|        index=True,\n   266|    )\n   267|    login_at = Column(DateTime, nullable=False, server_default=func.now())\n   268|    logout_at = Column(DateTime, nullable=True)\n   269|    ip_address = Column(String, nullable=True)\n   270|    device_type = Column(String, nullable=True)\n   271|    browser = Column(String, nullable=True)\n   272|    user_agent = Column(String, nullable=True)\n   273|    os = Column(String, nullable=True)\n   274|    login_status = Column(\n   275|        sa.Enum(\n   276|            LoginStatus,\n   277|            name=\"login_status\",\n   278|            schema=\"auth\",\n   279|            create_type=False,\n   280|            # This is the critical fix: it tells SQLAlchemy to send the .value\n   281|            values_callable=lambda obj: [e.value for e in obj],\n   282|        ),\n   283|        nullable=False,\n   284|        index=True,\n   285|    )\n   286|    failure_reason = Column(String, nullable=True)\n   287|    session_token = Column(String, nullable=True)\n   288|    location = Column(String, nullable=True)\n   289|    created_at = Column(DateTime, nullable=False, server_default=func.now())\n   290|\n   291|    def __repr__(self):\n\nDoes the `UserLoginInformation` class shown above define a column named `onboarded_at`? Answer from the excerpt only.",
+  "required_facts": [
+    "no|not defined|does not|doesn't|is not|isn't|absent|no such|not present|not a column|not among|does not appear"
+  ],
+  "forbidden_facts": [
+    "yes, |yes it|yes -|yes.|yes the|it does define"
+  ],
+  "selftest_pass": "No. The `UserLoginInformation` class in the excerpt does not define a column named `onboarded_at`.",
+  "selftest_fail": "Yes, it does define `onboarded_at` as a column on `UserLoginInformation`."
+}

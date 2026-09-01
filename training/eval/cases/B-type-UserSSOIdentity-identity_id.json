@@ -1,0 +1,16 @@
+{
+  "id": "B-type-UserSSOIdentity-identity_id",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/models.py:302 (verified: the literal 'UUID(as_uuid=True)' is on that line). Exact-value extraction from provided evidence.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/models.py`:\n\n   296|    __tablename__ = \"user_sso_identities\"\n   297|    __table_args__ = (\n   298|        sa.UniqueConstraint(\"provider\", \"provider_user_id\", name=\"uq_provider_user\"),\n   299|        {\"schema\": \"auth\"},\n   300|    )\n   301|\n   302|    identity_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   303|    user_id = Column(\n   304|        UUID(as_uuid=True),\n   305|        sa.ForeignKey(\"auth.users.user_id\", ondelete=\"CASCADE\"),\n   306|        nullable=False,\n   307|    )\n   308|    provider = Column(sa.String(50), nullable=False)  # 'google', 'microsoft', etc.\n\nIn the `UserSSOIdentity` model, what is the declared column type of `identity_id`? Quote it exactly as written. Answer from the excerpt only.",
+  "required_facts": [
+    "UUID(as_uuid=True)"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "`identity_id` is declared as `UUID(as_uuid=True)`.",
+  "selftest_fail": "`identity_id` is declared as a plain unsized column."
+}

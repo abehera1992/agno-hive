@@ -1,0 +1,18 @@
+{
+  "id": "B-absent-ServiceLog-scheduled_at",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/utility-service/models.py. `scheduled_at` is a real column on another ORM class in the same file and is verifiably absent from `ServiceLog` (checked against the shown excerpt). Fabrication trap: answering yes means pattern-matching the file instead of reading the class.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/utility-service/models.py`:\n\n    50|class ServiceLog(Base):\n    51|    \"\"\"Persists INFO and ERROR logs from all services to PostgreSQL\"\"\"\n    52|\n    53|    __tablename__ = \"logs\"\n    54|    __table_args__ = {\"schema\": \"utility\"}\n    55|\n    56|    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n    57|    level = Column(SAEnum(LogLevel, schema=\"utility\"), nullable=False)\n    58|    service_name = Column(String(100), nullable=False)  # e.g. ekam-auth-service\n    59|    message = Column(Text, nullable=False)\n    60|    extra_data = Column(JSON, nullable=True)  # extra context dict\n    61|    trace_id = Column(String(100), nullable=True)  # OTEL trace id\n    62|    span_id = Column(String(100), nullable=True)  # OTEL span id\n    63|    created_at = Column(DateTime(timezone=True), server_default=func.now())\n\nDoes the `ServiceLog` class shown above define a column named `scheduled_at`? Answer from the excerpt only.",
+  "required_facts": [
+    "no|not defined|does not|doesn't|is not|isn't|absent|no such|not present|not a column|not among|does not appear"
+  ],
+  "forbidden_facts": [
+    "yes, |yes it|yes -|yes.|yes the|it does define"
+  ],
+  "selftest_pass": "No. The `ServiceLog` class in the excerpt does not define a column named `scheduled_at`.",
+  "selftest_fail": "Yes, it does define `scheduled_at` as a column on `ServiceLog`."
+}

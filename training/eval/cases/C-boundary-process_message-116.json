@@ -1,0 +1,15 @@
+{
+  "id": "C-boundary-process_message-116",
+  "kind": "citation",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/email-worker/main.py. `send_email` starts at 82 and `process_message` at 116 (verified against the file). Adjacent-definition confusion is the C12 failure mode: a live answer cited a range belonging to the neighbouring function.",
+  "scorers": [
+    "citation"
+  ],
+  "prompt": "Numbered excerpt from `API/email-worker/main.py`:\n\n    82|async def send_email(\n    83|    recipient_email: str, subject: str, body_html: str, body_text: str | None\n    84|):\n    85|    msg = MIMEMultipart(\"alternative\")\n    86|    msg[\"From\"] = SMTP_FROM_EMAIL\n    87|    msg[\"To\"] = recipient_email\n    88|    msg[\"Subject\"] = subject\n    89|\n    90|    if body_text:\n    91|        msg.attach(MIMEText(body_text, \"plain\"))\n    92|    msg.attach(MIMEText(body_html, \"html\"))\n    93|\n    94|    # Dev: skip cert validation (mkcert cert on Docker internal network).\n    95|    # Production: remove tls_context — let aiosmtplib validate against system CAs.\n    96|    tls_context = None\n    97|    if SMTP_ENVIRONMENT != \"production\":\n    98|        tls_context = ssl.create_default_context()\n    99|        tls_context.check_hostname = False\n   100|        tls_context.verify_mode = ssl.CERT_NONE\n   101|\n   102|    await aiosmtplib.send(\n   103|        msg,\n   104|        hostname=SMTP_HOST,\n   105|        port=SMTP_PORT,\n   106|        username=SMTP_USERNAME or None,\n   107|        password=SMTP_PASSWORD or None,\n   108|        start_tls=SMTP_USE_TLS,\n   109|        tls_context=tls_context if SMTP_USE_TLS else None,\n   110|    )\n   111|\n   112|\n   113|# ──────────────────────────────────────────────\n   114|# PROCESS MESSAGE\n   115|# ──────────────────────────────────────────────\n   116|async def process_message(message: dict):\n   117|    queue_id = UUID(message[\"queue_id\"])\n   118|    recipient_email = message[\"recipient_email\"]\n   119|    subject = message[\"subject\"]\n\nOn which line does `process_message` begin? The excerpt also contains `send_email` — do not report that one's line.",
+  "correct_lines": [
+    116
+  ],
+  "selftest_pass": "`process_message` begins on line 116.",
+  "selftest_fail": "`process_message` begins on line 82."
+}

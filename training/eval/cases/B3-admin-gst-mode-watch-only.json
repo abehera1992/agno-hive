@@ -1,9 +1,18 @@
 {
   "id": "B3-admin-gst-mode-watch-only",
   "kind": "grounding",
-  "provenance": "EK-247 (2026-07-26) retired admin_gst_api's mode=full path (removed _run_refresh_job + scheduled_rate_check) -- the endpoint is now watch-only. Verified directly against API/inventory-service/router/admin_gst_api.py:99 2026-08-16, where the mode parameter's regex literally enforces this (`regex=\"^watch$\"`), a genuine trap for a model whose training predates the retirement and still expects mode=full to be a valid option.",
-  "scorers": ["grounding"],
-  "prompt": "In EkamApp's admin_gst_api.py, does the GST rate-check endpoint still accept a mode=full query parameter to trigger a manual refresh job? What mode value does it actually accept today?",
-  "required_facts": ["watch"],
-  "forbidden_facts": ["mode=full is", "full is a valid", "yes, mode=full"]
+  "origin": "hand",
+  "provenance": "EkamApp admin_gst_api.py. The `regex=\"^watch$\"` constraint in the excerpt is what rules out `full`. Replaces the pre-2026-08-31 version, which supplied no excerpt: the deployed model answered `mode=refresh` (or `mode=sync`) with a formatted valid/invalid table -- confident, fluent, and invented. Excerpt API/inventory-service/router/admin_gst_api.py:91-105, cut and verified at generation time.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/inventory-service/router/admin_gst_api.py`:\n\n    91|    code_count: int\n    92|\n    93|\n    94|@router.post(\"/admin/hsn/rate-refresh\", response_model=RateRefreshResponse, status_code=202)\n    95|async def trigger_rate_refresh(\n    96|    body: RateRefreshRequest,\n    97|    background_tasks: BackgroundTasks,\n    98|    current_user: TokenUser = Depends(get_current_app_admin),\n    99|    mode: str = Query(default=\"watch\", regex=\"^watch$\"),\n   100|):\n   101|    \"\"\"Kick off an AGNOHive agent run to research + stage GST rate proposals (app-admin only).\n   102|\n   103|    Returns immediately with a job_id; the proposals are fetched and staged asynchronously so\n   104|    the long-running agent call does not block the request.\n   105|    \"\"\"\n\nDoes this rate-refresh endpoint accept `mode=full`? What value of `mode` does it actually accept? Answer from the excerpt only.",
+  "required_facts": [
+    "watch"
+  ],
+  "forbidden_facts": [
+    "mode=full is accepted|accepts full|full is valid|mode=refresh|mode=sync"
+  ],
+  "selftest_pass": "No — the Query regex is ^watch$, so the only accepted value is watch.",
+  "selftest_fail": "It accepts mode=full, and also mode=refresh."
 }

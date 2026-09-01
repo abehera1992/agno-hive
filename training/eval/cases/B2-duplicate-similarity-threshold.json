@@ -1,9 +1,17 @@
 {
   "id": "B2-duplicate-similarity-threshold",
   "kind": "grounding",
-  "provenance": "EK-269/270/271/272 (2026-07-30) added pg_trgm-based duplicate-name detection on item creation. Verified directly against API/inventory-service/router/items_api.py:396 2026-08-16 -- a specific numeric threshold with no obvious 'round number' answer, good fabrication bait.",
-  "scorers": ["grounding"],
-  "prompt": "In EkamApp, when a new item is created, the system warns if a similarly-named item already exists for the tenant, using PostgreSQL's pg_trgm similarity() function. What is the exact similarity threshold above which an existing item counts as 'similar', and how many candidate matches does the query return at most?",
-  "required_facts": ["0.4", "5"],
-  "forbidden_facts": ["0.5", "0.8", "0.3", "10"]
+  "origin": "hand",
+  "provenance": "EkamApp items_api.py, the raw SQL duplicate-name probe. Exact-value extraction from supplied evidence. Replaces the pre-2026-08-31 version, which required the literals 0.4 and 5 with nothing in the prompt to read them from. Excerpt API/inventory-service/router/items_api.py:384-402, cut and verified at generation time.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/inventory-service/router/items_api.py`:\n\n   384|                applied_rate=item.gst_rate,\n   385|                master_rate=master_rate,\n   386|                invoice_date=date.today(),\n   387|                override_reason=item.override_reason,\n   388|                attested_by=UUID(current_user.user_id),\n   389|                attested_at=datetime.now(timezone.utc)\n   390|            )\n   391|\n   392|    # Check for similar items using similarity threshold\n   393|    similar_result = await db.execute(\n   394|        text(\n   395|            \"SELECT item_id, name, is_active FROM inventory.items \"\n   396|            \"WHERE tenant_id = :tenant_id AND similarity(name, :new_name) > 0.4 \"\n   397|            \"ORDER BY similarity(name, :new_name) DESC LIMIT 5\"\n   398|        ),\n   399|        {\"tenant_id\": UUID(tenant_id), \"new_name\": item.name},\n   400|    )\n   401|    similar_items = [\n   402|        {\"item_id\": str(row.item_id), \"name\": row.name, \"is_active\": row.is_active}\n\nAbove what pg_trgm `similarity()` score is an existing item reported as a near-duplicate, and at most how many are returned? Answer from the excerpt only.",
+  "required_facts": [
+    "0.4",
+    "5"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "Above a similarity of 0.4, and at most 5 rows are returned.",
+  "selftest_fail": "Above a similarity of 0.8, and at most 20 rows are returned."
 }

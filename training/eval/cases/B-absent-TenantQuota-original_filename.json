@@ -1,0 +1,18 @@
+{
+  "id": "B-absent-TenantQuota-original_filename",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/storage-service/models.py. `original_filename` is a real column on another ORM class in the same file and is verifiably absent from `TenantQuota` (checked against the shown excerpt). Fabrication trap: answering yes means pattern-matching the file instead of reading the class.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/storage-service/models.py`:\n\n    58|class TenantQuota(Base):\n    59|    __tablename__ = \"tenant_quotas\"\n    60|    __table_args__ = {\"schema\": \"storage\"}\n    61|\n    62|    quota_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n    63|    tenant_id = Column(UUID(as_uuid=True), unique=True, nullable=False)\n    64|    plan = Column(\n    65|        sa.Enum(StoragePlan, name=\"storage_plan\", schema=\"storage\", create_type=False,\n    66|                values_callable=lambda obj: [e.value for e in obj]),\n    67|        nullable=False,\n    68|        default=StoragePlan.STANDARD,\n    69|    )\n    70|    # Hard cap in bytes. NULL = no hard cap (usage-based plan — billed per overage).\n    71|    max_bytes = Column(BigInteger, nullable=True, default=STANDARD_QUOTA_BYTES)\n    72|    # Free allocation threshold. Bytes beyond this are billed at the overage rate.\n    73|    free_bytes = Column(BigInteger, nullable=False, default=STANDARD_QUOTA_BYTES)\n    74|    used_bytes = Column(BigInteger, nullable=False, default=0)\n    75|    provisioned_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())\n\nDoes the `TenantQuota` class shown above define a column named `original_filename`? Answer from the excerpt only.",
+  "required_facts": [
+    "no|not defined|does not|doesn't|is not|isn't|absent|no such|not present|not a column|not among|does not appear"
+  ],
+  "forbidden_facts": [
+    "yes, |yes it|yes -|yes.|yes the|it does define"
+  ],
+  "selftest_pass": "No. The `TenantQuota` class in the excerpt does not define a column named `original_filename`.",
+  "selftest_fail": "Yes, it does define `original_filename` as a column on `TenantQuota`."
+}

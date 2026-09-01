@@ -1,0 +1,16 @@
+{
+  "id": "B-type-RefreshToken-created_at",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/models.py:146 (verified: the literal 'DateTime(timezone=True)' is on that line). Exact-value extraction from provided evidence.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/models.py`:\n\n   140|        UUID(as_uuid=True),\n   141|        ForeignKey(\"auth.users.user_id\", ondelete=\"CASCADE\"),\n   142|        nullable=False,\n   143|    )\n   144|    token = Column(String, nullable=False)\n   145|    expires_at = Column(DateTime, nullable=False)\n   146|    created_at = Column(DateTime(timezone=True), server_default=func.now())\n   147|    user_agent = Column(String(500), nullable=True)\n   148|\n   149|    user = relationship(\"User\", back_populates=\"refresh_tokens\")\n   150|\n   151|\n   152|class ResetToken(Base):\n\nIn the `RefreshToken` model, what is the declared column type of `created_at`? Quote it exactly as written. Answer from the excerpt only.",
+  "required_facts": [
+    "DateTime(timezone=True)"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "`created_at` is declared as `DateTime(timezone=True)`.",
+  "selftest_fail": "`created_at` is declared as a plain unsized column."
+}

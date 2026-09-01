@@ -1,0 +1,15 @@
+{
+  "id": "C-boundary-get_tenant_ids_for_users-47",
+  "kind": "citation",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/utils/service_clients/auth_service_client.py. `provision_tenant_for_seller` starts at 16 and `get_tenant_ids_for_users` at 47 (verified against the file). Adjacent-definition confusion is the C12 failure mode: a live answer cited a range belonging to the neighbouring function.",
+  "scorers": [
+    "citation"
+  ],
+  "prompt": "Numbered excerpt from `API/utils/service_clients/auth_service_client.py`:\n\n    16|async def provision_tenant_for_seller(\n    17|    user_id: str,\n    18|    tenant_name: str,\n    19|    internal_api_key: str,\n    20|) -> dict:\n    21|    \"\"\"\n    22|    Create an auth.tenants record and link it to the user.\n    23|    Idempotent — safe to call multiple times; returns existing tenant if already set.\n    24|\n    25|    Returns dict with tenant_id, name, created (bool).\n    26|    Raises AuthServiceError on failure.\n    27|    \"\"\"\n    28|    try:\n    29|        async with httpx.AsyncClient(timeout=10.0) as client:\n    30|            resp = await client.post(\n    31|                f\"{AUTH_SERVICE_URL}/tenant/internal/provision-tenant\",\n    32|                json={\"user_id\": user_id, \"tenant_name\": tenant_name},\n    33|                headers={\"X-Internal-API-Key\": internal_api_key},\n    34|            )\n    35|            resp.raise_for_status()\n    36|            return resp.json()\n    37|\n    38|    except httpx.HTTPStatusError as e:\n    39|        raise AuthServiceError(\n    40|            f\"Auth service returned {e.response.status_code}: {e.response.text}\"\n    41|        ) from e\n    42|\n    43|    except httpx.RequestError as e:\n    44|        raise AuthServiceError(f\"Could not reach auth service: {e}\") from e\n    45|\n    46|\n    47|async def get_tenant_ids_for_users(\n    48|    user_ids: list[str],\n    49|    internal_api_key: str,\n    50|) -> dict:\n\nOn which line does `get_tenant_ids_for_users` begin? The excerpt also contains `provision_tenant_for_seller` — do not report that one's line.",
+  "correct_lines": [
+    47
+  ],
+  "selftest_pass": "`get_tenant_ids_for_users` begins on line 47.",
+  "selftest_fail": "`get_tenant_ids_for_users` begins on line 16."
+}

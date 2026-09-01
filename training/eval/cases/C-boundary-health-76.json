@@ -1,0 +1,16 @@
+{
+  "id": "C-boundary-health-76",
+  "kind": "citation",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/datalake-service/main.py. `lifespan` starts at 46 and `health` at 76 (verified against the file). Adjacent-definition confusion is the C12 failure mode: a live answer cited a range belonging to the neighbouring function.",
+  "scorers": [
+    "citation"
+  ],
+  "prompt": "Numbered excerpt from `API/datalake-service/main.py`:\n\n    46|async def lifespan(app: FastAPI):\n    47|    # Ensure Lakekeeper warehouse exists, then warm up catalog connection\n    48|    try:\n    49|        ensure_warehouse()\n    50|        get_catalog()\n    51|        logger.info(\"datalake_catalog_connected\", warehouse=\"ekam\")\n    52|    except Exception as exc:\n    53|        logger.warning(\"datalake_catalog_unavailable\", error=str(exc))\n    54|    yield\n    55|\n    56|\n    57|app = FastAPI(title=\"Datalake Service\", version=\"1.0.0\", lifespan=lifespan)\n    58|\n    59|\n    60|app.add_middleware(\n    61|    CORSMiddleware,\n    62|    allow_origins=[\n    63|        \"https://app.local.dev\",\n    64|        \"http://localhost:3000\",\n    65|        \"http://localhost:3001\",\n    66|    ],\n    67|    allow_credentials=True,\n    68|    allow_methods=[\"*\"],\n    69|    allow_headers=[\"*\"],\n    70|)\n    71|\n    72|\n    73|# -- Health -------------------------------------------------------------------\n    74|\n    75|@app.get(\"/health\")\n    76|async def health():\n    77|    return {\"status\": \"ok\"}\n    78|\n    79|\n\nOn which line does `health` begin? The excerpt also contains `lifespan` — do not report that one's line.",
+  "correct_lines": [
+    75,
+    76
+  ],
+  "selftest_pass": "`health` begins on line 76.",
+  "selftest_fail": "`health` begins on line 46."
+}

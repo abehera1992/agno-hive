@@ -1,9 +1,16 @@
 {
   "id": "B5-tenant-ids-endpoint-auth",
   "kind": "grounding",
-  "provenance": "EK-269 (2026-07-30) added the internal /internal/tenant-ids-by-users endpoint. Verified directly against API/authentication-service/router/tenant_service_api.py:265-267 2026-08-16 -- a service-to-service internal endpoint, not user-facing, so the default fabrication guess ('Authorization: Bearer') is plausible but wrong.",
-  "scorers": ["grounding"],
-  "prompt": "How does EkamApp's internal /internal/tenant-ids-by-users endpoint (business-service calling authentication-service) authenticate the caller? Name the exact HTTP header it checks.",
-  "required_facts": ["x-internal-api-key"],
-  "forbidden_facts": ["authorization", "bearer"]
+  "origin": "hand",
+  "provenance": "EkamApp tenant_service_api.py. Replaces the pre-2026-08-31 version, which supplied no excerpt: the deployed model answered `X-Auth-Service-Request` and elaborated that it carries a signed JWT. Both invented. Excerpt API/authentication-service/router/tenant_service_api.py:187-205, cut and verified at generation time.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/router/tenant_service_api.py`:\n\n   187|\n   188|\n   189|@router.post(\"/internal/provision-tenant\", status_code=201)\n   190|async def internal_provision_tenant(\n   191|    request: Request,\n   192|    db: db_dependency,\n   193|):\n   194|    \"\"\"\n   195|    Internal endpoint called by business-service on seller approval.\n   196|    Creates a tenant record and assigns it to the user atomically.\n   197|    Secured by X-Internal-API-Key header.\n   198|    \"\"\"\n   199|    api_key = request.headers.get(\"X-Internal-API-Key\")\n   200|    if not api_key or api_key != settings.INTERNAL_API_KEY:\n   201|        raise HTTPException(status_code=401, detail=\"Invalid internal API key\")\n   202|\n   203|    body = await request.json()\n   204|    user_id = UUID(body[\"user_id\"])\n   205|    tenant_name = body[\"tenant_name\"]\n\nWhich exact HTTP header does this endpoint read to authenticate an internal caller? Answer from the excerpt only.",
+  "required_facts": [
+    "X-Internal-API-Key"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "It reads the `X-Internal-API-Key` request header.",
+  "selftest_fail": "It reads the `X-Auth-Service-Request` header, carrying a JWT."
 }

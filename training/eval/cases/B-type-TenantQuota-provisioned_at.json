@@ -1,0 +1,16 @@
+{
+  "id": "B-type-TenantQuota-provisioned_at",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/storage-service/models.py:75 (verified: the literal 'DateTime(timezone=True)' is on that line). Exact-value extraction from provided evidence.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/storage-service/models.py`:\n\n    69|    )\n    70|    # Hard cap in bytes. NULL = no hard cap (usage-based plan — billed per overage).\n    71|    max_bytes = Column(BigInteger, nullable=True, default=STANDARD_QUOTA_BYTES)\n    72|    # Free allocation threshold. Bytes beyond this are billed at the overage rate.\n    73|    free_bytes = Column(BigInteger, nullable=False, default=STANDARD_QUOTA_BYTES)\n    74|    used_bytes = Column(BigInteger, nullable=False, default=0)\n    75|    provisioned_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())\n\nIn the `TenantQuota` model, what is the declared column type of `provisioned_at`? Quote it exactly as written. Answer from the excerpt only.",
+  "required_facts": [
+    "DateTime(timezone=True)"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "`provisioned_at` is declared as `DateTime(timezone=True)`.",
+  "selftest_fail": "`provisioned_at` is declared as a plain unsized column."
+}

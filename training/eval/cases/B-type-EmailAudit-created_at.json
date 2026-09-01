@@ -1,0 +1,16 @@
+{
+  "id": "B-type-EmailAudit-created_at",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/utility-service/models.py:154 (verified: the literal 'DateTime(timezone=True)' is on that line). Exact-value extraction from provided evidence.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/utility-service/models.py`:\n\n   148|        UUID(as_uuid=True), ForeignKey(\"utility.email_queue.id\"), nullable=False\n   149|    )\n   150|    recipient_email = Column(String(255), nullable=False)\n   151|    status = Column(SAEnum(EmailStatus, schema=\"utility\"), nullable=False)\n   152|    error_message = Column(Text, nullable=True)  # populated on failure\n   153|    sent_at = Column(DateTime(timezone=True), nullable=True)\n   154|    created_at = Column(DateTime(timezone=True), server_default=func.now())\n   155|\n   156|\n   157|# ──────────────────────────────────────────────\n   158|# TENANT NOTIFICATION PREFERENCES\n   159|# ──────────────────────────────────────────────\n   160|\n\nIn the `EmailAudit` model, what is the declared column type of `created_at`? Quote it exactly as written. Answer from the excerpt only.",
+  "required_facts": [
+    "DateTime(timezone=True)"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "`created_at` is declared as `DateTime(timezone=True)`.",
+  "selftest_fail": "`created_at` is declared as a plain unsized column."
+}

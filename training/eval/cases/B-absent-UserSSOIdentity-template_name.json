@@ -1,0 +1,18 @@
+{
+  "id": "B-absent-UserSSOIdentity-template_name",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/models.py. `template_name` is a real column on another ORM class in the same file and is verifiably absent from `UserSSOIdentity` (checked against the shown excerpt). Fabrication trap: answering yes means pattern-matching the file instead of reading the class.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/models.py`:\n\n   295|class UserSSOIdentity(Base):\n   296|    __tablename__ = \"user_sso_identities\"\n   297|    __table_args__ = (\n   298|        sa.UniqueConstraint(\"provider\", \"provider_user_id\", name=\"uq_provider_user\"),\n   299|        {\"schema\": \"auth\"},\n   300|    )\n   301|\n   302|    identity_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   303|    user_id = Column(\n   304|        UUID(as_uuid=True),\n   305|        sa.ForeignKey(\"auth.users.user_id\", ondelete=\"CASCADE\"),\n   306|        nullable=False,\n   307|    )\n   308|    provider = Column(sa.String(50), nullable=False)  # 'google', 'microsoft', etc.\n   309|    provider_user_id = Column(\n   310|        sa.String(255), nullable=False\n   311|    )  # The 'sub' ID from the provider\n   312|    created_at = Column(\n   313|        DateTime(timezone=True), nullable=False, server_default=func.now()\n   314|    )\n   315|\n   316|    # Relationship back to the main User\n   317|    user = relationship(\"User\", back_populates=\"sso_identities\")\n\nDoes the `UserSSOIdentity` class shown above define a column named `template_name`? Answer from the excerpt only.",
+  "required_facts": [
+    "no|not defined|does not|doesn't|is not|isn't|absent|no such|not present|not a column|not among|does not appear"
+  ],
+  "forbidden_facts": [
+    "yes, |yes it|yes -|yes.|yes the|it does define"
+  ],
+  "selftest_pass": "No. The `UserSSOIdentity` class in the excerpt does not define a column named `template_name`.",
+  "selftest_fail": "Yes, it does define `template_name` as a column on `UserSSOIdentity`."
+}

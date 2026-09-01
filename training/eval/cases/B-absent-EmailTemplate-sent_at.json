@@ -1,0 +1,18 @@
+{
+  "id": "B-absent-EmailTemplate-sent_at",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/utility-service/models.py. `sent_at` is a real column on another ORM class in the same file and is verifiably absent from `EmailTemplate` (checked against the shown excerpt). Fabrication trap: answering yes means pattern-matching the file instead of reading the class.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/utility-service/models.py`:\n\n    71|class EmailTemplate(Base):\n    72|    \"\"\"Jinja2 templates stored per tenant\"\"\"\n    73|\n    74|    __tablename__ = \"email_templates\"\n    75|    __table_args__ = {\"schema\": \"utility\"}\n    76|\n    77|    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n    78|    tenant_id = Column(UUID(as_uuid=True), nullable=True)  # null = global template\n    79|    name = Column(String(100), nullable=False)  # e.g. welcome_email\n    80|    subject = Column(String(255), nullable=False)\n    81|    body_html = Column(Text, nullable=False)  # Jinja2 HTML template\n    82|    body_text = Column(Text, nullable=True)  # Plain text fallback\n    83|    is_active = Column(Boolean, default=True)\n    84|    created_at = Column(DateTime(timezone=True), server_default=func.now())\n    85|    updated_at = Column(DateTime(timezone=True), onupdate=func.now())\n\nDoes the `EmailTemplate` class shown above define a column named `sent_at`? Answer from the excerpt only.",
+  "required_facts": [
+    "no|not defined|does not|doesn't|is not|isn't|absent|no such|not present|not a column|not among|does not appear"
+  ],
+  "forbidden_facts": [
+    "yes, |yes it|yes -|yes.|yes the|it does define"
+  ],
+  "selftest_pass": "No. The `EmailTemplate` class in the excerpt does not define a column named `sent_at`.",
+  "selftest_fail": "Yes, it does define `sent_at` as a column on `EmailTemplate`."
+}

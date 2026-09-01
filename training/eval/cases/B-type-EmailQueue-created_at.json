@@ -1,0 +1,16 @@
+{
+  "id": "B-type-EmailQueue-created_at",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/utility-service/models.py:132 (verified: the literal 'DateTime(timezone=True)' is on that line). Exact-value extraction from provided evidence.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/utility-service/models.py`:\n\n   126|    recipient_name = Column(String(255), nullable=True)\n   127|    subject = Column(String(255), nullable=False)\n   128|    template_context = Column(JSON, nullable=True)  # Variables for Jinja2 rendering\n   129|    status = Column(SAEnum(EmailStatus, schema=\"utility\"), default=EmailStatus.PENDING)\n   130|    retry_count = Column(Integer, default=0)\n   131|    scheduled_at = Column(DateTime(timezone=True), nullable=True)\n   132|    created_at = Column(DateTime(timezone=True), server_default=func.now())\n   133|\n   134|\n   135|# ──────────────────────────────────────────────\n   136|# EMAIL AUDIT\n   137|# ──────────────────────────────────────────────\n   138|\n\nIn the `EmailQueue` model, what is the declared column type of `created_at`? Quote it exactly as written. Answer from the excerpt only.",
+  "required_facts": [
+    "DateTime(timezone=True)"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "`created_at` is declared as `DateTime(timezone=True)`.",
+  "selftest_fail": "`created_at` is declared as a plain unsized column."
+}

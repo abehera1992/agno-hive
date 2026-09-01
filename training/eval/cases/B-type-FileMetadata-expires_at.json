@@ -1,0 +1,16 @@
+{
+  "id": "B-type-FileMetadata-expires_at",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/storage-service/models.py:54 (verified: the literal 'DateTime(timezone=True)' is on that line). Exact-value extraction from provided evidence.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/storage-service/models.py`:\n\n    48|    original_filename = Column(String, nullable=False)\n    49|    file_size = Column(BigInteger, nullable=False)\n    50|    mime_type = Column(String, nullable=True)\n    51|    is_public = Column(Boolean, nullable=False, default=False)\n    52|    context = Column(String, nullable=True)\n    53|    ttl_seconds = Column(Integer, nullable=True)\n    54|    expires_at = Column(DateTime(timezone=True), nullable=True)\n    55|    uploaded_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())\n    56|\n    57|\n    58|class TenantQuota(Base):\n    59|    __tablename__ = \"tenant_quotas\"\n    60|    __table_args__ = {\"schema\": \"storage\"}\n\nIn the `FileMetadata` model, what is the declared column type of `expires_at`? Quote it exactly as written. Answer from the excerpt only.",
+  "required_facts": [
+    "DateTime(timezone=True)"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "`expires_at` is declared as `DateTime(timezone=True)`.",
+  "selftest_fail": "`expires_at` is declared as a plain unsized column."
+}

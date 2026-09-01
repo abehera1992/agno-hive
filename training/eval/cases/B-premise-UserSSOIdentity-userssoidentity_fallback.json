@@ -1,0 +1,16 @@
+{
+  "id": "B-premise-UserSSOIdentity-userssoidentity_fallback",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "FALSE PREMISE. `_USERSSOIDENTITY_FALLBACK` does not appear anywhere under API/ (verified against every .py file at generation time). `UserSSOIdentity` in API/authentication-service/models.py is real, which is what makes the question plausible. The pass is declining to confirm the premise; describing the symbol's retirement or its replacement is fabrication.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Does EkamApp's `authentication-service` still fall back to the module-level `_USERSSOIDENTITY_FALLBACK` dict when a `UserSSOIdentity` row is missing, or was that retired? What happens instead now?",
+  "required_facts": [
+    "no such|does not exist|doesn't exist|not exist|cannot verify|can't verify|cannot confirm|can't confirm|unable to|not aware of|no evidence|no information|would need to|you'd need to|not been shown|haven't been shown|no access|don't have access|do not have access|check the|read the|inspect the|cannot determine|can't determine|not something i can"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "I can't confirm that — I have no access to the `authentication-service` source, and I see no such `_USERSSOIDENTITY_FALLBACK`. You'd need to read the module to say.",
+  "selftest_fail": "As of the latest updates, the legacy `_USERSSOIDENTITY_FALLBACK` dictionary has been retired. Now the service loads those values from the database instead."
+}

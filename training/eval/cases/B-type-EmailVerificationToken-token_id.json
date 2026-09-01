@@ -1,0 +1,16 @@
+{
+  "id": "B-type-EmailVerificationToken-token_id",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/models.py:168 (verified: the literal 'UUID(as_uuid=True)' is on that line). Exact-value extraction from provided evidence.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/models.py`:\n\n   162|    expires_at = Column(DateTime, nullable=False)\n   163|\n   164|\n   165|class EmailVerificationToken(Base):\n   166|    __tablename__ = \"email_verification_tokens\"\n   167|    __table_args__ = {\"schema\": \"auth\"}\n   168|    token_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   169|    user_id = Column(\n   170|        UUID(as_uuid=True),\n   171|        ForeignKey(\"auth.users.user_id\", ondelete=\"CASCADE\"),\n   172|        nullable=False,\n   173|    )\n   174|    token = Column(String, nullable=False)\n\nIn the `EmailVerificationToken` model, what is the declared column type of `token_id`? Quote it exactly as written. Answer from the excerpt only.",
+  "required_facts": [
+    "UUID(as_uuid=True)"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "`token_id` is declared as `UUID(as_uuid=True)`.",
+  "selftest_fail": "`token_id` is declared as a plain unsized column."
+}

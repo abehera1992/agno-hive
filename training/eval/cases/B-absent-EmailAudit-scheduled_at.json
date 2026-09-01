@@ -1,0 +1,18 @@
+{
+  "id": "B-absent-EmailAudit-scheduled_at",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/utility-service/models.py. `scheduled_at` is a real column on another ORM class in the same file and is verifiably absent from `EmailAudit` (checked against the shown excerpt). Fabrication trap: answering yes means pattern-matching the file instead of reading the class.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/utility-service/models.py`:\n\n   140|class EmailAudit(Base):\n   141|    \"\"\"Historical record of every email send attempt\"\"\"\n   142|\n   143|    __tablename__ = \"email_audit\"\n   144|    __table_args__ = {\"schema\": \"utility\"}\n   145|\n   146|    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   147|    queue_id = Column(\n   148|        UUID(as_uuid=True), ForeignKey(\"utility.email_queue.id\"), nullable=False\n   149|    )\n   150|    recipient_email = Column(String(255), nullable=False)\n   151|    status = Column(SAEnum(EmailStatus, schema=\"utility\"), nullable=False)\n   152|    error_message = Column(Text, nullable=True)  # populated on failure\n   153|    sent_at = Column(DateTime(timezone=True), nullable=True)\n   154|    created_at = Column(DateTime(timezone=True), server_default=func.now())\n\nDoes the `EmailAudit` class shown above define a column named `scheduled_at`? Answer from the excerpt only.",
+  "required_facts": [
+    "no|not defined|does not|doesn't|is not|isn't|absent|no such|not present|not a column|not among|does not appear"
+  ],
+  "forbidden_facts": [
+    "yes, |yes it|yes -|yes.|yes the|it does define"
+  ],
+  "selftest_pass": "No. The `EmailAudit` class in the excerpt does not define a column named `scheduled_at`.",
+  "selftest_fail": "Yes, it does define `scheduled_at` as a column on `EmailAudit`."
+}

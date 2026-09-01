@@ -1,0 +1,16 @@
+{
+  "id": "C-boundary-update_ai_config-80",
+  "kind": "citation",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/utility-service/router/tenant_config_api.py. `get_ai_config` starts at 68 and `update_ai_config` at 80 (verified against the file). Adjacent-definition confusion is the C12 failure mode: a live answer cited a range belonging to the neighbouring function.",
+  "scorers": [
+    "citation"
+  ],
+  "prompt": "Numbered excerpt from `API/utility-service/router/tenant_config_api.py`:\n\n    68|async def get_ai_config(\n    69|    current_user: TokenUser = Depends(get_current_user),\n    70|):\n    71|    ctx = _resolve_context(current_user)\n    72|    if ctx[\"is_admin\"]:\n    73|        meta = get_admin_ai_config_meta(user_id=ctx[\"user_id\"])\n    74|    else:\n    75|        meta = get_ai_config_meta(tenant_id=ctx[\"tenant_id\"])\n    76|    return AiConfigMeta(**meta)\n    77|\n    78|\n    79|@router.put(\"/ai\")\n    80|async def update_ai_config(\n    81|    body: AiConfigUpdate,\n    82|    current_user: TokenUser = Depends(get_current_user),\n    83|):\n\nOn which line does `update_ai_config` begin? The excerpt also contains `get_ai_config` — do not report that one's line.",
+  "correct_lines": [
+    79,
+    80
+  ],
+  "selftest_pass": "`update_ai_config` begins on line 80.",
+  "selftest_fail": "`update_ai_config` begins on line 68."
+}

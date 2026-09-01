@@ -1,0 +1,16 @@
+{
+  "id": "B-type-Invite-expires_at",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/authentication-service/models.py:118 (verified: the literal 'DateTime(timezone=True)' is on that line). Exact-value extraction from provided evidence.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/authentication-service/models.py`:\n\n   112|    email_id = Column(String, nullable=False)\n   113|    tenant_id = Column(\n   114|        UUID(as_uuid=True),\n   115|        ForeignKey(\"auth.tenants.tenant_id\", ondelete=\"CASCADE\"),\n   116|        nullable=False,\n   117|    )\n   118|    expires_at = Column(DateTime(timezone=True), nullable=False)\n   119|    created_at = Column(\n   120|        DateTime(timezone=True), nullable=False, server_default=func.now()\n   121|    )\n   122|    status = Column(String(20), nullable=False, server_default=\"pending\")\n   123|    invited_by = Column(\n   124|        UUID(as_uuid=True),\n\nIn the `Invite` model, what is the declared column type of `expires_at`? Quote it exactly as written. Answer from the excerpt only.",
+  "required_facts": [
+    "DateTime(timezone=True)"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "`expires_at` is declared as `DateTime(timezone=True)`.",
+  "selftest_fail": "`expires_at` is declared as a plain unsized column."
+}

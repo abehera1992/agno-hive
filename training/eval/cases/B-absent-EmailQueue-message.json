@@ -1,0 +1,18 @@
+{
+  "id": "B-absent-EmailQueue-message",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/utility-service/models.py. `message` is a real column on another ORM class in the same file and is verifiably absent from `EmailQueue` (checked against the shown excerpt). Fabrication trap: answering yes means pattern-matching the file instead of reading the class.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/utility-service/models.py`:\n\n   114|class EmailQueue(Base):\n   115|    \"\"\"Persists email jobs before and after Redpanda queuing\"\"\"\n   116|\n   117|    __tablename__ = \"email_queue\"\n   118|    __table_args__ = {\"schema\": \"utility\"}\n   119|\n   120|    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)\n   121|    template_id = Column(\n   122|        UUID(as_uuid=True), ForeignKey(\"utility.email_templates.id\"), nullable=True\n   123|    )\n   124|    tenant_id = Column(UUID(as_uuid=True), nullable=True)\n   125|    recipient_email = Column(String(255), nullable=False)\n   126|    recipient_name = Column(String(255), nullable=True)\n   127|    subject = Column(String(255), nullable=False)\n   128|    template_context = Column(JSON, nullable=True)  # Variables for Jinja2 rendering\n   129|    status = Column(SAEnum(EmailStatus, schema=\"utility\"), default=EmailStatus.PENDING)\n   130|    retry_count = Column(Integer, default=0)\n   131|    scheduled_at = Column(DateTime(timezone=True), nullable=True)\n   132|    created_at = Column(DateTime(timezone=True), server_default=func.now())\n\nDoes the `EmailQueue` class shown above define a column named `message`? Answer from the excerpt only.",
+  "required_facts": [
+    "no|not defined|does not|doesn't|is not|isn't|absent|no such|not present|not a column|not among|does not appear"
+  ],
+  "forbidden_facts": [
+    "yes, |yes it|yes -|yes.|yes the|it does define"
+  ],
+  "selftest_pass": "No. The `EmailQueue` class in the excerpt does not define a column named `message`.",
+  "selftest_fail": "Yes, it does define `message` as a column on `EmailQueue`."
+}

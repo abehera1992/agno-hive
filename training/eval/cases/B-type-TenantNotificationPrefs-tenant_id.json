@@ -1,0 +1,16 @@
+{
+  "id": "B-type-TenantNotificationPrefs-tenant_id",
+  "kind": "grounding",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/utility-service/models.py:168 (verified: the literal 'UUID(as_uuid=True)' is on that line). Exact-value extraction from provided evidence.",
+  "scorers": [
+    "grounding"
+  ],
+  "prompt": "Numbered excerpt from `API/utility-service/models.py`:\n\n   162|class TenantNotificationPrefs(Base):\n   163|    \"\"\"Per-tenant notification toggle preferences stored in DB.\"\"\"\n   164|\n   165|    __tablename__ = \"tenant_notification_prefs\"\n   166|    __table_args__ = {\"schema\": \"utility\"}\n   167|\n   168|    tenant_id = Column(UUID(as_uuid=True), primary_key=True)\n   169|    weekly_digest = Column(Boolean, default=True, nullable=False)\n   170|    low_stock_alerts = Column(Boolean, default=True, nullable=False)\n   171|    voucher_reminders = Column(Boolean, default=False, nullable=False)\n   172|    updated_at = Column(\n   173|        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()\n   174|    )\n\nIn the `TenantNotificationPrefs` model, what is the declared column type of `tenant_id`? Quote it exactly as written. Answer from the excerpt only.",
+  "required_facts": [
+    "UUID(as_uuid=True)"
+  ],
+  "forbidden_facts": [],
+  "selftest_pass": "`tenant_id` is declared as `UUID(as_uuid=True)`.",
+  "selftest_fail": "`tenant_id` is declared as a plain unsized column."
+}

@@ -1,0 +1,15 @@
+{
+  "id": "C-boundary-downgrade-44",
+  "kind": "citation",
+  "origin": "generated",
+  "provenance": "Generated from EkamApp API/business-service/migrations/versions/d6e7f8a9b0c1_ondc_domains_keywords.py. `upgrade` starts at 34 and `downgrade` at 44 (verified against the file). Adjacent-definition confusion is the C12 failure mode: a live answer cited a range belonging to the neighbouring function.",
+  "scorers": [
+    "citation"
+  ],
+  "prompt": "Numbered excerpt from `API/business-service/migrations/versions/d6e7f8a9b0c1_ondc_domains_keywords.py`:\n\n    34|def upgrade():\n    35|    op.add_column(\"ondc_domains\", sa.Column(\"keywords\", JSONB, nullable=False, server_default=\"[]\"), schema=\"business\")\n    36|    conn = op.get_bind()\n    37|    for code, kws in _KW.items():\n    38|        conn.execute(\n    39|            sa.text(\"UPDATE business.ondc_domains SET keywords = :kw WHERE code = :code\"),\n    40|            {\"kw\": json.dumps(kws), \"code\": code},\n    41|        )\n    42|\n    43|\n    44|def downgrade():\n    45|    op.drop_column(\"ondc_domains\", \"keywords\", schema=\"business\")\n\nOn which line does `downgrade` begin? The excerpt also contains `upgrade` — do not report that one's line.",
+  "correct_lines": [
+    44
+  ],
+  "selftest_pass": "`downgrade` begins on line 44.",
+  "selftest_fail": "`downgrade` begins on line 34."
+}
