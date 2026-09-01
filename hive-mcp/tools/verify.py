@@ -529,11 +529,40 @@ _RUNTIME_CREATE_CONTEXT_RE = re.compile(
 )
 
 
+# Where the backward window must stop: a list marker, a table row, a heading, or a blank
+# line. Past any of these the text belongs to a DIFFERENT item and says nothing about
+# this symbol.
+_ITEM_BOUNDARY_RE = re.compile(r"\n[ \t]*(?:[-*+]|\d+[.)])[ \t]|\n[ \t]*\n|\n[ \t]*#{1,6}[ \t]|\n[ \t]*\|")
+
+
 def _is_proposed_new_claim(answer: str, start: int) -> bool:
     """True if the text shortly before this backticked span frames it as NEW code
     the answer is proposing to add, rather than an assertion that it already exists.
-    See _PROPOSED_NEW_CUE_RE's comment for the window-width tradeoff."""
+    See _PROPOSED_NEW_CUE_RE's comment for the window-width tradeoff.
+
+    The window stops at the enclosing list item / table row / heading / paragraph.
+    Without that bound it reads across the boundary and attributes the PREVIOUS item's
+    verb to this symbol. Measured on T13b, 2026-09-01, where an enumeration of nine
+    hooks was described one per line ("`createStockAdjustment(data: any)` — Creates a
+    direct stock adjustment"). Each symbol's 90-char lookback landed inside its
+    predecessor's description, so the cue matched was always the neighbour's:
+
+        postVoucher            <- "...`createVoucher(data: any)` - Creates a new draft voucher\\n4. "
+        createStockAdjustment  <- "...- Creates a credit note from a posted sales invoice\\n8. "
+        createStockTransfer    <- "...- Creates a direct stock adjustment\\n9. "
+
+    All three were filed PROPOSED — "not counted toward the verdict" — and two of them
+    are fabrications that appear nowhere in the repo. `createGRNFromPO` escaped the same
+    fate only because the item above it happened to read "Cancels a voucher" rather than
+    "Creates ...", which is luck, not discrimination.
+
+    A real proposal is unaffected: "we should add a new helper:\\n`foo()`" carries its cue
+    in the same paragraph, with no list marker or blank line between cue and symbol.
+    """
     before = answer[max(0, start - _PROPOSED_NEW_WINDOW):start]
+    bounds = list(_ITEM_BOUNDARY_RE.finditer(before))
+    if bounds:
+        before = before[bounds[-1].end():]
     cue = _PROPOSED_NEW_CUE_RE.search(before)
     if not cue:
         return False
