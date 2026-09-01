@@ -5789,6 +5789,73 @@ def _make_decompose_first_gate_hook(task: str | None, researcher_member_id: str 
     return _decompose_first_gate_hook
 
 
+def _make_capability_routing_gate_hook(member_tools: dict):
+    """Block a delegation that names a tool the target member does not hold.
+
+    T8, 2026-09-01. The coordinator delegated, verbatim:
+
+        delegate_task_to_member('executor',
+            "Call db_query('SELECT COUNT(*) FROM inventory.parties;') ... return its
+             raw output verbatim.")
+
+    `db_query` is on the Researcher's surface. The Executor's eleven tools do not
+    include it. Unable to comply and unwilling to say so, the Executor reached for what
+    it did hold -- check_port and list_processes -- found 5432 and 5433 closed INSIDE ITS
+    OWN CONTAINER, and answered "the live database is currently unavailable, no
+    PostgreSQL processes are running". The database was up: `db_schema({})` had returned
+    successfully 0.05s earlier in that same run, and the row count is 0, confirmed
+    directly against ekamapp-postgres-1.
+
+    So a routing mistake became a confident, wrong, load-bearing factual claim about
+    production infrastructure. Nothing downstream could catch it: no symbol was
+    fabricated for verify_claims to grep, the reads that did happen were real, and the
+    answer was longer than its relay so the thin-answer guard never looked.
+
+    The roster prose already tells the coordinator to route by capability -- "The
+    `tools:` line under each member is what that member CAN DO -- route by it: pick the
+    member that holds the tool the task needs". That instruction is present, explicit,
+    and was not followed. Same escalation the decompose-first and search-before-browse
+    gates went through, for the same reason.
+
+    Deliberately narrow. It fires only when the task text names a KNOWN tool -- one some
+    member on this team actually holds, so there is no vocabulary to maintain and no way
+    to invent a name -- that the TARGET does not hold and some OTHER member does. A task
+    that names no tool, or names one the target holds, is untouched; so is a tool no
+    member holds, which is a different problem and not this hook's to guess at.
+    """
+    async def _capability_routing_gate_hook(function_name, function, args, run_context=None):
+        if function_name != "delegate_task_to_member" or not member_tools:
+            return await function(**args)
+        target = _member_id(str((args or {}).get("member_id", "")).strip())
+        held = member_tools.get(target)
+        if held is None:
+            return await function(**args)          # unknown member: not ours to judge
+        text = str((args or {}).get("task", "") or "")
+        if not text:
+            return await function(**args)
+
+        for tool in sorted({t for ts in member_tools.values() for t in ts} - held):
+            if not re.search(rf"(?<!\w){re.escape(tool)}(?!\w)", text):
+                continue
+            holders = sorted(m for m, ts in member_tools.items() if tool in ts)
+            if not holders:
+                continue
+            print(f"[team] capability routing: {target!r} was asked to call {tool!r}, "
+                  f"which it does not hold — redirecting to {holders}", flush=True)
+            return (
+                f"REDIRECTED: this task tells {target!r} to call {tool}(), but {target!r} "
+                f"does not have that tool — its surface is {sorted(held)}. Delegating it "
+                f"anyway does not make the tool appear; the member improvises with what "
+                f"it does hold and reports the result as fact. {tool} is held by "
+                f"{' or '.join(repr(h) for h in holders)}: call "
+                f"delegate_task_to_member({holders[0]!r}, <the same task>) instead. "
+                f"This delegation to {target!r} was NOT executed."
+            )
+        return await function(**args)
+
+    return _capability_routing_gate_hook
+
+
 _BROWSE_TOOL_NAMES = {"list_directory_tree", "find_files", "get_file_content"}
 _SEARCH_TOOL_NAMES = {"search_files", "lightrag_query"}
 
@@ -6887,6 +6954,11 @@ def _build_team(
     search_before_browse_gate_hook = _make_search_before_browse_gate_hook(
         task=search_gate_task, researcher_agent_name=researcher_agent_name,
     )
+    # Filled AFTER members are constructed (hooks are built first, and a member's
+    # surface only exists once it is). Passed by reference so the hook reads the
+    # populated map at delegation time, which is always later than construction.
+    member_tools: dict[str, set] = {}
+    capability_routing_gate_hook = _make_capability_routing_gate_hook(member_tools)
     duplicate_delegation_gate_hook = _make_duplicate_delegation_gate_hook(read_only=read_only)
     delegation_log_hook = _make_delegation_log_hook()
     interception_hook = _make_tool_interception_hook(activity=activity)
@@ -6928,7 +7000,8 @@ def _build_team(
     # log, one interception trace).
     tool_hooks = [
         interception_hook, search_before_browse_gate_hook, read_cache_hook,
-        decompose_first_gate_hook, duplicate_delegation_gate_hook, delegation_log_hook,
+        decompose_first_gate_hook, capability_routing_gate_hook,
+        duplicate_delegation_gate_hook, delegation_log_hook,
     ]
 
     def _hooks_for(role: str) -> list:
@@ -6969,6 +7042,10 @@ def _build_team(
         def _agno_member_id(m):                 # type: ignore[misc]
             return _member_id(getattr(m, "name", "") or "")
     for _m in members:
+        member_tools[_agno_member_id(_m)] = {
+            getattr(t, "name", "") for t in (getattr(_m, "tools", []) or [])
+            if getattr(t, "name", "")
+        }
         print(f"[team] member surface {_agno_member_id(_m)!r} ({len(getattr(_m, 'tools', []) or [])}): "
               f"{[getattr(t, 'name', type(t).__name__) for t in (getattr(_m, 'tools', []) or [])]} "
               f"tool_call_limit={getattr(_m, 'tool_call_limit', None)}", flush=True)
