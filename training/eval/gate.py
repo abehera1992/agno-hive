@@ -61,9 +61,11 @@ def resolve_floor(spec: float | str, baseline: float | None, axis: str) -> float
     and can silently contradict the repo. So D is no longer a training target — but a
     candidate that gets WORSE at it is still a candidate we reject.
 
-    Written as a rule rather than the number it currently evaluates to (0.480), because a
-    hardcoded floor is exactly what went stale here before: guard_min sat at 0.98 from
-    when the suite had n=2, long after the real baseline had moved to 0.500.
+    Written as a rule rather than a fixed number, because a hardcoded floor is exactly what
+    went stale here before: guard_min sat at 0.98 from when the suite had n=2, long after
+    the real baseline had moved to 0.500. The rule form has since paid for itself twice —
+    it tracked D down to ~0.19 while the suite was broken, then back up to 0.924 the moment
+    the repaired suite was re-baselined (2026-09-01), with no edit to this file either time.
     """
     if isinstance(spec, str):
         if spec != "baseline":

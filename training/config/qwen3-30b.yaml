@@ -116,10 +116,23 @@ gate:
   # 0.65, which was worse reasoning — that number was picked after seeing the candidate
   # score 0.643, i.e. fitted to a result rather than derived from a requirement.
   #
-  # The real finding is that D does not belong in this file at all. Inspecting the eval
-  # prompts settled it: they never state the rule ("write a FastAPI endpoint that takes a
-  # session dependency" — nothing says AsyncSession), so Axis D asks the model to RECALL
-  # 19 held-out project conventions. That is knowledge, not behaviour:
+  # The real finding is that D does not belong in this file at all: guard adherence is
+  # project KNOWLEDGE, not behaviour.
+  #
+  # CORRECTION 2026-09-01 — the evidence originally cited for this was wrong, though the
+  # conclusion is not. This comment used to argue "the eval prompts never state the rule
+  # ('write a FastAPI endpoint that takes a session dependency' — nothing says
+  # AsyncSession), so Axis D asks the model to RECALL 19 held-out conventions." That was a
+  # property of the auto-generated cases, not of Axis D. Those cases scored the model on
+  # the reference snippet's own variable names (`old_used`, `db.add(invite)`) and two of
+  # them had an EMPTY rule; the suite, not the model, was what read 21.4%. The
+  # hand-authored replacements state each rule in full, and the same checkpoint scores
+  # 100% on them (45/45 across 3 reps). See training/RUNBOOK.md 2.5.4.
+  #
+  # The conclusion survives on the reason gate.py's resolve_floor() docstring gives
+  # instead — the rules live in patterns/*.md and reach the agents through context, which
+  # stays current the moment a rule is edited, whereas weights need a retrain per rule and
+  # can silently contradict the repo:
   #   * it already lives in patterns/*.md, which hive fetches into context at session
   #     start, where it stays correct the moment a rule is edited;
   #   * baked into weights it needs a retrain per new guard and can silently contradict

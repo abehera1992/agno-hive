@@ -94,33 +94,39 @@ Those are the only prompts where stale-weight fabrication is detectable.
 
 ### 2.5.3 Re-baseline on the widened set
 
-> **The served WEIGHTS are the only thing that distinguishes a baseline run from a
-> candidate run.** The command below is byte-identical to the candidate command apart
-> from `--out`/`--label`: both point at `:8003` and ask for `local-shared`, which is a
-> stable alias whose backing checkpoint has been swapped at least four times
-> (granite4.1:30b → qwen3-coder:30b → Qwen3-30B-A3B-Instruct-2507-FP8 → qwen3-30b-hive-v2-fp8).
+> **The baseline is CURRENT PRODUCTION, not an untuned checkpoint.** A gate answers
+> "should this candidate replace what is deployed", so the reference is whatever
+> `vllm-coord` serves today. `DOCS.md` records the 2026-08-16 gate for
+> `Qwen3.8-27B-hive-v1` as `tool_call 100→91.7, grounding 76.6→73.7, citation 91.7→81.6,
+> guard 21.4→28.6` — that left-hand column is `qwen3-30b-hive-v2-fp8`, the deployed
+> fine-tune. An earlier revision of this section called the baseline "untuned
+> Qwen3-30B-A3B-Instruct-2507-FP8" and flagged a production-weights baseline run as an
+> error. That was wrong on both counts.
 >
-> So **check what `:8003` is actually serving before running this**, or the output is a
-> candidate measurement wearing the baseline filename:
+> **The served WEIGHTS are still the thing to check before running this.** The command
+> below is byte-identical to the candidate command apart from `--out`/`--label`: both
+> point at `:8003` and ask for `local-shared`, a stable alias whose backing checkpoint has
+> been swapped at least four times (granite4.1:30b → qwen3-coder:30b →
+> Qwen3-30B-A3B-Instruct-2507-FP8 → qwen3-30b-hive-v2-fp8). Record which one it was, in
+> the label, or the file's numbers cannot be attributed later:
 >
 > ```bash
 > docker inspect vllm-coord --format '{{range .Mounts}}{{.Source}}{{println}}{{end}}'
 > ```
->
-> Done wrong on 2026-08-31: this command was run while v2 was served, producing
-> candidate scores in `baseline.json` — the file `gate.py` compares every future
-> candidate against. Nothing errored; the numbers simply meant something other than
-> their filename. An untracked file also leaves no trace when overwritten, which is why
-> the eval outputs are now committed (see 2.5.4).
 
 ```bash
 ~/miniforge3/envs/zgx/bin/python -m training.eval.harness \
   --base-url http://localhost:8003/v1 --model local-shared \
   --out training/eval/baseline.json \
-  --label "untuned Qwen3-30B-A3B-Instruct-2507-FP8 (baseline, 15-20 cases)"
+  --label "qwen3-30b-hive-v2-fp8 (deployed) - <suite version>"
 ```
 
 The 6-case baseline is **superseded** — do not compare a widened candidate against it.
+
+**Re-baseline after any suite change.** The suite was repaired and widened on 2026-08-31
+(47 → 96 cases); scores from before that are not comparable to scores after it. Run
+`python training/eval/validate_cases.py` first — it fails the build if a case is
+unpassable, and it is the reason the repair was possible to make with confidence.
 
 ### 2.5.4 Commit the eval output
 
@@ -132,14 +138,55 @@ Two things to know when reading them:
 
 * **Scores move between identical runs.** Two runs of the same 44 cases against the same
   served model, minutes apart, gave `C 93.3% → 86.7%` and `D 21.4% → 28.6%`. At n=14-15
-  one case flipping is ~7 points, so treat any single-run C/D delta under ~10 points as
-  noise. A/B/E were stable across both.
-* **Axis D's scorer requires literal strings the prompt never states.** D-guard10 gives a
-  rule about `old_string` uniqueness, says "write code that follows this rule", then
-  requires the output to contain `db.add(invite)` and `db.refresh(invite)` — names that
-  appear only in the guard's original example. Cases whose required string IS in the
-  prompt pass; cases whose isn't, fail. D is not a clean measure of rule-following until
-  that is fixed.
+  one case flipping is ~7 points, so treat a single-run delta smaller than `1/n` as noise.
+  The 2026-08-31 widening (B n=19→55, C n=15→29) is what makes those axes readable at all;
+  E is still n=2 and should not be read as a percentage.
+* **Axis D was measuring the suite, not the model — fixed 2026-08-31.** Its 21.4% was
+  produced by auto-generated cases whose required strings were set-differences of code
+  tokens between the guard's WRONG and CORRECT blocks: `D-guard2` required the local
+  variable name `old_used`, `D-guard10` required `db.add(invite)`, and `D-guard30`/`32`
+  had an EMPTY rule (their guards put the prose after the code fence, and the extractor
+  only read before it) while `D-guard32` also required `False)` and forbade `False`.
+  Rewritten by hand in `author_guard_cases.py`: the rule is stated in full, every required
+  token appears in the prompt, and rules that are structural (ordering, positional-before-
+  keyword, kwarg presence) now use the AST checkers in `harness.py` — `score_structural`
+  had been written for exactly this and was wired to zero cases. The same model on the
+  repaired suite scores **100%**, stable over four runs.
+
+  A 100% axis has **no discriminating power**. D was hardened on 2026-09-01 to fix that:
+  guards 10/14/16 were recovered with three new AST checkers (`kwarg_substring`,
+  `kwarg_multiline`, `arg_not_suffix` — each expresses a RELATIONSHIP between arguments,
+  which is why substring scoring had to drop them), and two composite cases were added
+  that hold several even-numbered guards at once. D now reads **95.9% (n=17)**, with the
+  composites at 65% — a regression is detectable again.
+
+### 2.5.5 The one real, quantified failure: false-premise questions
+
+Read the **per-shape breakdown** the harness prints, never the axis average. On the v4
+suite the deployed model is at 100% on eleven of thirteen shapes, and the axis averages are
+almost entirely a function of how many easy cases are in the pool.
+
+The failure that survives every repair is `B-premise` — **28.6%, n=14**. These ask a
+leading, system-level question about a symbol verified absent from every `.py` file under
+`API/` ("does service X still fall back to the module-level `_ROLE_PRESETS` dict, or was
+that retired?"). Ten of fourteen answers open with the same template — *"As of the latest
+updates to EkamApp's `authentication-service`, the fallback mechanism using the
+module-level `_ROLE_PRESETS` ... no longer falls back to ..."* — confidently describing the
+retirement, and the replacement, of something that never existed.
+
+It is specifically the **leading, presuppositional phrasing** that triggers it, not the
+absence of evidence. Direct probing on 2026-08-31 established the boundary:
+
+* "what is the declared column type of `X` on `Y` in file `Z`?" — abstains cleanly, with
+  or without being told it has no tools (`B-refuse-type`, 14/14).
+* "on which line is `X` defined?" — abstains cleanly (`B-refuse`, 14/14).
+* "does X *still* use `_FOO`, or was that retired?" — fabricates (10/14).
+
+So citation restraint, which is what `corpus_v2` trained, generalised and holds. Restraint
+against a **false premise embedded in the question** is a different behaviour and was never
+trained. If a retrain is ever justified, that is the target — and `B-premise` is the axis
+to move. Do not train on these cases themselves: like the even-numbered guards, they are
+the holdout.
 
 ---
 
