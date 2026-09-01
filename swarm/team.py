@@ -1567,7 +1567,133 @@ _GUARD_BANNERS = (
     "ASKED FOR A LIST",
     "LONGER THAN ITS EVIDENCE",
     "Answered by the coordinator alone",
+    "ADOPTS A PREMISE THIS ANSWER'S OWN FINDINGS DENY",
 )
+
+
+# ── premise-adoption guard ───────────────────────────────────────────────────
+# Measured 2026-09-01 against the deployed swarm (n=10, tools on): asked whether a
+# service "still falls back to the module-level `_TENANT_REGISTRY` dict, or was that
+# retired", 4 of 10 answers OPENED with "EkamApp's authentication-service no longer
+# falls back to a module-level `_TENANT_REGISTRY` dict" and only then established, in
+# the body, that the symbol appears nowhere in the project.
+#
+# Every sentence is individually TRUE -- a service does not fall back to something that
+# does not exist -- so there is nothing here for the other guards to catch.
+# _verify_claims greps for fabricated symbols and finds none fabricated; the
+# search-claim guard checks whether claimed searches ran, and here they did. The defect
+# is ORDERING: a reader who stops at the lead comes away believing the symbol was real
+# and was retired, which is the exact false belief the question tried to plant.
+#
+# This is the residual after tools. The bare model fabricates a retirement narrative on
+# ~80% of these (n=56 pooled, training/eval B-premise); through the swarm that drops to
+# ~0-10% wrong bodies, and what is left is this lead-sentence artifact.
+#
+# Fixed by reordering, not by re-running the model: the finding the body ALREADY reached
+# is hoisted above the lead. No extra inference, no model call, no retry budget --
+# consistent with every other fix that has actually held here.
+
+# The optional adverb is not decoration: the swarm writes "has been COMPLETELY retired",
+# which the tighter form missed on a live run.
+_PREMISE_AFFIRM_RE = re.compile(
+    r"\b(?:no longer|(?:was|were|has\s+been|have\s+been|had\s+been)\s+"
+    r"(?:\w+\s+){0,2}"
+    r"(?:retired|removed|replaced|deprecated|dropped|eliminated)|"
+    r"has\s+since\s+been|is\s+deprecated|are\s+deprecated)\b", re.I)
+
+# Widened after the second live run: the first version missed the swarm's most common
+# way of saying it, "No references to `_TENANT_FALLBACK` exist in the codebase" -- plural
+# "references", and "exist" rather than "does not exist". Two answers whose bodies denied
+# the symbol perfectly well read as non-denials, so the guard stayed silent on exactly
+# the cases it was written for. Vocabulary, not logic, is what this guard lives or dies on.
+_PREMISE_DENY_RE = re.compile(
+    r"does\s+not\s+exist|doesn'?t\s+exist|never\s+existed|no\s+such|"
+    r"does\s+not\s+appear|doesn'?t\s+appear|no\s+matches|not\s+found|"
+    r"could\s+not\s+find|couldn'?t\s+find|is\s+not\s+present|"
+    r"not\s+defined\s+anywhere|does\s+not\s+use|doesn'?t\s+use|"
+    r"no\s+results|returned\s+nothing|"
+    r"\bno\s+(?:references?|mentions?|occurrences?|matches|instances?|"
+    r"definitions?|declarations?)\b|"
+    r"\bnot\s+(?:exist|present|defined|declared|referenced|mentioned)\b|"
+    r"\bcontains?\s+no\b|\bfound\s+no\b|\bwithout\s+any\s+reference|"
+    r"\bno\s+trace\b|\bnowhere\s+in\b|\babsent\s+from\b", re.I)
+
+# Only module-level-constant shapes: a leading underscore, or ALL_CAPS. Matching every
+# backticked identifier was measured wrong on the first live run -- the lead sentence
+# also names ordinary classes (`Role`, `Invite`) and the proximity check below found a
+# denial near them, so the banner asserted "`Role` does not exist in this project" about
+# a real ORM model. A banner that states a falsehood is worse than the ordering defect it
+# was added to fix, so this stays narrow: a genuinely retired class simply will not fire
+# the guard, which is the right way for it to fail.
+_PREMISE_SYM_RE = re.compile(r"`(_[A-Za-z0-9_]{3,}|[A-Z][A-Z0-9_]{3,})`")
+_PREMISE_NEAR_CHARS = 240
+
+# Emphasis markers land INSIDE the phrases these regexes look for -- the swarm writes
+# "does **not** fall back", which no amount of `does\s+not` matching will catch. Stripped
+# before matching, on both the lead and the body window. Backticks are kept: symbol
+# extraction needs them.
+_MD_EMPHASIS_RE = re.compile(r"\*\*|__|(?<!\w)\*(?!\w)")
+
+
+def _demphasize(text: str) -> str:
+    return _MD_EMPHASIS_RE.sub("", text)
+_PREMISE_BANNER = "**CORRECTION — THE LEAD SENTENCE ADOPTS A PREMISE THIS ANSWER'S OWN FINDINGS DENY:"
+
+
+def _lead_sentence(content: str) -> str:
+    """First real prose sentence, skipping headings, fences, tables and rules."""
+    for raw in content.splitlines():
+        line = raw.strip().lstrip("#").strip().lstrip("*").strip()
+        if not line or line.startswith(("```", "---", "===", "|", ">")):
+            continue
+        m = re.search(r"(?<=[.!?])(?:\s|$)", line)
+        return line[: m.start()] if m else line
+    return ""
+
+
+def _symbol_denied_in_body(content: str, sym: str) -> bool:
+    """Does the answer state, near an occurrence of `sym`, that it does not exist?
+
+    Word-bounded: a bare substring search for `Role` matches inside `_ROLE_OVERRIDES`,
+    `RolePermission` and `roles`, which is how the first live run reached a denial that
+    was never about the symbol it flagged.
+    """
+    body = _demphasize(content)
+    for m in re.finditer(rf"(?<!\w){re.escape(sym)}(?!\w)", body):
+        window = body[max(0, m.start() - _PREMISE_NEAR_CHARS):
+                      m.end() + _PREMISE_NEAR_CHARS]
+        if _PREMISE_DENY_RE.search(window):
+            return True
+    return False
+
+
+def _hoist_denied_premise(content: str) -> str:
+    """Put the denial first when the lead sentence implies a non-existent thing existed.
+
+    Deliberately narrow. It fires only when ALL of these hold, so a legitimate answer
+    about something genuinely retired is untouched:
+      * the lead sentence carries retirement/removal language,
+      * that same sentence does NOT itself deny existence,
+      * it names a backticked symbol, and
+      * the body says that symbol does not exist.
+    """
+    if not content or _PREMISE_BANNER in content:
+        return content
+    lead = _demphasize(_lead_sentence(content))
+    if not lead or _PREMISE_DENY_RE.search(lead) or not _PREMISE_AFFIRM_RE.search(lead):
+        return content
+    syms = [s for s in dict.fromkeys(_PREMISE_SYM_RE.findall(lead))
+            if _symbol_denied_in_body(content, s)]
+    if not syms:
+        return content
+    named = ", ".join(f"`{s}`" for s in syms)
+    print(f"[team] lead sentence adopts a premise the body denies ({syms}) — "
+          f"hoisting the denial above it")
+    return (
+        f"{_PREMISE_BANNER} {named} does not exist in this project. Nothing was "
+        f"retired, removed or replaced — the premise in the question was false, and "
+        f"the sentence below is phrased as though the thing had once been real. The "
+        f"body's own finding is the answer.**\n\n---\n\n{content}")
 
 
 def _is_success_exemplar(content: str) -> bool:
@@ -10080,6 +10206,11 @@ async def run_task_async(
                         content, task, team, _hive_url,
                         final_run_output, liveness_path=liveness_path,
                         hive_mcp_tools=_hive_tools, synthesis_run=synthesis_run)
+                    # Applied HERE, at _verified_answer's single call site, rather than
+                    # at its 20+ return sites. The _verification_block rollout showed
+                    # what per-return-site wiring costs: four early returns were missed
+                    # and shipped unguarded. One choke point covers every path.
+                    content = _hoist_denied_premise(content)
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
                 tokens = _extract_tokens(final_run_output)
