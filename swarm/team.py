@@ -1637,6 +1637,9 @@ _MD_EMPHASIS_RE = re.compile(r"\*\*|__|(?<!\w)\*(?!\w)")
 
 def _demphasize(text: str) -> str:
     return _MD_EMPHASIS_RE.sub("", text)
+# At most this many count_matches calls per answer. The lead rarely names more than
+# one constant, and this bounds the cost of a pathological one.
+_PREMISE_MAX_LOOKUPS = 3
 _PREMISE_BANNER = "**CORRECTION — THE LEAD SENTENCE ADOPTS A PREMISE THIS ANSWER'S OWN FINDINGS DENY:"
 
 
@@ -1651,49 +1654,113 @@ def _lead_sentence(content: str) -> str:
     return ""
 
 
-def _symbol_denied_in_body(content: str, sym: str) -> bool:
-    """Does the answer state, near an occurrence of `sym`, that it does not exist?
+async def _repo_match_count(pattern: str, hive_mcp_url: str | None,
+                            hive_mcp_tools=None) -> int | None:
+    """Exact count of `pattern` in the project, from hive-mcp's count_matches.
 
-    Word-bounded: a bare substring search for `Role` matches inside `_ROLE_OVERRIDES`,
-    `RolePermission` and `roles`, which is how the first live run reached a denial that
-    was never about the symbol it flagged.
+    Returns None when the count could not be obtained. None is NOT zero, and every
+    caller must treat it as "unknown" -- concluding absence from a failed lookup is the
+    same over-claim this guard exists to correct.
+
+    Same live-session-then-fresh-connection shape as _fill_count_markers, and for the
+    same reason: opening a new streamablehttp_client while the run's own connections to
+    that server are still open is the step confirmed to hang on 2026-08-20.
     """
-    body = _demphasize(content)
-    for m in re.finditer(rf"(?<!\w){re.escape(sym)}(?!\w)", body):
-        window = body[max(0, m.start() - _PREMISE_NEAR_CHARS):
-                      m.end() + _PREMISE_NEAR_CHARS]
-        if _PREMISE_DENY_RE.search(window):
-            return True
-    return False
+    if not (hive_mcp_url or hive_mcp_tools):
+        return None
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    box: dict = {"n": None}
+
+    async def _ask(session) -> None:
+        res = await session.call_tool(
+            "count_matches", {"pattern": pattern, "glob_filter": "**/*"})
+        err = _mcp_error_text(res)
+        if err:
+            print(f"[team] premise guard: count_matches rejected ({pattern!r}): {err}")
+            return
+        m = re.search(r"TOTAL:\s*(\d+)", _extract_mcp_text(res))
+        if m:
+            box["n"] = int(m.group(1))
+
+    if hive_mcp_tools is not None:
+        try:
+            await asyncio.wait_for(_ask(await hive_mcp_tools.get_session_for_run()),
+                                   timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:
+            print(f"[team] premise guard: live session failed "
+                  f"({type(exc).__name__}: {exc or '<no message>'})")
+
+    if box["n"] is None and hive_mcp_url:
+        try:
+            async def _fresh() -> None:
+                async with streamablehttp_client(hive_mcp_url) as (read, write, _):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        await _ask(session)
+            await asyncio.wait_for(_fresh(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:
+            print(f"[team] premise guard: hive-mcp unreachable ({hive_mcp_url}): "
+                  f"{type(exc).__name__}: {exc or '<no message>'}")
+    return box["n"]
 
 
-def _hoist_denied_premise(content: str) -> str:
-    """Put the denial first when the lead sentence implies a non-existent thing existed.
+async def _hoist_denied_premise(content: str, hive_mcp_url: str | None = None,
+                                hive_mcp_tools=None) -> str:
+    """Correct a lead sentence that implies a symbol the project does not contain.
 
-    Deliberately narrow. It fires only when ALL of these hold, so a legitimate answer
-    about something genuinely retired is untouched:
+    Fires only when ALL of these hold, so an answer about something genuinely retired
+    is untouched:
       * the lead sentence carries retirement/removal language,
       * that same sentence does NOT itself deny existence,
-      * it names a backticked symbol, and
-      * the body says that symbol does not exist.
+      * it names a module-level-constant-shaped symbol, and
+      * count_matches puts that symbol at EXACTLY ZERO occurrences in the project.
+
+    The last condition asks the repository; the first version asked the prose, and that
+    is why it shipped inert. It tried to detect "the body denies this symbol" with a
+    phrase list, and five consecutive live batches produced five new ways of writing the
+    denial -- "No references to X exist", "No trace of X exists", "No file contains X",
+    "no fallback defaults exist", "no ... was found". Each time the vocabulary looked
+    complete; each time the next batch broke it. Worse, the list was tuned against the
+    very answers then reported as its verification, which is fitting to the test set.
+    Deployed, it fired on 0 of 6 answers, two of which were textbook cases.
+
+    count_matches has no vocabulary. It returns a number from the actual tree.
+
+    A lookup that FAILS returns None and the guard stays silent: unknown is not zero, and
+    inferring absence from a failed check would be the same over-claim this corrects.
     """
     if not content or _PREMISE_BANNER in content:
         return content
     lead = _demphasize(_lead_sentence(content))
     if not lead or _PREMISE_DENY_RE.search(lead) or not _PREMISE_AFFIRM_RE.search(lead):
         return content
-    syms = [s for s in dict.fromkeys(_PREMISE_SYM_RE.findall(lead))
-            if _symbol_denied_in_body(content, s)]
-    if not syms:
+    candidates = list(dict.fromkeys(_PREMISE_SYM_RE.findall(lead)))
+    if not candidates:
         return content
-    named = ", ".join(f"`{s}`" for s in syms)
-    print(f"[team] lead sentence adopts a premise the body denies ({syms}) — "
-          f"hoisting the denial above it")
+
+    absent = []
+    for sym in candidates[:_PREMISE_MAX_LOOKUPS]:
+        n = await _repo_match_count(sym, hive_mcp_url, hive_mcp_tools)
+        if n == 0:
+            absent.append(sym)
+        elif n is None:
+            print(f"[team] premise guard: could not count {sym!r} — staying silent "
+                  f"(unknown is not absent)")
+    if not absent:
+        return content
+
+    named = ", ".join(f"`{s}`" for s in absent)
+    print(f"[team] lead adopts a premise the project does not support ({absent}, "
+          f"count_matches=0) — hoisting the correction above it")
     return (
-        f"{_PREMISE_BANNER} {named} does not exist in this project. Nothing was "
-        f"retired, removed or replaced — the premise in the question was false, and "
-        f"the sentence below is phrased as though the thing had once been real. The "
-        f"body's own finding is the answer.**\n\n---\n\n{content}")
+        f"{_PREMISE_BANNER} {named} occurs ZERO times anywhere in this project — "
+        f"counted directly, not inferred from the text below. The sentence that follows "
+        f"is phrased as though it had once been real and was then retired, which nothing "
+        f"here establishes: the working tree cannot separate 'never existed' from "
+        f"'removed at some point', and no git history was consulted. Treat the absence "
+        f"as the finding and any retirement narrative as unsupported.**\n\n---\n\n{content}")
 
 
 def _is_success_exemplar(content: str) -> bool:
@@ -10210,7 +10277,8 @@ async def run_task_async(
                     # at its 20+ return sites. The _verification_block rollout showed
                     # what per-return-site wiring costs: four early returns were missed
                     # and shipped unguarded. One choke point covers every path.
-                    content = _hoist_denied_premise(content)
+                    content = await _hoist_denied_premise(
+                        content, _hive_url, hive_mcp_tools=_hive_tools)
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
                 tokens = _extract_tokens(final_run_output)
