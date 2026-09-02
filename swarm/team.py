@@ -1951,6 +1951,24 @@ async def _verify_claims(content: str, hive_mcp_url: str | None,
             if err:
                 raise RuntimeError(f"verify_claims tool returned an error: {err}")
             report = _extract_mcp_text(res)
+            # A REPORT THAT IS NOT A REPORT IS NOT A PASS.
+            #
+            # `bad` below is a substring test, so an empty or truncated payload returns
+            # ("", False, False) -- byte-identical to "checked everything, found nothing
+            # wrong". T11, run 3 (2026-09-01): attempt 1 timed out at its 90s budget,
+            # attempt 2 came back "ok" in 0.1s, and the answer shipped unflagged with a
+            # fabricated path in it. Replaying that same answer through verify_claims by
+            # hand returns "VERDICT: 2 claim(s) could NOT be found" and names the path
+            # twice -- the check was right, the result was dropped.
+            #
+            # Every legitimate return starts with "verify_claims", including both
+            # no-op forms ("nothing to check (empty answer)", "no checkable claims
+            # found"). Anything else is a failed call wearing a success, and must take
+            # the retry / unavailable path so _verification_block says so out loud.
+            if not report.strip().startswith("verify_claims"):
+                raise RuntimeError(
+                    f"verify_claims returned a malformed report "
+                    f"({len(report)} chars, starts {report.strip()[:60]!r})")
             # Logged on EVERY success, including the first attempt. Previously only
             # attempt 2+ logged, so a successful run produced no line at all and the
             # path actually taken was unobservable -- "no failure lines" was equally
@@ -1958,8 +1976,11 @@ async def _verify_claims(content: str, hive_mcp_url: str | None,
             # exactly the ambiguity that made verifying the 2026-08-20 reuse fix harder
             # than it should have been (settled only by reading hive-mcp's raw HTTP log
             # for a missing POST/GET handshake).
+            # Report SHAPE is logged, not just timing: the T11 incident above was
+            # invisible because a 0.1s "ok" and a real 5s "ok" logged identically.
             print(f"[team] verify_claims ok via {label} (attempt {n}) in "
-                  f"{time.monotonic() - started:.1f}s")
+                  f"{time.monotonic() - started:.1f}s "
+                  f"({len(report)} chars, {report.strip().splitlines()[0][:48]!r})")
             return report, "could NOT be found" in report, False
         except Exception as exc:
             last_exc = exc
