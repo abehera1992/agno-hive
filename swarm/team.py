@@ -3766,7 +3766,21 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # _count_contradicts_own_list for the two live cases.
     self_contra = _count_contradicts_own_list(content)
     if self_contra is not None:
-        stated, actual, intro = self_contra
+        stated, actual, intro, concrete = self_contra
+        if actual == stated:
+            # Padded filler: the tally only balances because an item names nothing.
+            print(f"[team] answer says {stated} and lists {actual}, but only {concrete} "
+                  f"items name anything — flagging padded enumeration", flush=True)
+            return (
+                f"{content}\n\n---\n**THE COUNT ONLY ADDS UP BECAUSE AN ITEM NAMES "
+                f"NOTHING — the answer says {stated} (\"{intro[:90]}\") and lists "
+                f"{actual} items, but only {concrete} of them name a specific thing; "
+                f"the rest restate the point in prose. Dropping those leaves "
+                f"{concrete}, not {stated}. Which number is right depends on what the "
+                f"task asked and this check does not adjudicate that — but do not read "
+                f"the matching totals as confirmation.**"
+                + _summarize_actual_writes(*all_results)
+            )
         print(f"[team] answer says {stated} but lists {actual} — flagging "
               f"self-contradiction", flush=True)
         return (
@@ -9681,11 +9695,40 @@ _LOCATION_WORD_BEFORE_RE = re.compile(
     r"\b(?:lines?|ln|cols?|columns?|pp|pages?|chunks?|rows?|ports?|steps?|versions?)"
     r"\.?[ \t]$", re.IGNORECASE)
 
+# A backticked span containing '*' is a PATTERN, not a name: `/internal/*`, `**/*.ts`.
+# Removed before the concreteness test below, because the path regex would otherwise
+# match the "/internal/" prefix of a glob and score it as a real endpoint -- which is
+# precisely how the live filler item passed for one.
+_GLOB_SPAN_RE = re.compile(r"`[^`]*\*[^`]*`")
 
-def _count_contradicts_own_list(content: str) -> tuple[int, int, str] | None:
+# Shapes that mean a list item NAMES something rather than describing one. Any single
+# hit qualifies the item; the bar is deliberately low, since the target is an item
+# carrying no identifier at all, not one that is merely vague.
+_CONCRETE_ITEM_RES = (
+    re.compile(r"/[A-Za-z_{][\w{}/.\-]*"),                       # a route or path
+    re.compile(r"\b\w+_\w+\b"),                                  # snake_case
+    re.compile(r"\b[a-z][a-z0-9]*[A-Z]\w*\b"),                   # camelCase
+    re.compile(r"\b[\w-]+\.(?:py|ts|tsx|js|jsx|sql|md|json|ya?ml)\b"),
+)
+
+
+def _names_something(line: str) -> bool:
+    """Does this list item name a concrete thing, or only talk about one?
+
+    The discriminator for a padded filler item -- see _count_contradicts_own_list's
+    third live case. Globs are stripped first so a pattern cannot pose as a name.
+    """
+    stripped = _GLOB_SPAN_RE.sub(" ", line)
+    stripped = re.sub(r"^\s*(?:[-*+•]|\d{1,3}[.)])\s*", "", stripped)
+    return any(r.search(stripped) for r in _CONCRETE_ITEM_RES)
+
+
+def _count_contradicts_own_list(content: str) -> tuple[int, int, str, int] | None:
     """A stated count that disagrees with the answer's OWN enumeration right below it.
 
-    Returns (stated, actual, intro_text) or None.
+    Returns (stated, actual, intro_text, concrete) or None. `concrete` is how many of
+    those `actual` items actually name something; it differs from `actual` only in the
+    padded-filler case below, and the caller words the banner off that.
 
     Sibling of _miscounted_listing, pointed inward: that one checks a stated number
     against a directory listing the RUN made, this one against a list the ANSWER
@@ -9697,7 +9740,21 @@ def _count_contradicts_own_list(content: str) -> tuple[int, int, str] | None:
         T2    "The following 7 endpoints ... have no corresponding hook:"  -> 6 bullets
         T13b  "The vouchers module has **5 backend-only endpoints** ...:"  -> 7 bullets
 
-    In both the LIST was closer to right than the number (T2's 6 was exactly right;
+    A third shape (2026-09-02) defeats a plain item count and is why `concrete` exists.
+    T2 enumerated 13 endpoints and 16 hooks, both exactly right, tabulated 6 endpoints
+    as unhooked -- then claimed 7 and padded the list to seven:
+
+        7. **(No hook for internal endpoints)** - All internal endpoints (`/internal/*`)
+           are intentionally not exposed.
+
+    Seven items for a stated seven, so the arithmetic agreed and this stayed silent. The
+    lie is not in the count but in the seventh item, which names no endpoint: its only
+    path-shaped token is a glob, and the six above it are each a real route. Counting
+    only items that name something recovers 6 != 7. Measured over 116 stored answers
+    (300k chars) from this battery: one new fire, this one, no false positives, and none
+    of the five existing detections suppressed.
+
+    In the first two the LIST was closer to right than the number (T2's 6 was exactly right;
     T13b's 7 was wrong too, but not in the way the count claimed). Neither is
     fabrication and every existing guard passed them: the reads happened, the items are
     real, and nothing was invented -- the answer simply contradicts itself, and a reader
@@ -9731,19 +9788,28 @@ def _count_contradicts_own_list(content: str) -> tuple[int, int, str] | None:
             continue
         if _LOCATION_WORD_BEFORE_RE.search(content[:m.start()]):
             continue
-        actual = 0
+        actual = concrete = 0
         for line in content[m.end():].splitlines():
             stripped = line.strip()
             if not stripped:
                 continue        # markdown lists are often blank-line separated
             if _LIST_LINE_RE.match(stripped):
                 actual += 1
+                concrete += _names_something(stripped)
             else:
                 break           # prose ends the list
         # Two items minimum: a single line after a count is usually a sentence that
         # happens to start with a dash, not an enumeration.
-        if actual >= 2 and actual != stated:
-            return stated, actual, m.group(0).strip().rstrip(":")
+        if actual < 2:
+            continue
+        if actual != stated:
+            return stated, actual, m.group(0).strip().rstrip(":"), concrete
+        # Item count agrees; the padded-filler case. Only report when dropping the
+        # unqualified items breaks the agreement -- an answer whose items are all
+        # prose (concrete == 0 against a matching count) is a different complaint and
+        # not one this arithmetic check can make.
+        if concrete != stated and concrete >= 2:
+            return stated, actual, m.group(0).strip().rstrip(":"), concrete
     return None
 
 
