@@ -4020,18 +4020,24 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         )
 
     _rs_enum = getattr(team, "_read_state", None)
-    # Two-sided comparison answered with only the conclusion (2026-09-02). Sits BEFORE
-    # the enumeration guard: that one needs a recorded listing or a read count, and T2's
-    # evidence is two file reads, so it had nothing to gate on and stayed silent while
-    # both requested enumerations were missing.
-    if _under_answered_comparison(content, task):
-        print(f"[team] two-sided comparison answered without enumerating either side "
-              f"— flagging", flush=True)
+    # Two-sided comparison answered with far fewer items than the run had (2026-09-02).
+    # Sits before the enumeration guard because that one returns early on two list
+    # lines, which a gap list alone supplies -- see _under_answered_comparison for the
+    # two shape-based versions this replaces and the runs that defeated each.
+    _cmp_available = (_rs_enum.get("max_enumerable", 0)
+                      if isinstance(_rs_enum, dict) else 0)
+    missing_cmp = _under_answered_comparison(content, task, _cmp_available)
+    if missing_cmp is not None:
+        print(f"[team] two-sided comparison listed "
+              f"{len(_LIST_LINE_RE.findall(content))} items against {missing_cmp} "
+              f"available — flagging", flush=True)
         return (
             f"{content}\n\n---\n**BOTH SIDES WERE NOT ENUMERATED - this task asked "
-            f"for each side listed in full before comparing, and the answer above "
-            f"contains fewer than two separate lists. The conclusion may well be "
-            f"correct; it cannot be checked without redoing the comparison.**"
+            f"for each side listed in full before comparing. The answer above lists "
+            f"fewer items than a single tool result in this run already held "
+            f"({missing_cmp}), so at least one side was not enumerated. The "
+            f"conclusion may well be correct; it cannot be checked without redoing "
+            f"the comparison.**"
             + _summarize_actual_writes(*all_results)
         )
 
@@ -8904,8 +8910,7 @@ def _under_answered_enumeration(content: str, task: str, listings: list | None,
 
 # A task demanding BOTH sides enumerated before a comparison. T2's wording is the
 # canonical case: "List every endpoint defined in X, then list every RTK Query hook
-# exported by Y, and state which endpoints have no corresponding hook. Enumerate both
-# sides in full before comparing."
+# exported by Y ... Enumerate both sides in full before comparing."
 _TWO_SIDED_TASK_RE = re.compile(
     r"\bboth\s+sides\b"
     r"|\benumerate\s+both\b"
@@ -8915,45 +8920,43 @@ _TWO_SIDED_TASK_RE = re.compile(
 )
 
 
-def _list_block_count(content: str) -> int:
-    """How many SEPARATE runs of list items the answer contains.
+def _under_answered_comparison(content: str, task: str, available: int) -> int | None:
+    """A two-sided comparison answered with far fewer items than the run had in hand.
 
-    Blocks, not lines. _under_answered_enumeration is satisfied by two list LINES
-    anywhere, which a single list trivially provides -- and that is how T2 slipped
-    through on 2026-09-02 while omitting both enumerations it was asked for.
+    Returns the item count the run could have shown, or None.
+
+    Compares against EVIDENCE, not against the answer's shape. Two shape-based versions
+    failed live before this one, both for the same reason -- any two lists satisfied
+    them, whatever the lists contained:
+
+      * first cut: "at least two list LINES anywhere" (the pre-existing rule in
+        _under_answered_enumeration). T2 run 5 answered with six gap endpoints and
+        neither of the two enumerations it was told to produce; six lines cleared the bar.
+      * second cut: "at least two list BLOCKS". T2 run 7 answered with the six gaps plus
+        a three-line block speculating WHY hooks might be missing -- a decoy, not a side.
+        Two blocks cleared the bar and both enumerations were still absent.
+
+    `available` is read_state["max_enumerable"]: the most enumerable lines any single
+    tool result held this run. _ENUMERABLE_LINE_RE counts `@router.get(`, `def`, `class`
+    and `export const`, so a read of business_api.py yields 28. Measured across the five
+    stored T2 answers, the separation is not marginal:
+
+        run 3  35 items listed   both sides enumerated   silent
+        run 4  37                both sides              silent
+        run 5   6                NEITHER side            fires
+        run 6  45                both sides              silent
+        run 7   9                NEITHER side            fires
+
+    Gated on the task asking for both sides, so a question asking for a SUBSET ("which
+    endpoints lack hooks?") is never required to enumerate everything the run read.
     """
-    blocks, in_block = 0, False
-    for line in content.splitlines():
-        item = bool(_LIST_LINE_RE.match(line))
-        if item and not in_block:
-            blocks += 1
-        in_block = item
-    return blocks
-
-
-def _under_answered_comparison(content: str, task: str) -> bool:
-    """A two-sided comparison answered with the conclusion and neither side listed.
-
-    T2, run 5 (2026-09-02): the six gap endpoints were EXACTLY right -- verified against
-    business_api.py and businessApi.ts by hand -- and the answer was 533 characters
-    containing only those six. The thirteen endpoints and sixteen hooks it was told to
-    enumerate "in full before comparing" were both absent, so a correct conclusion
-    arrived with no way to check it short of redoing the work.
-
-    No guard fired. _under_answered_enumeration needs an evidence source -- a recorded
-    directory listing, or read_items -- and T2's evidence is two file reads, so
-    `available` was 0. Even had it been set, that guard returns early on two list LINES
-    anywhere in the answer, and the gap list alone supplies six.
-
-    So this is deliberately SHAPE-ONLY: no listing, no read count, nothing but the task's
-    own wording and the answer's structure. The task says enumerate both sides; fewer
-    than two separate list blocks means at most one side was enumerated.
-    """
-    if not content or not task:
-        return False
+    if not content or not task or available < 3:
+        return None
     if not _TWO_SIDED_TASK_RE.search(task):
-        return False
-    return _list_block_count(content) < 2
+        return None
+    if len(_LIST_LINE_RE.findall(content)) >= available:
+        return None
+    return available
 
 
 _GENERIC_PATH_SEGMENTS = {"src", "api", "app", "lib", "project", "root", "code"}
