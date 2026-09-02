@@ -8586,13 +8586,27 @@ _ASKS_FOR_LIST_RE = re.compile(
 # vouchers_api.py (37,113 bytes, so a skeleton rather than a full read) contains
 # exactly 9 `@router` decorators, matching the 9 real endpoints T13 was asked to list
 # and reported only in prose.
+# The optional NNN<tab> prefix is not cosmetic. get_file_content returns cat -n style
+# NUMBERED lines --
+#
+#     '     1\t"""Seller registration and status endpoints."""'
+#
+# -- and every alternative below anchors at ^ then expects @, def, class, export or a
+# bullet. After a line number and a tab, none of them match. Measured 2026-09-02 by
+# calling the real tool: business_api.py scores 28 as a RAW FILE and 0 as TOOL OUTPUT,
+# so read_state["max_enumerable"] was 0 for every get_file_content read and any guard
+# gated on it stayed silent. That is why _under_answered_enumeration cannot see
+# endpoints in a file read today, and why the T2 comparison guard shipped inert: its
+# rule was validated against the file on disk, not against what the tool returns.
 _ENUMERABLE_LINE_RE = re.compile(
-    r"^\s*(?:[-*+•]|\d{1,3}[.)])\s+\S"
-    r"|^\s*@\w[\w.]*\("
-    r"|^\s*(?:async\s+)?def\s+\w+"
-    r"|^\s*class\s+\w+"
-    r"|^\s*export\s+(?:const|function|default)\s+\w+"
-    r"|^\s*\[(?:FILE|DIR)\]\s+\S",
+    r"^[ \t]*(?:\d{1,6}\t[ \t]*)?(?:"
+    r"(?:[-*+•]|\d{1,3}[.)])\s+\S"
+    r"|@\w[\w.]*\("
+    r"|(?:async\s+)?def\s+\w+"
+    r"|class\s+\w+"
+    r"|export\s+(?:const|function|default)\s+\w+"
+    r"|\[(?:FILE|DIR)\]\s+\S"
+    r")",
     re.MULTILINE,
 )
 
