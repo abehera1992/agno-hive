@@ -762,6 +762,59 @@ def find_files(glob_pattern: str, max_results: int = 200) -> str:
     return f"{len(matches)} result(s) for '{glob_pattern}':\n" + "\n".join(matches)
 
 
+def _zero_glob_note(glob_filter: str) -> str:
+    """Warn when `glob_filter` selects NO files at all. Returns "" otherwise.
+
+    "Your pattern has no matches" and "your filter matched no files" are different
+    facts, and every zero-result path here collapsed them into one sentence. Only the
+    tool can tell them apart, and it was not saying.
+
+    The live case (T13a, 2026-09-02): an agent auditing the vouchers module swept the
+    frontend with glob_filter='src/**/*'. The frontend is at
+    Client/EcommClient-Web/ekamweb/src/..., so that glob matched zero files. Four
+    searches -- 'voucher', 'Voucher', 'VoucherSeries', 'voucher_series' -- each came
+    back "No matches for: <term>", indistinguishable from a true absence. The answer
+    then reported that no frontend file references vouchers (8 do, including a whole
+    page at (portal)/business/inventory/vouchers/page.tsx) and recommended building
+    the page that already exists.
+
+    No guard could have caught it downstream: the search-claim guard's bare-absence
+    layer requires ZERO searches for the term, and its proximity layer checks the term
+    WAS searched. The agent searched four times, so both layers passed, correctly. The
+    missing information was never in the tool output to begin with.
+
+    Only ever called on a zero-result path, so it costs nothing in the common case, and
+    it fails open -- a warning that cannot be computed is simply not shown.
+    """
+    if not glob_filter or glob_filter in ("**/*", "**", "*"):
+        return ""       # a catch-all selects everything; zero files is impossible
+    import subprocess, shutil
+    try:
+        rg = shutil.which("rg")
+        if rg:
+            probe = subprocess.run(
+                [rg, "--files", "--glob", glob_filter] + _RG_EXCLUDES,
+                capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=15,
+            )
+            if probe.returncode not in (0, 1):
+                return ""
+            if any(l.strip() for l in probe.stdout.splitlines()):
+                return ""
+        else:
+            for rel in _walk_project():
+                if _matches_glob(rel, glob_filter):
+                    return ""
+    except Exception:
+        return ""       # never let the warning path break the tool it annotates
+    return (
+        f"\n\nNOTE: glob_filter {glob_filter!r} matched 0 files in this project, so "
+        f"this search scanned nothing. A zero result here is NOT evidence that the "
+        f"pattern is absent — it only means the filter selected no files. Find the "
+        f"real path before concluding anything: find_files('**/*<name>*') or "
+        f"list_directory_tree(), then search under the path those return."
+    )
+
+
 def search_files(pattern: str, glob_filter: str = "**/*", max_results: int = 80) -> str:
     """
     Search file contents with a regex pattern. Returns matching lines with path:line: content.
@@ -802,7 +855,7 @@ def search_files(pattern: str, glob_filter: str = "**/*", max_results: int = 80)
                 raise RuntimeError(result.stderr.strip())
             lines = [l for l in result.stdout.splitlines() if l.strip()]
             if not lines:
-                return f"No matches for: {pattern}"
+                return f"No matches for: {pattern}" + _zero_glob_note(glob_filter)
             # rg output: path:line:content — reformat to path:line: content
             out = []
             for ln in lines[:max_results]:
@@ -851,7 +904,9 @@ def search_files(pattern: str, glob_filter: str = "**/*", max_results: int = 80)
     except Exception as e:
         return f"search_files failed: {e}"
 
-    return _cap("\n".join(results)) if results else f"No matches for: {pattern}"
+    if results:
+        return _cap("\n".join(results))
+    return f"No matches for: {pattern}" + _zero_glob_note(glob_filter)
 
 
 def count_matches(pattern: str, glob_filter: str = "**/*",
@@ -893,6 +948,16 @@ def count_matches(pattern: str, glob_filter: str = "**/*",
         )
         # rg exit: 0 = matches, 1 = no matches, 2+ = real error
         if result.returncode not in (0, 1):
+            # A glob selecting nothing is exit 2 with this exact message, so it never
+            # reaches the zero-result branch below -- it lands here, where "count_matches
+            # failed: rg: ..." reads like a broken tool rather than a wrong filter. Say
+            # what actually happened instead. See _zero_glob_note for the live incident.
+            if "No files were searched" in (result.stderr or ""):
+                return (f"TOTAL: 0 file(s) searched for pattern {pattern!r} in "
+                        f"'{glob_filter}' — nothing was counted."
+                        + (_zero_glob_note(glob_filter)
+                           or f"\n\nNOTE: glob_filter {glob_filter!r} selected no "
+                              f"searchable files. This is not a count of 0 occurrences."))
             return f"count_matches failed: {result.stderr.strip() or 'rg error'}"
         total = 0
         per_file: list[tuple[str, int]] = []
@@ -909,7 +974,11 @@ def count_matches(pattern: str, glob_filter: str = "**/*",
         head = (f"TOTAL: {total} match(es) for pattern {pattern!r} in '{glob_filter}' "
                 f"across {len(per_file)} file(s)")
         if not per_file:
-            return f"TOTAL: 0 match(es) for pattern {pattern!r} in '{glob_filter}'"
+            # Same trap as search_files, and worse here: this tool is documented as the
+            # authoritative counter ("NEVER count by reading a file"), so its 0 gets
+            # relayed as fact. A 0 from a glob that matched no files is not a count.
+            return (f"TOTAL: 0 match(es) for pattern {pattern!r} in '{glob_filter}'"
+                    + _zero_glob_note(glob_filter))
         body = "\n".join(f"  {p}: {c}" for p, c in sorted(per_file, key=lambda x: -x[1])[:50])
         return head + "\n" + body
     except subprocess.TimeoutExpired:
