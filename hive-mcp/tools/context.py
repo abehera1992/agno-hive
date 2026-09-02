@@ -918,7 +918,7 @@ def count_matches(pattern: str, glob_filter: str = "**/*",
         return f"count_matches failed: {e}"
 
 
-def list_directory_tree(max_depth: int = 3) -> str:
+def list_directory_tree(max_depth: int = 8) -> str:
     """
     Return the full directory tree of the project up to max_depth levels deep.
     Shows directories only (no individual files) — no result cap.
@@ -926,11 +926,37 @@ def list_directory_tree(max_depth: int = 3) -> str:
     Prefer this over find_files('**/*') for structure questions — no cap, always complete.
 
     Args:
-        max_depth: How many levels deep to traverse (default 3)
+        max_depth: How many levels deep to traverse (default 8)
 
     Examples:
-        list_directory_tree()    → full project structure, 3 levels deep
+        list_directory_tree()    → full project structure, 8 levels deep
         list_directory_tree(2)   → top 2 levels only
+
+    Default raised 3 -> 8 on 2026-09-02. At 3 this tool was STRUCTURALLY BLIND to the
+    frontend routes: Client/EcommClient-Web/ekamweb/src/app is already 5 segments deep,
+    and an actual route like .../src/app/(portal)/business/verification-status sits at 8.
+    A model asking for the project structure got a tree that stopped four levels above
+    the thing it was asked about.
+
+    Battery T11 (2026-09-01) is the cost. Asked to trace a seller document upload, the
+    run made 66 tool calls -- 20+ READMEs, docs/frontend.md -- and one
+    list_directory_tree(max_depth=3), then answered with
+    `src/app/seller/verification-status/page.tsx`. That path does not exist; the real one
+    is (portal)/business/verification-status. "verification-status" appears ZERO times in
+    that run's entire log, so it was never in any tool result -- the route was produced
+    from pattern knowledge because the tree could not show the real one. Four battery runs,
+    three T11 failures.
+
+    Measured on this repo before changing it, so the cost is known rather than assumed:
+
+        depth  3 ->  1,028 chars,  72 lines          sees the route dir: NO
+        depth  7 ->  2,670 chars, 158 lines          NO
+        depth  8 ->  4,038 chars, 213 lines, 3.8s    YES
+        depth 10 ->  4,609 chars, 236 lines, 5.5s    YES (saturates)
+
+    ~3 KB and ~3s to stop inventing paths, and the tree saturates by 10 so there is no
+    cliff past this. Note this lists DIRECTORIES only at any depth -- it will show the
+    real route directory, never page.tsx; citing a file still needs find_files/search_files.
     """
     lines = []
 

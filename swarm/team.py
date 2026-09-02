@@ -4029,16 +4029,36 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         print(f"[team] enumeration task answered without a list "
               f"({missing_enum} items were available) — flagging"
               f"{' + rendering the listing' if recorded else ''}", flush=True)
+        if recorded:
+            # REPAIR, not complain (2026-09-02). The list came SECOND, beneath a banner
+            # whose opening words were that the answer had failed -- so the delivered
+            # artifact led with a complaint and buried the very items that answered the
+            # question. T6 is byte-identical across four battery runs: the coordinator
+            # says "There are 24 Python files in `API/inventory-service/router/`" and
+            # stops, and this guard then printed all 24 correct names underneath a
+            # notice announcing they were missing. They were not missing; they were
+            # below the fold.
+            #
+            # The items now sit with the answer and the disclosure is a footnote.
+            # Nothing is concealed: the "ASKED FOR A LIST" marker stays, so
+            # _GUARD_BANNERS still matches and the answer is still kept out of the
+            # success-exemplar store, and the footnote still says plainly that the
+            # items are the tool's output rather than the model's.
+            return (
+                f"{content}{recorded}"
+                f"\n\n---\n**ASKED FOR A LIST, ANSWERED WITHOUT ONE - the answer "
+                f"above gave only the count. The {missing_enum} items listed with it "
+                f"are this run's own directory listing, reproduced verbatim; they are "
+                f"the tool's output, not the model's.**"
+                + _summarize_actual_writes(*all_results)
+            )
         return (
-            f"{content}\n\n---\n**ASKED FOR A LIST, ANSWERED WITHOUT ONE — this task "
-            f"asked for an enumeration and a directory listing in this run returned "
-            f"{missing_enum} entries, but the answer above shows no itemised list. The "
-            f"underlying facts may well be correct; they simply cannot be checked "
-            f"without redoing the work."
-            # The rendered list goes OUTSIDE the bold span -- markdown list items
-            # inside `**...**` do not render as a list.
-            + (("**" + recorded) if recorded
-               else " Ask again for the items themselves if you need to verify them.**")
+            f"{content}\n\n---\n**ASKED FOR A LIST, ANSWERED WITHOUT ONE - this "
+            f"task asked for an enumeration and a directory listing in this run "
+            f"returned {missing_enum} entries, but the answer above shows no itemised "
+            f"list. The underlying facts may well be correct; they simply cannot be "
+            f"checked without redoing the work. Ask again for the items themselves if "
+            f"you need to verify them.**"
             + _summarize_actual_writes(*all_results)
         )
 
