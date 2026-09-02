@@ -180,8 +180,25 @@ def _resolves_as_suffix(rel: str) -> bool:
         if len(parts) < 2:
             return False
         needle = "/".join(parts)
-        for found in PROJECT_ROOT.rglob(parts[-1]):
-            if found.as_posix().endswith(needle):
+        basename = parts[-1]
+        # Pruned walk, NOT Path.rglob -- the identical defect _staged_files documents
+        # above, left behind in this function when that one was fixed on 2026-08-05.
+        # rglob visits every directory before any filtering can happen, so a lookup for
+        # a common basename walked node_modules (27,405 files) and .venv (14,790) on
+        # every call.
+        #
+        # And it runs on exactly the answers that matter: a path that RESOLVES never
+        # reaches here, so the cost was paid only when a path was wrong -- making
+        # fabricated-path detection the slowest thing verify_claims could do. Measured
+        # 2026-09-01: a 327-char prefix of T11 (two bad paths ending in the very common
+        # `page.tsx`) took 178s, which is what exhausted verify_claims' 90s budget and
+        # dropped the verdict that had correctly caught the fabrication.
+        for dirpath, dirnames, filenames in os.walk(PROJECT_ROOT, topdown=True):
+            dirnames[:] = [d for d in dirnames
+                           if d not in EXCLUDE_DIRS and not d.startswith(".")]
+            if basename not in filenames:
+                continue
+            if (Path(dirpath) / basename).as_posix().endswith(needle):
                 return True
         return False
     except Exception:
@@ -1074,6 +1091,66 @@ def _rg(pattern: str, fixed: bool = True, glob_filter: str = "",
         return []
 
 
+def _rg_batch(patterns: list[str], glob_filter: str = "",
+              whole_word: bool = False,
+              per_pattern_cap: int = 8) -> dict[str, list[str]]:
+    r"""One ripgrep pass for MANY patterns, hits attributed back per pattern.
+
+    _rg spawns one subprocess per pattern, and each one is a full scan of the project.
+    Measured in the live container on this repo: 1.10s per scan, so the 16 symbols in a
+    single T13b answer cost 17.56s and _MAX_CLAIMS=25 allows ~27s of grep before paths
+    or citations are even looked at. That is the origin of the 30-47s verify_claims
+    times in battery run 3 and of the 90s timeout that silently dropped T11's verdict.
+    The same 16 patterns as one alternation: 1.12s. 15.7x, and the gap widens with the
+    pattern count because the batched cost is essentially flat.
+
+    _MAX_CLAIMS' own comment ("subprocess per claim; keep the whole check inside a few
+    seconds") describes an assumption that stopped holding as the repo grew. This makes
+    it true again without lowering the cap, which would have bought latency by throwing
+    away detection -- T13b needed all 16 of its symbols to surface 4 fabrications.
+
+    Semantics are kept identical to _rg deliberately:
+      * patterns are re.escape'd, so the alternation matches literally, as -F did;
+      * `whole_word` reproduces -w via a (?<!\w)...(?!\w) guard when attributing;
+      * attribution reads the TEXT field of `path:lineno:text`, never the path, so a
+        symbol that appears only in a filename cannot claim a content hit.
+
+    --max-count 1 is deliberately NOT passed: it caps per FILE, which under an
+    alternation would mean per file across ALL patterns and could starve one symbol of
+    its only hit. `per_pattern_cap` bounds the output per pattern instead; every caller
+    uses truthiness or hits[0], so the cap is invisible to them.
+    """
+    out: dict[str, list[str]] = {p: [] for p in patterns}
+    rg = shutil.which("rg")
+    if not rg or not patterns:
+        return out
+    cmd = [rg, "-n", "--no-heading"]
+    if whole_word:
+        cmd.append("-w")
+    if glob_filter:
+        cmd += ["--glob", glob_filter]
+    cmd += rg_args()
+    cmd += ["-e", "|".join(re.escape(p) for p in patterns)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           cwd=str(PROJECT_ROOT), timeout=60)
+    except Exception:
+        return out
+    matchers = [
+        (p, re.compile(rf"(?<!\w){re.escape(p)}(?!\w)" if whole_word else re.escape(p)))
+        for p in patterns
+    ]
+    for line in r.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split(":", 2)
+        text = parts[2] if len(parts) == 3 else line
+        for pat, rx in matchers:
+            if len(out[pat]) < per_pattern_cap and rx.search(text):
+                out[pat].append(line)
+    return out
+
+
 def _resolve_path(rel_path: str, hint_paths: list[str] | None = None) -> tuple[str | None, int]:
     """Resolve a cited path to a real repo file. Returns (resolved_path, n_candidates).
 
@@ -1687,6 +1764,17 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     # ── symbols ───────────────────────────────────────────────────────────────
     if idents:
         out.append(f"SYMBOLS ({len(idents[:_MAX_CLAIMS])} checked):")
+        # ONE ripgrep pass per flag group instead of one per symbol. `whole_word`
+        # is the only flag that varies across these tokens (-w for a bare identifier,
+        # off for a dotted owner.attribute), so there are at most two groups. See
+        # _rg_batch: 16 symbols went 17.56s -> 1.12s on this repo.
+        _batch = list(idents[:_MAX_CLAIMS])
+        _sym_hits: dict[str, list[str]] = {}
+        for _ww in (True, False):
+            _group = [t for t in _batch if (("." not in t) is _ww)]
+            if _group:
+                _sym_hits.update(_rg_batch(_group, glob_filter=glob_filter,
+                                           whole_word=_ww))
         for tok in idents[:_MAX_CLAIMS]:
             dotted = "." in tok
             # Structural check FIRST, scoped to the files the answer itself named
@@ -1714,7 +1802,13 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                 if structural.lstrip().startswith("NOT IN FILE"):
                     problems += 1
                 continue
-            hits = _rg(tok, fixed=True, glob_filter=glob_filter, whole_word=not dotted)
+            # From the batched pass above; falls back to a single call if this token
+            # somehow was not in the batch (never expected -- the batch is built from
+            # the same idents[:_MAX_CLAIMS] slice this loop walks).
+            hits = _sym_hits.get(tok)
+            if hits is None:
+                hits = _rg(tok, fixed=True, glob_filter=glob_filter,
+                           whole_word=not dotted)
             code_hits = [h for h in hits
                          if not h.split(":", 1)[0].lower().endswith(_DOC_EXTS)]
             if not code_hits:
