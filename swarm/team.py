@@ -7192,10 +7192,6 @@ def _build_team(
     # Run-scoped read log, visible to _verified_answer's groundedness guards regardless
     # of delegation depth (2026-08-21) -- see the hook's own read_state comment.
     team._read_state = read_cache_hook.state
-    # The run's own task, for guards that need to know what was ASKED and not only what
-    # was answered. _record_stream_artifacts is the case: it sees member results stream
-    # past but had no way to tell an enumeration request from any other.
-    team._task = task
     return team
 
 
@@ -8227,43 +8223,7 @@ def _record_stream_artifacts(team, out: dict) -> None:
         # bucket, the same normalisation the delegation gate matches on.
         if not isinstance(getattr(team, "_member_results", None), dict):
             team._member_results = {}
-        # RESTORE A LOST ENUMERATION BEFORE THE COORDINATOR SEES IT (2026-09-02).
-        #
-        # T6 is byte-identical across five battery runs: the coordinator answers "There
-        # are 24 Python files in `API/inventory-service/router/`" and stops. It is not
-        # withholding the list -- it never receives one. The Researcher calls
-        # list_directory, gets all 24 names (658 chars, measured), and relays a count;
-        # the coordinator can only pass on what reached it, so the names die at the
-        # relay and the enumeration guard then reattaches them AFTER the answer.
-        #
-        # This is not the "give the model more context and hope" pattern that measured
-        # null three times this session (success-context, skill injection, bottom-
-        # anchored evidence). Those added hints hoping for better reasoning. This
-        # repairs a concrete information loss: the data the question asks for exists in
-        # the run and is being dropped in transit.
-        #
-        # Deliberately narrow -- only an enumeration task, only a member that returned
-        # no list of its own, only when a real listing of 3+ entries was recorded. On
-        # any other task nothing is appended and the context cost is zero.
-        _mc = out["content"]
-        try:
-            _mtask = getattr(team, "_task", "") or ""
-            if (_mtask and _asks_for_list(_mtask)
-                    and len(_LIST_LINE_RE.findall(_mc)) < 2):
-                _best = max((l for l in (getattr(team, "_listings", None) or [])
-                             if l.get("names")),
-                            key=lambda l: l.get("items", 0), default=None)
-                if _best and _best.get("items", 0) >= 3:
-                    _names = _best["names"][:_LISTING_RENDER_CAP]
-                    _mc = (_mc + "\n\nEntries returned by the listing of "
-                           f"`{_best.get('path', '')}` this run:\n"
-                           + "\n".join(f"- {n}" for n in _names))
-                    print(f"[team] restored {len(_names)} listing entries into the "
-                          f"member result for the coordinator (relay dropped them)",
-                          flush=True)
-        except Exception as exc:
-            print(f"[team] listing restore skipped: {exc}", flush=True)
-        team._member_results[_member_key(out.get("agent_name", ""))] = _mc
+        team._member_results[_member_key(out.get("agent_name", ""))] = out["content"]
         # Running total of what has landed in the COORDINATOR's context. Every member
         # result is appended there verbatim, so this is the quantity that actually
         # grows toward the model's context limit -- see _delegation_budget_exhausted.
