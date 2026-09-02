@@ -1568,6 +1568,7 @@ _GUARD_BANNERS = (
     "LONGER THAN ITS EVIDENCE",
     "Answered by the coordinator alone",
     "ADOPTS A PREMISE THIS ANSWER'S OWN FINDINGS DENY",
+    "BOTH SIDES WERE NOT ENUMERATED",
 )
 
 
@@ -4019,6 +4020,21 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         )
 
     _rs_enum = getattr(team, "_read_state", None)
+    # Two-sided comparison answered with only the conclusion (2026-09-02). Sits BEFORE
+    # the enumeration guard: that one needs a recorded listing or a read count, and T2's
+    # evidence is two file reads, so it had nothing to gate on and stayed silent while
+    # both requested enumerations were missing.
+    if _under_answered_comparison(content, task):
+        print(f"[team] two-sided comparison answered without enumerating either side "
+              f"— flagging", flush=True)
+        return (
+            f"{content}\n\n---\n**BOTH SIDES WERE NOT ENUMERATED - this task asked "
+            f"for each side listed in full before comparing, and the answer above "
+            f"contains fewer than two separate lists. The conclusion may well be "
+            f"correct; it cannot be checked without redoing the comparison.**"
+            + _summarize_actual_writes(*all_results)
+        )
+
     missing_enum = _under_answered_enumeration(
         content, task, getattr(team, "_listings", None),
         read_items=(_rs_enum.get("max_enumerable", 0) if isinstance(_rs_enum, dict) else 0),
@@ -7176,6 +7192,10 @@ def _build_team(
     # Run-scoped read log, visible to _verified_answer's groundedness guards regardless
     # of delegation depth (2026-08-21) -- see the hook's own read_state comment.
     team._read_state = read_cache_hook.state
+    # The run's own task, for guards that need to know what was ASKED and not only what
+    # was answered. _record_stream_artifacts is the case: it sees member results stream
+    # past but had no way to tell an enumeration request from any other.
+    team._task = task
     return team
 
 
@@ -8207,7 +8227,43 @@ def _record_stream_artifacts(team, out: dict) -> None:
         # bucket, the same normalisation the delegation gate matches on.
         if not isinstance(getattr(team, "_member_results", None), dict):
             team._member_results = {}
-        team._member_results[_member_key(out.get("agent_name", ""))] = out["content"]
+        # RESTORE A LOST ENUMERATION BEFORE THE COORDINATOR SEES IT (2026-09-02).
+        #
+        # T6 is byte-identical across five battery runs: the coordinator answers "There
+        # are 24 Python files in `API/inventory-service/router/`" and stops. It is not
+        # withholding the list -- it never receives one. The Researcher calls
+        # list_directory, gets all 24 names (658 chars, measured), and relays a count;
+        # the coordinator can only pass on what reached it, so the names die at the
+        # relay and the enumeration guard then reattaches them AFTER the answer.
+        #
+        # This is not the "give the model more context and hope" pattern that measured
+        # null three times this session (success-context, skill injection, bottom-
+        # anchored evidence). Those added hints hoping for better reasoning. This
+        # repairs a concrete information loss: the data the question asks for exists in
+        # the run and is being dropped in transit.
+        #
+        # Deliberately narrow -- only an enumeration task, only a member that returned
+        # no list of its own, only when a real listing of 3+ entries was recorded. On
+        # any other task nothing is appended and the context cost is zero.
+        _mc = out["content"]
+        try:
+            _mtask = getattr(team, "_task", "") or ""
+            if (_mtask and _asks_for_list(_mtask)
+                    and len(_LIST_LINE_RE.findall(_mc)) < 2):
+                _best = max((l for l in (getattr(team, "_listings", None) or [])
+                             if l.get("names")),
+                            key=lambda l: l.get("items", 0), default=None)
+                if _best and _best.get("items", 0) >= 3:
+                    _names = _best["names"][:_LISTING_RENDER_CAP]
+                    _mc = (_mc + "\n\nEntries returned by the listing of "
+                           f"`{_best.get('path', '')}` this run:\n"
+                           + "\n".join(f"- {n}" for n in _names))
+                    print(f"[team] restored {len(_names)} listing entries into the "
+                          f"member result for the coordinator (relay dropped them)",
+                          flush=True)
+        except Exception as exc:
+            print(f"[team] listing restore skipped: {exc}", flush=True)
+        team._member_results[_member_key(out.get("agent_name", ""))] = _mc
         # Running total of what has landed in the COORDINATOR's context. Every member
         # result is appended there verbatim, so this is the quantity that actually
         # grows toward the model's context limit -- see _delegation_budget_exhausted.
@@ -8884,6 +8940,60 @@ def _under_answered_enumeration(content: str, task: str, listings: list | None,
     if len(_LIST_LINE_RE.findall(content)) >= 2:
         return None
     return available
+
+
+# A task demanding BOTH sides enumerated before a comparison. T2's wording is the
+# canonical case: "List every endpoint defined in X, then list every RTK Query hook
+# exported by Y, and state which endpoints have no corresponding hook. Enumerate both
+# sides in full before comparing."
+_TWO_SIDED_TASK_RE = re.compile(
+    r"\bboth\s+sides\b"
+    r"|\benumerate\s+both\b"
+    r"|\bthen\s+list\s+(?:every|all|each)\b"
+    r"|\blist\s+(?:every|all|each)\b[^.]{0,160}?\bthen\s+list\b",
+    re.IGNORECASE,
+)
+
+
+def _list_block_count(content: str) -> int:
+    """How many SEPARATE runs of list items the answer contains.
+
+    Blocks, not lines. _under_answered_enumeration is satisfied by two list LINES
+    anywhere, which a single list trivially provides -- and that is how T2 slipped
+    through on 2026-09-02 while omitting both enumerations it was asked for.
+    """
+    blocks, in_block = 0, False
+    for line in content.splitlines():
+        item = bool(_LIST_LINE_RE.match(line))
+        if item and not in_block:
+            blocks += 1
+        in_block = item
+    return blocks
+
+
+def _under_answered_comparison(content: str, task: str) -> bool:
+    """A two-sided comparison answered with the conclusion and neither side listed.
+
+    T2, run 5 (2026-09-02): the six gap endpoints were EXACTLY right -- verified against
+    business_api.py and businessApi.ts by hand -- and the answer was 533 characters
+    containing only those six. The thirteen endpoints and sixteen hooks it was told to
+    enumerate "in full before comparing" were both absent, so a correct conclusion
+    arrived with no way to check it short of redoing the work.
+
+    No guard fired. _under_answered_enumeration needs an evidence source -- a recorded
+    directory listing, or read_items -- and T2's evidence is two file reads, so
+    `available` was 0. Even had it been set, that guard returns early on two list LINES
+    anywhere in the answer, and the gap list alone supplies six.
+
+    So this is deliberately SHAPE-ONLY: no listing, no read count, nothing but the task's
+    own wording and the answer's structure. The task says enumerate both sides; fewer
+    than two separate list blocks means at most one side was enumerated.
+    """
+    if not content or not task:
+        return False
+    if not _TWO_SIDED_TASK_RE.search(task):
+        return False
+    return _list_block_count(content) < 2
 
 
 _GENERIC_PATH_SEGMENTS = {"src", "api", "app", "lib", "project", "root", "code"}
