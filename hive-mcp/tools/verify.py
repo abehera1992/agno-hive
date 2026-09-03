@@ -164,6 +164,37 @@ _ASSERTED_PATH_RE = re.compile(
 # file deeper in the tree. Both were reported NOT FOUND in one live report on
 # 2026-08-23 -- two false positives in a single answer, which is how a checker stops
 # being read at all.
+# A backticked "seg/seg" that the SAME answer elsewhere writes as an HTTP route is an
+# ENDPOINT path, not a file path. Live false positive 2026-09-03, battery T2: the answer
+# listed `GET /business/internal/ondc-domains` correctly among its endpoints, then
+# referred back to them in shorthand --
+#
+#     three internal-only endpoints (`internal/ondc-domains`, `internal/tenants/names`)
+#
+# -- and the backticked branch of _ASSERTED_PATH_RE, which needs no file extension,
+# read those as paths and reported both as fabrications. Both routes are real
+# (@router.get("/internal/ondc-domains") in business_api.py). Two false NOT FOUNDs in
+# one report, on the one banner that has to stay believable: a reader who sees the
+# fabrication check cry wolf on real endpoints learns to skim past it, and then it is
+# worth nothing on the day it catches something.
+#
+# The run's own `routes` list cannot cover this -- it is built from _ROUTE_RE, which
+# only matches config.ROUTE_PREFIXES (default "/api"), and these routes live under
+# /business. So the test is self-contained: does the answer itself, anywhere, present
+# this token as the tail of a method-prefixed route. That is the answer calling it an
+# endpoint in its own words, which is exactly the evidence needed.
+_ROUTE_TAIL_RE_TMPL = r"(?:GET|POST|PUT|PATCH|DELETE)\s+`?/[A-Za-z0-9_\-./{}]*%s(?![\w/])"
+
+
+def _answer_presents_as_route(answer: str, path: str) -> bool:
+    """Does this answer elsewhere write `path` as the tail of an HTTP route?"""
+    try:
+        return re.search(_ROUTE_TAIL_RE_TMPL % re.escape(path.rstrip("/")),
+                         answer, re.IGNORECASE) is not None
+    except re.error:                      # pragma: no cover - defensive
+        return False
+
+
 _MIME_PREFIXES = ("application/", "text/", "image/", "audio/", "video/", "multipart/",
                   "font/", "model/", "message/")
 
@@ -1729,6 +1760,8 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             continue
         if p.lower().startswith(_MIME_PREFIXES):
             continue          # "application/pdf" is a MIME type, not a path
+        if _answer_presents_as_route(answer, p):
+            continue          # the answer's own words call this an endpoint, not a file
         # A path already carrying a line number is checked, and checked harder, by the
         # citation section -- do not report it twice under two headings.
         if any(p == f for f, _ in file_lines):

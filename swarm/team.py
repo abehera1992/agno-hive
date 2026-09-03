@@ -1839,8 +1839,46 @@ async def _queue_outcome(task: str, content: str, project_id: str) -> None:
         print(f"[feedback] could not queue outcome: {exc}", flush=True)
 
 
+# A source file the ANSWER names, used to find the second side of a comparison when the
+# run only opened the first. Requires a real source extension and at least one directory
+# separator: a bare "models.py" is too ambiguous to open on the strength of prose.
+_ANSWER_PATH_RE = re.compile(
+    r"`([A-Za-z0-9_\-.]+(?:/[A-Za-z0-9_\-.]+)+\.(?:py|ts|tsx|js|jsx))`"
+    r"|(?<![`\w/])([A-Za-z0-9_\-.]+(?:/[A-Za-z0-9_\-.]+)+\.(?:py|ts|tsx|js|jsx))(?![\w`])"
+)
+
+
+def _second_side_from_answer(content: str, already: str) -> str:
+    """The other file a two-sided answer names, when the run only enumerated one.
+
+    Added 2026-09-03 after the guard-side comparison went 4/4 in its own window and
+    then produced nothing on the battery's T2. Not a bug -- a reach limit. That window's
+    task NAMED both paths, so the model opened both; the battery's T2 says only "the
+    frontend's business API slice", the model never opened it, and a diff cannot be
+    computed over a file nobody read.
+
+    The answer itself names the file even when the run did not read it -- T2's own text
+    cites `Client/.../businessApi.ts` in its heading. So take the operand from there.
+
+    Deliberately narrow, because this makes the guard OPEN A FILE on the strength of
+    parsed prose, which is a new kind of thing for it to do and a new way to be wrong:
+    a real source extension is required, a directory separator is required (a bare
+    `models.py` is ambiguous -- EkamApp has eight), and the path must differ from the
+    one already enumerated. compare_enumerations validates existence itself and its
+    failure string is already suppressed by the caller, so a wrong guess costs a
+    no-op rather than a false finding.
+    """
+    seen = []
+    for m in _ANSWER_PATH_RE.finditer(content or ""):
+        p = (m.group(1) or m.group(2) or "").strip()
+        if p and p != already and p not in seen:
+            seen.append(p)
+    return seen[0] if len(seen) == 1 else ""
+
+
 async def _computed_comparison(task: str, enumerations: dict | None,
-                               hive_mcp_url: str | None, hive_mcp_tools=None) -> str:
+                               hive_mcp_url: str | None, hive_mcp_tools=None,
+                               content: str = "") -> str:
     """Run compare_enumerations over the two files this run read, and return the diff.
 
     The answer to a question three measured escalations could not answer: how do you
@@ -1871,13 +1909,23 @@ async def _computed_comparison(task: str, enumerations: dict | None,
     """
     if not task or not _TWO_SIDED_TASK_RE.search(task):
         return ""
-    if not enumerations or len(enumerations) < 2:
+    if not enumerations:
         return ""
     if not (hive_mcp_url or hive_mcp_tools):
         return ""
     top = sorted(enumerations.values(), key=lambda e: -e.get("count", 0))[:2]
-    left, right = top[0].get("path", ""), top[1].get("path", "")
-    if not left or not right:
+    left = top[0].get("path", "")
+    if len(top) >= 2:
+        right = top[1].get("path", "")
+    else:
+        # Only one side was read. Take the other from the answer's own text rather than
+        # abandoning the comparison -- see _second_side_from_answer for why this is kept
+        # narrow, and for the battery run that made it necessary.
+        right = _second_side_from_answer(content, left)
+        if right:
+            print(f"[team] second comparison side taken from the answer: {right}",
+                  flush=True)
+    if not left or not right or left == right:
         return ""
     try:
         if hive_mcp_tools is not None:
@@ -3388,7 +3436,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         task,
         (getattr(team, "_read_state", None) or {}).get("enumerations")
         if isinstance(getattr(team, "_read_state", None), dict) else None,
-        hive_mcp_url, hive_mcp_tools)
+        hive_mcp_url, hive_mcp_tools, content)
 
     def _tail() -> str:
         """What every guard appends: the write summary, plus any fabrication finding,
