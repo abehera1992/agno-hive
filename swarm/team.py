@@ -1907,12 +1907,22 @@ async def _computed_comparison(task: str, enumerations: dict | None,
     or the call fails. Never raises: a comparison that cannot be computed is simply
     not shown, exactly like the fabrication check's own unavailable path.
     """
+    # Say WHY when this declines. Twice now its silence has had to be diagnosed by
+    # elimination from the outside -- once for the ledger gate, once for the operand
+    # lookup -- and both times the guess was wrong before the log settled it. A
+    # decision this conditional has to narrate itself.
+    def _skip(reason: str) -> str:
+        print(f"[team] computed comparison skipped: {reason}", flush=True)
+        return ""
+
     if not task or not _TWO_SIDED_TASK_RE.search(task):
-        return ""
+        return _skip("task is not two-sided")
     if not enumerations:
-        return ""
+        return _skip("no enumerations recorded this run")
     if not (hive_mcp_url or hive_mcp_tools):
-        return ""
+        return _skip("no hive-mcp connection available")
+    if hive_mcp_tools is None:
+        return _skip("no live hive-mcp session (url only; not opening one for a footnote)")
     top = sorted(enumerations.values(), key=lambda e: -e.get("count", 0))[:2]
     left = top[0].get("path", "")
     if len(top) >= 2:
@@ -1926,12 +1936,10 @@ async def _computed_comparison(task: str, enumerations: dict | None,
             print(f"[team] second comparison side taken from the answer: {right}",
                   flush=True)
     if not left or not right or left == right:
-        return ""
+        return _skip(f"could not resolve two distinct sides (left={left!r}, right={right!r}; "
+                     f"{len(enumerations)} enumeration(s) recorded)")
     try:
-        if hive_mcp_tools is not None:
-            session = await hive_mcp_tools.get_session_for_run()
-        else:
-            return ""       # a fresh connection is not worth opening for a footnote
+        session = await hive_mcp_tools.get_session_for_run()
         res = await session.call_tool(
             "compare_enumerations", {"left_path": left, "right_path": right})
         text = "\n".join(getattr(c, "text", "") for c in (res.content or [])).strip()
