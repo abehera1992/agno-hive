@@ -7815,7 +7815,23 @@ def _finalise_member_chunks(team, agent_name: str) -> None:
     if not isinstance(getattr(team, "_member_results", None), dict):
         team._member_results = {}
     team._member_results[key] = text
-    print(f"[team] member result captured: {agent_name} ({len(text)} chars)", flush=True)
+    # Fingerprint WHAT the member relayed, not just how much (2026-09-03). The relay
+    # ratios are measurable today -- subset11: T12 read 470,149 chars and relayed
+    # 66,331 (7.1:1), T11 relayed 2,875 of 122,451 (42.6:1) -- but a character count
+    # cannot say whether the dropped bytes were the answer's substance or its
+    # boilerplate. T12 named 8 of 23 router modules; deciding whether to widen the
+    # under-report guard's 10% threshold turns entirely on whether the other 15 were
+    # lost member->coordinator or coordinator->answer, and nothing logged today
+    # distinguishes those.
+    #
+    # Distinct source filenames is the cheapest proxy that answers it: compare this
+    # count against the same count taken from the delivered answer, and the stage that
+    # dropped them is whichever side the number falls on.
+    _names = sorted(set(_RELAY_FILENAME_RE.findall(text)))
+    _shown = ", ".join(_names[:8]) + ("…" if len(_names) > 8 else "")
+    print(f"[team] member result captured: {agent_name} ({len(text)} chars, "
+          f"{len(_names)} distinct filenames{': ' + _shown if _names else ''})",
+          flush=True)
 
 
 class _BackendRunError(RuntimeError):
@@ -9358,6 +9374,11 @@ _COMPLETION_CLAIM_MAX_RATIO = 0.25
 #
 # Refit these against a real battery rather than reasoning about them -- five points
 # is enough to separate today's cases and not enough to call a law.
+# Source filenames a relayed member result names, for the loss-stage fingerprint at the
+# capture site. Bare basenames, not paths: a member writes `items_api.py` as often as
+# the full path, and the question here is only how many distinct files survived.
+_RELAY_FILENAME_RE = re.compile(r"\b[\w.-]+\.(?:py|ts|tsx|js|jsx|sql|md)\b")
+
 _NON_DELIVERY_MIN_MEMBER_CHARS = 8_000
 _NON_DELIVERY_MAX_RATIO = 0.10
 
