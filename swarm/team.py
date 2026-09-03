@@ -4052,6 +4052,9 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"({missing_cmp}), so at least one side was not enumerated. The "
             f"conclusion may well be correct; it cannot be checked without redoing "
             f"the comparison.**"
+            + _recorded_enumeration_block(
+                _rs_enum.get("enumerable_block") if isinstance(_rs_enum, dict) else None,
+                missing_cmp)
             + _summarize_actual_writes(*all_results)
         )
 
@@ -4086,6 +4089,22 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"above gave only the count. The {missing_enum} items listed with it "
                 f"are this run's own directory listing, reproduced verbatim; they are "
                 f"the tool's output, not the model's.**"
+                + _summarize_actual_writes(*all_results)
+            )
+        # No directory listing matched, but the number may have come from a FILE read
+        # instead -- max_enumerable counts both. Same repair, different evidence source:
+        # put the items with the answer and leave the disclosure as a footnote.
+        from_file = _recorded_enumeration_block(
+            _rs_enum.get("enumerable_block") if isinstance(_rs_enum, dict) else None,
+            missing_enum)
+        if from_file:
+            return (
+                f"{content}{from_file}"
+                f"\n\n---\n**ASKED FOR A LIST, ANSWERED WITHOUT ONE - the answer above "
+                f"gave only the count. The {missing_enum} lines listed with it were read "
+                f"from the file by this run and are reproduced verbatim; they are the "
+                f"tool's output, not the model's, and they are raw source lines rather "
+                f"than a curated list.**"
                 + _summarize_actual_writes(*all_results)
             )
         return (
@@ -5163,6 +5182,65 @@ def _record_read(run_context, function_name: str, args: dict, agent_key: str, re
         del log[: len(log) - _MAX_READ_LOG_ENTRIES]
 
 
+def _enumerable_lines(text: str) -> list[str]:
+    """The lines in a tool result that read as enumerable items, verbatim.
+
+    The count this returns IS max_enumerable -- deliberately one function, so the
+    number a guard reports and the list it shows can never disagree. Counting with
+    findall() and rendering from a separate pass is how that drifts, and every
+    divergence of that shape this session took three commits to find.
+
+    The cat -n prefix is stripped: this gets appended to someone else's answer and
+    should read as source, not as raw tool output.
+    """
+    out = []
+    for line in text.splitlines():
+        if _ENUMERABLE_LINE_RE.match(line):
+            stripped = re.sub(r"^\s*\d{1,6}\t\s*", "", line).strip()
+            if stripped:
+                out.append(stripped)
+    return out
+
+
+# Enough for a real router file (business_api.py is 28: 13 decorators + 13 handlers +
+# 2 others) without letting a large module bury the answer it is appended to.
+_ENUMERATION_RENDER_CAP = 60
+
+
+def _recorded_enumeration_block(enum: dict | None, available: int) -> str:
+    """The enumerable lines this run read, for an answer that dropped them.
+
+    T2's structural fix, and the direct sibling of _recorded_listing_block -- that one
+    recovers a DIRECTORY listing the answer summarised away, this one recovers the
+    lines of a FILE. Same finding underneath: the guard was already holding the
+    evidence and printing only its size, telling the reader an itemised list was
+    possible while withholding the one in hand.
+
+    Measured over 21 runs of the two-sided T2 task, 13 before this and 8 after an
+    instruction change: the answer showed both sides 4/13 and 2/8 -- statistically the
+    same -- and every run under 70s gave the conclusion alone while its Researcher had
+    already returned every item. Asking the models to relay better was tried twice
+    (_COORDINATOR_INSTRUCTIONS' verbatim-relay demand, then an explicit data-vs-
+    narration carve-out, reverted in 98f1cfb) and moved nothing. Printing what the
+    process already stored asks nothing of either model.
+
+    Rendered only when the stored read is the one the guard measured, so the block can
+    never show a different file from the number beside it.
+    """
+    if not enum or not enum.get("lines"):
+        return ""
+    lines = enum["lines"]
+    if len(lines) != available:
+        return ""
+    shown = lines[:_ENUMERATION_RENDER_CAP]
+    body = "\n".join(f"- `{ln}`" for ln in shown)
+    if len(lines) > len(shown):
+        body += f"\n- …and {len(lines) - len(shown)} more"
+    return (f"\n\nThe {len(lines)} enumerable lines this run read from "
+            f"`{enum.get('path', '')}`, verbatim — the answer above did not list them:"
+            f"\n{body}")
+
+
 def _result_text(result) -> str:
     """The TEXT a tool returned, whatever wrapper it arrived in.
 
@@ -5607,9 +5685,19 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             # that was itself correct.
             _enum_src = _result_text(result)
             if len(_enum_src) < 400_000:
-                found = len(_ENUMERABLE_LINE_RE.findall(_enum_src))
+                # The LINES, not just how many -- so a guard that reports the number can
+                # also show the items behind it (see _recorded_enumeration_block). Count
+                # derived from the same list, never counted separately.
+                _enum_lines = _enumerable_lines(_enum_src)
+                found = len(_enum_lines)
                 if found > read_state.get("max_enumerable", 0):
                     read_state["max_enumerable"] = found
+                    read_state["enumerable_block"] = {
+                        "path": str((args or {}).get("relative_path")
+                                    or (args or {}).get("path") or ""),
+                        "tool": function_name,
+                        "lines": _enum_lines,
+                    }
                     print(f"[team] enumerable: {found} items in {function_name} "
                           f"result (wrapper {type(result).__name__}, "
                           f"{len(_enum_src):,} chars of text) — max now {found}",
