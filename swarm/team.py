@@ -6304,6 +6304,74 @@ def _make_search_before_browse_gate_hook(task: str | None, researcher_agent_name
     return _search_before_browse_gate_hook
 
 
+def _make_compare_first_gate_hook(task: str | None, researcher_agent_name: str = "Researcher"):
+    """Point a two-sided task at compare_enumerations when it opens its SECOND file.
+
+    Third escalation of the same pattern this codebase has run twice before -- prose
+    proven insufficient by measurement, then enforced mechanically. Delegation went
+    that way (prose -> _make_decompose_first_gate_hook), and so did search-before-browse
+    (prose reworded "ALWAYS, NO EXCEPTIONS", still ignored across three live tests ->
+    _make_search_before_browse_gate_hook).
+
+    Measured here, 2026-09-03, before writing this: compare_enumerations was registered
+    and reachable (hive-mcp reports 56 tools, spec.tools is None for every engineering
+    agent so the whole surface reaches the model) and called ZERO times across 4 runs of
+    a two-sided task. A Step 0 instruction naming the exact call was then added to the
+    Researcher and measured again over 4 more runs: still zero. The instruction was read
+    -- the tool mix moved sharply, search_files 3 -> 41 and lightrag_query 0 -> 23 -- it
+    simply produced more searching rather than the one call it named. Sixth consecutive
+    null result for a prompt-side change in this session.
+
+    A ONE-TIME nudge, not a shut gate, and the difference matters. search-before-browse
+    can stay shut because one search unblocks it and searching is always valid. Here the
+    tool genuinely does not apply to every two-sided task -- one side may be a directory,
+    span several files, or not be route-shaped -- so blocking every second read would
+    break the cases it cannot serve. After one redirect, reads proceed normally whatever
+    the agent decides. Same reasoning as the decompose-first gate's own one-shot design.
+
+    Fires on the second DISTINCT file, because that is the first moment both operands
+    exist: the redirect names both concrete paths, so the agent's next move is a single
+    call with the arguments already filled in rather than a decision. The blocked read is
+    not lost either -- compare_enumerations opens both files itself.
+
+    `task=None` makes this a permanent no-op, the same convention as the other gates.
+    """
+    state = {"paths": [], "nudged": False, "compared": False}
+
+    async def _compare_first_gate_hook(function_name, function, args, agent=None, run_context=None):
+        if (getattr(agent, "name", None) or "") != researcher_agent_name:
+            return await function(**args)
+        if function_name == "compare_enumerations":
+            state["compared"] = True
+            return await function(**args)
+        if (function_name != "get_file_content" or state["compared"] or state["nudged"]
+                or not task or not _TWO_SIDED_TASK_RE.search(task)):
+            return await function(**args)
+        path = str((args or {}).get("relative_path") or "")
+        if path and path not in state["paths"]:
+            state["paths"].append(path)
+        if len(state["paths"]) < 2:
+            return await function(**args)
+        state["nudged"] = True
+        left, right = state["paths"][0], state["paths"][1]
+        print(f"[team] compare-first gate: redirecting {researcher_agent_name} to "
+              f"compare_enumerations({left!r}, {right!r})", flush=True)
+        return (
+            f"REDIRECTED: {function_name} was blocked once — this task compares two "
+            f"sides, and you are now opening the second file. Call\n"
+            f"    compare_enumerations({left!r}, {right!r})\n"
+            f"instead. It returns BOTH enumerations in full plus the difference, "
+            f"computed by string match rather than worked out while reading. It opens "
+            f"both files itself, so nothing is lost by this call not running — and a "
+            f"difference you derive by eye is exactly what it replaces, the same way "
+            f"count_matches replaced counting in your head. If it reports that these "
+            f"files are not route-shaped, read them normally and compare by hand: this "
+            f"redirect happens ONCE per run and every later read goes through."
+        )
+
+    return _compare_first_gate_hook
+
+
 def _normalize_delegation_task(task_text) -> str:
     """Whitespace/case-folded form of a delegation's task text, used ONLY for
     exact-duplicate comparison in _make_duplicate_delegation_gate_hook -- not a
@@ -7296,6 +7364,12 @@ def _build_team(
     search_before_browse_gate_hook = _make_search_before_browse_gate_hook(
         task=search_gate_task, researcher_agent_name=researcher_agent_name,
     )
+    # Reuses search_before_browse's own enable flag rather than adding a third knob:
+    # both are Researcher-scoped tool-selection gates on the same teams, and a task
+    # that has opted out of one has opted out of this kind of steering entirely.
+    compare_first_gate_hook = _make_compare_first_gate_hook(
+        task=search_gate_task, researcher_agent_name=researcher_agent_name,
+    )
     # Filled AFTER members are constructed (hooks are built first, and a member's
     # surface only exists once it is). Passed by reference so the hook reads the
     # populated map at delegation time, which is always later than construction.
@@ -7341,7 +7415,8 @@ def _build_team(
     # Shared across every agent -- these are genuinely run-wide (one cache, one delegation
     # log, one interception trace).
     tool_hooks = [
-        interception_hook, search_before_browse_gate_hook, read_cache_hook,
+        interception_hook, search_before_browse_gate_hook, compare_first_gate_hook,
+        read_cache_hook,
         decompose_first_gate_hook, capability_routing_gate_hook,
         duplicate_delegation_gate_hook, delegation_log_hook,
     ]
