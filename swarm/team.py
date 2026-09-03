@@ -4760,6 +4760,31 @@ _BATCH_ALTERNATIVE_HINTS = {
 # well-behaved run never sees it.
 _BATCH_HINT_EVERY = 8
 
+# Distinct lightrag_query calls one agent may make in one run before the tool starts
+# refusing. Semantic recall is cheap to ASK for and expensive to serve, which is the
+# combination that produces a runaway nothing else bounds: the read-char budget cannot
+# see it (these results are small) and tool_call_limit counts every tool alike.
+#
+# Measured 2026-09-03, subset10 T12: 68 lightrag_query calls consumed 957s of a 1,386s
+# run -- 69% of the wall clock -- against 13 file reads. Duplicate suppression was
+# working correctly (the 8x-repeated query billed 27.44s once and 0.00s thereafter), so
+# the cost was 68 DISTINCT queries, not repetition. The agent had drifted off the task
+# (routers, models, dependencies, integration) into invented facets: "data sharing and
+# collaboration protocols", "data lineage and provenance tracking", "data governance
+# and policy enforcement", "documentation and knowledge base".
+#
+# 15 is not tuned to a narrow margin. Across the six runs in that window the per-run
+# counts were 0, 2, 0, 2, 68, 1 -- healthy runs use 0-2 and the runaway used 68, with
+# nothing in between, so any threshold from ~5 to ~60 separates the two classes
+# identically. 15 sits 7x above the observed normal ceiling.
+#
+# It bounds blast radius; it does not cure the drift. The agent still spends 15 slow
+# queries before this bites (~200s rather than ~950s). The log line exists so a cap
+# that ever binds on legitimate work is visible rather than silent -- if it starts
+# tripping on real audits, raise it or replace it with a time budget, which would
+# target the actual expense more honestly than a count does.
+_LIGHTRAG_QUERY_CAP = int(os.getenv("LIGHTRAG_QUERY_CAP", "15"))
+
 
 _CACHEABLE_READ_TOOLS = {
     "get_file_content", "get_files_batch", "search_files", "search_files_batch",
@@ -5883,6 +5908,31 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 f"been completed\", \"the analysis is finished\" or \"all claims are "
                 f"verified\" are NOT an answer — they describe one. The reader cannot "
                 f"see your work; only what you write here exists."
+            )
+
+        # Semantic-recall cap. Gated on a FRESH call only: a repeat that the cache can
+        # serve costs nothing and must stay free, or an agent re-asking something it
+        # already asked would be punished for the one behaviour that is not expensive.
+        if (function_name == "lightrag_query"
+                and cache_key not in cache
+                and batch_counts.get((norm_agent_key, function_name), 0) >= _LIGHTRAG_QUERY_CAP):
+            if (norm_agent_key, "lightrag_capped") not in serve_counts:
+                serve_counts[(norm_agent_key, "lightrag_capped")] = 1
+                print(f"[team] lightrag_query cap hit: {agent_key or 'coordinator'} has "
+                      f"made {_LIGHTRAG_QUERY_CAP} distinct semantic queries this run — "
+                      f"further ones refused, told to ground in files instead", flush=True)
+            return (
+                f"REFUSED: you have already made {_LIGHTRAG_QUERY_CAP} distinct "
+                f"lightrag_query calls this run, which is the cap. Semantic recall has "
+                f"given you what it can; more phrasings of the same question will not "
+                f"add information, and each one costs seconds the run does not have.\n"
+                f"Ground the rest of your answer in FILES: search_files(<a term you "
+                f"actually need>, '<glob>') to locate, then get_file_content(<path>) to "
+                f"read. Answer from what you have already gathered plus what those reads "
+                f"return.\n"
+                f"If you cannot cover everything, say so plainly and list what you did "
+                f"not examine — a partial answer that names its gaps is worth more than "
+                f"a complete-sounding one built from semantic summaries."
             )
 
         is_fresh_fetch = cache_key not in cache
