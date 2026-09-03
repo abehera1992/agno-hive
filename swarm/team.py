@@ -1839,6 +1839,67 @@ async def _queue_outcome(task: str, content: str, project_id: str) -> None:
         print(f"[feedback] could not queue outcome: {exc}", flush=True)
 
 
+async def _computed_comparison(task: str, enumerations: dict | None,
+                               hive_mcp_url: str | None, hive_mcp_tools=None) -> str:
+    """Run compare_enumerations over the two files this run read, and return the diff.
+
+    The answer to a question three measured escalations could not answer: how do you
+    get a deterministic set difference into a two-sided answer? Each window was n=4 on
+    the same task, counting real calls in the journal:
+
+        tool registered, no steering                    0 calls
+        + Step 0 instruction naming the exact call      0 calls
+        + gate blocking the 2nd read, naming both paths 4 gate fires, 0 calls
+
+    The gate worked mechanically -- fired every run, correct paths, the 764-char
+    redirect delivered to the Researcher as its tool result, no schema errors -- and
+    the model re-read both files and ran 60 search_files calls instead. The precedent
+    used to justify it does not actually cover it: decompose-first and
+    search-before-browse redirect to tools the model already uses constantly, changing
+    WHEN it reaches for a familiar one. This redirected to a tool it had never called,
+    and blocking a call does not create a reach for an unfamiliar replacement.
+
+    So stop asking. The run already read both files, the ledger already holds their
+    paths, and the tool is proven exact against ground truth (13/16/7 matched/6
+    left-only, the same six gaps verified by hand). Call it here and show the result.
+    Same shape as every repair that has worked on this system -- do not ask the model
+    to do the thing, do it and show what it produced.
+
+    Returns "" when the task is not two-sided, fewer than two files were enumerated,
+    or the call fails. Never raises: a comparison that cannot be computed is simply
+    not shown, exactly like the fabrication check's own unavailable path.
+    """
+    if not task or not _TWO_SIDED_TASK_RE.search(task):
+        return ""
+    if not enumerations or len(enumerations) < 2:
+        return ""
+    if not (hive_mcp_url or hive_mcp_tools):
+        return ""
+    top = sorted(enumerations.values(), key=lambda e: -e.get("count", 0))[:2]
+    left, right = top[0].get("path", ""), top[1].get("path", "")
+    if not left or not right:
+        return ""
+    try:
+        if hive_mcp_tools is not None:
+            session = await hive_mcp_tools.get_session_for_run()
+        else:
+            return ""       # a fresh connection is not worth opening for a footnote
+        res = await session.call_tool(
+            "compare_enumerations", {"left_path": left, "right_path": right})
+        text = "\n".join(getattr(c, "text", "") for c in (res.content or [])).strip()
+    except Exception as exc:
+        print(f"[team] computed comparison unavailable: "
+              f"{type(exc).__name__}: {str(exc)[:80]}", flush=True)
+        return ""
+    if not text or text.startswith("compare_enumerations failed"):
+        return ""
+    print(f"[team] computed the comparison for {left} vs {right}", flush=True)
+    return ("\n\n---\n**THE COMPARISON, COMPUTED — the answer above states a "
+            "relationship between two files; this is that same relationship worked out "
+            "by string match over both, not by reading and comparing. Where the two "
+            "disagree, trust this one.**\n```\n" + text + "\n```")
+
+
 async def _verify_claims(content: str, hive_mcp_url: str | None,
                          hive_mcp_tools=None) -> tuple[str, bool, bool]:
     """Run hive-mcp's verify_claims over a draft answer.
@@ -3320,8 +3381,18 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         print("[team] fabrication detected up front — it will ride along with whichever "
               "guard fires", flush=True)
 
+    # Computed alongside the fabrication check, for the same reason: both are awaits,
+    # and _tail() is a sync closure 30 guards call. Runs only for a two-sided task with
+    # two enumerations recorded, so an ordinary answer pays nothing.
+    _cmp_note = await _computed_comparison(
+        task,
+        (getattr(team, "_read_state", None) or {}).get("enumerations")
+        if isinstance(getattr(team, "_read_state", None), dict) else None,
+        hive_mcp_url, hive_mcp_tools)
+
     def _tail() -> str:
         """What every guard appends: the write summary, plus any fabrication finding,
+        plus the computed comparison when the task had two sides,
         plus a completeness claim shown against the evidence it rests on.
 
         One closure rather than 30 edited return sites, and it is why a guard author
@@ -3333,7 +3404,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         _rs = getattr(team, "_read_state", None)
         completeness = _unchecked_completeness_block(
             content, _rs.get("enumerations") if isinstance(_rs, dict) else None)
-        return _fab_note + completeness + _summarize_actual_writes(*all_results)
+        return _fab_note + _cmp_note + completeness + _summarize_actual_writes(*all_results)
 
     # Unfinished-intent check, before every other guard — an answer whose own final
     # words describe a NEXT action rather than a completed one means the rest of its
