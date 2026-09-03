@@ -3321,12 +3321,19 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
               "guard fires", flush=True)
 
     def _tail() -> str:
-        """What every guard appends: the write summary, plus any fabrication finding.
+        """What every guard appends: the write summary, plus any fabrication finding,
+        plus a completeness claim shown against the evidence it rests on.
 
         One closure rather than 30 edited return sites, and it is why a guard author
-        does not have to remember this exists.
+        does not have to remember this exists. Both extras are FOOTNOTES that ride
+        along with whatever fired -- deliberately not guards of their own, because
+        every guard here returns, and adding competitors to a first-match-wins chain
+        is what produced the inversion this closure was built to fix.
         """
-        return _fab_note + _summarize_actual_writes(*all_results)
+        _rs = getattr(team, "_read_state", None)
+        completeness = _unchecked_completeness_block(
+            content, _rs.get("enumerations") if isinstance(_rs, dict) else None)
+        return _fab_note + completeness + _summarize_actual_writes(*all_results)
 
     # Unfinished-intent check, before every other guard — an answer whose own final
     # words describe a NEXT action rather than a completed one means the rest of its
@@ -4262,7 +4269,12 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     if unavailable:
         return content + _UNVERIFIED_DISCLAIMER + _summarize_actual_writes(*all_results)
     if not bad:
-        return content + _summarize_actual_writes(*all_results)
+        # _tail(), not the bare write summary: an answer that trips NO guard is exactly
+        # where a false completeness claim hides best -- T13b's "there are no gaps"
+        # (4 gaps) and T2's "all 13 backend endpoints have a corresponding hook" (6 do
+        # not) were both otherwise-clean answers. `bad` is False here, so the
+        # fabrication half of _tail() is empty by construction and nothing is doubled.
+        return content + _tail()
 
     # Name ONLY the unsupported items, in prose. The first version of this prompt
     # embedded the whole draft and the whole verification report; the coordinator echoed
@@ -5267,6 +5279,46 @@ _ENUMERATION_RENDER_CAP = 60
 # needs two; an audit spanning a service reads a handful. 40 covers both with room,
 # and caps what a runaway read loop can accumulate.
 _LEDGER_MAX_PATHS = 40
+
+
+def _unchecked_completeness_block(content: str, enumerations: dict | None) -> str:
+    """A completeness claim, shown against BOTH enumerations the run actually holds.
+
+    The end of the two-sided design, and the thing none of the four earlier guards
+    could do: a claim like "all 13 backend endpoints have a corresponding frontend
+    hook" or "there are no gaps" is a statement about the difference between two sets,
+    and a guard holding one set cannot evaluate it. The ledger holds both, so this
+    puts both in front of the reader alongside the claim that rests on them.
+
+    Deliberately NOT computing the difference here. compare_enumerations does that, in
+    hive-mcp, as one implementation both the agent and a reader can call -- duplicating
+    the join in the guard layer would mean two normalisers drifting apart, and a wrong
+    join is worse than no join. This states what was claimed and shows the evidence;
+    it does not adjudicate.
+
+    Fires only when a completeness claim is present AND at least two enumerations were
+    recorded, so an ordinary single-file answer is untouched.
+    """
+    claims = _completeness_claims(content)
+    if not claims or not enumerations or len(enumerations) < 2:
+        return ""
+    top = sorted(enumerations.values(), key=lambda e: -e.get("count", 0))[:2]
+    if any(e.get("count", 0) < 2 for e in top):
+        return ""
+    body = []
+    for e in top:
+        shown = e.get("lines", [])[:_ENUMERATION_RENDER_CAP]
+        listed = "\n".join(f"  - `{ln}`" for ln in shown)
+        more = (f"\n  - …and {e['count'] - len(shown)} more"
+                if e.get("count", 0) > len(shown) else "")
+        body.append(f"\n`{e.get('path','')}` — {e.get('count', 0)} items:\n{listed}{more}")
+    quoted = "; ".join(f'"{c}"' for c in claims[:3])
+    return ("\n\n---\n**A COMPLETENESS CLAIM, WITH THE EVIDENCE IT RESTS ON — the answer "
+            f"above asserts {quoted}. That is a claim about two sets, which nothing in "
+            "this run verified. Both enumerations it read are reproduced below, "
+            "verbatim, so the assertion can be checked rather than taken: "
+            "`compare_enumerations(left, right)` computes the difference "
+            "deterministically if you want it settled.**" + "".join(body))
 
 
 def _recorded_enumeration_block(enum: dict | None, available: int) -> str:
@@ -9152,6 +9204,64 @@ def _under_answered_enumeration(content: str, task: str, listings: list | None,
 # A task demanding BOTH sides enumerated before a comparison. T2's wording is the
 # canonical case: "List every endpoint defined in X, then list every RTK Query hook
 # exported by Y ... Enumerate both sides in full before comparing."
+# ── typed claims ─────────────────────────────────────────────────────────────
+# Step 4 of the two-sided design. Four guards each grew their own verb list, and one
+# claim has now been seen in three spellings -- "exposes 16 router modules", "there are
+# 24 files", "**Python router modules:** 24". A per-guard regex is structurally always
+# one phrasing behind, and widening four of them independently multiplies the surface.
+#
+# So phrasing is parsed ONCE into a small typed vocabulary that guards consume:
+#
+#   COMPLETE(subject)        "all 16 routers are accounted for", "there are no gaps",
+#                            "no additional files are involved", "the complete list"
+#
+# Deliberately additive. The existing guards keep their own patterns and behaviour --
+# a big-bang refactor of four working, separately-measured guards is how a regression
+# gets shipped, and every fix that has held on this system attacked one measured
+# mechanism at a time. What this earns now is that the NEW ledger-backed guard below
+# reads typed claims instead of adding a fifth verb list; the older four can migrate
+# onto it individually, each with its own before/after measurement.
+_COMPLETENESS_CLAIM_RE = re.compile(
+    r"\ball\s+\d{1,3}\s+[\w\- ]{2,30}?\s+(?:are|have|is|has)\b"
+    r"|\ball\s+(?:other\s+)?[\w\- ]{3,30}\s+(?:are|is)\s+"
+    r"(?:covered|accounted for|listed|identified)"
+    r"|\bthere\s+are\s+no\s+(?:gaps|others|other\s+[\w\- ]{3,20})"
+    r"|\bno\s+(?:other|additional)\s+"
+    r"(?:files?|services?|endpoints?|hooks?|tables?|modules?|routers?)"
+    r"|\b(?:complete|exhaustive)\s+(?:list|enumeration|audit)\b",
+    re.IGNORECASE,
+)
+
+# Excluded because they describe CODE, not the answer: "disables the item if no other
+# configs exist" is a conditional in the source being summarised. Measured as a false
+# positive on the stored answers.
+_COMPLETENESS_NOT_A_CLAIM_RE = re.compile(r"\bif\s+no\s+other\b", re.IGNORECASE)
+
+
+def _completeness_claims(content: str) -> list[str]:
+    """Every completeness assertion in an answer, as matched text.
+
+    Measured over the 166 stored answers of this battery: 13 answers (8%) carry one,
+    and roughly 40% of those were false -- "all 13 backend endpoints have a
+    corresponding frontend hook" (6 do not), "there are no gaps" (4 gaps), "all 16
+    routers are accounted for" (23 exist), "no additional files or services are
+    involved" (two more upload paths).
+
+    Two large noise sources are deliberately NOT matched, because neither names a
+    countable set: "all claims are grounded in actual file content" (an epistemic
+    self-assessment) and "no further action is required" (a sign-off). Including them
+    took the same corpus from 15 matches to 33, and every one of the 18 additions was
+    boilerplate.
+    """
+    out = []
+    body = (content or "").split("---\n**")[0]      # model's text, not guard banners
+    for m in _COMPLETENESS_CLAIM_RE.finditer(body):
+        if _COMPLETENESS_NOT_A_CLAIM_RE.search(body[max(0, m.start() - 12):m.start() + 12]):
+            continue
+        out.append(m.group(0).strip())
+    return out
+
+
 _TWO_SIDED_TASK_RE = re.compile(
     r"\bboth\s+sides\b"
     r"|\benumerate\s+both\b"
