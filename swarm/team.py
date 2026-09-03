@@ -3283,11 +3283,50 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     immediately instead of attempting another full pipeline re-run.
     """
     # Every result object seen this call, original attempt first -- fed to
-    # _summarize_actual_writes(*all_results) at every return point so a write that
+    # _tail() at every return point so a write that
     # happened in an EARLIER attempt is never lost just because a LATER retry's own
     # trace made no further successful write call. See _summarize_actual_writes'
     # docstring for the live incident this closes.
     all_results = [result]
+
+    # Fabrication detection runs FIRST, and its finding rides along with whichever
+    # guard fires (2026-09-02). Every guard below ends in a `return`, so the chain is
+    # first-match-wins, and _verify_claims sat last -- meaning an answer with two
+    # defects reported only the milder one and the fabrication check never ran at all.
+    #
+    # Measured live on T13a: the answer named 5 frontend hooks that do not exist
+    # (`getVouchersQuery` and four siblings -- the real ones carry a `use` prefix) AND
+    # under-reported its members. It got the under-report banner; the five fabricated
+    # symbols shipped unflagged. verify_claims catches all five when called directly,
+    # so the checker was fine -- the ordering was not. That inverts this file's own
+    # stated severity rule, written at _fabricated_tool_use: invented EVIDENCE is worse
+    # than a wrong conclusion, because the conclusion can be argued with and the fake
+    # symbol gets believed and repeated.
+    #
+    # Detection only here. The DISPOSITION -- the one correction retry -- stays at the
+    # bottom, unmoved and re-using these values rather than re-running the check, so an
+    # answer that reaches it behaves exactly as before. What changes is only that an
+    # answer caught by an earlier guard now carries the fabrication finding too,
+    # instead of silently losing it.
+    _fab_report, _fab_bad, _fab_unavailable = await _verify_claims(
+        content, hive_mcp_url, hive_mcp_tools)
+    _fab_note = ""
+    if _fab_bad:
+        _fab_note = (
+            f"\n\n---\n**UNVERIFIED CLAIMS IN THIS ANSWER — a deterministic grep of the "
+            f"repository could not find some of what it names. This is reported "
+            f"alongside the finding above, not instead of it; an invented symbol is the "
+            f"more serious of the two.**\n```\n{_fab_report.strip()}\n```")
+        print("[team] fabrication detected up front — it will ride along with whichever "
+              "guard fires", flush=True)
+
+    def _tail() -> str:
+        """What every guard appends: the write summary, plus any fabrication finding.
+
+        One closure rather than 30 edited return sites, and it is why a guard author
+        does not have to remember this exists.
+        """
+        return _fab_note + _summarize_actual_writes(*all_results)
 
     # Unfinished-intent check, before every other guard — an answer whose own final
     # words describe a NEXT action rather than a completed one means the rest of its
@@ -3304,7 +3343,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"describe a next action that was never taken. Treat this as INCOMPLETE, "
                 f"not a finished answer. (Not retried: this run's one correction retry "
                 f"was already used by an earlier check.)**"
-                + _summarize_actual_writes(*all_results)
+                + _tail()
             )
         print("[team] answer ends on a stated next action that was never taken — retrying to actually finish the task")
         try:
@@ -3326,7 +3365,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                         f"{retried}\n\n---\n**This answer still ends mid-task after one "
                         f"retry — its own final words describe a next action that was "
                         f"never taken. Treat this as INCOMPLETE.**"
-                        + _summarize_actual_writes(*all_results)
+                        + _tail()
                     )
                 content, result = _adopt_retry(
                     "unfinished-intent", content, result, retried, retry
@@ -3353,7 +3392,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"apply_diff()/write_file() call actually succeeded — treat this as "
                 f"NOT applied. (Not retried: this run's one correction retry was "
                 f"already used by an earlier check.)**"
-                + _summarize_actual_writes(*all_results)
+                + _tail()
             )
         print("[team] answer claims a file was written but no write tool call succeeded — retrying with a mandatory write")
         try:
@@ -3381,7 +3420,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                         f"{retried}\n\n---\n**This answer claims a file was changed, but "
                         f"no apply_diff()/write_file() call in either attempt actually "
                         f"succeeded — treat this as NOT applied.**"
-                        + _summarize_actual_writes(*all_results)
+                        + _tail()
                     )
                 content, result = _adopt_retry(
                     "write-claim", content, result, retried, retry
@@ -3410,7 +3449,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"actually run ({named}) — treat any 'NOT FOUND' conclusion resting on "
             f"them as UNVERIFIED, not confirmed absent. (Not retried: this run's "
             f"one correction retry was already used by an earlier check.)**"
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
     if unverified_searches or bare_absence:
         if unverified_searches:
@@ -3453,7 +3492,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                         f"never actually run ({named}) — treat any 'NOT FOUND' "
                         f"conclusion resting on them as UNVERIFIED, not confirmed "
                         f"absent.**"
-                        + _summarize_actual_writes(*all_results)
+                        + _tail()
                     )
                 content, result = _adopt_retry(
                     "search-claim", content, result, retried, retry
@@ -3498,7 +3537,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"{content}\n\n---\n**This answer states code facts without reading any "
             f"file this run — treat it as UNVERIFIED. (Not retried: this run's one "
             f"correction retry was already used by an earlier check.)**"
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
     if reads == 0 and _CLAIMY_RE.search(content or ""):
         print("[team] answer asserts code facts with ZERO read calls — retrying with evidence required")
@@ -3557,7 +3596,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"the model's own priors, not from this codebase. Treat every specific "
                 f"claim as unverified until checked by hand — including ones that look "
                 f"plausible.**"
-                + _summarize_actual_writes(*all_results)
+                + _tail()
             )
 
     # DB-evidence guard: a task explicitly demanding a live-database check must show at
@@ -3601,7 +3640,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"corrective retry called db_query/db_schema. Any row count, column, or "
                 f"table-existence claim above is inferred from source files, not read from "
                 f"the running database, and may not reflect its actual current state.**"
-                + _summarize_actual_writes(*all_results)
+                + _tail()
             )
 
     # Narrated-unreachable-tool check (2026-08-21). Direction 2 of the "removing a tool
@@ -3727,7 +3766,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"recalled rather than enumerated, and has been wrong by a factor of "
                 f"6-8x on this exact failure before.**"
                 + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
-                + _summarize_actual_writes(*all_results)
+                + _tail()
             )
 
     # Listing-count check (2026-08-22). The one failure that survived the
@@ -3757,7 +3796,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"{'; ' + by_ext if by_ext else ''}). The listing itself was fetched "
             f"correctly; the count stated above is not any reading of it. Trust the "
             f"tool's numbers here, not the sentence.**"
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
 
     # Self-contradiction check (2026-08-26). Same arithmetic family as the listing
@@ -3779,7 +3818,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"{concrete}, not {stated}. Which number is right depends on what the "
                 f"task asked and this check does not adjudicate that — but do not read "
                 f"the matching totals as confirmation.**"
-                + _summarize_actual_writes(*all_results)
+                + _tail()
             )
         print(f"[team] answer says {stated} but lists {actual} — flagging "
               f"self-contradiction", flush=True)
@@ -3789,7 +3828,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"is wrong and this check cannot tell which: the number and the enumeration "
             f"come from the same answer, and nothing outside it was consulted. Count the "
             f"list yourself before relying on either.**"
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
 
     # Fabricated-tool-use check (2026-08-23). An answer describing a tool result that
@@ -3807,7 +3846,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"at any point in this run. That sentence is invented, and any "
             f"conclusion resting on it — including a 'not found' — is unsupported. "
             f"Re-run the lookup before believing either.**"
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
 
     # Coverage-arithmetic check (2026-08-23). A gap analysis whose own stated numbers
@@ -3826,7 +3865,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"and the enumeration above may be correct while the summary is not — that "
             f"combination has shipped before. Re-check the gap list item by item against "
             f"the full list before acting on it.**"
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
 
     # Non-delivery check (2026-08-24, retry REMOVED same day -- see below).
@@ -3868,7 +3907,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"{wrote:,}. Most of it therefore does not come from anything this run "
             f"gathered. Treat specifics — file paths, names, counts — as unverified "
             f"until checked by hand.**"
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
 
     withheld = _completion_claim_instead_of_answer(
@@ -3885,7 +3924,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"correct; most of what was researched is simply not in it.**"
             + _recovered_member_findings(team)
             + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
 
     # Thin-answer tool-evidence check (2026-08-28). Deliberately measured against what
@@ -3907,7 +3946,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                   f"output", flush=True)
             return (content + tool_evidence
                     + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
-                    + _summarize_actual_writes(*all_results))
+                    + _tail())
 
     # Under-answered enumeration check (2026-08-22). See _under_answered_enumeration
     # for why this is its own guard rather than a case of the count check above: the
@@ -3933,7 +3972,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"established members of: {named}. One of the two is wrong and this check "
             f"cannot tell which, so treat the denial as unproven and re-check against "
             f"the file directly rather than against the conversation.**"
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
 
     # Inferred-item check (2026-08-25). Runs before the other enumeration checks
@@ -3950,7 +3989,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"meant to report what the tools returned; an item reasoned out from a "
             f"pattern has not been verified to exist and must not be counted as a "
             f"finding. Check each one against the file before acting on it.**"
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
 
     # Guess-driven enumeration check (2026-08-25). Sits before the under-answered
@@ -3973,7 +4012,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"was never guessed is missing from the list above and any 'not found' "
             f"here is unproven. Ask again for a pattern-based search of the actual "
             f"file's exports.**"
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
 
     # Under-reported exports (2026-08-28). The T13 shape: the run OPENED the file and
@@ -3990,7 +4029,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"`{path}` and it declares {total} exports of the same family, but the "
             f"answer above names only {named}. Not listed: {listed}. Any count or gap "
             f"analysis resting on the shorter list is wrong by the difference.**"
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
 
     # Self-contradiction against the run's own lookups (2026-08-27). Ranked ahead of
@@ -4010,7 +4049,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"for that path and came back empty. The run had the disproof and the "
             f"answer states the opposite, so anything resting on it is unsupported. "
             f"Check by hand before acting on it.**"
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
 
     # Answer-time precedent (2026-08-26). Ranked ahead of the enumeration checks below
@@ -4030,7 +4069,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"enumeration as unverified — particularly if it was described as a "
             f"directory listing.**"
             + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
 
     _rs_enum = getattr(team, "_read_state", None)
@@ -4069,7 +4108,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                f" The conclusion may well be correct; it cannot be checked without "
                f"redoing the comparison.")
             + "**"
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
 
     missing_enum = _under_answered_enumeration(
@@ -4103,7 +4142,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"above gave only the count. The {missing_enum} items listed with it "
                 f"are this run's own directory listing, reproduced verbatim; they are "
                 f"the tool's output, not the model's.**"
-                + _summarize_actual_writes(*all_results)
+                + _tail()
             )
         # No directory listing matched, but the number may have come from a FILE read
         # instead -- max_enumerable counts both. Same repair, different evidence source:
@@ -4119,7 +4158,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"from the file by this run and are reproduced verbatim; they are the "
                 f"tool's output, not the model's, and they are raw source lines rather "
                 f"than a curated list.**"
-                + _summarize_actual_writes(*all_results)
+                + _tail()
             )
         return (
             f"{content}\n\n---\n**ASKED FOR A LIST, ANSWERED WITHOUT ONE - this "
@@ -4128,7 +4167,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"list. The underlying facts may well be correct; they simply cannot be "
             f"checked without redoing the work. Ask again for the items themselves if "
             f"you need to verify them.**"
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
 
     # Capability-claim check (2026-08-22). Sibling of the bare-absence search guard
@@ -4156,7 +4195,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"{content}\n\n---\n**{family.upper()} AVAILABILITY CLAIM NOT SUPPORTED BY "
             f"THIS RUN — {detail} Do not act on the claim that the {family} is down "
             f"without checking by hand.**"
-            + _summarize_actual_writes(*all_results)
+            + _tail()
         )
 
     # Tool-budget-exhausted check. Unlike every other guard here this one cannot force a
@@ -4215,7 +4254,11 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"service/module.**"
         )
 
-    report, bad, unavailable = await _verify_claims(content, hive_mcp_url, hive_mcp_tools)
+    # Re-using the verdict computed up front, NOT re-running it: the check is a live
+    # MCP round trip and the answer has not changed since. An answer that reaches here
+    # is one no earlier guard claimed, so this path behaves exactly as it did before
+    # detection was hoisted -- same values, same retry, same returns.
+    report, bad, unavailable = _fab_report, _fab_bad, _fab_unavailable
     if unavailable:
         return content + _UNVERIFIED_DISCLAIMER + _summarize_actual_writes(*all_results)
     if not bad:
