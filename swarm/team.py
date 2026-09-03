@@ -9818,8 +9818,23 @@ def _recorded_listing_block(listings: list | None, available: int,
 _LISTING_RENDER_CAP = 60
 
 
+# Verbs that introduce a COUNT OF THINGS IN A PLACE. The original five missed the
+# most common shape a service description actually uses: T12 (2026-09-02) said "The
+# inventory service exposes 16 router modules" against a directory holding 23, and
+# this never matched, so the arithmetic guard never even reached its listing check.
+# "exposes/defines/provides/implements" are the verbs that phrasing reaches for.
+#
+# Deliberately NOT "has" or "includes": both attach to abstractions far more often
+# than to files ("has 3 responsibilities", "includes 2 retry layers"), and this regex
+# only earns its keep when the number refers to something a directory listing can
+# settle. Measured over the 164 stored answers of this battery, the four added verbs
+# produce exactly 3 new matches -- "exposes 24 API endpoints", "defines 21 tables",
+# "exposes 16 router modules" -- all real counts of real files, no prose noise. A
+# match is not a fire: the number must also match no defensible reading of a listing
+# whose path the claim names.
 _STATED_COUNT_RE = re.compile(
-    r"\b(?:there are|there is|contains|returned|total of|exactly)\s+"
+    r"\b(?:there are|there is|contains|returned|total of|exactly"
+    r"|exposes|defines|provides|implements)\s+"
     r"(?:exactly\s+)?(\d{1,4})\b",
     re.IGNORECASE,
 )
@@ -10000,6 +10015,40 @@ def _count_contradicts_own_list(content: str) -> tuple[int, int, str, int] | Non
     return None
 
 
+def _listing_named_in(sentence: str, by_path: dict) -> dict | None:
+    """Which of several listed directories is THIS sentence counting? None if unclear.
+
+    Not _listing_matches_task, and the difference is the whole point. That one asks
+    "is this listing plausibly relevant" and is deliberately permissive; here the
+    listings compete, so what matters is which segments DISTINGUISH them. Built with
+    _listing_matches_task's any-segment rule first, and it failed the case it was
+    written for: T12's three listings were inventory-service/router,
+    storage-service/router and business-service/router, every one of them matched the
+    word "router" in "exposes 16 router modules", so all three tied and it abstained.
+
+    Two changes make it work. Separators are normalised, because prose writes
+    "inventory service" for a directory named `inventory-service`. And the winner must
+    be a STRICT maximum -- a tie means the sentence genuinely does not say which, and
+    abstaining is then correct rather than a missed detection.
+    """
+    def norm(s: str) -> str:
+        return re.sub(r"[-_]+", " ", (s or "").lower())
+
+    text = norm(sentence)
+    best, best_score, tied = None, 0, False
+    for path, listing in by_path.items():
+        segments = [s.strip("()[]{}.,") for s in re.split(r"[/\\]+", path or "")
+                    if s.strip("()[]{}.,")]
+        score = sum(1 for s in segments
+                    if len(s) >= 4 and s.lower() not in _GENERIC_PATH_SEGMENTS
+                    and norm(s) in text)
+        if score > best_score:
+            best, best_score, tied = listing, score, False
+        elif score == best_score and score > 0:
+            tied = True
+    return None if (best_score == 0 or tied) else best
+
+
 def _miscounted_listing(content: str, listings: list | None) -> tuple[int, dict] | None:
     """A stated count that matches NO defensible reading of the one listing this run.
 
@@ -10019,12 +10068,30 @@ def _miscounted_listing(content: str, listings: list | None) -> tuple[int, dict]
     if not listings:
         return None
     by_path = {l["path"]: l for l in listings if l.get("path")}
-    if len(by_path) != 1:
+    if not by_path:
         return None
-    listing = next(iter(by_path.values()))
     match = _STATED_COUNT_RE.search(content or "")
     if match is None:
         return None
+    if len(by_path) == 1:
+        listing = next(iter(by_path.values()))
+    else:
+        # Several directories listed. Abstaining outright was too blunt (2026-09-02):
+        # T12 claimed 16 router modules while this run had listed the very directory
+        # that holds 23, and the guard declined because storage-service/router and
+        # business-service/router had also been listed. The ambiguity this protects
+        # against -- a number that might describe either listing -- does not arise when
+        # the claim NAMES its directory, which that one did.
+        #
+        # So disambiguate by the claim's own sentence, and only that sentence: a path
+        # named three paragraphs away is not this number's subject. Still abstains when
+        # the sentence names none of them, or more than one.
+        start = (content or "").rfind(".", 0, match.start()) + 1
+        end = (content or "").find(".", match.end())
+        sentence = (content or "")[start:end if end != -1 else len(content or "")]
+        listing = _listing_named_in(sentence, by_path)
+        if listing is None:
+            return None
     stated = int(match.group(1))
     defensible = {listing["items"], listing["files"], listing["dirs"]}
     defensible |= set(listing["by_ext"].values())
