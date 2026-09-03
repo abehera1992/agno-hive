@@ -34,6 +34,7 @@ from tools.context import (
     list_directory,
     list_directory_tree,
 )
+from tools.compare import compare_enumerations
 from tools.files import write_file, apply_diff, run_command
 from tools import bash as _bash_tools
 from tools.bash import (
@@ -182,6 +183,7 @@ _tool(find_files)
 _tool(search_files)
 _tool(search_files_batch)
 _tool(count_matches)
+_tool(compare_enumerations)
 _tool(verify_claims)
 _tool(list_skills)
 _tool(load_skill)

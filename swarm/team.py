@@ -5263,6 +5263,11 @@ def _enumerable_lines(text: str) -> list[str]:
 # 2 others) without letting a large module bury the answer it is appended to.
 _ENUMERATION_RENDER_CAP = 60
 
+# How many distinct paths the per-path enumeration ledger keeps. A two-sided claim
+# needs two; an audit spanning a service reads a handful. 40 covers both with room,
+# and caps what a runaway read loop can accumulate.
+_LEDGER_MAX_PATHS = 40
+
 
 def _recorded_enumeration_block(enum: dict | None, available: int) -> str:
     """The enumerable lines this run read, for an answer that dropped them.
@@ -5747,11 +5752,32 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 # derived from the same list, never counted separately.
                 _enum_lines = _enumerable_lines(_enum_src)
                 found = len(_enum_lines)
+                _enum_path = str((args or {}).get("relative_path")
+                                 or (args or {}).get("path") or "")
+                # THE LEDGER (2026-09-02). Keyed by path and keeping every read, not
+                # only the largest. max_enumerable is a scalar, so a run that read two
+                # files retained one of them -- which is why the T2 repair could recover
+                # the backend endpoints and never the frontend hooks, and why no guard
+                # can check a two-sided claim ("all 13 endpoints have a hook", "there
+                # are no gaps"). Those claims are a set difference across two files, and
+                # a guard holding one side cannot evaluate one.
+                #
+                # Bounded deliberately: _LEDGER_MAX_PATHS entries, first-come, and only
+                # reads that actually enumerated something. A run reading 200 files
+                # should not carry 200 enumerations into every guard.
+                if found and _enum_path:
+                    ledger = read_state.setdefault("enumerations", {})
+                    if _enum_path in ledger or len(ledger) < _LEDGER_MAX_PATHS:
+                        ledger[_enum_path] = {
+                            "path": _enum_path,
+                            "tool": function_name,
+                            "lines": _enum_lines,
+                            "count": found,
+                        }
                 if found > read_state.get("max_enumerable", 0):
                     read_state["max_enumerable"] = found
                     read_state["enumerable_block"] = {
-                        "path": str((args or {}).get("relative_path")
-                                    or (args or {}).get("path") or ""),
+                        "path": _enum_path,
                         "tool": function_name,
                         "lines": _enum_lines,
                     }
