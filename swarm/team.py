@@ -5626,6 +5626,11 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # objective fact for the whole run, not per-argument or per-agent context.
     # See _not_found_retry_stub's own docstring for the live incident.
     not_found_counts: dict[str, int] = {}
+    # Paths hive-mcp has served WHOLE (its "offset/limit ignored ... fits in one read"
+    # response). Keyed on relative_path alone for the same reason not_found_counts is:
+    # a file being one page is a fact about the file, not about the arguments or the
+    # agent that asked. Drives the key collapse in the hook below.
+    whole_file_paths: set[str] = set()
     # Identical FAILING calls per (agent, tool, args) -- see the collapse branch below.
     # Reset on success, so a tool that fails twice then works starts clean.
     failure_counts: dict[tuple, int] = {}
@@ -5772,6 +5777,34 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             delegation_generation.get(norm_agent_key, 0),
             delegation_generation.get("__broadcast__", 0),
         )
+        # A file hive-mcp has already served WHOLE is one page, whatever offset is
+        # asked for next. get_file_content ignores offset/limit for a file under its
+        # full-read threshold and says so plainly -- "There are NO further pages. Do
+        # not call this again with another offset or limit for this file." -- and that
+        # prose was added 2026-08-27 for this exact loop. It did not hold.
+        #
+        # Measured again 2026-09-03, subset9 T12: the Reviewer paged vouchers_api.py at
+        # offsets 0, 100, 200 ... 1700, received the identical 45,601-char whole file
+        # every time, and never advanced. Each offset is a different args_key, so the
+        # identical-args cache never matched and every repeat counted as a FRESH fetch:
+        #
+        #   read budget: Reviewer   594,542/450,000 chars (+45,601 get_file_content)
+        #   read budget: Reviewer   640,143/450,000       (+45,601)
+        #   ...
+        #   read budget: Reviewer 1,096,153/450,000       (+45,601)
+        #
+        # 2.4x over budget, 1,081s, an 82,401-char answer that is loop residue rather
+        # than thoroughness -- and T13a stalled in the same loop, was liveness-killed,
+        # and shipped five fabrications unverified because the kill bypasses the guards.
+        #
+        # So collapse the key instead of asking again. Once a path is known to have been
+        # served whole, every later ranged read of it maps to the SAME cache entry and
+        # is served from cache -- no round trip, no budget growth, and the duplicate-read
+        # machinery below sees a repeat and can say so. The model is free to keep
+        # paginating; it just cannot make it cost anything.
+        if function_name == "get_file_content" and (args or {}).get("relative_path") in whole_file_paths:
+            args_key = json.dumps({"relative_path": (args or {}).get("relative_path")},
+                                  sort_keys=True)
         cache_key = (function_name, args_key)
         serve_key = (agent_key, generation, function_name, args_key)
         # Initialised here, not in the fresh-fetch branch that sets it: the final
@@ -5856,6 +5889,18 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         if is_fresh_fetch:
             result = await function(**args)
             cache[cache_key] = result
+            # Record a whole-file serve so the NEXT ranged read of this path collapses
+            # onto this entry. Read off hive-mcp's own marker rather than guessing from
+            # size: the tool owns the threshold, and duplicating it here would drift.
+            _path = (args or {}).get("relative_path")
+            if (function_name == "get_file_content" and _path
+                    and _path not in whole_file_paths
+                    and "offset/limit ignored" in _result_text(result)[:400]):
+                whole_file_paths.add(_path)
+                cache[(function_name,
+                       json.dumps({"relative_path": _path}, sort_keys=True))] = result
+                print(f"[team] {_path} was served whole — later ranged reads of it "
+                      f"will be served from cache, not re-fetched", flush=True)
         else:
             result = cache[cache_key]
 
