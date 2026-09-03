@@ -5163,6 +5163,32 @@ def _record_read(run_context, function_name: str, args: dict, agent_key: str, re
         del log[: len(log) - _MAX_READ_LOG_ENTRIES]
 
 
+def _result_text(result) -> str:
+    """The TEXT a tool returned, whatever wrapper it arrived in.
+
+    An MCP tool result reaches the hooks as a wrapper object, not the bare string the
+    tool returned -- measured 2026-09-02: get_file_content('.../business_api.py')
+    returns a 25,709-char str, and the hook's len(str(result)) logged 26,709+ for the
+    same call. Anything gated on isinstance(result, str) therefore never ran.
+
+    str(result) is the last resort, not the first: a repr escapes newlines, and every
+    caller here counts line-anchored patterns, which would then match nothing -- failing
+    the same silent way this exists to fix.
+    """
+    if isinstance(result, str):
+        return result
+    for attr in ("content", "text", "data", "output", "result"):
+        val = getattr(result, attr, None)
+        if isinstance(val, str):
+            return val
+        if isinstance(val, (list, tuple)):
+            parts = [b if isinstance(b, str) else getattr(b, "text", None) for b in val]
+            parts = [p for p in parts if isinstance(p, str)]
+            if parts:
+                return "\n".join(parts)
+    return str(result)
+
+
 def _make_read_cache_tool_hook(activity: dict | None = None):
     """Build a fresh, run-scoped cache for read-only tool calls -- a new dict per
     _build_team() call means the cache lives exactly as long as one run and can
@@ -5568,10 +5594,26 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             # Max of a single read, not a sum across reads: the claim being supported is
             # "one tool call had N items in front of it", which a total across unrelated
             # files would overstate.
-            if isinstance(result, str) and len(result) < 400_000:
-                found = len(_ENUMERABLE_LINE_RE.findall(result))
+            #
+            # The `isinstance(result, str)` this used to be gated on was never true for
+            # an MCP tool (2026-09-02): the hook receives a wrapper, not the bare string,
+            # so this block never ran and max_enumerable stayed 0 for every read. The
+            # tell was two lines up -- read_chars uses len(str(result)) and logged 26,956
+            # for a get_file_content whose real return is a 25,709-char str. Both guards
+            # that consume max_enumerable were therefore inert regardless of the regex
+            # they count with. Unwrap first, and LOG the number, so the value the guards
+            # actually see is readable from the journal instead of recomputed by hand
+            # from the producer -- which is how this stayed hidden through a regex fix
+            # that was itself correct.
+            _enum_src = _result_text(result)
+            if len(_enum_src) < 400_000:
+                found = len(_ENUMERABLE_LINE_RE.findall(_enum_src))
                 if found > read_state.get("max_enumerable", 0):
                     read_state["max_enumerable"] = found
+                    print(f"[team] enumerable: {found} items in {function_name} "
+                          f"result (wrapper {type(result).__name__}, "
+                          f"{len(_enum_src):,} chars of text) — max now {found}",
+                          flush=True)
             # Search patterns and whether each found anything (2026-08-25), for the
             # guess-driven-enumeration check. See _guess_driven_enumeration.
             if function_name in ("search_files", "search_files_batch"):
