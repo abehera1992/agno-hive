@@ -4042,19 +4042,33 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                       if isinstance(_rs_enum, dict) else 0)
     missing_cmp = _under_answered_comparison(content, task, _cmp_available)
     if missing_cmp is not None:
+        # Items BEFORE the banner, disclosure as a footnote -- the same ordering the
+        # enumeration guard already settled on. Appending them after the banner
+        # reproduces the exact fault that repair was written for: the artifact leads
+        # with a complaint and buries the items that answer the question below it.
+        # Shipped that way once here (b5a686b) and it is visible in the run that
+        # verified it, which is how the ordering came up again at all.
+        recovered_cmp = _recorded_enumeration_block(
+            _rs_enum.get("enumerable_block") if isinstance(_rs_enum, dict) else None,
+            missing_cmp)
         print(f"[team] two-sided comparison listed "
               f"{len(_LIST_LINE_RE.findall(content))} items against {missing_cmp} "
-              f"available — flagging", flush=True)
+              f"available — flagging"
+              f"{' + rendering the read lines' if recovered_cmp else ''}", flush=True)
         return (
-            f"{content}\n\n---\n**BOTH SIDES WERE NOT ENUMERATED - this task asked "
-            f"for each side listed in full before comparing. The answer above lists "
-            f"fewer items than a single tool result in this run already held "
-            f"({missing_cmp}), so at least one side was not enumerated. The "
-            f"conclusion may well be correct; it cannot be checked without redoing "
-            f"the comparison.**"
-            + _recorded_enumeration_block(
-                _rs_enum.get("enumerable_block") if isinstance(_rs_enum, dict) else None,
-                missing_cmp)
+            f"{content}{recovered_cmp}"
+            f"\n\n---\n**BOTH SIDES WERE NOT ENUMERATED - this task asked "
+            f"for each side listed in full before comparing, and the model's own "
+            f"answer listed fewer items than a single tool result in this run already "
+            f"held ({missing_cmp}), so at least one side was not enumerated."
+            + (f" The {missing_cmp} lines shown above the model's conclusion were read "
+               f"from the file by this run and reproduced verbatim; they are the tool's "
+               f"output, not the model's, and are raw source lines rather than a "
+               f"curated list. The other side is not recovered here."
+               if recovered_cmp else
+               f" The conclusion may well be correct; it cannot be checked without "
+               f"redoing the comparison.")
+            + "**"
             + _summarize_actual_writes(*all_results)
         )
 
