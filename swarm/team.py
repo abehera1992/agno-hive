@@ -8905,13 +8905,31 @@ _COVERAGE_TOTAL_RE = re.compile(
     r"|\btotal\b[^.\n:]{0,40}?[:\t ][ \t]*\**(\d{1,4})\b"      # "total: 13" -- same line
     r"|\ball\s+(\d{1,4})\s+\w+[^.\n]{0,40}?\b(?:are|is)\b",
     re.IGNORECASE)
+# `[ \t]*`, NOT `\s*`, between the label and its number: the number must sit on the
+# SAME LINE as the word that labels it. Live false positive 2026-09-03, battery T2, on
+# a fully correct answer -- it said "Covered endpoints: 7" and "Uncovered endpoints: 6"
+# (7 + 6 = 13, right), then opened its gap list:
+#
+#     ### Endpoints with No Corresponding Frontend Hook:
+#     1. `POST /business/register` - Internal seller registration
+#
+# `\s*` let the gap pattern step over the newline and read the "1" of the first list
+# item, giving 7 + 1 != 13 and a banner telling a reader the correct answer did not add
+# up. A heading that ends in a colon above a numbered list is the single most common
+# shape in these answers, so this was firing on the good ones.
+#
+# "uncovered"/"unmatched" added at the same time: "Uncovered endpoints: 6" was not a
+# recognised gap phrase at all, which is why the pattern went looking further and found
+# a list marker instead. (\bcovered\b does not match inside "Uncovered" -- no word
+# boundary between "n" and "c" -- so the covered pattern was never the problem here.)
 _COVERAGE_COVERED_RE = re.compile(
     r"\b(?:with (?:a )?matching|with corresponding|covered|matched|have (?:a )?"
-    r"(?:matching|corresponding))\b[^.\n:]{0,40}?[:\s]\s*\**(\d{1,4})\b",
+    r"(?:matching|corresponding))\b[^.\n:]{0,40}?[:\s][ \t]*\**(\d{1,4})\b",
     re.IGNORECASE)
 _COVERAGE_GAP_RE = re.compile(
-    r"\b(?:without|missing|no (?:corresponding|matching)|not covered|gaps?)\b"
-    r"[^.\n:]{0,40}?[:\s]\s*\**(\d{1,4})\b",
+    r"\b(?:without|missing|no (?:corresponding|matching)|not covered|uncovered"
+    r"|unmatched|gaps?)\b"
+    r"[^.\n:]{0,40}?[:\s][ \t]*\**(\d{1,4})\b",
     re.IGNORECASE)
 
 
