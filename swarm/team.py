@@ -1923,7 +1923,19 @@ async def _computed_comparison(task: str, enumerations: dict | None,
         return _skip("no hive-mcp connection available")
     if hive_mcp_tools is None:
         return _skip("no live hive-mcp session (url only; not opening one for a footnote)")
-    top = sorted(enumerations.values(), key=lambda e: -e.get("count", 0))[:2]
+    # FILES only. compare_enumerations extracts routes from source, so a directory
+    # entry is useless to it -- and the ledger holds directory listings too, keyed by
+    # path exactly like file reads. Measured on subset8's T2: the ledger held
+    # business_api.py (28 items) and the inventory router DIRECTORY (24), top-2 by count
+    # took the directory as the second operand, the tool could not extract from it, and
+    # the failure was swallowed by the one return this function left unnarrated. Worse,
+    # having two entries meant the answer-derived side was never consulted, so the
+    # fallback that exists for exactly this case never ran.
+    files_only = [e for e in enumerations.values()
+                  if str(e.get("path", "")).endswith((".py", ".ts", ".tsx", ".js", ".jsx"))]
+    top = sorted(files_only, key=lambda e: -e.get("count", 0))[:2]
+    if not top:
+        return _skip("no file enumerations recorded (directories only)")
     left = top[0].get("path", "")
     if len(top) >= 2:
         right = top[1].get("path", "")
@@ -1948,7 +1960,11 @@ async def _computed_comparison(task: str, enumerations: dict | None,
               f"{type(exc).__name__}: {str(exc)[:80]}", flush=True)
         return ""
     if not text or text.startswith("compare_enumerations failed"):
-        return ""
+        # The last silent return, and the one that actually fired: subset8's T2 produced
+        # NO log line at all, which ruled out every branch above it and left only this.
+        # A diagnostic pass that leaves one exit unnarrated diagnoses nothing.
+        return _skip(f"tool returned no usable result for {left} vs {right}: "
+                     f"{(text or '(empty)')[:120]}")
     print(f"[team] computed the comparison for {left} vs {right}", flush=True)
     return ("\n\n---\n**THE COMPARISON, COMPUTED — the answer above states a "
             "relationship between two files; this is that same relationship worked out "
