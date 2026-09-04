@@ -4047,6 +4047,26 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             + _tail()
         )
 
+    # Under-reported enumeration (2026-09-04). Runs AFTER the self-contradiction check
+    # above so the more specific adjacent-list guard keeps ownership of its own shape;
+    # this only sees what falls through. See _undercounted_claim for the live case and
+    # the 81-answer false-positive measurement.
+    under = _undercounted_claim(content)
+    if under is not None:
+        stated, named, kind, phrase = under
+        print(f"[team] answer states {stated} {kind}s but names {named} — flagging "
+              f"under-reported enumeration", flush=True)
+        noun = kind + "s"
+        return (
+            f"{content}\n\n---\n**THE COUNT IS STATED BUT THE LIST IS NOT — the answer "
+            f"says {stated} {noun} (\"{phrase[:60]}\") and names {named} of them "
+            f"anywhere in the text. The remaining {stated - named} were counted but "
+            f"never enumerated, so nothing here lets you check them. Which number is "
+            f"right depends on what the task asked and this check does not adjudicate "
+            f"that — but do not read the stated total as a delivered list.**"
+            + _tail()
+        )
+
     # Fabricated-tool-use check (2026-08-23). An answer describing a tool result that
     # never happened -- see _fabricated_tool_use for the T5 incident. Ranked ahead of
     # the arithmetic and enumeration checks because invented EVIDENCE is worse than a
@@ -10487,6 +10507,90 @@ def _names_something(line: str) -> bool:
     stripped = _GLOB_SPAN_RE.sub(" ", line)
     stripped = re.sub(r"^\s*(?:[-*+•]|\d{1,3}[.)])\s*", "", stripped)
     return any(r.search(stripped) for r in _CONCRETE_ITEM_RES)
+
+
+# A stated count paired with the TYPE of thing counted -- "8 endpoints", "21 tables",
+# "16 RTK Query hooks". Up to two words may sit between the number and the noun so
+# "16 RTK Query hooks" and "10 frontend hooks" both bind. The lookbehind is the same
+# one _COUNT_INTRO_RE uses, for the same reason (Type-2, HTTP/2, line-12).
+_COUNT_TYPE_RE = re.compile(
+    r"(?<![\w.:/-])(\d{1,3})\s+(?:\*{0,2}[A-Za-z-]+\*{0,2}\s+){0,2}"
+    r"\*{0,2}(endpoints?|routes?|hooks?|tables?)\*{0,2}\b", re.I)
+
+# One matcher per countable type. Each recognises the shape the item is WRITTEN in,
+# not merely a word that could be anything: a route carries an HTTP verb or a
+# backticked path, a hook is useXxx, a table is a backticked snake_case identifier.
+# `files` is deliberately absent -- _asked_for_a_list_answered_without_one already
+# owns that case (T6), and adding it here would double-flag the same sentence.
+_COUNT_TYPE_MATCHERS = {
+    "endpoint": re.compile(r"(?:GET|POST|PUT|PATCH|DELETE)\s+/\S+|`/[\w{}$/\-.]+`"),
+    "route": re.compile(r"(?:GET|POST|PUT|PATCH|DELETE)\s+/\S+|`/[\w{}$/\-.]+`"),
+    "hook": re.compile(r"\buse[A-Z]\w+"),
+    "table": re.compile(r"`([a-z][a-z0-9]*(?:_[a-z0-9]+)+)`"),
+}
+
+
+def _undercounted_claim(content: str) -> tuple[int, int, str, str] | None:
+    """A stated count of N things whose items the answer never actually names.
+
+    Returns (stated, named, kind, phrase) for the WIDEST gap, or None.
+
+    Sibling of _count_contradicts_own_list, which this runs after and never
+    duplicates: that one needs the list to sit directly beneath the number
+    (_COUNT_INTRO_RE is anchored on `colon + newline`), and _asked_for_a_list_-
+    answered_without_one needs there to be no list at all. An answer that states a
+    count in mid-sentence prose and enumerates SOME of it falls between the two --
+    which is exactly where it lands, because partial enumeration is what a
+    summariser produces.
+
+    Live case (subset18 T13a, 2026-09-04, 1,285 chars, no guard fired):
+
+        **Backend Endpoints**: The module exposes 8 endpoints for voucher
+        management, including GRN creation, credit notes, ...
+        **Database Tables**: 7 tables support the module's functionality, ...
+
+    Four routes and four tables are named in the whole answer. The sentence ends in
+    a period with no list under it, so _COUNT_INTRO_RE matched nothing; a separate
+    4-item gap list exists, so "answered without one" was false. It read as a
+    finished audit.
+
+    Measured over the 81 stored battery answers before shipping: 12 fires, every one
+    inspected and every one a real under-report -- no false positives, and none of
+    the existing detections suppressed. The three most extreme all assert completeness
+    while naming NOTHING of the type they counted:
+
+        subset17 T2    "16 RTK Query hooks ... After a full enumeration"   ->  0 named
+        subset5  T2    "13 backend endpoints but only 10 frontend hooks"   ->  0 named
+        subset3  T13a  "all requested components ... have been identified
+                        and cited with verbatim file content"              ->  0 named
+
+    Scored on the answer's own text and nothing else, like its two siblings: no tool
+    output, no file access, no model. Reports rather than adjudicates -- the stated
+    number may be right and the enumeration lazy, or the number may be wrong; this
+    cannot tell which, and says so.
+    """
+    if not content:
+        return None
+    best = None
+    for m in _COUNT_TYPE_RE.finditer(content):
+        stated = int(m.group(1))
+        kind = m.group(2).lower().rstrip("s")
+        # Below 3 there is nothing meaningful to under-report; above 100 a
+        # hand-written enumeration is not what the sentence is describing.
+        if not 3 <= stated <= 100:
+            continue
+        if _RANGE_AFTER_RE.match(content[m.end(1):m.end(1) + 2]):
+            continue
+        if _PROPER_NOUN_BEFORE_RE.search(content[:m.start(1)]):
+            continue
+        named = len({x.lower() for x in _COUNT_TYPE_MATCHERS[kind].findall(content)})
+        # A gap of one is a miscount, not a withheld list, and the existing
+        # self-contradiction guard is the right owner of that shape.
+        if stated - named < 2:
+            continue
+        if best is None or (stated - named) > (best[0] - best[1]):
+            best = (stated, named, kind, m.group(0).strip())
+    return best
 
 
 def _count_contradicts_own_list(content: str) -> tuple[int, int, str, int] | None:
