@@ -10324,6 +10324,23 @@ _CONCRETE_ITEM_RES = (
     re.compile(r"\b\w+_\w+\b"),                                  # snake_case
     re.compile(r"\b[a-z][a-z0-9]*[A-Z]\w*\b"),                   # camelCase
     re.compile(r"\b[\w-]+\.(?:py|ts|tsx|js|jsx|sql|md|json|ya?ml)\b"),
+    # A dotted identifier -- schema.table, module.attr. Added 2026-09-03 after this
+    # guard falsely accused a CORRECT answer. T13a listed 7 voucher-module tables, all
+    # of which exist in the live database, and scored 5:
+    #
+    #     inventory.voucher_series   True      inventory.vouchers   False
+    #     inventory.stock_ledger     True      inventory.payments   False
+    #
+    # `vouchers` and `payments` are single-word table names, so they matched no
+    # snake_case, camelCase, path or source-extension pattern, and the banner told the
+    # reader "only 5 of them name a specific thing" about seven that all do.
+    #
+    # That is the exact failure this file has spent the day fixing in other checks -- a
+    # test that demands one surface form and reads its absence as absence of the thing
+    # -- committed in my own guard three commits earlier and found only by a production
+    # run. Requires a dot BETWEEN word characters, so it cannot match a sentence's
+    # trailing period or an ellipsis.
+    re.compile(r"\b\w+\.\w+\b"),
 )
 
 
