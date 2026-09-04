@@ -7908,7 +7908,18 @@ def _finalise_member_chunks(team, agent_name: str) -> None:
     # JSONs never captured member text and this premise cannot be checked offline.
     if not isinstance(getattr(team, "_member_items", None), dict):
         team._member_items = {}
-    team._member_items[key] = _names
+    # UNION across delegations, not overwrite. _member_results above deliberately
+    # overwrites -- "the result is the latest complete answer that member gave" -- and
+    # that is right for an ANSWER but wrong for an item set. Every member here is named
+    # "Researcher", so keying by name and assigning discarded all but the last.
+    #
+    # Measured 2026-09-04, subset15 T12: three Researcher delegations named
+    # {Next.js, init-postgres.sql, inventory.md, secrets.md}, {models.py} and
+    # {categories_api.py, gst_compliance_api.py, parties_api.py, vouchers_api.py} --
+    # nine distinct files. The coverage line reported "members named 4", the last set
+    # only, and therefore "missing 0". An instrument that under-counts the baseline
+    # makes the loss it exists to measure disappear.
+    team._member_items[key] = sorted(set(team._member_items.get(key, [])) | set(_names))
     _shown = ", ".join(_names[:8]) + ("…" if len(_names) > 8 else "")
     print(f"[team] member result captured: {agent_name} ({len(text)} chars, "
           f"{len(_names)} distinct filenames{': ' + _shown if _names else ''})",
