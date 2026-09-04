@@ -3489,6 +3489,24 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     print(f"[team] verify (draft): bad={_fab_bad} unavailable={_fab_unavailable} | "
           f"{_verdict_digest(_fab_report)}", flush=True)
 
+    # MEASUREMENT ONLY (2026-09-04) — the numbers step 3 of the T12-repair plan needs,
+    # and cannot get offline: run JSONs store the answer but never member text. Prints
+    # what the members collectively named against what the answer kept, so the fire
+    # rate and correctness of a would-be repair can be judged from real runs BEFORE the
+    # attachment is built. Two previous versions of this idea were confident and wrong
+    # (task-phrasing gating shuts out T12 entirely; directory-mention gating measured
+    # 86% false attachment), so this one gets measured first.
+    _mi = getattr(team, "_member_items", None)
+    if isinstance(_mi, dict) and _mi:
+        _member_union = sorted({n for names in _mi.values() for n in names})
+        _answer_items = set(_RELAY_FILENAME_RE.findall(content or ""))
+        _missing = [n for n in _member_union if n not in _answer_items]
+        print(f"[team] relay coverage: members named {len(_member_union)}, answer kept "
+              f"{len(_member_union) - len(_missing)}, missing {len(_missing)}"
+              + (f" — {', '.join(_missing[:8])}"
+                 + ("…" if len(_missing) > 8 else "") if _missing else ""),
+              flush=True)
+
     # Computed alongside the fabrication check, for the same reason: both are awaits,
     # and _tail() is a sync closure 30 guards call. Runs only for a two-sided task with
     # two enumerations recorded, so an ordinary answer pays nothing.
@@ -7870,6 +7888,27 @@ def _finalise_member_chunks(team, agent_name: str) -> None:
     # count against the same count taken from the delivered answer, and the stage that
     # dropped them is whichever side the number falls on.
     _names = sorted(set(_RELAY_FILENAME_RE.findall(text)))
+    # Keep the SET, not just its size (2026-09-04). The count alone answers "was there
+    # loss"; deciding what to do about it needs "which items". The union across members
+    # is the run's own record of what the team actually surfaced, and comparing it
+    # against the delivered answer locates the loss AND names the missing pieces.
+    #
+    # Why this is the gate that could work where two others failed. The existing
+    # enumeration repair is gated on TASK PHRASING -- _enumeration_kind() scores T12's
+    # "architectural overview of its routers" as None, so the repair path is shut for
+    # the test that needs it most, while T6 scores 'directory' and gets repaired on all
+    # 17 runs. Gating on DIRECTORY MENTIONS was built and measured instead: 86% false
+    # attachment, 19 of 22 fires being vouchers audits that legitimately mention one
+    # file inside a directory. What members actually relayed is neither: T12's members
+    # relayed 24 filenames in a 739-char result against an answer naming 8, while
+    # T13a's members name ~4 and its answer names ~4 and would not fire.
+    #
+    # Storage only. Nothing reads this yet, deliberately -- the attachment is not built
+    # until the fire rate and correctness are measured over real runs, because the run
+    # JSONs never captured member text and this premise cannot be checked offline.
+    if not isinstance(getattr(team, "_member_items", None), dict):
+        team._member_items = {}
+    team._member_items[key] = _names
     _shown = ", ".join(_names[:8]) + ("…" if len(_names) > 8 else "")
     print(f"[team] member result captured: {agent_name} ({len(text)} chars, "
           f"{len(_names)} distinct filenames{': ' + _shown if _names else ''})",
