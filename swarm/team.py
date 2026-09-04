@@ -2264,6 +2264,40 @@ _MODEL_DIRECTED_VERDICT_RE = re.compile(
 )
 
 
+_VERDICT_FLAG_PREFIXES = ("NOT FOUND", "MISMATCH", "AMBIGUOUS", "DOC ONLY", "BAD",
+                          "CONTRADICTED", "SPLIT-FOUND")
+
+
+def _verdict_digest(report: str, limit: int = 4) -> str:
+    """One log-line summary of a verify_claims report: what it flagged, or that it did not.
+
+    Added 2026-09-03 after a contradiction that could not be resolved from the journal.
+    subset13's T11 shipped six fabrications with no banner. The log showed the draft
+    check firing ("fabrication detected up front", 3,914-char report), a correction
+    retry running, and a re-check returning a 1,013-char report -- after which the run
+    returned clean. Re-running verify_claims against that same delivered text now
+    yields 3 NOT FOUND and a 1,510-char report. Those cannot both describe one text,
+    and the container's verify.py hashes identical to the image's, so the checker did
+    not change underneath.
+
+    The reason it could not be settled is that only the report's LENGTH and DURATION
+    were logged, never its verdict or contents. Same instrumentation hole that made
+    _computed_comparison's silence undiagnosable two runs earlier, where three
+    successive guesses were wrong before each early return was made to state its
+    reason. A check whose outcome is not in the journal cannot be debugged from it.
+
+    Deliberately bounded: counts every flagged line, shows the first few. A verdict
+    line that dumps a whole report is one nobody reads.
+    """
+    flagged = [ln.strip() for ln in (report or "").splitlines()
+               if ln.strip().startswith(_VERDICT_FLAG_PREFIXES)]
+    if not flagged:
+        return "clean — nothing flagged"
+    shown = "; ".join(re.sub(r"\s+", " ", f)[:58] for f in flagged[:limit])
+    return (f"{len(flagged)} flagged: {shown}"
+            + ("…" if len(flagged) > limit else ""))
+
+
 def _reader_facing_report(report: str) -> str:
     """Strip the model-directed imperative from a verify_claims report before it is
     shown to a human.
@@ -3452,6 +3486,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"more serious of the two.**\n```\n{_fab_report.strip()}\n```")
         print("[team] fabrication detected up front — it will ride along with whichever "
               "guard fires", flush=True)
+    print(f"[team] verify (draft): bad={_fab_bad} unavailable={_fab_unavailable} | "
+          f"{_verdict_digest(_fab_report)}", flush=True)
 
     # Computed alongside the fabrication check, for the same reason: both are awaits,
     # and _tail() is a sync closure 30 guards call. Runs only for a two-sided task with
@@ -4621,6 +4657,12 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
 
     report2, still_bad, still_unavailable = await _verify_claims(
         corrected, hive_mcp_url, hive_mcp_tools)
+    # The verdict this run acted on, next to the length of the text it judged. Without
+    # both, a later "why did this ship unflagged?" has nothing to work from -- which is
+    # exactly where T11 left us: a clean re-check on text that fails the same check now.
+    print(f"[team] verify (after correction retry): still_bad={still_bad} "
+          f"unavailable={still_unavailable} corrected={len(corrected):,} chars | "
+          f"{_verdict_digest(report2)}", flush=True)
     if still_unavailable:
         return (corrected + _UNVERIFIED_DISCLAIMER + unread_note
                 + _summarize_actual_writes(*all_results))
