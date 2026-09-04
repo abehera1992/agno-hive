@@ -19,6 +19,7 @@ from .sources.patterns_md import PatternsMdSource
 from .sources.failure_log import FailureLogSource
 from .sources.postgres_sessions import PostgresSessionsSource
 from .sources.synthetic_citation import SyntheticCitationSource
+from .sources.guard_repairs import GuardRepairsSource
 
 
 def build(
@@ -28,6 +29,7 @@ def build(
     citation_root: str | None = None,
     citation_per_file: int = 3,
     exclude_guards: set[int] | None = None,
+    guard_runs_dir: str | None = None,
 ):
     sources = []
     if patterns_path:
@@ -36,6 +38,15 @@ def build(
     sources.append(PostgresSessionsSource(postgres_uri=postgres_uri, project_id=project))
     if citation_root:
         sources.append(SyntheticCitationSource(citation_root, max_per_file=citation_per_file))
+    # Opt-in, and off by default on purpose. As of 2026-09-03 this source yields 27 raw
+    # pairs that dedupe to 14, of which T6 contributes ONE pattern repeated 14 times and
+    # six T2 pairs share an identical 488-char recovered block. That is a collection
+    # mechanism worth running, not a corpus worth mixing in unannounced: enabled
+    # silently it would pad the quality report with near-duplicates of a single lesson
+    # and make a thin dataset look healthy. Pass --guard-runs to include it deliberately,
+    # and read the per-source counts in the report before trusting the total.
+    if guard_runs_dir:
+        sources.append(GuardRepairsSource(guard_runs_dir))
 
     kept: list[Record] = []
     seen: set[str] = set()
@@ -112,6 +123,9 @@ def main() -> None:
     ap.add_argument("--citation-root", default=None,
                     help="repo root to synthesise citation-restraint pairs from")
     ap.add_argument("--citation-per-file", type=int, default=3)
+    ap.add_argument("--guard-runs", default=None,
+                    help="directory of battery run JSONs (subset*.json) to harvest "
+                         "guard-repair preference pairs from; off unless given")
     ap.add_argument("--exclude-guards", default="",
                     help="comma-separated guard numbers reserved for eval")
     args = ap.parse_args()
@@ -120,6 +134,7 @@ def main() -> None:
         args.patterns, args.project, args.postgres_uri,
         citation_root=args.citation_root, citation_per_file=args.citation_per_file,
         exclude_guards={int(x) for x in args.exclude_guards.split(',') if x.strip()},
+        guard_runs_dir=args.guard_runs,
     )
 
     out = Path(args.out)
