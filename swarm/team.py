@@ -3104,6 +3104,18 @@ def _adopt_retry(label: str, content: str, result, retried: str, retry, member_r
             f"stripping -- keeping the original draft"
         )
         return content, result
+    # A retry that came back as the canned budget-exhausted sentence is never an
+    # improvement on anything, at any read count. Checked by identity with the
+    # constant rather than left to _more_grounded's arithmetic below: that scores on
+    # read counts, and a -1 (undeterminable) on either side, or a member-read delta
+    # that happens to cover the gap, both resolve to ADOPT -- so the one case we can
+    # recognise exactly would have depended on a comparison that can decline to fire.
+    if retried.strip() == _BUDGET_EXHAUSTED_ANSWER:
+        print(
+            f"[team] {label}: retry returned only the canned budget-exhausted "
+            f"sentence -- keeping the original draft"
+        )
+        return content, result
     if _more_grounded(result, retry, member_reads=member_reads):
         return retried, retry
     print(
@@ -4641,6 +4653,36 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         return content + _summarize_actual_writes(*all_results)
     if not corrected:
         return content + _summarize_actual_writes(*all_results)
+
+    # The one retry site that never went through _adopt_retry, wired in 2026-09-04.
+    # Two live stubs forced it: subset17's T12 delivered exactly
+    # _BUDGET_EXHAUSTED_ANSWER (234 chars, byte-identical) and subset16's T11 that
+    # same sentence plus the unread_note below -- a note warning that "every line
+    # number above is recalled" above an answer containing no line numbers at all.
+    # Both REPLACED substantive drafts, and the re-check then found nothing wrong
+    # with them precisely BECAUSE a canned apology contains no claims to check:
+    # still_bad=False, no banner, shipped clean. "Nothing to check" and "checks out"
+    # were reaching the reader as the same verdict.
+    #
+    # This is the oldest retry in the file. The preservation cascade was built later,
+    # around the guards that came after it, and held everywhere it was wired -- the
+    # bare `if not corrected` above was the whole gate here, and a 234-character
+    # apology is not falsy.
+    adopted, _ = _adopt_retry(
+        "citation-correction", content, result, corrected, retry,
+        member_reads=_member_reads_delta(team, _reads_before_retry),
+    )
+    if adopted is not corrected:
+        # Draft kept -- but it is still the flagged draft that triggered this retry,
+        # so the original report ships with it. Returning it silently would re-create
+        # the same non-disclosure from the other direction. Wording follows the
+        # budget-already-spent branch above, for the same reason: no retry remains.
+        return (f"{content}\n\n---\n**Unverified claims flagged automatically "
+                f"(these could not be found in the repository; this run's one "
+                f"correction retry came back with less evidence than the draft it "
+                f"would have replaced, and was discarded):**\n"
+                f"```\n{_reader_facing_report(report)}\n```"
+                + _summarize_actual_writes(*all_results))
 
     # Still not a second retry -- that would break the "bounded at ONE retry" design
     # documented above. But as of 2026-08-20 this is no longer ONLY a log line.
