@@ -105,6 +105,11 @@ _TC_BUFFER_CAP = 8192
 
 
 class _ToolCallRecoveryMixin:
+    # Instrumentation counter (temporary). Class-level on purpose: every agent builds
+    # its own model instance, so a per-instance counter would report 1 forever and say
+    # nothing about whether the path is hot.
+    _delta_calls = 0
+
     """Shared parsing + response-hook logic for OllamaToolFix and VLLMToolFix.
     Relies on `super()._parse_provider_response(...)` / `..._delta(...)`
     resolving to the real base model class (Ollama or OpenAILike) via each
@@ -290,6 +295,16 @@ class _ToolCallRecoveryMixin:
 
     def _parse_provider_response_delta(self, response: Any) -> ModelResponse:
         model_response = super()._parse_provider_response_delta(response)
+        # Instrumentation (2026-09-05, temporary). Everything about this path checks
+        # out statically -- right class, bound override, agno yields through it,
+        # agno accumulates what it returns, and the deployed file recovers a
+        # one-character stream when driven directly -- and a raw "<tool_call>" still
+        # reaches the answer in production. Static reasoning has produced two wrong
+        # causal claims already; this prints what actually happens instead.
+        _ToolCallRecoveryMixin._delta_calls += 1
+        if _ToolCallRecoveryMixin._delta_calls in (1, 100, 1000, 10000):
+            print(f"[toolfix] delta parser reached {_ToolCallRecoveryMixin._delta_calls} "
+                  f"time(s) — the override IS in the production path", flush=True)
         # Same placement rationale as the non-streaming parser above. Usage rides
         # on the FINAL chunk only (stream_options include_usage), so this is a
         # no-op on the thousands of content deltas and fires once per call.
@@ -337,6 +352,8 @@ class _ToolCallRecoveryMixin:
             if not buf:
                 combined = getattr(self, "_tc_pend", "") + model_response.content
                 if _TC_OPEN in combined:
+                    print(f"[toolfix] buffering STARTED (delta={len(model_response.content)} "
+                          f"chars, pend={len(getattr(self, '_tc_pend', ''))})", flush=True)
                     head, _, rest = combined.partition(_TC_OPEN)
                     self._tc_pend = ""
                     buf = _TC_OPEN + rest
@@ -365,15 +382,22 @@ class _ToolCallRecoveryMixin:
                 # A runaway buffer would swallow a whole answer if the closing tag
                 # never arrives. Past the cap, give the text back rather than eat it.
                 if len(buf) > _TC_BUFFER_CAP:
+                    print(f"[toolfix] buffer hit the {_TC_BUFFER_CAP} cap — releasing "
+                          f"{len(buf)} chars back as content", flush=True)
                     self._tc_buffer = ""
                     model_response.content = buf
                     return model_response
                 if "</tool_call>" in buf:
+                    print(f"[toolfix] buffering CLOSED at {len(buf)} chars — "
+                          f"attempting recovery", flush=True)
                     self._tc_buffer = ""
                     parsed = self._parse_tool_calls_from_content(buf)
                     if parsed:
                         tool_calls = self._to_tool_calls(parsed)
                         if tool_calls:
+                            print(f"[toolfix] RECOVERED a leaked call: "
+                                  f"{[t.get('function', {}).get('name') for t in tool_calls]}",
+                                  flush=True)
                             model_response.tool_calls = tool_calls
                             model_response.content = ""
                             return model_response
