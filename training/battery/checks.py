@@ -28,11 +28,75 @@ def _norm(text: str) -> str:
     return (text or "").lower()
 
 
+_NEGATION = re.compile(
+    r"\b(no|not|never|isn'?t|aren'?t|does\s+not|do\s+not|doesn'?t|don'?t|without|"
+    r"rather than|instead of|nothing|nowhere|incorrect|false premise|mistaken)\b", re.I)
+
+
+# A sentence or line boundary. A period only ends a sentence when what follows looks
+# like a new one -- otherwise "(e.g. `storageApi.ts`)" would be cut at the "e.g." and
+# lose the "There is no ..." that governs it.
+_SENT_BREAK = re.compile(r"\n|(?<=[.!?;:])\s+(?=[A-Z0-9])")
+
+
+def _clause_before(text: str, pos: int) -> str:
+    """The run-up to `pos` within its own clause -- not a fixed character window.
+
+    A flat 80-character lookbehind was the first attempt and it broke enumeration
+    scoring immediately: battery2's E5 listed all nine routes correctly, and
+    `/vouchers/stock-transfer` was rejected as "negated" because the PREVIOUS list item
+    ended "(no party, no tax)". Ordinary prose is full of the word "no"; what matters
+    is whether the negation actually governs this mention, and a list item on its own
+    line is not governed by the line above it.
+
+    Fixing a false PASS by creating a false FAIL is not progress, so the scope stops at
+    the nearest line or sentence boundary.
+    """
+    start = 0
+    for m in _SENT_BREAK.finditer(text, 0, pos):
+        start = m.end()
+    return text[start:pos]
+
+
+def _affirms(text: str, term: str) -> bool:
+    """Is `term` asserted as fact, rather than named in order to be denied?
+
+    The distinction is the whole point of a false-premise trap and the first version
+    of this missed it completely: it counted ANY mention as affirmation, so the ideal
+    answer -- "It does not use MongoDB; the stock ledger is a SQLAlchemy model" --
+    scored as falling for the trap. Rejecting a premise requires naming the premise.
+    The self-test caught it before a single run was scored.
+
+    An occurrence counts as affirmed only when no negation appears in the run-up to
+    it. Crude, and deliberately so: this is reported as a heuristic verdict and never
+    added to the computed ones.
+    """
+    occurrences = list(re.finditer(re.escape(term), text, re.I))
+    if not occurrences:
+        return False
+    return any(not _NEGATION.search(_clause_before(text, m.start()))
+               for m in occurrences)
+
+
 def names_all(expected, label="items", allow_missing=0):
-    """Answer must name every expected item. The core enumeration check."""
+    """Answer must name every expected item -- and mean it.
+
+    Mentioning a name is not claiming it exists. battery2's X2 answered "There is no
+    top-level API slice (e.g. `storageApi.ts`) ... No Hooks for Upload/Download Exist"
+    about a file that exists and exports nine hooks. The answer was wrong, and this
+    checker scored it CORRECT, because the string "storageApi.ts" was present -- inside
+    the sentence denying it.
+
+    A false PASS is the most dangerous result a scorer can produce: a false FAIL gets
+    investigated, a false PASS is filed as success and never looked at again. So an
+    item counts only when at least one mention is not inside a negation, reusing the
+    same _affirms helper the false-premise checker uses. That helper exists because
+    rejects_premise had this identical bug pointed the other way -- it treated any
+    mention as agreement. Same confusion, opposite sign, two different functions.
+    """
     def check(answer: str) -> Verdict:
-        low = _norm(answer)
-        missing = [e for e in expected if e.lower() not in low]
+        a = answer or ""
+        missing = [e for e in expected if not _affirms(a, e)]
         ok = len(missing) <= allow_missing
         return Verdict(
             ok,
@@ -84,31 +148,6 @@ def denies_existence(token: str):
         return Verdict(ok, "denial=%s contradicting-assertion=%s" % (denied, asserts),
                        kind="heuristic")
     return check
-
-
-_NEGATION = re.compile(
-    r"\b(no|not|never|isn'?t|aren'?t|does\s+not|do\s+not|doesn'?t|don'?t|without|"
-    r"rather than|instead of|nothing|nowhere|incorrect|false premise|mistaken)\b", re.I)
-
-
-def _affirms(text: str, term: str) -> bool:
-    """Is `term` asserted as fact, rather than named in order to be denied?
-
-    The distinction is the whole point of a false-premise trap and the first version
-    of this missed it completely: it counted ANY mention as affirmation, so the ideal
-    answer -- "It does not use MongoDB; the stock ledger is a SQLAlchemy model" --
-    scored as falling for the trap. Rejecting a premise requires naming the premise.
-    The self-test caught it before a single run was scored.
-
-    An occurrence counts as affirmed only when no negation appears in the run-up to
-    it. Crude, and deliberately so: this is reported as a heuristic verdict and never
-    added to the computed ones.
-    """
-    occurrences = list(re.finditer(re.escape(term), text, re.I))
-    if not occurrences:
-        return False
-    return any(not _NEGATION.search(text[max(0, m.start() - 80):m.start()])
-               for m in occurrences)
 
 
 def rejects_premise(false_terms: tuple[str, ...], true_terms):
