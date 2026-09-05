@@ -796,6 +796,7 @@ async def run(request: RunRequest, http_request: Request):
         "read_only": request.read_only,
         "team_name": gate_team_name,
         "synthesis_run": request.synthesis_run,
+        "solo": request.solo,
     }
     result, tokens, clarification = await _run_worker_subprocess(http_request, worker_payload)
 

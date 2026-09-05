@@ -179,6 +179,7 @@ async def _run_worker() -> dict:
             liveness_path=payload.get("liveness_path"),
             team_name=payload.get("team_name"),
             synthesis_run=payload.get("synthesis_run", False),
+            solo=payload.get("solo", False),
         )
         return {"content": content, "tokens": tokens, "clarification": clarification}
     except Exception as exc:

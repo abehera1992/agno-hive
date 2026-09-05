@@ -11274,6 +11274,7 @@ async def run_task_async(
     liveness_path: str | None = None,
     team_name: str | None = None,
     synthesis_run: bool = False,
+    solo: bool = False,
 ) -> tuple[str, dict, dict | None]:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer.
 
@@ -11664,6 +11665,43 @@ async def run_task_async(
                     span.set_status(trace.StatusCode.OK)
                     task_counter.add(1, {"project_id": project_id, "outcome": "clarification"})
                     return content, tokens, clarification
+                # ── solo answer (A/B, 2026-09-05) ────────────────────────────
+                # Deliver the MEMBER's own text instead of the coordinator's synthesis.
+                #
+                # Everything else about the run is unchanged -- same team, same
+                # delegation, same tools, same hooks, same guards below. The single
+                # variable is who authors the answer, which is the whole hypothesis:
+                # the members are accurate and the synthesis step is where content is
+                # lost and invented.
+                #
+                # Why that hypothesis, in one case: battery4's X2 coordinator wrote
+                # "the file .../storage/storageApi.ts defines the core upload interface"
+                # in its own draft, had the Researcher open that exact file, and
+                # delivered "the slice is imagegenApi.ts; there is no storage slice" --
+                # while dropping 20 of the 23 filenames its member handed it. Across all
+                # runs the coordinator sees 1/15th to 1/83rd of what members read, holds
+                # NO tools at all (teams/engineering.yaml: `coordinator_tools: []`, so it
+                # cannot check a word it writes), and is the only agent whose prompt
+                # carries the user's question and its presuppositions.
+                #
+                # Not a merge and not a fallback: if a member produced nothing, the
+                # coordinator's content stands, because an empty answer is worse than a
+                # lossy one. Longest wins among members -- the enumerations this battery
+                # cares about are the long results, and picking "latest" would take a
+                # follow-up delegation that only re-checked one detail.
+                if solo:
+                    _mr = getattr(team, "_member_results", None)
+                    _cands = [t for t in (_mr or {}).values() if t and t.strip()]
+                    if _cands:
+                        _best = max(_cands, key=len)
+                        print(f"[team] solo: delivering the member's own answer "
+                              f"({len(_best):,} chars) instead of the coordinator's "
+                              f"synthesis ({len(content or ''):,} chars)", flush=True)
+                        content = _best
+                    else:
+                        print("[team] solo: no member result captured — keeping the "
+                              "coordinator's answer", flush=True)
+
                 # Tier-3 guard: fill any [[COUNT ...]] markers with deterministic counts.
                 try:
                     _cm_url, _cm_tools = _pick_hive_mcp(mcp_by_url, "count_matches")

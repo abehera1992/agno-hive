@@ -62,6 +62,10 @@ class RunRequest(BaseModel):
                                           # team be used read-only per request instead of
                                           # duplicating the team YAML.
 
+    # A/B (2026-09-05): deliver the member's own answer rather than the
+    # coordinator's synthesis. Off by default; nothing else about the run
+    # changes, so a paired run isolates the synthesis step.
+    solo: bool = False
 
 class SessionMeta(BaseModel):
     session_id: str
