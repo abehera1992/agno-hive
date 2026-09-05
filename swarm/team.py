@@ -1583,6 +1583,7 @@ _GUARD_BANNERS = (
     # was missed: a liveness-killed draft never passed a guard chain at all.
     "RUN STOPPED EARLY",
     "THIS RUN PRODUCED NO ANSWER",
+    "UNVERIFIED CLAIMS, AND THE CORRECTION ATTEMPT DID NOT COMPLETE",
 )
 
 
@@ -2278,8 +2279,13 @@ _MODEL_DIRECTED_VERDICT_RE = re.compile(
 )
 
 
+# Every prefix verify_claims can emit for a finding that counts toward `problems`.
+# Two were missing until 2026-09-05 and the omission was visible in the journal as a
+# verdict contradicting itself -- "bad=True ... | clean - nothing flagged" -- on three
+# real runs (battery1 G1, battery2 G1, battery2 F1). A reader of that line cannot tell
+# whether the checker found something or not.
 _VERDICT_FLAG_PREFIXES = ("NOT FOUND", "MISMATCH", "AMBIGUOUS", "DOC ONLY", "BAD",
-                          "CONTRADICTED", "SPLIT-FOUND")
+                          "CONTRADICTED", "SPLIT-FOUND", "NOT IN FILE", "BLOCK NOT IN")
 
 
 def _verdict_digest(report: str, limit: int = 4) -> str:
@@ -4630,7 +4636,28 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # the whole remainder of the line rather than _claim_token's first-word split.
     lint_violations = [ln.strip()[len("VIOLATION"):].strip()
                         for ln in report.splitlines() if ln.strip().startswith("VIOLATION")]
-    if not missing_symbols and not bad_citations and not lint_violations:
+    # A quoted code block attributed to a file it is not in, and a symbol claimed to be
+    # in a file where it does not appear. Both count toward verify_claims' `problems`,
+    # so both set bad=True -- and until 2026-09-05 neither was extracted here, so a
+    # report containing ONLY these fell through the early return below: no retry, no
+    # banner, nothing said. Detection with no delivery.
+    #
+    # Confirmed against the live container rather than by reading: battery2's U1
+    # fabricated a `"p99": 500` block attributed to a real krakend/krakend.json. The
+    # deployed verify_claims reports it exactly right --
+    #   BLOCK NOT IN krakend/krakend.json <-- none of the 4 quoted lines appear
+    # -- and feeding that report through this function's own extraction returned three
+    # empty lists. The check shipped the day before could detect the fabrication and
+    # tell nobody, which is the failure mode it was written to close.
+    block_findings = [ln.strip()[len("BLOCK NOT IN"):].strip()
+                      for ln in report.splitlines()
+                      if ln.strip().startswith("BLOCK NOT IN")]
+    structural_findings = [ln.strip()[len("NOT IN FILE"):].strip()
+                           for ln in report.splitlines()
+                           if ln.strip().startswith("NOT IN FILE")]
+
+    if not (missing_symbols or bad_citations or lint_violations
+            or block_findings or structural_findings):
         return content + _summarize_actual_writes(*all_results)
     if len(all_results) > 1:
         # Aggregate retry budget already spent by an earlier guard this call --
@@ -4712,6 +4739,23 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"something else that could be improved — fix only the exact "
             f"violation named above and nothing else."
         )
+    if block_findings:
+        named = "; ".join(block_findings[:3])
+        # Re-read, or retract. A block that is not in the file it names is either a
+        # misremembered quotation or an invention, and both are fixed the same way.
+        instructions.append(
+            f"the answer shows a code block attributed to a file that does not contain "
+            f"it: {named}. Call get_file_content on that file and quote what is actually "
+            f"there, or drop the block entirely and state plainly that the value is not "
+            f"present in this project. Do not reproduce the block as it stands."
+        )
+    if structural_findings:
+        named = "; ".join(structural_findings[:3])
+        instructions.append(
+            f"a claim places something in a file that does not contain it: {named}. "
+            f"Re-read the file with get_file_content and either cite where the thing "
+            f"really is, or say it is not there."
+        )
     retry_prompt = f"{task}\n\nIMPORTANT: " + " Also, ".join(instructions)
     # Snapshotted so the retry's OWN reads can be measured as a delta (2026-08-21).
     # The run-scoped log is cumulative, so comparing its total would always look like
@@ -4724,9 +4768,11 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         all_results.append(retry)
     except Exception as exc:
         print(f"[team] verify retry failed: {exc}")
-        return content + _summarize_actual_writes(*all_results)
+        return content + _flagged_draft_note(report) + _summarize_actual_writes(*all_results)
     if not corrected:
-        return content + _summarize_actual_writes(*all_results)
+        print("[team] correction retry returned nothing — surfacing the original "
+              "report rather than shipping the flagged draft silently", flush=True)
+        return content + _flagged_draft_note(report) + _summarize_actual_writes(*all_results)
 
     # The one retry site that never went through _adopt_retry, wired in 2026-09-04.
     # Two live stubs forced it: subset17's T12 delivered exactly
@@ -4807,6 +4853,29 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 + unread_note
                 + _summarize_actual_writes(*all_results))
     return corrected + unread_note + _summarize_actual_writes(*all_results)
+
+
+
+def _flagged_draft_note(report: str) -> str:
+    """Disclosure for a draft we KNOW is bad and could not correct.
+
+    Both exits from the correction retry -- it raised, or it came back empty -- used to
+    `return content` bare. The draft that reaches them has already failed verify_claims;
+    that is why the retry ran. So the one case where the answer is known to be wrong and
+    nothing can be done about it was also the case where the reader was told least.
+
+    Found 2026-09-05 by replaying battery2's fabricated U1 through this function with a
+    retry that returns nothing: the invented `"p99": 500` block shipped byte-identical to
+    the draft, no banner, and _is_success_exemplar said True. The preceding fix had
+    correctly routed the finding INTO the retry, and the retry's own failure path threw
+    it away again.
+    """
+    if not report:
+        return ""
+    return (f"\n\n---\n**UNVERIFIED CLAIMS, AND THE CORRECTION ATTEMPT DID NOT "
+            f"COMPLETE — the checks below flagged this answer and the one retry this "
+            f"run allows produced nothing to replace it with, so what you are reading "
+            f"is the flagged draft:**\n```\n{_reader_facing_report(report)}\n```")
 
 
 async def _fill_count_markers(content: str, hive_mcp_url: str | None,
