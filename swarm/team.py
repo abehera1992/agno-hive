@@ -1569,6 +1569,19 @@ _GUARD_BANNERS = (
     "Answered by the coordinator alone",
     "ADOPTS A PREMISE THIS ANSWER'S OWN FINDINGS DENY",
     "BOTH SIDES WERE NOT ENUMERATED",
+    # Four banners that guards emit but this tuple never listed, found 2026-09-04 by
+    # diffing the emitters against this list. The tuple's own docstring claims to hold
+    # EVERY banner, and _is_success_exemplar is its only consumer -- so each omission
+    # meant an answer a guard had just flagged still qualified as a "how to answer
+    # well" exemplar for the experience namespace. That is the exact outcome
+    # _is_success_exemplar exists to prevent, and its docstring calls storing such an
+    # answer worse than storing nothing.
+    "THE COUNT ONLY ADDS UP BECAUSE AN ITEM NAMES NOTHING",
+    "THE COUNT IS STATED BUT THE LIST IS NOT",
+    "THE COMPARISON, COMPUTED",
+    # Emitted by api/server.py, not by a guard in this module, which is likely why it
+    # was missed: a liveness-killed draft never passed a guard chain at all.
+    "RUN STOPPED EARLY",
 )
 
 
