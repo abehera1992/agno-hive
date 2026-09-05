@@ -320,6 +320,18 @@ class _ToolCallRecoveryMixin:
         if _ToolCallRecoveryMixin._delta_calls in (1, 100, 1000, 10000):
             print(f"[toolfix] delta parser reached {_ToolCallRecoveryMixin._delta_calls} "
                   f"time(s) — the override IS in the production path", flush=True)
+        # WHERE is the tag, if not in content? agno populates reasoning_content two
+        # ways (openai/chat.py): from the provider's own delta field, and by pulling
+        # it out of content via extract_thinking_content -- which runs in super()
+        # BEFORE this line. Either would leave content clean while the text still
+        # exists, which matches every measurement so far: parser hot, tag never seen,
+        # leak downstream. This looks in the other places it could be.
+        for _attr in ("reasoning_content", "thinking", "redacted_reasoning_content"):
+            _val = getattr(model_response, _attr, None)
+            if isinstance(_val, str) and _TC_OPEN in _val:
+                print(f"[toolfix] FOUND the tag in {_attr} ({len(_val)} chars) — "
+                      f"content={len(model_response.content or '')} chars", flush=True)
+                break
         # Same placement rationale as the non-streaming parser above. Usage rides
         # on the FINAL chunk only (stream_options include_usage), so this is a
         # no-op on the thousands of content deltas and fires once per call.
