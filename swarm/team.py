@@ -7937,17 +7937,6 @@ def _build_team(
             getattr(t, "name", "") for t in (getattr(_m, "tools", []) or [])
             if getattr(t, "name", "")
         }
-        # Which MODEL OBJECT this member actually holds (2026-09-05, temporary).
-        # get_model() returns VLLMToolFix when called directly, and both tool-call
-        # recovery parsers are on that class -- yet a five-task run produced 13 delta
-        # calls, six leaked-syntax strips and a member discard, with the non-streaming
-        # parser never called once. If members hold something other than VLLMToolFix,
-        # every tool-call recovery in this codebase has been inert for member turns.
-        _mm = getattr(_m, "model", None)
-        print(f"[team] member model {_agno_member_id(_m)!r}: {type(_mm).__name__} "
-              f"id={getattr(_mm, 'id', '?')!r} "
-              f"delta_parser={getattr(type(_mm), '_parse_provider_response_delta', None) is not None and type(_mm)._parse_provider_response_delta.__qualname__.split('.')[0]}",
-              flush=True)
         print(f"[team] member surface {_agno_member_id(_m)!r} ({len(getattr(_m, 'tools', []) or [])}): "
               f"{[getattr(t, 'name', type(t).__name__) for t in (getattr(_m, 'tools', []) or [])]} "
               f"tool_call_limit={getattr(_m, 'tool_call_limit', None)}", flush=True)
@@ -8026,11 +8015,6 @@ def _build_team(
         tool_call_limit=_resolve_tool_call_limit(team_name, "Coordinator"),
         tool_hooks=_hooks_for("Coordinator"),
     )
-    _cm = getattr(team, "model", None)
-    print(f"[team] coordinator model: {type(_cm).__name__} id={getattr(_cm, 'id', '?')!r} "
-          f"owner={type(_cm)._parse_provider_response_delta.__qualname__.split('.')[0] if hasattr(type(_cm), '_parse_provider_response_delta') else 'n/a'}",
-          flush=True)
-
     # Expose the delegation hook's closure-local counter on the team object so
     # _verified_answer can ask "did the coordinator delegate at all this run?" after
     # the run completes. Attribute rather than a changed return signature: every

@@ -80,37 +80,7 @@ from agno.models.openai.like import OpenAILike
 from agno.models.response import ModelResponse
 
 
-# Largest partial tool call to hold before deciding it is not one. A member's whole
-# report can be longer than this; the buffer only ever holds text after an opening
-# "<tool_call>" tag, so the cap bounds a malformed emission, not an answer.
-_TC_OPEN = "<tool_call>"
-
-
-def _open_tag_prefix_len(text: str) -> int:
-    """How many trailing characters of `text` could still grow into _TC_OPEN.
-
-    "…the <too" -> 4, so those four are withheld until the next delta decides. Returns
-    0 when nothing at the end could become the tag, which is the case for essentially
-    every chunk of ordinary prose.
-    """
-    if not text:
-        return 0
-    for n in range(min(len(text), len(_TC_OPEN) - 1), 0, -1):
-        if _TC_OPEN.startswith(text[-n:]):
-            return n
-    return 0
-
-
-_TC_BUFFER_CAP = 8192
-
-
 class _ToolCallRecoveryMixin:
-    # Instrumentation counter (temporary). Class-level on purpose: every agent builds
-    # its own model instance, so a per-instance counter would report 1 forever and say
-    # nothing about whether the path is hot.
-    _delta_calls = 0
-    _full_calls = 0
-
     """Shared parsing + response-hook logic for OllamaToolFix and VLLMToolFix.
     Relies on `super()._parse_provider_response(...)` / `..._delta(...)`
     resolving to the real base model class (Ollama or OpenAILike) via each
@@ -273,20 +243,6 @@ class _ToolCallRecoveryMixin:
 
     def _parse_provider_response(self, response: dict) -> ModelResponse:
         model_response = super()._parse_provider_response(response)
-        # Companion to the delta counter (2026-09-05). The delta path is provably hot
-        # (1,000+ calls per task) and provably never sees the leaked tag -- buffering
-        # STARTED fired 0 times across a run with 5 strip calls. Either these turns
-        # come through HERE instead, or there is a third producer. One counter
-        # discriminates; four hypotheses without one were wrong.
-        _ToolCallRecoveryMixin._full_calls += 1
-        if _ToolCallRecoveryMixin._full_calls in (1, 10, 100):
-            print(f"[toolfix] NON-STREAM parser reached "
-                  f"{_ToolCallRecoveryMixin._full_calls} time(s)", flush=True)
-        if model_response.content and _TC_OPEN in (model_response.content or ""):
-            print(f"[toolfix] NON-STREAM saw a leaked tag in "
-                  f"{len(model_response.content)} chars of content "
-                  f"(tool_calls={bool(model_response.tool_calls)}, "
-                  f"tool_choice={getattr(self, '_tool_choice', None)!r})", flush=True)
         # Before any early return below -- a turn that came back as a tool call has
         # the same prompt behind it as one that came back as prose, and skipping it
         # would blind the budget to exactly the tool-heavy runs that overflow.
@@ -310,134 +266,18 @@ class _ToolCallRecoveryMixin:
 
     def _parse_provider_response_delta(self, response: Any) -> ModelResponse:
         model_response = super()._parse_provider_response_delta(response)
-        # Instrumentation (2026-09-05, temporary). Everything about this path checks
-        # out statically -- right class, bound override, agno yields through it,
-        # agno accumulates what it returns, and the deployed file recovers a
-        # one-character stream when driven directly -- and a raw "<tool_call>" still
-        # reaches the answer in production. Static reasoning has produced two wrong
-        # causal claims already; this prints what actually happens instead.
-        _ToolCallRecoveryMixin._delta_calls += 1
-        if _ToolCallRecoveryMixin._delta_calls in (1, 100, 1000, 10000):
-            print(f"[toolfix] delta parser reached {_ToolCallRecoveryMixin._delta_calls} "
-                  f"time(s) — the override IS in the production path", flush=True)
-        # WHERE is the tag, if not in content? agno populates reasoning_content two
-        # ways (openai/chat.py): from the provider's own delta field, and by pulling
-        # it out of content via extract_thinking_content -- which runs in super()
-        # BEFORE this line. Either would leave content clean while the text still
-        # exists, which matches every measurement so far: parser hot, tag never seen,
-        # leak downstream. This looks in the other places it could be.
-        for _attr in ("reasoning_content", "thinking", "redacted_reasoning_content"):
-            _val = getattr(model_response, _attr, None)
-            if isinstance(_val, str) and _TC_OPEN in _val:
-                print(f"[toolfix] FOUND the tag in {_attr} ({len(_val)} chars) — "
-                      f"content={len(model_response.content or '')} chars", flush=True)
-                break
         # Same placement rationale as the non-streaming parser above. Usage rides
         # on the FINAL chunk only (stream_options include_usage), so this is a
         # no-op on the thousands of content deltas and fires once per call.
         _record_input_tokens(model_response)
 
         if model_response.tool_calls:
-            self._tc_buffer = ""
             return model_response
 
         if self._sanitize_forced_text(model_response):
             return model_response
 
         if model_response.content:
-            # Recover a call that arrives SPLIT ACROSS DELTAS, which is every one of
-            # them on this path. The single-delta parse below cannot see it: content
-            # streams in fragments as small as one character, so an 11-character
-            # "<tool_call>" tag is spread over 11 deltas and no individual fragment
-            # ever contains a complete call. The recovery has been here since the
-            # 2026-08-15 port and has been structurally unreachable while streaming.
-            #
-            # Measured 2026-09-05 across two days: 21 of 159 member episodes (13%)
-            # end with the member emitting a tool call that arrives as prose, and
-            # those runs hold ALL 5 verified fabrications in the corpus. Ruled out as
-            # causes, with data: our own _force_text_only (0 of 24 leaks preceded by a
-            # forcing line, whole-run window), agno's tool_call_limit (leaks at 13, 15
-            # and 16 cumulative calls against limits of 25/45/80, 0 of 24 reaching
-            # one), and parser misconfiguration (--enable-auto-tool-choice
-            # --tool-call-parser hermes is set, and vLLM logs zero parse errors). The
-            # emission itself is well formed and starts at character 0 --
-            # "content: +11 chars (11 total) -- '<tool_call>'".
-            #
-            # Buffering starts ONLY once an opening tag is seen and ends at the
-            # closing tag, so ordinary prose never accumulates and a normal answer
-            # streams through untouched. Content is withheld while buffering,
-            # because emitting the fragments is exactly how the tag reached a user.
-            buf = getattr(self, "_tc_buffer", "")
-            # The trigger has to be PREFIX-aware, not a containment test. The first
-            # version of this fix asked `"<tool_call>" in content` and reproduced the
-            # exact blindness it was written to remove: with one character per delta,
-            # no single chunk ever contains the eleven-character tag, so buffering
-            # never started. Caught by replaying a real leak one character at a time.
-            #
-            # So: carry any trailing text that could still BECOME the tag, and decide
-            # once enough characters have arrived.
-            if not buf:
-                combined = getattr(self, "_tc_pend", "") + model_response.content
-                if _TC_OPEN in combined:
-                    print(f"[toolfix] buffering STARTED (delta={len(model_response.content)} "
-                          f"chars, pend={len(getattr(self, '_tc_pend', ''))})", flush=True)
-                    head, _, rest = combined.partition(_TC_OPEN)
-                    self._tc_pend = ""
-                    buf = _TC_OPEN + rest
-                    model_response.content = head      # anything before the tag is real
-                else:
-                    keep = _open_tag_prefix_len(combined)
-                    if keep:
-                        self._tc_pend = combined[-keep:]
-                        model_response.content = combined[:-keep]
-                    else:
-                        self._tc_pend = ""
-                        model_response.content = combined
-                    if not buf:
-                        if model_response.content:
-                            parsed = self._parse_tool_calls_from_content(
-                                model_response.content)
-                            if parsed:
-                                tool_calls = self._to_tool_calls(parsed)
-                                if tool_calls:
-                                    model_response.tool_calls = tool_calls
-                                    model_response.content = ""
-                        return model_response
-            else:
-                buf += model_response.content
-            if buf:
-                # A runaway buffer would swallow a whole answer if the closing tag
-                # never arrives. Past the cap, give the text back rather than eat it.
-                if len(buf) > _TC_BUFFER_CAP:
-                    print(f"[toolfix] buffer hit the {_TC_BUFFER_CAP} cap — releasing "
-                          f"{len(buf)} chars back as content", flush=True)
-                    self._tc_buffer = ""
-                    model_response.content = buf
-                    return model_response
-                if "</tool_call>" in buf:
-                    print(f"[toolfix] buffering CLOSED at {len(buf)} chars — "
-                          f"attempting recovery", flush=True)
-                    self._tc_buffer = ""
-                    parsed = self._parse_tool_calls_from_content(buf)
-                    if parsed:
-                        tool_calls = self._to_tool_calls(parsed)
-                        if tool_calls:
-                            print(f"[toolfix] RECOVERED a leaked call: "
-                                  f"{[t.get('function', {}).get('name') for t in tool_calls]}",
-                                  flush=True)
-                            model_response.tool_calls = tool_calls
-                            model_response.content = ""
-                            return model_response
-                    # Not a real call after all -- a quotation, or malformed. Hand the
-                    # text back verbatim; swallowing a genuine quotation would be its
-                    # own fabrication, the rule _strip_leaked_tool_tags already keeps.
-                    model_response.content = buf
-                    return model_response
-                # Mid-call: hold the fragment back and wait for the rest.
-                self._tc_buffer = buf
-                model_response.content = ""
-                return model_response
-
             parsed = self._parse_tool_calls_from_content(model_response.content)
             if parsed:
                 tool_calls = self._to_tool_calls(parsed)
