@@ -4229,44 +4229,6 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             + _tail()
         )
 
-    # Relay drop (2026-09-05). _recovered_member_findings has existed for a while and
-    # had exactly ONE caller: the guard above, which triggers on
-    # _completion_claim_instead_of_answer -- a CHARACTER-LENGTH test. So the members'
-    # own text was recovered only when the coordinator wrote a conspicuously SHORT
-    # answer, which fired 27 times in the whole journal.
-    #
-    # Losing the findings and writing a short answer are different things. The common
-    # case is a normal-length, plausible answer carrying a fraction of what was found,
-    # and a length gate cannot see it. Measured over 84 runs with coverage logging:
-    # overall item retention 154/482 = 32%, with "24 named / 0 kept" recurring NINE
-    # times -- the coordinator handed 24 filenames and passing on none, in an answer
-    # long enough to look finished.
-    #
-    # The item-capture beside _member_items was left deliberately unread, its comment
-    # asking for exactly this before anything was built: "the attachment is not built
-    # until the fire rate and correctness are measured over real runs". Those numbers
-    # now exist. At >=3 named and <=25% kept the trigger fires on 15 of 84 runs (18%);
-    # the alternatives measured were kept-0 (12%) and <=50% (21%).
-    #
-    # Appends, never replaces -- same rule as the guard above. The coordinator's
-    # summary may be a correct precis of a subset, and substituting for it would hide
-    # what it chose to say. The reader gets both, labelled.
-    if (len(_member_union) >= _RELAY_DROP_MIN_ITEMS
-            and len(_member_union) - len(_missing)
-                <= _RELAY_DROP_MAX_KEPT_RATIO * len(_member_union)):
-        _kept_n = len(_member_union) - len(_missing)
-        print(f"[team] relay drop: members named {len(_member_union)}, answer kept "
-              f"{_kept_n} — flagging + attaching the members' own findings", flush=True)
-        return (
-            f"{content}\n\n---\n**MOST OF WHAT THIS RUN FOUND IS NOT IN THE ANSWER — "
-            f"the members identified {len(_member_union)} items and the answer above "
-            f"names {_kept_n} of them. What is here may be correct; the rest was "
-            f"gathered and then left out, so do not read this as the full picture. "
-            f"Not carried through: {', '.join(_missing[:12])}"
-            f"{'…' if len(_missing) > 12 else ''}.**"
-            + _recovered_member_findings(team)
-            + _tail()
-        )
 
     # Thin-answer tool-evidence check (2026-08-28). Deliberately measured against what
     # was READ, not against what members RELAYED -- the guard directly above compares
@@ -4508,6 +4470,58 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"list. The underlying facts may well be correct; they simply cannot be "
             f"checked without redoing the work. Ask again for the items themselves if "
             f"you need to verify them.**"
+            + _tail()
+        )
+
+    # Ordered AFTER the enumeration guards deliberately (2026-09-05). First-match-wins:
+    # when this block sat above them it claimed E1 -- a plain "list every file" ask --
+    # and attached a member's PARAPHRASE where ASKED FOR A LIST would have attached the
+    # run's own directory listing, the tool's output verbatim. The specific guard should
+    # own the specific case; this one exists for the trace and overview questions where
+    # nothing else fires.
+    # Relay drop (2026-09-05). _recovered_member_findings has existed for a while and
+    # had exactly ONE caller: the guard above, which triggers on
+    # _completion_claim_instead_of_answer -- a CHARACTER-LENGTH test. So the members'
+    # own text was recovered only when the coordinator wrote a conspicuously SHORT
+    # answer, which fired 27 times in the whole journal.
+    #
+    # Losing the findings and writing a short answer are different things. The common
+    # case is a normal-length, plausible answer carrying a fraction of what was found,
+    # and a length gate cannot see it. Measured over 84 runs with coverage logging:
+    # overall item retention 154/482 = 32%, with "24 named / 0 kept" recurring NINE
+    # times -- the coordinator handed 24 filenames and passing on none, in an answer
+    # long enough to look finished.
+    #
+    # The item-capture beside _member_items was left deliberately unread, its comment
+    # asking for exactly this before anything was built: "the attachment is not built
+    # until the fire rate and correctness are measured over real runs". Those numbers
+    # now exist. At >=3 named and <=25% kept the trigger fires on 15 of 84 runs (18%);
+    # the alternatives measured were kept-0 (12%) and <=50% (21%).
+    #
+    # Appends, never replaces -- same rule as the guard above. The coordinator's
+    # summary may be a correct precis of a subset, and substituting for it would hide
+    # what it chose to say. The reader gets both, labelled.
+    if (len(_member_union) >= _RELAY_DROP_MIN_ITEMS
+            and len(_member_union) - len(_missing)
+                <= _RELAY_DROP_MAX_KEPT_RATIO * len(_member_union)):
+        _kept_n = len(_member_union) - len(_missing)
+        print(f"[team] relay drop: members named {len(_member_union)}, answer kept "
+              f"{_kept_n} — flagging + attaching the members' own findings", flush=True)
+        return (
+            f"{content}\n\n---\n**MOST OF WHAT THIS RUN FOUND IS NOT IN THE ANSWER — "
+            f"the members identified {len(_member_union)} items and the answer above "
+            f"names {_kept_n} of them. What is here may be correct; the rest was "
+            f"gathered and then left out, so read it as partial. "
+            # Wording matters here in a way it normally would not. The first version
+            # ended "...do not read this as the full picture. Not carried through: X,
+            # Y, Z" -- and a negation-scoped name checker reads each of those names as
+            # DENIED, because the clause running up to them says "not". battery7's E1
+            # scored 12/24 files missing while all 24 were present in the answer, and
+            # the 12 were exactly the ones this line prints. A banner that lists names
+            # must not put a negation in front of them.
+            f"Gathered but missing above: {', '.join(_missing[:12])}"
+            f"{'…' if len(_missing) > 12 else ''}.**"
+            + _recovered_member_findings(team)
             + _tail()
         )
 
