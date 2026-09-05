@@ -109,6 +109,7 @@ class _ToolCallRecoveryMixin:
     # its own model instance, so a per-instance counter would report 1 forever and say
     # nothing about whether the path is hot.
     _delta_calls = 0
+    _full_calls = 0
 
     """Shared parsing + response-hook logic for OllamaToolFix and VLLMToolFix.
     Relies on `super()._parse_provider_response(...)` / `..._delta(...)`
@@ -272,6 +273,20 @@ class _ToolCallRecoveryMixin:
 
     def _parse_provider_response(self, response: dict) -> ModelResponse:
         model_response = super()._parse_provider_response(response)
+        # Companion to the delta counter (2026-09-05). The delta path is provably hot
+        # (1,000+ calls per task) and provably never sees the leaked tag -- buffering
+        # STARTED fired 0 times across a run with 5 strip calls. Either these turns
+        # come through HERE instead, or there is a third producer. One counter
+        # discriminates; four hypotheses without one were wrong.
+        _ToolCallRecoveryMixin._full_calls += 1
+        if _ToolCallRecoveryMixin._full_calls in (1, 10, 100):
+            print(f"[toolfix] NON-STREAM parser reached "
+                  f"{_ToolCallRecoveryMixin._full_calls} time(s)", flush=True)
+        if model_response.content and _TC_OPEN in (model_response.content or ""):
+            print(f"[toolfix] NON-STREAM saw a leaked tag in "
+                  f"{len(model_response.content)} chars of content "
+                  f"(tool_calls={bool(model_response.tool_calls)}, "
+                  f"tool_choice={getattr(self, '_tool_choice', None)!r})", flush=True)
         # Before any early return below -- a turn that came back as a tool call has
         # the same prompt behind it as one that came back as prose, and skipping it
         # would blind the budget to exactly the tool-heavy runs that overflow.
