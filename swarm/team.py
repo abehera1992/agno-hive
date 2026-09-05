@@ -1585,6 +1585,7 @@ _GUARD_BANNERS = (
     "THIS RUN PRODUCED NO ANSWER",
     "UNVERIFIED CLAIMS, AND THE CORRECTION ATTEMPT DID NOT COMPLETE",
     "MOST OF WHAT THIS RUN FOUND IS NOT IN THE ANSWER",
+    "A MEMBER DID WORK THIS RUN AND REPORTED NONE OF IT",
 )
 
 
@@ -3568,7 +3569,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         _rs = getattr(team, "_read_state", None)
         completeness = _unchecked_completeness_block(
             content, _rs.get("enumerations") if isinstance(_rs, dict) else None)
-        return _fab_note + _cmp_note + completeness + _summarize_actual_writes(*all_results)
+        return (_fab_note + _cmp_note + completeness + _lost_report_evidence(team)
+                + _summarize_actual_writes(*all_results))
 
     # No-answer check, ahead of everything else -- there is nothing for a later guard
     # to examine, and every later guard would correctly find nothing wrong.
@@ -4717,7 +4719,12 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
 
     if not (missing_symbols or bad_citations or lint_violations
             or block_findings or structural_findings):
-        return content + _summarize_actual_writes(*all_results)
+        # _tail() is not reached on this path -- it belongs to the guards, and none
+        # fired. A lost report is a fact about the RUN, not a verdict on the answer,
+        # so it must survive a clean verification too; the runs it matters most for
+        # are exactly the ones where nothing else flagged anything.
+        return (content + _lost_report_evidence(team)
+                + _summarize_actual_writes(*all_results))
     if len(all_results) > 1:
         # Aggregate retry budget already spent by an earlier guard this call --
         # surface the verify_claims report rather than attempt a second full
@@ -9092,6 +9099,17 @@ def _record_stream_artifacts(team, out: dict) -> None:
                   f"{out.get('agent_name', '?')!r} was tool-call syntax only "
                   f"({len(raw_content)} chars) — discarding, delegation treated as "
                   f"failed", flush=True)
+            # Remember WHO lost a report, so the answer can carry what that member
+            # actually opened. Deliberately NOT stored in _member_results: the comment
+            # above is load-bearing -- the duplicate gate cannot tell a member that
+            # answered from one that emitted syntax, and recording anything there
+            # refuses the re-delegation that would fix the run. A separate attribute
+            # the gate never reads keeps both properties.
+            if not isinstance(getattr(team, "_discarded_delegations", None), dict):
+                team._discarded_delegations = {}
+            _who = _member_key(out.get("agent_name", ""))
+            team._discarded_delegations[_who] = (
+                team._discarded_delegations.get(_who, 0) + 1)
             return True
         out["content"] = content
         # Keyed by _member_key so 'context-router' and 'contextrouter' land in one
@@ -9972,6 +9990,51 @@ _EVIDENCE_HEADER = "── EVIDENCE FROM THE RUN ITSELF, not from the member ─
 
 _EVIDENCE_MANIFEST_FILES = 12      # named reads shown; beyond this the list stops helping
 _EVIDENCE_MANIFEST_MISSES = 8      # empty lookups shown -- the half that prevents invention
+
+
+
+def _lost_report_evidence(team) -> str:
+    """What a member opened, for members whose report was discarded as syntax.
+
+    Measured 2026-09-05 over two days of runs: 21 of 159 member episodes (13%) ended
+    with the member emitting tool-call syntax where its report belonged -- 100% of the
+    "did real work, relayed almost nothing" cases, and NOT caused by tool-limit forcing
+    (0% of them were preceded by a forcing line, against 9% of healthy episodes). The
+    24 runs containing one are where 5 of 5 verified fabrications live, with a 42%
+    bad-draft rate against a 12.5% base.
+
+    The chain is: member does the work -> emits <tool_call> instead of prose -> the
+    reply is correctly discarded -> the coordinator receives nothing -> re-delegates
+    (63% of these runs) -> STOP after three (33%) -> answers from nothing -> invents.
+
+    This does not prevent that. Injecting the manifest into the coordinator's context
+    BEFORE it writes is where the value would be, and it is not reachable from here:
+    on the streaming path delegate_task_to_member returns an async_generator, and
+    _evidence_manifest only rides on results that are already str (the duplicate gate
+    and the warn tier). Wrapping the generator is real surgery and is not this change.
+
+    So this is recovery, not prevention: the reader and verify_claims get the file list
+    the answer was written without. A manifest, never the content -- see
+    _evidence_manifest on why shipping what the member read relocates the context
+    problem instead of solving it.
+    """
+    lost = getattr(team, "_discarded_delegations", None)
+    if not isinstance(lost, dict) or not lost:
+        return ""
+    read_state = getattr(team, "_read_state", None)
+    blocks = []
+    for who in sorted(lost):
+        manifest = _evidence_manifest(read_state, who)
+        if manifest:
+            blocks.append(f"\n\nFrom {who} (report lost):{manifest}")
+    if not blocks:
+        return ""
+    n = sum(lost.values())
+    return (f"\n\n---\n**A MEMBER DID WORK THIS RUN AND REPORTED NONE OF IT — "
+            f"{n} delegation(s) came back as tool-call syntax instead of findings and "
+            f"were discarded, so the answer above was written without them. What those "
+            f"members actually opened is below; treat anything above that is not "
+            f"supported by it as unverified.**" + "".join(blocks))
 
 
 def _evidence_manifest(read_state, agent_key: str) -> str:
