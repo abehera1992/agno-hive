@@ -1582,6 +1582,7 @@ _GUARD_BANNERS = (
     # Emitted by api/server.py, not by a guard in this module, which is likely why it
     # was missed: a liveness-killed draft never passed a guard chain at all.
     "RUN STOPPED EARLY",
+    "THIS RUN PRODUCED NO ANSWER",
 )
 
 
@@ -3556,6 +3557,46 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         completeness = _unchecked_completeness_block(
             content, _rs.get("enumerations") if isinstance(_rs, dict) else None)
         return _fab_note + _cmp_note + completeness + _summarize_actual_writes(*all_results)
+
+    # No-answer check, ahead of everything else -- there is nothing for a later guard
+    # to examine, and every later guard would correctly find nothing wrong.
+    #
+    # Live (battery1 X2, 2026-09-04, 105s): the Researcher successfully read four
+    # storage-service files, but every piece of model text this run emitted was
+    # tool-call syntax and stripped to nothing (11->0, 128->0, 139->0, 256->0), the
+    # member result was discarded as syntax-only, and the coordinator re-delegated the
+    # same task three times before being stopped. _first_nonempty_after_stripping then
+    # correctly fell through to its last resort. The stub is not the bug -- there
+    # genuinely was no answer.
+    #
+    # The bug is that it shipped looking fine: "verify (draft): bad=False | clean --
+    # nothing flagged", no banner, and eligible as a success exemplar. A canned failure
+    # sentence passes every check for the same reason an empty answer does -- it makes
+    # no claims. "Nothing to check" and "checks out" have now reached a reader as the
+    # same verdict three separate times, through three different paths; this closes the
+    # one where no retry is involved at all.
+    if (content or "").strip() == _BUDGET_EXHAUSTED_ANSWER:
+        _mi = getattr(team, "_member_items", None)
+        _found = sorted({n for names in _mi.values() for n in names}) if isinstance(_mi, dict) else []
+        # A run can gather real evidence and still emit nothing usable. Naming what was
+        # read costs nothing and is the difference between "we learned nothing" and
+        # "we read these and lost the write-up".
+        _recovered = ("" if not _found else
+                      " This run's members did read: "
+                      + ", ".join("`%s`" % n for n in _found[:20])
+                      + ("," + " and %d more." % (len(_found) - 20) if len(_found) > 20 else ".")
+                      + " Those reads happened; the answer summarising them did not survive.")
+        print("[team] run produced no usable answer — every candidate stripped to "
+              "nothing; flagging", flush=True)
+        return (
+            f"{content}\n\n---\n**THIS RUN PRODUCED NO ANSWER — the text above is a "
+            f"canned failure message, not a result. Every candidate this run emitted was "
+            f"tool-call syntax that stripped to nothing, so there is no finding here to "
+            f"act on. Nothing below it was verified either: a checker finds no fault in "
+            f"this text only because it contains no claims.{_recovered} Re-run the "
+            f"task.**"
+            + _tail()
+        )
 
     # Unfinished-intent check, before every other guard — an answer whose own final
     # words describe a NEXT action rather than a completed one means the rest of its
