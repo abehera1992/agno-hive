@@ -1584,6 +1584,7 @@ _GUARD_BANNERS = (
     "RUN STOPPED EARLY",
     "THIS RUN PRODUCED NO ANSWER",
     "UNVERIFIED CLAIMS, AND THE CORRECTION ATTEMPT DID NOT COMPLETE",
+    "MOST OF WHAT THIS RUN FOUND IS NOT IN THE ANSWER",
 )
 
 
@@ -3529,6 +3530,11 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # (task-phrasing gating shuts out T12 entirely; directory-mention gating measured
     # 86% false attachment), so this one gets measured first.
     _mi = getattr(team, "_member_items", None)
+    # Defined unconditionally: the relay-drop guard below reads these, and a guard
+    # reading a different computation from the one the log prints is how the two
+    # silently disagree about the same run.
+    _member_union: list[str] = []
+    _missing: list[str] = []
     if isinstance(_mi, dict) and _mi:
         _member_union = sorted({n for names in _mi.values() for n in names})
         _answer_items = set(_RELAY_FILENAME_RE.findall(content or ""))
@@ -4220,6 +4226,45 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"correct; most of what was researched is simply not in it.**"
             + _recovered_member_findings(team)
             + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
+            + _tail()
+        )
+
+    # Relay drop (2026-09-05). _recovered_member_findings has existed for a while and
+    # had exactly ONE caller: the guard above, which triggers on
+    # _completion_claim_instead_of_answer -- a CHARACTER-LENGTH test. So the members'
+    # own text was recovered only when the coordinator wrote a conspicuously SHORT
+    # answer, which fired 27 times in the whole journal.
+    #
+    # Losing the findings and writing a short answer are different things. The common
+    # case is a normal-length, plausible answer carrying a fraction of what was found,
+    # and a length gate cannot see it. Measured over 84 runs with coverage logging:
+    # overall item retention 154/482 = 32%, with "24 named / 0 kept" recurring NINE
+    # times -- the coordinator handed 24 filenames and passing on none, in an answer
+    # long enough to look finished.
+    #
+    # The item-capture beside _member_items was left deliberately unread, its comment
+    # asking for exactly this before anything was built: "the attachment is not built
+    # until the fire rate and correctness are measured over real runs". Those numbers
+    # now exist. At >=3 named and <=25% kept the trigger fires on 15 of 84 runs (18%);
+    # the alternatives measured were kept-0 (12%) and <=50% (21%).
+    #
+    # Appends, never replaces -- same rule as the guard above. The coordinator's
+    # summary may be a correct precis of a subset, and substituting for it would hide
+    # what it chose to say. The reader gets both, labelled.
+    if (len(_member_union) >= _RELAY_DROP_MIN_ITEMS
+            and len(_member_union) - len(_missing)
+                <= _RELAY_DROP_MAX_KEPT_RATIO * len(_member_union)):
+        _kept_n = len(_member_union) - len(_missing)
+        print(f"[team] relay drop: members named {len(_member_union)}, answer kept "
+              f"{_kept_n} — flagging + attaching the members' own findings", flush=True)
+        return (
+            f"{content}\n\n---\n**MOST OF WHAT THIS RUN FOUND IS NOT IN THE ANSWER — "
+            f"the members identified {len(_member_union)} items and the answer above "
+            f"names {_kept_n} of them. What is here may be correct; the rest was "
+            f"gathered and then left out, so do not read this as the full picture. "
+            f"Not carried through: {', '.join(_missing[:12])}"
+            f"{'…' if len(_missing) > 12 else ''}.**"
+            + _recovered_member_findings(team)
             + _tail()
         )
 
@@ -10241,6 +10286,12 @@ def _checkpoint_block(team) -> str:
         + "\n".join(parts)[:_CHECKPOINT_TOTAL_CHARS]
         + "\n── end of prior findings ──"
     )
+
+
+# Relay-drop trigger. Measured over 84 runs (2026-09-05): >=3 named with <=25% kept
+# fires on 15 of them (18%). Below 3 items "most of it" is not a meaningful claim.
+_RELAY_DROP_MIN_ITEMS = 3
+_RELAY_DROP_MAX_KEPT_RATIO = 0.25
 
 
 def _recovered_member_findings(team) -> str:
