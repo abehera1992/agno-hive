@@ -102,7 +102,7 @@ def select(args) -> list:
     return tasks
 
 
-def execute(tasks, url: str, out: Path, timeout: int) -> list[dict]:
+def execute(tasks, url: str, out: Path, timeout: int, solo: bool = False) -> list[dict]:
     rows: list[dict] = []
     for t in tasks:
         if not t.available():
@@ -112,7 +112,7 @@ def execute(tasks, url: str, out: Path, timeout: int) -> list[dict]:
         t0 = time.time()
         try:
             with httpx.Client(timeout=timeout) as cl:
-                r = cl.post(url, json=dict(BASE, task=t.prompt))
+                r = cl.post(url, json=dict(BASE, task=t.prompt, solo=solo))
                 r.raise_for_status()
             row = {"id": t.id, "family": t.family, "prompt": t.prompt,
                    "text": r.json().get("result") or "", "secs": round(time.time() - t0)}
@@ -216,6 +216,9 @@ def main() -> int:
     ap.add_argument("--out")
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--score-only", help="score an existing results json, no hive calls")
+    # A/B: same tasks, same scoring, one variable -- who authors the answer.
+    ap.add_argument("--solo", action="store_true",
+                    help="ask hive to deliver the member's answer, not the coordinator's")
     args = ap.parse_args()
 
     if args.score_only:
@@ -229,7 +232,9 @@ def main() -> int:
         return 1
     out = Path(args.out) if args.out else _next_out()
     print("running %d tasks -> %s\n" % (len(tasks), out))
-    rows = execute(tasks, args.url, out, args.timeout)
+    print("mode: %s" % ("SOLO (member authors)" if args.solo else "TEAM (coordinator authors)"))
+    print()
+    rows = execute(tasks, args.url, out, args.timeout, solo=args.solo)
     score(rows)
     print("\nwrote %s" % out)
     return 0
