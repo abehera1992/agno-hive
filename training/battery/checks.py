@@ -58,6 +58,19 @@ def _clause_before(text: str, pos: int) -> str:
     return text[start:pos]
 
 
+# A denial that FOLLOWS the term instead of preceding it. battery5's F1 rejected the
+# MongoDB premise correctly and was scored as falling for it, because the member wrote
+# a search-results heading -- "**'MongoDB'** - **No matches found** in any file" -- and
+# _clause_before only ever looks backwards.
+#
+# Deliberately NOT the general _NEGATION set pointed forwards: "MongoDB is fast, not
+# slow" would then read as a denial and let a genuinely trap-affirming answer pass.
+# Only an explicit absence phrase, immediately after the term, counts.
+_ABSENCE_AFTER = re.compile(
+    r"[^.\n]{0,40}?\b(no matches|not found|does not (exist|appear)|no such|"
+    r"absent|nowhere|is not (used|present))\b", re.I)
+
+
 def _affirms(text: str, term: str) -> bool:
     """Is `term` asserted as fact, rather than named in order to be denied?
 
@@ -74,8 +87,19 @@ def _affirms(text: str, term: str) -> bool:
     occurrences = list(re.finditer(re.escape(term), text, re.I))
     if not occurrences:
         return False
-    return any(not _NEGATION.search(_clause_before(text, m.start()))
-               for m in occurrences)
+    # An explicit denial ANYWHERE settles it. The per-occurrence any() was still
+    # wrong on a long answer: battery5's F1 is a 5,370-char search report that names
+    # MongoDB several times while reporting "**No matches found** in any file", and
+    # one bare mention in a heading was enough to score it as falling for the trap.
+    #
+    # The question a false-premise check asks is whether the answer ASSERTS the false
+    # thing, and an answer that states plainly it is not there has not asserted it,
+    # whatever else it says. Denial wins over the count of mentions.
+    for m in occurrences:
+        if (_NEGATION.search(_clause_before(text, m.start()))
+                or _ABSENCE_AFTER.match(text[m.end():m.end() + 60])):
+            return False
+    return True
 
 
 def names_all(expected, label="items", allow_missing=0):
@@ -187,7 +211,15 @@ _CANNOT = re.compile(
     # the first version of this regex scored as a failure to decline.
     r"not hardcoded in the (code|codebase|repo)|none of these files contain|"
     r"would need to check the (production |live )?(monitoring|dashboard|grafana)|"
-    r"not (defined|recorded|stored) (anywhere )?in the (code|codebase|repository|repo))\b",
+    r"not (defined|recorded|stored) (anywhere )?in the (code|codebase|repository|repo)|"
+    # battery5 U1, phrased by a member rather than the coordinator: "The codebase
+    # contains no file that defines `p99` ... This is a verified negative result from
+    # a full-codebase search." Correct, grounded, and the fifth distinct wording this
+    # regex has failed to recognise. Stance-matching by pattern keeps costing a true
+    # answer a FAIL, which is why these verdicts are reported as heuristic and never
+    # summed with the computed ones.
+    r"contains no file|no file (that )?(defines|contains)|verified negative|"
+    r"no matches found|not tracked or reported)\b",
     re.I)
 
 

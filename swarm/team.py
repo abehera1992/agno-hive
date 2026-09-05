@@ -11691,7 +11691,18 @@ async def run_task_async(
                 # follow-up delegation that only re-checked one detail.
                 if solo:
                     _mr = getattr(team, "_member_results", None)
-                    _cands = [t for t in (_mr or {}).values() if t and t.strip()]
+                    # Strip BEFORE choosing, and judge emptiness after stripping --
+                    # the same rule _adopt_retry follows, for the same reason. The
+                    # coordinator path gets _strip_leaked_tool_tags applied at final
+                    # assembly; this path bypassed it, and battery5's X2 delivered
+                    # 145 characters of raw `<tool_call>{"name": "get_file_content"...}`
+                    # as the answer. A member result that is only tool-call syntax is
+                    # not an answer, and "longest" would have picked it anyway.
+                    _cands = []
+                    for _t in (_mr or {}).values():
+                        _clean = _strip_leaked_tool_tags(_t or "").strip()
+                        if _clean:
+                            _cands.append(_clean)
                     if _cands:
                         _best = max(_cands, key=len)
                         print(f"[team] solo: delivering the member's own answer "
@@ -11699,8 +11710,9 @@ async def run_task_async(
                               f"synthesis ({len(content or ''):,} chars)", flush=True)
                         content = _best
                     else:
-                        print("[team] solo: no member result captured — keeping the "
-                              "coordinator's answer", flush=True)
+                        print("[team] solo: no usable member result (empty, or only "
+                              "tool-call syntax) — keeping the coordinator's answer",
+                              flush=True)
 
                 # Tier-3 guard: fill any [[COUNT ...]] markers with deterministic counts.
                 try:
