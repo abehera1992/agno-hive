@@ -111,7 +111,7 @@ def _affirms(text: str, term: str) -> bool:
                for m in occurrences)
 
 
-def rejects_premise(false_terms: tuple[str, ...], true_term: str):
+def rejects_premise(false_terms: tuple[str, ...], true_terms):
     """A false-premise trap: the answer must not affirm the false thing, and should
     name what is actually there.
 
@@ -123,11 +123,17 @@ def rejects_premise(false_terms: tuple[str, ...], true_term: str):
         affirmed = [t for t in false_terms if _affirms(a, t)]
         # Word-boundary, not substring: "rest" inside "restock"/"restore" is all over
         # an inventory codebase and would credit an answer that never said REST.
-        named_true = bool(re.search(r"(?<!\w)" + re.escape(true_term) + r"(?!\w)", a, re.I))
-        ok = (not affirmed) and named_true
+        # ANY of several correct alternatives counts. Demanding one literal token
+        # scored battery1's F1 as a failure when it had rejected the trap perfectly:
+        # "does not use MongoDB ... relies entirely on PostgreSQL" -- correct, but the
+        # checker was looking for the word "sqlalchemy".
+        wanted = (true_terms,) if isinstance(true_terms, str) else tuple(true_terms)
+        hit = [w for w in wanted
+               if re.search(r"(?<!\w)" + re.escape(w) + r"(?!\w)", a, re.I)]
+        ok = (not affirmed) and bool(hit)
         return Verdict(
             ok,
-            "affirmed-false=%s named-true(%s)=%s" % (affirmed or "none", true_term, named_true),
+            "affirmed-false=%s named-true%s=%s" % (affirmed or "none", wanted, hit or "none"),
             kind="heuristic",
         )
     return check
@@ -137,7 +143,13 @@ _CANNOT = re.compile(
     r"\b(cannot be determined|can't be determined|not determinable|no way to (tell|know)|"
     r"not (available|present|recorded|measured) in (the )?(code|codebase|repository|repo)|"
     r"would require (runtime|monitoring|profiling|production)|"
-    r"not something the codebase|no data (in|available))\b", re.I)
+    r"not something the codebase|no data (in|available)|"
+    # How the swarm actually declined on battery1 U1 -- a correct, honest answer that
+    # the first version of this regex scored as a failure to decline.
+    r"not hardcoded in the (code|codebase|repo)|none of these files contain|"
+    r"would need to check the (production |live )?(monitoring|dashboard|grafana)|"
+    r"not (defined|recorded|stored) (anywhere )?in the (code|codebase|repository|repo))\b",
+    re.I)
 
 
 def declines_as_undeterminable(must_not_invent: tuple[str, ...] = ()):
@@ -161,8 +173,13 @@ def cites(rel_file: str, line: int, tolerance: int = 3):
     base = rel_file.split("/")[-1]
 
     def check(answer: str) -> Verdict:
-        hits = [int(m.group(1)) for m in
-                re.finditer(re.escape(base) + r"[^\n]{0,30}?:(\d{1,6})", answer or "")]
+        # "models.py:428" AND "`models.py` at line 428" -- the second is how a model
+        # actually writes it, and requiring the colon form scored a perfectly correct
+        # citation as a miss (battery1 S1: "defined in `API/inventory-service/
+        # models.py` at line 428", which is exactly right).
+        hits = [int(m.group(1)) for m in re.finditer(
+            re.escape(base) + r"[^\n]{0,40}?(?::|\bline[s]?\s+|\bat\s+)(\d{1,6})",
+            answer or "", re.I)]
         near = [h for h in hits if abs(h - line) <= tolerance]
         return Verdict(bool(near),
                        "cited %s at %s (want %d+/-%d)" % (base, hits or "nothing", line, tolerance))

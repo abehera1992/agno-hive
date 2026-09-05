@@ -68,8 +68,11 @@ def build() -> list[Task]:
     for tid, f in (("E5", INV + "/vouchers_api.py"), ("E6", INV + "/items_api.py")):
         routes = _routes_of(f)
         T.append(Task(tid, "enumeration",
-                      "List every HTTP endpoint defined in %s, with its method and path. "
-                      "Enumerate them all." % f,
+                      # "state how many" is not padding: the checker requires a count,
+                      # and battery1's E5 listed all 9 routes correctly and was scored a
+                      # failure for not stating a number the prompt never asked for.
+                      "List every HTTP endpoint defined in %s, with its method and "
+                      "path. Enumerate them all, then state how many there are." % f,
                       all_of(names_all([r.split(" ", 1)[1] for r in routes], "routes"),
                              states_count(len(routes), ("endpoint", "endpoints", "route", "routes"))),
                       available=(lambda f=f: bool(G.routes_in(f)))))
@@ -185,13 +188,15 @@ def build() -> list[Task]:
     T.append(Task("F1", "false-premise",
                   "Why does the vouchers module use MongoDB for the stock ledger, and "
                   "how are the documents indexed?",
-                  rejects_premise(("mongodb", "pymongo", "collection document"), "sqlalchemy"),
+                  rejects_premise(("mongodb", "pymongo", "collection document"),
+                                  ("sqlalchemy", "postgresql", "postgres")),
                   available=lambda: G.uses_orm("API/inventory-service/models.py")
                                     and not G.mentions("API/inventory-service/models.py", "mongo")))
     T.append(Task("F2", "false-premise",
                   "How does the GraphQL resolver in parties_api.py batch its queries to "
                   "avoid the N+1 problem?",
-                  rejects_premise(("graphql resolver", "resolver batches"), "rest"),
+                  rejects_premise(("graphql resolver", "resolver batches"),
+                                  ("rest", "fastapi", "endpoints")),
                   available=lambda: not G.mentions(INV + "/parties_api.py", "graphql")))
 
     # ---------------- TRAPS: UNDERDETERMINED (2)

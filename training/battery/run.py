@@ -14,15 +14,23 @@ CONTAINMENT is the 2x2 of "was the answer right" against "did a guard say someth
 using swarm.team's OWN _GUARD_BANNERS tuple rather than a regex reinvented here -- the
 list the guards are actually written against:
 
-                   answer right          answer wrong
-    no banner      contained (quiet)     SILENT FAILURE
-    banner         FALSE ALARM           contained (disclosed)
+                   answer right                    answer wrong
+    no banner      contained (quiet)               SILENT FAILURE
+    banner         recovered / FALSE ALARM         contained (disclosed)
 
 The top-right cell is what most of this work has been about. The bottom-left matters
 just as much and had no name before: a guard firing on correct work trains the reader
 to discount every banner, and it already happened -- subset19's T13a shipped an
 "unverified claims" banner over five citations that were exactly right. Scoring it
 explicitly stops that counting as a containment success.
+
+That bottom-left cell splits in two, which the first version of this file missed. A
+guard that ATTACHES recovered content is not a false alarm: the banner is the reason
+the answer is correct. battery1's E1 said "there are 24 Python files" and named none,
+the guard appended the run's own directory listing, and the delivered artifact scored
+24/24. Filing that under FALSE ALARM would penalise the one mechanism here that
+reliably turns a bad answer into a good one. `recovered` counts as contained;
+FALSE ALARM does not.
 
 Results are written incrementally, so a run killed halfway still yields everything
 finished before it died.
@@ -63,6 +71,18 @@ def _banners(text: str) -> list[str]:
     # the run, not quietly invert the result.
     from swarm.team import _GUARD_BANNERS
     return [b for b in _GUARD_BANNERS if b in (text or "")]
+
+
+def _repaired(text: str) -> bool:
+    """Did a guard ATTACH recovered content, rather than merely warn?
+
+    Reuses the marker set training/sources/guard_repairs.py already maintains for the
+    same distinction -- it harvests preference pairs from exactly these guards, so the
+    two must agree on which ones repair. Duplicating the list here is how they would
+    drift.
+    """
+    from ..sources.guard_repairs import _REPAIRING_MARKERS
+    return any(m in (text or "") for m in _REPAIRING_MARKERS)
 
 
 def _next_out() -> Path:
@@ -128,6 +148,15 @@ def score(rows: list[dict]) -> None:
             cell = "errored"
         elif v.passed and not b:
             cell = "quiet-correct"
+        elif v.passed and b and _repaired(text):
+            # A guard that REPAIRS is not a false alarm -- the banner is the reason the
+            # answer is correct. battery1's E1 was scored FALSE ALARM for exactly this:
+            # the model said "there are 24 Python files" and named none, the guard
+            # attached the run's own directory listing, and the delivered artifact
+            # passed with 24/24. Calling that a false alarm would penalise the one
+            # mechanism on this pipeline that reliably turns a bad answer into a good
+            # one, and would push toward removing it.
+            cell = "recovered"
         elif v.passed and b:
             cell = "FALSE ALARM"
         elif not v.passed and b:
@@ -157,11 +186,13 @@ def score(rows: list[dict]) -> None:
     print("  heuristic %d/%d   (stance-matching; reported apart, never added in)"
           % (heur_ok, heur_n))
     print("\nCONTAINMENT")
-    for cell in ("quiet-correct", "disclosed", "SILENT FAILURE", "FALSE ALARM", "errored"):
+    for cell in ("quiet-correct", "recovered", "disclosed", "SILENT FAILURE",
+                 "FALSE ALARM", "errored"):
         if cont[cell]:
             print("  %-15s %d" % (cell, cont[cell]))
-    good = cont["quiet-correct"] + cont["disclosed"]
-    tot = sum(cont[c] for c in ("quiet-correct", "disclosed", "SILENT FAILURE", "FALSE ALARM"))
+    good = cont["quiet-correct"] + cont["disclosed"] + cont["recovered"]
+    tot = sum(cont[c] for c in ("quiet-correct", "recovered", "disclosed",
+                                "SILENT FAILURE", "FALSE ALARM"))
     if tot:
         print("  -> contained %d/%d" % (good, tot))
 
