@@ -41,6 +41,7 @@ What is deliberately NOT harvested
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -85,6 +86,16 @@ _TASKS = {
 _MIN_MODEL_CHARS = 80          # below this the "answer" is a fragment, not an attempt
 _MIN_RECOVERED_CHARS = 120     # below this the repair added nothing worth learning
 
+# How many pairs may share ONE recovered block. Several different bad answers
+# corrected to the same good shape is real preference signal -- "many ways of being
+# wrong map to this right shape" -- so the cap is not 1. But it must be small:
+# measured 2026-09-04 over 19 battery runs, a single 489-char recovered block
+# appeared in 8 of 21 pairs (38% of the corpus) and T2 alone supplied 16 of 21 (76%).
+# Record.dedupe_key cannot see this -- it hashes prompt+chosen+rejected, so pairs
+# sharing a lesson but differing in the model text it corrects are all distinct
+# records. Redundancy of LESSONS is a source-level concern and belongs here.
+_MAX_PER_RECOVERED_BLOCK = 2
+
 
 def _split_at_first_banner(text: str) -> tuple[str, str]:
     """(model's own text, everything the guards appended). Split at the FIRST marker.
@@ -107,6 +118,8 @@ class GuardRepairsSource(Source):
         super().__init__()
         self.runs_dir = Path(runs_dir)
         self.glob = glob
+        # fingerprint of the recovered block -> how many pairs already carry it
+        self._block_counts: dict[str, int] = {}
 
     def load(self) -> Iterable[Record]:
         if not self.runs_dir.is_dir():
@@ -159,6 +172,14 @@ class GuardRepairsSource(Source):
             self.drop("no_signal_identical_sides")
             return None
 
+        # Cap how many pairs may teach the SAME correction. Without this the report
+        # shows a healthy total for a corpus that is mostly one lesson repeated.
+        fp = hashlib.sha1(appended.encode("utf-8")).hexdigest()
+        if self._block_counts.get(fp, 0) >= _MAX_PER_RECOVERED_BLOCK:
+            self.drop("recovered_block_over_represented")
+            return None
+        self._block_counts[fp] = self._block_counts.get(fp, 0) + 1
+
         return Record(
             kind="pref",
             source=self.name,
@@ -166,6 +187,10 @@ class GuardRepairsSource(Source):
             rejected=model_text,
             chosen=delivered,
             meta={
+                # build_dataset's report groups preference pairs by meta["shape"];
+                # keying it per TEST makes the task imbalance visible in the report
+                # itself rather than only under separate analysis.
+                "shape": f"guard_repairs:{tid}",
                 "run": run_name,
                 "test": tid,
                 "secs": row.get("secs"),
