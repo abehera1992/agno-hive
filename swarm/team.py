@@ -5263,6 +5263,7 @@ async def _affirmed_term_absent_from_citations(
             continue
         checked += 1
         if n > 0:
+            print(f"[team] term check: {term!r} found in {fn} — silent", flush=True)
             return ""
     if not checked:
         return ""
@@ -5316,6 +5317,11 @@ async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None
     paths = await _repo_find_files(f"**/{service}-service/router/*.py",
                                    hive_mcp_url, hive_mcp_tools)
     if not paths:
+        # Logged because silence has two causes here and they must not look alike: a
+        # lookup that failed and an answer that covered everything both return "".
+        # Verifying this guard live on 2026-09-06 was blocked for exactly that reason.
+        print(f"[team] scope check: no listing for {service}-service/router "
+              f"— nothing to compare", flush=True)
         return ""
     names: list[str] = []
     for path in paths:
@@ -5328,6 +5334,8 @@ async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None
 
     named = [n for n in names if n in content]
     if len(named) > _SCOPED_COVERAGE_RATIO * len(names):
+        print(f"[team] scope check: {service}-service has {len(names)} router files, "
+              f"answer names {len(named)} — above threshold, silent", flush=True)
         return ""
     missing = [n for n in names if n not in named]
     print(f"[team] scope check: {service}-service has {len(names)} router files, "
