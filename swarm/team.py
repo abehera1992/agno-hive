@@ -1586,6 +1586,7 @@ _GUARD_BANNERS = (
     "UNVERIFIED CLAIMS, AND THE CORRECTION ATTEMPT DID NOT COMPLETE",
     "MOST OF WHAT THIS RUN FOUND IS NOT IN THE ANSWER",
     "A MEMBER DID WORK THIS RUN AND REPORTED NONE OF IT",
+    "A STATED COUNT IS WRONG, CHECKED AGAINST THE FILE",
 )
 
 
@@ -1655,6 +1656,10 @@ _MD_EMPHASIS_RE = re.compile(r"\*\*|__|(?<!\w)\*(?!\w)")
 
 def _demphasize(text: str) -> str:
     return _MD_EMPHASIS_RE.sub("", text)
+# At most this many stated-count claims verified per answer -- one MCP round trip
+# each, and an answer naming more than a handful is not the shape this checks.
+_MAX_COUNT_CLAIM_CHECKS = 4
+
 # At most this many count_matches calls per answer. The lead rarely names more than
 # one constant, and this bounds the cost of a pathological one.
 _PREMISE_MAX_LOOKUPS = 3
@@ -1673,7 +1678,7 @@ def _lead_sentence(content: str) -> str:
 
 
 async def _repo_match_count(pattern: str, hive_mcp_url: str | None,
-                            hive_mcp_tools=None) -> int | None:
+                            hive_mcp_tools=None, glob_filter: str = "**/*") -> int | None:
     """Exact count of `pattern` in the project, from hive-mcp's count_matches.
 
     Returns None when the count could not be obtained. None is NOT zero, and every
@@ -1693,7 +1698,7 @@ async def _repo_match_count(pattern: str, hive_mcp_url: str | None,
 
     async def _ask(session) -> None:
         res = await session.call_tool(
-            "count_matches", {"pattern": pattern, "glob_filter": "**/*"})
+            "count_matches", {"pattern": pattern, "glob_filter": glob_filter})
         err = _mcp_error_text(res)
         if err:
             print(f"[team] premise guard: count_matches rejected ({pattern!r}): {err}")
@@ -3549,6 +3554,9 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # Computed alongside the fabrication check, for the same reason: both are awaits,
     # and _tail() is a sync closure 30 guards call. Runs only for a two-sided task with
     # two enumerations recorded, so an ordinary answer pays nothing.
+    # Awaited here with _cmp_note, for the same reason: _tail() is a sync closure that
+    # 30 guards call, so anything needing an MCP round trip has to be resolved first.
+    _count_note = await _miscounted_against_tool(content, hive_mcp_url, hive_mcp_tools)
     _cmp_note = await _computed_comparison(
         task,
         (getattr(team, "_read_state", None) or {}).get("enumerations")
@@ -3570,7 +3578,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         completeness = _unchecked_completeness_block(
             content, _rs.get("enumerations") if isinstance(_rs, dict) else None)
         return (_fab_note + _cmp_note + completeness + _lost_report_evidence(team)
-                + _summarize_actual_writes(*all_results))
+                + _count_note + _summarize_actual_writes(*all_results))
 
     # No-answer check, ahead of everything else -- there is nothing for a later guard
     # to examine, and every later guard would correctly find nothing wrong.
@@ -4723,7 +4731,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         # fired. A lost report is a fact about the RUN, not a verdict on the answer,
         # so it must survive a clean verification too; the runs it matters most for
         # are exactly the ones where nothing else flagged anything.
-        return (content + _lost_report_evidence(team)
+        return (content + _lost_report_evidence(team) + _count_note
                 + _summarize_actual_writes(*all_results))
     if len(all_results) > 1:
         # Aggregate retry budget already spent by an earlier guard this call --
@@ -4942,6 +4950,110 @@ def _flagged_draft_note(report: str) -> str:
             f"COMPLETE — the checks below flagged this answer and the one retry this "
             f"run allows produced nothing to replace it with, so what you are reading "
             f"is the flagged draft:**\n```\n{_reader_facing_report(report)}\n```")
+
+
+
+# A count claim that names exactly one file, for a type whose declarations can be
+# counted DEFINITIONALLY -- one match per declared thing, so the tool's number means
+# the same as the sentence. Anything looser (a bare identifier that also appears at
+# call sites) would compare two different quantities and manufacture disagreements.
+_COUNT_CLAIM_RE = re.compile(
+    r"(?<![\w.:/-])(\d{1,3})\s+(?:\*{0,2}[A-Za-z-]+\*{0,2}\s+){0,2}"
+    r"\*{0,2}(endpoints?|routes?|hooks?)\*{0,2}", re.I)
+_COUNT_CLAIM_FILE_RE = re.compile(r"\b([\w-]+\.(?:py|ts|tsx))\b")
+_DEFINITIONAL_PATTERNS = {
+    ("py", "endpoint"): r"@router\.(get|post|put|patch|delete)",
+    ("py", "route"):    r"@router\.(get|post|put|patch|delete)",
+    ("ts", "hook"):     r"builder\.(query|mutation)",
+    ("tsx", "hook"):    r"builder\.(query|mutation)",
+}
+_COUNT_CLAIM_LOOKBACK = 220
+
+
+def _count_claims_with_a_file(content: str) -> list[tuple[int, str, str, str]]:
+    """(stated, kind, filename, pattern) for each checkable count claim.
+
+    Requires exactly ONE filename in the run-up, so "13 endpoints" sitting between two
+    filenames is skipped rather than guessed at -- attributing a count to the wrong
+    file would invent a disagreement, which is the failure mode this whole guard family
+    exists to avoid.
+    """
+    out, seen = [], set()
+    for m in _COUNT_CLAIM_RE.finditer(content or ""):
+        stated = int(m.group(1))
+        kind = m.group(2).lower().rstrip("s")
+        if not 2 <= stated <= 200:
+            continue
+        near = _COUNT_CLAIM_FILE_RE.findall(
+            content[max(0, m.start() - _COUNT_CLAIM_LOOKBACK):m.start() + 80])
+        if len(set(near)) != 1:
+            continue
+        fn = near[0]
+        pat = _DEFINITIONAL_PATTERNS.get((fn.rsplit(".", 1)[1], kind))
+        if not pat:
+            continue
+        key = (stated, kind, fn)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((stated, kind, fn, pat))
+    return out
+
+
+async def _miscounted_against_tool(content: str, hive_mcp_url: str | None,
+                                   hive_mcp_tools=None) -> str:
+    """Check stated counts against hive-mcp's count_matches, and say the real number.
+
+    The members hold count_matches and do not use it: 43 calls against 18,365
+    get_file_content calls across the whole journal -- 427 reads per deterministic
+    count -- and the [[COUNT ...]] marker that exists so a model can defer a count has
+    been emitted ZERO times, ever. So they read files and tally by eye, and the number
+    is wrong more often than not.
+
+    Measured over every stored answer (2026-09-05), claims naming one file with a
+    definitional pattern: 3 correct, 9 wrong.
+
+        rbacApi.ts       hooks      tool 23   model said 10, 16, 20, 22, 23, 24
+        business_api.py  endpoints  tool 13   model said 6, 10, 13
+        inventoryApi.ts  hooks      tool 48   model said 5
+        businessApi.ts   hooks      tool 16   model said 13
+        vouchers_api.py  endpoints  tool  9   model said 9
+
+    Six different answers to one question about rbacApi.ts, and inventoryApi.ts off by
+    a factor of ten. The existing count guards catch the CONSEQUENCES of this -- a
+    stated total disagreeing with a list, 19 fires -- but none of them knows the true
+    number, so they can only report a contradiction. This one asks the tool.
+
+    Same shape as _computed_comparison, and for the same reason: agents have never
+    called compare_enumerations either, and it produces exact results only because a
+    guard invokes it from outside the model's control. Instruction has been tried --
+    count_matches' own description says "NEVER count by reading a file and tallying in
+    your head" -- and the compliance rate is 0.1%.
+
+    A miscount is stated as fact, not flagged as a disagreement: the tool read the
+    file, the sentence did not. None from _repo_match_count means "could not check",
+    and is skipped rather than reported as zero.
+    """
+    claims = _count_claims_with_a_file(content)
+    if not claims or not (hive_mcp_url or hive_mcp_tools):
+        return ""
+    findings = []
+    for stated, kind, fn, pat in claims[:_MAX_COUNT_CLAIM_CHECKS]:
+        real = await _repo_match_count(pat, hive_mcp_url, hive_mcp_tools,
+                                       glob_filter="**/" + fn)
+        if real is None or real == 0 or real == stated:
+            continue
+        findings.append((stated, kind, fn, real))
+    if not findings:
+        return ""
+    lines = "; ".join(
+        f"{fn} has {real} {kind}s, not {stated}" for stated, kind, fn, real in findings)
+    print(f"[team] count check: {lines} — correcting from count_matches", flush=True)
+    return (f"\n\n---\n**A STATED COUNT IS WRONG, CHECKED AGAINST THE FILE — {lines}. "
+            f"These totals come from counting the declarations in the file itself "
+            f"(count_matches), not from reading and tallying. Where the answer above "
+            f"disagrees, the number here is the file's.**")
+
 
 
 async def _fill_count_markers(content: str, hive_mcp_url: str | None,
