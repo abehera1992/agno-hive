@@ -9293,21 +9293,6 @@ def _record_stream_artifacts(team, out: dict) -> None:
                   f"{out.get('agent_name', '?')!r} was tool-call syntax only "
                   f"({len(raw_content)} chars) — discarding, delegation treated as "
                   f"failed", flush=True)
-            # TEMPORARY (2026-09-06, paired with tool_fix's _dump_raw_if_tag_present).
-            # The text that actually reached this layer. If a parser dump exists for the
-            # same run, the tag passed through a parser and was not recognised; if none
-            # does, it never went through either parser and is assembled downstream.
-            # That comparison is the whole point -- neither file answers it alone.
-            try:
-                import os as _os, time as _time
-                _os.makedirs("/tmp/hive-leak", exist_ok=True)
-                _dp = f"/tmp/hive-leak/{_time.strftime('%H%M%S')}-discarded.txt"
-                with open(_dp, "w", encoding="utf-8") as _fh:
-                    _fh.write(f"AGENT: {out.get('agent_name', '?')}\n")
-                    _fh.write(f"RAW LEN: {len(raw_content)}\n\n{raw_content[:60000]}")
-                print(f"[team] leaked member report saved -> {_dp}", flush=True)
-            except Exception as _exc:  # noqa: BLE001
-                print(f"[team] leak save failed: {_exc}", flush=True)
             # Remember WHO lost a report, so the answer can carry what that member
             # actually opened. Deliberately NOT stored in _member_results: the comment
             # above is load-bearing -- the duplicate gate cannot tell a member that

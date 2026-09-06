@@ -72,9 +72,7 @@ def _record_input_tokens(model_response) -> None:
     if isinstance(seen, (int, float)) and seen > _peak_input_tokens:
         _peak_input_tokens = int(seen)
 import json
-import os
 import re
-import time
 from typing import Any
 
 from agno.models.ollama import Ollama
@@ -82,63 +80,79 @@ from agno.models.openai.like import OpenAILike
 from agno.models.response import ModelResponse
 
 
-# TEMPORARY INSTRUMENTATION (2026-09-06) -- remove once the leak is located.
+# A tool call the model emits as CONTENT arrives one fragment per delta -- the first
+# fragment is the bare opening tag, "<tool_call>", on its own. The per-delta recovery
+# below looks for a complete <tool_call>...</tool_call> pair, which cannot exist inside a
+# fragment, so nothing converts; agno then concatenates the fragments and the member's
+# whole report is 120-201 characters of syntax, discarded as a failed delegation.
 #
-# A member's report reaches swarm/team.py as raw "<tool_call>..." text and is discarded
-# as a failed delegation; 4 of 14 runs in the 2026-09-05 battery lost a report that way.
-# Ten hypotheses have been eliminated one FIELD at a time (our forcing, agno's
-# tool_call_limit, parser misconfig, malformed emission, agno bypassing the wrapper,
-# wrong model class, override not bound, forced-text early return, non-streaming path,
-# reasoning fields) and every probe answered only "not this one".
-#
-# So this stops guessing which field and captures the whole object: the RAW provider
-# payload as it arrives, before super() parses it, alongside what the parse produced.
-# That distinguishes the two remaining possibilities in one shot -- the tag is already
-# in the provider's response (and the parser is looking in the wrong place), or it is
-# not (and agno assembles it downstream of both parsers).
+# Established 2026-09-06 by dumping the raw provider payload at the delta parser, 5
+# captures out of 5 identical: ChoiceDelta(content='<tool_call>', tool_calls=None), tag
+# present in both the raw chunk and the parsed .content. Ten earlier probes asked which
+# FIELD held the tag and all came back negative; it was the right field at the wrong
+# granularity, which no field-level probe could have shown.
 _TC_OPEN = "<tool_call>"
-_LEAK_DUMP_DIR = "/tmp/hive-leak"
-_LEAK_DUMP_MAX = 4
-_leak_dumps = 0
+_TC_CLOSE = "</tool_call>"
+# Bounds a malformed emission, not an answer: the buffer only ever holds text that
+# follows an opening tag, and anything longer is handed back verbatim.
+_TC_BUFFER_CAP = 8192
 
 
-def _dump_raw_if_tag_present(raw, model_response, where: str) -> None:
-    """Write the full raw provider response when the leaked tag is anywhere in play."""
-    global _leak_dumps
-    if _leak_dumps >= _LEAK_DUMP_MAX:
-        return
-    try:
-        raw_txt = repr(raw)
-        parsed = getattr(model_response, "content", None) or ""
-        if _TC_OPEN not in raw_txt and _TC_OPEN not in parsed:
-            return
-        _leak_dumps += 1
-        os.makedirs(_LEAK_DUMP_DIR, exist_ok=True)
-        path = os.path.join(
-            _LEAK_DUMP_DIR, f"{time.strftime('%H%M%S')}-{where}-{_leak_dumps}.txt")
-        fields = {}
-        for attr in dir(model_response):
-            if attr.startswith("__"):
-                continue
-            try:
-                val = getattr(model_response, attr)
-            except Exception:  # noqa: BLE001
-                continue
-            if not callable(val):
-                fields[attr] = repr(val)[:4000]
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(f"WHERE: {where}\n")
-            fh.write(f"TAG IN RAW PROVIDER RESPONSE: {_TC_OPEN in raw_txt}\n")
-            fh.write(f"TAG IN PARSED .content:       {_TC_OPEN in parsed}\n")
-            fh.write(f"\n===== RAW PROVIDER RESPONSE (repr) =====\n{raw_txt[:60000]}\n")
-            fh.write("\n===== PARSED ModelResponse, EVERY FIELD =====\n")
-            for k in sorted(fields):
-                fh.write(f"\n--- {k} ---\n{fields[k]}\n")
-        print(f"[toolfix] LEAK DUMP {_leak_dumps}/{_LEAK_DUMP_MAX} -> {path} "
-              f"(tag in raw={_TC_OPEN in raw_txt}, in parsed={_TC_OPEN in parsed})",
-              flush=True)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[toolfix] leak dump failed: {exc}", flush=True)
+def _open_tag_prefix_len(text: str) -> int:
+    """How many trailing characters of `text` could still grow into _TC_OPEN.
+
+    "...the <too" -> 4, so those four are withheld until the next delta decides. Returns
+    0 when nothing at the end could become the tag, which is every chunk of ordinary
+    prose. Without this the trigger has to ask `_TC_OPEN in content`, and at one
+    character per delta that is never true -- the exact blindness the first attempt at
+    this reproduced.
+    """
+    if not text:
+        return 0
+    for n in range(min(len(text), len(_TC_OPEN) - 1), 0, -1):
+        if _TC_OPEN.startswith(text[-n:]):
+            return n
+    return 0
+
+
+# JSON escapes a model may legally write. Anything else after a backslash is stray.
+_JSON_ESCAPES = set('"\\/bfnrtu')
+
+
+def _escape_stray_backslashes(text: str) -> str:
+    """Make a model-written tool call parseable without changing what it says.
+
+    The live payload that this exists for:
+
+        {"name": "search_files", "arguments": {"pattern": "router.post\\(\\"/register\\","}}
+
+    `\\(` is not a legal JSON escape, so json.loads rejects the whole object -- which is
+    why vLLM's hermes parser did not convert this call either and emitted it as content
+    instead. The model wrote a REGEX into a JSON string without escaping its backslashes,
+    and a search tool taking a regex argument makes that a routine thing for it to do.
+
+    Consumes a valid escape as a PAIR. A regex that inspects each backslash on its own
+    gets "back\\\\slash" wrong -- the second backslash of a correct pair is followed by
+    's', so it is doubled again and the string quietly changes meaning. That version was
+    written first and caught by replaying the safe cases, not by reading it.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        nxt = text[i + 1] if i + 1 < n else ""
+        if nxt and nxt in _JSON_ESCAPES:
+            out.append(ch)
+            out.append(nxt)
+            i += 2
+        else:
+            out.append("\\\\")
+            i += 1
+    return "".join(out)
 
 
 class _ToolCallRecoveryMixin:
@@ -156,10 +170,18 @@ class _ToolCallRecoveryMixin:
         tag_matches = re.findall(r"<tool_call>(.*?)</tool_call>", content, re.DOTALL)
         if tag_matches:
             for m in tag_matches:
+                body = m.strip()
                 try:
-                    calls.append(json.loads(m.strip()))
+                    calls.append(json.loads(body))
                 except json.JSONDecodeError:
-                    pass
+                    # Retry with stray backslashes escaped. Measured on the live leak:
+                    # every discarded member report in the 2026-09-06 battery carried a
+                    # regex argument written straight into JSON, and this is the reason
+                    # the call could not be recovered even once it was reassembled.
+                    try:
+                        calls.append(json.loads(_escape_stray_backslashes(body)))
+                    except json.JSONDecodeError:
+                        pass
             return calls
 
         # Format 2: <|python_tag|> prefix (llama3.3)
@@ -302,9 +324,96 @@ class _ToolCallRecoveryMixin:
         )
         return True
 
+
+    def _stream_key(self, response) -> str:
+        """Per-completion key, so two concurrent streams cannot share a buffer.
+
+        The reverted first attempt kept one buffer on the instance. In `coordinate` mode
+        members run one at a time and that is survivable, but `collaborate` (the
+        parallel-review team) runs three members at once, and interleaved fragments in a
+        single buffer would splice two answers together. The completion id is already on
+        every chunk.
+        """
+        try:
+            cid = getattr(response, "id", None)
+            if cid:
+                return str(cid)
+        except Exception:  # noqa: BLE001
+            pass
+        return "_default"
+
+    @staticmethod
+    def _stream_finished(response) -> bool:
+        """Has the provider said this stream is over? Drives the flush below."""
+        try:
+            for ch in (getattr(response, "choices", None) or []):
+                if getattr(ch, "finish_reason", None):
+                    return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def _recover_split_tool_call(self, model_response, response) -> None:
+        """Reassemble a tool call that arrives split across deltas.
+
+        Buffering starts only once an opening tag (or a prefix that could still become
+        one) is seen, so ordinary prose never accumulates and a normal answer streams
+        through byte-identical. While buffering, content is WITHHELD -- emitting the
+        fragments is precisely how a raw tag reaches a reader.
+
+        Everything that is not a recognised call is handed back verbatim: an unclosed
+        tag at end of stream, anything past _TC_BUFFER_CAP, and a tag pair whose JSON
+        will not parse. Swallowing a genuine quotation would be its own fabrication, and
+        an unflushed buffer would be silent data loss in the hot streaming path -- the
+        specific trap that got the first attempt reverted, where held text was dropped
+        whenever a stream ended without a closing tag.
+        """
+        if not isinstance(getattr(self, "_tc_pending", None), dict):
+            self._tc_pending = {}
+        key = self._stream_key(response)
+        pending = self._tc_pending.get(key, "") + (model_response.content or "")
+        if not pending:
+            return
+
+        if _TC_OPEN in pending:
+            if _TC_CLOSE in pending:
+                parsed = self._parse_tool_calls_from_content(pending)
+                tool_calls = self._to_tool_calls(parsed) if parsed else None
+                if tool_calls:
+                    model_response.tool_calls = tool_calls
+                    # Whatever sat outside the tags is real text and still ships.
+                    model_response.content = re.sub(
+                        r"<tool_call>.*?</tool_call>", "", pending, flags=re.DOTALL)
+                    self._tc_pending.pop(key, None)
+                    print(f"[toolfix] recovered a tool call split across deltas "
+                          f"({len(pending)} chars buffered) -> "
+                          f"{[c.get('function', {}).get('name') for c in tool_calls]}",
+                          flush=True)
+                    return
+                # A closed pair we cannot parse is not a call. Hand it back.
+                model_response.content = pending
+                self._tc_pending.pop(key, None)
+                return
+            if len(pending) > _TC_BUFFER_CAP or self._stream_finished(response):
+                model_response.content = pending
+                self._tc_pending.pop(key, None)
+                return
+            self._tc_pending[key] = pending
+            model_response.content = ""
+            return
+
+        # No opening tag yet: withhold only a trailing fragment that could still become
+        # one, emit the rest now so streaming latency is unchanged for ordinary text.
+        n = _open_tag_prefix_len(pending)
+        if n and not self._stream_finished(response):
+            self._tc_pending[key] = pending[-n:]
+            model_response.content = pending[:-n]
+        else:
+            self._tc_pending.pop(key, None)
+            model_response.content = pending
+
     def _parse_provider_response(self, response: dict) -> ModelResponse:
         model_response = super()._parse_provider_response(response)
-        _dump_raw_if_tag_present(response, model_response, "nonstream")
         # Before any early return below -- a turn that came back as a tool call has
         # the same prompt behind it as one that came back as prose, and skipping it
         # would blind the budget to exactly the tool-heavy runs that overflow.
@@ -328,16 +437,23 @@ class _ToolCallRecoveryMixin:
 
     def _parse_provider_response_delta(self, response: Any) -> ModelResponse:
         model_response = super()._parse_provider_response_delta(response)
-        _dump_raw_if_tag_present(response, model_response, "delta")
         # Same placement rationale as the non-streaming parser above. Usage rides
         # on the FINAL chunk only (stream_options include_usage), so this is a
         # no-op on the thousands of content deltas and fires once per call.
         _record_input_tokens(model_response)
 
         if model_response.tool_calls:
+            if isinstance(getattr(self, "_tc_pending", None), dict):
+                self._tc_pending.pop(self._stream_key(response), None)
             return model_response
 
         if self._sanitize_forced_text(model_response):
+            return model_response
+
+        # Reassemble across deltas FIRST: the single-delta parse below cannot see a call
+        # that arrives one fragment at a time, which is how every one of them arrives.
+        self._recover_split_tool_call(model_response, response)
+        if model_response.tool_calls:
             return model_response
 
         if model_response.content:
