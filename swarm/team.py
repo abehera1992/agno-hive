@@ -3459,6 +3459,82 @@ def _ends_with_unfinished_intent(content: str) -> bool:
     return not _UNFINISHED_INTENT_COMPLETION_CUE_RE.search(m.group(0))
 
 
+_SYNTAX_REASK_FLAG = "_syntax_loss_reask_done"
+
+
+async def _reask_after_syntax_loss(content: str, task: str, team, all_results,
+                                   result, liveness_path: str | None,
+                                   synthesis_run: bool):
+    """Re-ask ONCE when a member's report was discarded as tool-call syntax.
+
+    The discard in _capture_member_result is correct and stays: nothing survived the
+    strip, so recording it would poison the duplicate-delegation gate, which cannot tell
+    a member that answered from one that emitted syntax and would then refuse the
+    re-delegation that fixes the run. Its comment says dropping "leaves the coordinator
+    free to ask again."
+
+    Measured 2026-09-05 over the 14-task battery: it does not ask again. The banner fired
+    on 4 of 14 runs (29%, against 13% recorded earlier), and T4's read "the answer above
+    was written without them" -- the run shipped anyway. The freedom to re-delegate is
+    real; the coordinator just does not use it. So the swarm asks instead of hoping.
+
+    ONE attempt, flagged on the team so a re-ask that loses its own report cannot
+    recurse. Adoption goes through _adopt_retry for the same reason every other retry
+    here does: a re-run is not automatically better than the draft it would replace, and
+    this file's oldest bug was a retry overwriting a good answer with a canned apology.
+    """
+    lost = getattr(team, "_discarded_delegations", None)
+    if synthesis_run or not isinstance(lost, dict) or not lost:
+        return content, result
+    if getattr(team, _SYNTAX_REASK_FLAG, False):
+        return content, result
+    setattr(team, _SYNTAX_REASK_FLAG, True)
+
+    snapshot = sorted(lost)
+    who = ", ".join(snapshot)
+    prompt = (
+        f"{task}\n\nIMPORTANT: the {who} member returned a tool call instead of its "
+        f"findings, so its work is missing and the answer would be written without it. "
+        f"Delegate to {who} again and require the report itself to be plain prose -- "
+        f"what it found, with file paths and line numbers, and no tool-call syntax in "
+        f"the report. Then answer the original question using those findings."
+    )
+    reads_before = _run_read_count(team)
+    print(f"[team] syntax-loss re-ask: {who} lost a report — asking once more",
+          flush=True)
+    try:
+        retried, retry = await _stream_team_run(
+            team, prompt, log_label="syntax-loss-reask", liveness_path=liveness_path)
+        all_results.append(retry)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[team] syntax-loss re-ask failed: {exc} — keeping the draft", flush=True)
+        return content, result
+    if not retried:
+        print("[team] syntax-loss re-ask returned nothing — keeping the draft",
+              flush=True)
+        return content, result
+
+    adopted, adopted_result = _adopt_retry(
+        "syntax-loss-reask", content, result, retried, retry,
+        member_reads=_member_reads_delta(team, reads_before))
+    if adopted is not retried:
+        return content, result
+
+    # Adopted. Clear ONLY the members that actually reported this time -- checked
+    # against _member_results, the dict the answer was really built from, not against
+    # the fact that a re-ask happened. Verifying the consumer rather than the attempt
+    # is what keeps the banner honest: a re-ask that lost its report too leaves the
+    # entry in place, and the reader still gets told the findings are missing.
+    landed = getattr(team, "_member_results", None)
+    if isinstance(landed, dict):
+        for w in snapshot:
+            if landed.get(w):
+                lost.pop(w, None)
+                print(f"[team] syntax-loss re-ask: {w} reported on the retry — "
+                      f"clearing its lost-report flag", flush=True)
+    return adopted, adopted_result
+
+
 async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | None,
                            result=None, liveness_path: str | None = None,
                            hive_mcp_tools=None, synthesis_run: bool = False) -> str:
@@ -3494,6 +3570,11 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # trace made no further successful write call. See _summarize_actual_writes'
     # docstring for the live incident this closes.
     all_results = [result]
+    # Before any guard looks at the draft: if a member's report was lost to the tool-call
+    # syntax leak, get it back. A guard chain reasoning about an answer written without
+    # findings that ARE recoverable is measuring the wrong artefact.
+    content, result = await _reask_after_syntax_loss(
+        content, task, team, all_results, result, liveness_path, synthesis_run)
 
     # Fabrication detection runs FIRST, and its finding rides along with whichever
     # guard fires (2026-09-02). Every guard below ends in a `return`, so the chain is
@@ -4512,6 +4593,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # summary may be a correct precis of a subset, and substituting for it would hide
     # what it chose to say. The reader gets both, labelled.
     if (len(_member_union) >= _RELAY_DROP_MIN_ITEMS
+            and not _asks_for_one_fact(task)
             and len(_member_union) - len(_missing)
                 <= _RELAY_DROP_MAX_KEPT_RATIO * len(_member_union)):
         _kept_n = len(_member_union) - len(_missing)
@@ -9211,6 +9293,21 @@ def _record_stream_artifacts(team, out: dict) -> None:
                   f"{out.get('agent_name', '?')!r} was tool-call syntax only "
                   f"({len(raw_content)} chars) — discarding, delegation treated as "
                   f"failed", flush=True)
+            # TEMPORARY (2026-09-06, paired with tool_fix's _dump_raw_if_tag_present).
+            # The text that actually reached this layer. If a parser dump exists for the
+            # same run, the tag passed through a parser and was not recognised; if none
+            # does, it never went through either parser and is assembled downstream.
+            # That comparison is the whole point -- neither file answers it alone.
+            try:
+                import os as _os, time as _time
+                _os.makedirs("/tmp/hive-leak", exist_ok=True)
+                _dp = f"/tmp/hive-leak/{_time.strftime('%H%M%S')}-discarded.txt"
+                with open(_dp, "w", encoding="utf-8") as _fh:
+                    _fh.write(f"AGENT: {out.get('agent_name', '?')}\n")
+                    _fh.write(f"RAW LEN: {len(raw_content)}\n\n{raw_content[:60000]}")
+                print(f"[team] leaked member report saved -> {_dp}", flush=True)
+            except Exception as _exc:  # noqa: BLE001
+                print(f"[team] leak save failed: {_exc}", flush=True)
             # Remember WHO lost a report, so the answer can carry what that member
             # actually opened. Deliberately NOT stored in _member_results: the comment
             # above is load-bearing -- the duplicate gate cannot tell a member that
@@ -10479,6 +10576,41 @@ def _checkpoint_block(team) -> str:
 
 # Relay-drop trigger. Measured over 84 runs (2026-09-05): >=3 named with <=25% kept
 # fires on 15 of them (18%). Below 3 items "most of it" is not a meaningful claim.
+# A question whose correct answer is ONE item. The relay-drop guard below counts how
+# much of what the members found reached the answer, and a low ratio normally means the
+# coordinator dropped findings -- but on a single-fact question, naming 1 of 10 gathered
+# items is the CORRECT answer, not a drop. T1 (2026-09-05) asked which file defines
+# ItemCategory and on which line sku_prefix is declared; members touched 10 files, the
+# answer named the 1 that was asked for, and the banner told the reader to treat a
+# correctly-scoped answer as partial.
+#
+# Deliberately NOT the complement of _ENUM_TASK_RE. Gating on "not an enumeration task"
+# was measured against the 14-task battery first and rejected: T13a ("Audit the vouchers
+# module: list its endpoints, its database tables, and its frontend hooks") scores False
+# there, because that regex requires "list every/all/each" -- so an enum gate would have
+# traded T1's false alarm for a new blind spot on the exact audit shape that produced the
+# battery's worst answer. This predicate is subtractive instead: it can only silence the
+# guard on questions that ask for a single thing, so it cannot open that gap.
+_SINGLE_FACT_ASK_RE = re.compile(
+    r"\b(?:which|what)\s+(?:file|line|function|class|method|model|table|column)\b"
+    r"|\bon\s+which\s+line\b|\bwhat\s+line\b",
+    re.IGNORECASE,
+)
+# Any of these means the ask is plural even if a singular interrogative appears earlier,
+# e.g. T11's "which function in each one handles it? Name every file in the chain."
+_LIST_VERB_RE = re.compile(
+    r"\blist\b|\benumerate\b|\bevery\b|\beach\b|\baudit\b|\btrace\b"
+    r"|\ball\s+(?:the\s+)?\w+s\b|\bwhich\s+\w+s\b|\bend[- ]to[- ]end\b",
+    re.IGNORECASE,
+)
+
+
+def _asks_for_one_fact(task: str | None) -> bool:
+    """Is the correct answer to this task a single item?"""
+    t = task or ""
+    return bool(_SINGLE_FACT_ASK_RE.search(t)) and not _LIST_VERB_RE.search(t)
+
+
 _RELAY_DROP_MIN_ITEMS = 3
 _RELAY_DROP_MAX_KEPT_RATIO = 0.25
 
