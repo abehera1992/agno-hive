@@ -72,12 +72,73 @@ def _record_input_tokens(model_response) -> None:
     if isinstance(seen, (int, float)) and seen > _peak_input_tokens:
         _peak_input_tokens = int(seen)
 import json
+import os
 import re
+import time
 from typing import Any
 
 from agno.models.ollama import Ollama
 from agno.models.openai.like import OpenAILike
 from agno.models.response import ModelResponse
+
+
+# TEMPORARY INSTRUMENTATION (2026-09-06) -- remove once the leak is located.
+#
+# A member's report reaches swarm/team.py as raw "<tool_call>..." text and is discarded
+# as a failed delegation; 4 of 14 runs in the 2026-09-05 battery lost a report that way.
+# Ten hypotheses have been eliminated one FIELD at a time (our forcing, agno's
+# tool_call_limit, parser misconfig, malformed emission, agno bypassing the wrapper,
+# wrong model class, override not bound, forced-text early return, non-streaming path,
+# reasoning fields) and every probe answered only "not this one".
+#
+# So this stops guessing which field and captures the whole object: the RAW provider
+# payload as it arrives, before super() parses it, alongside what the parse produced.
+# That distinguishes the two remaining possibilities in one shot -- the tag is already
+# in the provider's response (and the parser is looking in the wrong place), or it is
+# not (and agno assembles it downstream of both parsers).
+_TC_OPEN = "<tool_call>"
+_LEAK_DUMP_DIR = "/tmp/hive-leak"
+_LEAK_DUMP_MAX = 4
+_leak_dumps = 0
+
+
+def _dump_raw_if_tag_present(raw, model_response, where: str) -> None:
+    """Write the full raw provider response when the leaked tag is anywhere in play."""
+    global _leak_dumps
+    if _leak_dumps >= _LEAK_DUMP_MAX:
+        return
+    try:
+        raw_txt = repr(raw)
+        parsed = getattr(model_response, "content", None) or ""
+        if _TC_OPEN not in raw_txt and _TC_OPEN not in parsed:
+            return
+        _leak_dumps += 1
+        os.makedirs(_LEAK_DUMP_DIR, exist_ok=True)
+        path = os.path.join(
+            _LEAK_DUMP_DIR, f"{time.strftime('%H%M%S')}-{where}-{_leak_dumps}.txt")
+        fields = {}
+        for attr in dir(model_response):
+            if attr.startswith("__"):
+                continue
+            try:
+                val = getattr(model_response, attr)
+            except Exception:  # noqa: BLE001
+                continue
+            if not callable(val):
+                fields[attr] = repr(val)[:4000]
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(f"WHERE: {where}\n")
+            fh.write(f"TAG IN RAW PROVIDER RESPONSE: {_TC_OPEN in raw_txt}\n")
+            fh.write(f"TAG IN PARSED .content:       {_TC_OPEN in parsed}\n")
+            fh.write(f"\n===== RAW PROVIDER RESPONSE (repr) =====\n{raw_txt[:60000]}\n")
+            fh.write("\n===== PARSED ModelResponse, EVERY FIELD =====\n")
+            for k in sorted(fields):
+                fh.write(f"\n--- {k} ---\n{fields[k]}\n")
+        print(f"[toolfix] LEAK DUMP {_leak_dumps}/{_LEAK_DUMP_MAX} -> {path} "
+              f"(tag in raw={_TC_OPEN in raw_txt}, in parsed={_TC_OPEN in parsed})",
+              flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[toolfix] leak dump failed: {exc}", flush=True)
 
 
 class _ToolCallRecoveryMixin:
@@ -243,6 +304,7 @@ class _ToolCallRecoveryMixin:
 
     def _parse_provider_response(self, response: dict) -> ModelResponse:
         model_response = super()._parse_provider_response(response)
+        _dump_raw_if_tag_present(response, model_response, "nonstream")
         # Before any early return below -- a turn that came back as a tool call has
         # the same prompt behind it as one that came back as prose, and skipping it
         # would blind the budget to exactly the tool-heavy runs that overflow.
@@ -266,6 +328,7 @@ class _ToolCallRecoveryMixin:
 
     def _parse_provider_response_delta(self, response: Any) -> ModelResponse:
         model_response = super()._parse_provider_response_delta(response)
+        _dump_raw_if_tag_present(response, model_response, "delta")
         # Same placement rationale as the non-streaming parser above. Usage rides
         # on the FINAL chunk only (stream_options include_usage), so this is a
         # no-op on the thousands of content deltas and fires once per call.
