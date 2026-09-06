@@ -57,6 +57,12 @@ _REPAIRING_MARKERS = (
     "enumerable lines this run read from",        # file-read recovery (T2, T13a)
     "THE COMPARISON, COMPUTED",                   # deterministic set difference
     "WHAT THE MEMBERS ACTUALLY REPORTED",         # member-findings recovery
+    # Supplies the TRUE number from count_matches, not a warning that two figures
+    # disagree. battery15's S7 stated 16 hooks, the guard attached "rbacApi.ts has 23",
+    # and the delivered answer became correct -- the same repair shape as the listing
+    # and comparison recoveries above, and the ideal preference pair: a wrong count
+    # against the file's own.
+    "A STATED COUNT IS WRONG, CHECKED AGAINST THE FILE",
 )
 
 # Every banner marker, used to split the model's own text from everything appended.
