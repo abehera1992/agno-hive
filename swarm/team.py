@@ -1587,6 +1587,8 @@ _GUARD_BANNERS = (
     "MOST OF WHAT THIS RUN FOUND IS NOT IN THE ANSWER",
     "A MEMBER DID WORK THIS RUN AND REPORTED NONE OF IT",
     "A STATED COUNT IS WRONG, CHECKED AGAINST THE FILE",
+    "AND NOTHING CITED IS ONE",
+    "THE ANSWER COVERS ALMOST NONE OF WHAT WAS ASKED ABOUT",
 )
 
 
@@ -3638,6 +3640,10 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # Awaited here with _cmp_note, for the same reason: _tail() is a sync closure that
     # 30 guards call, so anything needing an MCP round trip has to be resolved first.
     _count_note = await _miscounted_against_tool(content, hive_mcp_url, hive_mcp_tools)
+    _term_note = await _affirmed_term_absent_from_citations(
+        task, content, hive_mcp_url, hive_mcp_tools)
+    _scope_note = await _scoped_coverage_gap(
+        task, content, hive_mcp_url, hive_mcp_tools)
     _cmp_note = await _computed_comparison(
         task,
         (getattr(team, "_read_state", None) or {}).get("enumerations")
@@ -3659,7 +3665,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         completeness = _unchecked_completeness_block(
             content, _rs.get("enumerations") if isinstance(_rs, dict) else None)
         return (_fab_note + _cmp_note + completeness + _lost_report_evidence(team)
-                + _count_note + _summarize_actual_writes(*all_results))
+                + _count_note + _term_note + _scope_note
+                + _summarize_actual_writes(*all_results))
 
     # No-answer check, ahead of everything else -- there is nothing for a later guard
     # to examine, and every later guard would correctly find nothing wrong.
@@ -4814,6 +4821,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         # so it must survive a clean verification too; the runs it matters most for
         # are exactly the ones where nothing else flagged anything.
         return (content + _lost_report_evidence(team) + _count_note
+                + _term_note + _scope_note
                 + _summarize_actual_writes(*all_results))
     if len(all_results) > 1:
         # Aggregate retry budget already spent by an earlier guard this call --
@@ -5135,6 +5143,200 @@ async def _miscounted_against_tool(content: str, hive_mcp_url: str | None,
             f"These totals come from counting the declarations in the file itself "
             f"(count_matches), not from reading and tallying. Where the answer above "
             f"disagrees, the number here is the file's.**")
+
+
+
+async def _repo_find_files(glob_pattern: str, hive_mcp_url: str | None,
+                           hive_mcp_tools=None) -> list[str] | None:
+    """Paths matching `glob_pattern`, from hive-mcp's find_files.
+
+    None means the lookup failed and is NOT an empty directory -- same rule as
+    _repo_match_count, whose session handling this mirrors exactly (live session first,
+    fresh connection only as a fallback; opening a new streamablehttp_client while the
+    run's own connections are open is the step confirmed to hang on 2026-08-20).
+    """
+    if not (hive_mcp_url or hive_mcp_tools):
+        return None
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    box: dict = {"paths": None}
+
+    async def _ask(session) -> None:
+        res = await session.call_tool("find_files", {"glob_pattern": glob_pattern})
+        err = _mcp_error_text(res)
+        if err:
+            print(f"[team] scope guard: find_files rejected ({glob_pattern!r}): {err}")
+            return
+        text = _extract_mcp_text(res)
+        found = re.findall(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+", text)
+        box["paths"] = [f.replace("\\", "/") for f in found]
+
+    if hive_mcp_tools is not None:
+        try:
+            await asyncio.wait_for(_ask(await hive_mcp_tools.get_session_for_run()),
+                                   timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] scope guard: live session failed "
+                  f"({type(exc).__name__}: {exc or '<no message>'})")
+
+    if box["paths"] is None and hive_mcp_url:
+        try:
+            async def _fresh() -> None:
+                async with streamablehttp_client(hive_mcp_url) as (read, write, _):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        await _ask(session)
+            await asyncio.wait_for(_fresh(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] scope guard: find_files failed "
+                  f"({type(exc).__name__}: {exc or '<no message>'})")
+    return box["paths"]
+
+
+# "Is there a rate-limiting middleware anywhere in the authentication service?" -- a
+# yes/no question about a NAMED CONSTRUCT. The trailing lookahead stops the phrase at
+# the first preposition so the captured noun phrase is the construct itself and not the
+# rest of the sentence.
+_ASKS_EXISTS_RE = re.compile(
+    r"\bis there\s+(?:a|an|any)\s+([a-z][\w-]*(?:\s+[a-z][\w-]*){0,2}?)\s*"
+    r"(?=\banywhere\b|\bin\b|\bfor\b|\bthat\b|\bwhich\b|[,?.])", re.I)
+# Only the OPENING of the answer counts as an affirmation. A "yes" buried in later prose
+# is usually about something else.
+_AFFIRMS_RE = re.compile(r"^\W*(?:yes\b|there is\b|there are\b)", re.I)
+_CITED_FILE_RE = re.compile(r"`?([A-Za-z0-9_./-]+\.(?:py|ts|tsx))`?")
+_MAX_TERM_FILE_CHECKS = 4
+
+
+async def _affirmed_term_absent_from_citations(
+        task: str, content: str, hive_mcp_url: str | None, hive_mcp_tools=None) -> str:
+    """The question asked whether an X exists, the answer says yes, and no file it cites
+    contains the word X.
+
+    T10, wrong in all three runs of the 2026-09-06 battery and never flagged by anything:
+    asked whether a rate-limiting MIDDLEWARE exists in the auth service, it answered
+    "Yes, there is rate-limiting middleware" and cited real rate-limiting code that is
+    not middleware -- a method on a service class and a Redis cooldown inside a route
+    handler. No middleware is registered in that service at all; its four
+    `add_middleware`/`@app.middleware` registrations are logging, https-scheme, session
+    and proxy-headers. The member never searched for the construct either: its pattern
+    was `rate-limit|express-rate-limit|throttling|redis.*limit`.
+
+    Deliberately NOT a structural test of what "middleware" means. Defining that, then
+    "hook", "decorator", "interceptor" and "guard", is a per-framework knowledge base and
+    exactly the project-dependence this codebase avoids. The generic form asks only
+    whether the term the QUESTION used appears anywhere in the files the answer offers as
+    evidence -- framework-agnostic, and it passes the near misses: "is there caching?"
+    citing `lru_cache` contains "cache"; "is there rate limiting?" citing
+    `check_login_rate_limit` contains "rate limit" once the hyphen is normalised.
+
+    A disclosure, not a correction: the cited code is usually real and relevant, and the
+    guard cannot know whether some other file holds the real construct. It says what was
+    asked, what was checked, and that the affirmative is unverified.
+
+    None from _repo_match_count means "could not check" and is skipped -- concluding
+    absence from a failed lookup is the over-claim this whole guard family exists to
+    prevent.
+    """
+    m = _ASKS_EXISTS_RE.search(task or "")
+    if not m:
+        return ""
+    term = m.group(1).split()[-1].lower().strip("-")
+    if len(term) < 4 or not (content or "").strip():
+        return ""
+    if not _AFFIRMS_RE.match((content or "").strip()[:400]):
+        return ""
+
+    seen: list[str] = []
+    for path in _CITED_FILE_RE.findall(content or ""):
+        base = path.rsplit("/", 1)[-1]
+        if base not in seen:
+            seen.append(base)
+    if not seen:
+        return ""
+
+    checked = 0
+    for fn in seen[:_MAX_TERM_FILE_CHECKS]:
+        n = await _repo_match_count(re.escape(term), hive_mcp_url, hive_mcp_tools,
+                                    glob_filter="**/" + fn)
+        if n is None:
+            continue
+        checked += 1
+        if n > 0:
+            return ""
+    if not checked:
+        return ""
+
+    print(f"[team] term check: answer affirms {term!r} but none of "
+          f"{seen[:_MAX_TERM_FILE_CHECKS]} contains it", flush=True)
+    return (f"\n\n---\n**ASKED ABOUT A {term.upper()}, AND NOTHING CITED IS ONE — the "
+            f"question asked whether a {term} exists and the answer above says it does, "
+            f"but the word does not appear in any of the {checked} file(s) it cites "
+            f"(checked with count_matches). The cited code may be real and relevant and "
+            f"still not be a {term}; treat the affirmative as unverified.**")
+
+
+# "a detailed architectural overview of the inventory service: its routers, its models"
+# -- a target plus a facet that is a directory listing, so the expected coverage can be
+# computed from the QUESTION without depending on what the members happened to gather.
+_SCOPED_ASK_RE = re.compile(
+    r"\b(?:overview|audit|describe|document|summar\w+)\b[^.]{0,60}?\bof\s+the\s+"
+    r"([a-z][\w-]*)\s+service\b[^.]{0,140}?\b(?:routers?|models?|endpoints?)\b", re.I)
+_SCOPED_MIN_FILES = 4
+_SCOPED_COVERAGE_RATIO = 0.25
+
+
+async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None,
+                               hive_mcp_tools=None) -> str:
+    """The question named a service and asked for its routers; the answer names almost
+    none of them.
+
+    T12, wrong in every run that completed: asked for the inventory service's routers,
+    models, dependencies and business-service integration, it returned a project-wide
+    directory tour -- 21,393 characters in r3 naming ONE of the 23 router files, and zero
+    mentions of vouchers_api.py, items_api.py or stock_api.py. r1 named none of 23.
+
+    This is a SCOPE failure, not a knowledge failure, and it is why the existing
+    under-report guard cannot see it: that one compares the answer against what members
+    gathered, and here the members never enumerated the directory either -- they read
+    DOCS.md, architecture.md and hive.md. Nothing was dropped because nothing was
+    collected. The expectation therefore has to come from the question, and the count
+    from the tool, which is the same shape as _miscounted_against_tool and
+    _computed_comparison: the guard calls the tool itself instead of relying on the
+    model to have done so.
+
+    Silent unless the directory really exists and really holds several files. A failed
+    lookup returns None and is skipped, an unresolvable service name simply never
+    matches, and fewer than _SCOPED_MIN_FILES is not a listing worth measuring.
+    """
+    m = _SCOPED_ASK_RE.search(task or "")
+    if not m or not (content or "").strip():
+        return ""
+    service = m.group(1).lower()
+    paths = await _repo_find_files(f"**/{service}-service/router/*.py",
+                                   hive_mcp_url, hive_mcp_tools)
+    if not paths:
+        return ""
+    names: list[str] = []
+    for path in paths:
+        base = path.rsplit("/", 1)[-1]
+        if base.startswith("__") or base in names:
+            continue
+        names.append(base)
+    if len(names) < _SCOPED_MIN_FILES:
+        return ""
+
+    named = [n for n in names if n in content]
+    if len(named) > _SCOPED_COVERAGE_RATIO * len(names):
+        return ""
+    missing = [n for n in names if n not in named]
+    print(f"[team] scope check: {service}-service has {len(names)} router files, "
+          f"answer names {len(named)}", flush=True)
+    return (f"\n\n---\n**THE ANSWER COVERS ALMOST NONE OF WHAT WAS ASKED ABOUT — the "
+            f"question asked about the {service} service's routers; that directory holds "
+            f"{len(names)} files and the answer above names {len(named)} of them "
+            f"(listed with find_files). Not yet covered: "
+            f"{', '.join(missing[:12])}{'…' if len(missing) > 12 else ''}.**")
 
 
 
