@@ -8092,6 +8092,46 @@ _TARGET_CHECKED_ACTIONS = frozenset({"read", "search", "analyze", "verify"})
 _MAX_TARGETS_RESOLVED = 3
 
 
+# The tools a delegation uses to FIND A PATH. Distinct from _COORDINATOR_DISCOVERY_TOOLS
+# just above, which is about the coordinator''s own surface and includes web_search and
+# lightrag_query -- neither of which can resolve a file path. A delegation whose body calls one of
+# these is doing the lookup the target gate asks for, so the gate must not block it --
+# see _is_discovery_delegation.
+_PATH_DISCOVERY_TOOLS = ("find_files", "search_files", "search_files_batch", "list_directory",
+                    "list_directory_tree", "count_matches", "get_project_context")
+
+# How many times one missing basename may be redirected before the gate gets out of the
+# way. Two is enough to correct a typo and far short of a loop.
+_MAX_TARGET_REDIRECTS = 2
+
+
+def _is_discovery_delegation(task: str) -> bool:
+    """Is this delegation trying to LOCATE the target rather than read it?
+
+    The gate's own redirect tells the coordinator to "check the real path first
+    (list_directory or find_files on the directory you mean), then delegate again".
+    Without this, the gate then rejects that very delegation, because the coordinator
+    correctly keeps naming the file it is trying to find in the audit tag's target=
+    field. There is no wording of the audit tag that escapes it: the target IS the
+    unknown. The result is a deadlock, and it is not theoretical -- T3 of battery run 8
+    died in it. 41 redirects in 132 seconds, every one of them a delegation doing
+    exactly what the redirect asked for:
+
+        find_files for 'seller_verification.py' in the project root      x11
+        search_files for 'seller_verification.py'                        x12
+        list_directory for API/business-service/                          x7
+        list_directory_tree for the project root                          x6
+
+    None executed. The Researcher's budget drained, agno began refusing calls, and the
+    liveness auto-kill ended the run after 1,027 seconds with no answer.
+
+    So a delegation that names a discovery tool is let through even when its target does
+    not exist -- the nonexistence is the very thing it is being sent to establish.
+    """
+    body = re.sub(r"<delegation_audit>.*?</delegation_audit>", " ", task or "",
+                  flags=re.S)
+    return any(re.search(rf"(?<!\w){t}(?!\w)", body) for t in _PATH_DISCOVERY_TOOLS)
+
 def _fileish_targets(target_raw: str) -> list[str]:
     """The file paths inside an audit Target, which may name several, comma-separated,
     and may carry a :line suffix."""
@@ -8790,31 +8830,73 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
         # delegation names a file that does not exist yet, by definition.
         if function_name == "delegate_task_to_member":
             _audit = _parse_delegation_audit((args or {}).get("task"))
-            if _audit and _audit.get("action") in _TARGET_CHECKED_ACTIONS:
+            # A discovery delegation is exempt: it is the corrective action this gate
+            # asks for, and blocking it is a deadlock with no exit (see
+            # _is_discovery_delegation for the run it killed).
+            if (_audit and _audit.get("action") in _TARGET_CHECKED_ACTIONS
+                    and not _is_discovery_delegation((args or {}).get("task"))):
                 _paths = _fileish_targets(_raw_audit_target((args or {}).get("task")))
                 if _paths:
                     _gone = await _unresolvable_delegation_targets(
                         _paths, getattr(team, "_hive_mcp_url", None))
                     if _gone and len(_gone) == len(_paths[:_MAX_TARGETS_RESOLVED]):
-                        _lines = []
-                        for _p, _real in _gone:
-                            _lines.append(
-                                f"`{_p}` does not exist"
-                                + (f" — files actually named `{_p.rsplit('/', 1)[-1]}`: "
-                                   + ", ".join(f"`{r}`" for r in _real) if _real
-                                   else " — nothing in this repository has that name"))
-                        print(f"[team] target check: unresolvable delegation target(s) "
-                              f"{[g[0] for g in _gone]} — redirecting", flush=True)
-                        return (
-                            "REDIRECTED — this delegation names a file that does not "
-                            "exist, so it was NOT executed and nothing was read.\n\n"
-                            + "\n".join(_lines)
-                            + "\n\nCheck the real path first (list_directory or "
-                            "find_files on the directory you mean), then delegate again "
-                            "with a target that exists. Do not guess a filename from a "
-                            "module name: this project keeps a service's models in a "
-                            "single models.py, not a models/ package."
-                        )
+                        # Second safety net, independent of the discovery exemption: no
+                        # matter how a delegation is worded, this gate stops intervening
+                        # on a basename it has already redirected twice. A guard that can
+                        # fire unboundedly on the same name is a guard that can hang a
+                        # run, and letting the delegation through is strictly better --
+                        # the member reports "not found" itself, which is progress the
+                        # coordinator can act on.
+                        _seen = getattr(team, "_target_redirects", None)
+                        if _seen is None:
+                            _seen = {}
+                            team._target_redirects = _seen
+                        _key = tuple(sorted(p.rsplit("/", 1)[-1] for p, _ in _gone))
+                        _seen[_key] = _seen.get(_key, 0) + 1
+                        if _seen[_key] > _MAX_TARGET_REDIRECTS:
+                            print(f"[team] target check: {list(_key)} already redirected "
+                                  f"{_seen[_key] - 1}x — standing down, letting the "
+                                  f"delegation run", flush=True)
+                        else:
+                            _lines = []
+                            # Split by whether ANY file carries the name. "Go find the
+                            # real path" is sound advice for a typo and a dead end for a
+                            # name nothing in the repo has -- which was T3's case
+                            # exactly: no file matching *seller_verification* exists, so
+                            # every lookup the coordinator was told to run was destined
+                            # to return nothing.
+                            _any_real = any(_real for _, _real in _gone)
+                            for _p, _real in _gone:
+                                _lines.append(
+                                    f"`{_p}` does not exist"
+                                    + (f" — files actually named "
+                                       f"`{_p.rsplit('/', 1)[-1]}`: "
+                                       + ", ".join(f"`{r}`" for r in _real) if _real
+                                       else " — and NO file anywhere in this repository "
+                                            "is named that"))
+                            print(f"[team] target check: unresolvable delegation "
+                                  f"target(s) {[g[0] for g in _gone]} — redirecting "
+                                  f"({_seen[_key]}/{_MAX_TARGET_REDIRECTS})", flush=True)
+                            return (
+                                "REDIRECTED — this delegation names a file that does "
+                                "not exist, so it was NOT executed and nothing was "
+                                "read.\n\n"
+                                + "\n".join(_lines)
+                                + ("\n\nCheck the real path first (list_directory or "
+                                   "find_files on the directory you mean), then delegate "
+                                   "again with a target that exists. Do not guess a "
+                                   "filename from a module name: this project keeps a "
+                                   "service's models in a single models.py, not a "
+                                   "models/ package."
+                                   if _any_real else
+                                   "\n\nDo not look for this filename again — it is not "
+                                   "a path this repository has, under any directory. "
+                                   "Whatever it does lives under a different name. "
+                                   "Delegate a SEARCH BY BEHAVIOUR instead: "
+                                   "search_files for a function, class, route or column "
+                                   "name involved, and take the target from what comes "
+                                   "back.")
+                            )
 
         # LAST thing before the call, deliberately: this rewrites args["task"], and
         # every dedupe tier above compares task TEXT. Doing it earlier would make a
