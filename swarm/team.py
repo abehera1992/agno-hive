@@ -9792,21 +9792,6 @@ async def run_task_stream(
         _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
         + list(_COORDINATOR_INSTRUCTIONS)
     )
-    # Override AFTER the expression above, deliberately, rather than making it a
-    # conditional: test_result_is_prepended_ahead_of_coordinator_instructions_in_both_
-    # functions inspects this file's SOURCE for that exact composition line in both run
-    # paths, guarding the ordering convention (project id, then roster, then coordinator
-    # instructions). Rewriting it inline breaks that check for a reason unrelated to what
-    # it protects; this keeps the guarded literal intact and swaps the list after it, in
-    # the same order.
-    if team_config.get_gate_enabled(team_name, MINIMAL_COORDINATOR_GATE, False):
-        print(f"[team] EXPERIMENT: minimal coordinator instructions active for "
-              f"{team_name!r} ({len(_COORDINATOR_INSTRUCTIONS_MINIMAL)} lines instead of "
-              f"{len(_COORDINATOR_INSTRUCTIONS)})", flush=True)
-        instructions = (
-            _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
-            + list(_COORDINATOR_INSTRUCTIONS_MINIMAL)
-        )
 
     if skill_catalog:
         instructions += ["", format_skill_catalog(skill_catalog, None)]
@@ -9903,6 +9888,29 @@ async def run_task_stream(
         # CLI one-shot path, which never runs the FastAPI startup event.
         await model_routing.ensure_cache_loaded()
         await team_config.ensure_cache_loaded()
+
+        # Placed HERE, not beside the instruction composition above, and that placement
+        # is the whole point: team_config's gate cache is populated by the
+        # ensure_cache_loaded() call on the line above, so a get_gate_enabled() read
+        # earlier in this function returns the DEFAULT no matter what the DB says. The
+        # first version of this sat ~100 lines up, the row was present, the reload
+        # reported the gate changed -- and the experiment silently did not run, which
+        # only surfaced because its own log line never appeared. The pre-existing
+        # decompose_first gate works precisely because it lives inside _build_team,
+        # below this load.
+        #
+        # Kept as an override of `instructions` rather than folded into the composition
+        # expression: that literal is source-inspected by
+        # test_result_is_prepended_ahead_of_coordinator_instructions_in_both_functions,
+        # and the same order (project id, roster, coordinator instructions) is preserved.
+        if team_config.get_gate_enabled(team_name, MINIMAL_COORDINATOR_GATE, False):
+            print(f"[team] EXPERIMENT: minimal coordinator instructions active for "
+                  f"{team_name!r} ({len(_COORDINATOR_INSTRUCTIONS_MINIMAL)} lines "
+                  f"instead of {len(_COORDINATOR_INSTRUCTIONS)})", flush=True)
+            instructions = (
+                _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
+                + list(_COORDINATOR_INSTRUCTIONS_MINIMAL)
+            )
         # After the cache is loaded (it is what the no-op path compares against)
         # and before any agent is built. Writes only when hive-mcp's surface
         # actually gained a name.
@@ -12700,21 +12708,6 @@ async def run_task_async(
         _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
         + list(_COORDINATOR_INSTRUCTIONS)
     )
-    # Override AFTER the expression above, deliberately, rather than making it a
-    # conditional: test_result_is_prepended_ahead_of_coordinator_instructions_in_both_
-    # functions inspects this file's SOURCE for that exact composition line in both run
-    # paths, guarding the ordering convention (project id, then roster, then coordinator
-    # instructions). Rewriting it inline breaks that check for a reason unrelated to what
-    # it protects; this keeps the guarded literal intact and swaps the list after it, in
-    # the same order.
-    if team_config.get_gate_enabled(team_name, MINIMAL_COORDINATOR_GATE, False):
-        print(f"[team] EXPERIMENT: minimal coordinator instructions active for "
-              f"{team_name!r} ({len(_COORDINATOR_INSTRUCTIONS_MINIMAL)} lines instead of "
-              f"{len(_COORDINATOR_INSTRUCTIONS)})", flush=True)
-        instructions = (
-            _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
-            + list(_COORDINATOR_INSTRUCTIONS_MINIMAL)
-        )
 
     if skill_catalog:
         instructions += ["", format_skill_catalog(skill_catalog, None)]
@@ -12813,6 +12806,29 @@ async def run_task_async(
         # CLI one-shot path, which never runs the FastAPI startup event.
         await model_routing.ensure_cache_loaded()
         await team_config.ensure_cache_loaded()
+
+        # Placed HERE, not beside the instruction composition above, and that placement
+        # is the whole point: team_config's gate cache is populated by the
+        # ensure_cache_loaded() call on the line above, so a get_gate_enabled() read
+        # earlier in this function returns the DEFAULT no matter what the DB says. The
+        # first version of this sat ~100 lines up, the row was present, the reload
+        # reported the gate changed -- and the experiment silently did not run, which
+        # only surfaced because its own log line never appeared. The pre-existing
+        # decompose_first gate works precisely because it lives inside _build_team,
+        # below this load.
+        #
+        # Kept as an override of `instructions` rather than folded into the composition
+        # expression: that literal is source-inspected by
+        # test_result_is_prepended_ahead_of_coordinator_instructions_in_both_functions,
+        # and the same order (project id, roster, coordinator instructions) is preserved.
+        if team_config.get_gate_enabled(team_name, MINIMAL_COORDINATOR_GATE, False):
+            print(f"[team] EXPERIMENT: minimal coordinator instructions active for "
+                  f"{team_name!r} ({len(_COORDINATOR_INSTRUCTIONS_MINIMAL)} lines "
+                  f"instead of {len(_COORDINATOR_INSTRUCTIONS)})", flush=True)
+            instructions = (
+                _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
+                + list(_COORDINATOR_INSTRUCTIONS_MINIMAL)
+            )
         # After the cache is loaded (it is what the no-op path compares against)
         # and before any agent is built. Writes only when hive-mcp's surface
         # actually gained a name.
