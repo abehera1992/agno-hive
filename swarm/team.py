@@ -1359,6 +1359,14 @@ def _make_forward_member_answer(member_answers: dict):
     mutates that same dict in place as results land. Same late-binding shape as
     member_tools.
     """
+    # Decorated like request_clarification so it arrives as a named agno Function.
+    # Undecorated it still WORKS -- agno wraps a bare callable -- but the coordinator
+    # surface line prints getattr(t, "name", type(t).__name__), so it logged as
+    # 'function' and the one line that exists to make this surface auditable could not
+    # name it. Deliberately WITHOUT stop_after_tool_call, unlike request_clarification:
+    # forwarding is not the end of the turn, the coordinator forwards and then keeps
+    # writing.
+    @agno_tool
     async def forward_member_answer(member_id: str) -> str:
         """Return one member's answer EXACTLY as that member wrote it.
 
