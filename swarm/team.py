@@ -1733,6 +1733,12 @@ _GUARD_BANNERS = (
     "A DIRECTORY WAS READ THROUGH AND ALMOST NONE OF IT REACHED THE ANSWER",
     "THE INTEGRATION WAS ASKED FOR AND NOT DESCRIBED",
     "THE ANSWER PRESENTS ROUTERS THE SERVICE DOES NOT MOUNT",
+    "AT LEAST HALF THE MODELS ASKED FOR ARE NOT IN THE ANSWER",
+    # The wording this guard shipped with for one afternoon, kept because _GUARD_BANNERS
+    # is what cuts guard-appended text off an answer before it is scored. Any run stored
+    # from that window still carries the old banner, and a scorer that missed it would
+    # count class names the GUARD supplied as names the MODEL produced -- the exact
+    # miscount that nearly filed a working guard as broken once already.
     "THE MODELS WERE ASKED FOR AND ARE NOT IN THE ANSWER",
 )
 
@@ -5872,20 +5878,29 @@ async def _integration_mechanism_missing(task: str, content: str,
 _MODEL_CLASS_RE = re.compile(r"^(?:\s*\d+\t)?class ([A-Za-z_]\w*)\(", re.M)
 _MODEL_BASE_NAMES = frozenset({"Base", "BaseModel", "Enum", "str"})
 _MODELS_MIN_DECLARED = 6
-_MODELS_MAX_NAMED_RATIO = 0.25
+# 0.5, not the 0.25 its siblings use. This guard REPAIRS rather than discloses -- it
+# appends real class names read out of models.py -- so a firing costs the reader
+# accurate names they did not have, while a silence costs them the models entirely.
+# That asymmetry does not hold for a pure-disclosure guard, which is why the scope and
+# integration checks stay at 0.25. Measured over the 17 stored T12 answers: 0.25 fired
+# on 7 of them and left answers naming 8, 10 and 11 of 31 unflagged; 0.5 fires on 15,
+# leaving only the two that named 17 and 24. That is 88% of stored T12 runs, so on this
+# question shape the appended list is close to permanent -- accepted deliberately, on
+# the reasoning above, and the reason the banner had to stop overstating.
+_MODELS_MAX_NAMED_RATIO = 0.5
 _MODELS_RENDER_CAP = 40
 
 
 async def _declared_models_not_reported(task: str, content: str,
                                         hive_mcp_url: str | None,
                                         hive_mcp_tools=None) -> str:
-    """The task asked for a service's models and the answer names almost none of them.
+    """The task asked for a service's models and the answer names at most half of them.
 
     The last facet of T12 with no check at all, and the one with the widest spread.
-    Measured over 20 stored answers: models named ranged from 0 to 28 of the 31 classes
-    declared in API/inventory-service/models.py, mean ~11 (35%), with THREE runs naming
-    none. Router coverage has had a guard since this morning; this facet was scored by
-    hand every time and never by the pipeline.
+    Measured over the 17 stored T12 answers: models named ranged from 0 to 24 of the 31
+    classes API/inventory-service/models.py declares, and THREE answers named none.
+    Router coverage has had a guard since this morning; this facet was scored by hand
+    every time and never by the pipeline.
 
     REPAIRS rather than only disclosing, following ASKED FOR A LIST -- the one guard in
     this file that already does this and the reason T6 ships a correct answer in every
@@ -5925,7 +5940,11 @@ async def _declared_models_not_reported(task: str, content: str,
           f"answer names {len(named)} — attaching the {len(missing)} it omitted",
           flush=True)
     shown = missing[:_MODELS_RENDER_CAP]
-    return (f"\n\n---\n**THE MODELS WERE ASKED FOR AND ARE NOT IN THE ANSWER — "
+    # "AT LEAST HALF", not "ARE NOT IN THE ANSWER": at the 0.5 threshold the banner has
+    # to stay true at both ends of its firing range, and an answer naming 15 of 31 has
+    # not omitted the models, it has half-covered them. A banner that overstates at the
+    # boundary is how a correct guard gets read as noise and switched off.
+    return (f"\n\n---\n**AT LEAST HALF THE MODELS ASKED FOR ARE NOT IN THE ANSWER — "
             f"{service}-service declares {len(declared)} model classes in its models.py "
             f"and the answer above names {len(named)}. The rest, read from that file by "
             f"this run and reproduced verbatim — these are the file's own class names, "
