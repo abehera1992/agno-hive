@@ -1591,6 +1591,7 @@ _GUARD_BANNERS = (
     "THE ANSWER COVERS ALMOST NONE OF WHAT WAS ASKED ABOUT",
     "A DIRECTORY WAS READ THROUGH AND ALMOST NONE OF IT REACHED THE ANSWER",
     "THE INTEGRATION WAS ASKED FOR AND NOT DESCRIBED",
+    "THE ANSWER PRESENTS ROUTERS THE SERVICE DOES NOT MOUNT",
 )
 
 
@@ -5420,11 +5421,36 @@ async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None
         return ""
 
     named = [n for n in names if n in content]
+
+    # Presenting a router file the service does not MOUNT is a different error from
+    # under-coverage and a worse one: under-coverage is incomplete, this is confidently
+    # wrong. Of the 23 files in inventory-service/router/, seven are never
+    # include_router'd, and every stored T12 answer names some of them -- six, four, one
+    # and one. It happens because a member lists the directory and reports every file in
+    # it as "the routers"; nothing consults main.py. Checked only when the mounted set
+    # came from main.py, since the directory-listing fallback cannot tell the two apart.
+    _unmounted_note = ""
+    if basis == "mounted in main.py":
+        _present = await _repo_find_files(f"**/{service}-service/router/*.py",
+                                          hive_mcp_url, hive_mcp_tools)
+        _files = {p.rsplit("/", 1)[-1] for p in (_present or [])}
+        _unmounted = sorted(f for f in _files - set(names)
+                            if not f.startswith("__") and f in content)
+        if _unmounted:
+            print(f"[team] mount check: answer presents {len(_unmounted)} unmounted "
+                  f"router file(s) for {service}-service: {_unmounted}", flush=True)
+            _unmounted_note = (
+                f"\n\n---\n**THE ANSWER PRESENTS ROUTERS THE SERVICE DOES NOT MOUNT — "
+                f"{', '.join('`' + u + '`' for u in _unmounted)} exist as files under "
+                f"{service}-service/router/ but are never include_router'd in its "
+                f"main.py, so they are not part of this service's API surface. Whatever "
+                f"the answer above says about them describes dead code.**")
+
     if len(named) > _SCOPED_COVERAGE_RATIO * len(names):
         print(f"[team] scope check: {service}-service has {len(names)} routers "
               f"({basis}), answer names {len(named)} — above threshold, silent",
               flush=True)
-        return ""
+        return _unmounted_note
     missing = [n for n in names if n not in named]
     print(f"[team] scope check: {service}-service has {len(names)} routers "
           f"({basis}), answer names {len(named)}", flush=True)
@@ -5432,7 +5458,7 @@ async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None
             f"question asked about the {service} service's routers; it has {len(names)} "
             f"({basis}) and the answer above names {len(named)} of them. Not yet "
             f"covered: {', '.join(missing[:12])}"
-            f"{'…' if len(missing) > 12 else ''}.**")
+            f"{'…' if len(missing) > 12 else ''}.**" + _unmounted_note)
 
 
 
