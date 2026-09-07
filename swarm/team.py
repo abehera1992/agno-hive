@@ -1332,6 +1332,66 @@ class ClarificationOption(BaseModel):
     description: str | None = Field(None, description="One clarifying sentence about this option.")
 
 
+# The coordinator's own tool name for this, as granted in team_role_tools. A LOCAL tool,
+# so the MCP name-allowlist in _scope_coordinator_tools does not apply to it -- it is
+# attached beside request_clarification and gated on the DB grant instead.
+FORWARD_MEMBER_ANSWER_TOOL = "forward_member_answer"
+
+
+def _make_forward_member_answer(member_answers: dict):
+    """Build the coordinator's forward tool over the live member-results map.
+
+    Why forwarding rather than another guard: LangChain's multi-agent benchmark found a
+    supervisor architecture underperforming for exactly the reason measured here -- the
+    supervisor relaying subagent responses in its own words, a "game of telephone" --
+    and reported roughly 50% improvement from three fixes, the central one being a
+    forward_message tool that passes a subagent's response through WITHOUT regeneration.
+
+    The same loss is measured in this system: a Researcher opened 24 router files, its
+    own report named four, and the coordinator relayed those four faithfully -- 548,717
+    chars read, 17,915 relayed. Every other approach tried against it was measured and
+    rejected: a filesystem handoff needs 72% of the coordinator's context window, solo
+    mode drops router coverage from 13/16 to 1/16, and attaching the evidence manifest
+    to every report made the answer worse and was reverted.
+
+    The map is passed by REFERENCE, not copied: this tool is constructed before the Team
+    exists and therefore before any member has answered, and _capture_member_result
+    mutates that same dict in place as results land. Same late-binding shape as
+    member_tools.
+    """
+    async def forward_member_answer(member_id: str) -> str:
+        """Return one member's answer EXACTLY as that member wrote it.
+
+        Use this instead of restating a member's findings in your own words whenever the
+        answer is a list, an enumeration, or a set of file paths, names or line numbers.
+        Restating loses items -- measured here, a member that reported 24 files was
+        relayed as four -- and a forwarded answer loses none.
+
+        Forward as many members' answers as the task needs, then add only what is
+        genuinely yours: the ordering, the connective explanation, and anything the
+        members did not cover. Do not paraphrase what you forward.
+
+        Args:
+            member_id: the member whose answer to forward, e.g. "researcher".
+        """
+        key = _member_key(str(member_id or "").strip())
+        text = (member_answers or {}).get(key)
+        if not text:
+            have = sorted(k for k, v in (member_answers or {}).items() if v)
+            print(f"[team] forward_member_answer: nothing stored for {key!r} "
+                  f"(have: {have})", flush=True)
+            return (
+                f"NOTHING TO FORWARD: no answer is stored for member {member_id!r}. "
+                f"Members with an answer this run: {', '.join(have) if have else 'none'}. "
+                f"Delegate first, then forward."
+            )
+        print(f"[team] forward_member_answer: forwarding {key!r}'s answer verbatim "
+              f"({len(text):,} chars)", flush=True)
+        return text
+
+    return forward_member_answer
+
+
 @agno_tool(stop_after_tool_call=True)
 async def request_clarification(question: str, options: list[ClarificationOption]) -> str:
     """Ask the human a structured question with 2-4 predefined options, for a genuine decision
@@ -8831,6 +8891,10 @@ def _build_team(
     # surface only exists once it is). Passed by reference so the hook reads the
     # populated map at delegation time, which is always later than construction.
     member_tools: dict[str, set] = {}
+    # Filled by _capture_member_result as answers land. forward_member_answer closes over
+    # this exact object and team._member_results is bound to it below, so both sides read
+    # one map rather than two that can drift.
+    member_answers: dict[str, str] = {}
     capability_routing_gate_hook = _make_capability_routing_gate_hook(member_tools)
     duplicate_delegation_gate_hook = _make_duplicate_delegation_gate_hook(read_only=read_only)
     delegation_log_hook = _make_delegation_log_hook()
@@ -8939,6 +9003,17 @@ def _build_team(
     )) + [
         request_clarification, update_session_state,
     ]
+    # Granted from the DB (team_role_tools, role 'Coordinator'), not from the team YAML.
+    # It has to be checked HERE rather than flowing through coordinator_tools, because
+    # that path is unreachable for this team: api/server.py consults the DB only when a
+    # YAML omits coordinator_tools entirely, and engineering.yaml sets
+    # `coordinator_tools: []` explicitly -- which _scope_coordinator_tools early-returns
+    # on, by design, to keep a deliberately disarmed coordinator disarmed. A local tool
+    # is not part of that MCP surface, so granting one re-arms nothing: it reads a dict
+    # this process already holds, calls no tool, and changes no state.
+    if FORWARD_MEMBER_ANSWER_TOOL in set(
+            team_config.get_extra_tools(team_name or "", "Coordinator")):
+        coordinator_tools_list.append(_make_forward_member_answer(member_answers))
     # One line per run (2026-08-21). The coordinator's OWN tool surface is the single
     # most consequential thing _build_team decides and the hardest to confirm from
     # outside: engineering deliberately runs it disarmed (coordinator_tools: []), and a
@@ -9007,6 +9082,7 @@ def _build_team(
     team._delegation_state = delegation_log_hook.state
     # Run-scoped read log, visible to _verified_answer's groundedness guards regardless
     # of delegation depth (2026-08-21) -- see the hook's own read_state comment.
+    team._member_results = member_answers
     team._read_state = read_cache_hook.state
     # Set by the caller right after construction; the target-resolution gate reads it at
     # delegation time, which is always later. Same late-binding shape as member_tools.
