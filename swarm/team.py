@@ -699,6 +699,38 @@ _COORDINATOR_INSTRUCTIONS = [
 ]
 
 
+# Taught the way request_clarification is taught, and for a measured reason. The first
+# A/B of forward_member_answer produced ZERO calls across three runs where the tool was
+# granted and confirmed on the coordinator's surface -- and the diagnosis was not that
+# the coordinator ignores tools: nothing was blocking it (no force_text_only, budget at
+# call 1/60), it simply was never told the tool existed. request_clarification is the
+# counter-example in this same file: it gets four dedicated instruction lines and is
+# called often enough to need three separate gates redirecting its misuse. A tool with
+# instruction gets used here; a tool with only a docstring does not.
+#
+# Appended ONLY when the grant is present, never unconditionally: telling a coordinator
+# to call a tool it does not have is worse than saying nothing, and in the A/B's revoked
+# arm it would also confound the comparison it exists to measure.
+_FORWARD_INSTRUCTIONS = [
+    "",
+    "── FORWARD a member's answer instead of retyping it ──────────────",
+    "  When a member's answer contains a LIST -- file names, routers, endpoints, models,",
+    "  line numbers, anything enumerable -- do NOT retype it in your own words. Call the",
+    "  `forward_member_answer` tool with that member_id. It returns their answer exactly as",
+    "  they wrote it, and you place that in your final answer.",
+    "  WHY, measured on this system: a Researcher opened 24 router files, its own report",
+    "  named 4, and the answer shipped with 4. Retyping a list loses items every time. A",
+    "  forwarded list loses none.",
+    "  This is a REAL tool call, like delegate_task_to_member -- not text for you to write.",
+    "  Forward from as many members as the task needs. Then add ONLY what is genuinely",
+    "  yours: the ordering, the connective explanation, and anything no member covered.",
+    "  Do NOT paraphrase, shorten, re-order or 'clean up' what you forward -- the point is",
+    "  that it arrives unchanged.",
+    "  SELF-CHECK before you finish: if your answer contains a list you assembled from what",
+    "  a member told you, you should have forwarded it instead. Forward it now.",
+    "  This does NOT end your turn -- forward, then keep writing.",
+]
+
 def _team_roster_preamble(agent_specs: list | None) -> list[str]:
     """A real, per-team member roster computed from the actual `agent_specs` this
     run was built with -- 2026-08-15, part of the parallel-review/planning
@@ -9022,6 +9054,12 @@ def _build_team(
     if FORWARD_MEMBER_ANSWER_TOOL in set(
             team_config.get_extra_tools(team_name or "", "Coordinator")):
         coordinator_tools_list.append(_make_forward_member_answer(member_answers))
+        # Copied, never mutated in place: `instructions` belongs to the caller and is
+        # reused across runs in the same process, so appending to it directly would make
+        # the block accumulate once per run.
+        instructions = list(instructions) + _FORWARD_INSTRUCTIONS
+        print("[team] forward_member_answer granted — coordinator instructed to forward",
+              flush=True)
     # One line per run (2026-08-21). The coordinator's OWN tool surface is the single
     # most consequential thing _build_team decides and the hardest to confirm from
     # outside: engineering deliberately runs it disarmed (coordinator_tools: []), and a
