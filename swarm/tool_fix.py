@@ -80,41 +80,6 @@ from agno.models.openai.like import OpenAILike
 from agno.models.response import ModelResponse
 
 
-# A tool call the model emits as CONTENT arrives one fragment per delta -- the first
-# fragment is the bare opening tag, "<tool_call>", on its own. The per-delta recovery
-# below looks for a complete <tool_call>...</tool_call> pair, which cannot exist inside a
-# fragment, so nothing converts; agno then concatenates the fragments and the member's
-# whole report is 120-201 characters of syntax, discarded as a failed delegation.
-#
-# Established 2026-09-06 by dumping the raw provider payload at the delta parser, 5
-# captures out of 5 identical: ChoiceDelta(content='<tool_call>', tool_calls=None), tag
-# present in both the raw chunk and the parsed .content. Ten earlier probes asked which
-# FIELD held the tag and all came back negative; it was the right field at the wrong
-# granularity, which no field-level probe could have shown.
-_TC_OPEN = "<tool_call>"
-_TC_CLOSE = "</tool_call>"
-# Bounds a malformed emission, not an answer: the buffer only ever holds text that
-# follows an opening tag, and anything longer is handed back verbatim.
-_TC_BUFFER_CAP = 8192
-
-
-def _open_tag_prefix_len(text: str) -> int:
-    """How many trailing characters of `text` could still grow into _TC_OPEN.
-
-    "...the <too" -> 4, so those four are withheld until the next delta decides. Returns
-    0 when nothing at the end could become the tag, which is every chunk of ordinary
-    prose. Without this the trigger has to ask `_TC_OPEN in content`, and at one
-    character per delta that is never true -- the exact blindness the first attempt at
-    this reproduced.
-    """
-    if not text:
-        return 0
-    for n in range(min(len(text), len(_TC_OPEN) - 1), 0, -1):
-        if _TC_OPEN.startswith(text[-n:]):
-            return n
-    return 0
-
-
 # JSON escapes a model may legally write. Anything else after a backslash is stray.
 _JSON_ESCAPES = set('"\\/bfnrtu')
 
@@ -325,93 +290,6 @@ class _ToolCallRecoveryMixin:
         return True
 
 
-    def _stream_key(self, response) -> str:
-        """Per-completion key, so two concurrent streams cannot share a buffer.
-
-        The reverted first attempt kept one buffer on the instance. In `coordinate` mode
-        members run one at a time and that is survivable, but `collaborate` (the
-        parallel-review team) runs three members at once, and interleaved fragments in a
-        single buffer would splice two answers together. The completion id is already on
-        every chunk.
-        """
-        try:
-            cid = getattr(response, "id", None)
-            if cid:
-                return str(cid)
-        except Exception:  # noqa: BLE001
-            pass
-        return "_default"
-
-    @staticmethod
-    def _stream_finished(response) -> bool:
-        """Has the provider said this stream is over? Drives the flush below."""
-        try:
-            for ch in (getattr(response, "choices", None) or []):
-                if getattr(ch, "finish_reason", None):
-                    return True
-        except Exception:  # noqa: BLE001
-            pass
-        return False
-
-    def _recover_split_tool_call(self, model_response, response) -> None:
-        """Reassemble a tool call that arrives split across deltas.
-
-        Buffering starts only once an opening tag (or a prefix that could still become
-        one) is seen, so ordinary prose never accumulates and a normal answer streams
-        through byte-identical. While buffering, content is WITHHELD -- emitting the
-        fragments is precisely how a raw tag reaches a reader.
-
-        Everything that is not a recognised call is handed back verbatim: an unclosed
-        tag at end of stream, anything past _TC_BUFFER_CAP, and a tag pair whose JSON
-        will not parse. Swallowing a genuine quotation would be its own fabrication, and
-        an unflushed buffer would be silent data loss in the hot streaming path -- the
-        specific trap that got the first attempt reverted, where held text was dropped
-        whenever a stream ended without a closing tag.
-        """
-        if not isinstance(getattr(self, "_tc_pending", None), dict):
-            self._tc_pending = {}
-        key = self._stream_key(response)
-        pending = self._tc_pending.get(key, "") + (model_response.content or "")
-        if not pending:
-            return
-
-        if _TC_OPEN in pending:
-            if _TC_CLOSE in pending:
-                parsed = self._parse_tool_calls_from_content(pending)
-                tool_calls = self._to_tool_calls(parsed) if parsed else None
-                if tool_calls:
-                    model_response.tool_calls = tool_calls
-                    # Whatever sat outside the tags is real text and still ships.
-                    model_response.content = re.sub(
-                        r"<tool_call>.*?</tool_call>", "", pending, flags=re.DOTALL)
-                    self._tc_pending.pop(key, None)
-                    print(f"[toolfix] recovered a tool call split across deltas "
-                          f"({len(pending)} chars buffered) -> "
-                          f"{[c.get('function', {}).get('name') for c in tool_calls]}",
-                          flush=True)
-                    return
-                # A closed pair we cannot parse is not a call. Hand it back.
-                model_response.content = pending
-                self._tc_pending.pop(key, None)
-                return
-            if len(pending) > _TC_BUFFER_CAP or self._stream_finished(response):
-                model_response.content = pending
-                self._tc_pending.pop(key, None)
-                return
-            self._tc_pending[key] = pending
-            model_response.content = ""
-            return
-
-        # No opening tag yet: withhold only a trailing fragment that could still become
-        # one, emit the rest now so streaming latency is unchanged for ordinary text.
-        n = _open_tag_prefix_len(pending)
-        if n and not self._stream_finished(response):
-            self._tc_pending[key] = pending[-n:]
-            model_response.content = pending[:-n]
-        else:
-            self._tc_pending.pop(key, None)
-            model_response.content = pending
-
     def _parse_provider_response(self, response: dict) -> ModelResponse:
         model_response = super()._parse_provider_response(response)
         # Before any early return below -- a turn that came back as a tool call has
@@ -443,17 +321,9 @@ class _ToolCallRecoveryMixin:
         _record_input_tokens(model_response)
 
         if model_response.tool_calls:
-            if isinstance(getattr(self, "_tc_pending", None), dict):
-                self._tc_pending.pop(self._stream_key(response), None)
             return model_response
 
         if self._sanitize_forced_text(model_response):
-            return model_response
-
-        # Reassemble across deltas FIRST: the single-delta parse below cannot see a call
-        # that arrives one fragment at a time, which is how every one of them arrives.
-        self._recover_split_tool_call(model_response, response)
-        if model_response.tool_calls:
             return model_response
 
         if model_response.content:
