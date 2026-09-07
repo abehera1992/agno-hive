@@ -1589,6 +1589,7 @@ _GUARD_BANNERS = (
     "A STATED COUNT IS WRONG, CHECKED AGAINST THE FILE",
     "AND NOTHING CITED IS ONE",
     "THE ANSWER COVERS ALMOST NONE OF WHAT WAS ASKED ABOUT",
+    "A DIRECTORY WAS READ THROUGH AND ALMOST NONE OF IT REACHED THE ANSWER",
 )
 
 
@@ -3644,6 +3645,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         task, content, hive_mcp_url, hive_mcp_tools)
     _scope_note = await _scoped_coverage_gap(
         task, content, hive_mcp_url, hive_mcp_tools)
+    _opened_note = ("" if _asks_for_one_fact(task)
+                    else _swept_directory_not_reported(content, team))
     _cmp_note = await _computed_comparison(
         task,
         (getattr(team, "_read_state", None) or {}).get("enumerations")
@@ -3665,7 +3668,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         completeness = _unchecked_completeness_block(
             content, _rs.get("enumerations") if isinstance(_rs, dict) else None)
         return (_fab_note + _cmp_note + completeness + _lost_report_evidence(team)
-                + _count_note + _term_note + _scope_note
+                + _count_note + _term_note + _scope_note + _opened_note
                 + _summarize_actual_writes(*all_results))
 
     # No-answer check, ahead of everything else -- there is nothing for a later guard
@@ -4821,7 +4824,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         # so it must survive a clean verification too; the runs it matters most for
         # are exactly the ones where nothing else flagged anything.
         return (content + _lost_report_evidence(team) + _count_note
-                + _term_note + _scope_note
+                + _term_note + _scope_note + _opened_note
                 + _summarize_actual_writes(*all_results))
     if len(all_results) > 1:
         # Aggregate retry budget already spent by an earlier guard this call --
@@ -5345,6 +5348,95 @@ async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None
             f"{len(names)} files and the answer above names {len(named)} of them "
             f"(listed with find_files). Not yet covered: "
             f"{', '.join(missing[:12])}{'…' if len(missing) > 12 else ''}.**")
+
+
+
+# Files a member opened but that never reach the answer, grouped by the DIRECTORY they
+# came from. Per-directory, not per-run: an answer that legitimately spans several
+# concerns names files from each, and pooling them hides the one directory that was
+# swept and then dropped.
+_OPENED_DIR_MIN_FILES = 6
+_OPENED_DIR_MAX_NAMED_RATIO = 0.25
+# Opened as scaffolding by almost every task, and no answer is wrong for omitting them.
+_OPENED_NOISE_BASENAMES = frozenset({"__init__.py", "main.py", "config.py",
+                                     "conftest.py", "setup.py"})
+_MAX_OPENED_DIRS_REPORTED = 2
+
+
+def _swept_directory_not_reported(content: str, team) -> str:
+    """A member read most of a directory and the answer names almost none of it.
+
+    T12, wrong in every run: asked for the inventory service's routers, a member listed
+    the directory, opened 22 of its files (53 get_file_content calls, read budget driven
+    to 464,791 of 450,000) -- and the answer named FOUR. Traced through the logs, this is
+    neither a discovery failure nor a coordinator drop: the coordinator relayed exactly
+    the four the member's report contained. The loss is the member's own summarisation,
+    at 464,791 read -> 9,046 relayed (51.4:1).
+
+    Nothing existing could see it, and that is the gap this closes:
+      * _ENUM_TASK_RE/_is_enumeration_task, which forces directory-listing evidence,
+        never matched -- T12 says "its routers, its models", and those patterns need
+        "list every/all/each", "how many ... files", or "what ... exist".
+      * the relay-drop and under-report guards compare the answer against _member_items,
+        which is built from filenames the member NAMED IN ITS REPORT. The member named
+        ~6 and the answer kept 4, so 67% retention passed their 25% threshold. Their
+        baseline is what a member SAID; they are structurally blind to "opened 22,
+        said 6".
+
+    So the baseline here is what was OPENED, from the read log, which no summarisation
+    step can shrink. Measured over the T10-T13b subset before building: only T12 has any
+    directory with >=6 files opened (22 in API/inventory-service/router), where the
+    answer names 4 of 21 non-noise files = 19%. T10, T11, T13a and T13b have no such
+    directory and are silent by construction, not by threshold luck.
+
+    A whole-run version of this was measured first and REJECTED: pooling every opened
+    file put T12 at 9 named of 27 = 33%, above threshold, so it would have missed the
+    only case it exists for. The dilution is real -- T12 opens business-service files
+    legitimately for the integration half of the question -- and grouping by directory
+    is what removes it.
+
+    Suppressed for a single-fact ask, the same rule the relay-drop guard needed: a
+    question whose correct answer is one item is not under-reporting when it names one.
+    """
+    rs = getattr(team, "_read_state", None)
+    if not isinstance(rs, dict) or not (content or "").strip():
+        return ""
+    by_dir: dict[str, set[str]] = {}
+    for entry in (rs.get("reads") or []):
+        if _member_key(str(entry.get("read_by") or "")) in ("", "coordinator"):
+            continue
+        path = (entry.get("path") or "").strip().replace("\\", "/")
+        if "/" not in path:
+            continue
+        folder, _, base = path.rpartition("/")
+        if base in _OPENED_NOISE_BASENAMES:
+            continue
+        by_dir.setdefault(folder, set()).add(base)
+
+    findings = []
+    for folder, files in sorted(by_dir.items()):
+        if len(files) < _OPENED_DIR_MIN_FILES:
+            continue
+        named = {f for f in files if f in content}
+        if len(named) > _OPENED_DIR_MAX_NAMED_RATIO * len(files):
+            continue
+        findings.append((folder, sorted(files - named), len(files), len(named)))
+    if not findings:
+        return ""
+
+    findings.sort(key=lambda f: -(f[2] - f[3]))
+    blocks = []
+    for folder, missing, total, kept in findings[:_MAX_OPENED_DIRS_REPORTED]:
+        print(f"[team] opened-vs-reported: {folder} — members opened {total} files, "
+              f"answer names {kept}", flush=True)
+        blocks.append(
+            f"`{folder}` — {total} files were opened, {kept} appear above. "
+            f"Not carried into the answer: {', '.join(missing[:12])}"
+            f"{'…' if len(missing) > 12 else ''}")
+    return ("\n\n---\n**A DIRECTORY WAS READ THROUGH AND ALMOST NONE OF IT REACHED THE "
+            "ANSWER — this is what the run OPENED, from the read log, not what a member "
+            "chose to mention, so a summary cannot shrink it. " + " ".join(blocks) +
+            ".**")
 
 
 
