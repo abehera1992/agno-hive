@@ -1733,6 +1733,7 @@ _GUARD_BANNERS = (
     "A DIRECTORY WAS READ THROUGH AND ALMOST NONE OF IT REACHED THE ANSWER",
     "THE INTEGRATION WAS ASKED FOR AND NOT DESCRIBED",
     "THE ANSWER PRESENTS ROUTERS THE SERVICE DOES NOT MOUNT",
+    "THE MODELS WERE ASKED FOR AND ARE NOT IN THE ANSWER",
 )
 
 
@@ -3792,6 +3793,9 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                     else _swept_directory_not_reported(content, team))
     _integ_note = await _integration_mechanism_missing(
         task, content, hive_mcp_url, hive_mcp_tools)
+    _models_note = ("" if _asks_for_one_fact(task) else
+                    await _declared_models_not_reported(
+                        task, content, hive_mcp_url, hive_mcp_tools))
     _cmp_note = await _computed_comparison(
         task,
         (getattr(team, "_read_state", None) or {}).get("enumerations")
@@ -3814,7 +3818,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             content, _rs.get("enumerations") if isinstance(_rs, dict) else None)
         return (_fab_note + _cmp_note + completeness + _lost_report_evidence(team)
                 + _count_note + _term_note + _scope_note + _opened_note
-                + _integ_note + _summarize_actual_writes(*all_results))
+                + _integ_note + _models_note
+                + _summarize_actual_writes(*all_results))
 
     # No-answer check, ahead of everything else -- there is nothing for a later guard
     # to examine, and every later guard would correctly find nothing wrong.
@@ -4970,7 +4975,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         # are exactly the ones where nothing else flagged anything.
         return (content + _lost_report_evidence(team) + _count_note
                 + _term_note + _scope_note + _opened_note + _integ_note
-                + _summarize_actual_writes(*all_results))
+                + _models_note + _summarize_actual_writes(*all_results))
     if len(all_results) > 1:
         # Aggregate retry budget already spent by an earlier guard this call --
         # surface the verify_claims report rather than attempt a second full
@@ -5850,6 +5855,82 @@ async def _integration_mechanism_missing(task: str, content: str,
             f"above names neither that nor any of the code that uses it. The real call "
             f"sites (from search_files): "
             f"{', '.join('`' + s + '`' for s in sites[:_MAX_INTEGRATION_SITES])}.**")
+
+
+
+# A service's ORM classes, from its models.py. Same shape as _mounted_router_files: the
+# ground truth is read out of the source, not inferred from what a member happened to
+# mention.
+#
+# The `\s*\d+\t` prefix is REQUIRED, not defensive: get_file_content returns cat -n
+# numbered lines ("     1\tclass Foo(Base):"), so a plain ^class anchor matches nothing
+# and the whole check ships inert and silent. Caught by probing the real tool -- the
+# first version of this regex found 0 of 32 classes. _mounted_router_files never hit
+# this because its pattern is unanchored. Keeping the anchor (rather than dropping to a
+# bare `class X(`) is what restricts the match to TOP-LEVEL classes, excluding nested
+# ones and the word appearing inside a docstring.
+_MODEL_CLASS_RE = re.compile(r"^(?:\s*\d+\t)?class ([A-Za-z_]\w*)\(", re.M)
+_MODEL_BASE_NAMES = frozenset({"Base", "BaseModel", "Enum", "str"})
+_MODELS_MIN_DECLARED = 6
+_MODELS_MAX_NAMED_RATIO = 0.25
+_MODELS_RENDER_CAP = 40
+
+
+async def _declared_models_not_reported(task: str, content: str,
+                                        hive_mcp_url: str | None,
+                                        hive_mcp_tools=None) -> str:
+    """The task asked for a service's models and the answer names almost none of them.
+
+    The last facet of T12 with no check at all, and the one with the widest spread.
+    Measured over 20 stored answers: models named ranged from 0 to 28 of the 31 classes
+    declared in API/inventory-service/models.py, mean ~11 (35%), with THREE runs naming
+    none. Router coverage has had a guard since this morning; this facet was scored by
+    hand every time and never by the pipeline.
+
+    REPAIRS rather than only disclosing, following ASKED FOR A LIST -- the one guard in
+    this file that already does this and the reason T6 ships a correct answer in every
+    run: when the model gave a count and no list, it attaches the tool's own directory
+    listing verbatim and says whose output it is. The names here come from a
+    get_file_content of models.py, so the reader gets the classes the answer omitted
+    instead of only being told that some are missing.
+
+    Same conservatism as its siblings: silent when the file cannot be read (unknown is
+    not missing), when a service declares too few classes to be worth measuring, and when
+    the answer already covers them. Suppressed for a single-fact ask by the caller.
+    """
+    m = _SCOPED_ASK_RE.search(task or "")
+    if not m or not (content or "").strip():
+        return ""
+    if not re.search(r"\bmodels?\b", task or "", re.I):
+        return ""
+    service = m.group(1).strip().lower()
+    src = await _repo_file_text(f"API/{service}-service/models.py",
+                                hive_mcp_url, hive_mcp_tools)
+    if not src:
+        print(f"[team] models check: could not read {service}-service/models.py — "
+              f"nothing to compare", flush=True)
+        return ""
+    declared = [c for c in dict.fromkeys(_MODEL_CLASS_RE.findall(src))
+                if c not in _MODEL_BASE_NAMES]
+    if len(declared) < _MODELS_MIN_DECLARED:
+        return ""
+
+    named = [c for c in declared if re.search(rf"(?<!\w){re.escape(c)}(?!\w)", content)]
+    if len(named) > _MODELS_MAX_NAMED_RATIO * len(declared):
+        print(f"[team] models check: {service}-service declares {len(declared)} models, "
+              f"answer names {len(named)} — above threshold, silent", flush=True)
+        return ""
+    missing = [c for c in declared if c not in named]
+    print(f"[team] models check: {service}-service declares {len(declared)} models, "
+          f"answer names {len(named)} — attaching the {len(missing)} it omitted",
+          flush=True)
+    shown = missing[:_MODELS_RENDER_CAP]
+    return (f"\n\n---\n**THE MODELS WERE ASKED FOR AND ARE NOT IN THE ANSWER — "
+            f"{service}-service declares {len(declared)} model classes in its models.py "
+            f"and the answer above names {len(named)}. The rest, read from that file by "
+            f"this run and reproduced verbatim — these are the file's own class names, "
+            f"not the model's recollection: {', '.join(shown)}"
+            f"{'…' if len(missing) > len(shown) else ''}.**")
 
 
 
