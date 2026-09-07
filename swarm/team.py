@@ -731,6 +731,47 @@ _FORWARD_INSTRUCTIONS = [
     "  This does NOT end your turn -- forward, then keep writing.",
 ]
 
+# EXPERIMENT, default OFF, toggled per team via team_gate_flags. Answers one question:
+# is the coordinator's collapse onto delegate_task_to_member caused by the INSTRUCTIONS,
+# or by something structural?
+#
+# The evidence that raised it: over 16 hours the coordinator called exactly ONE distinct
+# tool -- delegate_task_to_member, which agno injects itself -- 31 times, while members
+# on the SAME model called six different tools freely (get_file_content 73,
+# list_directory_tree 29, get_files_batch 10, search_files 7, db_query 7, db_schema 6).
+# Wiring was cleared at every layer: get_resolved_tools returns team.tools,
+# _determine_tools_for_model appends each for the model, the Team carries the budget hook
+# and records its calls, no tool_choice="none" was ever applied to the coordinator, and
+# the capability gate intercepts only delegate_task_to_member. The coordinator receives
+# request_clarification, update_session_state and forward_member_answer, and calls none.
+#
+# _COORDINATOR_INSTRUCTIONS opens with "MISSING A TOOL? DELEGATE — never improvise" and
+# spends hundreds of lines on delegating and then writing the answer. The hypothesis is
+# that this prior is strong enough that a 17-line block appended at the end cannot move
+# it. This strips it to the minimum that still describes the job, so the difference in
+# behaviour is attributable.
+#
+# Deliberately NOT a replacement of _COORDINATOR_INSTRUCTIONS. That set took eight
+# live-validated phases to get right and encodes a long list of specific failures; this
+# gate exists to MEASURE, and reverts by deleting one DB row.
+MINIMAL_COORDINATOR_GATE = "minimal_coordinator_instructions"
+
+_COORDINATOR_INSTRUCTIONS_MINIMAL = [
+    "You lead a team of specialist agents. You have no file or shell tools of your own.",
+    "",
+    "To learn anything about the codebase, delegate to a member with",
+    "delegate_task_to_member(member_id=..., task=...). Name the exact files or",
+    "directories the member should look at.",
+    "",
+    "When a member's answer contains a list -- files, routers, endpoints, models, line",
+    "numbers -- call forward_member_answer(member_id=...) to place their exact words in",
+    "your answer. Do not retype a list yourself; retyping loses items.",
+    "",
+    "Then write the final answer: forward what the members found, and add the ordering,",
+    "the explanation, and anything they did not cover. Answer the question that was",
+    "asked, in full, and say plainly which parts you could not cover.",
+]
+
 def _team_roster_preamble(agent_specs: list | None) -> list[str]:
     """A real, per-team member roster computed from the actual `agent_specs` this
     run was built with -- 2026-08-15, part of the parallel-review/planning
@@ -9751,6 +9792,22 @@ async def run_task_stream(
         _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
         + list(_COORDINATOR_INSTRUCTIONS)
     )
+    # Override AFTER the expression above, deliberately, rather than making it a
+    # conditional: test_result_is_prepended_ahead_of_coordinator_instructions_in_both_
+    # functions inspects this file's SOURCE for that exact composition line in both run
+    # paths, guarding the ordering convention (project id, then roster, then coordinator
+    # instructions). Rewriting it inline breaks that check for a reason unrelated to what
+    # it protects; this keeps the guarded literal intact and swaps the list after it, in
+    # the same order.
+    if team_config.get_gate_enabled(team_name, MINIMAL_COORDINATOR_GATE, False):
+        print(f"[team] EXPERIMENT: minimal coordinator instructions active for "
+              f"{team_name!r} ({len(_COORDINATOR_INSTRUCTIONS_MINIMAL)} lines instead of "
+              f"{len(_COORDINATOR_INSTRUCTIONS)})", flush=True)
+        instructions = (
+            _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
+            + list(_COORDINATOR_INSTRUCTIONS_MINIMAL)
+        )
+
     if skill_catalog:
         instructions += ["", format_skill_catalog(skill_catalog, None)]
     # Bottom-anchoring (change #4, 2026-08-31, default OFF -- config.bottom_anchor_
@@ -12643,6 +12700,22 @@ async def run_task_async(
         _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
         + list(_COORDINATOR_INSTRUCTIONS)
     )
+    # Override AFTER the expression above, deliberately, rather than making it a
+    # conditional: test_result_is_prepended_ahead_of_coordinator_instructions_in_both_
+    # functions inspects this file's SOURCE for that exact composition line in both run
+    # paths, guarding the ordering convention (project id, then roster, then coordinator
+    # instructions). Rewriting it inline breaks that check for a reason unrelated to what
+    # it protects; this keeps the guarded literal intact and swaps the list after it, in
+    # the same order.
+    if team_config.get_gate_enabled(team_name, MINIMAL_COORDINATOR_GATE, False):
+        print(f"[team] EXPERIMENT: minimal coordinator instructions active for "
+              f"{team_name!r} ({len(_COORDINATOR_INSTRUCTIONS_MINIMAL)} lines instead of "
+              f"{len(_COORDINATOR_INSTRUCTIONS)})", flush=True)
+        instructions = (
+            _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
+            + list(_COORDINATOR_INSTRUCTIONS_MINIMAL)
+        )
+
     if skill_catalog:
         instructions += ["", format_skill_catalog(skill_catalog, None)]
     # Bottom-anchoring (change #4, 2026-08-31, default OFF -- config.bottom_anchor_
