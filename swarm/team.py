@@ -5414,14 +5414,28 @@ def _swept_directory_not_reported(content: str, team) -> str:
         by_dir.setdefault(folder, set()).add(base)
 
     findings = []
+    widest = None
     for folder, files in sorted(by_dir.items()):
         if len(files) < _OPENED_DIR_MIN_FILES:
             continue
         named = {f for f in files if f in content}
+        if widest is None or len(files) > widest[1]:
+            widest = (folder, len(files), len(named))
         if len(named) > _OPENED_DIR_MAX_NAMED_RATIO * len(files):
             continue
         findings.append((folder, sorted(files - named), len(files), len(named)))
     if not findings:
+        # Logged on the quiet path too. A check that only speaks when it fires cannot be
+        # told apart from one that never ran -- that cost a whole verification round on
+        # the scope guard (d664387), and this one shipped with the same defect.
+        if widest:
+            print(f"[team] opened-vs-reported: widest directory {widest[0]} — "
+                  f"{widest[1]} opened, {widest[2]} named, above threshold, silent",
+                  flush=True)
+        else:
+            print(f"[team] opened-vs-reported: no directory reached "
+                  f"{_OPENED_DIR_MIN_FILES} opened files — nothing to compare",
+                  flush=True)
         return ""
 
     findings.sort(key=lambda f: -(f[2] - f[3]))
