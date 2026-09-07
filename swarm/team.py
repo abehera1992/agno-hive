@@ -10100,6 +10100,40 @@ def _record_stream_artifacts(team, out: dict) -> None:
             team._discarded_delegations[_who] = (
                 team._discarded_delegations.get(_who, 0) + 1)
             return True
+        # What the member OPENED, attached to what it CHOSE TO SAY (2026-09-06).
+        #
+        # This is the member-report boundary, and it is where the run's information
+        # actually dies. Measured live: a Researcher opened 24 router files and its own
+        # report named FOUR; the coordinator then relayed those four faithfully. Read
+        # 548,717 chars, relayed 17,915 -- 30.6:1, and the coordinator never had the
+        # chance to do better, because what it received was already the summary.
+        #
+        # The manifest existed for this and could not reach here. _gate_with_evidence
+        # attaches it only when a delegation result is a `str` -- the duplicate-gate and
+        # warn tiers -- because on the normal streaming path the result is an async
+        # generator, and appending to that hangs the run (live, delegation #8). So the
+        # one mechanism that carries what a member really read was structurally excluded
+        # from every successful delegation, and rode along only on failures.
+        #
+        # out["content"] is the other end of the same pipe and is not a generator: the
+        # line below records it as "what has landed in the COORDINATOR's context ...
+        # appended there verbatim". Mutating it here puts the file list in front of the
+        # coordinator on every report, at a few hundred characters against a 400,000
+        # char budget.
+        #
+        # Additive and non-destructive by construction: the member's own prose is
+        # untouched, nothing is replaced, and a summary that already named everything
+        # simply gets a list it agrees with. Idempotent on _EVIDENCE_HEADER, the same
+        # guard the str path uses, so a result that came through both cannot carry two.
+        if content and _EVIDENCE_HEADER not in content:
+            _manifest = _evidence_manifest(getattr(team, "_read_state", None),
+                                           _member_key(out.get("agent_name", "")))
+            if _manifest:
+                content = content + _manifest
+                print(f"[team] evidence manifest attached to "
+                      f"{out.get('agent_name', '?')!r}'s report (+{len(_manifest)} chars)",
+                      flush=True)
+
         out["content"] = content
         # Keyed by _member_key so 'context-router' and 'contextrouter' land in one
         # bucket, the same normalisation the delegation gate matches on.
