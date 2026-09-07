@@ -6896,6 +6896,98 @@ _MAX_DELEGATION_LOG_ENTRIES = 200
 # SILENTLY, and the run degrades into empty-content turns no watchdog can read as
 # stalled. Firing at 12 keeps a forced, partial, USABLE answer five times clear of
 # that cliff.
+
+# Paths a delegation task names, for deciding whether a member is being sent back to
+# ground it has already covered.
+_TASK_PATH_RE = re.compile(
+    r"[A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|md|json|ya?ml|sql|scss)")
+# How much of a member's prior report to carry forward. Its whole report is typically
+# 2-5K; the cap exists so a pathological one cannot crowd out the task itself.
+_MAX_CARRIED_FINDINGS_CHARS = 4000
+
+
+def _paths_named_in_task(task: str | None) -> set[str]:
+    return set(_TASK_PATH_RE.findall(task or ""))
+
+
+def _paths_already_read_by(run_context, member_key: str) -> set[str]:
+    """Files this member already opened earlier in THIS run, from the shared read log."""
+    if run_context is None or getattr(run_context, "session_state", None) is None:
+        return set()
+    out: set[str] = set()
+    for entry in (run_context.session_state.get("read_log") or []):
+        if entry.get("tool") != "get_file_content":
+            continue
+        if _member_key(str(entry.get("read_by") or "")) != member_key:
+            continue
+        path = (entry.get("args") or {}).get("relative_path")
+        if path:
+            out.add(str(path))
+    return out
+
+
+def _carry_prior_findings(function_name: str, args: dict, run_context, team) -> bool:
+    """Hand a re-delegated member its own earlier findings, in its new task.
+
+    Every delegation starts the member with a FRESH context -- verified live
+    2026-09-06, not assumed: the per-member tool-call counter resets ([budget]
+    Researcher: call 1/80) and prompt peaks drop between delegations (133,104 ->
+    14,576 tokens) instead of accumulating. That is also why the read cache's serve_key
+    carries the delegation generation, and why relaxing it would starve the new context
+    rather than save anything.
+
+    So when the coordinator sends a member back to files it already read, the member
+    re-reads them from scratch. Measured over 12 hours: 46% of all read volume is
+    re-reads, and 98% of that (1,140,168 of 1,164,159 chars) is ONE agent re-reading its
+    own earlier files -- only 2% is a different agent, across 2 files, which is why
+    sharing findings BETWEEN members was measured and rejected as having no leverage.
+    Of 103 repeat delegations, 20 (19%) named only files that member had already read;
+    researcher delegations #3, #4 and #5 in one run each named just business_api.py.
+
+    This adds context; it never refuses. The delegation still runs and any genuinely new
+    question still gets answered -- the member simply starts holding what it found last
+    time. Deliberately weaker than a refusal: "same files" is a far softer signal than
+    the byte-identical repeat the duplicate tier blocks, and a wrong refusal costs an
+    answer, while a wrong carry-forward costs a few thousand characters.
+
+    Whether it actually reduces re-reads is NOT established by construction and must be
+    measured after deploy. Everything this file has learned says context is not a
+    constraint on behaviour the way a tool surface is; the member remains free to read
+    it all again.
+
+    Complementary to the volume gate above, not a duplicate of it: that one fires at 8
+    and 12 delegations to a member, and these repeats occur at #2-#5.
+    """
+    if function_name != "delegate_task_to_member" or not isinstance(args, dict):
+        return False
+    task = args.get("task")
+    if not isinstance(task, str) or not task.strip():
+        return False
+    member_key = _member_key(str(args.get("member_id") or "").strip())
+    if not member_key:
+        return False
+    named = _paths_named_in_task(task)
+    if not named:
+        return False
+    already = _paths_already_read_by(run_context, member_key)
+    if not already or not named <= already:
+        return False
+    prior = (getattr(team, "_member_results", None) or {}).get(member_key)
+    if not isinstance(prior, str) or not prior.strip():
+        return False
+
+    carried = prior.strip()[:_MAX_CARRIED_FINDINGS_CHARS]
+    args["task"] = (
+        f"You already opened {', '.join(sorted(named))} earlier in this run, and this "
+        f"is what you reported then:\n\n{carried}\n\n"
+        f"--- your new task ---\n{task}"
+    )
+    print(f"[team] carrying prior findings to {member_key!r}: "
+          f"{len(named)} file(s) already read, {len(carried)} chars carried",
+          flush=True)
+    return True
+
+
 _MEMBER_DELEGATION_WARN = 8
 _MEMBER_DELEGATION_LIMIT = 12
 
@@ -7916,6 +8008,11 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                             f"the audit tag to reflect that. This delegate_task_to_members call was "
                             f"NOT executed."
                         )
+
+        # LAST thing before the call, deliberately: this rewrites args["task"], and
+        # every dedupe tier above compares task TEXT. Doing it earlier would make a
+        # byte-identical repeat look novel and silently defeat the duplicate gate.
+        _carry_prior_findings(function_name, args, run_context, team)
 
         result = await function(**args)
         log.append({
