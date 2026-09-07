@@ -5280,6 +5280,79 @@ async def _affirmed_term_absent_from_citations(
             f"still not be a {term}; treat the affirmative as unverified.**")
 
 
+
+async def _repo_file_text(rel_path: str, hive_mcp_url: str | None,
+                          hive_mcp_tools=None) -> str:
+    """One file's contents from hive-mcp, or "" when it cannot be read.
+
+    Same session handling as _repo_match_count and _repo_find_files -- live session
+    first, fresh connection only as a fallback.
+    """
+    if not (hive_mcp_url or hive_mcp_tools):
+        return ""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    box: dict = {"text": ""}
+
+    async def _ask(session) -> None:
+        res = await session.call_tool("get_file_content", {"relative_path": rel_path})
+        if _mcp_error_text(res):
+            return
+        box["text"] = _extract_mcp_text(res)
+
+    if hive_mcp_tools is not None:
+        try:
+            await asyncio.wait_for(_ask(await hive_mcp_tools.get_session_for_run()),
+                                   timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] scope guard: live session failed "
+                  f"({type(exc).__name__}: {exc or '<no message>'})")
+
+    if not box["text"] and hive_mcp_url:
+        try:
+            async def _fresh() -> None:
+                async with streamablehttp_client(hive_mcp_url) as (read, write, _):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        await _ask(session)
+            await asyncio.wait_for(_fresh(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] scope guard: get_file_content failed "
+                  f"({type(exc).__name__}: {exc or '<no message>'})")
+    return box["text"]
+
+
+# app.include_router(items_api.router) -- the module whose router is actually MOUNTED.
+_INCLUDE_ROUTER_RE = re.compile(r"include_router\(\s*(?:[\w.]+\.)?([A-Za-z_]\w*)\s*\.router")
+
+
+async def _mounted_router_files(service: str, hive_mcp_url: str | None,
+                                hive_mcp_tools=None) -> list[str]:
+    """Router modules the service actually mounts, from its main.py.
+
+    A directory glob is the wrong denominator and that is not hypothetical: of the 23
+    files in API/inventory-service/router/, only SIXTEEN are include_router'd. The other
+    seven -- auto_restock_config_api, inventory_api, inventory_suppliers_api,
+    purchase_order_api, purchase_order_items_api, stock_transactions_api,
+    supplier_items_api -- are not part of the service's API surface at all. Measuring
+    "its routers" against 23 understates every answer by a third and would penalise an
+    answer that correctly names the 16 and omits the dead ones.
+
+    search_files cannot supply this: it collapses to one match per file (71 chars, a
+    single include_router line for a main.py holding sixteen), so the file itself is read.
+
+    Returns [] when main.py cannot be read or mounts nothing recognisable, and the caller
+    falls back to the directory listing -- a service that wires its routes another way
+    still gets the weaker check rather than none.
+    """
+    text = await _repo_file_text(f"API/{service}-service/main.py",
+                                 hive_mcp_url, hive_mcp_tools)
+    if not text:
+        return []
+    return sorted({m + ".py" for m in _INCLUDE_ROUTER_RE.findall(text)})
+
+
 # "a detailed architectural overview of the inventory service: its routers, its models"
 # -- a target plus a facet that is a directory listing, so the expected coverage can be
 # computed from the QUESTION without depending on what the members happened to gather.
@@ -5317,8 +5390,16 @@ async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None
     if not m or not (content or "").strip():
         return ""
     service = m.group(1).lower()
-    paths = await _repo_find_files(f"**/{service}-service/router/*.py",
-                                   hive_mcp_url, hive_mcp_tools)
+    # Mounted routers first; the directory listing is the fallback, not the source of
+    # truth. See _mounted_router_files for the 23-vs-16 measurement behind that order.
+    names = await _mounted_router_files(service, hive_mcp_url, hive_mcp_tools)
+    basis = "mounted in main.py"
+    if names:
+        paths = names
+    else:
+        basis = "files in the router directory"
+        paths = await _repo_find_files(f"**/{service}-service/router/*.py",
+                                       hive_mcp_url, hive_mcp_tools)
     if not paths:
         # Logged because silence has two causes here and they must not look alike: a
         # lookup that failed and an answer that covered everything both return "".
@@ -5337,17 +5418,18 @@ async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None
 
     named = [n for n in names if n in content]
     if len(named) > _SCOPED_COVERAGE_RATIO * len(names):
-        print(f"[team] scope check: {service}-service has {len(names)} router files, "
-              f"answer names {len(named)} — above threshold, silent", flush=True)
+        print(f"[team] scope check: {service}-service has {len(names)} routers "
+              f"({basis}), answer names {len(named)} — above threshold, silent",
+              flush=True)
         return ""
     missing = [n for n in names if n not in named]
-    print(f"[team] scope check: {service}-service has {len(names)} router files, "
-          f"answer names {len(named)}", flush=True)
+    print(f"[team] scope check: {service}-service has {len(names)} routers "
+          f"({basis}), answer names {len(named)}", flush=True)
     return (f"\n\n---\n**THE ANSWER COVERS ALMOST NONE OF WHAT WAS ASKED ABOUT — the "
-            f"question asked about the {service} service's routers; that directory holds "
-            f"{len(names)} files and the answer above names {len(named)} of them "
-            f"(listed with find_files). Not yet covered: "
-            f"{', '.join(missing[:12])}{'…' if len(missing) > 12 else ''}.**")
+            f"question asked about the {service} service's routers; it has {len(names)} "
+            f"({basis}) and the answer above names {len(named)} of them. Not yet "
+            f"covered: {', '.join(missing[:12])}"
+            f"{'…' if len(missing) > 12 else ''}.**")
 
 
 
