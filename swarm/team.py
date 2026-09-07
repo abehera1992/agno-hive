@@ -7576,6 +7576,57 @@ def _normalize_delegation_task(task_text) -> str:
 # comparing normalized Target values directly sidesteps the Party vs
 # PartyRegistration trap entirely, since those are two different targets by
 # construction, not two different phrasings of the same one.
+
+# A target worth resolving: a FILE path, not a directory and not prose. Measured over
+# one day of delegations, 25 of 54 targets were prose ("vouchers module", "seller
+# onboarding and verification", "POST /vouchers/{po_id}/grn", "Item") -- those must pass
+# through untouched or this gate blocks real work.
+_FILEISH_TARGET_RE = re.compile(
+    r"^[\w./()\[\]-]+\.(?:py|ts|tsx|js|jsx|md|json|ya?ml|sql|scss)$")
+# Actions that READ something that must already exist. "implement" and "plan" are
+# excluded on purpose: a delegation that creates a file names one that does not exist
+# yet, and refusing it would be exactly wrong.
+_TARGET_CHECKED_ACTIONS = frozenset({"read", "search", "analyze", "verify"})
+_MAX_TARGETS_RESOLVED = 3
+
+
+def _fileish_targets(target_raw: str) -> list[str]:
+    """The file paths inside an audit Target, which may name several, comma-separated,
+    and may carry a :line suffix."""
+    out = []
+    for part in str(target_raw or "").split(","):
+        cand = part.strip().split(":")[0].strip()
+        if cand and _FILEISH_TARGET_RE.match(cand) and cand not in out:
+            out.append(cand)
+    return out
+
+
+async def _unresolvable_delegation_targets(
+        paths: list[str], hive_mcp_url: str | None, hive_mcp_tools=None
+) -> list[tuple[str, list[str]]]:
+    """Which of these paths do not exist, and what the real ones with that name are.
+
+    Resolution is by SUFFIX, not literal equality: 'inventory-service/router/items_api.py'
+    is a legitimate way to name 'API/inventory-service/router/items_api.py', and 19 of the
+    30 path-shaped targets measured were written that way.
+
+    A lookup that FAILS returns nothing for that path -- unknown is not missing, the same
+    rule _repo_match_count states. Only a lookup that succeeded and produced no suffix
+    match counts as unresolvable.
+    """
+    missing: list[tuple[str, list[str]]] = []
+    for path in paths[:_MAX_TARGETS_RESOLVED]:
+        base = path.rsplit("/", 1)[-1]
+        found = await _repo_find_files(f"**/{base}", hive_mcp_url, hive_mcp_tools)
+        if found is None:
+            continue                       # lookup failed -- say nothing
+        norm = path.strip("/")
+        if any(c == norm or c.endswith("/" + norm) for c in found):
+            continue
+        missing.append((path, found[:4]))
+    return missing
+
+
 _DELEGATION_AUDIT_ACTIONS = frozenset({
     "read", "search", "analyze", "implement", "verify", "plan",
 })
@@ -7623,6 +7674,19 @@ def _parse_delegation_audit(task_text) -> dict | None:
         "action": m.group("action").strip().lower(),
         "target": _normalize_delegation_target(m.group("target")),
     }
+
+
+def _raw_audit_target(task_text) -> str:
+    """The audit Target exactly as written, for path resolution only.
+
+    Separate from _parse_delegation_audit rather than another key on its dict: that
+    return value is an established contract with its own test asserting the exact keys,
+    and `target` there must stay lowercased because the dedupe tiers compare it. A
+    lowercased path cannot be looked up -- Client/EcommClient-Web/... is not
+    client/ecommclient-web/... on a case-sensitive checkout.
+    """
+    m = _DELEGATION_AUDIT_RE.match(str(task_text or ""))
+    return str(m.group("target") or "").strip() if m else ""
 
 
 # A clarification question proposing WORK rather than resolving an ambiguity. Paired
@@ -8197,6 +8261,59 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                             f"NOT executed."
                         )
 
+        # Does the delegation's declared Target actually exist? The coordinator is
+        # already required to emit <delegation_audit>...target=...</delegation_audit> and
+        # that field is already parsed -- it has only ever been used for dedupe, never
+        # checked against the repository.
+        #
+        # Measured over one day: of 30 path-shaped targets, ELEVEN name files that do not
+        # exist -- including inventory-service/models/item.py, models/__init__.py and
+        # models/hsn_catalogue.py, an entire models/ PACKAGE that exists in no service
+        # (every one uses a single models.py). T12 lost its whole models facet that way:
+        # the member was sent to read files that were never there, while models.py went
+        # unopened and 31 of that run's 40 reads went to READMEs and __init__.py files.
+        #
+        # This is the validation-hook pattern from the Spec Kit Agents work (arXiv
+        # 2604.05278), which checks "whether file paths referenced in PLAN.md exist"
+        # against an explicit artifact rather than inside the agent's prompt. The audit
+        # tuple is already that artifact here.
+        #
+        # REDIRECTS rather than refuses, and hands back what really carries that name: a
+        # refusal burns the turn and the coordinator retries blind, while a near miss
+        # turns a wasted delegation into a corrected one. Same shape as
+        # _not_found_retry_stub and verify.py's _near_miss_hint.
+        #
+        # Fires only when EVERY file-shaped target is unresolvable, so a mostly-correct
+        # delegation still runs, and only for read-shaped actions -- an "implement"
+        # delegation names a file that does not exist yet, by definition.
+        if function_name == "delegate_task_to_member":
+            _audit = _parse_delegation_audit((args or {}).get("task"))
+            if _audit and _audit.get("action") in _TARGET_CHECKED_ACTIONS:
+                _paths = _fileish_targets(_raw_audit_target((args or {}).get("task")))
+                if _paths:
+                    _gone = await _unresolvable_delegation_targets(
+                        _paths, getattr(team, "_hive_mcp_url", None))
+                    if _gone and len(_gone) == len(_paths[:_MAX_TARGETS_RESOLVED]):
+                        _lines = []
+                        for _p, _real in _gone:
+                            _lines.append(
+                                f"`{_p}` does not exist"
+                                + (f" — files actually named `{_p.rsplit('/', 1)[-1]}`: "
+                                   + ", ".join(f"`{r}`" for r in _real) if _real
+                                   else " — nothing in this repository has that name"))
+                        print(f"[team] target check: unresolvable delegation target(s) "
+                              f"{[g[0] for g in _gone]} — redirecting", flush=True)
+                        return (
+                            "REDIRECTED — this delegation names a file that does not "
+                            "exist, so it was NOT executed and nothing was read.\n\n"
+                            + "\n".join(_lines)
+                            + "\n\nCheck the real path first (list_directory or "
+                            "find_files on the directory you mean), then delegate again "
+                            "with a target that exists. Do not guess a filename from a "
+                            "module name: this project keeps a service's models in a "
+                            "single models.py, not a models/ package."
+                        )
+
         # LAST thing before the call, deliberately: this rewrites args["task"], and
         # every dedupe tier above compares task TEXT. Doing it earlier would make a
         # byte-identical repeat look novel and silently defeat the duplicate gate.
@@ -8715,6 +8832,9 @@ def _build_team(
     # Run-scoped read log, visible to _verified_answer's groundedness guards regardless
     # of delegation depth (2026-08-21) -- see the hook's own read_state comment.
     team._read_state = read_cache_hook.state
+    # Set by the caller right after construction; the target-resolution gate reads it at
+    # delegation time, which is always later. Same late-binding shape as member_tools.
+    team._hive_mcp_url = None
     return team
 
 
@@ -9432,6 +9552,7 @@ async def run_task_stream(
         # and before any agent is built. Writes only when hive-mcp's surface
         # actually gained a name.
         await _sync_tool_registry(mcp_list, skill_catalog)
+        _hive_for_targets = _pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
             read_only=read_only, skill_catalog=skill_catalog, task=task, team_name=team_name,
@@ -9439,6 +9560,9 @@ async def run_task_stream(
         )
         # What earlier turns of this session already established, for the chain-
         # degradation check at answer time. See _chain_contradictions.
+        # Read by the target-resolution gate at delegation time (see
+        # _unresolvable_delegation_targets); _build_team has no MCP url in scope.
+        team._hive_mcp_url = _hive_for_targets
         team._session_summary = session_summary or ""
 
         full_content: list[str] = []
@@ -12345,6 +12469,7 @@ async def run_task_async(
             "last_call_name": None, "last_call_at": time.monotonic(),
             "stream_event_count": 0, "last_progress_at": time.monotonic(),
         }
+        _hive_for_targets = _pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
             read_only=read_only, skill_catalog=skill_catalog, activity=activity, task=task,
@@ -12352,6 +12477,9 @@ async def run_task_async(
         )
         # See the matching line in run_task_stream: the digest of what earlier turns
         # established, read back by _chain_contradictions at answer time.
+        # Read by the target-resolution gate at delegation time (see
+        # _unresolvable_delegation_targets); _build_team has no MCP url in scope.
+        team._hive_mcp_url = _hive_for_targets
         team._session_summary = session_summary or ""
 
         span_attrs = {
