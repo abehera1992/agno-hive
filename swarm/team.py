@@ -1590,6 +1590,7 @@ _GUARD_BANNERS = (
     "AND NOTHING CITED IS ONE",
     "THE ANSWER COVERS ALMOST NONE OF WHAT WAS ASKED ABOUT",
     "A DIRECTORY WAS READ THROUGH AND ALMOST NONE OF IT REACHED THE ANSWER",
+    "THE INTEGRATION WAS ASKED FOR AND NOT DESCRIBED",
 )
 
 
@@ -3647,6 +3648,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         task, content, hive_mcp_url, hive_mcp_tools)
     _opened_note = ("" if _asks_for_one_fact(task)
                     else _swept_directory_not_reported(content, team))
+    _integ_note = await _integration_mechanism_missing(
+        task, content, hive_mcp_url, hive_mcp_tools)
     _cmp_note = await _computed_comparison(
         task,
         (getattr(team, "_read_state", None) or {}).get("enumerations")
@@ -3669,7 +3672,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             content, _rs.get("enumerations") if isinstance(_rs, dict) else None)
         return (_fab_note + _cmp_note + completeness + _lost_report_evidence(team)
                 + _count_note + _term_note + _scope_note + _opened_note
-                + _summarize_actual_writes(*all_results))
+                + _integ_note + _summarize_actual_writes(*all_results))
 
     # No-answer check, ahead of everything else -- there is nothing for a later guard
     # to examine, and every later guard would correctly find nothing wrong.
@@ -4824,7 +4827,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         # so it must survive a clean verification too; the runs it matters most for
         # are exactly the ones where nothing else flagged anything.
         return (content + _lost_report_evidence(team) + _count_note
-                + _term_note + _scope_note + _opened_note
+                + _term_note + _scope_note + _opened_note + _integ_note
                 + _summarize_actual_writes(*all_results))
     if len(all_results) > 1:
         # Aggregate retry budget already spent by an earlier guard this call --
@@ -5533,6 +5536,153 @@ def _swept_directory_not_reported(content: str, team) -> str:
             "ANSWER — this is what the run OPENED, from the read log, not what a member "
             "chose to mention, so a summary cannot shrink it. " + " ".join(blocks) +
             ".**")
+
+
+
+async def _repo_search_text(pattern: str, glob_filter: str, hive_mcp_url: str | None,
+                            hive_mcp_tools=None) -> str:
+    """Matching lines from hive-mcp's search_files, as `path:line: content`, or "".
+
+    Same session handling as the other _repo_* helpers.
+    """
+    if not (hive_mcp_url or hive_mcp_tools):
+        return ""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    box: dict = {"text": ""}
+
+    async def _ask(session) -> None:
+        res = await session.call_tool(
+            "search_files", {"pattern": pattern, "glob_filter": glob_filter})
+        if _mcp_error_text(res):
+            return
+        box["text"] = _extract_mcp_text(res)
+
+    if hive_mcp_tools is not None:
+        try:
+            await asyncio.wait_for(_ask(await hive_mcp_tools.get_session_for_run()),
+                                   timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] integration guard: live session failed "
+                  f"({type(exc).__name__}: {exc or '<no message>'})")
+
+    if not box["text"] and hive_mcp_url:
+        try:
+            async def _fresh() -> None:
+                async with streamablehttp_client(hive_mcp_url) as (read, write, _):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        await _ask(session)
+            await asyncio.wait_for(_fresh(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] integration guard: search_files failed "
+                  f"({type(exc).__name__}: {exc or '<no message>'})")
+    return box["text"]
+
+
+# "...and how it integrates with the business service" -- the subject service comes from
+# _SCOPED_ASK_RE, this captures the OTHER one.
+_INTEGRATES_WITH_RE = re.compile(
+    r"\b(?:integrat\w+|interact\w+|communicat\w+|talks?\s+to|calls?)\b[^.]{0,40}?"
+    r"\bwith\s+the\s+([a-z][\w-]*)[\s-]service\b|"
+    r"\bhow\s+it\s+(?:integrates|interacts|communicates)\s+with\s+the\s+"
+    r"([a-z][\w-]*)[\s-]service\b",
+    re.I,
+)
+_SEARCH_LINE_RE = re.compile(r"^([\w./-]+):(\d+):", re.M)
+_MAX_INTEGRATION_SITES = 4
+# Words that appear in any HTTP call site and prove nothing about having described THIS
+# integration -- without these, "settings" or "await" in an answer would silence the check.
+_INTEGRATION_NOISE_TOKENS = frozenset({
+    "settings", "config", "import", "return", "await", "async", "string", "getenv",
+    "base_url", "api_key", "client", "request", "response", "params", "headers",
+    "timeout", "service", "business", "https", "http",
+})
+
+
+async def _integration_mechanism_missing(task: str, content: str,
+                                         hive_mcp_url: str | None,
+                                         hive_mcp_tools=None) -> str:
+    """The task asked how one service integrates with another, and the answer names none
+    of the code that actually does it.
+
+    T12's most persistent failure and the only one that recurred in EVERY run measured:
+    asked "how it integrates with the business service", the answers say business-service
+    exists and stop. Not one names BUSINESS_SERVICE_URL, fetch_catalog,
+    /business/internal/tenants/names, or the Kafka topic -- and this is not a gathering
+    failure, since config.py (which DEFINES the constant) and categories_api.py (which
+    calls through it, read 6 times in one run) were both opened.
+
+    The mechanism is findable deterministically because this project names it by
+    convention: BUSINESS_SERVICE_URL, STORAGE_SERVICE_URL, UTILITY_SERVICE_URL,
+    AUTH_SERVICE_URL, DATALAKE_SERVICE_URL. So the constant is derived from the service
+    the question names, and search_files locates its real call sites --
+
+        API/inventory-service/config.py:41           BUSINESS_SERVICE_URL: str = ...
+        API/inventory-service/router/categories_api.py:186   fetch_catalog(base_url=...)
+        API/inventory-service/router/admin_gst_api.py:684    .../internal/tenants/names
+
+    -- which is what the answer was asked for and did not give.
+
+    Silent unless the integration demonstrably EXISTS: no matches means these services may
+    genuinely not talk, and saying nothing is then correct. Silent too when the answer
+    already names the constant or any call-site file.
+    """
+    subject = _SCOPED_ASK_RE.search(task or "")
+    other = _INTEGRATES_WITH_RE.search(task or "")
+    if not subject or not other or not (content or "").strip():
+        return ""
+    target_service = (other.group(1) or other.group(2) or "").strip().lower()
+    subject_service = subject.group(1).strip().lower()
+    if not target_service or target_service == subject_service:
+        return ""
+
+    const = target_service.upper().replace("-", "_") + "_SERVICE_URL"
+    hits = await _repo_search_text(const, f"**/{subject_service}-service/**/*.py",
+                                   hive_mcp_url, hive_mcp_tools)
+    sites = []
+    for m in _SEARCH_LINE_RE.finditer(hits or ""):
+        entry = f"{m.group(1)}:{m.group(2)}"
+        if entry not in sites:
+            sites.append(entry)
+    if not sites:
+        print(f"[team] integration check: no {const} in {subject_service}-service — "
+              f"nothing to require, silent", flush=True)
+        return ""
+
+    # What counts as having DESCRIBED the integration: the constant itself, or a token
+    # taken from the call-site lines -- fetch_catalog, /business/internal/tenants/names.
+    # Deliberately NOT the call site's filename. categories_api.py is both a router and a
+    # call site, so every answer that merely LISTS the routers would look like it had
+    # described the integration; that swallowed all three real T12 failures on the first
+    # version of this check.
+    evidence = {const}
+    for line in (hits or "").splitlines():
+        body = line.split(":", 2)[-1]
+        # Only DISTINCTIVE evidence counts. A bare word lifted from a call-site line is
+        # worthless: the first version accepted "internal" and "catalog", which appear in
+        # any answer discussing HSN catalogues or internal APIs, and it silently swallowed
+        # all three real failures. A route path with real depth, or a snake_case
+        # identifier long enough to be a specific function, cannot be arrived at by
+        # accident.
+        evidence.update(m for m in re.findall(r"/[a-z][\w-]+(?:/[a-z][\w{}-]+){2,}", body))
+        evidence.update(w for w in re.findall(r"\b[a-z]+(?:_[a-z]+)+\b", body)
+                        if len(w) >= 10 and w not in _INTEGRATION_NOISE_TOKENS)
+    named = sorted(e for e in evidence if e in content)
+    if named:
+        print(f"[team] integration check: answer names {named[:3]} — silent", flush=True)
+        return ""
+
+    print(f"[team] integration check: asked how {subject_service} integrates with "
+          f"{target_service}; answer names none of {sites[:_MAX_INTEGRATION_SITES]}",
+          flush=True)
+    return (f"\n\n---\n**THE INTEGRATION WAS ASKED FOR AND NOT DESCRIBED — the question "
+            f"asked how the {subject_service} service integrates with the "
+            f"{target_service} service. It does so through `{const}`, and the answer "
+            f"above names neither that nor any of the code that uses it. The real call "
+            f"sites (from search_files): "
+            f"{', '.join('`' + s + '`' for s in sites[:_MAX_INTEGRATION_SITES])}.**")
 
 
 
