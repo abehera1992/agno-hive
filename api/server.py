@@ -19,7 +19,9 @@ from api.models import (
 )
 from fastapi.responses import StreamingResponse
 from swarm.ollama import ensure_models
-from swarm.team import run_task_async, run_task_stream, _queue_outcome
+from swarm.team import (
+    run_task_async, run_task_stream, _queue_outcome, repair_unguarded_draft,
+)
 from swarm.feedback import record_failure, record_success, drain_background_tasks
 from swarm import db, model_routing, team_config
 from config.config import config
@@ -585,15 +587,43 @@ async def _run_worker_subprocess(
                         if draft:
                             print(f"[api] returning the {len(draft):,}-char draft the "
                                   f"run had already produced")
+                            # The guards live in _verified_answer, which lives in the
+                            # worker we just SIGKILLed -- so until 2026-09-07 an
+                            # auto-killed run reached the caller with NOT ONE guard
+                            # having run. Measured: a killed T12 draft named one of
+                            # inventory-service's 31 models and shipped that way. The
+                            # subset of guards that re-derive their facts from the repo
+                            # needs nothing from the dead process, so they run here
+                            # instead. repair_unguarded_draft never raises; the belt
+                            # and braces is because this path exists to salvage an
+                            # answer and must not become a way to lose one.
+                            try:
+                                repairs = await repair_unguarded_draft(
+                                    payload.get("task") or "", draft,
+                                    payload.get("mcp_url"), payload.get("mcp_urls"),
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                print(f"[api] draft repair failed "
+                                      f"({type(exc).__name__}: {exc}) — "
+                                      f"returning the draft unchecked")
+                                repairs = ""
                             # Token counts are unavailable -- they are assembled by the
                             # worker at normal completion and this run never got there.
                             # Zeros, not estimates: a fabricated count would be worse
                             # than an obviously-absent one.
                             return (
+                                # "Everything above this line came from the run itself"
+                                # replaces "Nothing after this point was generated",
+                                # which stopped being true once the repair notes were
+                                # appended below it. Same guarantee, stated from the
+                                # other side: the draft is the run's, the checks that
+                                # follow are not, and the reader can tell which is
+                                # which.
                                 f"{draft}\n\n---\n**RUN STOPPED EARLY — {reason}. The "
                                 f"answer above is what had been produced when the run "
                                 f"was stopped, and may be incomplete or unreviewed. "
-                                f"Nothing after this point was generated.**",
+                                f"Everything above this line came from the run "
+                                f"itself.**" + repairs,
                                 {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                                 None,
                             )

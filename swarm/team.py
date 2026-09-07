@@ -5952,6 +5952,91 @@ async def _declared_models_not_reported(task: str, content: str,
             f"{'…' if len(missing) > len(shown) else ''}.**")
 
 
+# Long enough for five guards that each open their own hive-mcp connection and read a
+# file or two, short enough that a stalled run's caller is not made to wait again. The
+# run this rescues has already burned its whole liveness budget.
+_DRAFT_REPAIR_TIMEOUT_S = 90.0
+
+
+async def repair_unguarded_draft(task: str, content: str, mcp_url: str | None = None,
+                                 mcp_urls: list[str] | None = None) -> str:
+    """Run the repair guards against a draft whose worker was killed before verifying it.
+
+    A liveness auto-kill SIGKILLs the worker process and api/server.py hands back the
+    last heartbeat draft from the PARENT. _verified_answer lives in the worker, so an
+    auto-killed run reaches the caller with NO guard having run -- not the scope check,
+    not the integration check, not verify_claims. Measured live 2026-09-07: an
+    auto-killed T12 draft named ONE of the 31 models inventory-service declares, exactly
+    the case the models guard exists to repair, and the guard was unreachable by
+    construction. The RUN STOPPED EARLY banner disclosed that the draft was unreviewed;
+    it could not do anything about it.
+
+    Only the guards that need nothing but the answer text and a fresh hive-mcp
+    connection can run here. _swept_directory_not_reported and _lost_report_evidence
+    both take the live `team` object (what a member opened, whose report was discarded)
+    and _summarize_actual_writes takes the agent results -- all three died with the
+    worker, and no approximation of them belongs in a rescue path. What remains is the
+    subset that re-derives its facts from the repo, which is the half that REPAIRS:
+    counts against count_matches, routers against include_router, integration against
+    search_files, models against models.py.
+
+    Never raises and never returns anything but a suffix. The draft is the only thing
+    this path has left; a guard that fails, hangs, or finds hive-mcp unreachable must
+    cost the caller nothing more than the notes it would have added.
+    """
+    if not (content or "").strip():
+        return ""
+    effective_mcp_url = mcp_url or config.mcp_url
+    all_urls = [u for u in (mcp_urls or []) + [effective_mcp_url] if u]
+    hive_url = _pick_hive_mcp_url(all_urls, effective_mcp_url)
+    if not hive_url:
+        print("[team] draft repair: no hive-mcp url in the run's MCP set — "
+              "returning the draft unchecked", flush=True)
+        return ""
+
+    # Same order _verified_answer appends them in, so a rescued answer reads like a
+    # normal one. Ordering matters more than it looks: these banners are what a reader
+    # scans for, and two answer shapes for the same question shape is its own defect.
+    async def _nothing() -> str:
+        return ""
+
+    async def _run() -> list[str]:
+        notes = await asyncio.gather(
+            _miscounted_against_tool(content, hive_url, None),
+            _affirmed_term_absent_from_citations(task, content, hive_url, None),
+            _scoped_coverage_gap(task, content, hive_url, None),
+            _integration_mechanism_missing(task, content, hive_url, None),
+            # _nothing() rather than a bare "": gather takes awaitables only, and the
+            # models guard is the one _verified_answer suppresses for a single-fact ask.
+            _nothing() if _asks_for_one_fact(task) else
+            _declared_models_not_reported(task, content, hive_url, None),
+            return_exceptions=True,
+        )
+        out = []
+        for n in notes:
+            if isinstance(n, BaseException):
+                print(f"[team] draft repair: one guard failed "
+                      f"({type(n).__name__}: {n or '<no message>'})", flush=True)
+            elif n:
+                out.append(n)
+        return out
+
+    try:
+        fired = await asyncio.wait_for(_run(), timeout=_DRAFT_REPAIR_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        print(f"[team] draft repair: gave up after {_DRAFT_REPAIR_TIMEOUT_S:.0f}s — "
+              f"returning the draft unchecked", flush=True)
+        return ""
+    except Exception as exc:  # noqa: BLE001
+        print(f"[team] draft repair: failed ({type(exc).__name__}: {exc}) — "
+              f"returning the draft unchecked", flush=True)
+        return ""
+
+    print(f"[team] draft repair: {len(fired)} guard(s) fired on the "
+          f"{len(content):,}-char draft of a killed run", flush=True)
+    return "".join(fired)
+
+
 
 async def _fill_count_markers(content: str, hive_mcp_url: str | None,
                               hive_mcp_tools=None) -> str:
