@@ -1723,6 +1723,9 @@ _GUARD_BANNERS = (
     # Emitted by api/server.py, not by a guard in this module, which is likely why it
     # was missed: a liveness-killed draft never passed a guard chain at all.
     "RUN STOPPED EARLY",
+    # Its sibling for a worker that crashed rather than stalled — same recovered draft,
+    # same provenance line, so a scorer cuts guard text off both the same way.
+    "RUN FAILED BEFORE IT FINISHED",
     "THIS RUN PRODUCED NO ANSWER",
     "UNVERIFIED CLAIMS, AND THE CORRECTION ATTEMPT DID NOT COMPLETE",
     "MOST OF WHAT THIS RUN FOUND IS NOT IN THE ANSWER",
@@ -1740,6 +1743,7 @@ _GUARD_BANNERS = (
     # count class names the GUARD supplied as names the MODEL produced -- the exact
     # miscount that nearly filed a working guard as broken once already.
     "THE MODELS WERE ASKED FOR AND ARE NOT IN THE ANSWER",
+    "A TABLE CALLED MISSING HERE EXISTS UNDER ANOTHER SCHEMA",
 )
 
 
@@ -3802,6 +3806,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     _models_note = ("" if _asks_for_one_fact(task) else
                     await _declared_models_not_reported(
                         task, content, hive_mcp_url, hive_mcp_tools))
+    _table_note = await _table_claimed_missing_but_present(
+        task, content, hive_mcp_url, hive_mcp_tools)
     _cmp_note = await _computed_comparison(
         task,
         (getattr(team, "_read_state", None) or {}).get("enumerations")
@@ -3824,7 +3830,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             content, _rs.get("enumerations") if isinstance(_rs, dict) else None)
         return (_fab_note + _cmp_note + completeness + _lost_report_evidence(team)
                 + _count_note + _term_note + _scope_note + _opened_note
-                + _integ_note + _models_note
+                + _integ_note + _models_note + _table_note
                 + _summarize_actual_writes(*all_results))
 
     # No-answer check, ahead of everything else -- there is nothing for a later guard
@@ -4981,7 +4987,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         # are exactly the ones where nothing else flagged anything.
         return (content + _lost_report_evidence(team) + _count_note
                 + _term_note + _scope_note + _opened_note + _integ_note
-                + _models_note + _summarize_actual_writes(*all_results))
+                + _models_note + _table_note
+                + _summarize_actual_writes(*all_results))
     if len(all_results) > 1:
         # Aggregate retry budget already spent by an earlier guard this call --
         # surface the verify_claims report rather than attempt a second full
@@ -5434,6 +5441,50 @@ async def _affirmed_term_absent_from_citations(
             f"but the word does not appear in any of the {checked} file(s) it cites "
             f"(checked with count_matches). The cited code may be real and relevant and "
             f"still not be a {term}; treat the affirmative as unverified.**")
+
+
+
+async def _repo_db_schema(hive_mcp_url: str | None, hive_mcp_tools=None) -> str:
+    """hive-mcp's db_schema listing (`schema.table` per line), or "" when unavailable.
+
+    Same live-session-then-fresh-connection shape as _repo_file_text. Empty means
+    UNKNOWN -- db_schema is gated on HIVE_DB_URL and simply absent on a project with no
+    database configured -- so every caller must treat "" as "cannot say", never as
+    "no tables".
+    """
+    if not (hive_mcp_url or hive_mcp_tools):
+        return ""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    box: dict = {"text": ""}
+
+    async def _ask(session) -> None:
+        res = await session.call_tool("db_schema", {})
+        if _mcp_error_text(res):
+            return
+        box["text"] = _extract_mcp_text(res)
+
+    if hive_mcp_tools is not None:
+        try:
+            await asyncio.wait_for(_ask(await hive_mcp_tools.get_session_for_run()),
+                                   timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] table check: live session failed "
+                  f"({type(exc).__name__}: {exc or '<no message>'})")
+
+    if not box["text"] and hive_mcp_url:
+        try:
+            async def _fresh() -> None:
+                async with streamablehttp_client(hive_mcp_url) as (r, w, _):
+                    async with ClientSession(r, w) as session:
+                        await session.initialize()
+                        await _ask(session)
+            await asyncio.wait_for(_fresh(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] table check: db_schema unavailable "
+                  f"({type(exc).__name__}: {exc or '<no message>'})")
+    return box["text"]
 
 
 
@@ -6035,6 +6086,80 @@ async def repair_unguarded_draft(task: str, content: str, mcp_url: str | None = 
     print(f"[team] draft repair: {len(fired)} guard(s) fired on the "
           f"{len(content):,}-char draft of a killed run", flush=True)
     return "".join(fired)
+
+
+
+# "`public.parties` does not exist", "the parties table does not exist", "no such table
+# as parties". Anchored on the negation, because the failure this catches is always
+# phrased as a finding rather than a doubt.
+_MISSING_TABLE_RE = re.compile(
+    r"[`\"']?([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)*)[`\"']?\s+"
+    r"(?:table\s+)?does\s+not\s+exist"
+    r"|(?:table|relation)\s+[`\"']?([a-z_][a-z0-9_.]*)[`\"']?\s+does\s+not\s+exist"
+    r"|no\s+such\s+table[:\s]+[`\"']?([a-z_][a-z0-9_.]*)",
+    re.I)
+_MAX_MISSING_TABLE_CLAIMS = 4
+
+
+async def _table_claimed_missing_but_present(task: str, content: str,
+                                             hive_mcp_url: str | None,
+                                             hive_mcp_tools=None) -> str:
+    """The answer says a table does not exist and the live schema says it does.
+
+    T8 of battery run 8, verbatim: "The `public.parties` table does not exist in the
+    live database. This is a verified negative result based on the `db_schema` output,
+    which lists 162 tables." The table exists -- as `inventory.parties`, with 0 rows,
+    which was also the answer to the question actually asked ("how many rows are in the
+    parties table"). The model chose the `public.` qualifier itself, got nothing back for
+    a name no schema carries, and reported the miss as a verified finding.
+
+    The existing DB-evidence guard cannot catch this. It fires when a live-DB task makes
+    ZERO db_query/db_schema calls; T8 made two. Its own docstring records the identical
+    fabrication from 2026-08-20 -- "the items table does not exist (it does, as
+    inventory.items)" -- so this is the second recurrence of one failure, and calling a
+    DB tool has now twice been shown to be no evidence of having answered from it.
+
+    Repairs rather than discloses, like the models and integration guards: db_schema
+    returns plain `schema.table` lines, so the real qualified name can simply be handed
+    back. Silent when the schema cannot be read, when nothing claims absence, or when the
+    claim is true -- a table that really is missing must still be reportable as missing.
+    """
+    if not (content or "").strip() or not _DB_TASK_RE.search(task or ""):
+        return ""
+    claims = []
+    for m in _MISSING_TABLE_RE.finditer(content):
+        name = next((g for g in m.groups() if g), "")
+        if name and name not in claims:
+            claims.append(name)
+    if not claims:
+        return ""
+
+    listing = await _repo_db_schema(hive_mcp_url, hive_mcp_tools)
+    if not listing:
+        print("[team] table check: could not read db_schema — nothing to compare",
+              flush=True)
+        return ""
+    tables = [ln.strip() for ln in listing.splitlines() if "." in ln.strip()]
+
+    found = []
+    for claim in claims[:_MAX_MISSING_TABLE_CLAIMS]:
+        bare = claim.rsplit(".", 1)[-1].lower()
+        real = [t for t in tables if t.rsplit(".", 1)[-1].lower() == bare]
+        if real and claim.lower() not in [t.lower() for t in real]:
+            found.append((claim, real))
+    if not found:
+        print(f"[team] table check: {len(claims)} absence claim(s), none contradicted "
+              f"by db_schema — silent", flush=True)
+        return ""
+
+    print(f"[team] table check: answer calls {[c for c, _ in found]} missing, but "
+          f"db_schema lists {[r for _, rs in found for r in rs]}", flush=True)
+    lines = "; ".join(
+        f"`{c}` is not a table, but `{'`, `'.join(rs)}` is" for c, rs in found)
+    return (f"\n\n---\n**A TABLE CALLED MISSING HERE EXISTS UNDER ANOTHER SCHEMA — "
+            f"{lines}. Read back from db_schema by this run. The absence above is an "
+            f"artifact of the schema qualifier the answer chose, not a fact about the "
+            f"database, and any count or conclusion resting on it is unsupported.**")
 
 
 

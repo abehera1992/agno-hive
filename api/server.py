@@ -633,12 +633,66 @@ async def _run_worker_subprocess(
         raise
     finally:
         _ACTIVE_WORKERS.pop(proc.pid, None)
+        # Read the draft BEFORE the unlink below, not inside _salvage. This block runs
+        # on every exit path, so by the time any error branch calls _salvage the file is
+        # already gone — the first version of the salvage read it there and recovered
+        # nothing, every time, while reporting success in its own log line.
+        try:
+            _crash_draft = ((_read_liveness_snapshot(liveness_path) or {})
+                            .get("draft") or "").strip()
+        except Exception:  # noqa: BLE001
+            _crash_draft = ""
         try:
             liveness_path.unlink(missing_ok=True)
         except OSError:
             pass
 
+    async def _salvage(reason: str):
+        """The draft on disk, when the worker died instead of answering.
+
+        The liveness path has handed back its heartbeat draft since 2026-08-24; a worker
+        that CRASHES threw the identical draft away and returned a bare 500. Same loss,
+        same file already sitting on disk, opposite outcome — for no reason other than
+        which branch noticed first.
+
+        Live case, T12 of battery run 8 (2026-09-07): the run generated for ten minutes,
+        reached 55,279 characters, then died in `RuntimeError: Attempted to exit cancel
+        scope in a different task than it was entered in` while the MCP client tore down
+        — a pre-existing intermittent anyio fault, 6 incidents in 3 days, unrelated to
+        anything the answer contained. All 55,279 characters were discarded and the
+        caller got "unparseable output". The answer was complete enough to score.
+
+        Returns None when there is genuinely nothing to hand back, so the caller raises
+        exactly as it did before.
+        """
+        draft = _crash_draft
+        if not draft:
+            return None
+        print(f"[api] worker died ({reason}) — salvaging the {len(draft):,}-char draft "
+              f"from the liveness snapshot")
+        try:
+            repairs = await repair_unguarded_draft(
+                payload.get("task") or "", draft,
+                payload.get("mcp_url"), payload.get("mcp_urls"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[api] draft repair failed ({type(exc).__name__}: {exc}) — "
+                  f"returning the draft unchecked")
+            repairs = ""
+        return (
+            f"{draft}\n\n---\n**RUN FAILED BEFORE IT FINISHED — {reason}. The answer "
+            f"above is what the run had produced when it died, recovered from its last "
+            f"heartbeat, and may be incomplete or unreviewed. Everything above this "
+            f"line came from the run itself.**" + repairs,
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            None,
+        )
+
     if proc.returncode != 0:
+        salvaged = await _salvage(
+            f"the worker process exited with code {proc.returncode}")
+        if salvaged:
+            return salvaged
         raise HTTPException(
             status_code=500,
             detail=f"worker process exited with code {proc.returncode}",
@@ -647,10 +701,16 @@ async def _run_worker_subprocess(
     try:
         result = json.loads(stdout_data.decode())
     except json.JSONDecodeError as exc:
+        salvaged = await _salvage(f"the worker produced unparseable output: {exc}")
+        if salvaged:
+            return salvaged
         raise HTTPException(
             status_code=500, detail=f"worker process produced unparseable output: {exc}"
         )
     if "error" in result:
+        salvaged = await _salvage(str(result["error"])[:200])
+        if salvaged:
+            return salvaged
         raise HTTPException(status_code=500, detail=result["error"])
     return result["content"], result["tokens"], result["clarification"]
 
