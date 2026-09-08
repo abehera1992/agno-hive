@@ -3648,6 +3648,28 @@ async def _reask_after_syntax_loss(content: str, task: str, team, all_results,
     setattr(team, _SYNTAX_REASK_FLAG, True)
 
     snapshot = sorted(lost)
+    # A member whose report was lost BECAUSE the harness took its tools away cannot be
+    # helped by asking again: it still has tool_choice="none" and, on the budget path, a
+    # spent call budget, so the re-delegation returns the canned budget-exhausted
+    # sentence and the original draft is kept anyway. Measured every time it fired on
+    # 2026-09-08 -- "syntax-loss-reask: retry returned only the canned budget-exhausted
+    # sentence -- keeping the original draft".
+    #
+    # It is not a free no-op. This re-ask spends the run's ONE corrective retry, so
+    # verify_claims later finds the budget gone and takes its budget-spent branch
+    # instead of correcting the answer. Six deliberate attempts to reach the
+    # adopted-retry path failed for exactly this reason. Skipping a re-ask that cannot
+    # succeed leaves that retry for a check that can use it.
+    #
+    # What the member gathered is not lost with it: _lost_report_evidence already
+    # surfaces the files it opened, which is why the discard site records the member.
+    _recoverable = [w for w in snapshot if not _was_forced_text_only(w)]
+    if not _recoverable:
+        print(f"[team] syntax-loss re-ask SKIPPED: {', '.join(snapshot)} lost the "
+              f"report to a forced text-only turn — re-asking cannot recover it, and "
+              f"the retry is left for verify_claims", flush=True)
+        return content, result
+    snapshot = _recoverable
     who = ", ".join(snapshot)
     prompt = (
         f"{task}\n\nIMPORTANT: the {who} member returned a tool call instead of its "
@@ -6904,6 +6926,35 @@ def is_fresh_read_budget_exceeded(read_chars: dict[str, int], agent_key: str) ->
 _TOOL_BUDGET_RESERVE = 1
 
 
+# Members the harness deliberately flipped into text-only mode this run. Module scope,
+# one run per worker process -- the same lifetime as _best_draft and
+# _best_member_results, and for the same reason: the two escalation sites and the
+# syntax-loss re-ask are far apart in this file and share no object.
+#
+# This exists because a report lost to a FORCED text-only turn is not the same failure
+# as a report lost for any other reason, and only the first kind is unrecoverable by
+# re-asking. Proven on 2026-09-08, both escalation paths, three runs:
+#
+#   10:44:48 researcher served 3 consecutive stubs - forcing text-only
+#   10:44:51 member result from 'Researcher' was tool-call syntax only   (3s later)
+#   10:59:20 / 10:59:25  the same pair again, 5s apart
+#   09:39:34 / 09:40:53  the budget path, same shape
+#
+# tool_choice="none" makes vLLM skip its tool parser, so a model that still wants a
+# tool writes <tool_call> as prose -- documented directly above _force_text_only with
+# its own controlled probe. The report is then syntax that strips to nothing.
+_forced_text_only_members: set[str] = set()
+
+
+def _record_forced_text_only(member_key: str) -> None:
+    if member_key:
+        _forced_text_only_members.add(_member_key(member_key))
+
+
+def _was_forced_text_only(member_key: str) -> bool:
+    return _member_key(member_key or "") in _forced_text_only_members
+
+
 def _force_text_only(agent, team=None) -> None:
     """Flip an agent OR the coordinator into text-only mode on its next model call.
 
@@ -6927,6 +6978,7 @@ def _force_text_only(agent, team=None) -> None:
     target = agent if agent is not None else team
     if target is None:
         return
+    _record_forced_text_only(getattr(target, "name", "") or getattr(target, "id", ""))
     target.tool_choice = "none"
     model = getattr(target, "model", None)
     if model is not None:
@@ -7084,6 +7136,7 @@ def _bump_consecutive_stub_and_maybe_force_text_only(
               f"{consecutive_stub_count[norm_agent_key]} consecutive stubs — forcing "
               f"text-only (tool_choice=none; vLLM will not parse tool calls now)",
               flush=True)
+        _record_forced_text_only(norm_agent_key)
         agent.tool_choice = "none"
         model = getattr(agent, "model", None)
         if model is not None:
