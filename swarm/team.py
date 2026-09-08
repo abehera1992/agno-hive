@@ -5188,24 +5188,38 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     print(f"[team] verify (after correction retry): still_bad={still_bad} "
           f"unavailable={still_unavailable} corrected={len(corrected):,} chars | "
           f"{_verdict_digest(report2)}", flush=True)
-    # The three returns below deliberately do NOT call _tail(), and that is the whole
-    # difference between them and the two branches above: they ship `corrected`, the
-    # RETRY's answer, while every note in _tail() was computed against `content`, the
-    # draft the retry replaced. Attaching them here would tell the reader that an answer
-    # omits models or routers it may well have just added — a guard reporting on text
-    # that is no longer in front of it. Recomputing the notes against `corrected` is the
-    # real fix and is a larger change than this one; until then, silence is the honest
-    # option, because a stale repair is worse than a missing one.
+    # These three ship `corrected`, the RETRY's answer, so _tail()'s notes -- all
+    # computed against `content`, the draft the retry replaced -- do not describe what
+    # the reader is about to see. Attaching them would report on text no longer on
+    # screen; that is why they were excluded when the other four sites were wired up.
+    #
+    # Excluding them has a price, and it came due: T12 (2026-09-08) adopted a retry and
+    # shipped 4,743 characters naming 9 of 31 models with no integration section and NOT
+    # ONE banner, because every guard had measured a different draft. The exclusion was
+    # right and the silence was still wrong.
+    #
+    # So recompute rather than reuse. Only the five repo-derived guards can be re-run
+    # this way -- they depend on nothing but the answer text and hive-mcp, which is the
+    # same property that lets the parent process run them after a SIGKILL. The rest of
+    # _tail() (_lost_report_evidence, _swept_directory_not_reported,
+    # _summarize_actual_writes) reads run state that describes the RUN rather than the
+    # answer, and stays valid either way, so it is appended unchanged.
+    _corrected_notes = "".join(await _run_repo_derived_guards(
+        task, corrected, hive_mcp_url, hive_mcp_tools, "recheck after retry"))
+    if _corrected_notes:
+        print(f"[team] recheck after retry: re-ran the repo-derived guards against the "
+              f"{len(corrected):,}-char corrected answer", flush=True)
     if still_unavailable:
-        return (corrected + _UNVERIFIED_DISCLAIMER + unread_note
+        return (corrected + _UNVERIFIED_DISCLAIMER + unread_note + _corrected_notes
                 + _summarize_actual_writes(*all_results))
     if still_bad:
         # Surface rather than hide: the reader needs to know which claims are unsupported.
         return (f"{corrected}\n\n---\n**Unverified claims flagged automatically "
                 f"(these could not be found in the repository):**\n```\n{_reader_facing_report(report2)}\n```"
-                + unread_note
+                + unread_note + _corrected_notes
                 + _summarize_actual_writes(*all_results))
-    return corrected + unread_note + _summarize_actual_writes(*all_results)
+    return (corrected + unread_note + _corrected_notes
+            + _summarize_actual_writes(*all_results))
 
 
 
@@ -6243,44 +6257,64 @@ async def repair_unguarded_draft(task: str, content: str, mcp_url: str | None = 
     # Same order _verified_answer appends them in, so a rescued answer reads like a
     # normal one. Ordering matters more than it looks: these banners are what a reader
     # scans for, and two answer shapes for the same question shape is its own defect.
+    fired = await _run_repo_derived_guards(task, content, hive_url, None, "draft repair")
+    if fired:
+        print(f"[team] draft repair: {len(fired)} guard(s) fired on the "
+              f"{len(content):,}-char draft of a killed run", flush=True)
+    else:
+        print(f"[team] draft repair: 0 guard(s) fired on the {len(content):,}-char "
+              f"draft of a killed run", flush=True)
+    return "".join(fired)
+
+
+async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None,
+                                   hive_mcp_tools, label: str) -> list[str]:
+    """The five guards that re-derive their facts from the repo, run against `content`.
+
+    Shared by the parent-process rescue (repair_unguarded_draft) and the corrected-answer
+    path inside _verified_answer. One implementation because these two callers must not
+    disagree about which guards are safe to re-run against arbitrary text -- the whole
+    point of this set is that it depends on nothing but the answer and a hive-mcp
+    connection, so it can be pointed at a draft the worker never verified OR at a retry's
+    output that the notes computed earlier do not describe.
+
+    Never raises. A failing guard is dropped with a log line; the caller gets whatever
+    the others produced.
+    """
     async def _nothing() -> str:
         return ""
 
     async def _run() -> list[str]:
         notes = await asyncio.gather(
-            _miscounted_against_tool(content, hive_url, None),
-            _affirmed_term_absent_from_citations(task, content, hive_url, None),
-            _scoped_coverage_gap(task, content, hive_url, None),
-            _integration_mechanism_missing(task, content, hive_url, None),
+            _miscounted_against_tool(content, hive_url, hive_mcp_tools),
+            _affirmed_term_absent_from_citations(task, content, hive_url, hive_mcp_tools),
+            _scoped_coverage_gap(task, content, hive_url, hive_mcp_tools),
+            _integration_mechanism_missing(task, content, hive_url, hive_mcp_tools),
             # _nothing() rather than a bare "": gather takes awaitables only, and the
             # models guard is the one _verified_answer suppresses for a single-fact ask.
             _nothing() if _asks_for_one_fact(task) else
-            _declared_models_not_reported(task, content, hive_url, None),
+            _declared_models_not_reported(task, content, hive_url, hive_mcp_tools),
             return_exceptions=True,
         )
         out = []
         for n in notes:
             if isinstance(n, BaseException):
-                print(f"[team] draft repair: one guard failed "
+                print(f"[team] {label}: one guard failed "
                       f"({type(n).__name__}: {n or '<no message>'})", flush=True)
             elif n:
                 out.append(n)
         return out
 
     try:
-        fired = await asyncio.wait_for(_run(), timeout=_DRAFT_REPAIR_TIMEOUT_S)
+        return await asyncio.wait_for(_run(), timeout=_DRAFT_REPAIR_TIMEOUT_S)
     except asyncio.TimeoutError:
-        print(f"[team] draft repair: gave up after {_DRAFT_REPAIR_TIMEOUT_S:.0f}s — "
-              f"returning the draft unchecked", flush=True)
-        return ""
+        print(f"[team] {label}: gave up after {_DRAFT_REPAIR_TIMEOUT_S:.0f}s — "
+              f"returning the text unchecked", flush=True)
+        return []
     except Exception as exc:  # noqa: BLE001
-        print(f"[team] draft repair: failed ({type(exc).__name__}: {exc}) — "
-              f"returning the draft unchecked", flush=True)
-        return ""
-
-    print(f"[team] draft repair: {len(fired)} guard(s) fired on the "
-          f"{len(content):,}-char draft of a killed run", flush=True)
-    return "".join(fired)
+        print(f"[team] {label}: failed ({type(exc).__name__}: {exc}) — "
+              f"returning the text unchecked", flush=True)
+        return []
 
 
 
