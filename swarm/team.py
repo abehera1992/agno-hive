@@ -13308,6 +13308,35 @@ _PREFLIGHT_TARGET_RE = re.compile(
     r"(?:service|module|component|package|app|api|subsystem)\b", re.I)
 
 
+# Top-level definitions in a source file, across the languages this is likely to
+# meet. Deliberately a spread of keywords rather than one language's: the point is
+# to say HOW MUCH is in a file, not to parse it. A file with 31 definitions is where
+# the substance lives, whatever the project calls it.
+#
+# The `\s*\d+\t` prefix is required, not defensive: get_file_content returns cat -n
+# numbered lines, so an anchor without it matches nothing. That exact mistake shipped
+# a guard inert earlier in this file's history and was only caught by probing the
+# real tool instead of a fixture.
+_TOPLEVEL_DEF_RE = re.compile(
+    r"^(?:\s*\d+\t)?(?:export\s+)?(?:default\s+)?(?:public\s+|private\s+|"
+    r"protected\s+)?(?:abstract\s+)?(?:async\s+)?"
+    r"(?:class|def|function|func|interface|struct|enum|trait|module)\s+"
+    r"([A-Za-z_]\w*)", re.M)
+_PREFLIGHT_MAX_PROBED = 12
+
+
+async def _count_definitions(path: str, hive_mcp_url: str | None,
+                             hive_mcp_tools=None) -> int | None:
+    """How many top-level definitions `path` declares, or None if it cannot be read.
+
+    None is not zero. An unreadable file must not be reported as empty -- the same
+    rule every other repo helper here follows.
+    """
+    src = await _repo_file_text(path, hive_mcp_url, hive_mcp_tools)
+    if not src:
+        return None
+    return len(set(_TOPLEVEL_DEF_RE.findall(src)))
+
 async def _preflight_repo_facts(task: str, hive_mcp_url: str | None,
                                 hive_mcp_tools=None) -> str:
     """Where the thing the question names actually lives, resolved before delegating.
@@ -13387,9 +13416,35 @@ async def _preflight_repo_facts(task: str, hive_mcp_url: str | None,
         shown = names[:_PREFLIGHT_MAX_FILES]
         entry = ""
         if shown:
-            extra = (f", +{len(names) - len(shown)} more"
-                     if len(names) > len(shown) else "")
-            entry = ("\n    files directly inside: " + ", ".join(shown) + extra)
+            # For the best-matching location only, say how much is IN each file. Naming
+            # files was not enough on its own: measured over 3 runs each, grounding that
+            # listed filenames alone scored 18.0 of 31 models, no better than no
+            # grounding at all (21.7), while the earlier project-specific version that
+            # said "models.py declares 31 classes" scored 30.7. The count is what made
+            # the difference, so this recovers it WITHOUT naming what any file means --
+            # it reports a number, and the coordinator draws its own conclusion about
+            # where 31 definitions probably live.
+            #
+            # Top directory only: this costs one read per file and the deeper matches
+            # are rarely the answer.
+            counted: list[tuple[str, int]] = []
+            if d == ranked[0][0]:
+                for fname in shown[:_PREFLIGHT_MAX_PROBED]:
+                    c = await _count_definitions(f"{d}/{fname}", hive_mcp_url,
+                                                 hive_mcp_tools)
+                    if c:
+                        counted.append((fname, c))
+            if counted:
+                counted.sort(key=lambda kv: -kv[1])
+                rendered = ", ".join(f"{f} ({c} top-level definitions)"
+                                     for f, c in counted)
+                rest = [f for f in shown if f not in {c[0] for c in counted}]
+                entry = ("\n    files directly inside: " + rendered
+                         + (", " + ", ".join(rest) if rest else ""))
+            else:
+                extra = (f", +{len(names) - len(shown)} more"
+                         if len(names) > len(shown) else "")
+                entry = ("\n    files directly inside: " + ", ".join(shown) + extra)
         lines.append(f"- {d}/  ({n} matching file(s) below it)" + entry)
 
     print(f"[team] preflight: {name!r} resolves to {len(ranked)} location(s), "
