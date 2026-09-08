@@ -10844,10 +10844,33 @@ async def _run_heartbeat(
         last_name = activity["last_call_name"] or "(none yet)"
         event_count = activity.get("stream_event_count")
         event_count_str = f", {event_count} stream events received so far" if event_count is not None else ""
+        # The two numbers that actually DECIDE the auto-kill, printed alongside the ones
+        # that merely describe the run. "since last tool call" reads like a stall and is
+        # not what any tier keys on: the parent kills on the snapshot's
+        # stagnant_seconds, which is stagnant_ticks * interval, which comes from the age
+        # of last_progress_at.
+        #
+        # Their absence cost a diagnosis on 2026-09-08. A run sat for 26 minutes with
+        # ZERO tool calls and 4,384 stream events whose content was empty every time,
+        # the heartbeat printed "1590s since last tool call ... coordinator still
+        # running" throughout, and no kill ever came. Whether the stall clock was
+        # genuinely not advancing or the snapshot was not being written could not be
+        # settled afterwards -- the liveness file is unlinked on exit and the only
+        # record of the governing value was that file. Same shape as the silent
+        # tool_choice escalation fixed earlier the same day: a mechanism that decides
+        # something leaves no trace of what it decided on.
+        #
+        # stall= is the PREVIOUS tick's accumulation, because stagnant_ticks is updated
+        # below; that is the honest reading either way, and one tick of lag on a 30s
+        # heartbeat costs nothing against a 300s threshold.
+        _progress_at = activity.get("last_progress_at")
+        _progress_str = (f", {now - _progress_at:.0f}s since real progress"
+                         if _progress_at is not None else ", no progress tracking")
         print(
             f"[team] heartbeat: {now - run_started:.0f}s since task start, "
             f"{since_last_tool:.0f}s since last tool call (last: {last_name})"
-            f"{event_count_str}, coordinator still running",
+            f"{event_count_str}{_progress_str}, "
+            f"stall={stagnant_ticks * interval:.0f}s, coordinator still running",
             flush=True,
         )
         last_progress_at = activity.get("last_progress_at")
