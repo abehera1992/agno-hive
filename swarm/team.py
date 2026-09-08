@@ -7065,6 +7065,25 @@ def _bump_consecutive_stub_and_maybe_force_text_only(
     the SAME pattern is."""
     consecutive_stub_count[norm_agent_key] = consecutive_stub_count.get(norm_agent_key, 0) + 1
     if consecutive_stub_count[norm_agent_key] >= _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS and agent is not None:
+        # Logged for the same reason the budget-based escalation at the top of this
+        # section logs: tool_choice="none" is the one setting that makes vLLM skip its
+        # tool parser entirely, so a model that emits <tool_call> anyway has it passed
+        # through as PROSE. agno then sees no structured tool_calls, ends the turn
+        # (models/base.py, "No tool calls or finished processing them" -> break), and
+        # the member's whole report is tool-call syntax that strips to nothing.
+        #
+        # That chain is proven for the budget path -- 09:39:34 "forcing text-only" ->
+        # 09:40:53 "tool-call syntax only" on 2026-09-08. It is only PLAUSIBLE for this
+        # path, because this path sets the identical flag and says nothing, so three
+        # other discards the same morning could not be attributed either way. A
+        # mechanism that can end a member's turn must be visible in the log; without
+        # this line the next person diagnosing it re-derives it from the source, which
+        # is how the leak was twice blamed on the wrong cause (generation decay, then
+        # malformed JSON).
+        print(f"[team] {norm_agent_key} served "
+              f"{consecutive_stub_count[norm_agent_key]} consecutive stubs — forcing "
+              f"text-only (tool_choice=none; vLLM will not parse tool calls now)",
+              flush=True)
         agent.tool_choice = "none"
         model = getattr(agent, "model", None)
         if model is not None:
