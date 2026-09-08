@@ -791,6 +791,57 @@ _COORDINATOR_INSTRUCTIONS_MINIMAL = [
     "asked, in full, and say plainly which parts you could not cover.",
 ]
 
+# A/B CONTROL ARM, default OFF. Enabling this STRIPS the scoped-overview recipe added in
+# b40e38a, reverting the coordinator to the pre-fix behaviour where a question naming one
+# service fell through to the WHOLE-PROJECT recipe. Default off means the shipped answer
+# is the fixed one; the gate exists only so both arms run on ONE build, interleaved,
+# instead of comparing two batches separated by several commits and an afternoon of
+# thermal drift.
+#
+# Measured before the fix, first delegation vs models named of 31 (14 runs, 2026-09-08):
+#   scoped / targeted (4):  4, 12, 29, 31          mean 19.0, zero zeroes
+#   unscoped "project" (7): 0, 0, 0, 0, 0, 15, 31  mean  6.6, FIVE zeroes
+# That is observational. This gate is what makes it an experiment.
+SCOPED_OVERVIEW_GATE = "disable_scoped_overview_recipe"
+
+_SCOPED_RECIPE_FIRST_LINE = ("For an overview/audit of ONE NAMED service or component "
+                             "('architectural overview of the")
+_SCOPED_RECIPE_LAST_LINE = ("    named the service averaged 19 of 31 and none scored "
+                            "zero.")
+
+
+def _instructions_without_scoped_recipe(lines: list[str]) -> list[str]:
+    """_COORDINATOR_INSTRUCTIONS with the scoped-overview recipe removed.
+
+    Slices between the recipe's first and last line rather than filtering by content, so
+    the control arm is exactly the pre-b40e38a text and cannot drift as the recipe is
+    edited. Returns the list unchanged if either marker is missing -- a control arm that
+    silently failed to strip anything would report the fix as having no effect, which is
+    the one wrong answer this experiment must not produce.
+    """
+    try:
+        i = next(n for n, ln in enumerate(lines)
+                 if ln.startswith(_SCOPED_RECIPE_FIRST_LINE))
+        j = next(n for n, ln in enumerate(lines)
+                 if ln.startswith(_SCOPED_RECIPE_LAST_LINE))
+    except StopIteration:
+        print("[team] A/B WARNING: scoped-recipe markers not found — control arm is "
+              "IDENTICAL to the treatment arm, results are meaningless", flush=True)
+        return list(lines)
+    # +2 drops the recipe block and the blank line that follows it.
+    out = list(lines[:i]) + list(lines[j + 2:])
+    # The WHOLE-PROJECT recipe's pointer lines must go too. They say "if the question
+    # names ONE service ... use the scoped recipe ABOVE" -- which, in the control arm,
+    # points at a recipe that is no longer there. Leaving them would hand the control
+    # the very scoping instruction the experiment is trying to withhold, and a
+    # contaminated control reports the treatment as having no effect. Caught before the
+    # first run: the strip removed 16 lines and left these 3.
+    _pointer = ("This is for the WHOLE repository only",
+                "directory, use the scoped recipe ABOVE instead",
+                "named in it is a SCOPED question, not a project question")
+    out = [ln for ln in out if not any(p in ln for p in _pointer)]
+    return out
+
 def _team_roster_preamble(agent_specs: list | None) -> list[str]:
     """A real, per-team member roster computed from the actual `agent_specs` this
     run was built with -- 2026-08-15, part of the parallel-review/planning
@@ -10631,6 +10682,17 @@ async def run_task_stream(
                 _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
                 + list(_COORDINATOR_INSTRUCTIONS_MINIMAL)
             )
+        # Same placement rule as the gate above -- AFTER ensure_cache_loaded(), because
+        # get_gate_enabled is a cache-only read and returns the default otherwise.
+        elif team_config.get_gate_enabled(team_name, SCOPED_OVERVIEW_GATE, False):
+            _control = _instructions_without_scoped_recipe(_COORDINATOR_INSTRUCTIONS)
+            print(f"[team] A/B CONTROL ARM: scoped-overview recipe STRIPPED for "
+                  f"{team_name!r} ({len(_control)} lines instead of "
+                  f"{len(_COORDINATOR_INSTRUCTIONS)})", flush=True)
+            instructions = (
+                _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
+                + _control
+            )
         # After the cache is loaded (it is what the no-op path compares against)
         # and before any agent is built. Writes only when hive-mcp's surface
         # actually gained a name.
@@ -13607,6 +13669,17 @@ async def run_task_async(
             instructions = (
                 _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
                 + list(_COORDINATOR_INSTRUCTIONS_MINIMAL)
+            )
+        # Same placement rule as the gate above -- AFTER ensure_cache_loaded(), because
+        # get_gate_enabled is a cache-only read and returns the default otherwise.
+        elif team_config.get_gate_enabled(team_name, SCOPED_OVERVIEW_GATE, False):
+            _control = _instructions_without_scoped_recipe(_COORDINATOR_INSTRUCTIONS)
+            print(f"[team] A/B CONTROL ARM: scoped-overview recipe STRIPPED for "
+                  f"{team_name!r} ({len(_control)} lines instead of "
+                  f"{len(_COORDINATOR_INSTRUCTIONS)})", flush=True)
+            instructions = (
+                _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
+                + _control
             )
         # After the cache is loaded (it is what the no-op path compares against)
         # and before any agent is built. Writes only when hive-mcp's surface
