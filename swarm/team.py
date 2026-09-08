@@ -4993,11 +4993,21 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         # Aggregate retry budget already spent by an earlier guard this call --
         # surface the verify_claims report rather than attempt a second full
         # pipeline re-run.
+        # _tail(), not _summarize_actual_writes alone: this branch returns the ORIGINAL
+        # content, so every repair note computed for it is still valid, and ending on
+        # the write summary silently dropped all of them.
+        #
+        # Live cost, T12 of battery run 9: the models check had resolved 16 omitted
+        # class names and the integration check had resolved 3 real call sites — both
+        # logged, both discarded here, and the reader got only the verify report. The
+        # repairs were reaching the answer ONLY when verify_claims found nothing, which
+        # is backwards: an answer with unverifiable citations is the one that most needs
+        # its missing pieces attached.
         return (f"{content}\n\n---\n**Unverified claims flagged automatically "
                 f"(these could not be found in the repository, and this run's one "
                 f"correction retry was already used by an earlier check):**\n"
                 f"```\n{_reader_facing_report(report)}\n```"
-                + _summarize_actual_writes(*all_results))
+                + _tail())
     instructions = []
     if missing_symbols:
         named = ", ".join(missing_symbols[:6])
@@ -5098,11 +5108,14 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         all_results.append(retry)
     except Exception as exc:
         print(f"[team] verify retry failed: {exc}")
-        return content + _flagged_draft_note(report) + _summarize_actual_writes(*all_results)
+        # _tail(), like the two branches above and unlike the `corrected` ones below:
+        # the retry never produced anything, so what ships is the original content and
+        # its repair notes still describe exactly this text.
+        return content + _flagged_draft_note(report) + _tail()
     if not corrected:
         print("[team] correction retry returned nothing — surfacing the original "
               "report rather than shipping the flagged draft silently", flush=True)
-        return content + _flagged_draft_note(report) + _summarize_actual_writes(*all_results)
+        return content + _flagged_draft_note(report) + _tail()
 
     # The one retry site that never went through _adopt_retry, wired in 2026-09-04.
     # Two live stubs forced it: subset17's T12 delivered exactly
@@ -5127,12 +5140,14 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         # so the original report ships with it. Returning it silently would re-create
         # the same non-disclosure from the other direction. Wording follows the
         # budget-already-spent branch above, for the same reason: no retry remains.
+        # Same reasoning as the budget-spent branch above: the retry was discarded, so
+        # what ships is the original content and its notes still describe it.
         return (f"{content}\n\n---\n**Unverified claims flagged automatically "
                 f"(these could not be found in the repository; this run's one "
                 f"correction retry came back with less evidence than the draft it "
                 f"would have replaced, and was discarded):**\n"
                 f"```\n{_reader_facing_report(report)}\n```"
-                + _summarize_actual_writes(*all_results))
+                + _tail())
 
     # Still not a second retry -- that would break the "bounded at ONE retry" design
     # documented above. But as of 2026-08-20 this is no longer ONLY a log line.
@@ -5173,6 +5188,14 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     print(f"[team] verify (after correction retry): still_bad={still_bad} "
           f"unavailable={still_unavailable} corrected={len(corrected):,} chars | "
           f"{_verdict_digest(report2)}", flush=True)
+    # The three returns below deliberately do NOT call _tail(), and that is the whole
+    # difference between them and the two branches above: they ship `corrected`, the
+    # RETRY's answer, while every note in _tail() was computed against `content`, the
+    # draft the retry replaced. Attaching them here would tell the reader that an answer
+    # omits models or routers it may well have just added — a guard reporting on text
+    # that is no longer in front of it. Recomputing the notes against `corrected` is the
+    # real fix and is a larger change than this one; until then, silence is the honest
+    # option, because a stale repair is worse than a missing one.
     if still_unavailable:
         return (corrected + _UNVERIFIED_DISCLAIMER + unread_note
                 + _summarize_actual_writes(*all_results))
