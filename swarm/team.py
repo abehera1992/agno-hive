@@ -5369,7 +5369,52 @@ _ASKS_EXISTS_RE = re.compile(
     r"(?=\banywhere\b|\bin\b|\bfor\b|\bthat\b|\bwhich\b|[,?.])", re.I)
 # Only the OPENING of the answer counts as an affirmation. A "yes" buried in later prose
 # is usually about something else.
-_AFFIRMS_RE = re.compile(r"^\W*(?:yes\b|there is\b|there are\b)", re.I)
+#
+# The negative lookahead is not decoration: "There is no rate-limiting middleware in the
+# authentication service" -- the CORRECT answer to T10 -- opens with "there is" and was
+# read as an affirmation. It survived only because such answers usually cite nothing and
+# the guard bails on an empty citation list; one that named a near miss ("there is none;
+# the closest is authHelper.py:132") would have been flagged for affirming something it
+# had just denied.
+_AFFIRMS_RE = re.compile(
+    r"^\W*(?:yes\b|there\s+(?:is|are)\s+(?!no\b|not\b|none\b|nothing\b))", re.I)
+
+# Verbs that assert a construct EXISTS without ever saying "yes" or "there is".
+_EXISTENCE_VERBS = (r"implemented|defined|present|available|located|configured|handled"
+                    r"|provided|registered|applied|in\s+place|set\s+up")
+
+
+def _affirms_existence(content: str, term: str) -> bool:
+    """Does the answer's opening assert that `term` exists?
+
+    Two shapes, because the model uses both interchangeably and the guard used to see
+    only the first. T10 got the same question wrong in battery runs 8 and 9; the guard
+    caught it once:
+
+        run 8  "Yes, there is rate-limiting middleware in the authentication service."
+        run 9  "Rate-limiting middleware is implemented in the authentication service at:"
+
+    Identical claim, identical error -- three cited lines, not one of them a middleware
+    -- and the second slipped through because it never said "yes". A declarative
+    assertion is an affirmation with the word removed, so matching only the explicit
+    form measures phrasing rather than substance.
+
+    The declarative branch is deliberately term-anchored rather than a generic "X is
+    implemented": the construct has to be the thing the question asked about. And it
+    refuses a negated verb, so "the middleware is not implemented" -- agreement with a
+    NO answer -- is not read as a claim that it exists.
+    """
+    head = (content or "").strip()[:400]
+    if not head:
+        return False
+    if _AFFIRMS_RE.match(head):
+        return True
+    if not term:
+        return False
+    return bool(re.search(
+        rf"\b{re.escape(term)}\b[^.\n]{{0,40}}?\b(?:is|are)\s+"
+        rf"(?!not\b|no\b|never\b|nowhere\b|absent\b|missing\b)"
+        rf"(?:{_EXISTENCE_VERBS})\b", head, re.I))
 _CITED_FILE_RE = re.compile(r"`?([A-Za-z0-9_./-]+\.(?:py|ts|tsx))`?")
 _MAX_TERM_FILE_CHECKS = 4
 
@@ -5410,7 +5455,7 @@ async def _affirmed_term_absent_from_citations(
     term = m.group(1).split()[-1].lower().strip("-")
     if len(term) < 4 or not (content or "").strip():
         return ""
-    if not _AFFIRMS_RE.match((content or "").strip()[:400]):
+    if not _affirms_existence(content, term):
         return ""
 
     seen: list[str] = []
