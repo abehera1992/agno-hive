@@ -5924,7 +5924,31 @@ async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None
     if len(names) < _SCOPED_MIN_FILES:
         return ""
 
-    named = [n for n in names if n in content]
+    # A router counts as named in EITHER notation: the filename (items_api.py) or the
+    # mounted-module form the answer copies out of main.py (items_api.router).
+    #
+    # Filename-only was wrong in 2 of 18 stored inventory answers (11%): the guard
+    # reported 0 of 16 while the answer had listed all sixteen, verbatim, as
+    # `app.include_router(items_api.router)`. A false alarm on correct work is worse
+    # than a missed one -- it is what teaches a reader to ignore the banner everywhere
+    # it IS deserved.
+    #
+    # It also became MORE likely as of the pre-flight grounding change, which leads the
+    # coordinator to delegate "return every include_router line verbatim" and so
+    # produces precisely this notation.
+    #
+    # Deliberately NOT matching a bare `items_api`. That appears inside any quoted
+    # `from router import (...)` block, so accepting it would count a pasted import
+    # listing as an enumeration -- the same mistake that once made a hand-scored
+    # router figure read 16/16 when the answer had enumerated nothing.
+    #
+    # `.router` is this framework's spelling, and using it adds no coupling that was
+    # not already there: _mounted_router_files derives the ground truth by parsing
+    # include_router(x.router) in the first place, so the guard already only applies
+    # where that convention holds.
+    named = [n for n in names
+             if n in content
+             or re.search(rf"(?<!\w){re.escape(n[:-3])}\.router\b", content)]
 
     # Presenting a router file the service does not MOUNT is a different error from
     # under-coverage and a worse one: under-coverage is incomplete, this is confidently
