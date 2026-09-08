@@ -5504,11 +5504,72 @@ async def _affirmed_term_absent_from_citations(
 
     print(f"[team] term check: answer affirms {term!r} but none of "
           f"{seen[:_MAX_TERM_FILE_CHECKS]} contains it", flush=True)
+    # The locator runs only once the guard has already decided to fire, so a clean
+    # answer never pays for it.
+    _where = await _where_the_term_actually_is(task, term, hive_mcp_url, hive_mcp_tools)
     return (f"\n\n---\n**ASKED ABOUT A {term.upper()}, AND NOTHING CITED IS ONE — the "
             f"question asked whether a {term} exists and the answer above says it does, "
             f"but the word does not appear in any of the {checked} file(s) it cites "
             f"(checked with count_matches). The cited code may be real and relevant and "
-            f"still not be a {term}; treat the affirmative as unverified.**")
+            f"still not be a {term}; treat the affirmative as unverified."
+            + _where + "**")
+
+
+
+# "in the authentication service", "of the inventory service" -- the scope to search
+# when the answer's own citations turn out not to contain the asked-about term.
+_SERVICE_SCOPE_RE = re.compile(r"\b([a-z][\w-]*?)[- ]service\b", re.I)
+_MAX_TERM_LOCATIONS = 6
+
+
+async def _where_the_term_actually_is(task: str, term: str, hive_mcp_url: str | None,
+                                      hive_mcp_tools=None) -> str:
+    """Where `term` really appears in the service the question named, if anywhere.
+
+    Upgrades the term check from disclosure to repair. Telling a reader "nothing you
+    cited is a middleware" leaves them exactly where they started; running the search
+    the model never ran answers the question. For T10 the whole result is one line --
+    `API/authentication-service/main.py:7: from starlette.middleware.sessions import
+    SessionMiddleware` -- which settles it: the only middleware in that service is a
+    session middleware, so there is no rate-limiting one.
+
+    Deliberately term-based, NOT construct-based. The parent guard's docstring rejects
+    encoding what "middleware" means, then "hook", "decorator", "interceptor" and
+    "guard", as a per-framework knowledge base and a project-dependence this codebase
+    avoids -- and searching for `add_middleware|@app.middleware|BaseHTTPMiddleware`
+    would be exactly that, FastAPI/Starlette spelling baked into a generic guard. This
+    searches for the QUESTION'S OWN WORD instead: framework-agnostic, and it works for
+    "is there a cache", "is there a scheduler", "is there a webhook" without knowing
+    anything about any of them.
+
+    Returns "" when the scope cannot be derived or the search fails -- unknown is not
+    the same as absent, and this guard family exists because that conflation is the
+    failure mode.
+    """
+    m = _SERVICE_SCOPE_RE.search(task or "")
+    if not m:
+        return ""
+    service = m.group(1).lower()
+    hits = await _repo_search_text(term, f"API/{service}-service/**/*.py",
+                                   hive_mcp_url, hive_mcp_tools)
+    if hits is None:
+        return ""
+    lines = [ln.strip() for ln in (hits or "").splitlines() if ln.strip()]
+    if not lines:
+        print(f"[team] term check: {term!r} appears NOWHERE in {service}-service",
+              flush=True)
+        return (f" A search of the whole {service}-service for the word "
+                f"\"{term}\" returns nothing at all, so the answer's affirmative is "
+                f"not merely uncited — there is no {term} in that service to cite.")
+    shown = lines[:_MAX_TERM_LOCATIONS]
+    print(f"[team] term check: {term!r} really appears at "
+          f"{[ln.split(':')[0].rsplit('/', 1)[-1] for ln in shown]}", flush=True)
+    return (f" Where the word \"{term}\" does appear in {service}-service, read back "
+            f"from search_files by this run: "
+            + "; ".join(f"`{ln}`" for ln in shown)
+            + (f" (and {len(lines) - len(shown)} more)"
+               if len(lines) > len(shown) else "")
+            + ". Check those before accepting the answer's citations.")
 
 
 
