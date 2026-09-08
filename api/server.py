@@ -21,6 +21,7 @@ from fastapi.responses import StreamingResponse
 from swarm.ollama import ensure_models
 from swarm.team import (
     run_task_async, run_task_stream, _queue_outcome, repair_unguarded_draft,
+    render_member_findings,
 )
 from swarm.feedback import record_failure, record_success, drain_background_tasks
 from swarm import db, model_routing, team_config
@@ -607,6 +608,19 @@ async def _run_worker_subprocess(
                                       f"({type(exc).__name__}: {exc}) — "
                                       f"returning the draft unchecked")
                                 repairs = ""
+                            # The members' own findings, which used to die with the
+                            # worker. The four parent-side repair guards can only
+                            # re-derive facts from the repo; they cannot recover what
+                            # THIS run gathered. T11 (2026-09-08) is the case: killed
+                            # at 513s, 2,228 characters handed back, every guard
+                            # correctly silent because none applied to that question
+                            # shape, and the Researcher's work simply gone.
+                            _found = render_member_findings(
+                                (snapshot or {}).get("member_results"))
+                            if _found:
+                                print(f"[api] attaching {len(_found):,} chars of member "
+                                      f"findings recovered from the snapshot")
+                            repairs = _found + repairs
                             # Token counts are unavailable -- they are assembled by the
                             # worker at normal completion and this run never got there.
                             # Zeros, not estimates: a fabricated count would be worse
@@ -638,10 +652,11 @@ async def _run_worker_subprocess(
         # already gone — the first version of the salvage read it there and recovered
         # nothing, every time, while reporting success in its own log line.
         try:
-            _crash_draft = ((_read_liveness_snapshot(liveness_path) or {})
-                            .get("draft") or "").strip()
+            _snap = _read_liveness_snapshot(liveness_path) or {}
+            _crash_draft = (_snap.get("draft") or "").strip()
+            _crash_members = _snap.get("member_results")
         except Exception:  # noqa: BLE001
-            _crash_draft = ""
+            _crash_draft, _crash_members = "", None
         try:
             liveness_path.unlink(missing_ok=True)
         except OSError:
@@ -679,6 +694,13 @@ async def _run_worker_subprocess(
             print(f"[api] draft repair failed ({type(exc).__name__}: {exc}) — "
                   f"returning the draft unchecked")
             repairs = ""
+        # Same recovery as the liveness path above: a crashed worker's members did the
+        # work whether or not the process survived to report it.
+        _found = render_member_findings(_crash_members)
+        if _found:
+            print(f"[api] attaching {len(_found):,} chars of member findings recovered "
+                  f"from the snapshot")
+        repairs = _found + repairs
         return (
             f"{draft}\n\n---\n**RUN FAILED BEFORE IT FINISHED — {reason}. The answer "
             f"above is what the run had produced when it died, recovered from its last "

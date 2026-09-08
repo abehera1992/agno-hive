@@ -5442,6 +5442,64 @@ _CITED_FILE_RE = re.compile(r"`?([A-Za-z0-9_./-]+\.(?:py|ts|tsx))`?")
 _MAX_TERM_FILE_CHECKS = 4
 
 
+# `API/authentication-service/main.py:12` -- a citation that names a specific line, which
+# is a far stronger claim than naming a file and can be checked far more precisely.
+_CITED_LINE_RE = re.compile(r"`?([A-Za-z0-9_./-]+\.(?:py|ts|tsx)):(\d{1,6})`?")
+_MAX_TERM_LINE_CHECKS = 6
+
+
+async def _term_on_any_cited_line(term: str, content: str, hive_mcp_url: str | None,
+                                  hive_mcp_tools=None) -> bool | None:
+    """Does `term` appear on any line the answer actually cited?
+
+    True/False, or None when no citation carries a line number and the caller should
+    fall back to the file-level check.
+
+    The file-level check alone is defeated by one incidental co-location, and T10 is the
+    proof. Its fourth consecutive wrong answer cited
+    `API/authentication-service/main.py:12` -- a REDIS import -- and the guard went
+    silent because main.py contains "middleware" somewhere. Somewhere is line 7,
+    `from starlette.middleware.sessions import SessionMiddleware`, which has nothing to
+    do with the claim. One irrelevant citation to a file that happens to carry the word
+    switched off the whole check.
+
+    Exact line, no window, and the window is the entire design decision here: line 11 of
+    that same file is `from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware`
+    -- ONE line from the cited 12 -- so even the tightest tolerance reintroduces exactly
+    the false negative this closes. The rule that survives that is the strict one: if an
+    answer offers line N as evidence that a `term` exists, line N should say so.
+    """
+    seen: list[tuple[str, int]] = []
+    for path, num in _CITED_LINE_RE.findall(content or ""):
+        pair = (path, int(num))
+        if pair not in seen:
+            seen.append(pair)
+    if not seen:
+        return None
+
+    checked = 0
+    for path, num in seen[:_MAX_TERM_LINE_CHECKS]:
+        src = await _repo_file_text(path, hive_mcp_url, hive_mcp_tools)
+        if not src:
+            continue
+        # get_file_content returns cat -n output, so the line is addressable directly
+        # rather than by counting -- the same numbering the citation itself refers to.
+        m = re.search(rf"^\s*{num}\t(.*)$", src, re.M)
+        if not m:
+            continue
+        checked += 1
+        if term.replace("-", " ") in m.group(1).lower().replace("-", " "):
+            print(f"[team] term check: {term!r} is ON cited line {path}:{num} — silent",
+                  flush=True)
+            return True
+    if not checked:
+        return None
+    print(f"[team] term check: {term!r} on NONE of the {checked} cited line(s) checked",
+          flush=True)
+    return False
+
+
+
 async def _affirmed_term_absent_from_citations(
         task: str, content: str, hive_mcp_url: str | None, hive_mcp_tools=None) -> str:
     """The question asked whether an X exists, the answer says yes, and no file it cites
@@ -5489,18 +5547,26 @@ async def _affirmed_term_absent_from_citations(
     if not seen:
         return ""
 
-    checked = 0
-    for fn in seen[:_MAX_TERM_FILE_CHECKS]:
-        n = await _repo_match_count(re.escape(term), hive_mcp_url, hive_mcp_tools,
-                                    glob_filter="**/" + fn)
-        if n is None:
-            continue
-        checked += 1
-        if n > 0:
-            print(f"[team] term check: {term!r} found in {fn} — silent", flush=True)
-            return ""
-    if not checked:
+    # Cited LINES first when the answer offered any -- the precise claim beats the
+    # file-wide one, and the file-wide one is what T10 defeated four times.
+    on_line = await _term_on_any_cited_line(term, content, hive_mcp_url, hive_mcp_tools)
+    if on_line is True:
         return ""
+    if on_line is None:
+        checked = 0
+        for fn in seen[:_MAX_TERM_FILE_CHECKS]:
+            n = await _repo_match_count(re.escape(term), hive_mcp_url, hive_mcp_tools,
+                                        glob_filter="**/" + fn)
+            if n is None:
+                continue
+            checked += 1
+            if n > 0:
+                print(f"[team] term check: {term!r} found in {fn} — silent", flush=True)
+                return ""
+        if not checked:
+            return ""
+    else:
+        checked = len(seen)
 
     print(f"[team] term check: answer affirms {term!r} but none of "
           f"{seen[:_MAX_TERM_FILE_CHECKS]} contains it", flush=True)
@@ -9795,6 +9861,14 @@ def _finalise_member_chunks(team, agent_name: str) -> None:
     if not isinstance(getattr(team, "_member_results", None), dict):
         team._member_results = {}
     team._member_results[key] = text
+    # Mirrored to module scope for the same reason _best_draft is: the liveness
+    # heartbeat has no `team` in scope, and on an auto-kill the parent process is the
+    # only thing left alive. Without this, a killed run hands back the coordinator's
+    # draft with the members' findings unreachable -- observed live on T11
+    # (2026-09-08): 2,228 characters returned, the members' work already gathered and
+    # lost with the worker, and the four parent-side guards correctly silent because
+    # none of them applies to that question shape.
+    _record_member_result(key, text)
     # Fingerprint WHAT the member relayed, not just how much (2026-09-03). The relay
     # ratios are measurable today -- subset11: T12 read 470,149 chars and relayed
     # 66,331 (7.1:1), T11 relayed 2,875 of 122,451 (42.6:1) -- but a character count
@@ -10575,6 +10649,26 @@ _LIVENESS_DRAFT_MAX_CHARS = 120_000
 # only judgment available at kill time and is strictly better than losing everything.
 _best_draft = ""
 
+# Same lifetime and the same reason as _best_draft: one run per worker process, so a
+# module global is per-run state, and it is readable from the heartbeat which has no
+# team object.
+_best_member_results: dict[str, str] = {}
+# Per member, and generous: this is the reader's replacement for a lost answer, and the
+# renderer caps it again for display. The whole snapshot is rewritten each tick, so the
+# cost is a bounded file write, not growth.
+_LIVENESS_MEMBER_MAX_CHARS = 12000
+
+
+def _record_member_result(key: str, text: str) -> None:
+    global _best_member_results
+    if text and len(text) >= len(_best_member_results.get(key, "")):
+        _best_member_results[key] = text[:_LIVENESS_MEMBER_MAX_CHARS]
+
+
+def best_member_results() -> dict[str, str]:
+    """Members' findings so far, for the liveness snapshot."""
+    return dict(_best_member_results)
+
 
 def _record_draft(text: str) -> None:
     global _best_draft
@@ -10706,6 +10800,13 @@ async def _run_heartbeat(
                     # second one. Up to one heartbeat stale, which is the right
                     # trade: a 30s-old real answer beats a fresh 504.
                     "draft": best_draft()[:_LIVENESS_DRAFT_MAX_CHARS],
+                    # Rides the same atomic temp-file + os.replace channel as the
+                    # draft, for the same reason: it survives SIGKILL by already
+                    # being on disk. The draft alone answers "what did the
+                    # coordinator write"; this answers "what did the run actually
+                    # find", which on a killed run is usually the larger and more
+                    # useful half.
+                    "member_results": best_member_results(),
                 }
                 tmp_path = f"{liveness_path}.tmp"
                 with open(tmp_path, "w") as f:
@@ -12125,7 +12226,16 @@ def _recovered_member_findings(team) -> str:
     Appended, never substituted: the coordinator's summary may be a correct precis, and
     replacing it would hide what it chose to say. The reader gets both, clearly labelled.
     """
-    results = getattr(team, "_member_results", None)
+    return render_member_findings(getattr(team, "_member_results", None))
+
+
+def render_member_findings(results) -> str:
+    """The rendering half of _recovered_member_findings, callable without a `team`.
+
+    Split out so the SAME block can be produced from the liveness snapshot after the
+    worker has been SIGKILLed. Two renderers would drift, and this text is what a reader
+    sees in place of an answer.
+    """
     if not isinstance(results, dict) or not results:
         return ""
     parts = []
