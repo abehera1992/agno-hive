@@ -13262,82 +13262,125 @@ def _first_surviving_answer(*candidates: str | None) -> str:
     return _BUDGET_EXHAUSTED_ANSWER
 
 
+# Words that appear in the target position but never name a component.
+_NOISE_TARGET_WORDS = frozenset({
+    "this", "that", "whole", "entire", "full", "current", "same", "above", "following",
+    "project", "repository", "repo", "codebase", "system",
+})
+
 # Pre-flight grounding. Default OFF -- enable per team with this gate.
 PREFLIGHT_GROUNDING_GATE = "preflight_grounding"
 _PREFLIGHT_TIMEOUT_S = 45.0
-_PREFLIGHT_MAX_ROUTERS = 20
+_PREFLIGHT_MAX_FILES = 25
+_PREFLIGHT_MAX_DIRS = 4
+
+# "overview of the billing service", "audit the payments module", "describe the auth
+# component" -- a request aimed at ONE named part of the project. The trailing noun is
+# whatever this project calls its parts; the pattern does not care which, and the name it
+# captures is the user's own word, not a path this code invented.
+_PREFLIGHT_TARGET_RE = re.compile(
+    r"\b(?:overview|audit|describe|document|summar\w+|architecture)\b[^.]{0,80}?"
+    r"\b(?:of|for|on)\s+(?:the\s+)?([a-z][\w-]{2,})\s+"
+    r"(?:service|module|component|package|app|api|subsystem)\b", re.I)
 
 
 async def _preflight_repo_facts(task: str, hive_mcp_url: str | None,
                                 hive_mcp_tools=None) -> str:
-    """Verified paths for the service the question names, resolved BEFORE the first
-    delegation and handed to the coordinator as fact.
+    """Where the thing the question names actually lives, resolved before delegating.
 
     The coordinator writes every member's instructions and has no tools to check them
     against. Confirmed by reading agno rather than assuming: determine_input_for_members
-    defaults to True, so `member_agent_task = task` -- the sentence the coordinator
-    invented -- and the member never sees the user's question at all. Giving the
-    coordinator a tool does not fix this; it was granted one and never called it across
-    four separate conditions.
+    defaults True, so `member_agent_task = task` -- the sentence the coordinator invented
+    -- and the member never sees the user's question at all. Granting the coordinator a
+    tool does not help; it was given one and never called it across four conditions. So
+    the lookup happens in code, once, before anyone is dispatched.
 
-    So the lookup happens in CODE. These are the same deterministic helpers the guards
-    already use after the fact: _mounted_router_files reads include_router out of
-    main.py, _MODEL_CLASS_RE reads class declarations out of models.py. Running them
-    before the run turns a post-hoc correction into a precondition, and costs two file
-    reads instead of a member's exploratory scan -- so no work is duplicated.
+    DISCOVERS, never assumes. Everything returned is read out of the repository at run
+    time: the directory is found by searching for the name the USER used, and the file
+    list is whatever is actually in it. No path shape, framework, language or filename
+    convention is hard-coded -- an earlier version of this function asserted
+    "API/<name>-service/models.py holds the models and there is no models/ package",
+    which is true of one repository and confident nonsense in any other. This function
+    must stay portable: agno-hive points at whatever project it is given.
 
-    This is Rewrite-Retrieve-Read applied to a repository: rewrite the vague question
-    into the project's real vocabulary before anyone acts on it. Anthropic's multi-agent
-    write-up reports the same failure from the other side -- brief delegations made
-    subagents "misinterpret the task or perform the exact same searches as other agents"
-    -- and their remedy was to require objective, output format, tool guidance and task
-    boundaries in every task description. Real paths are the tool guidance.
+    It states location, not meaning. It says "these files exist here"; it does not say
+    which one holds the models or the routes, because that varies by project and a wrong
+    label injected as fact is worse than no fact -- a coordinator's guess gets caught by
+    the target gate downstream, an authoritative-sounding injection does not.
 
-    Returns "" when the question names no service or nothing resolves. Silence is right
-    there: a wrong path asserted as verified fact is worse than the coordinator guessing,
-    because a guess gets caught by the target gate and an injected fact does not.
+    Returns "" when the question names no component, or when nothing resolves.
     """
-    m = _SCOPED_ASK_RE.search(task or "")
+    m = _PREFLIGHT_TARGET_RE.search(task or "")
     if not m:
         return ""
-    service = m.group(1).strip().lower()
-
-    routers = await _mounted_router_files(service, hive_mcp_url, hive_mcp_tools)
-    src = await _repo_file_text(f"API/{service}-service/models.py",
-                                hive_mcp_url, hive_mcp_tools)
-    models = []
-    if src:
-        models = [c for c in dict.fromkeys(_MODEL_CLASS_RE.findall(src))
-                  if c not in _MODEL_BASE_NAMES]
-
-    lines = []
-    if routers:
-        shown = routers[:_PREFLIGHT_MAX_ROUTERS]
-        lines.append(
-            f"- The {service}-service mounts {len(routers)} router module(s), read from "
-            f"its main.py include_router calls: {', '.join(shown)}"
-            + (f" (+{len(routers) - len(shown)} more)" if len(routers) > len(shown)
-               else "")
-            + ". Files under router/ NOT in this list exist but are not mounted, so "
-              "they are not part of this service's API surface.")
-    if models:
-        lines.append(
-            f"- Its models are all in ONE file, API/{service}-service/models.py, which "
-            f"declares {len(models)} model classes. There is no models/ package.")
-    if not lines:
-        print(f"[team] preflight: nothing resolved for {service!r} — no facts injected",
-              flush=True)
+    name = m.group(1).strip().lower()
+    if name in _NOISE_TARGET_WORDS:
         return ""
 
-    print(f"[team] preflight: grounded {service}-service — {len(routers or [])} routers, "
-          f"{len(models)} models resolved before delegation", flush=True)
-    return (
-        "\n\nVERIFIED PROJECT FACTS (read from the repository by this run, before any "
-        "delegation). Use these exact paths in the instructions you write, and do not "
-        "send a member to discover what is already stated here:\n"
-        + "\n".join(lines)
-    )
+    # Find real files whose path mentions the name the user used, then report the
+    # DIRECTORIES they cluster into rather than the files themselves. Listing files
+    # directly was the first attempt and it was worse than nothing: one component
+    # name matched 104 paths across backend and frontend, the shared root collapsed
+    # to the repository root, and the 30 alphabetically-first entries were all
+    # frontend stylesheets for a question about backend architecture. Directories
+    # are compact, rank naturally by how many matches they hold, and leave the
+    # choice of which one matters to the coordinator, which is the part that varies
+    # by project.
+    paths = await _repo_find_files(f"**/*{name}*/**/*", hive_mcp_url, hive_mcp_tools)
+    if not paths:
+        paths = await _repo_find_files(f"**/*{name}*", hive_mcp_url, hive_mcp_tools)
+    if not paths:
+        print(f"[team] preflight: nothing in the repo matches {name!r} — no facts "
+              f"injected", flush=True)
+        return ""
 
+    # Bucket by the FIRST path segment that carries the name, so
+    # a/b/<name>-svc/c/d.py is credited to a/b/<name>-svc rather than to its
+    # subdirectory. A file that itself carries the name is credited to its parent.
+    buckets: dict[str, int] = {}
+    for p in paths:
+        segs = p.replace("\\", "/").strip("/").split("/")
+        hit = next((i for i, seg in enumerate(segs) if name in seg.lower()), None)
+        if hit is None:
+            continue
+        key = ("/".join(segs[:hit]) or "."               ) if hit == len(segs) - 1 else "/".join(segs[:hit + 1])
+        buckets[key] = buckets.get(key, 0) + 1
+    if not buckets:
+        return ""
+
+    ranked = sorted(buckets.items(), key=lambda kv: -kv[1])[:_PREFLIGHT_MAX_DIRS]
+    lines = []
+    for d, n in ranked:
+        # Files directly inside it -- this project's entry points, whatever it
+        # calls them. Not recursive, and no filename is assumed to mean anything.
+        direct = await _repo_find_files(f"{d}/*", hive_mcp_url, hive_mcp_tools) or []
+        # Dotfiles are skipped: this listing goes into a model prompt, and .env and its
+        # neighbours have no business there. Names only, never contents — but there is
+        # no reason to name them either.
+        names = sorted({p.replace("\\", "/").rsplit("/", 1)[-1] for p in direct
+                        if "." in p.rsplit("/", 1)[-1]
+                        and not p.rsplit("/", 1)[-1].startswith(".")})
+        shown = names[:_PREFLIGHT_MAX_FILES]
+        entry = ""
+        if shown:
+            extra = (f", +{len(names) - len(shown)} more"
+                     if len(names) > len(shown) else "")
+            entry = ("\n    files directly inside: " + ", ".join(shown) + extra)
+        lines.append(f"- {d}/  ({n} matching file(s) below it)" + entry)
+
+    print(f"[team] preflight: {name!r} resolves to {len(ranked)} location(s), "
+          f"top: {ranked[0][0]} ({ranked[0][1]} files)", flush=True)
+    return (
+        f"\n\nVERIFIED PROJECT FACTS (read from this repository just now, before "
+        f"any delegation). The '{name}' the question names appears in these real "
+        f"locations:\n"
+        + "\n".join(lines)
+        + "\n\nThese paths exist and were not inferred. Pick the location the "
+          "question is actually about, name the specific file a member should "
+          "open, and do not send anyone to discover a path already listed here. If "
+          "the question asks about something not present above, say so rather than "
+          "inventing a filename."
+    )
 
 async def _stream_team_run(
     team, prompt: str, *, log_label: str = "verify-retry", liveness_path: str | None = None
