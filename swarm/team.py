@@ -10739,6 +10739,17 @@ async def run_task_stream(
                 # chunk (it has no .event attribute so _stream_event_to_chunk would return
                 # None for it anyway; the explicit check just avoids relying on that
                 # incidentally).
+                if team_config.get_gate_enabled(team_name, PREFLIGHT_GROUNDING_GATE, False):
+                    try:
+                        _facts = await asyncio.wait_for(
+                            _preflight_repo_facts(task, _hive_for_targets, None),
+                            timeout=_PREFLIGHT_TIMEOUT_S)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[team] preflight: skipped ({type(exc).__name__}: {exc})",
+                              flush=True)
+                        _facts = ""
+                    if _facts:
+                        task = f"{task}{_facts}"
                 async for event in team.arun(task, stream=True, yield_run_output=True):
                     if not getattr(event, "event", None):
                         # Duck-typed rather than isinstance(event, TeamRunOutput): every
@@ -13251,6 +13262,83 @@ def _first_surviving_answer(*candidates: str | None) -> str:
     return _BUDGET_EXHAUSTED_ANSWER
 
 
+# Pre-flight grounding. Default OFF -- enable per team with this gate.
+PREFLIGHT_GROUNDING_GATE = "preflight_grounding"
+_PREFLIGHT_TIMEOUT_S = 45.0
+_PREFLIGHT_MAX_ROUTERS = 20
+
+
+async def _preflight_repo_facts(task: str, hive_mcp_url: str | None,
+                                hive_mcp_tools=None) -> str:
+    """Verified paths for the service the question names, resolved BEFORE the first
+    delegation and handed to the coordinator as fact.
+
+    The coordinator writes every member's instructions and has no tools to check them
+    against. Confirmed by reading agno rather than assuming: determine_input_for_members
+    defaults to True, so `member_agent_task = task` -- the sentence the coordinator
+    invented -- and the member never sees the user's question at all. Giving the
+    coordinator a tool does not fix this; it was granted one and never called it across
+    four separate conditions.
+
+    So the lookup happens in CODE. These are the same deterministic helpers the guards
+    already use after the fact: _mounted_router_files reads include_router out of
+    main.py, _MODEL_CLASS_RE reads class declarations out of models.py. Running them
+    before the run turns a post-hoc correction into a precondition, and costs two file
+    reads instead of a member's exploratory scan -- so no work is duplicated.
+
+    This is Rewrite-Retrieve-Read applied to a repository: rewrite the vague question
+    into the project's real vocabulary before anyone acts on it. Anthropic's multi-agent
+    write-up reports the same failure from the other side -- brief delegations made
+    subagents "misinterpret the task or perform the exact same searches as other agents"
+    -- and their remedy was to require objective, output format, tool guidance and task
+    boundaries in every task description. Real paths are the tool guidance.
+
+    Returns "" when the question names no service or nothing resolves. Silence is right
+    there: a wrong path asserted as verified fact is worse than the coordinator guessing,
+    because a guess gets caught by the target gate and an injected fact does not.
+    """
+    m = _SCOPED_ASK_RE.search(task or "")
+    if not m:
+        return ""
+    service = m.group(1).strip().lower()
+
+    routers = await _mounted_router_files(service, hive_mcp_url, hive_mcp_tools)
+    src = await _repo_file_text(f"API/{service}-service/models.py",
+                                hive_mcp_url, hive_mcp_tools)
+    models = []
+    if src:
+        models = [c for c in dict.fromkeys(_MODEL_CLASS_RE.findall(src))
+                  if c not in _MODEL_BASE_NAMES]
+
+    lines = []
+    if routers:
+        shown = routers[:_PREFLIGHT_MAX_ROUTERS]
+        lines.append(
+            f"- The {service}-service mounts {len(routers)} router module(s), read from "
+            f"its main.py include_router calls: {', '.join(shown)}"
+            + (f" (+{len(routers) - len(shown)} more)" if len(routers) > len(shown)
+               else "")
+            + ". Files under router/ NOT in this list exist but are not mounted, so "
+              "they are not part of this service's API surface.")
+    if models:
+        lines.append(
+            f"- Its models are all in ONE file, API/{service}-service/models.py, which "
+            f"declares {len(models)} model classes. There is no models/ package.")
+    if not lines:
+        print(f"[team] preflight: nothing resolved for {service!r} — no facts injected",
+              flush=True)
+        return ""
+
+    print(f"[team] preflight: grounded {service}-service — {len(routers or [])} routers, "
+          f"{len(models)} models resolved before delegation", flush=True)
+    return (
+        "\n\nVERIFIED PROJECT FACTS (read from the repository by this run, before any "
+        "delegation). Use these exact paths in the instructions you write, and do not "
+        "send a member to discover what is already stated here:\n"
+        + "\n".join(lines)
+    )
+
+
 async def _stream_team_run(
     team, prompt: str, *, log_label: str = "verify-retry", liveness_path: str | None = None
 ) -> tuple[str, "TeamRunOutput | None"]:
@@ -13771,6 +13859,17 @@ async def run_task_async(
                         # exact mechanism for the /stream endpoint -- this brings /run onto the
                         # same one, permanently, not just for this investigation.
                         unrecognized_event_counts: dict[str, int] = {}
+                        if team_config.get_gate_enabled(team_name, PREFLIGHT_GROUNDING_GATE, False):
+                            try:
+                                _facts = await asyncio.wait_for(
+                                    _preflight_repo_facts(task, _hive_for_targets, None),
+                                    timeout=_PREFLIGHT_TIMEOUT_S)
+                            except Exception as exc:  # noqa: BLE001
+                                print(f"[team] preflight: skipped ({type(exc).__name__}: {exc})",
+                                      flush=True)
+                                _facts = ""
+                            if _facts:
+                                task = f"{task}{_facts}"
                         async for event in team.arun(task, stream=True, yield_run_output=True):
                             if not getattr(event, "event", None):
                                 final_run_output = event
