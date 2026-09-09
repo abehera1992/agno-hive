@@ -3974,6 +3974,13 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                         task, content, hive_mcp_url, hive_mcp_tools))
     _table_note = await _table_claimed_missing_but_present(
         task, content, hive_mcp_url, hive_mcp_tools)
+    # Both also registered in _run_repo_derived_guards, which covers the rescue and
+    # corrected-answer paths. THIS is the one a normal answer takes -- registering only
+    # there left them unreachable in ordinary operation.
+    _docs_note = await _code_question_answered_from_docs(
+        task, content, hive_mcp_url, hive_mcp_tools)
+    _fields_note = await _fields_not_declared_on_type(
+        task, content, hive_mcp_url, hive_mcp_tools)
     _cmp_note = await _computed_comparison(
         task,
         (getattr(team, "_read_state", None) or {}).get("enumerations")
@@ -3997,6 +4004,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         return (_fab_note + _cmp_note + completeness + _lost_report_evidence(team)
                 + _count_note + _term_note + _scope_note + _opened_note
                 + _integ_note + _models_note + _table_note
+                + _docs_note + _fields_note
                 + _summarize_actual_writes(*all_results))
 
     # No-answer check, ahead of everything else -- there is nothing for a later guard
@@ -5186,7 +5194,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         # are exactly the ones where nothing else flagged anything.
         return (content + _lost_report_evidence(team) + _count_note
                 + _term_note + _scope_note + _opened_note + _integ_note
-                + _models_note + _table_note
+                + _models_note + _table_note + _docs_note + _fields_note
                 + _summarize_actual_writes(*all_results))
     if len(all_results) > 1:
         # Aggregate retry budget already spent by an earlier guard this call --
