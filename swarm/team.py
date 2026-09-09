@@ -8559,6 +8559,17 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         # concatenation, and the print above still records it either way.
         if batch_hint and isinstance(result, str):
             return result + batch_hint
+        # Same channel as batch_hint, for the same reason: a print reaches the journal,
+        # not the model. Fires only when an English-phrase search returned nothing but
+        # documentation -- the search that has failed T11 for three batteries while
+        # looking successful, because it does return hits.
+        if function_name == "search_files" and isinstance(result, str):
+            _note = _prose_search_note(str((args or {}).get("pattern", "")), result)
+            if _note:
+                print(f"[team] prose search: {(args or {}).get('pattern')!r} matched "
+                      f"documentation only — pointing the member at identifier forms",
+                      flush=True)
+                return result + _note
         return result
 
     # Exposed as an attribute rather than a second return value, so every existing
@@ -11602,6 +11613,79 @@ def _consume_stream_event(team, out: dict) -> bool:
     return not out.get("__member_result__")
 
 
+# Total member text allowed into the coordinator's context before results start being
+# elided. Calibrated, not guessed -- but calibrated on TWO runs of one task, so treat it
+# as directional. T12 with 11,270 chars of member results answered 31/31 models; the same
+# task with 23,494 answered 6/31. The better relay ratio produced the worse answer, which
+# is the opposite of the assumption this system was tuned on for weeks.
+#
+# The mechanism has a name: recall over long context is U-shaped (Liu et al., "Lost in
+# the Middle"), so what lands in the middle of a large pile is what goes missing. The
+# ceiling exists to keep the pile small enough that there is no middle.
+_MEMBER_VOLUME_CEILING = 12_000
+# Kept from each over-ceiling result: the opening and the closing, which are the two
+# positions long-context recall is reliable at.
+_ELIDE_HEAD = 1_200
+_ELIDE_TAIL = 800
+
+
+def _elide_middle(text: str, head: int = _ELIDE_HEAD, tail: int = _ELIDE_TAIL) -> str:
+    """Keep the start and the end, say what was removed.
+
+    Truncating the TAIL instead would be the obvious implementation and the wrong one:
+    a member's conclusion and its last enumerated items both live at the end, and the
+    end is the second-most reliably recalled position. Cutting the middle costs the
+    least-recalled span.
+    """
+    if len(text) <= head + tail + 200:
+        return text
+    removed = len(text) - head - tail
+    return (text[:head]
+            + f"\n\n[... {removed:,} characters elided from the middle of this report to "
+              f"keep the coordinator's context small enough to enumerate reliably; the "
+              f"opening and closing are intact. Ask this member again for a specific "
+              f"item if you need what was in between ...]\n\n"
+            + text[-tail:])
+
+
+# A prose phrase: two or more plain words, no identifier or regex punctuation. Searching
+# one of these matches documentation by construction -- code spells the same idea
+# `upload_document` or `uploadDocument`.
+_PROSE_PATTERN_RE = re.compile(r"^[A-Za-z][A-Za-z ]{4,}[A-Za-z]$")
+_DOC_SUFFIXES = (".md", ".mdx", ".rst", ".txt", ".adoc")
+
+
+def _prose_search_note(pattern: str, result: str) -> str:
+    """Warn when a prose search found only documentation, and say what to try instead.
+
+    T11, three batteries running: the coordinator asked a member to
+    `search_files('document upload', '**/*')`, which returned README.md and
+    frontend.md, and the run then answered a "which function handles this" question out
+    of documentation -- or, this time, looped seven times because nothing it had could
+    answer it. The search itself is the failure, and it looks successful: it returns
+    hits.
+
+    Only fires when EVERY hit is a doc file. A prose phrase that does turn up code has
+    found something real and is left alone.
+    """
+    if not pattern or not _PROSE_PATTERN_RE.match(pattern.strip()):
+        return ""
+    lines = [l for l in (result or "").splitlines() if ":" in l]
+    if not lines:
+        return ""
+    paths = [l.split(":", 1)[0].strip().lower() for l in lines]
+    if not all(p.endswith(_DOC_SUFFIXES) for p in paths if p):
+        return ""
+    words = pattern.strip().split()
+    snake = "_".join(w.lower() for w in words)
+    camel = words[0].lower() + "".join(w.capitalize() for w in words[1:])
+    return (f"\n\n[SEARCH NOTE: '{pattern}' is an English phrase, and every match above "
+            f"is documentation — no source file contains it, because code does not spell "
+            f"ideas as prose. If you are looking for the CODE that does this, search for "
+            f"an identifier instead: '{snake}', '{camel}', or a distinctive noun from the "
+            f"domain on its own. Do not answer a code question from these files.]")
+
+
 def _record_stream_artifacts(team, out: dict) -> None:
     """Record a tool event's listing counts and success/failure onto the team.
 
@@ -11652,6 +11736,40 @@ def _record_stream_artifacts(team, out: dict) -> None:
             team._discarded_delegations[_who] = (
                 team._discarded_delegations.get(_who, 0) + 1)
             return True
+        # Past the run's ceiling, keep the opening and closing of each further result
+        # and elide the middle. See _MEMBER_VOLUME_CEILING for why more relayed text
+        # made the answer worse rather than better.
+        _so_far = getattr(team, "_member_result_chars", 0)
+        if _so_far >= _MEMBER_VOLUME_CEILING and len(content) > 2_000:
+            _before = len(content)
+            content = _elide_middle(content)
+            print(f"[team] member volume ceiling ({_MEMBER_VOLUME_CEILING:,}) already "
+                  f"reached at {_so_far:,} — elided this report {_before:,} -> "
+                  f"{len(content):,} chars, head and tail kept", flush=True)
+
+        # A report that is a tiny fraction of what the member READ is the opposite
+        # failure, and the coordinator cannot see it: it receives 434 chars and has no
+        # idea 45,338 were read to produce them. Live, T13a: pre-flight fired, the right
+        # file was named, and the answer still came out of the one file that survived.
+        # Told here, in the return the coordinator already reads, so it can re-ask.
+        _rs_read = getattr(team, "_read_state", None)
+        _read_now = (_rs_read.get("read_chars_total", 0)
+                     if isinstance(_rs_read, dict) else 0)
+        _prev_read = getattr(team, "_read_at_last_result", 0)
+        _delta = _read_now - _prev_read
+        team._read_at_last_result = _read_now
+        if _delta > 20_000 and content and len(content) * 40 < _delta:
+            print(f"[team] starved report: member read {_delta:,} chars this delegation "
+                  f"and returned {len(content):,} ({_delta // max(len(content), 1)}:1) "
+                  f"— telling the coordinator", flush=True)
+            content += (
+                f"\n\n[REPORT IS THIN: this member read {_delta:,} characters to produce "
+                f"the {len(content):,} above. Most of what it opened is not in this "
+                f"report. If the task asked for an enumeration — every route, every "
+                f"class, every column — ask this member again for that specific list "
+                f"before you write the answer, and do NOT conclude from the files that "
+                f"happen to appear here.]")
+
         out["content"] = content
         # Keyed by _member_key so 'context-router' and 'contextrouter' land in one
         # bucket, the same normalisation the delegation gate matches on.
