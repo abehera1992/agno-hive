@@ -8468,6 +8468,18 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             read_state["read_chars_total"] = (
                 read_state.get("read_chars_total", 0) + len(str(result))
             )
+            # Index what this read actually declares, while the full text is in hand.
+            # Costs ~2% of the file's size and is the only copy that survives the
+            # member's own summary -- see _declaration_index_block.
+            if function_name == "get_file_content":
+                _p = (args or {}).get("relative_path")
+                if _p and str(_p).lower().endswith(
+                        (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".rb")):
+                    _decls = _extract_declarations(_result_text(result))
+                    if _decls:
+                        read_state.setdefault("pending_declarations", {})[_p] = _decls
+                        print(f"[team] indexed {len(_decls)} declaration(s) from {_p}",
+                              flush=True)
             # Most enumerable items any single read returned (2026-08-25). The
             # under-answered-enumeration guard could only ever count DIRECTORY entries,
             # so a task asking to list what is inside a FILE had no evidence source and
@@ -11769,6 +11781,77 @@ def _prose_search_note(pattern: str, result: str) -> str:
             f"code question from the files above.]")
 
 
+# Declarations worth indexing, with the cat -n line-number prefix get_file_content
+# emits. Anchored per line so the captured group is the NAME and the number is the real
+# file line -- the whole point is that the coordinator can cite it without re-reading.
+_INDEXABLE_DECL_RE = re.compile(
+    r"^\s*(\d+)\t\s*(?:export\s+|default\s+|public\s+|private\s+|protected\s+|abstract\s+"
+    r"|async\s+)*(class|def|function|interface|struct|enum)\s+([A-Za-z_]\w*)", re.M)
+# A route decorator carries no identifier, so index the METHOD and PATH instead -- that
+# is what a "list every endpoint" question actually wants.
+_INDEXABLE_ROUTE_RE = re.compile(
+    r"^\s*(\d+)\t\s*@\w+\.(get|post|put|patch|delete)\(\s*[\"']([^\"']+)", re.M)
+# Per file. A 500-class file would undo the saving this exists for.
+_MAX_INDEXED_PER_FILE = 60
+
+
+def _extract_declarations(text: str) -> list[str]:
+    """'Party:235' / 'POST /vouchers/grn/{po_id}:589' for one file's content.
+
+    Deterministic and model-free: this is the property that makes it survive a member
+    summarising its own report away.
+    """
+    out: list[str] = []
+    for line, _kind, name in _INDEXABLE_DECL_RE.findall(text or ""):
+        out.append(f"{name}:{line}")
+        if len(out) >= _MAX_INDEXED_PER_FILE:
+            return out
+    for line, method, path in _INDEXABLE_ROUTE_RE.findall(text or ""):
+        out.append(f"{method.upper()} {path}:{line}")
+        if len(out) >= _MAX_INDEXED_PER_FILE:
+            break
+    return out
+
+
+_MAX_INDEX_FILES = 6
+_MAX_INDEX_CHARS = 1_800
+
+
+def _declaration_index_block(team) -> str:
+    """The index for files read since the last member report, or "".
+
+    Consumed once and cleared, so each member's report carries only what THAT delegation
+    opened -- an index that accumulated across the run would re-send the same names on
+    every hop, which is the context bloat this is supposed to avoid.
+    """
+    rs = getattr(team, "_read_state", None)
+    if not isinstance(rs, dict):
+        return ""
+    pending = rs.get("pending_declarations")
+    if not isinstance(pending, dict) or not pending:
+        return ""
+    rs["pending_declarations"] = {}
+
+    lines, used = [], 0
+    for path, items in list(pending.items())[:_MAX_INDEX_FILES]:
+        if not items:
+            continue
+        shown = ", ".join(items)
+        row = f"- {path}: {shown}"
+        if used + len(row) > _MAX_INDEX_CHARS:
+            lines.append(f"- (index truncated — {len(pending) - len(lines)} more file(s))")
+            break
+        lines.append(row)
+        used += len(row)
+    if not lines:
+        return ""
+    return ("\n\n[DECLARATION INDEX — extracted from the tool output by code, not written "
+            "by the member. These are every declaration and route the files below "
+            "actually contain, with real line numbers. If the report above enumerates "
+            "fewer than this list does, THIS list is the complete one; use it.]\n"
+            + "\n".join(lines))
+
+
 def _record_stream_artifacts(team, out: dict) -> None:
     """Record a tool event's listing counts and success/failure onto the team.
 
@@ -11852,6 +11935,15 @@ def _record_stream_artifacts(team, out: dict) -> None:
                 f"class, every column — ask this member again for that specific list "
                 f"before you write the answer, and do NOT conclude from the files that "
                 f"happen to appear here.]")
+
+        # The index rides with the report. Appended AFTER the starved-report notice so
+        # the two read as one story: how little the member wrote, then exactly what it
+        # was looking at.
+        _idx = _declaration_index_block(team)
+        if _idx:
+            print(f"[team] attaching declaration index ({len(_idx):,} chars) to "
+                  f"{out.get('agent_name', '?')}'s report", flush=True)
+            content += _idx
 
         out["content"] = content
         # Keyed by _member_key so 'context-router' and 'contextrouter' land in one
