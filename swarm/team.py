@@ -6751,10 +6751,17 @@ async def _fields_not_declared_on_type(task: str, content: str,
             path = cited
             break
     if not path:
+        print("[team] field check: answer names a type's fields but cites no path "
+              "with a directory — cannot re-ground, staying silent", flush=True)
         return ""
     src = await _repo_file_text(path, hive_mcp_url, hive_mcp_tools)
     if not src:
-        # Unknown is not a finding. Every repo helper here follows the same rule.
+        # Unknown is not a finding. Every repo helper here follows the same rule --
+        # but SAY so, because a guard that verifies correctly in isolation and returns
+        # empty in production is indistinguishable from one that found nothing wrong.
+        # That ambiguity cost a full diagnosis cycle on T4.
+        print(f"[team] field check: could not read {path!r} to re-ground the field "
+              f"list — staying silent (this is 'unknown', not 'clean')", flush=True)
         return ""
 
     findings: list[str] = []
