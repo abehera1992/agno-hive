@@ -58,9 +58,75 @@ _AGNO_INTERNAL_TOOLS = {"delegate_task_to_member", "delegate_task_to_members", "
 _peak_input_tokens = 0
 
 
+# Largest PRE-FLIGHT estimate this run, from the messages actually about to be sent.
+# Separate from the server-reported figure because they answer different questions and
+# only one of them survives a rejected request.
+_peak_estimated_input_tokens = 0
+
+# Characters per token. Measured against the served model's own /tokenize endpoint, not
+# assumed: 25,854 chars of Python source -> 5,985 tokens (4.32), 28,800 chars of English
+# prose -> 4,801 (6.00). 4.0 is below both, so the estimate errs HIGH -- the right
+# direction for something whose job is to refuse before a hard limit is hit.
+_CHARS_PER_TOKEN = 4.0
+
+
 def peak_input_tokens() -> int:
-    """Largest prompt-token count the model server has reported this run."""
+    """Largest prompt this run, server-reported or estimated -- whichever is larger.
+
+    Returning the max, rather than only the server's figure, is the whole point. The
+    server never reports a request it REFUSED, so on the run that matters most its
+    number is stale by definition: T11 logged 133,446 from the last successful call
+    while the request that killed it was 258,049.
+    """
+    return max(_peak_input_tokens, _peak_estimated_input_tokens)
+
+
+def measured_input_tokens() -> int:
+    """Only the server-reported figure. For telling a real count from an estimate."""
     return _peak_input_tokens
+
+
+def _estimate_prompt_tokens(messages) -> int:
+    """Rough token count for a message list, before it is sent.
+
+    Deliberately cheap and defensive -- this runs on every model call, and a crash here
+    would break the request it is only supposed to measure. Content can be a plain
+    string or a list of parts (multimodal), and tool calls carry their own arguments,
+    so all three are summed rather than assuming the common shape.
+    """
+    total = 0
+    try:
+        for m in messages or []:
+            c = getattr(m, "content", None)
+            if isinstance(c, str):
+                total += len(c)
+            elif isinstance(c, list):
+                for part in c:
+                    if isinstance(part, str):
+                        total += len(part)
+                    elif isinstance(part, dict):
+                        total += len(str(part.get("text") or ""))
+            tc = getattr(m, "tool_calls", None)
+            if tc:
+                total += len(str(tc))
+    except Exception:  # noqa: BLE001
+        return 0
+    return int(total / _CHARS_PER_TOKEN)
+
+
+def record_prompt_estimate(messages) -> int:
+    """Record the pre-flight estimate for this call and return it."""
+    global _peak_estimated_input_tokens
+    est = _estimate_prompt_tokens(messages)
+    if est > _peak_estimated_input_tokens:
+        _peak_estimated_input_tokens = est
+        # Only when the estimate OVERTAKES what the server has confirmed: that is the
+        # gap the budget guard was blind to, and saying it every call would bury it.
+        if est > _peak_input_tokens:
+            print(f"[model] pre-flight prompt estimate {est:,} tokens exceeds the "
+                  f"largest server-reported {_peak_input_tokens:,} — the budget guard "
+                  f"would not have seen this without measuring first", flush=True)
+    return est
 
 
 def _record_input_tokens(model_response) -> None:
@@ -434,18 +500,24 @@ class _ForcedTextDirectiveMixin:
 
     def invoke(self, messages, *a, **kw):
         self._inject_forced_text_directive(messages, kw.get("tool_choice"))
+        record_prompt_estimate(messages)
         return super().invoke(messages, *a, **kw)
 
     async def ainvoke(self, messages, *a, **kw):
         self._inject_forced_text_directive(messages, kw.get("tool_choice"))
+        record_prompt_estimate(messages)
         return await super().ainvoke(messages, *a, **kw)
 
     def invoke_stream(self, messages, *a, **kw):
         self._inject_forced_text_directive(messages, kw.get("tool_choice"))
+        record_prompt_estimate(messages)
         return super().invoke_stream(messages, *a, **kw)
 
     def ainvoke_stream(self, messages, *a, **kw):
+        # Measured AFTER the directive is injected, so the estimate describes the
+        # request that is actually about to go out rather than the one before it.
         self._inject_forced_text_directive(messages, kw.get("tool_choice"))
+        record_prompt_estimate(messages)
         return super().ainvoke_stream(messages, *a, **kw)
 
 
