@@ -251,6 +251,45 @@ async def update_session_state(session_state_updates: dict[str, str], run_contex
     return _update_session_state_impl(session_state_updates, run_context)
 
 
+# Given to EVERY member, unconditionally. The coordinator-side version of this rule is
+# gated on a DB grant because it names a tool; this one names no tool, so there is
+# nothing to gate and nothing to fail closed.
+#
+# Measured on this system before it existed: a Researcher read 38,172 chars of one
+# models.py and reported 700 (54.5:1); the coordinator then rebuilt the field list from
+# that summary and produced `id` where the class declares `party_id`. Another opened 24
+# router files and its own report named 4. The detail is gone at THIS layer, before any
+# coordinator or guard can see it -- which is why four coordinator-side remedies were
+# measured and rejected.
+#
+# What justifies adding it now: granting forward_member_answer to the coordinator moved
+# T4 from invented field names at 54.5:1 to all 23 fields exact at 1.7:1, and T12 to
+# 31/31 models + 16/16 routers, its joint-best of eleven runs -- while the tool itself
+# was called ZERO times. The instruction is the active ingredient, so it is worth giving
+# to the side that actually does the compressing.
+#
+# Deliberately NOT "write a longer report": length is not the goal and padding is worse
+# than nothing. The rule is verbatim-for-enumerables, brief-for-everything-else.
+_VERBATIM_REPORT_INSTRUCTIONS = [
+    "",
+    "── REPORT ENUMERABLE FINDINGS VERBATIM ───────────────────────────",
+    "  When your report contains a LIST that came out of a tool -- file names, class or",
+    "  function declarations, route decorators, column definitions, line numbers, table",
+    "  names -- copy those items EXACTLY as the tool returned them, every one of them.",
+    "  Do not summarise a list, do not shorten it to 'and others', and do not re-type an",
+    "  identifier from memory: copy it.",
+    "  WHY, measured here: a member read 38,172 characters of one file and reported 700.",
+    "  Whoever received that report had to reconstruct the field names, and produced",
+    "  `id` where the class declares `party_id`. A near-miss identifier is worse than an",
+    "  admitted gap, because it looks correct.",
+    "  Everything that is NOT an enumerable finding -- your reasoning, what you looked",
+    "  for, what you concluded -- should stay brief. This is not an instruction to write",
+    "  more; it is an instruction not to compress the one part nobody can reconstruct.",
+    "  If you could not read something you were asked about, say so plainly and name it.",
+    "  Never fill the gap with a plausible-looking value.",
+]
+
+
 def make_agent_from_spec(
     spec, *mcps: MCPTools, skill_catalog: list[dict] | None = None, tool_hooks: list | None = None,
     project_id: str | None = None,
@@ -294,6 +333,7 @@ def make_agent_from_spec(
         agent_tools = list(mcps)
 
     instructions = list(spec.instructions)
+    instructions = instructions + _VERBATIM_REPORT_INSTRUCTIONS
     if project_id:
         instructions = [
             f"── This project's LightRAG namespace (for lightrag_query/lightrag_insert/index_project's "
