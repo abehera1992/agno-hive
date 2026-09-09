@@ -1592,6 +1592,14 @@ def _move_on_hint(log) -> str:
         return ""
     shown = ", ".join(repr(t) for t in done[:6])
     more = f", and {len(done) - 6} more" if len(done) > 6 else ""
+    # Its OWN line. The hint rides on the END of a long refusal string, and the
+    # `delegate result:` print truncates near 200 chars, so grepping the journal for the
+    # hint's own words finds nothing whether it fired or not -- unfalsifiable either way,
+    # which is how it looked after the first battery that shipped it. One dedicated line
+    # makes it observable, exactly as adding a line to the consecutive-stub escalation
+    # turned three unattributable discards into a proven root cause within two runs.
+    print(f"[team] move-on hint attached — {len(done)} target(s) covered so far: "
+          f"{shown}{more}", flush=True)
     return (f"\n\nSO FAR THIS RUN YOU HAVE DELEGATED ONLY ABOUT: {shown}{more}. If the "
             f"task names anything else -- another file, another layer, another part of a "
             f"multi-part question -- delegate for THAT now instead of rewording this. If "
@@ -1872,6 +1880,7 @@ _GUARD_BANNERS = (
     "THE ANSWER PRESENTS ROUTERS THE SERVICE DOES NOT MOUNT",
     "AT LEAST HALF THE MODELS ASKED FOR ARE NOT IN THE ANSWER",
     "ASKED WHICH CODE DOES THIS, AND NO CODE IS CITED",
+    "THAT IT DOES NOT DECLARE",
     # The wording this guard shipped with for one afternoon, kept because _GUARD_BANNERS
     # is what cuts guard-appended text off an answer before it is scored. Any run stored
     # from that window still carries the old banner, and a scorer that missed it would
@@ -6641,6 +6650,131 @@ async def _code_question_answered_from_docs(task: str, content: str,
             "until the actual source files are named.**")
 
 
+# "The `Party` model ... has the following fields", "fields of the Voucher class".
+# Requires the type noun so an ordinary capitalised word in prose does not qualify.
+#
+# The gap between the type and the word "fields" allows DOTS. Excluding them (to stay
+# inside one sentence) looked reasonable and matched nothing on the real answer, whose
+# opening line is "The `Party` model in `API/inventory-service/models.py` has the
+# following fields" -- the dot in the filename ended the match every time. Kept to a
+# single line instead, which is the constraint that was actually wanted.
+_FIELDS_OF_TYPE_RE = re.compile(
+    r"`?\b([A-Z][A-Za-z0-9_]{2,})`?\s+(?:model|class|table|entity|type|interface)\b"
+    r"[^\n]{0,120}?\bfields?\b", re.I)
+
+# A bullet naming one member: "- `party_id: UUID(...)`" or "- `party_id` (UUID)".
+_FIELD_BULLET_RE = re.compile(r"^\s*[-*]\s*`?([a-z_][a-z0-9_]*)`?\s*[:(]", re.M)
+
+# A member declared inside a class body, across the shapes this is likely to meet:
+# `name = Column(...)` (ORM), `name: str` (annotation/dataclass/TS interface),
+# `name = 3` (plain attribute). Indentation is what scopes it to the class body.
+_DECLARED_MEMBER_RE = re.compile(r"^[ \t]+([a-z_][a-z0-9_]*)\s*[:=]", re.M)
+_MAX_FIELD_CLAIMS = 12
+_MIN_FIELDS_TO_CHECK = 4
+
+
+def _class_body(src: str, name: str) -> str | None:
+    """The source of `class name` up to the next top-level declaration, or None.
+
+    Works on cat -n numbered text (what get_file_content returns) as well as raw source,
+    because the anchor allows a leading line number -- the same prefix that silently
+    made an earlier guard in this file match nothing at all.
+    """
+    start = re.search(rf"^(?:\s*\d+\t)?\s*(?:export\s+)?(?:class|interface|struct|type)\s+"
+                      rf"{re.escape(name)}\b", src, re.M)
+    if not start:
+        return None
+    rest = src[start.end():]
+    nxt = re.search(r"^(?:\s*\d+\t)?\s*(?:export\s+)?(?:class|interface|struct|def|"
+                    r"function)\s+\w", rest, re.M)
+    return rest[:nxt.start()] if nxt else rest
+
+
+async def _fields_not_declared_on_type(task: str, content: str,
+                                       hive_mcp_url: str | None = None,
+                                       hive_mcp_tools=None) -> str:
+    """The answer attributes fields to a named type; check them against the type.
+
+    Re-grounding, not prevention. The member's 54:1 summary is already gone by the time
+    this runs -- this reads the class back off disk and says which of the names the
+    answer listed are not declared on it.
+
+    Live, T4 of the 2026-09-09 v5 battery: `Party` was reported with `id` and `type`,
+    which do not exist (`party_id` and `party_type` do), and with line numbers five off.
+    The file was right, the class was right, the citations were inside the file, and
+    every existing guard stayed silent -- the fields themselves were never checked.
+
+    Silent unless the answer lists at least _MIN_FIELDS_TO_CHECK members, so a passing
+    mention of one attribute is not treated as an enumeration. Reports only names the
+    class does NOT declare: a MISSING field may simply not have been asked for, and
+    flagging omissions here would duplicate the relay-coverage guard.
+    """
+    body = _body_before_guard_notes(content)
+    marks = list(_FIELDS_OF_TYPE_RE.finditer(body))
+    if not marks:
+        return ""
+
+    # Each type owns the text from its own mention up to the NEXT type mention. An
+    # answer comparing two models -- exactly what a "how do X and Y differ" question
+    # asks for -- interleaves two bullet lists, and reading them as one list attributes
+    # the second model's fields to the first. That flagged a fully correct answer with
+    # seven invented findings before this scoping existed.
+    sections: list[tuple[str, str]] = []
+    for i, mk in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(body)
+        sections.append((mk.group(1), body[mk.end():end]))
+
+    path = None
+    for cited in _CITED_FILE_RE.findall(body):
+        if "/" in cited:
+            path = cited
+            break
+    if not path:
+        return ""
+    src = await _repo_file_text(path, hive_mcp_url, hive_mcp_tools)
+    if not src:
+        # Unknown is not a finding. Every repo helper here follows the same rule.
+        return ""
+
+    findings: list[str] = []
+    for type_name, section in sections:
+        claimed: list[str] = []
+        for f in _FIELD_BULLET_RE.findall(section):
+            if f not in claimed:
+                claimed.append(f)
+        if len(claimed) < _MIN_FIELDS_TO_CHECK:
+            continue
+        cls = _class_body(src, type_name)
+        if cls is None:
+            continue
+        declared = set(_DECLARED_MEMBER_RE.findall(cls))
+        if not declared:
+            continue
+        bogus = [c for c in claimed if c not in declared][:_MAX_FIELD_CLAIMS]
+        if not bogus:
+            print(f"[team] field check: all {len(claimed)} field(s) attributed to "
+                  f"{type_name!r} are declared on it — silent", flush=True)
+            continue
+        print(f"[team] field check: {len(bogus)} of {len(claimed)} field(s) attributed "
+              f"to {type_name!r} are not declared on it: {bogus}", flush=True)
+        real = sorted(r for r in declared if not r.startswith("__"))[:_MAX_FIELD_CLAIMS]
+        findings.append(
+            f"`{type_name}` is credited with "
+            + ", ".join("`" + b + "`" for b in bogus)
+            + ", none of which it declares. It actually declares: "
+            + ", ".join("`" + r + "`" for r in real)
+            + (", …" if len(real) == _MAX_FIELD_CLAIMS else "") + ".")
+
+    if not findings:
+        return ""
+    return (f"\n\n---\n**FIELDS ATTRIBUTED TO A TYPE THAT IT DOES NOT DECLARE — read "
+            f"back from `{path}` just now:**\n"
+            + "\n".join("- " + f for f in findings)
+            + "\n\nA near-miss name (`id` where the class declares `party_id`) is the "
+              "signature of a field list rebuilt from a summary rather than read, so "
+              "treat the types and line numbers given above as unverified too.")
+
+
 async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None,
                                    hive_mcp_tools, label: str) -> list[str]:
     """The five guards that re-derive their facts from the repo, run against `content`.
@@ -6666,6 +6800,8 @@ async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None
             _integration_mechanism_missing(task, content, hive_url, hive_mcp_tools),
             _code_question_answered_from_docs(task, content, hive_url,
                                               hive_mcp_tools),
+            _fields_not_declared_on_type(task, content, hive_url,
+                                         hive_mcp_tools),
             # _nothing() rather than a bare "": gather takes awaitables only, and the
             # models guard is the one _verified_answer suppresses for a single-fact ask.
             _nothing() if _asks_for_one_fact(task) else
