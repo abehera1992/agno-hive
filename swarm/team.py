@@ -8115,6 +8115,10 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # Fresh calls per (agent, tool) this run, for the one-call-per-item detector.
     batch_counts: dict[tuple[str, str], int] = {}
     read_chars: dict[str, int] = {}   # fresh-read chars per agent, see _MEMBER_READ_CHAR_BUDGET
+    # The same count scoped to ONE delegation, reset when a member is delegated to.
+    # The per-run budget above is 450,000 and never fires in time to stop a member
+    # reading 169,188 chars for one question and summarising them away (T13a).
+    delegation_read_chars: dict[str, int] = {}
     # Closure-local record of every REAL (fresh, non-stubbed) read this run, at any
     # delegation depth (2026-08-21). This hook instance is shared across the coordinator
     # and every member, so its closure sees all of them -- which session_state does not.
@@ -8145,6 +8149,13 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     # Fresh delegation -- clean slate, same principle the
                     # generation-scoped serve budget above already applies.
                     consecutive_stub_count[target] = 0
+                    # Read allowance resets with the delegation, for the same reason
+                    # the stub streak does: the member starts with a fresh context, so
+                    # an honest partial report genuinely costs it nothing.
+                    if delegation_read_chars.get(target):
+                        print(f"[team] delegation read counter reset for {target!r} "
+                              f"(was {delegation_read_chars[target]:,})", flush=True)
+                    delegation_read_chars[target] = 0
                     member_obj = agent_objects.get(target)
                     if member_obj is not None:
                         member_obj.tool_choice = None
@@ -8352,6 +8363,29 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 f"a complete-sounding one built from semantic summaries."
             )
 
+        # Per-delegation read ceiling. Checked BEFORE the read runs -- a notice after
+        # the fact is what the coordinator already ignored on T13a, and by then the
+        # member has the pile and will summarise it.
+        if function_name in _READ_TOOLS_FOR_CEILING and cache_key not in cache:
+            _dl_read = delegation_read_chars.get(norm_agent_key, 0)
+            if _dl_read >= _DELEGATION_READ_CEILING:
+                print(f"[team] {agent_key or 'coordinator'} has read {_dl_read:,} chars "
+                      f"in this delegation (ceiling {_DELEGATION_READ_CEILING:,}) — "
+                      f"refusing further reads until it reports", flush=True)
+                return (
+                    f"REPORT NOW: you have read {_dl_read:,} characters in this one "
+                    f"delegation, which is the ceiling. No further reads will run until "
+                    f"you report.\n"
+                    f"Write up what you have ALREADY read, and copy enumerable findings "
+                    f"verbatim — every route decorator, class declaration or column you "
+                    f"actually saw, exactly as it appeared. A report that summarises a "
+                    f"large pile loses the items in the middle of it, which is the "
+                    f"failure this ceiling exists to prevent.\n"
+                    f"Then say plainly what you have NOT examined. You will be delegated "
+                    f"to again if more is needed, and this ceiling resets when that "
+                    f"happens — so an honest partial report costs you nothing."
+                )
+
         is_fresh_fetch = cache_key not in cache
         if is_fresh_fetch:
             result = await function(**args)
@@ -8374,6 +8408,9 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         if is_fresh_fetch:
             read_chars[norm_agent_key] = (
                 read_chars.get(norm_agent_key, 0) + len(str(result))
+            )
+            delegation_read_chars[norm_agent_key] = (
+                delegation_read_chars.get(norm_agent_key, 0) + len(str(result))
             )
             # Log the running total on every fresh read, not only when the budget trips
             # (2026-08-23). The budget shipped without this and promptly went unmeasured:
@@ -11622,6 +11659,25 @@ def _consume_stream_event(team, out: dict) -> bool:
 # The mechanism has a name: recall over long context is U-shaped (Liu et al., "Lost in
 # the Middle"), so what lands in the middle of a large pile is what goes missing. The
 # ceiling exists to keep the pile small enough that there is no middle.
+# How much ONE delegation may read before it has to report. Not a run budget --
+# _MEMBER_READ_CHAR_BUDGET already covers the run, at 450,000, and never fires in time
+# to matter here.
+#
+# Measured: T13a's failing delegation read 169,188 chars and returned 4,120 (41:1),
+# after which the answer said "no backend endpoints were found" about a file it had
+# open. The same task's PASSING run read one file at a time and reported 1,540 chars
+# per delegation. T12's worst run (6/31 models) made 10 get_files_batch calls; its best
+# (31/31) made none.
+#
+# 60,000 is roughly two large source files -- enough to answer a real question, small
+# enough that the report cannot be a summary of a pile. A member that needs more gets
+# it the honest way: report, then be delegated to again, which resets this.
+_DELEGATION_READ_CEILING = 60_000
+_READ_TOOLS_FOR_CEILING = frozenset({
+    "get_file_content", "get_files_batch", "search_files", "search_files_batch",
+    "list_directory_tree", "count_matches",
+})
+
 _MEMBER_VOLUME_CEILING = 12_000
 # Kept from each over-ceiling result: the opening and the closing, which are the two
 # positions long-context recall is reliable at.
@@ -11675,7 +11731,12 @@ def _prose_search_note(pattern: str, result: str) -> str:
     Only fires when EVERY hit is a doc file. A prose phrase that does turn up code has
     found something real and is left alone.
     """
-    if not pattern or not _PROSE_PATTERN_RE.match(pattern.strip()):
+    # Any pattern, not only a prose-shaped one. The gate used to require two plain
+    # words, which excluded the exact string T11's failing run searched --
+    # 'POST /api/businessservice/seller/{seller_id}/documents' -- an over-specified
+    # literal that matched documentation only. Over-specifying is the same mistake as
+    # under-specifying and produces the same result: hits, none of them code.
+    if not pattern or len(pattern.strip()) < 4:
         return ""
     lines = [l for l in (result or "").splitlines() if ":" in l]
     if not lines:
@@ -11688,14 +11749,24 @@ def _prose_search_note(pattern: str, result: str) -> str:
     # more able to hold the function being asked about than a README is.
     if any(p.endswith(_CODE_SUFFIXES) for p in paths if p):
         return ""
-    words = pattern.strip().split()
+    words = [w for w in re.split(r"[^A-Za-z0-9]+", pattern.strip()) if w]
+    if not words:
+        return ""
     snake = "_".join(w.lower() for w in words)
     camel = words[0].lower() + "".join(w.capitalize() for w in words[1:])
-    return (f"\n\n[SEARCH NOTE: '{pattern}' is an English phrase, and every match above "
-            f"is documentation — no source file contains it, because code does not spell "
-            f"ideas as prose. If you are looking for the CODE that does this, search for "
-            f"an identifier instead: '{snake}', '{camel}', or a distinctive noun from the "
-            f"domain on its own. Do not answer a code question from these files.]")
+    noun = max(words, key=len).lower()
+    return (f"\n\n[SEARCH NOTE: nothing above is a source file — every match is "
+            f"documentation, styling or config, so this search has not found the code. "
+            f"Do NOT retry with a LONGER or more exact string; that is what fails. Go "
+            f"WIDER instead, in this order:\n"
+            f"  1. find_files('**/*{noun}*')            — locate the file by NAME\n"
+            f"  2. search_files('{snake}', '**/*.py')   — an identifier, scoped to code\n"
+            f"  3. search_files('{camel}', '**/*.ts')   — the camelCase form\n"
+            f"  4. search_files('{noun}', '**/*')       — the bare noun, nothing else\n"
+            f"Measured on this system: every run that recovered from a failed search did "
+            f"it with find_files or a bare noun; every run that answered from "
+            f"documentation had kept lengthening the pattern instead. Do not answer a "
+            f"code question from the files above.]")
 
 
 def _record_stream_artifacts(team, out: dict) -> None:
