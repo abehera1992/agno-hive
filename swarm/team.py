@@ -1556,6 +1556,48 @@ async def request_clarification(question: str, options: list[ClarificationOption
     return "Question presented to the user; the run has ended to wait for their choice."
 
 
+def _covered_targets(log) -> list[str]:
+    """Every distinct target this run has already delegated for, in order.
+
+    Takes the gate's OWN log list rather than reading an attribute off the team: that
+    log is closure-local to _make_tool_interception_hook (there is no
+    team._delegation_log), so an attribute read would return nothing and this hint
+    would never appear -- inert, and indistinguishable from "no targets yet".
+    """
+    if not isinstance(log, list):
+        return []
+    out: list[str] = []
+    for entry in log:
+        if not isinstance(entry, dict):
+            continue
+        audit = entry.get("audit") or {}
+        tgt = (audit.get("target") or "").strip()
+        if tgt and tgt not in out:
+            out.append(tgt)
+    return out
+
+
+def _move_on_hint(log) -> str:
+    """Tell a refused coordinator what it HAS covered, so "no" implies a next step.
+
+    A refusal that only says no is a dead end for a temperature-0 model: its next turn
+    is a deterministic function of the same context, so it rewords and asks again. This
+    adds the one fact it cannot derive -- the set of targets already delegated for --
+    and names the obvious move. Deliberately does NOT tell it what to read instead:
+    that would need project knowledge this layer refuses to hold, and the pre-flight
+    already supplies real paths when the question names something resolvable.
+    """
+    done = _covered_targets(log)
+    if not done:
+        return ""
+    shown = ", ".join(repr(t) for t in done[:6])
+    more = f", and {len(done) - 6} more" if len(done) > 6 else ""
+    return (f"\n\nSO FAR THIS RUN YOU HAVE DELEGATED ONLY ABOUT: {shown}{more}. If the "
+            f"task names anything else -- another file, another layer, another part of a "
+            f"multi-part question -- delegate for THAT now instead of rewording this. If "
+            f"every part is genuinely covered, write the final answer.")
+
+
 def _extract_clarification_from_tools(result) -> dict | None:
     """Pull a request_clarification tool call's own arguments off a completed agno run --
     the primary clarification-extraction path since 2026-08-10 (see the block comment
@@ -9505,8 +9547,8 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                             return (
                                 f"STOP: you have now asked {member_id!r} for this same "
                                 f"target ({audit['target']!r}) {n} times. No further "
-                                f"delegation will run. Write your final answer now using "
-                                f"what you already have."
+                                f"delegation for THAT target will run."
+                                + _move_on_hint(log)
                                 + (f"\n\nThe result, once more:\n{prior}" if prior else "")
                             )
                         if prior:
@@ -9518,6 +9560,7 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                                 f"{audit['target']!r} (action {audit['action']!r}) earlier "
                                 f"this run, worded differently, and returned:\n\n{prior}\n\n"
                                 f"Use this. Do not delegate it again." + tail
+                                + _move_on_hint(log)
                             )
                         # Nothing usable stored -- refusing would block the one action
                         # that could still rescue the run, exactly as on the sibling
@@ -13552,7 +13595,15 @@ _PREFLIGHT_TIMEOUT_S = 45.0
 # documentation it found.
 _PREFLIGHT_TARGET_RE = re.compile(
     r"\b(?:overview|audit|describe|document|summar\w+|architecture)\b[^.]{0,80}?"
-    r"\b(?:of|for|on)\s+(?:the\s+)?([a-z][\w-]{2,})\s+"
+    # Preposition OPTIONAL since 2026-09-09. It was required, and "Audit the
+    # vouchers module" -- an imperative, which is how these are actually written --
+    # missed by exactly one word while "an audit OF the vouchers module" matched.
+    # That miss is the upstream cause of T13a's worst run: ungrounded, the
+    # coordinator guessed paths, spent all seven delegations on one frontend file
+    # (one refused as naming a file that does not exist, two more served ALREADY
+    # DONE), never delegated for vouchers_api.py or models.py, and answered one
+    # third of a three-part question. project_map('vouchers') resolves both.
+    r"\b(?:(?:of|for|on)\s+)?(?:the\s+)?([a-z][\w-]{2,})\s+"
     r"(?:service|module|component|package|app|api|subsystem)\b", re.I)
 
 # A named SYMBOL: "the Party model", "the InvoiceBuilder class", "the upload_document

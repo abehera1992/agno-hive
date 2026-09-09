@@ -1680,6 +1680,26 @@ def _quote_matches(quoted: str, window: str) -> bool:
     """
     if quoted in window:
         return True
+
+    # An answer that wraps its quote in ITS OWN quote marks is quoting the line, not
+    # claiming the file contains quote characters. Live, T3 of the 2026-09-09 battery:
+    # the answer wrote `"// Seller verification pending notification"` and the file's
+    # line 95 is exactly `// Seller verification pending notification` -- correct
+    # citation, correct line, reported MISMATCH because the search string carried two
+    # extra `"` the source never had.
+    #
+    # Only a MATCHED pair is stripped, and only one layer, so a quote that legitimately
+    # begins or ends with a quote character inside real source still has to match on its
+    # own terms. Retried before the ellipsis logic below, which is the other way a
+    # correct citation used to fail here.
+    unwrapped = quoted.strip()
+    for q in ('"', "'", "`"):
+        if len(unwrapped) > 1 and unwrapped[0] == q and unwrapped[-1] == q:
+            unwrapped = unwrapped[1:-1]
+            break
+    if unwrapped != quoted and unwrapped and unwrapped in window:
+        return True
+
     parts = [p.strip() for p in _ELLIPSIS_RE.split(quoted)]
     parts = [p for p in parts if p]
     if len(parts) < 2:
