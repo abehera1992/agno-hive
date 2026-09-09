@@ -25,6 +25,7 @@ import config
 
 from tools.context import (
     get_project_context,
+    project_map,
     get_file_content,
     get_files_batch,
     find_files,
@@ -177,6 +178,7 @@ def _tool(fn):
 
 # ── Context + file reading ────────────────────────────────────────────────────
 _tool(get_project_context)
+_tool(project_map)
 _tool(get_file_content)
 _tool(get_files_batch)
 _tool(find_files)

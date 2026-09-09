@@ -1349,3 +1349,117 @@ def list_directory(relative_path: str = "") -> str:
     if not entries:
         return f"Empty: {relative_path or '(project root)'}"
     return f"{relative_path or '(project root)'}  ({len(entries)} items):\n" + "\n".join(entries)
+# Top-level definitions across the languages this is likely to meet. A spread of
+# keywords rather than one language's: the point is to say HOW MUCH is in a file, not to
+# parse it. A file with 30 definitions is where the substance lives, whatever the project
+# calls it.
+_TOPLEVEL_DEF_RE = re.compile(
+    r"^(?:export\s+)?(?:default\s+)?(?:public\s+|private\s+|protected\s+)?"
+    r"(?:abstract\s+)?(?:async\s+)?"
+    r"(?:class|def|function|func|interface|struct|enum|trait|module)\s+"
+    r"([A-Za-z_]\w*)", re.M)
+
+_MAP_MAX_DIRS = 4
+_MAP_MAX_FILES = 25
+_MAP_MAX_PROBED = 12
+
+
+def _is_empty_result(line: str) -> bool:
+    """find_files reports an empty result as prose, not an empty string.
+
+    Treating that prose as a path is not hypothetical -- the first version of
+    project_map did exactly that and reported the sentence "No matches for:
+    **/*inventory*/" as a directory containing one file.
+    """
+    t = line.strip()
+    return (not t) or t.startswith(("No matches", "No files", "Error", "Invalid"))
+
+
+def project_map(component: str) -> str:
+    """
+    Locate a named part of this project and report what is actually in it.
+
+    Answers "where does <component> live, and which file holds the substance" for any
+    repository, without assuming a layout, framework, language or filename convention.
+    Everything returned is read from disk at call time.
+
+    Use this BEFORE planning work on a named service/module/component, so paths in the
+    plan are real rather than guessed. It reports LOCATION and SIZE, never meaning: it
+    will tell you a file declares 31 top-level definitions; it will not tell you those
+    are "the models", because that varies by project and a wrong label is worse than
+    none.
+
+    Args:
+        component: the name as a human said it — 'billing', 'auth', 'inventory'.
+
+    Returns:
+        Ranked directories whose paths contain the name, with the files directly inside
+        the best match and how many top-level definitions each declares. Empty-handed
+        message when nothing matches.
+    """
+    name = (component or "").strip().lower()
+    if len(name) < 3:
+        return "project_map: give a component name of at least 3 characters."
+
+    raw = find_files(f"**/*{name}*/**/*", max_results=800)
+    paths = [ln.strip() for ln in raw.splitlines()
+             if ln.strip() and not _is_empty_result(ln)]
+    if not paths:
+        raw = find_files(f"**/*{name}*", max_results=800)
+        paths = [ln.strip() for ln in raw.splitlines()
+                 if ln.strip() and not _is_empty_result(ln)]
+    if not paths:
+        return (f"project_map: nothing in this repository has '{name}' in its path. "
+                f"The component may be called something else here — try search_files "
+                f"for a symbol you expect it to define.")
+
+    # Bucket by the FIRST path segment carrying the name, so a/b/<name>-svc/c/d.py is
+    # credited to a/b/<name>-svc rather than to its subdirectory. A file that itself
+    # carries the name is credited to its parent.
+    buckets: dict[str, int] = {}
+    for p in paths:
+        segs = p.replace("\\", "/").strip("/").split("/")
+        hit = next((i for i, seg in enumerate(segs) if name in seg.lower()), None)
+        if hit is None:
+            continue
+        key = ("/".join(segs[:hit]) or "."
+               ) if hit == len(segs) - 1 else "/".join(segs[:hit + 1])
+        buckets[key] = buckets.get(key, 0) + 1
+    if not buckets:
+        return f"project_map: no directory or file in this repository carries '{name}'."
+
+    ranked = sorted(buckets.items(), key=lambda kv: -kv[1])[:_MAP_MAX_DIRS]
+    out = [f"'{name}' appears in these real locations:"]
+    for d, n in ranked:
+        direct_raw = find_files(f"{d}/*", max_results=200)
+        names = sorted({ln.strip().replace("\\", "/").rsplit("/", 1)[-1]
+                        for ln in direct_raw.splitlines()
+                        if ln.strip() and "." in ln.strip().rsplit("/", 1)[-1]
+                        and not ln.strip().rsplit("/", 1)[-1].startswith(".")})
+        shown = names[:_MAP_MAX_FILES]
+        line = f"- {d}/  ({n} file(s) below it)"
+        if shown and d == ranked[0][0]:
+            counted = []
+            for fname in shown[:_MAP_MAX_PROBED]:
+                try:
+                    src = (PROJECT_ROOT / d / fname).read_text(
+                        encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                c = len(set(_TOPLEVEL_DEF_RE.findall(src)))
+                if c:
+                    counted.append((fname, c))
+            if counted:
+                counted.sort(key=lambda kv: -kv[1])
+                rest = [f for f in shown if f not in {c[0] for c in counted}]
+                line += ("\n    " + ", ".join(f"{f} ({c} top-level definitions)"
+                                              for f, c in counted)
+                         + (", " + ", ".join(rest) if rest else ""))
+            elif shown:
+                line += "\n    " + ", ".join(shown)
+        elif shown:
+            line += "\n    " + ", ".join(shown)
+        out.append(line)
+    out.append("These paths exist and were not inferred. Name the specific file to open "
+               "rather than searching for it again.")
+    return "\n".join(out)

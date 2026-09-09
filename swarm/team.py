@@ -3942,6 +3942,39 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # no claims. "Nothing to check" and "checks out" have now reached a reader as the
     # same verdict three separate times, through three different paths; this closes the
     # one where no retry is involved at all.
+    # An EMPTY answer, distinct from the canned failure sentence below. The run returns
+    # 200 OK with nothing in it, so no guard downstream has anything to examine and the
+    # caller cannot tell a silent failure from a fast success.
+    #
+    # Live, T12 with pre-flight grounding on (2026-09-08, 20:00:36): the Researcher
+    # returned 3,668 characters and the Reviewer 4,060, the coordinator returned an
+    # empty string, and 7,728 characters of real member work were delivered as zero.
+    #
+    # _recovered_member_findings is the right repair and already exists -- it attaches
+    # the members' own text verbatim. It was wired to the thin-answer and relay-drop
+    # paths and to the auto-kill salvage, but not here, because "the answer is short"
+    # and "there is no answer" were treated as the same shape and only the first had a
+    # trigger. Filenames are NOT enough for this case: the sibling branch below recovers
+    # _member_items (names only), which tells a reader what was opened but not what was
+    # found.
+    if not (content or "").strip():
+        _found = _recovered_member_findings(team)
+        if _found:
+            print(f"[team] run returned an EMPTY answer — attaching {len(_found):,} "
+                  f"chars of member findings that would otherwise be lost", flush=True)
+            return (
+                "**THIS RUN RETURNED NO ANSWER — the coordinator produced nothing. The "
+                "members' own findings are below, verbatim and unedited; nothing here "
+                "has been summarised or verified by the run itself.**"
+                + _found + _summarize_actual_writes(*all_results))
+        print("[team] run returned an EMPTY answer and no member findings were "
+              "captured — nothing to recover", flush=True)
+        return (
+            "**THIS RUN RETURNED NO ANSWER — the coordinator produced nothing and no "
+            "member reported any findings. Treat this as a failed run, not an empty "
+            "result: nothing was established either way.**"
+            + _summarize_actual_writes(*all_results))
+
     if (content or "").strip() == _BUDGET_EXHAUSTED_ANSWER:
         _mi = getattr(team, "_member_items", None)
         _found = sorted({n for names in _mi.values() for n in names}) if isinstance(_mi, dict) else []
