@@ -31,6 +31,8 @@ with the identical context -- a silent, repeating loop until the 300s liveness
 auto-kill (config.liveness_silence_threshold_s) fires with zero answer produced.
 """
 
+import os  # noqa: E402  (this module defines helpers above its imports)
+
 # agno team internal tools — do not strip from content, let agno handle natively
 _AGNO_INTERNAL_TOOLS = {"delegate_task_to_member", "delegate_task_to_members", "get_member_information"}
 
@@ -68,6 +70,65 @@ _peak_estimated_input_tokens = 0
 # prose -> 4,801 (6.00). 4.0 is below both, so the estimate errs HIGH -- the right
 # direction for something whose job is to refuse before a hard limit is hit.
 _CHARS_PER_TOKEN = 4.0
+
+
+# Hard ceiling for a single request, under the model's 262,144 and above the 190,000
+# soft budget, leaving room for the estimate's own error (it runs 1.08x high on source,
+# 1.50x on prose -- see _CHARS_PER_TOKEN).
+_PROMPT_HARD_CEILING = 230_000
+# A jump this large between consecutive calls is pathological and worth dumping the
+# message composition for. T13a went 158,695 -> 258,049+ in one step.
+_PROMPT_JUMP_ALERT = 50_000
+_last_estimate = 0
+# Env kill-switch. This is the one change that touches EVERY model call and alters what
+# the model sees, so a bug here degrades answers everywhere instead of failing loudly.
+_TRIM_ENABLED = os.getenv("PROMPT_TRIM_ENABLED", "1").strip() not in ("0", "false", "no")
+
+
+def _describe_messages(messages) -> str:
+    """Role counts and the biggest few messages, for a jump nobody can otherwise explain."""
+    try:
+        by_role: dict = {}
+        sizes = []
+        for i, m in enumerate(messages or []):
+            role = str(getattr(m, "role", "?"))
+            c = getattr(m, "content", None)
+            n = len(c) if isinstance(c, str) else len(str(c or ""))
+            tc = getattr(m, "tool_calls", None)
+            if tc:
+                n += len(str(tc))
+            by_role[role] = by_role.get(role, 0) + n
+            sizes.append((n, i, role))
+        sizes.sort(reverse=True)
+        roles = ", ".join(f"{r}={n:,}" for r, n in
+                          sorted(by_role.items(), key=lambda kv: -kv[1]))
+        big = "; ".join(f"#{i} {r} {n:,} chars" for n, i, r in sizes[:4])
+        return f"{len(messages or [])} messages | by role: {roles} | largest: {big}"
+    except Exception:  # noqa: BLE001
+        return "<could not describe>"
+
+
+def _trim_to_ceiling(messages) -> int:
+    """Drop oldest non-system messages until the estimate fits. Returns how many went.
+
+    System messages carry the instructions the whole run depends on and are never
+    dropped. Everything else goes oldest-first: that is both the conversation's least
+    relevant end and the position long-context recall is weakest at, so it is the
+    cheapest thing to lose.
+    """
+    if not isinstance(messages, list):
+        return 0
+    dropped = 0
+    # Leave the last few turns untouched no matter what -- the current question and its
+    # immediate context are the one thing the model cannot answer without.
+    while len(messages) > 6 and _estimate_prompt_tokens(messages) > _PROMPT_HARD_CEILING:
+        idx = next((i for i, m in enumerate(messages)
+                    if str(getattr(m, "role", "")) != "system"), None)
+        if idx is None or idx >= len(messages) - 4:
+            break
+        messages.pop(idx)
+        dropped += 1
+    return dropped
 
 
 def peak_input_tokens() -> int:
@@ -115,9 +176,31 @@ def _estimate_prompt_tokens(messages) -> int:
 
 
 def record_prompt_estimate(messages) -> int:
-    """Record the pre-flight estimate for this call and return it."""
-    global _peak_estimated_input_tokens
+    """Record the estimate, dump composition on a big jump, and trim past the ceiling."""
+    global _peak_estimated_input_tokens, _last_estimate
     est = _estimate_prompt_tokens(messages)
+
+    # A jump nobody can explain from the existing counters. Dumped only here, so an
+    # ordinary call costs nothing: T13a's member reports grew ~1k tokens while the
+    # request grew ~100,000, and no log said where the rest came from.
+    if est - _last_estimate >= _PROMPT_JUMP_ALERT:
+        print(f"[model] prompt jumped {_last_estimate:,} -> {est:,} tokens in one call "
+              f"— {_describe_messages(messages)}", flush=True)
+    _last_estimate = est
+
+    if est > _PROMPT_HARD_CEILING:
+        if not _TRIM_ENABLED:
+            print(f"[model] estimate {est:,} exceeds {_PROMPT_HARD_CEILING:,} and "
+                  f"trimming is DISABLED — sending anyway, this may be rejected",
+                  flush=True)
+        else:
+            dropped = _trim_to_ceiling(messages)
+            after = _estimate_prompt_tokens(messages)
+            print(f"[model] estimate {est:,} exceeded the {_PROMPT_HARD_CEILING:,} "
+                  f"ceiling — dropped {dropped} oldest non-system message(s), now "
+                  f"{after:,}. Sending a trimmed request beats sending one the model "
+                  f"will refuse, which ends the run with nothing.", flush=True)
+            est = after
     if est > _peak_estimated_input_tokens:
         _peak_estimated_input_tokens = est
         # Only when the estimate OVERTAKES what the server has confirmed: that is the

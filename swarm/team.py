@@ -6711,7 +6711,12 @@ _FIELDS_OF_TYPE_RE = re.compile(
     r"[^\n]{0,120}?\bfields?\b", re.I)
 
 # A bullet naming one member: "- `party_id: UUID(...)`" or "- `party_id` (UUID)".
-_FIELD_BULLET_RE = re.compile(r"^\s*[-*]\s*`?([a-z_][a-z0-9_]*)`?\s*[:(]", re.M)
+# `- \`party_id\` (UUID)`, `- \`party_id: UUID\``, and `- \`party_id = Column(...)\``.
+# The `=` form was missing and it is the one the model uses for its MOST precise
+# answers -- full Column definitions with line numbers -- so the guard skipped exactly
+# the shape it should have been checking. Measured: 0 fields parsed from an answer
+# listing 13.
+_FIELD_BULLET_RE = re.compile(r"^\s*[-*]\s*`?([a-z_][a-z0-9_]*)`?\s*[:(=]", re.M)
 
 # A member declared inside a class body, across the shapes this is likely to meet:
 # `name = Column(...)` (ORM), `name: str` (annotation/dataclass/TS interface),

@@ -1658,6 +1658,29 @@ def _read_window(rel_path: str, center_line: int, span: int) -> str:
 _ELLIPSIS_RE = re.compile(r"\.\.\.|…")
 
 
+# "(lines 235-263)", "lines 235–263", "lines 235 to 263" -- a SPAN, not a point. The end
+# of a span is not a claim that anything is declared there.
+_LINE_RANGE_RE = re.compile(
+    r"lines?\s+(\d{1,6})\s*(?:[-–—]|to)\s*(\d{1,6})", re.I)
+
+
+def _range_containing(answer: str, num: int) -> tuple[int, int] | None:
+    """The declared line-range whose END is `num`, if the answer states one.
+
+    Matching on the END specifically, because that is the number the citation extractor
+    picks up and the only one that can produce this false positive. A range whose start
+    is cited resolves correctly already.
+    """
+    for m in _LINE_RANGE_RE.finditer(answer or ""):
+        try:
+            lo, hi = int(m.group(1)), int(m.group(2))
+        except ValueError:
+            continue
+        if hi == num and lo <= hi:
+            return lo, hi
+    return None
+
+
 def _quote_matches(quoted: str, window: str) -> bool:
     """Does `quoted` appear in `window`, allowing an elided middle?
 
@@ -2182,7 +2205,23 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                                 # when it is declared at 941. The index knows 941
                                 # exactly; grep only knows every line mentioning it.
                                 decl, dline, kind = _decl_site(resolved, a)
-                                if decl and dline:
+                                # A cited number that is the END of a range the answer
+                                # itself declared is a SPAN, and the only question worth
+                                # asking is whether the declaration falls inside it.
+                                # T4 wrote "`Party` class (lines 235-263)" -- correct,
+                                # PartyRegistration starts at 264 -- and was reported
+                                # MISMATCH because 235 is not within 5 lines of 263.
+                                _rng = _range_containing(answer, num)
+                                if decl and dline and _rng and _rng[0] <= dline <= _rng[1]:
+                                    problems -= 1  # undo the increment above
+                                    out.append(
+                                        f"  LINE {num:<6} {resolved}"
+                                    )
+                                    out.append(
+                                        f"             `{a}` declared at {dline}, inside "
+                                        f"the cited range {_rng[0]}-{_rng[1]}"
+                                    )
+                                elif decl and dline:
                                     out.append(
                                         f"  MISMATCH   {resolved}:{num} <-- `{a}` is "
                                         f"declared at line {dline} ({kind}), not within "
