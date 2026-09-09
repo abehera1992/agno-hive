@@ -1807,6 +1807,7 @@ _GUARD_BANNERS = (
     "THE INTEGRATION WAS ASKED FOR AND NOT DESCRIBED",
     "THE ANSWER PRESENTS ROUTERS THE SERVICE DOES NOT MOUNT",
     "AT LEAST HALF THE MODELS ASKED FOR ARE NOT IN THE ANSWER",
+    "ASKED WHICH CODE DOES THIS, AND NO CODE IS CITED",
     # The wording this guard shipped with for one afternoon, kept because _GUARD_BANNERS
     # is what cuts guard-appended text off an answer before it is scored. Any run stored
     # from that window still carries the old banner, and a scorer that missed it would
@@ -6459,6 +6460,123 @@ async def repair_unguarded_draft(task: str, content: str, mcp_url: str | None = 
     return "".join(fired)
 
 
+def _body_before_guard_notes(content: str) -> str:
+    """Just the model's own answer, with any guard notes already appended cut off.
+
+    _run_repo_derived_guards is pointed at arbitrary text -- a rescued draft, a retry's
+    output -- which may ALREADY carry notes from an earlier pass. Those notes quote real
+    file paths on purpose (the middleware guard prints
+    `API/authentication-service/main.py:7`), so a guard that reads the whole string sees
+    citations the model never made. Here that would be a silent false NEGATIVE: one
+    earlier banner mentioning a .py file would convince this guard the answer cited code.
+
+    The same confusion, in the other direction, once had me scoring guard-appended text
+    as the model's answer and nearly filing a working guard as broken. Cut at the first
+    banner; everything after it belongs to the guards, not the model.
+    """
+    cut = len(content or "")
+    for marker in _GUARD_BANNERS:
+        i = (content or "").find(marker)
+        if i != -1:
+            cut = min(cut, i)
+    return (content or "")[:cut]
+
+
+# "which function ... handles it", "name every file in the chain", "trace it from the
+# API route to the database model" -- questions whose answer is source code by
+# construction. Kept to explicit asks: a general "how does X work" is legitimately
+# answerable from prose and must not trip this.
+_ASKS_FOR_CODE_RE = re.compile(
+    r"\bwhich\s+(?:function|method|handler|file)\b"
+    r"|\bwhat\s+(?:function|method|handler)\b"
+    r"|\bname\s+(?:every|each|all)\s+(?:the\s+)?file"
+    r"|\btrace\s+(?:it|this|the\s+\w+)\s+from\b",
+    re.I)
+
+# Anything that can hold a function. Deliberately broad and language-spread: the guard
+# fires only when NOT ONE cited file is of these kinds, so a missing extension here can
+# only cause a false POSITIVE, and this list is the cheap place to prevent that.
+_CODE_FILE_RE = re.compile(
+    r"`?([A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|mjs|cjs|go|java|kt|rb|rs|php|cs|swift|"
+    r"c|cc|cpp|h|hpp|scala|ex|exs|sql))`?")
+
+# Files an answer can legitimately cite that cannot contain the function being asked for.
+_NONCODE_FILE_RE = re.compile(
+    r"`?([A-Za-z0-9_./-]+\.(?:md|mdx|rst|txt|adoc|scss|css|less|json|yaml|yml|toml|"
+    r"ini|cfg|lock|svg|png))`?")
+_MAX_NONCODE_SHOWN = 5
+
+
+async def _code_question_answered_from_docs(task: str, content: str,
+                                            hive_mcp_url: str | None = None,
+                                            hive_mcp_tools=None) -> str:
+    """The question asked which code handles something; nothing cited is code.
+
+    T11 of the 2026-09-08 battery, and NOTHING flagged it -- the one silent miss in
+    fourteen tasks. Asked "which services are involved end to end, and which function in
+    each one handles it? Name every file in the chain", the answer gave four stages of
+    which three cited `docs/frontend.md` and one cited a `.module.scss`, offering a CSS
+    comment as the "function" and, for the storage stage, the phrase "Implicitly
+    referenced". Not one source file appeared anywhere in it.
+
+    verify_claims cannot catch this and is not failing when it does not: it asks whether
+    a claim is FABRICATED, and nothing here was. `docs/frontend.md` is a real file, the
+    route is real, `SellerStatusGuard` is real and was correctly reported DOC ONLY. Its
+    verdict -- "no fabricated claims found ... does not need to be fixed" -- is accurate
+    on the axis it measures. The defect is on a different axis entirely: every citation
+    is true and none of them answers the question. A guard that conflated the two would
+    have to call a correct documentation citation a fabrication, which is the false
+    positive this family exists to avoid.
+
+    Fires only when the count of cited code files is ZERO. An answer naming one real
+    source file alongside three docs has done the thing asked, however thinly, and the
+    relay-coverage guard already covers thin. Zero is unambiguous, which is what keeps
+    this silent on the thirteen tasks that did not need it.
+
+    A disclosure, not a correction. The cited documentation is usually accurate and
+    genuinely describes the flow; it simply is not the answer to "which function". The
+    guard says what was asked, what was cited, and that the chain is unverified -- it
+    does not claim the docs are wrong, and it does not guess at the real files, because
+    a wrong guess here would be worse than an honest gap.
+    """
+    if not _ASKS_FOR_CODE_RE.search(task or "") or not (content or "").strip():
+        return ""
+    body = _body_before_guard_notes(content)
+    if _CODE_FILE_RE.search(body):
+        return ""
+
+    # Deduped by BASENAME, not by the matched string: the same file is matched twice
+    # when it appears once with a leading path fragment and once bare, and listing
+    # `business-register.module.scss` beside
+    # `/auth/register/business/business-register.module.scss` reads as two findings when
+    # it is one file. Keeps the longest form seen, which is the more useful to a reader.
+    by_base: dict[str, str] = {}
+    for path in _NONCODE_FILE_RE.findall(body):
+        base = path.rsplit("/", 1)[-1]
+        if len(path) > len(by_base.get(base, "")):
+            by_base[base] = path
+    seen: list[str] = list(by_base.values())
+    if not seen:
+        # Cited nothing at all. That is a different failure with its own guards, and
+        # saying "you cited documentation" when it cited nothing would simply be untrue.
+        return ""
+
+    shown = ", ".join("`" + p + "`" for p in seen[:_MAX_NONCODE_SHOWN])
+    more = (", and " + str(len(seen) - _MAX_NONCODE_SHOWN) + " more"
+            if len(seen) > _MAX_NONCODE_SHOWN else "")
+    print("[team] code-source check: question asks for code, answer cites "
+          + str(len(seen)) + " non-code file(s) and no source file -- flagging",
+          flush=True)
+    return ("\n\n---\n**ASKED WHICH CODE DOES THIS, AND NO CODE IS CITED - the question "
+            "asked for the specific functions or files that implement this, but every "
+            "file this answer cites is documentation or configuration (" + shown + more +
+            ") and not one source file appears anywhere in it. Those citations may each "
+            "be accurate and still not answer what was asked: documentation describes "
+            "the flow, it does not implement it, and a file that cannot contain a "
+            "function cannot be the function. Treat the chain above as undetermined "
+            "until the actual source files are named.**")
+
+
 async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None,
                                    hive_mcp_tools, label: str) -> list[str]:
     """The five guards that re-derive their facts from the repo, run against `content`.
@@ -6482,6 +6600,8 @@ async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None
             _affirmed_term_absent_from_citations(task, content, hive_url, hive_mcp_tools),
             _scoped_coverage_gap(task, content, hive_url, hive_mcp_tools),
             _integration_mechanism_missing(task, content, hive_url, hive_mcp_tools),
+            _code_question_answered_from_docs(task, content, hive_url,
+                                              hive_mcp_tools),
             # _nothing() rather than a bare "": gather takes awaitables only, and the
             # models guard is the one _verified_answer suppresses for a single-fact ask.
             _nothing() if _asks_for_one_fact(task) else

@@ -1317,6 +1317,29 @@ def _resolve_path(rel_path: str, hint_paths: list[str] | None = None) -> tuple[s
     one candidate matches a hint the answer already gave for this basename, that is a
     stronger signal than "ambiguous, give up".
     """
+    # A hint the ANSWER gave beats a bare root-level file of the same name. T4 of the
+    # 2026-09-08 battery was a CORRECT answer reported BAD: it opened with "defined in
+    # `API/inventory-service/models.py`" and then cited `models.py:235` and `:264`, both
+    # exactly right (that file is 774 lines; Party is at 235, PartyRegistration at 264).
+    # But an empty models.py sits at the EkamApp project root, so PROJECT_ROOT/"models.py"
+    # was a file, this returned on the first line, the hint logic below was never reached,
+    # and a 0-byte file "has no line 235".
+    #
+    # A false positive is the worst failure this tool can have -- it teaches agents the
+    # checker is noise, and then the real fabrications get ignored too. That is why this
+    # runs BEFORE the plain existence check rather than as a fallback after it: by the
+    # time the check has returned, the wrong file has already won.
+    #
+    # Only for a bare basename with no directory part. A citation that already spells out
+    # a directory means what it says and is left alone.
+    if "/" not in rel_path.replace("\\", "/") and hint_paths:
+        base = rel_path.replace("\\", "/")
+        hinted = {h.replace("\\", "/").lstrip("./") for h in hint_paths
+                  if h.replace("\\", "/").endswith("/" + base)}
+        real = [h for h in sorted(hinted) if (PROJECT_ROOT / h).is_file()]
+        if len(real) == 1:
+            return real[0], 1
+
     p = PROJECT_ROOT / rel_path
     if p.is_file():
         return rel_path, 1
