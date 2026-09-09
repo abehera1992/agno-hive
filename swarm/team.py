@@ -11778,11 +11778,22 @@ _READ_TOOLS_FOR_CEILING = frozenset({
     "list_directory_tree", "count_matches",
 })
 
-# 12,000 -> 20,000. 12,000 sat BELOW the proven-good band and would have clipped two of
-# the three runs that scored 31/31 (member results 11,270 / 18,738 / 15,103). The only
-# collapse in the set was at 23,494, so the line belongs between them, not under all of
-# them. Not a sharp boundary: a later run reached 22,549 and still scored 8/9.
-_MEMBER_VOLUME_CEILING = 20_000
+# 12,000 -> 20,000 -> 15,000. The 20,000 was calibrated on T12 alone, where 31/31 was
+# scored at 11,270 / 18,738 / 15,103 and the only collapse was at 23,494 -- so the line
+# was placed between them. That generalised a T12-derived number to tasks with very
+# different read volume, and T11 then reached 32,375 chars of member results and died on
+# the model's hard 262,144-token limit. 12,000 would have started eliding at 12k.
+#
+# 15,000 is the value that covers T12's two proven-good runs (11,270 and 15,103 both
+# scored 31/31) while starting to elide T11 less than half way to where it crashed.
+#
+# Deliberately ONE global number rather than a per-task-shape rule: classifying a
+# question as narrow-lookup vs whole-service survey, and calibrating two branches, would
+# rest on about six data points -- the same guessing that produced the wrong 12,000. An
+# adaptive version keyed on real token growth is the better answer and is blocked on a
+# separate defect: the prompt-peak counter only records SUCCESSFUL calls, and read
+# 133,446 for the request that was actually 258,049.
+_MEMBER_VOLUME_CEILING = 15_000
 # Kept from each over-ceiling result: the opening and the closing, which are the two
 # positions long-context recall is reliable at.
 _ELIDE_HEAD = 1_200
