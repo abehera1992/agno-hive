@@ -230,6 +230,16 @@ async def _load_model_routing_cache():
     await db.ensure_schema()
     await model_routing.ensure_cache_loaded()
     await team_config.ensure_cache_loaded()
+    # Names any repo-derived guard wired into the shared runner but NOT into
+    # _verified_answer's main sequence -- such a guard runs only on the rescue and
+    # corrected-answer paths and is silently dead for a normal answer. Two shipped that
+    # way this session and let an answer out with three invented field names and no
+    # banner. Diagnostic only, never fails startup.
+    try:
+        from swarm.team import _warn_on_single_site_guards
+        _warn_on_single_site_guards()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[api] guard parity check skipped: {type(exc).__name__}: {exc}")
     # Non-blocking diagnostic (2026-08-16) — never delays or fails startup, see
     # check_coordinator_readiness()'s own docstring for the gap this closes.
     warning = await model_routing.check_coordinator_readiness()

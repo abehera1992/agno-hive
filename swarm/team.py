@@ -4001,7 +4001,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         _rs = getattr(team, "_read_state", None)
         completeness = _unchecked_completeness_block(
             content, _rs.get("enumerations") if isinstance(_rs, dict) else None)
-        return (_fab_note + _cmp_note + completeness + _lost_report_evidence(team)
+        return (_stale_findings_dropped(_fab_note, content)
+                + _cmp_note + completeness + _lost_report_evidence(team)
                 + _count_note + _term_note + _scope_note + _opened_note
                 + _integ_note + _models_note + _table_note
                 + _docs_note + _fields_note
@@ -5192,7 +5193,19 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         # fired. A lost report is a fact about the RUN, not a verdict on the answer,
         # so it must survive a clean verification too; the runs it matters most for
         # are exactly the ones where nothing else flagged anything.
-        return (content + _lost_report_evidence(team) + _count_note
+        # _fab_note rides this path too (2026-09-09). The condition above enumerates
+        # verdict TYPES, so a report carrying only a type it does not list reaches here
+        # with bad=True and its finding silently dropped -- which is what the comment
+        # above calls "detection with no delivery", recurring on a verdict added later.
+        # T4 of the v6 battery: verify reported CONTRADICTED PartyRegistration (claimed
+        # absent, declared at line 264), the extractor recognised nothing, and an answer
+        # that also invented three field names shipped with ZERO banners.
+        #
+        # Appending the note rather than adding CONTRADICTED to the list above, because
+        # the next new verdict type would reopen this in exactly the same way. The list
+        # decides whether to RETRY; it should never decide whether to TELL.
+        return (content + _stale_findings_dropped(_fab_note, content)
+                + _lost_report_evidence(team) + _count_note
                 + _term_note + _scope_note + _opened_note + _integ_note
                 + _models_note + _table_note + _docs_note + _fields_note
                 + _summarize_actual_writes(*all_results))
@@ -6781,6 +6794,63 @@ async def _fields_not_declared_on_type(task: str, content: str,
             + "\n\nA near-miss name (`id` where the class declares `party_id`) is the "
               "signature of a field list rebuilt from a summary rather than read, so "
               "treat the types and line numbers given above as unverified too.")
+
+
+# A verify_claims report line: two leading spaces, a verdict word, then the subject.
+_FINDING_LINE_RE = re.compile(
+    r"^\s{2}(NOT FOUND|BAD|AMBIGUOUS|MISMATCH|CONTRADICTED|NOT IN FILE|BLOCK NOT IN|"
+    r"DOC ONLY|SPLIT-FOUND|REFERENCED)\s+(\S+)")
+
+
+def _stale_findings_dropped(note: str, content: str) -> str:
+    """Remove findings whose subject is not in the answer being shipped.
+
+    _fab_note is computed against the DRAFT. When a correction retry replaces the
+    content, the note describes a sentence that no longer exists -- live, T1 of the v6
+    battery warned about `models.py:116` while the 134-char answer it was attached to
+    cites only 129, so "116" appeared nowhere except inside the warning itself. A
+    fabrication warning about a claim the answer does not make is worse than no warning:
+    it is unfalsifiable for the reader and it discredits the real ones.
+
+    Conservative in both directions. A line whose subject cannot be parsed is KEPT --
+    dropping something unrecognised would silently lose real findings, which is the
+    defect this file has fought hardest. And if every line survives, the note is
+    returned untouched rather than rebuilt.
+    """
+    if not note or not content:
+        return note
+    kept, dropped, saw_any = [], 0, False
+    for line in note.splitlines():
+        m = _FINDING_LINE_RE.match(line)
+        if not m:
+            kept.append(line)
+            continue
+        saw_any = True
+        subject = m.group(2).strip("`'\"")
+        # For a CITATION the line number IS the claim, so the file surviving proves
+        # nothing: a corrected answer keeps citing the same file. Checking "either part
+        # survives" kept T1's stale `models.py:116` (the file is named, 116 is not) and
+        # was the wrong rule in the only case this exists for. Require the line number.
+        if ":" in subject and subject.rsplit(":", 1)[-1].isdigit():
+            probe = [subject, subject.rsplit(":", 1)[-1]]
+        else:
+            probe = [subject]
+        if any(p and p in content for p in probe):
+            kept.append(line)
+        else:
+            dropped += 1
+    if not saw_any or not dropped:
+        return note
+    if dropped and len(kept) == len(note.splitlines()) - dropped:
+        print(f"[team] dropped {dropped} stale finding(s) — the shipped answer no "
+              f"longer makes those claims", flush=True)
+    rebuilt = "\n".join(kept)
+    # Nothing but scaffolding left: the whole note was about a superseded draft.
+    if not any(_FINDING_LINE_RE.match(l) for l in kept):
+        print("[team] every finding was stale — dropping the fabrication note entirely",
+              flush=True)
+        return ""
+    return rebuilt
 
 
 async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None,
@@ -14588,3 +14658,30 @@ async def run_task_async(
                     time.perf_counter() - t0,
                     {"project_id": project_id},
                 )
+
+
+def _warn_on_single_site_guards() -> None:
+    """Loudly name any repo-derived guard wired into only ONE of the two call paths.
+
+    _run_repo_derived_guards serves the rescue and corrected-answer paths; a normal
+    successful answer goes through _verified_answer's own sequence. Registering in one
+    looks like registering, produces no error, and leaves the guard unreachable for
+    ordinary runs -- which is how two guards written this session shipped dead and let
+    T4 out with three invented field names and no banner.
+
+    A warning rather than a hard failure: a false positive here should never take the
+    service down, and the failure it guards against is silence, which a startup line
+    already breaks.
+    """
+    import inspect
+    try:
+        shared = inspect.getsource(_run_repo_derived_guards)
+        main = inspect.getsource(_verified_answer)
+    except (OSError, TypeError):
+        return
+    names = set(re.findall(r"\b(_[a-z_]+)\(task, content", shared))
+    orphans = sorted(n for n in names if n not in main)
+    if orphans:
+        print(f"[team] WARNING: guard(s) registered in the shared runner but NOT in "
+              f"_verified_answer's main path — they will not run on a normal answer: "
+              f"{orphans}", flush=True)

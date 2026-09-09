@@ -285,6 +285,11 @@ _VERBATIM_REPORT_INSTRUCTIONS = [
     "  Everything that is NOT an enumerable finding -- your reasoning, what you looked",
     "  for, what you concluded -- should stay brief. This is not an instruction to write",
     "  more; it is an instruction not to compress the one part nobody can reconstruct.",
+    "  BUDGET: keep the whole report under about 6,000 characters. If the verbatim items",
+    "  do not fit, report the ones the question actually asked about, then state plainly",
+    "  how many you left out and where they are, e.g. 'plus 34 more routes in",
+    "  api/routes/, not listed'. A capped list with an honest remainder is useful; an",
+    "  uncapped one costs the run its budget and it finishes with nothing.",
     "  If you could not read something you were asked about, say so plainly and name it.",
     "  Never fill the gap with a plausible-looking value.",
 ]
