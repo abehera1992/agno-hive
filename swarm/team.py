@@ -1574,6 +1574,28 @@ def _extract_clarification_from_tools(result) -> dict | None:
     for t in tools:
         if getattr(t, "tool_name", None) != "request_clarification":
             continue
+        # A call the hook REFUSED is not a clarification request. All three refusal
+        # paths return a string opening with "REDIRECTED:" and the tool never executed,
+        # but the call is still recorded in `.tools` with its arguments intact -- so
+        # reading tool_name/tool_args alone cannot tell a refused call from an honoured
+        # one, and this function used to treat them identically.
+        #
+        # That is not cosmetic. The caller does `content = ""` and returns EARLY on any
+        # clarification, before _verified_answer runs, so a refused call blanked the
+        # answer and skipped every downstream guard -- including the empty-answer
+        # recovery written for exactly this shape, which therefore never fired.
+        #
+        # Live, T9 of the 2026-09-09 battery: the coordinator marked
+        # runtime_check_complete=true without checking anything, called
+        # request_clarification, was correctly redirected 2s later, and the run returned
+        # 200 OK with ZERO characters 1s after that. The user got nothing, and the
+        # honest "THIS RUN RETURNED NO ANSWER" message sat unreachable one branch away.
+        _res = getattr(t, "result", None)
+        if isinstance(_res, str) and _res.lstrip().startswith("REDIRECTED"):
+            print("[team] ignoring a request_clarification the hook already refused — "
+                  "not a clarification, letting the run fall through to the guards",
+                  flush=True)
+            continue
         args = getattr(t, "tool_args", None) or {}
         question = args.get("question")
         options = args.get("options")
@@ -6683,9 +6705,27 @@ async def _table_claimed_missing_but_present(task: str, content: str,
     tables = [ln.strip() for ln in listing.splitlines() if "." in ln.strip()]
 
     found = []
+    # An answer that names the RIGHT table alongside the wrong one has already made the
+    # correction this guard exists to make. T8 of the 2026-09-09 battery, verbatim:
+    # "The `public.parties` table does not exist in the live database. However, the
+    # `inventory.parties` table exists and currently contains 0 rows." -- correct, and
+    # complete. The banner appended to it said the absence "is an artifact of the schema
+    # qualifier the answer chose", which is exactly what the answer's own second sentence
+    # said. Firing on a right answer is the failure mode this guard family is least able
+    # to afford: a reader who sees one unnecessary banner discounts the next real one.
+    #
+    # Checked per claim rather than globally, so an answer that self-corrects ONE of two
+    # bad qualifiers still gets flagged on the other.
+    _lower = (content or "").lower()
+
     for claim in claims[:_MAX_MISSING_TABLE_CLAIMS]:
         bare = claim.rsplit(".", 1)[-1].lower()
         real = [t for t in tables if t.rsplit(".", 1)[-1].lower() == bare]
+        # Already named the correct qualified table itself -> nothing to disclose.
+        if any(t.lower() in _lower for t in real):
+            print(f"[team] table check: answer calls {claim!r} missing but also names "
+                  f"the real table itself — silent", flush=True)
+            continue
         if real and claim.lower() not in [t.lower() for t in real]:
             found.append((claim, real))
     if not found:
