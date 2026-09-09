@@ -13371,8 +13371,6 @@ _NOISE_TARGET_WORDS = frozenset({
 # Pre-flight grounding. Default OFF -- enable per team with this gate.
 PREFLIGHT_GROUNDING_GATE = "preflight_grounding"
 _PREFLIGHT_TIMEOUT_S = 45.0
-_PREFLIGHT_MAX_FILES = 25
-_PREFLIGHT_MAX_DIRS = 4
 
 # "overview of the billing service", "audit the payments module", "describe the auth
 # component" -- a request aimed at ONE named part of the project. The trailing noun is
@@ -13383,35 +13381,6 @@ _PREFLIGHT_TARGET_RE = re.compile(
     r"\b(?:of|for|on)\s+(?:the\s+)?([a-z][\w-]{2,})\s+"
     r"(?:service|module|component|package|app|api|subsystem)\b", re.I)
 
-
-# Top-level definitions in a source file, across the languages this is likely to
-# meet. Deliberately a spread of keywords rather than one language's: the point is
-# to say HOW MUCH is in a file, not to parse it. A file with 31 definitions is where
-# the substance lives, whatever the project calls it.
-#
-# The `\s*\d+\t` prefix is required, not defensive: get_file_content returns cat -n
-# numbered lines, so an anchor without it matches nothing. That exact mistake shipped
-# a guard inert earlier in this file's history and was only caught by probing the
-# real tool instead of a fixture.
-_TOPLEVEL_DEF_RE = re.compile(
-    r"^(?:\s*\d+\t)?(?:export\s+)?(?:default\s+)?(?:public\s+|private\s+|"
-    r"protected\s+)?(?:abstract\s+)?(?:async\s+)?"
-    r"(?:class|def|function|func|interface|struct|enum|trait|module)\s+"
-    r"([A-Za-z_]\w*)", re.M)
-_PREFLIGHT_MAX_PROBED = 12
-
-
-async def _count_definitions(path: str, hive_mcp_url: str | None,
-                             hive_mcp_tools=None) -> int | None:
-    """How many top-level definitions `path` declares, or None if it cannot be read.
-
-    None is not zero. An unreadable file must not be reported as empty -- the same
-    rule every other repo helper here follows.
-    """
-    src = await _repo_file_text(path, hive_mcp_url, hive_mcp_tools)
-    if not src:
-        return None
-    return len(set(_TOPLEVEL_DEF_RE.findall(src)))
 
 async def _preflight_repo_facts(task: str, hive_mcp_url: str | None,
                                 hive_mcp_tools=None) -> str:
