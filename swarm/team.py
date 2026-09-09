@@ -5432,6 +5432,23 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     if still_unavailable:
         return (corrected + _UNVERIFIED_DISCLAIMER + unread_note + _corrected_notes
                 + _summarize_actual_writes(*all_results))
+    if still_bad and len(corrected) < len(content) * _RETRY_MIN_LENGTH_RATIO:
+        # The retry did not fix the draft; it shortened it and stayed wrong. Keep the
+        # draft and say both things -- the reader gets the fuller text AND the finding.
+        #
+        # Measured three-for-three over one afternoon (T11 1,670 / T13 1,486 / T4 520
+        # chars, all still_bad). T4's is the clearest: the draft over-claimed
+        # PartyRegistration's fields, the retry deleted the model and asserted it does
+        # not exist. A fabrication is a bad answer; a false denial is a worse one,
+        # because nothing downstream can tell it from a real absence.
+        print(f"[team] correction retry came back still-bad and {len(corrected):,} "
+              f"chars against the draft's {len(content):,} — keeping the draft, which "
+              f"has more of the answer in it", flush=True)
+        return (content + _flagged_draft_note(report2)
+                + unread_note
+                + "".join(await _run_repo_derived_guards(
+                    task, content, hive_mcp_url, hive_mcp_tools, "draft kept over retry"))
+                + _summarize_actual_writes(*all_results))
     if still_bad:
         # Surface rather than hide: the reader needs to know which claims are unsupported.
         return (f"{corrected}\n\n---\n**Unverified claims flagged automatically "
@@ -5441,6 +5458,16 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     return (corrected + unread_note + _corrected_notes
             + _summarize_actual_writes(*all_results))
 
+
+
+# A still-bad retry has to be at least this fraction of the draft's length to be worth
+# adopting. Below it, the retry has not corrected the draft -- it has deleted the part
+# that was wrong, which reads as an answer and is not one.
+#
+# Only applied when the retry is STILL FLAGGED. A retry that comes back clean is adopted
+# at any length: answering less but correctly is a legitimate correction, and that is
+# most of what this path is for.
+_RETRY_MIN_LENGTH_RATIO = 0.5
 
 
 def _flagged_draft_note(report: str) -> str:
