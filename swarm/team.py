@@ -11653,6 +11653,13 @@ def _elide_middle(text: str, head: int = _ELIDE_HEAD, tail: int = _ELIDE_TAIL) -
 # `upload_document` or `uploadDocument`.
 _PROSE_PATTERN_RE = re.compile(r"^[A-Za-z][A-Za-z ]{4,}[A-Za-z]$")
 _DOC_SUFFIXES = (".md", ".mdx", ".rst", ".txt", ".adoc")
+# Anything that can actually declare the function a "which code does this" question is
+# asking about. Deliberately the inverse test: enumerating what CANNOT hold code (docs,
+# stylesheets, lockfiles, images, config...) is an open-ended list that silently grows,
+# and every gap in it turns the note off.
+_CODE_SUFFIXES = (".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".java",
+                  ".kt", ".rb", ".rs", ".php", ".cs", ".swift", ".c", ".cc", ".cpp",
+                  ".h", ".hpp", ".scala", ".ex", ".exs", ".sql")
 
 
 def _prose_search_note(pattern: str, result: str) -> str:
@@ -11674,7 +11681,12 @@ def _prose_search_note(pattern: str, result: str) -> str:
     if not lines:
         return ""
     paths = [l.split(":", 1)[0].strip().lower() for l in lines]
-    if not all(p.endswith(_DOC_SUFFIXES) for p in paths if p):
+    # Fires when NO hit is a source file -- not when every hit is a .md. The first
+    # version tested "all docs" against a two-line fixture I wrote myself; the real
+    # search returns README.md, docs/frontend.md AND a .module.scss, so one stylesheet
+    # was enough to silence it on the exact case it was built for. A stylesheet is no
+    # more able to hold the function being asked about than a README is.
+    if any(p.endswith(_CODE_SUFFIXES) for p in paths if p):
         return ""
     words = pattern.strip().split()
     snake = "_".join(w.lower() for w in words)
