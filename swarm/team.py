@@ -10140,6 +10140,11 @@ def _build_team(
         model=get_model(
             coordinator_model, config.ollama_host,
             temperature=config.coordinator_temperature, max_tokens=config.coordinator_max_tokens,
+            # Pinned so the same question decomposes the same way run to run -- the
+            # first delegation decides everything downstream, and it was varying on
+            # identical input. See config.coordinator_seed for why this reduces
+            # variance without making runs bitwise reproducible.
+            seed=config.coordinator_seed,
             frequency_penalty=config.coordinator_frequency_penalty,
             repetition_penalty=config.coordinator_repetition_penalty,
             min_p=config.coordinator_min_p,

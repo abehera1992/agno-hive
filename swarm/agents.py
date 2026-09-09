@@ -37,7 +37,7 @@ def get_model(
     model_id: str, host: str,
     temperature: float | None = None, max_tokens: int | None = None,
     frequency_penalty: float | None = None, repetition_penalty: float | None = None,
-    min_p: float | None = None,
+    min_p: float | None = None, seed: int | None = None,
 ):
     """Build the model object for an agent, honoring INFERENCE_BACKEND.
 
@@ -126,6 +126,7 @@ def get_model(
         return OpenAILike(
             id=model_id, base_url=config.vllm_gateway_url, api_key="EMPTY",
             temperature=temperature, max_tokens=max_tokens, frequency_penalty=frequency_penalty,
+            seed=seed,
             # See config.model_request_timeout_s's own docstring for the live hang this
             # closes -- a request whose response stream goes silent server-side otherwise
             # has nothing to time it out at the HTTP layer.
@@ -137,6 +138,7 @@ def get_model(
         return VLLMToolFix(
             id=served, base_url=config.vllm_gateway_url, api_key="EMPTY",
             temperature=temperature, max_tokens=max_tokens, frequency_penalty=frequency_penalty,
+            seed=seed,
             timeout=config.model_request_timeout_s,
             # extra_body only, not native OpenAIChat fields -- see this function's own
             # docstring. Only wired on the vLLM path: both are vLLM-native SamplingParams

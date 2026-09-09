@@ -144,7 +144,32 @@ class Config:
     # Applied only to the coordinator (swarm/team.py's _build_team), not member agents --
     # Researcher/Coder plausibly benefit from more sampling variance; this is scoped to
     # the coordinator's own decision-making role specifically.
-    coordinator_temperature: float = float(os.getenv("COORDINATOR_TEMPERATURE", "0.2"))
+    # 0.2 -> 0.0 (2026-09-09). 0.2 still samples, and the variance it leaves is not
+    # cosmetic: across three runs of the same 14-task battery the same question produced
+    # a different FIRST DELEGATION each time, and that choice decides the whole run. T4
+    # searched business-service one night and inventory-service the next, from identical
+    # input. Decomposition is a planning step -- there is no value in sampling diversity
+    # over "which file should the researcher open", only cost.
+    #
+    # Members keep 0.2 deliberately (see member_temperature): they write prose and
+    # explore, where some diversity is defensible. This is scoped to the coordinator's
+    # decision-making exactly as the original 0.2 was.
+    coordinator_temperature: float = float(os.getenv("COORDINATOR_TEMPERATURE", "0.0"))
+    # Pinned so repeated runs of one task follow the same path. agno's OpenAIChat has a
+    # native `seed` field and forwards it, and vLLM honours it per request.
+    #
+    # This makes runs MORE repeatable, not bitwise reproducible, and the difference is
+    # worth stating plainly: vLLM batches concurrent requests continuously, and batch
+    # composition changes floating-point reduction order, so identical inputs can still
+    # diverge under different load. Anyone reading a fixed seed as "deterministic" will
+    # eventually be surprised; expect much less variance, not none.
+    #
+    # Empty string disables it (omits the field entirely, the pre-2026-09-09 shape).
+    coordinator_seed: int | None = (
+        int(os.environ["COORDINATOR_SEED"])
+        if os.getenv("COORDINATOR_SEED", "").strip() else
+        (None if "COORDINATOR_SEED" in os.environ else 1729)
+    )
     # Output-length cap on the coordinator's own completions -- unset anywhere else in
     # this stack (agno's OpenAIChat.max_tokens defaults to None, meaning omitted from
     # the request, so vLLM lets the model generate up to its own context-length ceiling
