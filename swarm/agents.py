@@ -134,7 +134,24 @@ def get_model(
         )
 
     if config.inference_backend == "vllm":
-        served = route.vllm_served_as or model_id.replace(":", "-")
+        served = route.vllm_served_as
+        if not served:
+            # No DB route for this id. The mangled fallback is a guess, and on this
+            # gateway it is a guess that FAILS: LiteLLM answers an unmapped name with
+            # `400 Invalid model name passed in model=qwen3-coder-30b`, which reads like
+            # a broken model rather than an unloaded routing cache.
+            #
+            # The real cause is almost always that model_routing.ensure_cache_loaded()
+            # has not run -- the server awaits it at startup, so any code path that
+            # builds a model outside that lifecycle (a script, a probe, a test) silently
+            # gets the guess. That cost an hour of debugging a routing table that was
+            # correct all along: the DB had qwen3-coder:30b -> local-shared the whole
+            # time. Keep the fallback, but never let it be silent again.
+            served = model_id.replace(":", "-")
+            print(f"[model] no DB route for {model_id!r} — falling back to {served!r}, "
+                  f"which this gateway may reject. If you are calling get_model outside "
+                  f"the server, await model_routing.ensure_cache_loaded() first.",
+                  flush=True)
         return VLLMToolFix(
             id=served, base_url=config.vllm_gateway_url, api_key="EMPTY",
             temperature=temperature, max_tokens=max_tokens, frequency_penalty=frequency_penalty,

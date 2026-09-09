@@ -351,8 +351,27 @@ class _ToolCallRecoveryMixin:
         return True
 
 
-    def _parse_provider_response(self, response: dict) -> ModelResponse:
-        model_response = super()._parse_provider_response(response)
+    def _parse_provider_response(self, response: dict, **kwargs) -> ModelResponse:
+        """agno's own signature is (response, **kwargs); match it and pass them on.
+
+        Without **kwargs this override silently narrows the base signature. agno's
+        OpenAIChat calls it as `_parse_provider_response(response,
+        response_format=response_format)` from BOTH non-streaming paths (invoke and
+        ainvoke), so any non-streaming call through this mixin raised
+
+            TypeError: _parse_provider_response() got an unexpected keyword
+                       argument 'response_format'
+
+        AFTER a successful HTTP round-trip -- the request went out, the model answered,
+        and the reply was thrown away at the parse step, which is a confusing shape to
+        debug.
+
+        Latent, not live: hive only ever runs team.arun(task, stream=True), so the
+        streaming delta parser is the one production uses, and 7 days of logs contain
+        zero occurrences. Fixed anyway because it costs one word and the failure mode
+        would otherwise wait for the first non-streaming caller.
+        """
+        model_response = super()._parse_provider_response(response, **kwargs)
         # Before any early return below -- a turn that came back as a tool call has
         # the same prompt behind it as one that came back as prose, and skipping it
         # would blind the budget to exactly the tool-heavy runs that overflow.
@@ -374,8 +393,14 @@ class _ToolCallRecoveryMixin:
 
         return model_response
 
-    def _parse_provider_response_delta(self, response: Any) -> ModelResponse:
-        model_response = super()._parse_provider_response_delta(response)
+    def _parse_provider_response_delta(self, response: Any, **kwargs) -> ModelResponse:
+        """Same widening as the non-streaming parser above, for the same reason.
+
+        agno's base declares this one WITHOUT **kwargs today, so nothing passes extras
+        yet -- accepting them keeps this override from breaking the moment agno adds
+        one, which is exactly how the sibling method above came to break.
+        """
+        model_response = super()._parse_provider_response_delta(response, **kwargs)
         # Same placement rationale as the non-streaming parser above. Usage rides
         # on the FINAL chunk only (stream_options include_usage), so this is a
         # no-op on the thousands of content deltas and fires once per call.
