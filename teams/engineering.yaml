@@ -46,7 +46,35 @@ description: Full engineering team — routes context, researches codebase, plan
 # mattered, and the aggregation-fidelity question it exposed is open and tracked
 # separately. What the 2026-08-22 retest adds is the roster half of the design, absent
 # for every measurement above.
-coordinator_tools: []
+#
+# AMENDED 2026-09-08: one tool, not zero — `project_map` only.
+#
+# Deliberately a single named tool rather than deleting this key. Removing it entirely
+# restores the full ~25-tool surface, which is the configuration the history above
+# records as making aggregation WORSE (a column question off by ten lines, an invented
+# API/parties-service/ with fields that exist nowhere). Naming one tool keeps the
+# air-traffic-control shape: the coordinator still owns no reader, no shell and no
+# writer, and every low-level call still goes to the member that owns it.
+#
+# project_map is the narrowest useful exception and the one thing the coordinator has a
+# real need for. It writes every member's instructions while having no way to see the
+# project — agno's determine_input_for_members defaults True, so the member acts on the
+# coordinator's sentence and never sees the user's question — which is how delegations
+# to inventory_service/, models/__init__.py and src/api/models/seller_verification.py
+# came to be written. None of those paths exist.
+#
+# It cannot reproduce the 2026-08-20 failure above. That was db_schema being asked for a
+# line number it does not carry, so the number could only be invented. project_map
+# reports location and size only, never meaning, and returns no line numbers.
+#
+# Expect little from the grant itself. Measured over 17 hours the coordinator made 31
+# tool calls, every one delegate_task_to_member, and called a granted tool zero times
+# across four conditions. The same facts already reach it PUSHED, by the pre-flight
+# injection, which is what took routers from 7/16 to 16/16 in an interleaved A/B. This
+# adds the pull path for the case where it does choose to look; it is not the mechanism
+# that improvement rests on, and if aggregation degrades, revert THIS key first.
+coordinator_tools:
+  - project_map
 
 # Coordinator benchmark 2026-06-11 (same task, full 7-agent pipeline, Ollama 0.30.6):
 #   ibm/granite4.1:30b   217s — hallucinated service purposes from dir names

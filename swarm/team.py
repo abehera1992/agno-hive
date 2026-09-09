@@ -5822,6 +5822,49 @@ async def _repo_db_schema(hive_mcp_url: str | None, hive_mcp_tools=None) -> str:
 
 
 
+async def _call_hive_tool(tool: str, args: dict, hive_mcp_url: str | None,
+                          hive_mcp_tools=None) -> str:
+    """One hive-mcp tool call, or "" when it cannot be made.
+
+    Same live-session-then-fresh-connection shape as _repo_file_text, and the same rule:
+    "" means UNKNOWN, never "the tool returned nothing meaningful". Callers must not read
+    an empty string as a negative finding.
+    """
+    if not (hive_mcp_url or hive_mcp_tools):
+        return ""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    box: dict = {"text": ""}
+
+    async def _ask(session) -> None:
+        res = await session.call_tool(tool, args)
+        if _mcp_error_text(res):
+            return
+        box["text"] = _extract_mcp_text(res)
+
+    if hive_mcp_tools is not None:
+        try:
+            await asyncio.wait_for(_ask(await hive_mcp_tools.get_session_for_run()),
+                                   timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] {tool}: live session failed "
+                  f"({type(exc).__name__}: {exc or '<no message>'})")
+
+    if not box["text"] and hive_mcp_url:
+        try:
+            async def _fresh() -> None:
+                async with streamablehttp_client(hive_mcp_url) as (r, w, _):
+                    async with ClientSession(r, w) as session:
+                        await session.initialize()
+                        await _ask(session)
+            await asyncio.wait_for(_fresh(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] {tool}: unavailable "
+                  f"({type(exc).__name__}: {exc or '<no message>'})")
+    return box["text"]
+
+
 async def _repo_file_text(rel_path: str, hive_mcp_url: str | None,
                           hive_mcp_tools=None) -> str:
     """One file's contents from hive-mcp, or "" when it cannot be read.
@@ -13374,27 +13417,22 @@ async def _preflight_repo_facts(task: str, hive_mcp_url: str | None,
                                 hive_mcp_tools=None) -> str:
     """Where the thing the question names actually lives, resolved before delegating.
 
-    The coordinator writes every member's instructions and has no tools to check them
-    against. Confirmed by reading agno rather than assuming: determine_input_for_members
-    defaults True, so `member_agent_task = task` -- the sentence the coordinator invented
-    -- and the member never sees the user's question at all. Granting the coordinator a
-    tool does not help; it was given one and never called it across four conditions. So
-    the lookup happens in code, once, before anyone is dispatched.
+    Calls hive-mcp's project_map and passes its answer through. The lookup itself lives
+    there deliberately: hive-mcp owns every other repository read (find_files,
+    get_file_content, search_files) and is the layer that is project-agnostic by design.
+    An earlier version of this function reimplemented the same search here, which put
+    repo logic in the swarm layer and made it reusable by nobody.
 
-    DISCOVERS, never assumes. Everything returned is read out of the repository at run
-    time: the directory is found by searching for the name the USER used, and the file
-    list is whatever is actually in it. No path shape, framework, language or filename
-    convention is hard-coded -- an earlier version of this function asserted
-    "API/<name>-service/models.py holds the models and there is no models/ package",
-    which is true of one repository and confident nonsense in any other. This function
-    must stay portable: agno-hive points at whatever project it is given.
+    The PUSH stays here, and that is the whole reason this function still exists. The
+    coordinator writes every member's instructions and never calls a tool -- measured
+    over 17 hours, 31 tool calls, all of them delegate_task_to_member -- so a tool alone
+    would leave the one agent that needs the facts without them. agno confirms the
+    mechanism: determine_input_for_members defaults True, so `member_agent_task = task`,
+    the sentence the coordinator invented, and the member never sees the user's question.
 
-    It states location, not meaning. It says "these files exist here"; it does not say
-    which one holds the models or the routes, because that varies by project and a wrong
-    label injected as fact is worse than no fact -- a coordinator's guess gets caught by
-    the target gate downstream, an authoritative-sounding injection does not.
-
-    Returns "" when the question names no component, or when nothing resolves.
+    Returns "" on any failure. Unknown is not a fact, and a coordinator guessing a path
+    gets caught by the target gate downstream, whereas a wrong path asserted here would
+    not be.
     """
     m = _PREFLIGHT_TARGET_RE.search(task or "")
     if not m:
@@ -13403,96 +13441,25 @@ async def _preflight_repo_facts(task: str, hive_mcp_url: str | None,
     if name in _NOISE_TARGET_WORDS:
         return ""
 
-    # Find real files whose path mentions the name the user used, then report the
-    # DIRECTORIES they cluster into rather than the files themselves. Listing files
-    # directly was the first attempt and it was worse than nothing: one component
-    # name matched 104 paths across backend and frontend, the shared root collapsed
-    # to the repository root, and the 30 alphabetically-first entries were all
-    # frontend stylesheets for a question about backend architecture. Directories
-    # are compact, rank naturally by how many matches they hold, and leave the
-    # choice of which one matters to the coordinator, which is the part that varies
-    # by project.
-    paths = await _repo_find_files(f"**/*{name}*/**/*", hive_mcp_url, hive_mcp_tools)
-    if not paths:
-        paths = await _repo_find_files(f"**/*{name}*", hive_mcp_url, hive_mcp_tools)
-    if not paths:
-        print(f"[team] preflight: nothing in the repo matches {name!r} — no facts "
+    body = await _call_hive_tool("project_map", {"component": name},
+                                 hive_mcp_url, hive_mcp_tools)
+    if not body or body.lstrip().startswith("project_map:"):
+        # project_map prefixes its own empty-handed messages that way.
+        print(f"[team] preflight: project_map found nothing for {name!r} — no facts "
               f"injected", flush=True)
         return ""
 
-    # Bucket by the FIRST path segment that carries the name, so
-    # a/b/<name>-svc/c/d.py is credited to a/b/<name>-svc rather than to its
-    # subdirectory. A file that itself carries the name is credited to its parent.
-    buckets: dict[str, int] = {}
-    for p in paths:
-        segs = p.replace("\\", "/").strip("/").split("/")
-        hit = next((i for i, seg in enumerate(segs) if name in seg.lower()), None)
-        if hit is None:
-            continue
-        key = ("/".join(segs[:hit]) or "."               ) if hit == len(segs) - 1 else "/".join(segs[:hit + 1])
-        buckets[key] = buckets.get(key, 0) + 1
-    if not buckets:
-        return ""
-
-    ranked = sorted(buckets.items(), key=lambda kv: -kv[1])[:_PREFLIGHT_MAX_DIRS]
-    lines = []
-    for d, n in ranked:
-        # Files directly inside it -- this project's entry points, whatever it
-        # calls them. Not recursive, and no filename is assumed to mean anything.
-        direct = await _repo_find_files(f"{d}/*", hive_mcp_url, hive_mcp_tools) or []
-        # Dotfiles are skipped: this listing goes into a model prompt, and .env and its
-        # neighbours have no business there. Names only, never contents — but there is
-        # no reason to name them either.
-        names = sorted({p.replace("\\", "/").rsplit("/", 1)[-1] for p in direct
-                        if "." in p.rsplit("/", 1)[-1]
-                        and not p.rsplit("/", 1)[-1].startswith(".")})
-        shown = names[:_PREFLIGHT_MAX_FILES]
-        entry = ""
-        if shown:
-            # For the best-matching location only, say how much is IN each file. Naming
-            # files was not enough on its own: measured over 3 runs each, grounding that
-            # listed filenames alone scored 18.0 of 31 models, no better than no
-            # grounding at all (21.7), while the earlier project-specific version that
-            # said "models.py declares 31 classes" scored 30.7. The count is what made
-            # the difference, so this recovers it WITHOUT naming what any file means --
-            # it reports a number, and the coordinator draws its own conclusion about
-            # where 31 definitions probably live.
-            #
-            # Top directory only: this costs one read per file and the deeper matches
-            # are rarely the answer.
-            counted: list[tuple[str, int]] = []
-            if d == ranked[0][0]:
-                for fname in shown[:_PREFLIGHT_MAX_PROBED]:
-                    c = await _count_definitions(f"{d}/{fname}", hive_mcp_url,
-                                                 hive_mcp_tools)
-                    if c:
-                        counted.append((fname, c))
-            if counted:
-                counted.sort(key=lambda kv: -kv[1])
-                rendered = ", ".join(f"{f} ({c} top-level definitions)"
-                                     for f, c in counted)
-                rest = [f for f in shown if f not in {c[0] for c in counted}]
-                entry = ("\n    files directly inside: " + rendered
-                         + (", " + ", ".join(rest) if rest else ""))
-            else:
-                extra = (f", +{len(names) - len(shown)} more"
-                         if len(names) > len(shown) else "")
-                entry = ("\n    files directly inside: " + ", ".join(shown) + extra)
-        lines.append(f"- {d}/  ({n} matching file(s) below it)" + entry)
-
-    print(f"[team] preflight: {name!r} resolves to {len(ranked)} location(s), "
-          f"top: {ranked[0][0]} ({ranked[0][1]} files)", flush=True)
+    print(f"[team] preflight: grounded {name!r} via project_map "
+          f"({len(body):,} chars of facts)", flush=True)
     return (
-        f"\n\nVERIFIED PROJECT FACTS (read from this repository just now, before "
-        f"any delegation). The '{name}' the question names appears in these real "
-        f"locations:\n"
-        + "\n".join(lines)
-        + "\n\nThese paths exist and were not inferred. Pick the location the "
-          "question is actually about, name the specific file a member should "
-          "open, and do not send anyone to discover a path already listed here. If "
-          "the question asks about something not present above, say so rather than "
-          "inventing a filename."
+        "\n\nVERIFIED PROJECT FACTS (read from this repository just now, before any "
+        "delegation):\n" + body.strip()
+        + "\n\nUse these exact paths in the instructions you write. Name the specific "
+          "file a member should open, and do not send anyone to discover a path already "
+          "listed here. If the question asks about something not present above, say so "
+          "rather than inventing a filename."
     )
+
 
 async def _stream_team_run(
     team, prompt: str, *, log_label: str = "verify-retry", liveness_path: str | None = None
