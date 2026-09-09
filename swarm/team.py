@@ -8119,6 +8119,9 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # The per-run budget above is 450,000 and never fires in time to stop a member
     # reading 169,188 chars for one question and summarising them away (T13a).
     delegation_read_chars: dict[str, int] = {}
+    # Times each member has been refused for the ceiling in the CURRENT delegation.
+    # Without this the refusal is a static condition and repeats forever.
+    read_refusals: dict[str, int] = {}
     # Closure-local record of every REAL (fresh, non-stubbed) read this run, at any
     # delegation depth (2026-08-21). This hook instance is shared across the coordinator
     # and every member, so its closure sees all of them -- which session_state does not.
@@ -8156,6 +8159,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                         print(f"[team] delegation read counter reset for {target!r} "
                               f"(was {delegation_read_chars[target]:,})", flush=True)
                     delegation_read_chars[target] = 0
+                    read_refusals[target] = 0
                     member_obj = agent_objects.get(target)
                     if member_obj is not None:
                         member_obj.tool_choice = None
@@ -8369,9 +8373,28 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         if function_name in _READ_TOOLS_FOR_CEILING and cache_key not in cache:
             _dl_read = delegation_read_chars.get(norm_agent_key, 0)
             if _dl_read >= _DELEGATION_READ_CEILING:
+                read_refusals[norm_agent_key] = read_refusals.get(norm_agent_key, 0) + 1
+                _n = read_refusals[norm_agent_key]
+                # Escalate rather than repeat. The model demonstrably reads this string
+                # as an ordinary tool result and calls again; forcing text-only is the
+                # only lever here that ends the turn instead of inviting another try.
+                if _n > _MAX_READ_REFUSALS:
+                    print(f"[team] {agent_key or 'coordinator'} ignored the read ceiling "
+                          f"{_n} times — forcing text-only so the turn ends", flush=True)
+                    _bump_consecutive_stub_and_maybe_force_text_only(
+                        norm_agent_key, agent, consecutive_stub_count)
+                    return (
+                        "STOP READING AND ANSWER. You have been told "
+                        f"{_n} times that this delegation's read budget is spent, and "
+                        "each retry has returned this same refusal. No read will run "
+                        "again in this delegation. Write your report from what you "
+                        "already have, copying enumerable findings verbatim, and name "
+                        "what you did not examine."
+                    )
                 print(f"[team] {agent_key or 'coordinator'} has read {_dl_read:,} chars "
                       f"in this delegation (ceiling {_DELEGATION_READ_CEILING:,}) — "
-                      f"refusing further reads until it reports", flush=True)
+                      f"refusing further reads until it reports "
+                      f"(refusal {_n}/{_MAX_READ_REFUSALS})", flush=True)
                 return (
                     f"REPORT NOW: you have read {_dl_read:,} characters in this one "
                     f"delegation, which is the ceiling. No further reads will run until "
@@ -8384,6 +8407,23 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     f"Then say plainly what you have NOT examined. You will be delegated "
                     f"to again if more is needed, and this ceiling resets when that "
                     f"happens — so an honest partial report costs you nothing."
+                )
+
+        if function_name == "get_files_batch" and cache_key not in cache:
+            _nb = batch_counts.get((norm_agent_key, "get_files_batch"), 0)
+            if _nb >= _MAX_BATCH_READS_PER_MEMBER:
+                print(f"[team] {agent_key or 'coordinator'} has made {_nb} batch reads "
+                      f"(cap {_MAX_BATCH_READS_PER_MEMBER}) — refusing, one file at a "
+                      f"time from here", flush=True)
+                return (
+                    f"REFUSED: {_nb} batch reads is the cap for this run. Batching is "
+                    f"what produced the worst measured answer on this system — a run "
+                    f"with 10 batch reads reported 6 of 31 models, while runs with 4 or "
+                    f"fewer reported 31 of 31. A batch lands as one undifferentiated "
+                    f"pile and the items in the middle of it are the ones that go "
+                    f"missing.\n"
+                    f"Read the files you still need ONE AT A TIME with "
+                    f"get_file_content(path), and report each one's findings as you go."
                 )
 
         is_fresh_fetch = cache_key not in cache
@@ -11684,13 +11724,31 @@ def _consume_stream_event(team, out: dict) -> bool:
 # 60,000 is roughly two large source files -- enough to answer a real question, small
 # enough that the report cannot be a summary of a pile. A member that needs more gets
 # it the honest way: report, then be delegated to again, which resets this.
-_DELEGATION_READ_CEILING = 60_000
+# 60,000 -> 90,000. Measured: the run that thrashed hit this at 61,247 and 88,122, both
+# of which are ordinary work for a whole-service survey -- and it still scored 31/31, so
+# the ceiling was interrupting a HEALTHY run. 90,000 clears both without clipping it.
+_DELEGATION_READ_CEILING = 90_000
+# How many times one member may be refused before the refusal stops being advice. A
+# static condition that answers identically forever is not a stop, it is a loop: 59
+# refusals against two totals in one run. After this many, the member is forced
+# text-only through the same machinery the stub escalation uses, which ends the turn.
+_MAX_READ_REFUSALS = 3
+# Batch reads per member per run. The strongest single predictor of the score across
+# seven T12 runs and the only variable with a clean relationship to it: <=4 gave 26, 25,
+# 31, 31 and 31 of 31 models; 7 gave 25; 10 gave 6 -- the one collapse in the set.
+# A batch read is precisely the shape that builds an undifferentiated pile in one
+# context, which is the condition long-context recall degrades in.
+_MAX_BATCH_READS_PER_MEMBER = 4
 _READ_TOOLS_FOR_CEILING = frozenset({
     "get_file_content", "get_files_batch", "search_files", "search_files_batch",
     "list_directory_tree", "count_matches",
 })
 
-_MEMBER_VOLUME_CEILING = 12_000
+# 12,000 -> 20,000. 12,000 sat BELOW the proven-good band and would have clipped two of
+# the three runs that scored 31/31 (member results 11,270 / 18,738 / 15,103). The only
+# collapse in the set was at 23,494, so the line belongs between them, not under all of
+# them. Not a sharp boundary: a later run reached 22,549 and still scored 8/9.
+_MEMBER_VOLUME_CEILING = 20_000
 # Kept from each over-ceiling result: the opening and the closing, which are the two
 # positions long-context recall is reliable at.
 _ELIDE_HEAD = 1_200
