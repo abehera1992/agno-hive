@@ -13496,10 +13496,47 @@ _PREFLIGHT_TIMEOUT_S = 45.0
 # component" -- a request aimed at ONE named part of the project. The trailing noun is
 # whatever this project calls its parts; the pattern does not care which, and the name it
 # captures is the user's own word, not a path this code invented.
+# The "<name> service/module/component" shape. This was the ONLY trigger until
+# 2026-09-09, and measured across the 14-task battery it fired on 1 task of 14 -- the
+# single architectural-overview question it was built and A/B-tested against. The other
+# thirteen ran with no grounding at all, which is the upstream cause of two live
+# failures: T4's first delegation named no path, so a member guessed the wrong service
+# and read 17,000 characters out of it (the answer described `Party` from a file where
+# the word never appears), and T11 searched the English phrase "document upload" across
+# every file, which by construction can only match prose, and answered out of the
+# documentation it found.
 _PREFLIGHT_TARGET_RE = re.compile(
     r"\b(?:overview|audit|describe|document|summar\w+|architecture)\b[^.]{0,80}?"
     r"\b(?:of|for|on)\s+(?:the\s+)?([a-z][\w-]{2,})\s+"
     r"(?:service|module|component|package|app|api|subsystem)\b", re.I)
+
+# A named SYMBOL: "the Party model", "the InvoiceBuilder class", "the upload_document
+# function". Requires the noun, so an ordinary capitalised word in prose does not
+# qualify -- the ask has to be about a declared thing for a declaration lookup to be the
+# right answer. project_map resolves these since the same date; before that a symbol
+# name fell straight through to its empty-handed message.
+#
+# Case-SENSITIVE on the captured group by design (no re.I on the name itself): `Party`
+# and `party` are different symbols, and project_map's lookup is case-sensitive for the
+# same reason. The surrounding words are matched loosely.
+_PREFLIGHT_SYMBOL_RE = re.compile(
+    r"\b(?:the\s+)?([A-Z][A-Za-z0-9]{2,}|[a-z][a-z0-9]*(?:_[a-z0-9]+)+)\s+"
+    r"(?:model|class|table|schema|entity|function|method|handler|type|interface)\b")
+
+
+def _preflight_target(task: str) -> str:
+    """The one thing to look up before delegating, or "" when the ask names none.
+
+    Service shape first: it is the more specific match, and when a question says "the
+    inventory service" the directory IS the answer. A symbol name is the fallback.
+    """
+    m = _PREFLIGHT_TARGET_RE.search(task or "")
+    if m:
+        return m.group(1).strip()
+    m = _PREFLIGHT_SYMBOL_RE.search(task or "")
+    if m:
+        return m.group(1).strip()
+    return ""
 
 
 async def _preflight_repo_facts(task: str, hive_mcp_url: str | None,
@@ -13523,13 +13560,13 @@ async def _preflight_repo_facts(task: str, hive_mcp_url: str | None,
     gets caught by the target gate downstream, whereas a wrong path asserted here would
     not be.
     """
-    m = _PREFLIGHT_TARGET_RE.search(task or "")
-    if not m:
-        return ""
-    name = m.group(1).strip().lower()
-    if name in _NOISE_TARGET_WORDS:
+    name = _preflight_target(task)
+    if not name or name.lower() in _NOISE_TARGET_WORDS:
         return ""
 
+    # Original casing, not lowered: project_map's symbol lookup is case-sensitive, and
+    # a directory match is case-insensitive at its end anyway, so passing the name as
+    # the question wrote it is correct for both lookups.
     body = await _call_hive_tool("project_map", {"component": name},
                                  hive_mcp_url, hive_mcp_tools)
     if not body or body.lstrip().startswith("project_map:"):

@@ -1375,6 +1375,72 @@ def _is_empty_result(line: str) -> bool:
     return (not t) or t.startswith(("No matches", "No files", "Error", "Invalid"))
 
 
+# Declaration keywords across the languages this is likely to meet, same spread as
+# _TOPLEVEL_DEF_RE. The point is to find where a name is DECLARED rather than merely
+# mentioned: a plain grep for "Party" returns every import, call and comment, and the
+# declaration is the one answer a planner actually needs.
+# find_files ends its output with a count line ("6 result(s) for '**/*party*'"). It is
+# not a path, and treating it as one produced a bucket literally named
+# "6 result(s) for '**/*party*/" in real output.
+_SUMMARY_LINE_RE = re.compile(r"^\s*\d[\d,]*\s+(?:result|match|file)s?\b", re.I)
+
+
+def _is_summary_line(line: str) -> bool:
+    return bool(_SUMMARY_LINE_RE.match(line or ""))
+
+
+# Split a path segment into words: on separators AND at camelCase humps, so
+# "inventory-service" -> inventory, service and "thirdPartyApis" -> third, Party, Apis.
+_SEG_TOKEN_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+
+def _segment_carries(segment: str, name: str) -> bool:
+    """True when `segment` names `name` as a WORD, not merely as a substring.
+
+    "inventory-service" carries "inventory"; "thirdpartyapi" does NOT carry "party",
+    though a substring test says it does. That false match is not hypothetical: it sent
+    project_map('Party') to a vendored Go observability tree and would have handed the
+    planner a wrong path with full confidence.
+    """
+    if not name:
+        return False
+    return name.lower() in {t.lower() for t in _SEG_TOKEN_RE.findall(segment)}
+
+
+_SYMBOL_DECL_KEYWORDS = ("class", "def", "function", "func", "interface", "struct",
+                         "enum", "trait", "type", "const", "var", "let")
+_MAP_MAX_SYMBOL_HITS = 6
+
+
+def _symbol_locations(name: str) -> list[str]:
+    """Where `name` is DECLARED, as 'path:line: text' lines. Empty when nowhere.
+
+    Case-sensitive on purpose. A symbol lookup that ignored case would report `party`
+    the local variable for a question about the `Party` model, and a confident wrong
+    location is worse than none -- the caller falls through to its empty-handed message,
+    which is honest.
+    """
+    escaped = re.escape(name)
+    pattern = (r"^\s*(?:export\s+|default\s+|public\s+|private\s+|protected\s+|"
+               r"abstract\s+|async\s+)*(?:" + "|".join(_SYMBOL_DECL_KEYWORDS) + r")\s+"
+               + escaped + r"\b")
+    raw = search_files(pattern, glob_filter="**/*", max_results=_MAP_MAX_SYMBOL_HITS * 4)
+    out: list[str] = []
+    for ln in raw.splitlines():
+        ln = ln.strip()
+        if not ln or _is_empty_result(ln):
+            continue
+        # Documentation can carry a fenced code block that matches the same pattern.
+        # A declaration in prose is not where the thing lives.
+        path = ln.split(":", 1)[0].lower()
+        if path.endswith((".md", ".mdx", ".rst", ".txt", ".adoc")):
+            continue
+        out.append(ln)
+        if len(out) >= _MAP_MAX_SYMBOL_HITS:
+            break
+    return out
+
+
 def project_map(component: str) -> str:
     """
     Locate a named part of this project and report what is actually in it.
@@ -1389,29 +1455,66 @@ def project_map(component: str) -> str:
     are "the models", because that varies by project and a wrong label is worse than
     none.
 
+    Two lookups, in order. First by PATH: directories and files whose path carries the
+    name, which answers 'where does the billing service live'. If nothing in the tree
+    carries it, by SYMBOL: where a class/function/interface of that name is declared,
+    which answers 'where is the Party model defined'. A question naming a type rather
+    than a directory used to fall straight through to the empty-handed message, and the
+    caller then guessed a path -- measured live, that guess read 17,000 characters out of
+    the wrong service and the wrong content dominated the answer.
+
     Args:
-        component: the name as a human said it — 'billing', 'auth', 'inventory'.
+        component: the name as a human said it — 'billing', 'auth', 'inventory',
+            or a symbol such as 'Party' or 'InvoiceBuilder'.
 
     Returns:
         Ranked directories whose paths contain the name, with the files directly inside
-        the best match and how many top-level definitions each declares. Empty-handed
-        message when nothing matches.
+        the best match and how many top-level definitions each declares; or, when no path
+        matches, the file and line where the symbol is declared. Empty-handed message
+        when neither finds anything.
     """
-    name = (component or "").strip().lower()
+    raw_name = (component or "").strip()
+    name = raw_name.lower()
     if len(name) < 3:
         return "project_map: give a component name of at least 3 characters."
 
+    # A capitalised name is a declared symbol far more often than a directory: across
+    # ecosystems, types are capitalised and directories are not. Asking for the
+    # declaration FIRST is what makes 'Party' resolve to the model rather than to
+    # whichever unrelated path happens to contain those five letters. A lowercase name
+    # ('inventory', 'billing') keeps the path-first order it has always had.
+    if raw_name[:1].isupper():
+        hits = _symbol_locations(raw_name)
+        if hits:
+            return ("'" + raw_name + "' is declared here:\n"
+                    + "\n".join("- " + h for h in hits)
+                    + "\nThese locations were read from the repository just now. Open "
+                      "the file named above rather than searching for it again, and do "
+                      "not assume a same-named file in another service is the one meant.")
+
     raw = find_files(f"**/*{name}*/**/*", max_results=800)
     paths = [ln.strip() for ln in raw.splitlines()
-             if ln.strip() and not _is_empty_result(ln)]
+             if ln.strip() and not _is_empty_result(ln) and not _is_summary_line(ln)]
     if not paths:
         raw = find_files(f"**/*{name}*", max_results=800)
         paths = [ln.strip() for ln in raw.splitlines()
-                 if ln.strip() and not _is_empty_result(ln)]
+                 if ln.strip() and not _is_empty_result(ln) and not _is_summary_line(ln)]
     if not paths:
-        return (f"project_map: nothing in this repository has '{name}' in its path. "
-                f"The component may be called something else here — try search_files "
-                f"for a symbol you expect it to define.")
+        # No path carries the name. It may still be a SYMBOL -- searched with the
+        # caller's original casing, not the lowered `name`, because declarations are
+        # case-sensitive and `Party` is not `party`.
+        hits = _symbol_locations((component or "").strip())
+        if hits:
+            return ("'" + (component or "").strip() + "' is not a directory in this "
+                    "repository, but it is declared here:\n"
+                    + "\n".join("- " + h for h in hits)
+                    + "\nThese locations were read from the repository just now. Open "
+                      "the file named above rather than searching for it again, and do "
+                      "not assume a same-named file in another service is the one meant.")
+        return (f"project_map: nothing in this repository has '{name}' in its path, and "
+                f"no class, function or type of that name is declared anywhere. The "
+                f"component may be called something else here — try search_files for a "
+                f"term you expect its code to contain.")
 
     # Bucket by the FIRST path segment carrying the name, so a/b/<name>-svc/c/d.py is
     # credited to a/b/<name>-svc rather than to its subdirectory. A file that itself
@@ -1419,13 +1522,21 @@ def project_map(component: str) -> str:
     buckets: dict[str, int] = {}
     for p in paths:
         segs = p.replace("\\", "/").strip("/").split("/")
-        hit = next((i for i, seg in enumerate(segs) if name in seg.lower()), None)
+        hit = next((i for i, seg in enumerate(segs) if _segment_carries(seg, name)),
+                   None)
         if hit is None:
             continue
         key = ("/".join(segs[:hit]) or "."
                ) if hit == len(segs) - 1 else "/".join(segs[:hit + 1])
         buckets[key] = buckets.get(key, 0) + 1
     if not buckets:
+        hits = _symbol_locations((component or "").strip())
+        if hits:
+            return ("'" + (component or "").strip() + "' is not a directory in this "
+                    "repository, but it is declared here:\n"
+                    + "\n".join("- " + h for h in hits)
+                    + "\nThese locations were read from the repository just now. Open "
+                      "the file named above rather than searching for it again.")
         return f"project_map: no directory or file in this repository carries '{name}'."
 
     ranked = sorted(buckets.items(), key=lambda kv: -kv[1])[:_MAP_MAX_DIRS]
