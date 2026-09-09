@@ -8473,8 +8473,8 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             # member's own summary -- see _declaration_index_block.
             if function_name == "get_file_content":
                 _p = (args or {}).get("relative_path")
-                if _p and str(_p).lower().endswith(
-                        (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".rb")):
+                # Named constant, kept beside the keyword set it must agree with.
+                if _p and str(_p).lower().endswith(_INDEXABLE_SUFFIXES):
                     _decls = _extract_declarations(_result_text(result))
                     if _decls:
                         read_state.setdefault("pending_declarations", {})[_p] = _decls
@@ -11784,14 +11784,37 @@ def _prose_search_note(pattern: str, result: str) -> str:
 # Declarations worth indexing, with the cat -n line-number prefix get_file_content
 # emits. Anchored per line so the captured group is the NAME and the number is the real
 # file line -- the whole point is that the coordinator can cite it without re-reading.
+# The keyword set and _INDEXABLE_SUFFIXES have to agree, and the first version did not:
+# `.go` was allowlisted while the keywords held `function` but not `func`, so every Go
+# file was indexed for exactly nothing. Measured across twelve languages before and
+# after -- Go went [] -> [Server, Handle, New], Rust [] -> [Party, new, Store].
+#
+# `func` for Go and Swift, `fn` for Rust, `fun` for Kotlin, `impl`/`trait` for Rust,
+# `type` for Go's `type X struct` and TS aliases, `pub` as a Rust visibility prefix.
 _INDEXABLE_DECL_RE = re.compile(
-    r"^\s*(\d+)\t\s*(?:export\s+|default\s+|public\s+|private\s+|protected\s+|abstract\s+"
-    r"|async\s+)*(class|def|function|interface|struct|enum)\s+([A-Za-z_]\w*)", re.M)
+    r"^\s*(\d+)\t\s*(?:export\s+|default\s+|public\s+|private\s+|protected\s+|pub\s+"
+    r"|abstract\s+|async\s+|static\s+|final\s+|open\s+)*"
+    r"(class|def|function|func|fn|fun|interface|struct|enum|trait|impl|type|module|"
+    # Optional receiver/generic between the keyword and the name: Go's
+    # `func (s *Server) Handle()` is how most Go METHODS are written, and without this
+    # the token after `func` is `(` and the method is skipped -- measured, Handle was
+    # missing while the plain `func New()` beside it was found.
+    r"record|object)\s+(?:\([^)]{0,80}\)\s*)?([A-Za-z_]\w*)", re.M)
 # A route decorator carries no identifier, so index the METHOD and PATH instead -- that
 # is what a "list every endpoint" question actually wants.
 _INDEXABLE_ROUTE_RE = re.compile(
     r"^\s*(\d+)\t\s*@\w+\.(get|post|put|patch|delete)\(\s*[\"']([^\"']+)", re.M)
 # Per file. A 500-class file would undo the saving this exists for.
+# Languages whose declarations _INDEXABLE_DECL_RE can actually find. Deliberately NOT
+# "every extension a human uses". For brace languages with no method keyword (Java, C#,
+# C++) this finds the TYPES and not their methods -- honest and still useful -- and for
+# anything needing a real parser (Vue SFCs, SQL DDL) it finds nothing and should not
+# pretend otherwise. A regex index is a cheap ~2% addition, not a substitute for
+# tree-sitter. An extension listed here whose language has no matching keyword above is
+# indexed for nothing, which is exactly what .go did.
+_INDEXABLE_SUFFIXES = (".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go",
+                       ".rs", ".java", ".kt", ".rb", ".php", ".cs", ".swift", ".scala",
+                       ".ex", ".exs", ".dart", ".c", ".cc", ".cpp", ".h", ".hpp")
 _MAX_INDEXED_PER_FILE = 60
 
 
