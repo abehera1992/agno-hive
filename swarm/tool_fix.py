@@ -249,6 +249,67 @@ class _ToolCallRecoveryMixin:
     # tags it was trained on as prose.
     _FORCED_TAG_RE = re.compile(r"<tool_call>.*?</tool_call>|<\|python_tag\|>.*", re.DOTALL)
 
+    # Marker on the injected message, so a re-entry into the same run recognises its own
+    # directive instead of stacking another copy every turn.
+    _FORCED_DIRECTIVE_MARK = "[[tools-disabled-directive]]"
+
+    _FORCED_DIRECTIVE = (
+        "TOOLS ARE NOW DISABLED for the remainder of this task. You cannot make another "
+        "tool call; any tool-call syntax you emit will be discarded and your report will "
+        "be lost entirely. Write your final report NOW, in plain prose, using only what "
+        "you have already read. If something was never read, say so plainly rather than "
+        "guessing. " + _FORCED_DIRECTIVE_MARK
+    )
+
+    def _inject_forced_text_directive(self, messages, tool_choice) -> None:
+        """When the harness has taken tools away, say so IN THE PROMPT, not just the API.
+
+        `tool_choice="none"` is an API-level instruction the model never sees. vLLM
+        responds to it by skipping its tool parser, so a model that still wants a tool
+        writes the Hermes tags it was trained on as ordinary prose, `finish_reason` comes
+        back "stop", and agno ends the turn on a message made entirely of syntax. The
+        member's whole report is then that syntax, and the layer above strips it to
+        nothing and treats the delegation as failed.
+
+        Measured against the served model, one variable changed (streaming, tools
+        offered, tool_choice="none"):
+
+            without this directive -> '<tool_call>
+{"name": "get_file_content", ...}'
+            with this directive    -> 'The file ... contains the following classes:
+                                       Item, ItemCategory, and SkuSequence. The file
+                                       config.py was not read, so no settings can be
+                                       listed.'
+
+        The second is a usable report AND an honest statement of what was never read --
+        which is the outcome the forcing wanted all along.
+
+        Why here rather than in the sanitizer: repairing the sanitizer can only replace
+        the syntax with a canned apology, turning a discarded delegation into a useless
+        one. This restores real content instead. And a per-delta substring check cannot
+        work at all on the streaming path -- probed live, the tag is delta 0 ('<tool_call>',
+        11 chars) and the remaining 25 deltas carry the JSON body with no tag in them, so
+        anything keyed on the literal string sees one chunk in twenty-six.
+
+        Appends to the live list agno passes: `messages` is handed to the provider fresh
+        on every iteration of agno's `while True:` model loop (models/base.py), the same
+        per-iteration re-read that makes mutating `tool_choice` mid-run work. Mutating a
+        copy would be inert -- the failure mode this file has hit before.
+        """
+        if (tool_choice or getattr(self, "_tool_choice", None)) != "none":
+            return
+        if not isinstance(messages, list) or not messages:
+            return
+        for m in reversed(messages):
+            if self._FORCED_DIRECTIVE_MARK in (getattr(m, "content", None) or ""):
+                return
+        try:
+            messages.append(type(messages[-1])(role="user",
+                                               content=self._FORCED_DIRECTIVE))
+        except Exception:  # noqa: BLE001
+            # Never let a prompt tweak break the model call it was meant to improve.
+            return
+
     def _sanitize_forced_text(self, model_response) -> bool:
         """Strip leaked tool-call syntax when the model was forced text-only.
 
@@ -337,11 +398,37 @@ class _ToolCallRecoveryMixin:
         return model_response
 
 
-class OllamaToolFix(_ToolCallRecoveryMixin, Ollama):
+class _ForcedTextDirectiveMixin:
+    """Inject the tools-disabled directive at every provider entry point.
+
+    All four exist because agno picks among them by sync/async and stream/non-stream,
+    and a member agent uses a different one from the coordinator. Covering only the
+    streaming async path would leave the budget-ceiling route -- which fires on a
+    different call shape -- still emitting syntax.
+    """
+
+    def invoke(self, messages, *a, **kw):
+        self._inject_forced_text_directive(messages, kw.get("tool_choice"))
+        return super().invoke(messages, *a, **kw)
+
+    async def ainvoke(self, messages, *a, **kw):
+        self._inject_forced_text_directive(messages, kw.get("tool_choice"))
+        return await super().ainvoke(messages, *a, **kw)
+
+    def invoke_stream(self, messages, *a, **kw):
+        self._inject_forced_text_directive(messages, kw.get("tool_choice"))
+        return super().invoke_stream(messages, *a, **kw)
+
+    def ainvoke_stream(self, messages, *a, **kw):
+        self._inject_forced_text_directive(messages, kw.get("tool_choice"))
+        return super().ainvoke_stream(messages, *a, **kw)
+
+
+class OllamaToolFix(_ForcedTextDirectiveMixin, _ToolCallRecoveryMixin, Ollama):
     pass
 
 
-class VLLMToolFix(_ToolCallRecoveryMixin, OpenAILike):
+class VLLMToolFix(_ForcedTextDirectiveMixin, _ToolCallRecoveryMixin, OpenAILike):
     """Same recovery as OllamaToolFix, for the vLLM/OpenAILike path — see this
     module's own docstring for the live incident (2026-08-15) that motivated
     porting it here rather than leaving OllamaToolFix as Ollama-only."""
