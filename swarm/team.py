@@ -11814,6 +11814,13 @@ async def _run_heartbeat(
                     # find", which on a killed run is usually the larger and more
                     # useful half.
                     "member_results": best_member_results(),
+                    # Whether this run has produced ANYTHING yet. The parent needs to
+                    # tell a run that stalled after working -- which has a draft worth
+                    # salvaging -- from one that never got a single turn, which has
+                    # nothing to lose and can simply be run again. Both look identical
+                    # in `stagnant_seconds`.
+                    "stream_event_count": event_count or 0,
+                    "tool_calls_made": activity["last_call_name"] is not None,
                 }
                 tmp_path = f"{liveness_path}.tmp"
                 with open(tmp_path, "w") as f:

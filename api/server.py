@@ -344,6 +344,26 @@ _WORKER_POLL_S = 2.0
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _produced_nothing(snapshot: dict) -> bool:
+    """Whether a run reached its kill without producing anything at all.
+
+    Every condition, not any: one stream event, one tool call, one character of draft or
+    one member result all mean the run started and its output -- however partial -- is
+    worth more than a fresh attempt. Only the completely barren case qualifies.
+
+    Older snapshots predate the two counters and report neither. Absent is treated as
+    "not barren", so a worker running older code is never retried on a guess.
+    """
+    if "stream_event_count" not in snapshot or "tool_calls_made" not in snapshot:
+        return False
+    return (
+        not snapshot.get("stream_event_count")
+        and not snapshot.get("tool_calls_made")
+        and not (snapshot.get("draft") or "").strip()
+        and not snapshot.get("member_results")
+    )
+
+
 def _liveness_kill_reason(snapshot: dict) -> str | None:
     """Given a liveness snapshot dict (written each tick by swarm.team._run_heartbeat,
     read from disk by the worker-subprocess poll loops below), return a human-readable
@@ -497,8 +517,14 @@ async def cancel_run(pid: int):
     return {"cancelled": pid, "elapsed_s": round(time.time() - meta["started_at"], 1)}
 
 
+# One retry, for the barren case only. A second nothing means the fault is upstream of
+# this process and further attempts only spend the liveness threshold again.
+_MAX_BARREN_RETRIES = 1
+
+
 async def _run_worker_subprocess(
-    http_request, payload: dict, argv: list[str] | None = None
+    http_request, payload: dict, argv: list[str] | None = None,
+    barren_attempt: int = 0,
 ) -> tuple[str, dict, dict | None]:
     """Runs run_task_async() in an isolated child process (`python main.py
     --run-worker`, see main.py's _run_worker()) instead of in-process. See
@@ -651,6 +677,21 @@ async def _run_worker_subprocess(
                                 {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                                 None,
                             )
+                        # Nothing to hand back AND nothing was ever produced: run it
+                        # again rather than reporting a 504 that says only "this took
+                        # too long to produce zero output". Placed after the draft
+                        # branch above, so a run with anything to salvage keeps
+                        # salvaging it and never reaches here.
+                        if (_produced_nothing(snapshot)
+                                and barren_attempt < _MAX_BARREN_RETRIES):
+                            print(f"[api] the run produced no output at all before the "
+                                  f"liveness kill — no draft, no member findings, no "
+                                  f"tool calls. Nothing to lose by running it again; "
+                                  f"retrying once (attempt {barren_attempt + 2}).",
+                                  flush=True)
+                            return await _run_worker_subprocess(
+                                http_request, payload, argv,
+                                barren_attempt=barren_attempt + 1)
                         raise HTTPException(status_code=504, detail=f"run auto-terminated: {reason}")
     except asyncio.CancelledError:
         proc.kill()
