@@ -22,6 +22,7 @@ from . import model_routing, team_config
 from .tool_fix import peak_input_tokens
 from config.config import config
 from swarm import phase0
+from swarm import context_pack
 
 _tracer = trace.get_tracer("agno-hive.team")
 
@@ -10443,6 +10444,34 @@ def _make_tool_interception_hook(
         if abort_event is not None and abort_event.is_set():
             print(f"[team] tool_hook: {function_name}({args}) ABORTED before execution", flush=True)
             raise ToolCallAborted(function_name)
+        # ContextPack (Experiment 2): append target-scoped context to a CODER
+        # delegation, before the call runs. Appended to the task the coordinator
+        # wrote rather than replacing it -- the coordinator's own framing is part of
+        # the control condition and must survive. Coder only; no other member's
+        # delegation is touched. Inert unless CONTEXTPACK_ENABLED is set.
+        _cp = getattr(team, "_context_pack", None)
+        if (_cp and function_name == "delegate_task_to_member"
+                and isinstance(args, dict)
+                and _member_key(args.get("member_id", "")) == "coder"):
+            try:
+                # already_examined is deliberately NOT passed. _covered_targets reads
+                # the duplicate-delegation gate's CLOSURE-LOCAL log; there is no
+                # team._delegation_log (that helper's own docstring says so), so
+                # sourcing it here would pass None forever and ship a section that is
+                # permanently empty while looking implemented. Reaching the real log
+                # needs plumbing this experiment is not authorised to add.
+                _rendered = context_pack.render(
+                    _cp,
+                    member_results=getattr(team, "_member_results", None),
+                )
+                if _rendered and _rendered not in str(args.get("task") or ""):
+                    args["task"] = f"{args.get('task') or ''}{_rendered}"
+                    print(f"[contextpack] injected {len(_rendered):,} chars into a "
+                          f"coder delegation ({len(_cp['targets'])} target(s))",
+                          flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[contextpack] injection skipped "
+                      f"({type(exc).__name__}: {exc})", flush=True)
         started = time.monotonic()
         if activity is not None:
             activity["last_call_name"] = function_name
@@ -15152,6 +15181,28 @@ async def run_task_async(
         # which is always after construction. None when telemetry is off, and every
         # read site is guarded on that.
         team._phase0 = _phase0
+
+        # ContextPack (Phase 2, Experiment 2). Resolved ONCE here, before the team
+        # runs, so the delegation hook does no I/O. Targets come from the TASK rather
+        # than from the coordinator's delegation text: I4's control failure was a
+        # two-file task delegated as one file, and a pack built from that delegation
+        # could never reach the half that was dropped. None unless the flag is on.
+        team._context_pack = None
+        if context_pack.enabled():
+            try:
+                team._context_pack = await asyncio.wait_for(
+                    context_pack.build(task, _hive_for_targets, None,
+                                       failure_context=failure_context),
+                    timeout=_PREFLIGHT_TIMEOUT_S)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[contextpack] build skipped ({type(exc).__name__}: {exc})",
+                      flush=True)
+            _cp = team._context_pack
+            print(f"[contextpack] enabled — "
+                  + (f"{len(_cp['targets'])} target(s) resolved: "
+                     + ', '.join(t['path'] for t in _cp['targets'])
+                     if _cp else "no targets resolved from the task text"),
+                  flush=True)
 
         span_attrs = {
             "project_id": project_id,
