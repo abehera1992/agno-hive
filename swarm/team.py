@@ -21,6 +21,7 @@ from .feedback import (record_success, record_failure, load_failure_context,
 from . import model_routing, team_config
 from .tool_fix import peak_input_tokens
 from config.config import config
+from swarm import phase0
 
 _tracer = trace.get_tracer("agno-hive.team")
 
@@ -10423,6 +10424,16 @@ def _make_tool_interception_hook(
                 _preview = result if isinstance(result, str) else ""
                 print(f"[team] delegate result: {type(result).__name__} "
                       f"{_preview[:200]!r}", flush=True)
+                _p0 = getattr(team, "_phase0", None)
+                if _p0 is not None:
+                    _p0.record_delegation(
+                        member=_member_key((args or {}).get("member_id", "")),
+                        task_text=str((args or {}).get("task") or ""),
+                        audit_target=_raw_audit_target((args or {}).get("task")),
+                        result_kind=type(result).__name__,
+                        result_preview=_preview,
+                        duration_ms=int(elapsed * 1000),
+                    )
             if activity is not None:
                 now = time.monotonic()
                 activity["last_call_at"] = now
@@ -12207,6 +12218,27 @@ def _record_stream_artifacts(team, out: dict) -> None:
             print(f"[team] attaching declaration index ({len(_idx):,} chars) to "
                   f"{out.get('agent_name', '?')}'s report", flush=True)
             content += _idx
+
+        _p0 = getattr(team, "_phase0", None)
+        if _p0 is not None:
+            # files_read comes from read_state["reads"], the same per-member record
+            # _evidence_manifest already reads -- not a second tracker.
+            _rs_p0 = getattr(team, "_read_state", None)
+            _who = _member_key(out.get("agent_name", ""))
+            _files = []
+            if isinstance(_rs_p0, dict):
+                for _e in (_rs_p0.get("reads") or []):
+                    if _member_key(_e.get("read_by", "")) != _who:
+                        continue
+                    _pth = (_e.get("path") or "").strip()
+                    if _pth and _pth not in _files:
+                        _files.append(_pth)
+            _p0.record_member_result(
+                member=_who, content=content, read_delta=_delta,
+                files_read=_files,
+                elided=bool(locals().get("_before")),
+                thin_report="[REPORT IS THIN:" in content,
+            )
 
         out["content"] = content
         # Keyed by _member_key so 'context-router' and 'contextrouter' land in one
@@ -15039,6 +15071,35 @@ async def run_task_async(
             "stream_event_count": 0, "last_progress_at": time.monotonic(),
         }
         _hive_for_targets = _pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)
+        # Pre-flight in run_task_async runs AFTER the team is built (it needs `team`),
+        # so at measurement time these are empty and the run event records the block
+        # as absent. Explicit locals rather than omitted, so the field exists in every
+        # record and a later phase can fill it without changing the schema.
+        _preflight_facts_seen, _preflight_kind_seen = "", "none"
+        # Phase 0 (observational). Sizes the coordinator context blocks that already
+        # exist, one by one -- there is no pack in this phase and nothing here is
+        # injected anywhere. Returns None unless PHASE0_TELEMETRY is switched on.
+        _phase0 = phase0.start_run(project_id, session_id, team_name, read_only)
+        if _phase0 is not None:
+            def _blk(text, **extra):
+                _t = text or ""
+                return {"chars": len(_t), "present": bool(_t), **extra}
+            _phase0.record_context_blocks({
+                "project_id_preamble": _blk("".join(_project_id_preamble(project_id))),
+                "team_roster_preamble": _blk("".join(_team_roster_preamble(_specs))),
+                "coordinator_instructions": _blk("".join(_COORDINATOR_INSTRUCTIONS)),
+                "skill_catalog": _blk(format_skill_catalog(skill_catalog, None)
+                                      if skill_catalog else ""),
+                "failure_context": _blk(failure_context),
+                "success_context": _blk(success_context),
+                "session_summary": _blk(session_summary),
+                "recent_messages": _blk(
+                    "".join(m.get("content") or "" for m in (session_messages or [])),
+                    count=len(session_messages or [])),
+                "preflight_facts": _blk(_preflight_facts_seen,
+                                        kind=_preflight_kind_seen),
+                "bottom_anchored": bool(config.bottom_anchor_evidence),
+            })
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
             read_only=read_only, skill_catalog=skill_catalog, activity=activity, task=task,
@@ -15050,6 +15111,10 @@ async def run_task_async(
         # _unresolvable_delegation_targets); _build_team has no MCP url in scope.
         team._hive_mcp_url = _hive_for_targets
         team._session_summary = session_summary or ""
+        # Same late-binding slot as the two above: the hooks read it at call time,
+        # which is always after construction. None when telemetry is off, and every
+        # read site is guarded on that.
+        team._phase0 = _phase0
 
         span_attrs = {
             "project_id": project_id,
@@ -15309,6 +15374,19 @@ async def run_task_async(
                         content, _hive_url, hive_mcp_tools=_hive_tools)
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
+                if _phase0 is not None:
+                    # The ONE place this phase is allowed an MCP round trip: after the
+                    # answer is final, resolving the deduped union of cited paths.
+                    _rs_fin = getattr(team, "_read_state", None)
+                    await _phase0.finalize(
+                        answer_chars=len(content or ""),
+                        read_chars_total=(_rs_fin.get("read_chars_total", 0)
+                                          if isinstance(_rs_fin, dict) else 0),
+                        member_result_chars=getattr(team, "_member_result_chars", 0),
+                        outcome="ok",
+                        hive_mcp_url=getattr(team, "_hive_mcp_url", None),
+                        hive_mcp_tools=_hive_tools,
+                    )
                 tokens = _extract_tokens(final_run_output)
                 span.set_status(trace.StatusCode.OK)
                 task_counter.add(1, {"project_id": project_id, "outcome": "success"})
