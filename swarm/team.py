@@ -8389,7 +8389,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             # made this exemption silently inert.
             if function_name == "apply_diff" and isinstance(args, dict):
                 _p = (args.get("relative_path") or "").strip()
-                if _p and _result_preview_text(out).lstrip().startswith("apply_diff failed"):
+                if _p and _result_text(out).lstrip().startswith("apply_diff failed"):
                     edit_failed_paths.setdefault(
                         norm_agent_key_for_fail(agent), set()).add(_p)
             return out
