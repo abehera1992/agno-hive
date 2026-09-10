@@ -8229,6 +8229,10 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # Identical FAILING calls per (agent, tool, args) -- see the collapse branch below.
     # Reset on success, so a tool that fails twice then works starts clean.
     failure_counts: dict[tuple, int] = {}
+    # (norm_agent_key -> {relative_path}) for paths whose LAST apply_diff by that agent
+    # failed. One entry buys one fresh get_file_content of that path and is then
+    # discarded -- see the read-after-failed-edit block below.
+    edit_failed_paths: dict[str, set] = {}
     # 2026-08-19 (T6 follow-up -- Reviewer repeated its own entire first read pass
     # verbatim, 8 calls, within a SINGLE delegate_task_to_member('reviewer', ...)
     # call, landing exactly on config.tool_call_limit's ceiling with no answer
@@ -8373,6 +8377,21 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 failure_counts[fail_key] = prior + 1
             else:
                 failure_counts.pop(fail_key, None)   # a success clears the streak
+            # A FAILED apply_diff means this agent's anchor did not match the bytes
+            # currently at that path -- the one case where re-reading is the documented
+            # next step rather than a redundant repeat. Recorded here because this
+            # branch is the only place the hook already sees a write tool's result.
+            # Matched on apply_diff's OWN contract, not on a generic error heuristic:
+            # hive-mcp/tools/files.py returns "apply_diff failed: ..." on every failure
+            # path (old_string not found, ambiguous match, exception) and
+            # "review_pending: ..." on success. _looks_like_tool_error does not
+            # recognise the former -- verified directly -- so using it here would have
+            # made this exemption silently inert.
+            if function_name == "apply_diff" and isinstance(args, dict):
+                _p = (args.get("relative_path") or "").strip()
+                if _p and _result_preview_text(out).lstrip().startswith("apply_diff failed"):
+                    edit_failed_paths.setdefault(
+                        norm_agent_key_for_fail(agent), set()).add(_p)
             return out
         try:
             args_key = json.dumps(args or {}, sort_keys=True)
@@ -8417,6 +8436,23 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                                   sort_keys=True)
         cache_key = (function_name, args_key)
         serve_key = (agent_key, generation, function_name, args_key)
+
+        # Read-after-failed-edit (Phase 2 Experiment 1). The staged .hive_proposed this
+        # agent just failed to anchor against is what hive-mcp will serve next for this
+        # path, so the cached bytes are stale precisely here. Drop the cache entry and
+        # reset this key's serve count so the retry is a genuine fetch counted as a
+        # first serve -- no other counter, tier or escalation is touched.
+        _eviction_key = norm_agent_key or agent_key or ""
+        if (function_name == "get_file_content"
+                and (args or {}).get("relative_path")
+                in edit_failed_paths.get(_eviction_key, ())):
+            edit_failed_paths[_eviction_key].discard((args or {})["relative_path"])
+            cache.pop(cache_key, None)
+            serve_counts.pop(serve_key, None)
+            print(f"[team] fresh read allowed for "
+                  f"{(args or {}).get('relative_path')} — {_eviction_key or 'agent'}'s "
+                  f"last apply_diff on it failed, so the cached copy is not what the "
+                  f"next edit must anchor against", flush=True)
         # Initialised here, not in the fresh-fetch branch that sets it: the final
         # `return result` reads it on every path, including a cache hit that never
         # enters that branch, where a branch-local binding would be a NameError.
