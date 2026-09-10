@@ -1577,7 +1577,23 @@ def _covered_targets(log) -> list[str]:
     return out
 
 
-def _move_on_hint(log) -> str:
+def _uncovered_components(log, team) -> list[str]:
+    """Discovered components no delegation this run has mentioned.
+
+    Coverage is by substring against the targets already delegated for: a target names a
+    path, and a component root is a path prefix of it. Deliberately generous -- counting
+    a component as covered when it merely appeared is the safe direction, since the
+    output of this function is a nudge to look somewhere, and nudging toward a place
+    already visited wastes a turn while nudging toward nothing loses the run.
+    """
+    roots = getattr(team, "_component_roots", None)
+    if not isinstance(roots, list) or not roots:
+        return []
+    seen = " ".join(_covered_targets(log)).lower()
+    return [r for r in roots if r.lower() not in seen]
+
+
+def _move_on_hint(log, team=None) -> str:
     """Tell a refused coordinator what it HAS covered, so "no" implies a next step.
 
     A refusal that only says no is a dead end for a temperature-0 model: its next turn
@@ -1600,10 +1616,31 @@ def _move_on_hint(log) -> str:
     # turned three unattributable discards into a proven root cause within two runs.
     print(f"[team] move-on hint attached — {len(done)} target(s) covered so far: "
           f"{shown}{more}", flush=True)
+    # What has NOT been looked at, when the pre-flight discovered the component set.
+    # Listing only what IS covered was measured insufficient: on T11 this hint attached
+    # with all four covered files named, and the coordinator still concluded there were
+    # no other services. "You have done X" does not imply "Y exists".
+    unseen = _uncovered_components(log, team) if team is not None else []
+    unseen_note = ""
+    if unseen:
+        # Twelve, not the six the covered-list uses. These are sorted by path, so a
+        # short window shows whichever components sort early rather than whichever
+        # matter: at six, T11's rehearsal hid `API/storage-service` and both clients --
+        # the exact three an upload chain runs through -- behind "and 7 more".
+        _shown = ", ".join(repr(u) for u in unseen[:12])
+        _more = f", and {len(unseen) - 12} more" if len(unseen) > 12 else ""
+        print(f"[team] move-on hint: {len(unseen)} component(s) untouched so far: "
+              f"{_shown}{_more}", flush=True)
+        unseen_note = (
+            f"\n\nCOMPONENTS NOTHING IN THIS RUN HAS OPENED YET: {_shown}{_more}. That "
+            f"is a fact about this run, not about the task: some of these may have no "
+            f"part in it. But you have not looked, so you cannot yet say so — delegate "
+            f"for one of them, or state explicitly why it is out of scope.")
     return (f"\n\nSO FAR THIS RUN YOU HAVE DELEGATED ONLY ABOUT: {shown}{more}. If the "
             f"task names anything else -- another file, another layer, another part of a "
             f"multi-part question -- delegate for THAT now instead of rewording this. If "
-            f"every part is genuinely covered, write the final answer.")
+            f"every part is genuinely covered, write the final answer."
+            + unseen_note)
 
 
 def _extract_clarification_from_tools(result) -> dict | None:
@@ -3963,15 +4000,19 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     _count_note = await _miscounted_against_tool(content, hive_mcp_url, hive_mcp_tools)
     _term_note = await _affirmed_term_absent_from_citations(
         task, content, hive_mcp_url, hive_mcp_tools)
+    # What the DRAFT names, kept whether or not the guard speaks — the comparison a
+    # correction retry is judged against later needs the silent case most of all.
+    _draft_coverage: dict[str, int] = {}
     _scope_note = await _scoped_coverage_gap(
-        task, content, hive_mcp_url, hive_mcp_tools)
+        task, content, hive_mcp_url, hive_mcp_tools, record=_draft_coverage)
     _opened_note = ("" if _asks_for_one_fact(task)
                     else _swept_directory_not_reported(content, team))
     _integ_note = await _integration_mechanism_missing(
         task, content, hive_mcp_url, hive_mcp_tools)
     _models_note = ("" if _asks_for_one_fact(task) else
                     await _declared_models_not_reported(
-                        task, content, hive_mcp_url, hive_mcp_tools))
+                        task, content, hive_mcp_url, hive_mcp_tools,
+                        record=_draft_coverage))
     _table_note = await _table_claimed_missing_but_present(
         task, content, hive_mcp_url, hive_mcp_tools)
     # Both also registered in _run_repo_derived_guards, which covers the rescue and
@@ -5424,13 +5465,30 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # _tail() (_lost_report_evidence, _swept_directory_not_reported,
     # _summarize_actual_writes) reads run state that describes the RUN rather than the
     # answer, and stays valid either way, so it is appended unchanged.
+    _retry_coverage: dict[str, int] = {}
     _corrected_notes = "".join(await _run_repo_derived_guards(
-        task, corrected, hive_mcp_url, hive_mcp_tools, "recheck after retry"))
+        task, corrected, hive_mcp_url, hive_mcp_tools, "recheck after retry",
+        record=_retry_coverage))
     if _corrected_notes:
         print(f"[team] recheck after retry: re-ran the repo-derived guards against the "
               f"{len(corrected):,}-char corrected answer", flush=True)
     if still_unavailable:
         return (corrected + _UNVERIFIED_DISCLAIMER + unread_note + _corrected_notes
+                + _summarize_actual_writes(*all_results))
+    # Content loss first, length second. A retry can hold its length and still delete
+    # the entire enumeration -- T12 kept 4,423 chars while going from 22 models and 16
+    # routers to 2 and 0, sailing over the length threshold. Where both passes measured
+    # the same thing, that measurement is the better judge of what was lost.
+    _lost = _retry_lost_enumeration(_draft_coverage, _retry_coverage)
+    if still_bad and _lost is not None:
+        _kind, _was, _now = _lost
+        print(f"[team] correction retry came back still-bad and names {_now} "
+              f"{_kind} against the draft's {_was} — keeping the draft, which has more "
+              f"of the answer in it", flush=True)
+        return (content + _flagged_draft_note(report2)
+                + unread_note
+                + "".join(await _run_repo_derived_guards(
+                    task, content, hive_mcp_url, hive_mcp_tools, "draft kept over retry"))
                 + _summarize_actual_writes(*all_results))
     if still_bad and len(corrected) < len(content) * _RETRY_MIN_LENGTH_RATIO:
         # The retry did not fix the draft; it shortened it and stayed wrong. Keep the
@@ -5468,6 +5526,29 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
 # at any length: answering less but correctly is a legitimate correction, and that is
 # most of what this path is for.
 _RETRY_MIN_LENGTH_RATIO = 0.5
+
+
+# How many enumerated items a still-bad retry may lose before the draft is kept instead.
+# Two absorbs ordinary rewording; T12's retry dropped 20 models and 16 routers.
+_RETRY_MAX_ENUMERATION_LOSS = 2
+
+
+def _retry_lost_enumeration(draft: dict, retry: dict) -> tuple[str, int, int] | None:
+    """The enumeration a retry shrank, as (kind, draft_named, retry_named).
+
+    Only compares kinds BOTH passes measured: a guard that ran on the draft and not on
+    the retry has told us nothing about the retry, and treating an absent measurement as
+    zero would reject every retry those guards happen to skip.
+    """
+    worst = None
+    for kind in ("models", "routers"):
+        if kind not in draft or kind not in retry:
+            continue
+        lost = draft[kind] - retry[kind]
+        if lost >= _RETRY_MAX_ENUMERATION_LOSS and (
+                worst is None or lost > worst[1] - worst[2]):
+            worst = (kind, draft[kind], retry[kind])
+    return worst
 
 
 def _flagged_draft_note(report: str) -> str:
@@ -5596,6 +5677,29 @@ async def _miscounted_against_tool(content: str, hive_mcp_url: str | None,
 
 
 
+# Path tokens in tool output. Includes (), [] and @ so this project's real syntax
+# survives: Next.js route groups `(portal)`, dynamic segments `[id]`, parallel routes
+# `@modal`. Excluding them silently truncated every frontend path to its tail, which is
+# how a guard came to tell the model that an existing page.tsx did not exist.
+_PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9_./\\()\[\]@-]+\.[A-Za-z0-9]+")
+
+
+def _balanced_path(token: str) -> str:
+    """`token` with unbalanced bracket characters stripped off either end.
+
+    Widening the class means a path written in prose picks up its surroundings --
+    "(see swarm/team.py)" would match with both parens attached. Balance is the test
+    that separates a genuine route group, which closes what it opens, from punctuation
+    that does not.
+    """
+    for _open, _close in (("(", ")"), ("[", "]")):
+        while token.startswith(_open) and token.count(_open) > token.count(_close):
+            token = token[1:]
+        while token.endswith(_close) and token.count(_close) > token.count(_open):
+            token = token[:-1]
+    return token
+
+
 async def _repo_find_files(glob_pattern: str, hive_mcp_url: str | None,
                            hive_mcp_tools=None) -> list[str] | None:
     """Paths matching `glob_pattern`, from hive-mcp's find_files.
@@ -5619,8 +5723,9 @@ async def _repo_find_files(glob_pattern: str, hive_mcp_url: str | None,
             print(f"[team] scope guard: find_files rejected ({glob_pattern!r}): {err}")
             return
         text = _extract_mcp_text(res)
-        found = re.findall(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+", text)
-        box["paths"] = [f.replace("\\", "/") for f in found]
+        found = _PATH_TOKEN_RE.findall(text)
+        box["paths"] = [p for p in
+                        (_balanced_path(f.replace("\\", "/")) for f in found) if p]
 
     if hive_mcp_tools is not None:
         try:
@@ -6070,7 +6175,7 @@ _SCOPED_COVERAGE_RATIO = 0.25
 
 
 async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None,
-                               hive_mcp_tools=None) -> str:
+                               hive_mcp_tools=None, record: dict | None = None) -> str:
     """The question named a service and asked for its routers; the answer names almost
     none of them.
 
@@ -6172,6 +6277,8 @@ async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None
                 f"main.py, so they are not part of this service's API surface. Whatever "
                 f"the answer above says about them describes dead code.**")
 
+    if record is not None:
+        record["routers"] = len(named)
     if len(named) > _SCOPED_COVERAGE_RATIO * len(names):
         print(f"[team] scope check: {service}-service has {len(names)} routers "
               f"({basis}), answer names {len(named)} — above threshold, silent",
@@ -6467,7 +6574,8 @@ _MODELS_RENDER_CAP = 40
 
 async def _declared_models_not_reported(task: str, content: str,
                                         hive_mcp_url: str | None,
-                                        hive_mcp_tools=None) -> str:
+                                        hive_mcp_tools=None,
+                                        record: dict | None = None) -> str:
     """The task asked for a service's models and the answer names at most half of them.
 
     The last facet of T12 with no check at all, and the one with the widest spread.
@@ -6505,6 +6613,8 @@ async def _declared_models_not_reported(task: str, content: str,
         return ""
 
     named = [c for c in declared if re.search(rf"(?<!\w){re.escape(c)}(?!\w)", content)]
+    if record is not None:
+        record["models"] = len(named)
     if len(named) > _MODELS_MAX_NAMED_RATIO * len(declared):
         print(f"[team] models check: {service}-service declares {len(declared)} models, "
               f"answer names {len(named)} — above threshold, silent", flush=True)
@@ -6893,7 +7003,8 @@ def _stale_findings_dropped(note: str, content: str) -> str:
 
 
 async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None,
-                                   hive_mcp_tools, label: str) -> list[str]:
+                                   hive_mcp_tools, label: str,
+                                   record: dict | None = None) -> list[str]:
     """The five guards that re-derive their facts from the repo, run against `content`.
 
     Shared by the parent-process rescue (repair_unguarded_draft) and the corrected-answer
@@ -6913,7 +7024,8 @@ async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None
         notes = await asyncio.gather(
             _miscounted_against_tool(content, hive_url, hive_mcp_tools),
             _affirmed_term_absent_from_citations(task, content, hive_url, hive_mcp_tools),
-            _scoped_coverage_gap(task, content, hive_url, hive_mcp_tools),
+            _scoped_coverage_gap(task, content, hive_url, hive_mcp_tools,
+                                 record=record),
             _integration_mechanism_missing(task, content, hive_url, hive_mcp_tools),
             _code_question_answered_from_docs(task, content, hive_url,
                                               hive_mcp_tools),
@@ -6922,7 +7034,8 @@ async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None
             # _nothing() rather than a bare "": gather takes awaitables only, and the
             # models guard is the one _verified_answer suppresses for a single-fact ask.
             _nothing() if _asks_for_one_fact(task) else
-            _declared_models_not_reported(task, content, hive_url, hive_mcp_tools),
+            _declared_models_not_reported(task, content, hive_url, hive_mcp_tools,
+                                          record=record),
             return_exceptions=True,
         )
         out = []
@@ -9253,7 +9366,11 @@ _PATH_DISCOVERY_TOOLS = ("find_files", "search_files", "search_files_batch", "li
 
 # How many times one missing basename may be redirected before the gate gets out of the
 # way. Two is enough to correct a typo and far short of a loop.
-_MAX_TARGET_REDIRECTS = 2
+# One redirect, then stand down. At 2 the coordinator hit the same wall twice and gave
+# up before the stand-down could fire -- it never reached a third attempt. A guard whose
+# advice did not work the first time has no better second answer, and letting the
+# delegation run produces a real "not found" from the member instead of a guessed one.
+_MAX_TARGET_REDIRECTS = 1
 
 
 def _is_discovery_delegation(task: str) -> bool:
@@ -9901,7 +10018,7 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                                 f"STOP: you have now asked {member_id!r} for this same "
                                 f"target ({audit['target']!r}) {n} times. No further "
                                 f"delegation for THAT target will run."
-                                + _move_on_hint(log)
+                                + _move_on_hint(log, team)
                                 + (f"\n\nThe result, once more:\n{prior}" if prior else "")
                             )
                         if prior:
@@ -9913,7 +10030,7 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                                 f"{audit['target']!r} (action {audit['action']!r}) earlier "
                                 f"this run, worded differently, and returned:\n\n{prior}\n\n"
                                 f"Use this. Do not delegate it again." + tail
-                                + _move_on_hint(log)
+                                + _move_on_hint(log, team)
                             )
                         # Nothing usable stored -- refusing would block the one action
                         # that could still rescue the run, exactly as on the sibling
@@ -10020,19 +10137,26 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                             _any_real = any(_real for _, _real in _gone)
                             for _p, _real in _gone:
                                 _lines.append(
-                                    f"`{_p}` does not exist"
-                                    + (f" — files actually named "
+                                    f"`{_p}` did not resolve"
+                                    + (f" — find_files returned these for "
                                        f"`{_p.rsplit('/', 1)[-1]}`: "
                                        + ", ".join(f"`{r}`" for r in _real) if _real
-                                       else " — and NO file anywhere in this repository "
-                                            "is named that"))
+                                       else " — and find_files returned nothing with "
+                                            "that name"))
                             print(f"[team] target check: unresolvable delegation "
                                   f"target(s) {[g[0] for g in _gone]} — redirecting "
                                   f"({_seen[_key]}/{_MAX_TARGET_REDIRECTS})", flush=True)
                             return (
-                                "REDIRECTED — this delegation names a file that does "
-                                "not exist, so it was NOT executed and nothing was "
-                                "read.\n\n"
+                                # States what the GUARD could not do, never what the
+                                # repository contains. The two are not the same and only
+                                # this code can tell them apart: a path this lookup fails
+                                # to resolve may exist perfectly well, which is exactly
+                                # what happened when the extractor could not spell
+                                # `(portal)`. An assertion here becomes the model's
+                                # answer, so it must not claim more than it checked.
+                                "NOT RESOLVED — this delegation was not executed "
+                                "because the path lookup could not match its target. "
+                                "That is a lookup result, not proof of absence.\n\n"
                                 + "\n".join(_lines)
                                 + ("\n\nCheck the real path first (list_directory or "
                                    "find_files on the directory you mean), then delegate "
@@ -10041,13 +10165,13 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                                    "service's models in a single models.py, not a "
                                    "models/ package."
                                    if _any_real else
-                                   "\n\nDo not look for this filename again — it is not "
-                                   "a path this repository has, under any directory. "
-                                   "Whatever it does lives under a different name. "
-                                   "Delegate a SEARCH BY BEHAVIOUR instead: "
-                                   "search_files for a function, class, route or column "
-                                   "name involved, and take the target from what comes "
-                                   "back.")
+                                   "\n\nNothing came back for that filename. Rather "
+                                   "than retrying the same path, delegate a SEARCH BY "
+                                   "BEHAVIOUR: search_files for a function, class, "
+                                   "route or column name involved, and take the target "
+                                   "from what comes back. If a directory listing has "
+                                   "already shown you the file, trust the listing over "
+                                   "this message and read it directly.")
                             )
 
         # LAST thing before the call, deliberately: this rewrites args["task"], and
@@ -11403,7 +11527,8 @@ async def run_task_stream(
                 if team_config.get_gate_enabled(team_name, PREFLIGHT_GROUNDING_GATE, False):
                     try:
                         _facts = await asyncio.wait_for(
-                            _preflight_repo_facts(task, _hive_for_targets, None),
+                            _preflight_repo_facts(task, _hive_for_targets, None,
+                                                  team=team),
                             timeout=_PREFLIGHT_TIMEOUT_S)
                     except Exception as exc:  # noqa: BLE001
                         print(f"[team] preflight: skipped ({type(exc).__name__}: {exc})",
@@ -13782,9 +13907,25 @@ _COUNT_TYPE_RE = re.compile(
 # backticked path, a hook is useXxx, a table is a backticked snake_case identifier.
 # `files` is deliberately absent -- _asked_for_a_list_answered_without_one already
 # owns that case (T6), and adding it here would double-flag the same sentence.
+# How an endpoint can be NAMED in an answer. The third alternative is the decorator
+# form this codebase actually declares routes in -- `@router.get("/vouchers")` -- which
+# the first two both miss: there is no bare "GET /x", and the backtick is followed by
+# '@' rather than '/'. Measured on T13b's real answer, which listed all nine vouchers
+# endpoints as decorators: 0 matches before, 8 distinct after. Counting them as unnamed
+# turned a complete enumeration into a flagged one.
+_ENDPOINT_NAMED_RE = re.compile(
+    r"(?:GET|POST|PUT|PATCH|DELETE)\s+/\S+"
+    r"|`/[\w{}$/\-.]+`"
+    # Non-capturing: re.findall returns GROUPS whenever the pattern has one, which
+    # would collapse every "GET /x" and "`/x`" match to the empty string and count all
+    # of them as a single name. Each alternative must contribute its whole match.
+    r"|@\w+\.(?:get|post|put|patch|delete)\(\s*[\"\'](?:/[^\"\']*)",
+    re.I,
+)
+
 _COUNT_TYPE_MATCHERS = {
-    "endpoint": re.compile(r"(?:GET|POST|PUT|PATCH|DELETE)\s+/\S+|`/[\w{}$/\-.]+`"),
-    "route": re.compile(r"(?:GET|POST|PUT|PATCH|DELETE)\s+/\S+|`/[\w{}$/\-.]+`"),
+    "endpoint": _ENDPOINT_NAMED_RE,
+    "route": _ENDPOINT_NAMED_RE,
     "hook": re.compile(r"\buse[A-Z]\w+"),
     "table": re.compile(r"`([a-z][a-z0-9]*(?:_[a-z0-9]+)+)`"),
 }
@@ -14273,8 +14414,87 @@ def _preflight_target(task: str) -> str:
     return ""
 
 
+# Files that mark a directory as an independently built or run unit. Chosen to be
+# language- and layout-agnostic -- this file must not learn any one project's shape --
+# and measured live before shipping: on the project this was built against, these three
+# recover all ten backend services, the MCP server and both client apps, while a
+# hardcoded services glob would have recovered only what someone remembered to write.
+#
+# Dockerfile is deliberately absent: it marks a build, not a component, and in practice
+# sits beside a manifest that already qualifies the same directory.
+_COMPONENT_MARKERS = ("main.py", "package.json", "requirements.txt",
+                      "go.mod", "Cargo.toml", "pom.xml", "pyproject.toml")
+# Above this a repository is a monorepo whose component list is noise rather than
+# orientation, and a wall of paths in the prompt costs more than it grounds.
+_MAX_COMPONENT_ROOTS = 40
+_COMPONENT_NOISE = ("node_modules/", "site-packages/", "/.venv", "/venv/", "/dist/",
+                    "/build/", "/.git/", "/__pycache__/")
+
+
+async def _component_roots(hive_mcp_url: str | None, hive_mcp_tools=None) -> list[str]:
+    """Directories in this repository that look like their own component.
+
+    Derived from markers, never from a layout assumption. A lookup that fails
+    contributes nothing rather than shrinking the set -- unknown is not missing, the
+    same rule _repo_find_files and _repo_match_count already state.
+    """
+    roots: list[str] = []
+    for marker in _COMPONENT_MARKERS:
+        found = await _repo_find_files(f"**/{marker}", hive_mcp_url, hive_mcp_tools)
+        for path in found or []:
+            if not path.endswith(marker):
+                continue
+            parent = path[: -len(marker)].rstrip("/")
+            # A bare marker name with no directory is find_files' own no-match sentence
+            # being read as a path -- every empty lookup produced one of these in the
+            # live probe. It would otherwise add the repository root as a "component".
+            if not parent or parent in (".", "/"):
+                continue
+            low = "/" + parent.lower() + "/"
+            if any(n in low for n in _COMPONENT_NOISE):
+                continue
+            if parent not in roots:
+                roots.append(parent)
+
+    # Drop a directory that sits under another discovered root: an Android app inside a
+    # mobile client is part of that component, not a peer of it.
+    roots = [r for r in roots
+             if not any(r != other and r.startswith(other + "/") for other in roots)]
+    roots.sort()
+    if len(roots) > _MAX_COMPONENT_ROOTS:
+        print(f"[team] component scan: {len(roots)} roots — too many to be orienting, "
+              f"not injecting", flush=True)
+        return []
+    return roots
+
+
+# A question answered ACROSS components rather than inside one: "which services are
+# involved end to end", "trace the call chain", "name every file in the chain". These
+# supply no component name, which is why _preflight_target returns '' for them and why
+# every coverage guard in this file is blind to them -- they all derive their candidate
+# set from a name the question gives.
+_CHAIN_QUESTION_RE = re.compile(
+    # PLURAL only. The singular reads as a question scoped to one named component --
+    # "list every model and router in the inventory service" matched while the optional
+    # 's' was there, which would have injected the whole component list into the one
+    # test that reliably scores full marks on a single service.
+    r"\b(?:which|what|list|name|trace|identify)\b[^.?]{0,80}?"
+    r"\b(?:services|components|modules|micro-?services)\b"
+    r"|\bend[\s-]to[\s-]end\b"
+    r"|\b(?:call|request|data|processing)[\s-]chain\b"
+    r"|\bevery file in the chain\b"
+    r"|\bfull(?:\s+\w+)?\s+chain\b",
+    re.I,
+)
+
+
+def _is_chain_question(task: str) -> bool:
+    """Whether the ask spans components rather than naming one."""
+    return bool(_CHAIN_QUESTION_RE.search(task or ""))
+
+
 async def _preflight_repo_facts(task: str, hive_mcp_url: str | None,
-                                hive_mcp_tools=None) -> str:
+                                hive_mcp_tools=None, team=None) -> str:
     """Where the thing the question names actually lives, resolved before delegating.
 
     Calls hive-mcp's project_map and passes its answer through. The lookup itself lives
@@ -14294,6 +14514,39 @@ async def _preflight_repo_facts(task: str, hive_mcp_url: str | None,
     gets caught by the target gate downstream, whereas a wrong path asserted here would
     not be.
     """
+    # A chain question first: it names no component, so the name-based lookup below
+    # cannot fire for it at all -- _preflight_target returns '' and T11 consequently ran
+    # with no facts of any kind. What it needs is the opposite of a single resolved
+    # path: the full set, so "I have covered one" is visibly not "I have covered all".
+    # ...and only when the question resolves to no specific component. A question that
+    # names one has a more precise answer available, and the established lookup below
+    # keeps priority: a list of every component is orientation for someone lost, and
+    # noise for someone who already knows where they are going.
+    if _is_chain_question(task) and not _preflight_target(task):
+        roots = await _component_roots(hive_mcp_url, hive_mcp_tools)
+        if roots:
+            if team is not None:
+                # Read back by _move_on_hint, which holds no project knowledge of its
+                # own. Set here because this function is the one that owns discovery.
+                team._component_roots = roots
+            print(f"[team] preflight: chain question — {len(roots)} component root(s) "
+                  f"injected: {', '.join(roots[:8])}"
+                  + (f" (+{len(roots) - 8} more)" if len(roots) > 8 else ""), flush=True)
+            return (
+                "\n\nVERIFIED PROJECT FACTS (read from this repository just now, before "
+                "any delegation):\nThis repository contains "
+                f"{len(roots)} component(s) — directories with their own entrypoint or "
+                "dependency manifest:\n"
+                + "\n".join("- " + r for r in roots)
+                + "\n\nThis question spans components. Examining one of them is not an "
+                  "answer to it, and finding nothing in one is not evidence that the "
+                  "others are uninvolved — check before concluding. Where a component "
+                  "genuinely plays no part, say so explicitly instead of leaving it "
+                  "out, so the reader can tell a considered exclusion from an oversight."
+            )
+        print("[team] preflight: chain question but no component roots found — "
+              "no facts injected", flush=True)
+
     name = _preflight_target(task)
     if not name or name.lower() in _NOISE_TARGET_WORDS:
         return ""
@@ -14844,7 +15097,8 @@ async def run_task_async(
                         if team_config.get_gate_enabled(team_name, PREFLIGHT_GROUNDING_GATE, False):
                             try:
                                 _facts = await asyncio.wait_for(
-                                    _preflight_repo_facts(task, _hive_for_targets, None),
+                                    _preflight_repo_facts(task, _hive_for_targets, None,
+                                                          team=team),
                                     timeout=_PREFLIGHT_TIMEOUT_S)
                             except Exception as exc:  # noqa: BLE001
                                 print(f"[team] preflight: skipped ({type(exc).__name__}: {exc})",
