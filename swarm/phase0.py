@@ -29,6 +29,11 @@ Design constraints, set with the reviewer and held to deliberately:
     unresolved means fabricated is a question for the baseline, not an assumption
     built into the measurement.
 
+Records are written the moment they exist, not batched at the end: a liveness kill
+SIGKILLs the worker, and a buffered run loses everything it gathered. Only the run
+summary and the one batch of path lookups need the end of the run, so only those are
+lost when a run is killed.
+
 Ambiguity is its own bucket. A bare basename (`models.py` -- eight files carry that
 name in the project this was built against) cannot be resolved to one file, so it is
 neither resolved nor unresolved and is excluded from the rate's denominator. The raw
@@ -184,9 +189,17 @@ class Phase0Run:
             else:
                 # No authoritative target: the audit tuple is only required on a
                 # RE-delegation, so a first delegation legitimately carries none.
-                targets_all = _extract_paths(task_text)
+                # Gated by the SAME classifier the citations use -- without it the
+                # token rejected as a citation still became a target ('e.g', live).
+                targets_all = [t for t in _extract_paths(task_text)
+                               if classify_citation(t) in ("path", "basename")]
                 target = targets_all[0] if targets_all else None
                 source = "prose" if target else "none"
+            # Independent of source. An audit tuple is authoritative about INTENT and
+            # silent about FORM: a coordinator legitimately wrote 'database tables'
+            # there. Anything that later tries to RESOLVE a target needs this field,
+            # not target_source.
+            target_shape = classify_citation(target) if target else "none"
             self.delegations.append({
                 "type": "delegation",
                 "run_id": self.run_id,
@@ -194,6 +207,7 @@ class Phase0Run:
                 "member": member,
                 "target": target,
                 "target_source": source,
+                "target_shape": target_shape,
                 "targets_all": targets_all[:_MAX_LISTED_PATHS],
                 "member_input_chars": len(task_text or ""),
                 # "async_generator" = the member actually ran; "str" = a gate refused
@@ -202,6 +216,10 @@ class Phase0Run:
                 "result_preview": (result_preview or "")[:120],
                 "duration_ms": duration_ms,
             })
+            # Persisted NOW, not at finalize. A liveness kill SIGKILLs this process,
+            # and everything held in memory dies with it -- which is how a killed T11
+            # produced no telemetry at all.
+            _emit(self.delegations[-1])
         except Exception:  # noqa: BLE001
             pass
 
@@ -272,6 +290,8 @@ class Phase0Run:
                     },
                 },
             })
+            # Same reason as the delegation record above: survive the kill.
+            _emit(self.member_results[-1])
         except Exception:  # noqa: BLE001
             pass
 
@@ -372,8 +392,9 @@ class Phase0Run:
                 "duration_s": round(time.monotonic() - self.started, 1),
                 "outcome": outcome,
             }
-            for ev in self.delegations + self.member_results + [run_event]:
-                _emit(ev)
+            # Only the summary: every delegation and member result was written the
+            # moment it happened, so re-emitting them here would duplicate each one.
+            _emit(run_event)
         except Exception as exc:  # noqa: BLE001
             print(f"[phase0] finalize skipped ({type(exc).__name__}: {exc})", flush=True)
 
