@@ -1401,10 +1401,34 @@ def _segment_carries(segment: str, name: str) -> bool:
     though a substring test says it does. That false match is not hypothetical: it sent
     project_map('Party') to a vendored Go observability tree and would have handed the
     planner a wrong path with full confidence.
+
+    `name` is matched as a contiguous run of tokens, not as one token. The single-token
+    case is unchanged -- a run of length 1 IS membership -- but a name that carries its
+    own separator can now match the segment that literally spells it. Before this, the
+    whole multi-token name was compared against a set of single-word tokens and could
+    never be found: _segment_carries('inventory-service', 'inventory-service') and
+    ('vouchers_api.py', 'vouchers_api.py') both returned False.
+
+    That was not cosmetic. project_map's bucketing step is the only consumer, so an
+    exact directory or filename produced "no directory or file in this repository
+    carries X" while find_files located it immediately. project_map is the
+    coordinator's only tool: told its target did not exist, it retried name variants
+    until its 60-call budget was gone and then reported it had read nothing. Two of
+    four Phase-2 control pilots (I1, I4, both naming vouchers_api.py) ended with 59
+    project_map calls and zero delegations.
+
+    Order matters, and that is deliberate: 'service-inventory' does not carry
+    'inventory-service'.
     """
     if not name:
         return False
-    return name.lower() in {t.lower() for t in _SEG_TOKEN_RE.findall(segment)}
+    seg_tokens = [t.lower() for t in _SEG_TOKEN_RE.findall(segment)]
+    name_tokens = [t.lower() for t in _SEG_TOKEN_RE.findall(name)]
+    if not name_tokens:
+        return False
+    span = len(name_tokens)
+    return any(seg_tokens[i:i + span] == name_tokens
+               for i in range(len(seg_tokens) - span + 1))
 
 
 _SYMBOL_DECL_KEYWORDS = ("class", "def", "function", "func", "interface", "struct",
