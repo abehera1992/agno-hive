@@ -12225,17 +12225,18 @@ def _record_stream_artifacts(team, out: dict) -> None:
             # _evidence_manifest already reads -- not a second tracker.
             _rs_p0 = getattr(team, "_read_state", None)
             _who = _member_key(out.get("agent_name", ""))
-            _files = []
-            if isinstance(_rs_p0, dict):
-                for _e in (_rs_p0.get("reads") or []):
-                    if _member_key(_e.get("read_by", "")) != _who:
-                        continue
-                    _pth = (_e.get("path") or "").strip()
-                    if _pth and _pth not in _files:
-                        _files.append(_pth)
+            # The raw records, tool name included. phase0 decides what counts as an
+            # opened file -- team.py's own `path` field is `relative_path or
+            # glob_pattern or pattern`, so a search pattern is indistinguishable from
+            # a file here and only the tool name separates them.
+            _reads = [
+                {"tool": _e.get("tool"), "path": (_e.get("path") or "").strip()}
+                for _e in ((_rs_p0.get("reads") or []) if isinstance(_rs_p0, dict) else [])
+                if _member_key(_e.get("read_by", "")) == _who
+            ]
             _p0.record_member_result(
                 member=_who, content=content, read_delta=_delta,
-                files_read=_files,
+                reads=_reads,
                 elided=bool(locals().get("_before")),
                 thin_report="[REPORT IS THIN:" in content,
             )

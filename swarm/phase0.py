@@ -76,6 +76,66 @@ def _extract_paths(text: str) -> list[str]:
     return out
 
 
+# Tools whose recorded `path` is a file this member actually OPENED. team.py's read
+# record stores `relative_path or glob_pattern or pattern`, so the tool name is the
+# only thing that separates "opened API/x/models.py" from "searched for createVoucher".
+_FILE_OPENING_TOOLS = frozenset({"get_file_content"})
+# Takes a path but names a DIRECTORY, so it belongs in neither bucket.
+_DIRECTORY_TOOLS = frozenset({"list_directory", "list_directory_tree"})
+# Reads a file set the record cannot name: get_files_batch passes `paths` (plural), so
+# the stored path is "". Counted rather than dropped -- it is a real blind spot in
+# files_read and a silent zero would misrepresent coverage.
+_UNATTRIBUTED_READ_TOOLS = frozenset({"get_files_batch"})
+
+# Extensions that make a token a plausible source file. Required for a citation to
+# count as a path at all: it is what rejects `@router.get`, `e.g`, `builder.query` and
+# `sa.UniqueConstraint`, none of which the previous any-word.word rule could tell from
+# a filename.
+_SOURCE_EXTS = frozenset({
+    "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "vue", "svelte",
+    "md", "rst", "txt", "json", "yaml", "yml", "toml", "ini", "cfg", "env",
+    "sql", "scss", "sass", "css", "html", "htm", "xml",
+    "sh", "bash", "zsh", "ps1", "dockerfile",
+    "go", "rs", "java", "kt", "rb", "php", "cs", "c", "h", "cpp", "hpp", "swift",
+})
+
+
+def classify_citation(token: str) -> str:
+    """"path" (has a directory), "basename" (ambiguous), or "not_a_path".
+
+    Extension-first, deliberately. Requiring a separator instead would admit `and/or`
+    while rejecting a real bare `vouchers_api.py`; the extension is the property that
+    actually distinguishes a filename, and the separator then only decides whether it
+    can be resolved to one file.
+    """
+    tok = (token or "").strip().strip(".,;:)('\"`")
+    if not tok or "." not in tok:
+        return "not_a_path"
+    ext = tok.rsplit(".", 1)[-1].lower()
+    if ext not in _SOURCE_EXTS:
+        return "not_a_path"
+    return "path" if "/" in tok.strip("/") else "basename"
+
+
+def classify_read(entry: dict) -> tuple[str, str]:
+    """(bucket, path) for one team.py read record.
+
+    Buckets: "file" (really opened), "directory", "search" (a pattern, not a file),
+    "unattributed" (a batch read whose paths the record does not carry), "empty".
+    """
+    tool = str((entry or {}).get("tool") or "")
+    path = str((entry or {}).get("path") or "").strip()
+    if tool in _UNATTRIBUTED_READ_TOOLS:
+        return "unattributed", path
+    if not path:
+        return "empty", path
+    if tool in _DIRECTORY_TOOLS:
+        return "directory", path
+    if tool in _FILE_OPENING_TOOLS:
+        return "file", path
+    return "search", path
+
+
 def _is_ambiguous(path: str) -> bool:
     """A bare basename names no directory, so nothing can resolve it to one file."""
     return "/" not in path.strip("/")
@@ -146,12 +206,40 @@ class Phase0Run:
             pass
 
     def record_member_result(self, member: str, content: str, read_delta: int,
-                             files_read: list[str], elided: bool,
+                             reads: list[dict], elided: bool,
                              thin_report: bool) -> None:
+        """`reads` is team.py's own read records ({tool, path, ...}), not a path list.
+
+        Passing the raw entries keeps the file/search distinction here, in one place
+        that the emitted record then shows its working for, rather than at the call
+        site where it would be invisible.
+        """
         try:
-            cited = _extract_paths(content)
-            read = [p for p in dict.fromkeys(files_read or [])]
-            read_set, cited_set = set(read), set(cited)
+            files, dirs, searches = [], [], []
+            unattributed = 0
+            for entry in (reads or []):
+                bucket, path = classify_read(entry)
+                if bucket == "unattributed":
+                    unattributed += 1
+                elif bucket == "file" and path not in files:
+                    files.append(path)
+                elif bucket == "directory" and path not in dirs:
+                    dirs.append(path)
+                elif bucket == "search" and path not in searches:
+                    searches.append(path)
+
+            cited, cited_basenames, rejected = [], [], []
+            for tok in _extract_paths(content):
+                kind = classify_citation(tok)
+                if kind == "path" and tok not in cited:
+                    cited.append(tok)
+                elif kind == "basename" and tok not in cited_basenames:
+                    cited_basenames.append(tok)
+                elif kind == "not_a_path" and tok not in rejected:
+                    rejected.append(tok)
+
+            read_set = set(files)
+            cited_set = set(cited)
             self.member_results.append({
                 "type": "member_result",
                 "run_id": self.run_id,
@@ -160,12 +248,29 @@ class Phase0Run:
                 "output_elided": bool(elided),
                 "thin_report": bool(thin_report),
                 "read_chars_this_delegation": int(read_delta or 0),
-                "files_read": read[:_MAX_LISTED_PATHS],
+                "files_read": files[:_MAX_LISTED_PATHS],
                 "files_cited": cited[:_MAX_LISTED_PATHS],
+                "cited_basenames": cited_basenames[:_MAX_LISTED_PATHS],
                 # Two different losses, kept apart on purpose: naming what you did not
-                # open, versus opening what you did not report.
+                # open, versus opening what you did not report. Both now compare
+                # file-to-file, so neither is inflated by a search pattern or a dotted
+                # code identifier the way the first controlled run's numbers were.
                 "cited_not_read": [p for p in cited if p not in read_set][:_MAX_LISTED_PATHS],
-                "read_not_cited": [p for p in read if p not in cited_set][:_MAX_LISTED_PATHS],
+                "read_not_cited": [p for p in files if p not in cited_set][:_MAX_LISTED_PATHS],
+                # Everything the classifier decided against, so the decision can be
+                # audited from the record instead of by re-running.
+                "extractor": {
+                    "search_patterns": searches[:_MAX_LISTED_PATHS],
+                    "directories_listed": dirs[:_MAX_LISTED_PATHS],
+                    "batch_reads_unattributed": unattributed,
+                    "citations_rejected": rejected[:_MAX_LISTED_PATHS],
+                    "counts": {
+                        "files": len(files), "directories": len(dirs),
+                        "searches": len(searches), "cited_paths": len(cited),
+                        "cited_basenames": len(cited_basenames),
+                        "rejected": len(rejected),
+                    },
+                },
             })
         except Exception:  # noqa: BLE001
             pass
@@ -180,13 +285,17 @@ class Phase0Run:
         not missing, the rule _repo_find_files and _repo_match_count already state, and
         the one that keeps a measurement honest when the tool is simply unavailable.
         """
-        cited: list[str] = []
+        concrete: list[str] = []
+        ambiguous: list[str] = []
         for mr in self.member_results:
             for p in mr.get("files_cited") or []:
-                if p not in cited:
-                    cited.append(p)
-        ambiguous = [p for p in cited if _is_ambiguous(p)]
-        concrete = [p for p in cited if not _is_ambiguous(p)]
+                if p not in concrete:
+                    concrete.append(p)
+            # Real filenames that name no directory. Classified upstream now, so this
+            # bucket no longer collects `@router.get` and `builder.query`.
+            for p in mr.get("cited_basenames") or []:
+                if p not in ambiguous:
+                    ambiguous.append(p)
 
         resolved: list[str] = []
         unresolved: list[str] = []
