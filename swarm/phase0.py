@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -146,6 +147,168 @@ def _is_ambiguous(path: str) -> bool:
     return "/" not in path.strip("/")
 
 
+# ── write-action observation (2026-09-11) ───────────────────────────────────────────
+#
+# Added to answer ONE question and nothing else: when the Coder has the right target
+# and has read it, why does it sometimes not produce a write-tool call? The Experiment
+# 3 funnel localised the loss to exactly that step (2 of 8 I3 runs) but could not
+# explain it, because member_result recorded no terminal state, no tool-call count and
+# nothing about content the runtime discarded.
+#
+# Everything below is an OBSERVER. Nothing here changes control flow, return values,
+# counters the runtime acts on, or any policy. Every entry point swallows its own
+# exceptions and returns None, so a defect in this file cannot alter a run.
+#
+# WHAT IS OBSERVABLE, AND WHERE -- stated precisely, because the whole point is to
+# separate "the model never emitted a write call" from "the model emitted one and hive
+# prevented it":
+#
+#   reached hook  -- the tool interception hook sees every call agno actually
+#                    dispatches. Exact.
+#   executed/failed -- same hook, reading the tool's own result contract.
+#   suppressed by tool_choice -- when the harness forces text-only, the served model
+#                    keeps emitting Hermes <tool_call> tags as PROSE, and
+#                    VLLMToolFix._sanitize_forced_text strips them. That strip is the
+#                    one place a write call the model DID emit is visibly destroyed,
+#                    so it is counted there, with the tool name recovered from the
+#                    stripped text.
+#
+# WHAT IS NOT OBSERVABLE, and must not be inferred:
+#
+#   A call refused by agno's own tool_call_limit. agno appends
+#   create_tool_call_limit_error_result(fc) and continues: no hook fires and no stream
+#   event is emitted (see _make_tool_budget_guard_hook's docstring in team.py, which
+#   verified both routes by reading agno's source). So "emitted but refused for
+#   budget" is invisible to hive. It is reported as an explicit gap, never folded into
+#   another bucket. In practice hive's budget guard forces text-only BEFORE that
+#   ceiling, which converts the invisible case into the observable tool_choice one.
+_WRITE_TOOLS = ("apply_diff", "write_file")
+
+# Reset per run by start_run(). Module-level rather than per-Phase0Run because the
+# observers are called from places that hold no run handle (the model wrapper in
+# tool_fix.py has no idea a run object exists).
+_actions: dict = {}
+_discards: list = []
+
+
+def _reset_actions() -> None:
+    _actions.clear()
+    _discards.clear()
+
+
+def _slot(member: str) -> dict:
+    key = (member or "unknown").strip().lower()
+    return _actions.setdefault(key, {
+        "tool_calls_made": 0,
+        "write_tool_calls_reached_hook": 0,
+        "write_tool_calls_executed": 0,
+        "write_tool_calls_failed": 0,
+        "write_tools_seen": [],
+        "tool_choice_escalations": 0,
+        "tool_choice_raw": [],
+    })
+
+
+def note_tool_call(member: str, function_name: str, result_text: str | None) -> None:
+    """One tool call that REACHED the interception hook, with its outcome.
+
+    `result_text` is the tool's own already-unwrapped result. apply_diff's contract is
+    "apply_diff failed: ..." on every failure path and "review_pending: ..." on
+    success (hive-mcp/tools/files.py); anything else is treated as executed-not-failed
+    rather than guessed at.
+    """
+    try:
+        s = _slot(member)
+        s["tool_calls_made"] += 1
+        if function_name not in _WRITE_TOOLS:
+            return
+        s["write_tool_calls_reached_hook"] += 1
+        if function_name not in s["write_tools_seen"]:
+            s["write_tools_seen"].append(function_name)
+        txt = (result_text or "").lstrip()
+        if txt.startswith("apply_diff failed") or txt.startswith("write_file failed"):
+            s["write_tool_calls_failed"] += 1
+        else:
+            s["write_tool_calls_executed"] += 1
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def note_tool_choice_forced(member: str, raw: str | None = None) -> None:
+    """The harness flipped this member (or the coordinator) to tool_choice="none"."""
+    try:
+        s = _slot(member)
+        s["tool_choice_escalations"] += 1
+        if raw and raw not in s["tool_choice_raw"]:
+            s["tool_choice_raw"].append(raw)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def note_discarded_content(chars: int, reason: str, text: str = "") -> None:
+    """Content the EXISTING runtime filtering discarded. No new filter is created.
+
+    Recorded at run level, not per member: the sanitizer lives on the model wrapper and
+    has no member identity to attribute to. Claiming a member here would be a guess, so
+    the record says run-level and the analysis treats it that way.
+    """
+    try:
+        hit = next((w for w in _WRITE_TOOLS if w in (text or "")), None)
+        _discards.append({
+            "chars": int(chars or 0),
+            "reason": reason,
+            "contained_write_call": bool(hit),
+            "write_tool": hit,
+        })
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def action_snapshot(member: str) -> dict:
+    try:
+        return dict(_slot(member))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def discard_snapshot() -> dict:
+    try:
+        return {
+            "content_discarded_chars": sum(d["chars"] for d in _discards),
+            "discard_reasons": sorted({d["reason"] for d in _discards}),
+            "discarded_write_calls": sum(1 for d in _discards if d["contained_write_call"]),
+            "events": _discards[:10],
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+# Deliberately literal and narrow. A completion claim is only counted when the text
+# says the change was MADE, in the past tense -- never when it merely names the symbol
+# or describes a plan. No LLM, no semantic classifier: this must be reproducible from
+# the stored text alone, and it must under-report rather than over-report.
+_CLAIM_RE = re.compile(
+    r"(has|have)\s+been\s+(added|implemented|created|staged|appended)"
+    r"|\b(was|were)\s+(added|implemented|created|staged|appended)"
+    r"|\bI(?:'ve| have)?\s+(?:now\s+)?(added|implemented|created|staged)"
+    r"|\bsuccessfully\s+(added|implemented|created|staged)",
+    re.I)
+
+
+def claimed_completion(content: str, writes_executed: int) -> bool | None:
+    """True only when the member says it made the change AND no write executed.
+
+    None when there is no content to judge -- an absent answer is unknown, not a
+    negative.
+    """
+    try:
+        if not (content or "").strip():
+            return None
+        return bool(_CLAIM_RE.search(content)) and writes_executed == 0
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class Phase0Run:
     """One run's telemetry. Every public method is best-effort and returns None."""
 
@@ -225,7 +388,9 @@ class Phase0Run:
 
     def record_member_result(self, member: str, content: str, read_delta: int,
                              reads: list[dict], elided: bool,
-                             thin_report: bool) -> None:
+                             thin_report: bool,
+                             tool_call_limit: int | None = None,
+                             forced_text_only: bool = False) -> None:
         """`reads` is team.py's own read records ({tool, path, ...}), not a path list.
 
         Passing the raw entries keeps the file/search distinction here, in one place
@@ -289,6 +454,48 @@ class Phase0Run:
                         "rejected": len(rejected),
                     },
                 },
+            })
+            # ── write-action observation (2026-09-11) ──────────────────────────────
+            act = action_snapshot(member)
+            writes_exec = act.get("write_tool_calls_executed", 0)
+            calls = act.get("tool_calls_made", 0)
+            # terminal_reason uses ONLY evidence this record can actually carry.
+            # liveness_stop and exception are run-level outcomes that are not known at
+            # the moment a member's result lands, so they are never claimed here --
+            # the run-level record and the journal carry those.
+            if forced_text_only:
+                reason = "tool_choice_none"
+            elif tool_call_limit and calls >= tool_call_limit:
+                reason = "tool_limit"
+            elif content.strip():
+                reason = "normal_finish"
+            else:
+                reason = "unknown"
+            self.member_results[-1].update({
+                "tool_calls_made": calls,
+                "tool_call_limit": tool_call_limit,
+                "terminal_reason": reason,
+                "terminal_reason_evidence": {
+                    "forced_text_only": bool(forced_text_only),
+                    "content_chars": len(content or ""),
+                },
+                # reached_hook is exact. "attempted" is deliberately NOT a separate
+                # invented number: hive can only see a write call that reached the
+                # hook, plus one that was destroyed by the forced-text sanitizer. A
+                # call refused by agno's own tool_call_limit is invisible to both --
+                # see the module header. So attempted is reported as the sum of what
+                # is observable, with the unobservable case named rather than folded in.
+                "write_tool_calls_reached_hook": act.get("write_tool_calls_reached_hook", 0),
+                "write_tool_calls_executed": writes_exec,
+                "write_tool_calls_failed": act.get("write_tool_calls_failed", 0),
+                "write_tools_seen": act.get("write_tools_seen", []),
+                "write_calls_unobservable_note": (
+                    "agno tool_call_limit refusals emit no hook call and no stream "
+                    "event; they cannot be counted here"),
+                "tool_choice_escalations": act.get("tool_choice_escalations", 0),
+                "tool_choice_raw": act.get("tool_choice_raw", []),
+                "claimed_completion": claimed_completion(content, writes_exec),
+                **discard_snapshot(),
             })
             # Same reason as the delegation record above: survive the kill.
             _emit(self.member_results[-1])
@@ -445,6 +652,7 @@ def start_run(project_id: str, session_id: str | None, team_name: str | None,
     if not enabled():
         return None
     try:
+        _reset_actions()          # observers are module-level; clear last run's counts
         run = Phase0Run(project_id, session_id, team_name, read_only)
         print(f"[phase0] run {run.run_id} started "
               f"(project={project_id}, team={team_name}, read_only={read_only})",

@@ -491,6 +491,20 @@ class _ToolCallRecoveryMixin:
             return False
 
         stripped = self._FORCED_TAG_RE.sub("", content).strip()
+        # Write-action observation (2026-09-11). Observer only -- it records what this
+        # existing sanitizer was already going to discard and changes nothing about
+        # the discard itself. This is the single place where a write call the model
+        # genuinely emitted is destroyed rather than dispatched, so without counting
+        # it here "the model never tried to write" and "hive removed the write" are
+        # indistinguishable in the record.
+        try:
+            from swarm import phase0 as _p0
+            _p0.note_discarded_content(
+                chars=max(len(content) - len(stripped), 0),
+                reason="forced_text_only_tag_strip",
+                text=content)
+        except Exception:  # noqa: BLE001
+            pass
         model_response.content = stripped or (
             "I attempted another tool call, but this run's tool budget is exhausted so "
             "no further tool calls can be made. Answering from what was already "

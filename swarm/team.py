@@ -7719,6 +7719,11 @@ def _force_text_only(agent, team=None) -> None:
     if target is None:
         return
     _record_forced_text_only(getattr(target, "name", "") or getattr(target, "id", ""))
+    # Write-action observation (2026-09-11), observer only: this is the moment the
+    # harness takes the tool away, and it is the event that must be separable from
+    # "the model chose not to write".
+    phase0.note_tool_choice_forced(
+        _member_key(getattr(target, "name", "") or "coordinator"), raw="tool_choice=none")
     target.tool_choice = "none"
     model = getattr(target, "model", None)
     if model is not None:
@@ -10480,6 +10485,15 @@ def _make_tool_interception_hook(
             result = await function(**args)
             elapsed = time.monotonic() - started
             print(f"[team] tool_hook: {function_name}({args}) -> {elapsed:.2f}s", flush=True)
+            # Write-action observation (2026-09-11). Pure observer: it reads the call
+            # and its result and records them, and cannot alter either. This hook is
+            # registered OUTERMOST and always runs, which makes it the one exact
+            # measure of "a write call actually reached hive". Attribution comes from
+            # `agent` -- the coordinator's own calls arrive with agent=None and are
+            # recorded under "coordinator", the same convention the budget guard uses.
+            phase0.note_tool_call(
+                _member_key(getattr(agent, "name", "") or "coordinator"),
+                function_name, _result_text(result))
             # A delegation to context-router never emits RunStarted while an identical one to
             # researcher does, though both ids resolve and both members are armed. Awaiting the
             # delegate function returns before the member runs, so the hook's timing says
@@ -12304,6 +12318,11 @@ def _record_stream_artifacts(team, out: dict) -> None:
                 reads=_reads,
                 elided=bool(locals().get("_before")),
                 thin_report="[REPORT IS THIN:" in content,
+                # Both read from state the runtime already maintains for its own
+                # purposes -- no new tracker, and nothing here is written back.
+                tool_call_limit=_resolve_tool_call_limit(
+                    getattr(team, "_team_name", None) or getattr(team, "name", None), _who),
+                forced_text_only=_was_forced_text_only(_who),
             )
 
         out["content"] = content
