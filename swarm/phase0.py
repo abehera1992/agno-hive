@@ -334,6 +334,7 @@ class Phase0Run:
         self.context_blocks: dict = {}
         self.delegations: list[dict] = []
         self.member_results: list[dict] = []
+        self.mechverify: list[dict] = []
         self._seq = 0
 
     # ── during the run: append-only, no I/O ──────────────────────────────────────
@@ -394,6 +395,40 @@ class Phase0Run:
             # and everything held in memory dies with it -- which is how a killed T11
             # produced no telemetry at all.
             _emit(self.delegations[-1])
+        except Exception:  # noqa: BLE001
+            pass
+
+    def record_mechverify(self, member: str, target: str, checks: list[str],
+                          status: str, repair_attempt: int, repair_requested: bool,
+                          repair_limit_reached: bool, duration_ms: int,
+                          proceeded_to_reviewer: bool) -> None:
+        """Phase 3 (Experiment 5): one verify_project call, observed at the
+        interception hook the same way every other write action already is. Records
+        the funnel Phase 3's own report requires -- attempted, status, checks,
+        target, repair attempt number, duration, whether repair was requested,
+        whether the (pre-existing, unmodified) Reviewer flow was reached, and
+        whether the hard repair limit was hit -- as one flat event per call rather
+        than a parallel logging system. Same append-only, best-effort discipline as
+        every other record_* method: a telemetry defect here can cost a row, never
+        the run.
+        """
+        try:
+            self._seq += 1
+            self.mechverify.append({
+                "type": "mechverify",
+                "run_id": self.run_id,
+                "seq": self._seq,
+                "member": member,
+                "target": target,
+                "checks": checks,
+                "status": status,
+                "repair_attempt": repair_attempt,
+                "repair_requested": repair_requested,
+                "repair_limit_reached": repair_limit_reached,
+                "duration_ms": duration_ms,
+                "proceeded_to_reviewer": proceeded_to_reviewer,
+            })
+            _emit(self.mechverify[-1])
         except Exception:  # noqa: BLE001
             pass
 

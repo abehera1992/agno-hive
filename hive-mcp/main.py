@@ -37,6 +37,7 @@ from tools.context import (
 )
 from tools.compare import compare_enumerations
 from tools.files import write_file, apply_diff, run_command
+from tools.verification import verify_project
 from tools import bash as _bash_tools
 from tools.bash import (
     bash_session_start, bash_run, bash_session_close,
@@ -196,6 +197,11 @@ _tool(list_directory_tree)
 _tool(write_file)
 _tool(apply_diff)
 _tool(run_command)
+
+# ── Project-declared mechanical verification (Experiment 5 Phase 2) ──────────
+# Runs only a NAMED check from the project's own committed .hive-verify.json;
+# never accepts a command string. See tools/verification.py's module docstring.
+_tool(verify_project)
 
 # ── Shell + Docker + environment ─────────────────────────────────────────────
 _tool(run_shell)

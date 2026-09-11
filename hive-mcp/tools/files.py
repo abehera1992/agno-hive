@@ -19,6 +19,45 @@ from .scratch import maybe_offload
 _PROPOSED_SUFFIX = ".hive_proposed"
 _IN_DOCKER = Path("/.dockerenv").exists()
 
+# Experiment 5 Phase 1 (2026-09-11): a root-level manifest a project uses to declare
+# trusted verification commands (a future verify_project tool reads this directly off
+# disk, never through get_file_content). It must never be model-writable -- a model
+# that could edit the file verifying its own output could edit the verification away.
+#
+# This is deliberately NOT an is_excluded() change. is_excluded() hides a path from
+# EVERY tool (read, write, search, index) by directory-prefix rules; this manifest is
+# meant to stay READABLE (so a run can be debugged) while being uniquely unwritable.
+# Broadening the dot-directory rule to cover it would hide it from get_file_content
+# too, which is the opposite of what's needed. Kept as its own tiny set rather than a
+# general "protected config" framework -- one file, one purpose, easy to audit.
+#
+# Root-relative only: a file named .hive-verify.json inside some OTHER directory is a
+# different file and is not protected by this -- the manifest's whole trust model is
+# "the one at the project root," same as .gitignore or tsconfig.json.
+_PROTECTED_CONFIG_FILES = {".hive-verify.json"}
+
+
+def _is_protected_config(relative_path: str) -> bool:
+    """True if `relative_path` names a protected root-level config file.
+
+    Mirrors is_excluded()'s own normalization (backslash->slash, strip a leading
+    "./" prefix) so an equivalent spelling can't slip past it, and additionally
+    strips a trailing .hive_proposed suffix -- apply_diff already strips that before
+    its own is_excluded() check, but write_file does not, and a bare string match
+    would otherwise let 'write_file(".hive-verify.json.hive_proposed", ...)' through
+    disguised as a different filename. Case-insensitive: the project mount observed
+    in this environment is a case-preserving, case-INsensitive Windows volume, so
+    ".Hive-Verify.json" and ".hive-verify.json" are the same file on disk regardless
+    of what the string comparison says -- matching only the exact case would be a
+    real, not theoretical, bypass here.
+    """
+    rel = str(relative_path or "").replace("\\", "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    if rel.endswith(_PROPOSED_SUFFIX):
+        rel = rel[: -len(_PROPOSED_SUFFIX)]
+    return rel.lower() in _PROTECTED_CONFIG_FILES
+
 # Detects a stuck retry loop: the exact same failing apply_diff call repeated
 # verbatim against the same file. Module-level and intentionally coarse — hive-mcp
 # runs as one long-lived process, and this only needs to catch "the identical call,
@@ -198,6 +237,11 @@ def write_file(relative_path: str, content: str) -> str:
         relative_path: Path relative to project root (e.g. 'src/api/new_route.py')
         content:       Full file content to write
     """
+    if _is_protected_config(relative_path):
+        return (f"write_file blocked: '{relative_path}' is protected verification "
+                f"configuration and cannot be created or overwritten by a model-"
+                f"directed write. It is trusted, committed project configuration — "
+                f"edit it directly in the repository, not through hive-mcp.")
     if is_excluded(relative_path):
         return (f"write_file blocked: '{relative_path}' is in an excluded path "
                 f"(dependency tree, build output, or a project EXCLUDE_DIRS/EXCLUDE_GLOBS "
@@ -263,6 +307,11 @@ def apply_diff(relative_path: str, old_string: str, new_string: str, preserve_in
     if relative_path.endswith(_PROPOSED_SUFFIX):
         relative_path = relative_path[: -len(_PROPOSED_SUFFIX)]
 
+    if _is_protected_config(relative_path):
+        return (f"apply_diff blocked: '{relative_path}' is protected verification "
+                f"configuration and cannot be edited by a model-directed write. It "
+                f"is trusted, committed project configuration — edit it directly in "
+                f"the repository, not through hive-mcp.")
     if is_excluded(relative_path):
         return (f"apply_diff blocked: '{relative_path}' is in an excluded path "
                 f"(dependency tree, build output, or a project EXCLUDE_DIRS/EXCLUDE_GLOBS "

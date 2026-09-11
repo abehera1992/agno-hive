@@ -10405,6 +10405,176 @@ def _tag_invariant_enabled() -> bool:
         "1", "true", "yes", "on")
 
 
+# ── Experiment 5 Phase 3: mechanical verification integration ───────────────────────
+#
+# Coder apply_diff -> review_pending -> verify_project (hive-mcp, project-declared
+# manifest) -> PASS leaves the existing result untouched (Reviewer flow proceeds
+# exactly as it does today) -> FAIL rewrites the tool result into a repair request
+# instead of "review_pending", the same "steer the calling agent through what it
+# sees in its own tool result" pattern _force_text_only and the duplicate-delegation
+# ladder already use elsewhere in this file -- no coordinator-level control flow is
+# invented. ERROR/UNSUPPORTED pass the original result through unchanged: neither is
+# a code defect, so neither should look like one to the Coder or trigger repair.
+#
+# Deliberately generic. The four check names requested below (typecheck, lint,
+# test, build) are the same category names Experiment 5's own design used across
+# every language in its polyglot table -- TypeScript, Go, Python, Rust, Rails, .NET
+# alike -- not a TypeScript-specific list. Whichever of these a project's own
+# .hive-verify.json does not declare comes back UNSUPPORTED per-check (Phase 2's
+# own semantics) and does not affect the overall PASS/FAIL verdict. Nothing here
+# names getPayments, providesTags, tagTypes, or any I3 criterion.
+_MECHVERIFY_CHECKS = ("typecheck", "lint", "test", "build")
+_MECHVERIFY_MAX_REPAIRS = 2
+
+
+def _mechverify_enabled() -> bool:
+    """Off unless explicitly switched on. Same shape as context_pack.enabled(),
+    phase0.enabled(), and _tag_invariant_enabled() -- control and treatment differ
+    only by this environment variable, from one commit."""
+    return os.getenv("MECHVERIFY_ENABLED", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+async def _call_verify_project(hive_mcp_url: str | None, checks: list[str],
+                               targets: list[str]) -> dict | None:
+    """Calls hive-mcp's verify_project tool server-side, exactly the same
+    fresh-connection MCP pattern _repo_file_text already uses (live session first
+    is not attempted here -- ContextPack's own build() call made the same choice,
+    passing hive_mcp_tools=None, when it needed a server-side hive-mcp call outside
+    any member's own turn). Returns the parsed VerificationResult dict, or None on
+    any failure -- never raises. The caller treats None the same as an ERROR
+    status: verification infrastructure being unreachable is not a code defect and
+    must not trigger repair or be reported as PASS.
+    """
+    if not hive_mcp_url:
+        return None
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    try:
+        async def _ask() -> dict | None:
+            async with streamablehttp_client(hive_mcp_url) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    res = await session.call_tool(
+                        "verify_project", {"checks": list(checks), "targets": list(targets)})
+                    if _mcp_error_text(res):
+                        return None
+                    text = _extract_mcp_text(res)
+                    return json.loads(text) if text else None
+
+        return await asyncio.wait_for(_ask(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[mechverify] verify_project call failed "
+              f"({type(exc).__name__}: {exc})", flush=True)
+        return None
+
+
+def _format_mechverify_diagnostics(vr: dict) -> str:
+    """Renders a VerificationResult's diagnostics for a Coder repair request.
+    Preserves file/line/column/code/message verbatim -- no paraphrasing of
+    compiler/tool output, per Phase 3's own requirement -- and falls back to a
+    check's raw_output when it produced no structured diagnostics (Phase 2's own
+    rule: an unparsed failure is still a real FAIL, not silently dropped).
+    """
+    lines = []
+    for check in vr.get("checks", []):
+        lines.append(f"- {check.get('id')}: {check.get('status')}"
+                     + (f" (exit {check['exit_code']})"
+                        if check.get("exit_code") is not None else ""))
+        diags = check.get("diagnostics") or []
+        if diags:
+            for d in diags:
+                loc = d.get("file", "")
+                if d.get("line") is not None:
+                    loc += f":{d['line']}"
+                    if d.get("column") is not None:
+                        loc += f":{d['column']}"
+                code = f" {d['code']}" if d.get("code") else ""
+                lines.append(f"    {loc}{code}: {d.get('message', '')}")
+        elif check.get("status") in ("FAIL", "ERROR") and check.get("raw_output"):
+            lines.append(f"    {check['raw_output'][:800]}")
+        if check.get("reason"):
+            lines.append(f"    ({check['reason']})")
+    return "\n".join(lines)
+
+
+async def _run_mechverify(team, agent, target_rel: str, original_result,
+                          repair_counts: dict) -> object:
+    """Runs after a successful Coder apply_diff (review_pending), if
+    MECHVERIFY_ENABLED. Returns the value the Coder's own tool call should see:
+    the ORIGINAL result on PASS/ERROR/UNSUPPORTED (the existing, unmodified
+    Reviewer flow proceeds exactly as it does today), or a repair request on FAIL,
+    up to _MECHVERIFY_MAX_REPAIRS times per (member, target).
+
+    `repair_counts` is the factory-closure dict from _make_tool_interception_hook,
+    the same per-run-lifetime pattern _make_read_cache_tool_hook's own
+    edit_failed_paths already uses -- server-side state, not a prompt instruction,
+    is what actually enforces the repair limit.
+    """
+    coder_key = _member_key(getattr(agent, "name", "") or "coder")
+    repair_key = (coder_key, target_rel)
+    attempt = repair_counts.get(repair_key, 0)
+
+    hive_mcp_url = getattr(team, "_hive_mcp_url", None)
+    t0 = time.monotonic()
+    vr = await _call_verify_project(hive_mcp_url, list(_MECHVERIFY_CHECKS), [target_rel])
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    status = (vr or {}).get("status") if vr else "ERROR"
+    if status not in ("PASS", "FAIL", "ERROR", "UNSUPPORTED"):
+        status = "ERROR"
+
+    print(f"[mechverify] target={target_rel!r} member={coder_key!r} "
+          f"attempt={attempt} status={status} duration_ms={duration_ms}", flush=True)
+
+    repair_requested = False
+    repair_limit_reached = False
+    proceeded_to_reviewer = False
+    out = original_result
+
+    if status in ("ERROR", "UNSUPPORTED"):
+        # Infrastructure/configuration state, not a code defect -- surface as-is
+        # and stop automatic repair. Do not fabricate a fallback command, do not
+        # ask the Coder to fix a missing/broken manifest as though it were source.
+        proceeded_to_reviewer = True
+    elif status == "PASS":
+        repair_counts.pop(repair_key, None)
+        proceeded_to_reviewer = True
+    else:  # FAIL
+        if attempt >= _MECHVERIFY_MAX_REPAIRS:
+            repair_limit_reached = True
+            proceeded_to_reviewer = True
+            print(f"[mechverify] repair limit ({_MECHVERIFY_MAX_REPAIRS}) reached "
+                  f"for {target_rel!r} -- surfacing final failure, no further "
+                  f"repair", flush=True)
+        else:
+            repair_counts[repair_key] = attempt + 1
+            repair_requested = True
+            diag_text = _format_mechverify_diagnostics(vr) if vr else \
+                "(verification reported FAIL but returned no structured result)"
+            final_attempt = (attempt + 1) >= _MECHVERIFY_MAX_REPAIRS
+            out = (
+                f"Mechanical verification FAILED for {target_rel} "
+                f"(repair attempt {attempt + 1}/{_MECHVERIFY_MAX_REPAIRS}).\n\n"
+                f"Diagnostics:\n{diag_text}\n\n"
+                f"Repair the reported defect(s) in {target_rel} and submit the "
+                f"corrected change through the normal write flow (apply_diff)."
+                + (f" This is your final repair attempt -- if verification fails "
+                   f"again after this, stop and report what could not be fixed "
+                   f"rather than attempting a further edit." if final_attempt else "")
+            )
+
+    _p0 = getattr(team, "_phase0", None)
+    if _p0 is not None:
+        _p0.record_mechverify(
+            member=coder_key, target=target_rel, checks=list(_MECHVERIFY_CHECKS),
+            status=status, repair_attempt=attempt, repair_requested=repair_requested,
+            repair_limit_reached=repair_limit_reached, duration_ms=duration_ms,
+            proceeded_to_reviewer=proceeded_to_reviewer)
+
+    return out
+
+
 def _make_tool_interception_hook(
     abort_event: "asyncio.Event | None" = None,
     activity: dict | None = None,
@@ -10483,6 +10653,16 @@ def _make_tool_interception_hook(
     connected to steering.
     """
 
+    # Experiment 5 Phase 3: per-(member, target) repair-attempt counter. Lives
+    # here, not inside _tool_interception_hook itself, for the same reason
+    # _make_read_cache_tool_hook's own edit_failed_paths lives in ITS factory
+    # body rather than inside its inner hook -- this closure is constructed
+    # once per _build_team() call (once per run), so the dict's lifetime is
+    # exactly one run, shared across every tool call that run makes, and reset
+    # fresh on the next run. This dict, not any prompt text, is what actually
+    # enforces _MECHVERIFY_MAX_REPAIRS.
+    _mechverify_repair_counts: dict[tuple[str, str], int] = {}
+
     async def _tool_interception_hook(function_name, function, args, agent=None, team=None):
         if abort_event is not None and abort_event.is_set():
             print(f"[team] tool_hook: {function_name}({args}) ABORTED before execution", flush=True)
@@ -10549,6 +10729,21 @@ def _make_tool_interception_hook(
             phase0.note_tool_call(
                 _member_key(getattr(agent, "name", "") or "coordinator"),
                 function_name, _result_text(result))
+            # Experiment 5 Phase 3: mechanical verification. Only the intended first
+            # integration target -- a Coder's own successful apply_diff, staged as
+            # review_pending -- can trigger this. Every other tool call (failed
+            # apply_diff, write_file, any Reviewer/Executor/Researcher call, every
+            # delegate_task_to_member call) falls straight through untouched, exactly
+            # as it did before this block existed.
+            if (_mechverify_enabled()
+                    and function_name == "apply_diff"
+                    and _member_key(getattr(agent, "name", "") or "") == "coder"
+                    and isinstance(args, dict) and args.get("relative_path")):
+                _rt = _result_text(result)
+                if _WRITE_SUCCESS_RE.match(_rt.strip()) and "review_pending" in _rt:
+                    result = await _run_mechverify(
+                        team, agent, str(args["relative_path"]), result,
+                        _mechverify_repair_counts)
             # A delegation to context-router never emits RunStarted while an identical one to
             # researcher does, though both ids resolve and both members are armed. Awaiting the
             # delegate function returns before the member runs, so the hook's timing says

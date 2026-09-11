@@ -16,6 +16,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
+# Node.js runtime for verify_project (Experiment 5 Phase 4, 2026-09-11). The manifest-
+# declared checks run project-owned commands (e.g. `npx tsc --noEmit`) through the
+# existing run_command() -- this only makes that binary exist. It does NOT install any
+# project dependency: package.json/node_modules stay entirely on the bind-mounted
+# /project volume and are never touched here. npm/npx ship with the nodejs package
+# itself (npm >=5.2), so nothing extra is added for them.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
 # Docker CLI from official image (no daemon, talks to host socket via mount)
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 
