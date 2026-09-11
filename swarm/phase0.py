@@ -203,6 +203,7 @@ def _slot(member: str) -> dict:
         "write_tool_calls_reached_hook": 0,
         "write_tool_calls_executed": 0,
         "write_tool_calls_failed": 0,
+        "write_tool_calls_blocked": 0,
         "write_tools_seen": [],
         "tool_choice_escalations": 0,
         "tool_choice_raw": [],
@@ -212,10 +213,18 @@ def _slot(member: str) -> dict:
 def note_tool_call(member: str, function_name: str, result_text: str | None) -> None:
     """One tool call that REACHED the interception hook, with its outcome.
 
-    `result_text` is the tool's own already-unwrapped result. apply_diff's contract is
-    "apply_diff failed: ..." on every failure path and "review_pending: ..." on
-    success (hive-mcp/tools/files.py); anything else is treated as executed-not-failed
-    rather than guessed at.
+    `result_text` is the tool's own already-unwrapped result.
+
+    Success is decided on POSITIVE evidence -- "review_pending:", the staging receipt
+    hive-mcp/tools/files.py returns -- and never by exclusion. The first version of
+    this counter treated "anything that is not a failure" as executed, and the first
+    battery immediately proved that wrong: an observed run made 5 apply_diff calls of
+    which 3 returned "apply_diff failed" and 2 returned "apply_diff STOPPED: this
+    exact old_string/new_string was just retried...", a HIVE GUARD refusing a repeat.
+    Those two were recorded as executions while nothing was staged. A third shape,
+    "File not found:", appeared too. Anything that is neither a receipt nor the tool's
+    own failure string is therefore counted as blocked-by-guard, which is a distinct
+    mechanism from both and must not be folded into either.
     """
     try:
         s = _slot(member)
@@ -226,10 +235,12 @@ def note_tool_call(member: str, function_name: str, result_text: str | None) -> 
         if function_name not in s["write_tools_seen"]:
             s["write_tools_seen"].append(function_name)
         txt = (result_text or "").lstrip()
-        if txt.startswith("apply_diff failed") or txt.startswith("write_file failed"):
+        if txt.startswith("review_pending"):
+            s["write_tool_calls_executed"] += 1
+        elif txt.startswith(("apply_diff failed", "write_file failed", "File not found")):
             s["write_tool_calls_failed"] += 1
         else:
-            s["write_tool_calls_executed"] += 1
+            s["write_tool_calls_blocked"] += 1
     except Exception:  # noqa: BLE001
         pass
 
@@ -488,6 +499,7 @@ class Phase0Run:
                 "write_tool_calls_reached_hook": act.get("write_tool_calls_reached_hook", 0),
                 "write_tool_calls_executed": writes_exec,
                 "write_tool_calls_failed": act.get("write_tool_calls_failed", 0),
+                "write_tool_calls_blocked": act.get("write_tool_calls_blocked", 0),
                 "write_tools_seen": act.get("write_tools_seen", []),
                 "write_calls_unobservable_note": (
                     "agno tool_call_limit refusals emit no hook call and no stream "

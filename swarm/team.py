@@ -7882,6 +7882,15 @@ def _bump_consecutive_stub_and_maybe_force_text_only(
               f"text-only (tool_choice=none; vLLM will not parse tool calls now)",
               flush=True)
         _record_forced_text_only(norm_agent_key)
+        # Write-action observation (2026-09-11), observer only. This is the SECOND
+        # escalation path and it does not go through _force_text_only, so the first
+        # version of this telemetry missed it entirely: the first battery reported
+        # tool_choice_escalations=0 on five runs whose terminal_reason was
+        # tool_choice_none, and the journal showed "served 3 consecutive stubs --
+        # forcing text-only" in every one of them. Instrumenting only the tidier of
+        # two call sites is how a counter ends up quietly wrong.
+        phase0.note_tool_choice_forced(_member_key(norm_agent_key),
+                                       raw="consecutive_stubs")
         agent.tool_choice = "none"
         model = getattr(agent, "model", None)
         if model is not None:

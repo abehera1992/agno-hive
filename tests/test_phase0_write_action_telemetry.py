@@ -39,16 +39,21 @@ def _clean():
 
 # ── accounting primitives ───────────────────────────────────────────────────────────
 
-def test_write_success_and_failure_use_apply_diffs_own_contract():
-    """hive-mcp returns "review_pending: ..." on success and "apply_diff failed: ..."
-    on every failure path. Nothing here guesses from a generic error heuristic."""
+def test_write_outcomes_are_decided_on_positive_evidence_not_exclusion():
+    """Success is "review_pending:" and nothing else. The first battery produced 4
+    distinct apply_diff result shapes; treating "not a failure" as success recorded a
+    guard refusal as an execution while nothing was staged."""
     phase0.note_tool_call("coder", APPLY, f"review_pending: {PATH}")
     phase0.note_tool_call("coder", APPLY, f"apply_diff failed: old_string not found in {PATH}")
+    phase0.note_tool_call("coder", APPLY, f"File not found: {PATH}")
+    phase0.note_tool_call("coder", APPLY,
+                          "apply_diff STOPPED: this exact old_string/new_string was just retried")
     s = phase0.action_snapshot("coder")
-    assert s["write_tool_calls_reached_hook"] == 2
-    assert s["write_tool_calls_executed"] == 1
-    assert s["write_tool_calls_failed"] == 1
-    assert s["tool_calls_made"] == 2
+    assert s["write_tool_calls_reached_hook"] == 4
+    assert s["write_tool_calls_executed"] == 1, "only the staging receipt counts"
+    assert s["write_tool_calls_failed"] == 2, "tool failures incl. File not found"
+    assert s["write_tool_calls_blocked"] == 1, "a hive guard refusal is its own bucket"
+    assert s["tool_calls_made"] == 4
 
 
 def test_reads_count_as_tool_calls_but_never_as_writes():
