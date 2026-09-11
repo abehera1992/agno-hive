@@ -9201,45 +9201,6 @@ def _make_capability_routing_gate_hook(member_tools: dict):
     to invent a name -- that the TARGET does not hold and some OTHER member does. A task
     that names no tool, or names one the target holds, is untouched; so is a tool no
     member holds, which is a different problem and not this hook's to guess at.
-
-    CODE-SPAN EXCLUSION -- Experiment 3, 2026-09-10. The scan above was a bare
-    word-boundary match over the WHOLE task text, so it could not tell an instruction
-    from a quotation. Comparison-discipline review delegations quote another agent's
-    report verbatim, and those reports routinely name the tools they used. On 2026-09-10
-    the coordinator asked the Reviewer to check an answer containing the sentence
-
-        6. Was staged via `apply_diff` and successfully indexed in LightRAG ...
-
-    The gate read `apply_diff` as an instruction and refused. Its remedy -- "call
-    delegate_task_to_member('coder', <the same task>)" -- is not a valid action for a
-    review, so the coordinator could not comply: it re-issued the identical delegation
-    14 times over 126s and the run died on the liveness auto-kill with the backend half
-    staged and the frontend half never attempted. That was the only run in Experiment 2
-    that had produced any correctness at all.
-
-    Measured, not assumed. A frozen corpus of 5,861 archived delegations
-    (sha256 9f57eb4e...7e8c6c, 5,368 replayed against each run's OWN member surfaces)
-    was replayed through this very hook. It fired on 52; all 52 were hand-adjudicated
-    before this change was written (labels frozen, sha256 d1c6c407...e55751):
-
-        14 IMPERATIVE   -- "Call git_log_file on <path> ...", "Call db_query('SELECT
-                           COUNT(*) ...')" -- the T8 shape above. All researcher/executor.
-        38 NARRATIVE    -- every one a review delegation whose tool mention sits inside
-                           the quoted <researcher_answer> being reviewed. All reviewer.
-         0 AMBIGUOUS
-
-    Requiring the match to be a BARE mention -- no adjacent backtick -- suppresses 35 of
-    the 38 narrative hits and 0 of the 14 imperatives, and introduces no new fire
-    anywhere in the corpus. Guard precision goes 14/52 (27%) -> 14/17 (82%).
-
-    What this is NOT. It is a code-span exclusion, not a command detector: it says
-    nothing about whether a bare mention is imperative. Three narrative false positives
-    survive it precisely because they are unbackticked -- "(from db_schema)",
-    "(file: db_schema, ...)", "(list_directory:API/utils/email_templates/)". Those are
-    known, out of scope here, and must not be described as fixed. The gate's other
-    standing weakness -- that its refusal is advisory and unbounded, where the sibling
-    duplicate-delegation gate escalates serve -> warn -> STOP -- is likewise untouched
-    and deliberately left for a separate experiment.
     """
     async def _capability_routing_gate_hook(function_name, function, args, run_context=None):
         if function_name != "delegate_task_to_member" or not member_tools:
@@ -9253,14 +9214,7 @@ def _make_capability_routing_gate_hook(member_tools: dict):
             return await function(**args)
 
         for tool in sorted({t for ts in member_tools.values() for t in ts} - held):
-            if not re.search(rf"(?<![\w`]){re.escape(tool)}(?![\w`])", text):
-                # Log-only. Both branches continue identically; this records that the
-                # pre-Experiment-3 matcher WOULD have refused here, so the suppression
-                # is visible in the journal instead of being silent.
-                if re.search(rf"(?<!\w){re.escape(tool)}(?!\w)", text):
-                    print(f"[team] capability routing: code-span mention of {tool!r} in "
-                          f"a delegation to {target!r} — quoted, not a call; not "
-                          f"redirecting", flush=True)
+            if not re.search(rf"(?<!\w){re.escape(tool)}(?!\w)", text):
                 continue
             holders = sorted(m for m, ts in member_tools.items() if tool in ts)
             if not holders:
