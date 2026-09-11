@@ -10376,6 +10376,35 @@ class ToolCallAborted(Exception):
     because its abort_event was set before the call ran."""
 
 
+# ── Experiment 4 (H7): the coupled providesTags/tagTypes invariant ──────────────────
+#
+# FROZEN for the whole Experiment 4 battery. Exactly the two sentences below: no
+# self-inspection clause, no TypeScript or apply_diff guidance, nothing about newline
+# escaping. Editing this string invalidates the battery.
+#
+# Why it exists. The 10-run I3 observation battery (2026-09-11) staged 7 artifacts.
+# All 7 added a providesTags literal; NONE declared it in the API's tagTypes -- and
+# that single omission is the only criterion the two parse-valid runs missed, each
+# scoring 6/7. The invariant is already implied by the frozen task ("as appropriate
+# for the surrounding endpoints") and modelled 13 times in the target file itself, so
+# the prior on a reminder working is low; that is the point of measuring it.
+_TAG_INVARIANT_TEXT = (
+    "When adding an RTK Query endpoint that introduces a new literal tag in "
+    "providesTags, verify that the same tag is declared in the API's existing "
+    "tagTypes. Treat the endpoint and its tag configuration as one coupled change."
+)
+
+
+def _tag_invariant_enabled() -> bool:
+    """Off unless explicitly switched on. The control arm must be production.
+
+    Same shape as context_pack.enabled() and phase0.enabled(), so control and
+    treatment differ only by an environment variable and run from ONE commit.
+    """
+    return os.getenv("TAGINVARIANT_ENABLED", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _make_tool_interception_hook(
     abort_event: "asyncio.Event | None" = None,
     activity: dict | None = None,
@@ -10486,6 +10515,23 @@ def _make_tool_interception_hook(
             except Exception as exc:  # noqa: BLE001
                 print(f"[contextpack] injection skipped "
                       f"({type(exc).__name__}: {exc})", flush=True)
+        # Experiment 4 (H7). Appends ONE frozen invariant to a CODER delegation and
+        # nothing else. Deliberately independent of ContextPack: it never reads
+        # team._context_pack and never calls context_pack.render(), so the two are
+        # separately toggleable and this does not re-run Experiment 2's compound
+        # treatment. Coder-only, via the same member predicate the block above uses.
+        # Appended after the coordinator's own text rather than replacing it, so the
+        # control framing survives; the separating blank line is the only character
+        # added beyond the frozen sentences. Inert unless TAGINVARIANT_ENABLED is set.
+        if (_tag_invariant_enabled()
+                and function_name == "delegate_task_to_member"
+                and isinstance(args, dict)
+                and _member_key(args.get("member_id", "")) == "coder"):
+            _task_now = str(args.get("task") or "")
+            if _TAG_INVARIANT_TEXT not in _task_now:      # idempotent per delegation
+                args["task"] = f"{_task_now}\n\n{_TAG_INVARIANT_TEXT}"
+                print("[taginvariant] injected the providesTags/tagTypes invariant "
+                      "into a coder delegation", flush=True)
         started = time.monotonic()
         if activity is not None:
             activity["last_call_name"] = function_name
