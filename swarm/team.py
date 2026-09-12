@@ -5249,6 +5249,21 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             and not _asks_for_one_fact(task)
             and len(_member_union) - len(_missing)
                 <= _RELAY_DROP_MAX_KEPT_RATIO * len(_member_union)):
+        # Phase 16 (2026-09-26): one grounded recovery attempt, quoting
+        # team._tool_evidence and the specific missing items, before falling
+        # back to the disclosure-only banner below -- see
+        # _reconcile_relay_drop_with_tool_evidence. Success returns the
+        # recovered content directly; the banner below only ever applies to a
+        # draft this call could NOT recover.
+        content, result, _relay_recovered = await _reconcile_relay_drop_with_tool_evidence(
+            content, task, team, all_results, result, liveness_path,
+            _tool_evidence_lines(team), synthesis_run, _missing)
+        if _relay_recovered:
+            print(f"[team] relay drop recovered — {len(content.strip()):,} chars, "
+                  f"grounded in captured tool evidence", flush=True)
+            return (content
+                    + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
+                    + _tail())
         _kept_n = len(_member_union) - len(_missing)
         print(f"[team] relay drop: members named {len(_member_union)}, answer kept "
               f"{_kept_n} — flagging + attaching the members' own findings", flush=True)
@@ -14359,6 +14374,72 @@ async def _reconcile_under_delivery_with_tool_evidence(
     )
     return await _grounded_retry_from_evidence(
         "under-delivery-reconciliation", retry_prompt, content, task, team,
+        all_results, result, liveness_path)
+
+
+_RELAY_DROP_RECONCILE_FLAG = "_relay_drop_reconcile_done"
+
+
+async def _reconcile_relay_drop_with_tool_evidence(
+        content: str, task: str, team, all_results, result,
+        liveness_path: str | None, tool_evidence_lines: list[str],
+        synthesis_run: bool, missing: list[str]):
+    """Phase 16: a THIRD trigger sharing the same _grounded_retry_from_evidence
+    core as Phase 13's over-delivery mechanism and Phase 14 screw #1's
+    under-delivery mechanism -- this one wired to the relay-drop guard
+    immediately below (severe named-item drop: members collectively named
+    >= _RELAY_DROP_MIN_ITEMS files and the answer kept <=
+    _RELAY_DROP_MAX_KEPT_RATIO of them).
+
+    Phase 15's forensic trace found this guard fires on a DIFFERENT signal
+    (a named-filename union, computed from team._member_items) than
+    _completion_claim_instead_of_answer's char-count ratio (screw #1's own
+    hook), so a genuinely severe drop can reach here without ever tripping
+    screw #1 -- confirmed live on a T12-shaped run (53 named, 4 kept) whose
+    final answer was not short by character count at all. Same conclusion
+    Phase 15 reached: team._tool_evidence is still fully populated and
+    unmodified at this point in _verified_answer (nothing between the
+    fabrication check and this guard clears it), so the SAME evidence-quoting
+    recovery is structurally available here with no new evidence plumbing.
+
+    Retry prompt names the specific missing items (from the run's own
+    `missing` list, computed fresh each call -- never a fixed/battery list)
+    alongside the raw tool evidence, so the retry has both what was gathered
+    and which of it the previous draft dropped. Acceptance is still gated
+    solely on _answer_supported_by_evidence -- naming more of the missing
+    items is not itself sufficient if they are not grounded in captured
+    evidence; a retry that merely mentions more filenames without grounding
+    is rejected exactly like an ungrounded retry in either sibling mechanism.
+
+    Same once-per-run flag and same shared one-retry-per-call budget as its
+    two siblings -- this is a third TRIGGER on the same budget, not a third
+    retry opportunity.
+
+    Returns (content, result, reconciled) -- identical contract to the other
+    two reconciliation functions.
+    """
+    if (synthesis_run or not tool_evidence_lines or not missing
+            or getattr(team, _RELAY_DROP_RECONCILE_FLAG, False)):
+        return content, result, False
+    if len(all_results) > 1:
+        return content, result, False
+
+    setattr(team, _RELAY_DROP_RECONCILE_FLAG, True)
+    evidence_body = "\n".join(tool_evidence_lines)
+    missing_body = ", ".join(missing[:20])
+    retry_prompt = (
+        f"{task}\n\nIMPORTANT: your previous answer left out most of what "
+        f"this run's own tool calls actually found. In particular, these "
+        f"items were gathered but never named in your answer: {missing_body}"
+        f"{'…' if len(missing) > 20 else ''}. Before answering, here is "
+        f"exactly what those tools returned this run -- not a summary, not a "
+        f"guess, their own output:\n\n{evidence_body}\n\nAnswer the original "
+        f"question again, in full, covering the items listed above wherever "
+        f"they are actually supported by the evidence shown. Do not add any "
+        f"fact, number, name, or detail that does not appear in it."
+    )
+    return await _grounded_retry_from_evidence(
+        "relay-drop-reconciliation", retry_prompt, content, task, team,
         all_results, result, liveness_path)
 
 
