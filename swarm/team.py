@@ -12958,6 +12958,16 @@ def _record_stream_artifacts(team, out: dict) -> None:
                         "agent": out.get("agent_name") or "",
                         "chars": out.get("result_chars") or 0,
                         "salient_tokens": _dropped_toks,
+                        # Phase 18: the SAME bounded preview format already used for
+                        # the retained ledger above (a short, pre-truncated stream-
+                        # event preview, never the raw result) -- not new raw-content
+                        # exposure, just no longer discarding a field that already
+                        # existed on `out`. This is what lets a later, TARGETED
+                        # selection (see _dropped_evidence_lines_for_missing) quote a
+                        # specific dropped item verbatim instead of only knowing it
+                        # existed. Still capped at _TOOL_EVIDENCE_DROPPED_MAX entries
+                        # -- this does not enlarge _TOOL_EVIDENCE_MAX_ITEMS itself.
+                        "preview": (out.get("result_preview") or "")[:200],
                     })
                 team._tool_evidence_dropped_count = (
                     getattr(team, "_tool_evidence_dropped_count", 0) + 1)
@@ -14199,6 +14209,48 @@ def _tool_evidence_lines(team) -> list[str]:
     return lines
 
 
+def _dropped_evidence_lines_for_missing(team, missing: list[str]) -> list[str]:
+    """Phase 18: targeted evidence recovery, without touching the global
+    _TOOL_EVIDENCE_MAX_ITEMS cap.
+
+    team._tool_evidence_dropped (Phase 14, screw #3) already records bounded
+    metadata -- including, since Phase 18, a bounded preview -- for whatever
+    overflowed the 12-item retained ledger. Most of that overflow is
+    irrelevant to any one retry; indiscriminately appending all of it back in
+    would just recreate an uncapped evidence dump under a different name.
+
+    So this only surfaces a dropped entry when one of the run's OWN reported
+    `missing` filenames (the relay-drop guard's own list -- never a fixed or
+    battery-specific name) appears among that entry's already-computed
+    salient_tokens. _salient_tokens extracts bare filenames like
+    "admin_gst_api.py" as their own token (the file-extension alternative in
+    _SALIENT_RE), so this is a plain substring/membership check over data
+    already computed for an unrelated purpose -- no new extraction logic, no
+    per-project rule, and it can find nothing for a request that names no
+    real files.
+
+    Bounded by construction: team._tool_evidence_dropped is itself capped at
+    _TOOL_EVIDENCE_DROPPED_MAX entries, and this only ever returns a subset
+    of it.
+    """
+    dropped = getattr(team, "_tool_evidence_dropped", None)
+    if not dropped or not missing:
+        return []
+    wanted = {m.lower() for m in missing}
+    lines = []
+    for item in dropped:
+        toks = {t.lower() for t in (item.get("salient_tokens") or [])}
+        if not (wanted & toks):
+            continue
+        preview = " ".join((item.get("preview") or "").split())
+        if not preview:
+            continue
+        who = f" [{item['agent']}]" if item.get("agent") else ""
+        size = f" ({item['chars']:,} chars)" if item.get("chars") else ""
+        lines.append(f"  {item['name']}{who}{size} -> {preview}")
+    return lines
+
+
 _EVIDENCE_RECONCILE_FLAG = "_evidence_reconcile_done"
 
 
@@ -14411,6 +14463,21 @@ async def _reconcile_relay_drop_with_tool_evidence(
     evidence; a retry that merely mentions more filenames without grounding
     is rejected exactly like an ungrounded retry in either sibling mechanism.
 
+    Phase 18 addition: live validation (Phase 17) found a genuine relay-drop
+    fire (18 named/4 kept) whose retry was correctly REJECTED, and traced why
+    -- 2 of this run's own tool results had already overflowed the 12-item
+    _tool_evidence cap before the retry ran, so the retry's evidence view was
+    incomplete for exactly the kind of large, late reads a long enumeration
+    task produces. Rather than raise the global cap (which every OTHER
+    caller of team._tool_evidence would also inherit, unbounded and
+    unmeasured), this pulls in ONLY the dropped entries whose salient tokens
+    match one of THIS retry's own reported missing items -- see
+    _dropped_evidence_lines_for_missing. Acceptance is unaffected: this only
+    changes what the retry prompt can quote, never what
+    _answer_supported_by_evidence checks against (team._evidence_tokens
+    already included every dropped item's tokens regardless of this cap,
+    confirmed in Phase 15).
+
     Same once-per-run flag and same shared one-retry-per-call budget as its
     two siblings -- this is a third TRIGGER on the same budget, not a third
     retry opportunity.
@@ -14425,7 +14492,8 @@ async def _reconcile_relay_drop_with_tool_evidence(
         return content, result, False
 
     setattr(team, _RELAY_DROP_RECONCILE_FLAG, True)
-    evidence_body = "\n".join(tool_evidence_lines)
+    _targeted_lines = _dropped_evidence_lines_for_missing(team, missing)
+    evidence_body = "\n".join(tool_evidence_lines + _targeted_lines)
     missing_body = ", ".join(missing[:20])
     retry_prompt = (
         f"{task}\n\nIMPORTANT: your previous answer left out most of what "
