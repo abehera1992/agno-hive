@@ -78,9 +78,14 @@ def test_cap_overflow_is_logged_and_counted(capsys):
 
 def test_dropped_item_metadata_is_bounded_no_giant_preview_leakage(capsys):
     """Requirement: bounded metadata/previews only, never raw giant tool
-    output. The dropped-item record must not carry a 'preview' key at all --
-    only name/agent/chars/salient_tokens, and the tokens list itself is
-    capped."""
+    output. Phase 18 deliberately added a bounded preview to the dropped-item
+    record (same ~200-char stream-event preview already used for the
+    retained ledger, truncated defensively) so a later TARGETED selection
+    (_dropped_evidence_lines_for_missing) can quote a specific dropped item
+    verbatim -- this is not new raw-content exposure, since the preview
+    field already existed on the tool event and was simply not carried over
+    before. The tokens list remains capped, and the preview itself is capped
+    to 200 chars regardless of how large the real result was."""
     team = _Team()
     huge_tokens = {f"identifier_{i}" for i in range(500)}
     for i in range(_TOOL_EVIDENCE_MAX_ITEMS):
@@ -89,11 +94,14 @@ def test_dropped_item_metadata_is_bounded_no_giant_preview_leakage(capsys):
         team, _tool_end_event("get_file_content", "Coder", tokens=huge_tokens))
 
     dropped = team._tool_evidence_dropped[0]
-    assert "preview" not in dropped
+    assert dropped["preview"] == "preview of get_file_content"
+    assert len(dropped["preview"]) <= 200
     assert len(dropped["salient_tokens"]) <= 20
 
     out = capsys.readouterr().out
-    # The log line names the tool and counts, never a raw content dump.
+    # The LOG LINE itself still only names the tool and counts, never a raw
+    # content dump -- the preview lives in the bounded telemetry structure,
+    # not in unbounded log output.
     assert "preview of get_file_content" not in out
 
 
