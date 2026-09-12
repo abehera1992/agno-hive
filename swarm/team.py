@@ -4939,6 +4939,23 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         content, getattr(team, "_member_result_chars", 0)
     )
     if withheld is not None:
+        # Phase 14, screw #1 (2026-09-19): give this guard one grounded recovery
+        # attempt, quoting team._tool_evidence, before falling back to the
+        # disclosure-only behaviour below -- see
+        # _reconcile_under_delivery_with_tool_evidence for the full rationale
+        # and why this is the mirror of Phase 13's over-delivery mechanism.
+        # Reconciliation success returns the recovered content directly; the
+        # "far less than gathered" banner below only ever applies to a draft
+        # this call could NOT recover.
+        content, result, _recovered = await _reconcile_under_delivery_with_tool_evidence(
+            content, task, team, all_results, result, liveness_path,
+            _tool_evidence_lines(team), synthesis_run)
+        if _recovered:
+            print(f"[team] under-delivery recovered — {len(content.strip()):,} "
+                  f"chars, grounded in captured tool evidence", flush=True)
+            return (content
+                    + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
+                    + _tail())
         print(f"[team] answer reports far less than was gathered "
               f"({len(content.strip()):,} chars against {withheld:,} chars of member "
               f"results) — flagging", flush=True)
@@ -12761,10 +12778,34 @@ def _record_stream_artifacts(team, out: dict) -> None:
         _so_far = getattr(team, "_member_result_chars", 0)
         if _so_far >= _MEMBER_VOLUME_CEILING and len(content) > 2_000:
             _before = len(content)
+            _elided_middle_text = content[_ELIDE_HEAD:_before - _ELIDE_TAIL]
             content = _elide_middle(content)
-            print(f"[team] member volume ceiling ({_MEMBER_VOLUME_CEILING:,}) already "
-                  f"reached at {_so_far:,} — elided this report {_before:,} -> "
-                  f"{len(content):,} chars, head and tail kept", flush=True)
+            if len(content) < _before:  # _elide_middle can no-op below its own floor
+                print(f"[team] member volume ceiling ({_MEMBER_VOLUME_CEILING:,}) "
+                      f"already reached at {_so_far:,} — elided this report "
+                      f"{_before:,} -> {len(content):,} chars, head and tail kept",
+                      flush=True)
+                # Phase 14, screw #3 (observability only -- no behaviour change
+                # to what ships). Bounded metadata about the ELIDED MIDDLE
+                # specifically (never the raw text): which member, how much,
+                # and which salient identifiers were in the part that got cut
+                # -- so a later analysis can check whether one of them
+                # reappears, unsupported, in the final answer or a fabrication
+                # report, without this log line itself becoming a second copy
+                # of the full report.
+                if not isinstance(getattr(team, "_member_volume_overflow", None), list):
+                    team._member_volume_overflow = []
+                _elided_toks = sorted(_salient_tokens(_elided_middle_text))[:20]
+                if len(team._member_volume_overflow) < _TOOL_EVIDENCE_DROPPED_MAX:
+                    team._member_volume_overflow.append({
+                        "agent": out.get("agent_name") or "",
+                        "before_chars": _before,
+                        "after_chars": len(content),
+                        "elided_chars": _before - len(content),
+                        "salient_tokens_elided": _elided_toks,
+                    })
+                team._member_volume_overflow_count = (
+                    getattr(team, "_member_volume_overflow_count", 0) + 1)
 
         # A report that is a tiny fraction of what the member READ is the opposite
         # failure, and the coordinator cannot see it: it receives 434 chars and has no
@@ -12879,6 +12920,38 @@ def _record_stream_artifacts(team, out: dict) -> None:
                     "preview": out["result_preview"],
                     "chars": out.get("result_chars") or 0,
                 })
+            else:
+                # Phase 14, screw #3 (observability only -- no behaviour change).
+                # This item is NOT lost: _evidence_tokens below still accumulates
+                # its salient tokens regardless of this cap, so
+                # _answer_supported_by_evidence's grounding check is unaffected.
+                # What IS lost is the ability to QUOTE this specific item
+                # verbatim in a disclosure banner or a reconciliation retry
+                # prompt (_captured_tool_evidence / _tool_evidence_lines only
+                # ever see the first _TOOL_EVIDENCE_MAX_ITEMS). Bounded metadata
+                # only -- name/agent/chars/salient tokens already computed
+                # below, never the raw result -- so a later analysis can ask
+                # "did a dropped item's identifier reappear in the final answer
+                # unsupported" without this log line itself being a second,
+                # uncapped evidence store.
+                if not isinstance(getattr(team, "_tool_evidence_dropped", None), list):
+                    team._tool_evidence_dropped = []
+                _dropped_toks = sorted(out.get("result_tokens") or ())[:20]
+                if len(team._tool_evidence_dropped) < _TOOL_EVIDENCE_DROPPED_MAX:
+                    team._tool_evidence_dropped.append({
+                        "name": out["name"],
+                        "agent": out.get("agent_name") or "",
+                        "chars": out.get("result_chars") or 0,
+                        "salient_tokens": _dropped_toks,
+                    })
+                team._tool_evidence_dropped_count = (
+                    getattr(team, "_tool_evidence_dropped_count", 0) + 1)
+                print(f"[team] tool evidence cap ({_TOOL_EVIDENCE_MAX_ITEMS}) reached — "
+                      f"dropping {out['name']} [{out.get('agent_name') or '?'}] "
+                      f"({out.get('result_chars') or 0:,} chars) from the quotable "
+                      f"ledger; {_TOOL_EVIDENCE_MAX_ITEMS} retained, "
+                      f"{team._tool_evidence_dropped_count} dropped so far this run "
+                      f"(still counted toward _evidence_tokens)", flush=True)
             # Accumulated from EVERY tool result, not just the first twelve rendered
             # above: the rendering cap exists to keep a banner readable, and has nothing
             # to do with what the run is entitled to treat as evidence.
@@ -14018,6 +14091,9 @@ def _answer_supported_by_evidence(content: str, team) -> bool:
 
 
 _TOOL_EVIDENCE_MAX_ITEMS = 12
+# Phase 14, screw #3: bounded the same way as _TOOL_EVIDENCE_MAX_ITEMS itself --
+# this is metadata about what didn't make the cut, not a second uncapped store.
+_TOOL_EVIDENCE_DROPPED_MAX = 12
 _THIN_ANSWER_CHARS = 1_200
 # Retuned 2026-08-28, same day it shipped, after battery B17 fired it on two CORRECT
 # answers. The first cut gated on the read->relay collapse ratio, on the theory that a
@@ -14170,38 +14246,120 @@ async def _reconcile_thin_answer_with_tool_evidence(
         f"the values shown above. Do not add any fact, number, name, or detail "
         f"that does not appear in them."
     )
+    return await _grounded_retry_from_evidence(
+        "evidence-reconciliation", retry_prompt, content, task, team,
+        all_results, result, liveness_path)
+
+
+async def _grounded_retry_from_evidence(
+        label: str, retry_prompt: str, content: str, task: str, team,
+        all_results, result, liveness_path: str | None):
+    """Shared retry-and-accept core behind every "quote the evidence verbatim,
+    accept only if grounded" reconciliation in this file (Phase 13's thin-answer
+    case and Phase 14's under-delivery case, screw #1). Factored out so the
+    acceptance discipline documented on _reconcile_thin_answer_with_tool_evidence
+    -- quote evidence verbatim, accept via _answer_supported_by_evidence, never
+    on length or read count alone -- lives in exactly one place rather than
+    risking the two call sites drifting apart.
+
+    Callers own their own trigger conditions, their own once-per-run flag, and
+    the shared `len(all_results) > 1` retry-budget check; this function assumes
+    all of that has already passed and the caller has already decided a retry
+    should be attempted, decorated with the caller's own retry_prompt.
+
+    Returns (content, result, reconciled) -- see
+    _reconcile_thin_answer_with_tool_evidence's own docstring for the full
+    contract; identical here.
+    """
     reads_before = _run_read_count(team)
-    print(f"[team] evidence reconciliation: thin answer, real tool evidence "
-          f"available — asking once more, quoting it directly", flush=True)
+    print(f"[team] {label}: asking once more, quoting captured evidence "
+          f"directly", flush=True)
     try:
         retried, retry = await _stream_team_run(
-            team, retry_prompt, log_label="evidence-reconciliation",
-            liveness_path=liveness_path)
+            team, retry_prompt, log_label=label, liveness_path=liveness_path)
         all_results.append(retry)
     except Exception as exc:  # noqa: BLE001
-        print(f"[team] evidence reconciliation retry failed: {exc} — keeping "
-              f"the draft", flush=True)
+        print(f"[team] {label} retry failed: {exc} — keeping the draft",
+              flush=True)
         return content, result, False
     if not retried:
-        print("[team] evidence reconciliation retry returned nothing — keeping "
-              "the draft", flush=True)
+        print(f"[team] {label} retry returned nothing — keeping the draft",
+              flush=True)
         return content, result, False
 
     if not _answer_supported_by_evidence(retried, team):
-        # The exact failure this function is designed never to repeat: a retry
-        # that is different (even longer) but still not actually grounded in the
-        # quoted evidence. Reject it exactly like the original draft would have
-        # been -- the disclosure footer still runs on the ORIGINAL content.
-        print("[team] evidence reconciliation retry still not supported by "
-              "captured tool evidence — keeping the draft", flush=True)
+        # The exact failure this mechanism is designed never to repeat: a retry
+        # that is different (even longer, even naming more things) but still not
+        # actually grounded in the quoted evidence. Reject it exactly like the
+        # original draft would have been -- the caller's own disclosure/fallback
+        # still runs on the ORIGINAL content.
+        print(f"[team] {label} retry still not supported by captured evidence "
+              f"— keeping the draft", flush=True)
         return content, result, False
 
     adopted, adopted_result = _adopt_retry(
-        "evidence-reconciliation", content, result, retried, retry,
+        label, content, result, retried, retry,
         member_reads=_member_reads_delta(team, reads_before))
     if adopted is not retried:
         return content, result, False
     return adopted, adopted_result, True
+
+
+_UNDER_DELIVERY_RECONCILE_FLAG = "_under_delivery_reconcile_done"
+
+
+async def _reconcile_under_delivery_with_tool_evidence(
+        content: str, task: str, team, all_results, result,
+        liveness_path: str | None, tool_evidence_lines: list[str],
+        synthesis_run: bool):
+    """Phase 14, screw #1: the mirror case of _reconcile_thin_answer_with_tool_
+    evidence. That mechanism fires when the answer says MORE than its relay
+    supports; this one fires when the answer says FAR LESS than what was
+    actually gathered -- _completion_claim_instead_of_answer's own trigger
+    shape ("the reads happened, nothing was invented, the answer just doesn't
+    carry it"), which Phase 13's forensic trace found firing and returning
+    BEFORE the over-delivery mechanism was ever reached (T13a: 532 chars
+    against 16,214 gathered). Both mechanisms share the acceptance discipline
+    in _grounded_retry_from_evidence; only the trigger and the retry framing
+    differ.
+
+    Deliberately reuses team._tool_evidence -- the same bounded, already-
+    capped, already-tested ledger the over-delivery mechanism reads -- rather
+    than the members' own prose (team._member_results), which is the LOSSY
+    artifact under-delivery is defined against in the first place and so is
+    not "authoritative evidence" in the sense this recovery needs.
+
+    Same call-once-per-run flag pattern and same shared one-retry-per-call
+    budget (`len(all_results) > 1`) as every other reconciliation in this
+    file -- this does not add a second retry opportunity, it gives the
+    EXISTING under-delivery guard a grounded recovery attempt before it falls
+    back to disclosure, using whichever retry slot this call has not already
+    spent.
+
+    Returns (content, result, reconciled) -- identical contract to
+    _reconcile_thin_answer_with_tool_evidence.
+    """
+    if (synthesis_run or not tool_evidence_lines
+            or getattr(team, _UNDER_DELIVERY_RECONCILE_FLAG, False)):
+        return content, result, False
+    if len(all_results) > 1:
+        return content, result, False
+
+    setattr(team, _UNDER_DELIVERY_RECONCILE_FLAG, True)
+    evidence_body = "\n".join(tool_evidence_lines)
+    retry_prompt = (
+        f"{task}\n\nIMPORTANT: your previous answer reported back far less "
+        f"than this run's own tool calls actually found -- the reads happened "
+        f"and nothing was invented, but most of what was gathered never "
+        f"reached the answer. Before answering, here is exactly what those "
+        f"tools returned this run -- not a summary, not a guess, their own "
+        f"output:\n\n{evidence_body}\n\nAnswer the original question again, "
+        f"in full, using ONLY the values shown above. Do not add any fact, "
+        f"number, name, or detail that does not appear in them."
+    )
+    return await _grounded_retry_from_evidence(
+        "under-delivery-reconciliation", retry_prompt, content, task, team,
+        all_results, result, liveness_path)
 
 
 def _checkpoint_block(team) -> str:
