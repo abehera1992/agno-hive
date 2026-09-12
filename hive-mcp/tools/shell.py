@@ -161,6 +161,11 @@ def get_env_info() -> str:
         f"OS: {platform.system()} {platform.release()} ({platform.machine()})",
         f"Python: {platform.python_version()} at {sys.executable}",
         f"Project root: {PROJECT_ROOT}",
+        # Separate from Project root -- that's a configured constant, not a
+        # measurement. A task asking for "the current working directory" had
+        # no field to answer from before this: os.getcwd() is the actual
+        # runtime measurement, and can legitimately differ from PROJECT_ROOT.
+        f"Current working directory: {os.getcwd()}",
         "",
         "── Available tools ──────────────────────────────────",
     ]
