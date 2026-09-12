@@ -4965,11 +4965,15 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     if (_answer_thin < _THIN_ANSWER_CHARS and _relayed_thin
             and _answer_thin > _relayed_thin * _THIN_ANSWER_SURPLUS_RATIO
             and not _answer_supported_by_evidence(content, team)):
+        _evidence_lines = _tool_evidence_lines(team)
+        content, result, _reconciled = await _reconcile_thin_answer_with_tool_evidence(
+            content, task, team, all_results, result, liveness_path,
+            _evidence_lines, synthesis_run)
         tool_evidence = _captured_tool_evidence(team)
         if tool_evidence:
             print(f"[team] thin answer ({_answer_thin:,} chars) says more than the "
                   f"{_relayed_thin:,} chars relayed to it — surfacing captured tool "
-                  f"output", flush=True)
+                  f"output{' (reconciled)' if _reconciled else ''}", flush=True)
             return (content + tool_evidence
                     + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
                     + _tail())
@@ -14073,9 +14077,26 @@ def _captured_tool_evidence(team) -> str:
     high ratio, because compressing 40,000 chars of reading into a good 3,000-char
     answer is the job working correctly, not a failure.
     """
+    lines = _tool_evidence_lines(team)
+    if not lines:
+        return ""
+    return ("\n\n---\n**WHAT THE TOOLS ACTUALLY RETURNED — the answer above is short "
+            "relative to the evidence this run gathered, and the values below reached a "
+            "member but may not have survived its summary on the way to the answer. "
+            "Where the two disagree, these are the tool's own words:**\n```\n"
+            + "\n".join(lines) + "\n```")
+
+
+def _tool_evidence_lines(team) -> list[str]:
+    """The raw `name [agent] (chars) -> preview` lines behind _captured_tool_evidence,
+    factored out so a retry prompt can quote the bare evidence without the
+    reader-facing disclosure wrapper around it -- see
+    _reconcile_thin_answer_with_tool_evidence, which needs the same lines but as
+    something to ANSWER FROM, not something to read about.
+    """
     evidence = getattr(team, "_tool_evidence", None)
     if not evidence:
-        return ""
+        return []
     lines = []
     for item in evidence:
         preview = " ".join((item.get("preview") or "").split())
@@ -14084,13 +14105,103 @@ def _captured_tool_evidence(team) -> str:
         who = f" [{item['agent']}]" if item.get("agent") else ""
         size = f" ({item['chars']:,} chars)" if item.get("chars") else ""
         lines.append(f"  {item['name']}{who}{size} -> {preview}")
-    if not lines:
-        return ""
-    return ("\n\n---\n**WHAT THE TOOLS ACTUALLY RETURNED — the answer above is short "
-            "relative to the evidence this run gathered, and the values below reached a "
-            "member but may not have survived its summary on the way to the answer. "
-            "Where the two disagree, these are the tool's own words:**\n```\n"
-            + "\n".join(lines) + "\n```")
+    return lines
+
+
+_EVIDENCE_RECONCILE_FLAG = "_evidence_reconcile_done"
+
+
+async def _reconcile_thin_answer_with_tool_evidence(
+        content: str, task: str, team, all_results, result,
+        liveness_path: str | None, tool_evidence_lines: list[str],
+        synthesis_run: bool):
+    """Give the coordinator ONE chance to answer FROM the tools' own captured output
+    before falling back to appending it as a footnote the reader has to reconcile
+    themselves -- the generic evidence-fidelity intervention (2026-09-12), sharing
+    the exact trigger this guard family already used pre-existing (thin answer +
+    real captured tool evidence + claims not already grounded in it), changing only
+    what happens once that trigger fires.
+
+    Deliberately generic: this reuses whatever the run's OWN tool calls captured in
+    team._tool_evidence (get_env_info, db_query, list_directory, any tool at all --
+    nothing here names a specific tool, field, or test), gated on the SAME
+    conditions _captured_tool_evidence's own call site already checked before this
+    function is even called. No new detection logic, only a new disposition for an
+    existing, already-narrow trigger.
+
+    CRITICAL prior-art constraint, from the guard immediately above this one in the
+    file (_completion_claim_instead_of_answer's own history): a delivery-style retry
+    for this exact failure shape was tried once already and produced a WORSE
+    fabrication -- asked to "write what your members actually reported", the retry
+    invented a sprint summary, seven work items, five owner names and two
+    performance statistics, none of which existed in the 904 real characters
+    available, and was adopted because it was merely LONGER. This function avoids
+    that specific trap two ways: (1) the retry prompt QUOTES the captured tool
+    evidence verbatim rather than asking the model to "say more" in the abstract --
+    there is nothing left to invent if the real values are already in front of it;
+    (2) adoption is gated on _answer_supported_by_evidence(retried, team), the
+    existing, already-tested deterministic check that every claimed token in the
+    retry is one a tool actually returned this run -- not on length, not on read
+    count (which _more_grounded uses and which a delivery-only retry cannot move).
+
+    Returns (content, result, reconciled) -- reconciled is True only when a
+    grounded retry was actually adopted, so the caller knows whether to still fall
+    back to the original disclosure-footer behaviour (unchanged either way; the
+    footer still appends to whatever content ships, reconciled or not, so a reader
+    can always see the raw evidence regardless of which path was taken).
+    """
+    if synthesis_run or not tool_evidence_lines or getattr(team, _EVIDENCE_RECONCILE_FLAG, False):
+        return content, result, False
+    if len(all_results) > 1:
+        # Aggregate one-retry-per-call budget (see _verified_answer's own
+        # docstring) already spent by an earlier guard this call -- the raw
+        # evidence still reaches the reader via the unchanged disclosure
+        # footer, just not as a reconciled answer.
+        return content, result, False
+
+    setattr(team, _EVIDENCE_RECONCILE_FLAG, True)
+    evidence_body = "\n".join(tool_evidence_lines)
+    retry_prompt = (
+        f"{task}\n\nIMPORTANT: your previous answer was too short to plausibly "
+        f"reflect what this run's own tool calls actually found, and could not be "
+        f"confirmed against them. Before answering, here is exactly what those "
+        f"tools returned this run -- not a summary, not a guess, their own output:"
+        f"\n\n{evidence_body}\n\nAnswer the original question again using ONLY "
+        f"the values shown above. Do not add any fact, number, name, or detail "
+        f"that does not appear in them."
+    )
+    reads_before = _run_read_count(team)
+    print(f"[team] evidence reconciliation: thin answer, real tool evidence "
+          f"available — asking once more, quoting it directly", flush=True)
+    try:
+        retried, retry = await _stream_team_run(
+            team, retry_prompt, log_label="evidence-reconciliation",
+            liveness_path=liveness_path)
+        all_results.append(retry)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[team] evidence reconciliation retry failed: {exc} — keeping "
+              f"the draft", flush=True)
+        return content, result, False
+    if not retried:
+        print("[team] evidence reconciliation retry returned nothing — keeping "
+              "the draft", flush=True)
+        return content, result, False
+
+    if not _answer_supported_by_evidence(retried, team):
+        # The exact failure this function is designed never to repeat: a retry
+        # that is different (even longer) but still not actually grounded in the
+        # quoted evidence. Reject it exactly like the original draft would have
+        # been -- the disclosure footer still runs on the ORIGINAL content.
+        print("[team] evidence reconciliation retry still not supported by "
+              "captured tool evidence — keeping the draft", flush=True)
+        return content, result, False
+
+    adopted, adopted_result = _adopt_retry(
+        "evidence-reconciliation", content, result, retried, retry,
+        member_reads=_member_reads_delta(team, reads_before))
+    if adopted is not retried:
+        return content, result, False
+    return adopted, adopted_result, True
 
 
 def _checkpoint_block(team) -> str:
