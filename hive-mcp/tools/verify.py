@@ -1745,8 +1745,31 @@ def _quote_matches(quoted: str, window: str) -> bool:
 # answer (interleaved with re-reading files that never changed what got submitted),
 # ~50s each, before the run was cancelled — verify_claims itself never told the
 # caller that re-checking unchanged text is pointless.
-_last_checked_answer: str | None = None
-_repeat_count = 0
+#
+# Phase 4 (AGNOHive Reliability Program, 2026-09-12): this used to be a SINGLE
+# scalar (_last_checked_answer/_repeat_count), which is correct only if this
+# process ever checks one answer at a time. hive-mcp is one FastMCP process
+# serving every concurrent tool call from every agent in every run pointed at
+# it, and this state is module-level -- shared across all of them. Two
+# interleaved, UNRELATED calls on DIFFERENT text corrupt each other's tracking
+# through the single slot: Run A checks text X (slot := X); before A's own
+# second call, Run B (any other in-flight run) checks its own, different text
+# Y (slot := Y, overwriting X); A's genuine second submission of X now reads
+# as "different from the slot" and silently loses its own stuck-loop
+# detection. Keying by the answer text itself instead of one shared slot
+# means Run A's and Run B's tracking cannot overwrite each other merely by
+# interleaving. Bounded so unrelated concurrent traffic cannot grow this
+# without limit.
+#
+# NOT fixed by this: two DIFFERENT callers whose answer text is BYTE-
+# IDENTICAL by coincidence (e.g. both produced from the same canned failure
+# sentence) still collide, and the second will see the first's count and be
+# told STOPPED without ever having its own claims checked. No text-only key
+# can distinguish that from a genuine same-caller repeat; resolving it needs
+# a caller/session identity this module does not have and this phase's scope
+# does not add (see Phase 4 report, DEDUP FINDING).
+_MAX_TRACKED_ANSWERS = 8
+_checked_answer_counts: dict[str, int] = {}
 
 
 def verify_claims(answer: str, glob_filter: str = "") -> str:
@@ -1767,19 +1790,12 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     ("`path`, line N -- `quoted text`"), the quoted text's actual location IS checked
     against line N — but a bare, unquoted citation still only proves the line exists.
     """
-    global _last_checked_answer, _repeat_count
+    global _checked_answer_counts
     if not answer or not answer.strip():
         return "verify_claims: nothing to check (empty answer)."
 
-    if answer == _last_checked_answer:
-        _repeat_count += 1
-    else:
-        _last_checked_answer = answer
-        _repeat_count = 0
-
-    if _repeat_count >= 1:
-        _last_checked_answer = None  # reset — a later distinct check isn't blocked
-        _repeat_count = 0
+    if _checked_answer_counts.get(answer, 0) >= 1:
+        _checked_answer_counts.pop(answer, None)  # reset — a later distinct check isn't blocked
         # Deliberately contains "could NOT be found", the exact phrase
         # swarm/team.py's _verify_claims uses to classify a report as "bad"
         # ("could NOT be found" in report). That orchestrator-level guard calls
@@ -1797,6 +1813,12 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             "what you are claiming, or (b) if you cannot find a grounded answer "
             "after that, say so plainly instead of re-submitting the same draft."
         )
+
+    _checked_answer_counts[answer] = 1
+    if len(_checked_answer_counts) > _MAX_TRACKED_ANSWERS:
+        # Oldest entry evicted by insertion order -- bounds memory under
+        # concurrent load without needing a caller identity to key on.
+        _checked_answer_counts.pop(next(iter(_checked_answer_counts)), None)
 
     # ── collect candidate claims ──────────────────────────────────────────────
     idents: list[str] = []

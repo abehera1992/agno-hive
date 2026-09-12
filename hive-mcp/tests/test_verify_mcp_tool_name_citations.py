@@ -16,8 +16,7 @@ from tools import verify
 
 @pytest.fixture(autouse=True)
 def _reset_repeat_tracking():
-    verify._last_checked_answer = None
-    verify._repeat_count = 0
+    verify._checked_answer_counts = {}
 
 
 def test_known_hive_mcp_tool_name_backtick_is_excluded_like_noise(monkeypatch):

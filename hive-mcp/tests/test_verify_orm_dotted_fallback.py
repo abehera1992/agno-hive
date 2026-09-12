@@ -17,8 +17,7 @@ from tools import verify
 
 @pytest.fixture(autouse=True)
 def _reset_repeat_tracking():
-    verify._last_checked_answer = None
-    verify._repeat_count = 0
+    verify._checked_answer_counts = {}
 
 
 def test_dotted_claim_falls_back_to_bare_attribute_when_joined_string_not_found(monkeypatch):

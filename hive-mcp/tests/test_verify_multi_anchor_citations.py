@@ -33,11 +33,9 @@ def reset_repeat_guard():
     module-level state. Several tests here deliberately submit the SAME sentence
     against different fixtures, so without this the second one gets the repeat
     notice instead of a real report — a test-isolation problem, not a bug."""
-    verify._last_checked_answer = None
-    verify._repeat_count = 0
+    verify._checked_answer_counts = {}
     yield
-    verify._last_checked_answer = None
-    verify._repeat_count = 0
+    verify._checked_answer_counts = {}
 
 
 def _rg_noop(tok, **k):

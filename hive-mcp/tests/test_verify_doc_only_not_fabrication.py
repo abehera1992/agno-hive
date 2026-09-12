@@ -36,8 +36,7 @@ def _reset_repeat_tracking():
     short-circuit (verify_claims STOPPED: this exact answer text was already
     checked...) would otherwise fire on the second+ test and mask what's actually
     being tested here. Same reset pattern as test_verify_orm_dotted_fallback.py."""
-    verify._last_checked_answer = None
-    verify._repeat_count = 0
+    verify._checked_answer_counts = {}
 
 
 def test_symbol_found_only_in_docs_is_reported_as_doc_only(monkeypatch):
