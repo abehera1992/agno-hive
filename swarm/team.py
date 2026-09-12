@@ -3873,6 +3873,120 @@ def _ends_with_unfinished_intent(content: str) -> bool:
 
 _SYNTAX_REASK_FLAG = "_syntax_loss_reask_done"
 
+# The fixed totals line _computed_comparison's underlying tool always ends on
+# (hive-mcp/tools/compare.py's own `block()`/f-string) -- parsed back out
+# rather than changing _computed_comparison's return type, which _tail() and
+# its one caller already consume as a plain string.
+_COMPARISON_TOTALS_RE = re.compile(
+    r"TOTALS: left (\d+), right (\d+), matched (\d+), left-only (\d+), right-only (\d+)\.")
+_COMPARISON_BODY_RE = re.compile(r"```\n(.*)\n```", re.DOTALL)
+
+_COMPARISON_RECONCILE_FLAG = "_comparison_reconcile_done"
+
+
+def _comparison_gap_counts(cmp_note: str) -> tuple[int, int] | None:
+    """(left_only, right_only) from a _computed_comparison footnote, or None
+    when no comparison ran (empty note) or the totals line is missing."""
+    m = _COMPARISON_TOTALS_RE.search(cmp_note or "")
+    return (int(m.group(4)), int(m.group(5))) if m else None
+
+
+def _comparison_body(cmp_note: str) -> str:
+    """The raw compare_enumerations tool output inside a footnote, without the
+    '**THE COMPARISON, COMPUTED...**' wrapper prose -- handed to a retry
+    prompt as evidence, not the decorated version meant for a human reader."""
+    m = _COMPARISON_BODY_RE.search(cmp_note or "")
+    return m.group(1).strip() if m else (cmp_note or "").strip()
+
+
+async def _reconcile_completeness_claim_with_comparison(
+        content: str, task: str, team, all_results, result,
+        liveness_path: str | None, cmp_note: str, synthesis_run: bool):
+    """Give the coordinator ONE chance to reconcile its own completeness claim
+    against compare_enumerations' deterministic result BEFORE the answer is
+    finalised -- instead of only appending the comparison as a trailing
+    footnote after the wrong conclusion has already been written.
+
+    Phase 2 (AGNOHive Reliability Program) traced the exact failure this
+    closes: R4/R6 T2 both shipped "There are no missing or mismatched items."
+    followed, in the SAME message, by the same tool call's own "LEFT ONLY
+    (6)" -- confirmed via the ZGX journal that the coordinator's own content-
+    generation stream completed BEFORE "[team] computed the comparison" ever
+    printed. The deterministic evidence never participated in the decision;
+    it only decorated the answer afterward, which is why the contradiction
+    reached readers as two true-looking sentences instead of a caught error.
+
+    Deliberately narrow and content-agnostic: this fires on the SHAPE of a
+    contradiction (a completeness claim present + a real left-only/right-only
+    count from the SAME deterministic tool call this run already made), never
+    on specific wording -- no "six gaps", no T2/T13 phrasing. Reuses
+    _completeness_claims, the same tested lexicon _unchecked_completeness_
+    block already relies on, rather than inventing a second one.
+
+    Returns (content, result, reconciled) -- reconciled is True only when a
+    retry was actually adopted, so the caller knows to recompute _cmp_note
+    against the content that will actually ship (the retry may have prompted
+    fresh reads, growing the enumeration ledger).
+    """
+    if synthesis_run or not cmp_note or getattr(team, _COMPARISON_RECONCILE_FLAG, False):
+        return content, result, False
+    if len(all_results) > 1:
+        # Aggregate one-retry-per-call budget (see _verified_answer's own
+        # docstring) already spent by an earlier guard this call -- e.g. the
+        # syntax-loss reask above. The contradiction still rides along as a
+        # footnote via _tail(), exactly as before this change, rather than
+        # spending a second full pipeline re-run.
+        return content, result, False
+    gap = _comparison_gap_counts(cmp_note)
+    if not gap or (gap[0] == 0 and gap[1] == 0):
+        # Either the comparison could not be parsed (should not happen given
+        # compare_enumerations' fixed format) or it found nothing left/right-
+        # only -- nothing to reconcile.
+        return content, result, False
+    claims = _reconcile_completeness_claims(content)
+    if not claims:
+        # The draft never claimed completeness in the first place -- e.g. it
+        # already said "6 endpoints have no hook". Nothing to reconcile.
+        return content, result, False
+
+    setattr(team, _COMPARISON_RECONCILE_FLAG, True)
+    left_only, right_only = gap
+    evidence = _comparison_body(cmp_note)
+    retry_prompt = (
+        f"{task}\n\nIMPORTANT: your previous answer said \"{claims[0]}\", but "
+        f"compare_enumerations -- a deterministic tool, not a re-read -- found "
+        f"{left_only} item(s) on the left with no match on the right and "
+        f"{right_only} on the right with no match on the left, for the SAME "
+        f"two files this answer is about:\n\n{evidence}\n\nAnswer the "
+        f"original question again. If any left-only or right-only item is "
+        f"real, your answer must name it and must not claim completeness."
+    )
+    reads_before = _run_read_count(team)
+    print(f"[team] comparison reconciliation: draft claims completeness "
+          f"(\"{claims[0][:80]}\") but compare_enumerations shows "
+          f"left-only={left_only}, right-only={right_only} — asking once "
+          f"more before finalising", flush=True)
+    try:
+        retried, retry = await _stream_team_run(
+            team, retry_prompt, log_label="comparison-reconciliation",
+            liveness_path=liveness_path)
+        all_results.append(retry)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[team] comparison reconciliation retry failed: {exc} — "
+              f"keeping the draft", flush=True)
+        return content, result, False
+    if not retried:
+        print("[team] comparison reconciliation retry returned nothing — "
+              "keeping the draft", flush=True)
+        return content, result, False
+
+    adopted, adopted_result = _adopt_retry(
+        "comparison-reconciliation", content, result, retried, retry,
+        member_reads=_member_reads_delta(team, reads_before))
+    if adopted is not retried:
+        return content, result, False
+    return adopted, adopted_result, True
+
 
 async def _reask_after_syntax_loss(content: str, task: str, team, all_results,
                                    result, liveness_path: str | None,
@@ -4010,6 +4124,32 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     content, result = await _reask_after_syntax_loss(
         content, task, team, all_results, result, liveness_path, synthesis_run)
 
+    # Phase 2B (AGNOHive Reliability Program, 2026-09-12): compute the deterministic
+    # comparison HERE -- before fabrication detection, before every other guard --
+    # and give the coordinator one chance to reconcile a completeness claim against
+    # it, instead of only computing it at the very end and appending it as a
+    # footnote after the wrong conclusion has already been committed. See
+    # _reconcile_completeness_claim_with_comparison's docstring for the live R4/R6
+    # T2 trace this closes. Must run before _verify_claims below: a retry here
+    # changes `content`, and _fab_report/_fab_bad must be computed against
+    # whatever content actually ships, not the draft it replaced.
+    _cmp_note = await _computed_comparison(
+        task,
+        (getattr(team, "_read_state", None) or {}).get("enumerations")
+        if isinstance(getattr(team, "_read_state", None), dict) else None,
+        hive_mcp_url, hive_mcp_tools, content)
+    content, result, _reconciled = await _reconcile_completeness_claim_with_comparison(
+        content, task, team, all_results, result, liveness_path, _cmp_note, synthesis_run)
+    if _reconciled:
+        # The retry may have prompted fresh reads, growing the enumeration ledger --
+        # recompute so the footnote (still appended unconditionally via _tail(),
+        # exactly as before this change) describes the content that actually ships.
+        _cmp_note = await _computed_comparison(
+            task,
+            (getattr(team, "_read_state", None) or {}).get("enumerations")
+            if isinstance(getattr(team, "_read_state", None), dict) else None,
+            hive_mcp_url, hive_mcp_tools, content)
+
     # Fabrication detection runs FIRST, and its finding rides along with whichever
     # guard fires (2026-09-02). Every guard below ends in a `return`, so the chain is
     # first-match-wins, and _verify_claims sat last -- meaning an answer with two
@@ -4096,11 +4236,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         task, content, hive_mcp_url, hive_mcp_tools)
     _fields_note = await _fields_not_declared_on_type(
         task, content, hive_mcp_url, hive_mcp_tools)
-    _cmp_note = await _computed_comparison(
-        task,
-        (getattr(team, "_read_state", None) or {}).get("enumerations")
-        if isinstance(getattr(team, "_read_state", None), dict) else None,
-        hive_mcp_url, hive_mcp_tools, content)
+    # _cmp_note is now computed earlier (Phase 2B, above _verify_claims) so a
+    # reconciliation retry can run before finalisation -- not recomputed here.
 
     def _tail() -> str:
         """What every guard appends: the write summary, plus any fabrication finding,
@@ -13425,6 +13562,47 @@ def _completeness_claims(content: str) -> list[str]:
     for m in _COMPLETENESS_CLAIM_RE.finditer(body):
         if _COMPLETENESS_NOT_A_CLAIM_RE.search(body[max(0, m.start() - 12):m.start() + 12]):
             continue
+        out.append(m.group(0).strip())
+    return out
+
+
+# Phase 2B (2026-09-12): the exact real answers this phase traced miss
+# _COMPLETENESS_CLAIM_RE entirely. R4/R6 T2's own "There are no missing or
+# mismatched items." matches none of its five alternatives (no digit after
+# "all", no "are/is covered|accounted for|listed|identified", "items" is not
+# in the "other/additional FILES|SERVICES|..." noun list); R6 T13b's "No gaps
+# exist." fails the same way ("there are no gaps" requires the literal
+# "there are" prefix). Reusing _completeness_claims as-is would make
+# _reconcile_completeness_claim_with_comparison a no-op on both of the cases
+# that motivated it. Kept as an ADDITIVE, separate regex/function rather than
+# widening _COMPLETENESS_CLAIM_RE in place, so _unchecked_completeness_
+# block's own already-tuned false-positive behaviour is untouched by this
+# phase. Still generic -- no T2/T13 wording, no project nouns, only the same
+# "asserts a two-set difference is empty" shape the original targets.
+_RECONCILE_EXTRA_COMPLETENESS_RE = re.compile(
+    r"\bno\s+(?:missing|mismatched)(?:\s+or\s+\w+)?\s+items?\b"
+    r"|\bno\s+gaps?\s+(?:exist|found|remain)\b"
+    r"|\ball\s+[\w\- ]{3,40}\s+have\s+a\s+corresponding\b"
+    r"|\bfully\s+covered\b"
+    r"|\beverything\s+is\s+covered\b",
+    re.IGNORECASE,
+)
+
+
+def _reconcile_completeness_claims(content: str) -> list[str]:
+    """Completeness claims worth reconciling against a computed comparison --
+    _completeness_claims' own matches, plus _RECONCILE_EXTRA_COMPLETENESS_RE's
+    wider net over gap-analysis phrasing that lexicon does not cover. Used
+    only by _reconcile_completeness_claim_with_comparison, which already
+    gates on a real _computed_comparison result existing -- a slightly wider
+    completeness net carries far less false-positive risk here than it would
+    in _unchecked_completeness_block's more general context, since this one
+    only ever fires on an answer this run already ran a two-sided
+    comparison for.
+    """
+    out = _completeness_claims(content)
+    body = (content or "").split("---\n**")[0]
+    for m in _RECONCILE_EXTRA_COMPLETENESS_RE.finditer(body):
         out.append(m.group(0).strip())
     return out
 
