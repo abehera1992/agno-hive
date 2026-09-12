@@ -11672,6 +11672,33 @@ def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:
     about a detected loop (that's the caller's job, e.g. declining to advance
     last_progress_at) -- it only answers "does this look like one segment being
     generated over and over," nothing about intent or correctness.
+
+    Phase 5 (T12 context/liveness, 2026-09-12): the three tiers above all window
+    to _REPETITION_LOOKBACK_CHARS (4000 chars) -- correct for the sentence- and
+    phrase-scale repeats they were built for, but blind to T12's own failure
+    shape. Live-confirmed on R6 T12 (session 59033df0, the
+    litellm.ContextWindowExceededError at 258,049/262,144 tokens): the
+    coordinator regenerated a whole multi-thousand-character report section
+    ("## Verified Findings" through a full router/model enumeration) FOUR times
+    in one run, each recurrence separated by 8,000-25,000 chars of intervening
+    (also-repeated) text -- always outside the 4000-char window, so every tier
+    above stayed silent on every single cycle and nothing ever withheld
+    last_progress_at credit for it. Confirmed via direct byte comparison of the
+    persisted transcript: the first ~150 characters of two of those recurrences
+    are byte-identical 24,748 chars apart.
+    A fourth tier reuses the SAME prefix already extracted for tier 3, checked
+    against the full prior content instead of only its tail -- but requires it
+    to have already occurred TWICE there (this new one would be the third),
+    not merely once. A single far-apart reuse is deliberately still not
+    flagged: test_repetition_only_outside_the_lookback_window_is_not_flagged
+    pins exactly that as intentional ("targets recent, SUSTAINED repetition,
+    not any-time-ever reuse"), and _REPETITION_PREFIX_CHARS' own comment
+    already named this exact lever in advance ("require the prefix to recur
+    MULTIPLE times ... not a further threshold increase") for a case just
+    like this one. A genuine runaway loop keeps re-emitting the same block
+    every cycle, so it still reaches three occurrences with only one extra
+    cycle of delay versus flagging on the second; a phrase that legitimately
+    recurs once, far away, for an unrelated reason is left alone.
     """
     normalized_new = " ".join(new_segment.split())
     if len(normalized_new) < _REPETITION_MIN_SEGMENT_LEN:
@@ -11692,7 +11719,17 @@ def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:
     prefix = filler_stripped_new[:_REPETITION_PREFIX_CHARS]
     if len(prefix) < _REPETITION_MIN_SEGMENT_LEN:
         return False
-    return prefix in filler_stripped_prior
+    if prefix in filler_stripped_prior:
+        return True
+
+    # Tier 4 (Phase 5): same prefix, same floor, checked against the WHOLE
+    # prior content rather than only its tail -- catches a large-block repeat
+    # separated by more than _REPETITION_LOOKBACK_CHARS of intervening text.
+    # Requires 2 PRIOR occurrences (this would be the 3rd) rather than 1, so a
+    # single far-apart reuse (the existing, deliberately-permitted case) is
+    # still not flagged -- only sustained, repeated recurrence is.
+    full_filler_stripped_prior = _normalize_for_repetition_check(prior_content)
+    return full_filler_stripped_prior.count(prefix) >= 2
 
 
 _REPETITION_DECAY_WINDOW_CHARS = 1500

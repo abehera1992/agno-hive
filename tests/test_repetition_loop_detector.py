@@ -268,3 +268,93 @@ def test_original_escalating_incident_still_detected_at_the_calibrated_threshold
     )
 
     assert _looks_like_repetition_loop(new_segment, prior) is True
+
+
+# ── Phase 5 (AGNOHive Reliability Program): large-block repeats (T12) ───────
+#
+# Live-confirmed on R6 T12 (session 59033df0-4c6c-46eb-aa97-5fe2a1ca03d4, the
+# litellm.ContextWindowExceededError at 258,049/262,144 tokens): the
+# coordinator regenerated a whole multi-thousand-character report section
+# four times, each recurrence 8,000-25,000 chars apart -- always outside
+# _REPETITION_LOOKBACK_CHARS (4000), so tiers 1-3 above stayed silent every
+# single cycle. These pin the fourth, full-span tier added to close that gap,
+# and its interaction with the existing "single far-apart reuse is not
+# flagged" guarantee.
+
+_T12_HEADING = (
+    "## Verified Findings (From File Reads)\n\n"
+    "### 1. `include_router` lines in `API/inventory-service/main.py`:\n"
+    "- `app.include_router(items_api.router)`\n"
+    "- `app.include_router(categories_api.router)`\n"
+)
+
+
+def test_large_block_repeated_a_third_time_far_outside_the_window_is_detected():
+    """Reproduces the actual T12 shape: the same multi-hundred-char section
+    heading recurring a THIRD time, each occurrence separated by thousands of
+    characters of different intervening text -- far beyond
+    _REPETITION_LOOKBACK_CHARS, and far beyond a single reuse."""
+    filler = "x" * 9000
+    prior = _T12_HEADING + filler + _T12_HEADING + filler
+    new_segment = _T12_HEADING
+
+    assert _looks_like_repetition_loop(new_segment, prior) is True
+
+
+def test_large_block_repeated_only_a_second_time_is_not_yet_flagged():
+    """One recurrence of a large block, far outside the window, is NOT
+    flagged -- same 'single far-apart reuse is legitimate' guarantee
+    test_repetition_only_outside_the_lookback_window_is_not_flagged already
+    pins for a short phrase, now confirmed to hold for a large block too.
+    A genuine runaway loop reaches the 3rd occurrence one cycle later; this
+    is the deliberate cost of not false-positiving on a single coincidental
+    reuse."""
+    filler = "x" * 9000
+    prior = _T12_HEADING + filler
+    new_segment = _T12_HEADING
+
+    assert _looks_like_repetition_loop(new_segment, prior) is False
+
+
+def test_large_block_repeat_within_the_existing_window_still_caught_by_tier_one():
+    """When the repeat DOES happen to fall inside the existing lookback
+    window, the original (faster, single-recurrence) tiers still catch it
+    immediately -- tier 4 only extends coverage, it does not weaken the
+    existing fast path."""
+    new_segment = _T12_HEADING
+    prior = "some short recent text. " + _T12_HEADING
+
+    assert _looks_like_repetition_loop(new_segment, prior) is True
+
+
+def test_two_different_large_sections_are_not_confused_with_each_other():
+    """Two DIFFERENT large, legitimate sections (different prefixes) must not
+    trip the full-span tier just because both are long and far from the
+    lookback window -- only an actual recurring PREFIX does."""
+    filler = "x" * 9000
+    section_a = _T12_HEADING
+    section_b = (
+        "## External Service Dependencies\n\n"
+        "### Business Service Integration\n\n"
+        "- Calls `POST /internal/tenants/names` for tenant name resolution\n"
+    )
+    prior = section_a + filler + section_b + filler
+    new_segment = section_b  # b recurring once, far away -- not yet a 3rd time
+
+    assert _looks_like_repetition_loop(new_segment, prior) is False
+
+
+def test_normal_long_form_answer_with_no_repeats_is_never_flagged():
+    """A genuinely long, varied, non-repeating answer (T12's own passing
+    shape) must never be flagged by the new tier -- regression guard against
+    over-triggering on ordinary long-form generation."""
+    sections = [
+        f"## Section {i}\n\nDistinct content describing part {i} of the "
+        f"architecture, naming real files and line numbers unique to this "
+        f"section, not shared with any other.\n"
+        for i in range(20)
+    ]
+    prior = "".join(sections[:19])
+    new_segment = sections[19]
+
+    assert _looks_like_repetition_loop(new_segment, prior) is False
