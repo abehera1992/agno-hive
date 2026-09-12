@@ -2210,6 +2210,22 @@ _ANSWER_PATH_RE = re.compile(
 )
 
 
+def _extension_group(path: str) -> str:
+    """The join-relevant 'side' of a file, mirroring compare_enumerations' own
+    extractor split (hive-mcp/tools/compare.py's _extract): '.py' is the
+    @router/backend side, '.ts'/'.tsx'/'.js'/'.jsx' is the RTK Query/frontend
+    side. Not a claim that a codebase can only ever have two sides -- just the
+    two this tool currently understands -- so anything else is 'other' rather
+    than forced into one of these two.
+    """
+    p = str(path).lower()
+    if p.endswith(".py"):
+        return "py"
+    if p.endswith((".ts", ".tsx", ".js", ".jsx")):
+        return "ts"
+    return "other"
+
+
 def _second_side_from_answer(content: str, already: str) -> str:
     """The other file a two-sided answer names, when the run only enumerated one.
 
@@ -2295,20 +2311,76 @@ async def _computed_comparison(task: str, enumerations: dict | None,
     # fallback that exists for exactly this case never ran.
     files_only = [e for e in enumerations.values()
                   if str(e.get("path", "")).endswith((".py", ".ts", ".tsx", ".js", ".jsx"))]
-    top = sorted(files_only, key=lambda e: -e.get("count", 0))[:2]
-    if not top:
+    if not files_only:
         return _skip("no file enumerations recorded (directories only)")
-    left = top[0].get("path", "")
-    if len(top) >= 2:
-        right = top[1].get("path", "")
+
+    # Group by side, not a blind top-2-by-count (Phase 2A, 2026-09-12). R6 T2's
+    # ledger held business_api.py and business_admin_api.py -- two BACKEND files,
+    # one just happening to have more declarations than the one real frontend
+    # file, businessApi.ts -- and top-2-overall paired the two backend files,
+    # producing a nonsensical backend-vs-backend diff instead of the intended
+    # backend-vs-frontend one. Ranking within each side first, then pairing the
+    # two highest-ranked sides, means a same-side file can never outrank a
+    # cross-side one just by raw declaration count.
+    by_group: dict[str, list[dict]] = {}
+    for e in files_only:
+        by_group.setdefault(_extension_group(e.get("path", "")), []).append(e)
+    groups_present = [g for g in by_group if by_group[g]]
+
+    def _pick_within_side(candidates: list[dict]) -> str:
+        """Among same-side candidates, prefer the one the TASK TEXT itself
+        names -- every _TWO_SIDED_TASK_RE example names its left-hand file
+        verbatim ("List every endpoint defined in <path>, then..."), and a run
+        that incidentally read extra same-side files along the way (R6 T2:
+        business_admin_api.py and modules_api.py, both read while chasing the
+        frontend file) must not let one of those outrank the file the task
+        actually asked about just by having a higher raw declaration count.
+        Falls back to highest count only when the task names none of the
+        candidates, or names more than one (still genuinely ambiguous) --
+        e.g. T13a, which deliberately never names its files at all.
+        """
+        named = [c for c in candidates
+                 if c.get("path", "") and c.get("path", "") in (task or "")]
+        chosen = named[0] if len(named) == 1 else max(candidates, key=lambda e: e.get("count", 0))
+        return chosen.get("path", "")
+
+    if len(groups_present) >= 2:
+        # files_only already restricts extensions to .py/.ts/.tsx/.js/.jsx, so
+        # _extension_group can only ever produce "py" and/or "ts" here -- "py"
+        # is always the left/backend side and "ts" the right/frontend side,
+        # matching every existing example and docstring for this tool (never a
+        # claim these are the only two sides that could ever exist, just the
+        # only two _extension_group currently distinguishes). Ordering by count
+        # instead of by side is exactly the bug being fixed here, so it is not
+        # repeated for left/right selection either.
+        left = _pick_within_side(by_group["py"])
+        right = _pick_within_side(by_group["ts"])
     else:
-        # Only one side was read. Take the other from the answer's own text rather than
-        # abandoning the comparison -- see _second_side_from_answer for why this is kept
-        # narrow, and for the battery run that made it necessary.
-        right = _second_side_from_answer(content, left)
+        # Every enumerated file is on the SAME side -- e.g. only backend .py files
+        # were ever read this run, or only frontend .ts files were. There is no
+        # cross-side pair to offer from the ledger, and pairing two same-side
+        # files reproduces the exact R6 T2 defect this rewrite fixes. Try the
+        # answer's own text for a named file from a DIFFERENT side before giving
+        # up entirely -- the same narrow fallback _second_side_from_answer
+        # already provided for the single-file case, now also covering
+        # multiple-candidates-one-side.
+        only_group = groups_present[0] if groups_present else None
+        left = _pick_within_side(by_group[only_group]) if only_group else ""
+        right = _second_side_from_answer(content, left) if left else ""
+        if right and _extension_group(right) == only_group:
+            # The answer only named ANOTHER file of the same side -- still not a
+            # safe pair, so treat it as if nothing was found.
+            right = ""
         if right:
             print(f"[team] second comparison side taken from the answer: {right}",
                   flush=True)
+        if not right:
+            return _skip(
+                f"no safe pair — only one file side ({only_group or 'none'}) was "
+                f"enumerated this run ({len(files_only)} file(s): "
+                f"{[e.get('path', '') for e in files_only]}); refusing to pair two "
+                f"files from the same side")
+
     if not left or not right or left == right:
         return _skip(f"could not resolve two distinct sides (left={left!r}, right={right!r}; "
                      f"{len(enumerations)} enumeration(s) recorded)")
@@ -13361,7 +13433,19 @@ _TWO_SIDED_TASK_RE = re.compile(
     r"\bboth\s+sides\b"
     r"|\benumerate\s+both\b"
     r"|\bthen\s+list\s+(?:every|all|each)\b"
-    r"|\blist\s+(?:every|all|each)\b[^.]{0,160}?\bthen\s+list\b",
+    r"|\blist\s+(?:every|all|each)\b[^.]{0,160}?\bthen\s+list\b"
+    # T13's shape (Phase 2A, 2026-09-12): a single-sentence audit --
+    # "list its endpoints, its tables, and its hooks, and identify anything ...
+    # with no frontend counterpart" -- never says "both sides" or "then list",
+    # so it fell through to "task is not two-sided" and _computed_comparison
+    # never ran at all, unlike T2 which at least gets a (separately buggy)
+    # comparison. Anchored on the same gap-completeness lexicon as T2's own
+    # "no corresponding hook", not on loosening the enumeration-style phrases
+    # above -- narrower than "make it match more things", targeted at the
+    # actual semantic signal of a two-set completeness question.
+    r"|\bno\s+corresponding\s+\w+"
+    r"|\bno\s+matching\s+\w+"
+    r"|\bno\s+[\w\- ]{0,24}?counterpart\b",
     re.IGNORECASE,
 )
 
