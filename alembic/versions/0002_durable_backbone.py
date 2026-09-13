@@ -18,6 +18,23 @@ installation stamped past 0001_baseline).
 Revision ID: 0002_durable_backbone
 Revises: 0001_baseline
 Create Date: (Phase B)
+
+Phase C correction (still pre-first-deployment, see swarm/db.py's matching
+comment on `runs.run_id`): run_id/execution_id are Phase A's
+execution_context.new_id() -- uuid4().hex[:12], NOT a well-formed UUID
+string, since that is also Phase0Run.run_id's existing, load-bearing format.
+sa.Uuid columns (and Postgres's native UUID type) reject or mis-round-trip
+that shape -- confirmed empirically when Phase C's own persistence smoke
+test raised "badly formed hexadecimal UUID string" on read-back. Changed
+runs.run_id, executions.execution_id/run_id/parent_execution_id, and the two
+columns elsewhere that FK-reference them (tool_calls.execution_id,
+claims.run_id/execution_id) from Uuid to Text. tool_call_id/evidence_id/
+claim_id themselves are UNCHANGED (still Uuid) -- Phase C never writes to
+tool_calls/evidence/claims, so fixing those ids' identical, still-latent
+version of this same issue is left to whichever phase first persists them.
+Edited this revision directly, not layered as a new 0003, because 0002 has
+never been applied to any real (non-ephemeral-test) database -- the same
+reasoning already used for 0001_baseline's task_outcome_queue defaults fix.
 """
 from alembic import op
 import sqlalchemy as sa
@@ -31,7 +48,7 @@ depends_on = None
 def upgrade() -> None:
     op.create_table(
         "runs",
-        sa.Column("run_id", sa.Uuid(as_uuid=False), primary_key=True),
+        sa.Column("run_id", sa.Text, primary_key=True),
         sa.Column("session_id", sa.Uuid(as_uuid=False),
                   sa.ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False),
         sa.Column("run_type", sa.Text, nullable=True),
@@ -47,10 +64,10 @@ def upgrade() -> None:
 
     op.create_table(
         "executions",
-        sa.Column("execution_id", sa.Uuid(as_uuid=False), primary_key=True),
-        sa.Column("run_id", sa.Uuid(as_uuid=False),
+        sa.Column("execution_id", sa.Text, primary_key=True),
+        sa.Column("run_id", sa.Text,
                   sa.ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False),
-        sa.Column("parent_execution_id", sa.Uuid(as_uuid=False),
+        sa.Column("parent_execution_id", sa.Text,
                   sa.ForeignKey("executions.execution_id", ondelete="CASCADE"), nullable=True),
         sa.Column("agent_name", sa.Text, nullable=False),
         sa.Column("execution_type", sa.Text, nullable=False),
@@ -67,7 +84,7 @@ def upgrade() -> None:
     op.create_table(
         "tool_calls",
         sa.Column("tool_call_id", sa.Uuid(as_uuid=False), primary_key=True),
-        sa.Column("execution_id", sa.Uuid(as_uuid=False),
+        sa.Column("execution_id", sa.Text,
                   sa.ForeignKey("executions.execution_id", ondelete="CASCADE"), nullable=False),
         sa.Column("tool_name", sa.Text, nullable=False),
         sa.Column("arguments", sa.JSON, nullable=True),
@@ -97,9 +114,9 @@ def upgrade() -> None:
     op.create_table(
         "claims",
         sa.Column("claim_id", sa.Uuid(as_uuid=False), primary_key=True),
-        sa.Column("run_id", sa.Uuid(as_uuid=False),
+        sa.Column("run_id", sa.Text,
                   sa.ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False),
-        sa.Column("execution_id", sa.Uuid(as_uuid=False),
+        sa.Column("execution_id", sa.Text,
                   sa.ForeignKey("executions.execution_id", ondelete="SET NULL"), nullable=True),
         sa.Column("statement", sa.Text, nullable=False),
         sa.Column("status", sa.Text, nullable=False, server_default="unverified"),

@@ -207,7 +207,22 @@ def _existing_task_outcome_queue_columns(sync_conn) -> set[str]:
 # would only be able to drift from its own ancestor, never help deletion work.
 runs = Table(
     "runs", metadata,
-    Column("run_id", Uuid(as_uuid=False), primary_key=True),
+    # Text, NOT Uuid: run_id is Phase A's execution_context.new_id() --
+    # uuid4().hex[:12], the SAME 12-hex-char scheme Phase0Run.run_id already
+    # uses (see execution_context.py's own module docstring on why that
+    # format is load-bearing and must not change) -- not a well-formed UUID
+    # string. SQLAlchemy's Uuid type round-trips (and Postgres's native UUID
+    # column enforces at INSERT time) only real UUID-shaped values; a
+    # Phase-C smoke test caught this empirically (INSERT succeeded on SQLite,
+    # the very next SELECT raised "badly formed hexadecimal UUID string") --
+    # confirmed a genuine Phase B schema gap, not a Phase A defect, since
+    # Phase A's id format is explicitly protected elsewhere. Corrected here
+    # (and on every column below that stores or references a Phase A run_id/
+    # execution_id) rather than in a new migration layered on top, because
+    # 0002_durable_backbone has never been applied to any real database --
+    # the same reasoning already applied to 0001_baseline's task_outcome_queue
+    # defaults fix earlier in this same effort.
+    Column("run_id", Text, primary_key=True),
     Column("session_id", Uuid(as_uuid=False),
            ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False),
     # 'single' | 'chunk' | 'synthesis' -- set by a later phase; nullable here since
@@ -224,15 +239,17 @@ Index("runs_session_idx", runs.c.session_id, runs.c.started_at.asc())
 
 executions = Table(
     "executions", metadata,
-    Column("execution_id", Uuid(as_uuid=False), primary_key=True),
-    Column("run_id", Uuid(as_uuid=False), ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False),
+    # Text, NOT Uuid -- same reason as runs.run_id above: this is Phase A's
+    # execution_context.new_id(), a 12-hex-char string, not a well-formed UUID.
+    Column("execution_id", Text, primary_key=True),
+    Column("run_id", Text, ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False),
     # Self-referencing. CASCADE (not RESTRICT/SET NULL): deleting an execution
     # should take its own subtree with it, matching the execution-tree semantics
     # Phase A's RunContext already enforces at the application layer (parent
     # closed only after every child under it has finished). In practice this FK
     # is only ever exercised transitively via runs.run_id -> chat_sessions.id
     # cascading -- no code path deletes a single execution on its own.
-    Column("parent_execution_id", Uuid(as_uuid=False),
+    Column("parent_execution_id", Text,
            ForeignKey("executions.execution_id", ondelete="CASCADE"), nullable=True),
     Column("agent_name", Text, nullable=False),
     Column("execution_type", Text, nullable=False),   # 'coordinator' | 'delegation'
@@ -247,8 +264,17 @@ Index("executions_parent_idx", executions.c.parent_execution_id)
 
 tool_calls = Table(
     "tool_calls", metadata,
+    # tool_call_id itself stays Uuid for now -- Phase C never writes to this
+    # table (ToolCall persistence is explicitly out of scope here). A future
+    # phase that DOES persist ToolCallRecord.tool_call_id (also
+    # execution_context.new_id(), the same 12-hex-char scheme) will need the
+    # identical Text fix this file applies to run_id/execution_id below --
+    # flagged here so it is not silently rediscovered.
     Column("tool_call_id", Uuid(as_uuid=False), primary_key=True),
-    Column("execution_id", Uuid(as_uuid=False),
+    # Text, NOT Uuid: must match executions.execution_id's corrected type
+    # (a FK's column type must match what it references) -- see runs.run_id's
+    # comment above for the full reasoning.
+    Column("execution_id", Text,
            ForeignKey("executions.execution_id", ondelete="CASCADE"), nullable=False),
     Column("tool_name", Text, nullable=False),
     Column("arguments", JSON, nullable=True),
@@ -279,14 +305,20 @@ Index("evidence_content_hash_idx", evidence.c.content_hash)
 
 claims = Table(
     "claims", metadata,
+    # claim_id itself stays Uuid for now -- Phase C never writes to this table
+    # (Claim persistence is explicitly out of scope here); see tool_calls.
+    # tool_call_id's identical note above.
     Column("claim_id", Uuid(as_uuid=False), primary_key=True),
-    Column("run_id", Uuid(as_uuid=False), ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False),
+    # Text, NOT Uuid: must match runs.run_id's corrected type.
+    Column("run_id", Text, ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False),
     # SET NULL, not CASCADE: a claim's supporting execution is incidental context,
     # not what makes the claim exist -- deleting one execution (e.g. a superseded
     # retry) must not silently delete a claim that cited its output. The claim
     # still disappears when the whole RUN (and therefore session) is deleted, via
     # claims.run_id's own CASCADE above.
-    Column("execution_id", Uuid(as_uuid=False),
+    #
+    # Text, NOT Uuid: must match executions.execution_id's corrected type.
+    Column("execution_id", Text,
            ForeignKey("executions.execution_id", ondelete="SET NULL"), nullable=True),
     Column("statement", Text, nullable=False),
     Column("status", Text, nullable=False, default="unverified"),  # 'unverified' | 'grounded' | 'ungrounded'

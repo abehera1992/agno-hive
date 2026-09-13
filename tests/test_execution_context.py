@@ -1,23 +1,46 @@
-"""Phase A (durable execution/evidence backbone, runtime identity only --
-see swarm/execution_context.py's module docstring). No persistence exists yet;
-these tests cover the in-memory Session -> Run -> Execution -> ToolCall ->
-Evidence identity/boundary this phase establishes:
+"""Phase A/C (durable execution/evidence backbone). Covers:
 
-  * RunContext itself (pure, no team/agno involved)
-  * _tool_interception_hook's new ToolCall/Evidence capture and delegation ->
-    child-Execution wiring (swarm/team.py)
-  * _stream_team_run's new retry -> sibling-Execution wiring (swarm/team.py)
+  * RunContext itself (pure, no team/agno involved) -- Phase A, in-memory only
+  * _tool_interception_hook's ToolCall/Evidence capture (in-memory, still
+    Phase A -- ToolCall/Evidence are explicitly NOT persisted, see Phase C's
+    swarm/execution_store.py) and delegation -> child-Execution wiring
+  * _stream_team_run's retry -> sibling-Execution wiring
+  * Phase C's Run/Execution DURABLE persistence, wired at the exact same
+    points listed above -- a fake `team` carrying a real RunContext will now
+    also attempt real (fail-open) database writes via swarm/execution_store.py,
+    so this file points config.database_url at an isolated in-memory SQLite
+    database for its own duration, exactly like tests/test_migrations.py
+    does, rather than letting those writes reach the default on-disk
+    data/agnohive.db.
 
 Follows this suite's existing convention (see test_team_tool_interception_hook.py,
 test_relay_drop_reconciliation.py) of driving the hook/function directly with a
 lightweight fake `team`, rather than building a real agno Team.
 """
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 
 import swarm.execution_context as ec
 import swarm.team as team_mod
+from config.config import config
+from swarm import db
+
+
+@pytest.fixture(autouse=True)
+def _isolated_db(monkeypatch):
+    """Every test in this file may exercise a code path that now attempts a
+    real (fail-open) database write -- see this module's own docstring.
+    Points at an isolated in-memory SQLite database, migrated to head, so
+    those writes land somewhere real and inspectable rather than silently
+    failing against (or worse, touching) the default on-disk database."""
+    monkeypatch.setattr(config, "database_url", "sqlite+aiosqlite:///:memory:")
+    monkeypatch.setattr(config, "postgres_uri", "")
+    asyncio.run(db.reset_engine_for_tests())
+    from swarm.migrations import run_upgrade
+    run_upgrade("head")
+    yield
 from swarm.execution_context import RunContext
 from swarm.team import _make_tool_interception_hook, _stream_team_run
 
@@ -412,3 +435,94 @@ def test_run_context_gets_a_fresh_id_when_phase0_is_absent():
     run_id_2 = _phase0.run_id if _phase0 is not None else ec.new_id()
 
     assert run_id_1 != run_id_2   # every invocation without telemetry still gets its own id
+
+
+# ── Phase A finding A (fixed for Phase C): broadcast delegation ─────────────
+
+@pytest.mark.asyncio
+async def test_broadcast_delegation_does_not_create_a_bogus_empty_agent_execution():
+    """delegate_task_to_members (plural, agno's broadcast tool) must not match
+    the same handling as delegate_task_to_member (singular) -- it carries no
+    member_id at all, so treating it as a delegation created a child Execution
+    with an empty/meaningless agent_name."""
+    team = _fake_team()
+    root = team._run_context.root_execution_id
+    hook = _make_tool_interception_hook()
+
+    async def fake_broadcast(**kwargs):
+        return "broadcast dispatched"
+
+    await hook("delegate_task_to_members", fake_broadcast,
+               {"task": "look into X"}, team=team)
+
+    rc = team._run_context
+    # No new execution was created -- the broadcast call is still an ordinary
+    # ToolCall on the calling (root) execution, just not a delegation with its
+    # own child.
+    assert set(rc.executions.keys()) == {root}
+    assert rc.tool_calls[0].execution_id == root
+
+
+@pytest.mark.asyncio
+async def test_singular_delegation_is_unaffected_by_the_broadcast_fix():
+    """Regression guard: fixing the prefix match to an exact match must not
+    stop matching the real, singular delegate_task_to_member call."""
+    team = _fake_team()
+    root = team._run_context.root_execution_id
+    hook = _make_tool_interception_hook()
+
+    async def fake_delegate(**kwargs):
+        return "member did the work"
+
+    await hook("delegate_task_to_member", fake_delegate,
+               {"member_id": "researcher", "task": "look into X"}, team=team)
+
+    rc = team._run_context
+    children = [e for e in rc.executions.values() if e.parent_execution_id == root]
+    assert len(children) == 1
+    assert children[0].agent_name == "researcher"
+
+
+# ── Phase A finding B (fixed for Phase C): CancelledError status accounting ─
+
+@pytest.mark.asyncio
+async def test_cancelled_delegation_is_marked_failed_not_ok():
+    """asyncio.CancelledError is a BaseException, not caught by the hook's own
+    `except Exception` -- before the fix, the finally block unconditionally
+    marked a cancelled delegation's execution "ok". sys.exc_info() must now
+    see the in-flight cancellation and mark it "failed" instead."""
+    import asyncio as _asyncio
+
+    team = _fake_team()
+    hook = _make_tool_interception_hook()
+
+    async def cancelled_delegate(**kwargs):
+        raise _asyncio.CancelledError()
+
+    with pytest.raises(_asyncio.CancelledError):
+        await hook("delegate_task_to_member", cancelled_delegate,
+                   {"member_id": "researcher", "task": "x"}, team=team)
+
+    rc = team._run_context
+    child = next(e for e in rc.executions.values() if e.execution_type == "delegation")
+    assert child.status == "failed"
+    # The stack must not be left with the cancelled child still "current".
+    assert rc.current_execution_id == rc.root_execution_id
+
+
+@pytest.mark.asyncio
+async def test_a_successful_delegation_is_still_marked_ok_after_the_fix():
+    """Regression guard: the sys.exc_info()-based finally must not start
+    marking ordinary successful delegations as failed."""
+    team = _fake_team()
+    hook = _make_tool_interception_hook()
+
+    async def fake_delegate(**kwargs):
+        return "member did the work"
+
+    await hook("delegate_task_to_member", fake_delegate,
+               {"member_id": "researcher", "task": "x"}, team=team)
+
+    rc = team._run_context
+    child = next(e for e in rc.executions.values() if e.execution_type == "delegation")
+    assert child.status == "ok"

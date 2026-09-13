@@ -25,6 +25,7 @@ from config.config import config
 from swarm import phase0
 from swarm import context_pack
 from swarm import execution_context
+from swarm import execution_store
 
 _tracer = trace.get_tracer("agno-hive.team")
 
@@ -10966,7 +10967,18 @@ def _make_tool_interception_hook(
         # a delegate_task_to_member call itself is attributed to its caller, not
         # to the member execution it is about to start.
         run_context = getattr(team, "_run_context", None)
-        _is_delegation = function_name.startswith("delegate_task_to_member")
+        # Phase A finding A (fixed for Phase C): exact match, not a prefix check.
+        # "delegate_task_to_member".startswith() also matched the PLURAL broadcast
+        # tool "delegate_task_to_members" (agno's own, see team.py's
+        # _DELEGATION_TOOL_NAMES) -- that call carries no `member_id` at all (it
+        # targets the whole team, see the read-cache hook's own "broadcasts to
+        # the whole team, no single target" branch), so treating it as a
+        # delegation here created a child Execution with an empty/meaningless
+        # agent_name. A broadcast call is still recorded as an ordinary ToolCall
+        # on the CALLING execution (via _tool_call below) -- it simply does not
+        # get a durable per-member child Execution, since it has no single
+        # member to attribute one to.
+        _is_delegation = function_name == "delegate_task_to_member"
         _tool_call = (run_context.start_tool_call(function_name, args)
                       if run_context is not None else None)
         _delegation_execution_id = None
@@ -10976,6 +10988,13 @@ def _make_tool_interception_hook(
                 execution_type="delegation",
                 parent_execution_id=run_context.current_execution_id,
             )
+            # Phase C: durable Execution row for this delegation, mirroring the
+            # in-memory ExecutionRecord just created. Fail-open, awaited inline,
+            # and wrapped in guard() as a second, last-resort defense layer on
+            # top of this function's own internal try/except (see
+            # execution_store.guard's own docstring).
+            await execution_store.guard(execution_store.persist_execution_created(
+                run_context.executions[_delegation_execution_id]))
         started = time.monotonic()
         if activity is not None:
             activity["last_call_name"] = function_name
@@ -11047,6 +11066,9 @@ def _make_tool_interception_hook(
                 run_context.finish_tool_call(_tool_call, content=None, success=False, error=str(exc))
             if _delegation_execution_id is not None:
                 run_context.finish_execution(_delegation_execution_id, status="failed", error=str(exc))
+                # Phase C: durable completion, read before clearing the id below.
+                await execution_store.guard(execution_store.persist_execution_completed(
+                    run_context.executions[_delegation_execution_id]))
                 _delegation_execution_id = None
             print(f"[team] tool_hook: {function_name}({args}) RAISED {type(exc).__name__}: {exc} after {elapsed:.2f}s", flush=True)
             if activity is not None:
@@ -11059,8 +11081,26 @@ def _make_tool_interception_hook(
             # exactly once regardless of which branch above ran -- the except
             # branch already closed it (as "failed") and cleared the id, so this
             # only fires for the success path.
+            #
+            # Phase A finding B (fixed for Phase C): `except Exception` above
+            # does not catch asyncio.CancelledError (a BaseException since
+            # Python 3.8), so a cancelled delegation used to reach this finally
+            # with _delegation_execution_id still set and get marked "ok"
+            # unconditionally -- durably wrong once Phase C persists this
+            # status. sys.exc_info() reports whichever exception (if any) is
+            # currently propagating through this finally, including
+            # CancelledError, without changing what is caught/re-raised above
+            # or altering cancellation semantics in any way.
             if _delegation_execution_id is not None:
-                run_context.finish_execution(_delegation_execution_id, status="ok")
+                run_context.finish_execution(
+                    _delegation_execution_id,
+                    status="failed" if sys.exc_info()[0] is not None else "ok",
+                )
+                # Phase C: durable completion, mirroring the in-memory update
+                # above exactly -- covers the success path AND a cancellation
+                # (or any BaseException) that bypassed the except block above.
+                await execution_store.guard(execution_store.persist_execution_completed(
+                    run_context.executions[_delegation_execution_id]))
 
     return _tool_interception_hook
 
@@ -12165,6 +12205,15 @@ async def run_task_stream(
             session_id, execution_context.new_id())
         team._run_context.start_execution(
             agent_name="Coordinator", execution_type="coordinator", parent_execution_id=None)
+        # Phase C: durable Run + root Execution, one transaction (see
+        # swarm/execution_store.py). Fail-open -- awaited inline since it's
+        # already async, but any failure is caught and logged inside the
+        # store itself; this line can never raise into the run. guard() adds a
+        # second, last-resort defense layer on top of that (see its own
+        # docstring).
+        await execution_store.guard(execution_store.persist_run_started(
+            team._run_context, team_name=team_name, run_type="stream",
+            task_preview=(task or "")[:200]))
 
         full_content: list[str] = []
         # See _stream_team_run's own docstring for the narration-leak incident this
@@ -12288,10 +12337,20 @@ async def run_task_stream(
                 # the try block above, so identity/status stay available either way.
                 _run_ctx = getattr(team, "_run_context", None)
                 if _run_ctx is not None and _run_ctx.root_execution_id is not None:
-                    _run_ctx.finish_execution(
-                        _run_ctx.root_execution_id,
-                        status="failed" if sys.exc_info()[0] is not None else "ok",
-                    )
+                    _final_status = "failed" if sys.exc_info()[0] is not None else "ok"
+                    _run_ctx.finish_execution(_run_ctx.root_execution_id, status=_final_status)
+                    # Phase C: durable completion, mirroring the in-memory update
+                    # above exactly. run_task_stream never retries (no
+                    # _verified_answer/_stream_team_run call on this path), so the
+                    # root execution's own completion IS the run's completion here
+                    # -- unlike run_task_async, no later retry can still be running.
+                    _root_record = _run_ctx.executions[_run_ctx.root_execution_id]
+                    await execution_store.guard(
+                        execution_store.persist_execution_completed(_root_record))
+                    await execution_store.guard(execution_store.persist_run_completed(
+                        _run_ctx, status=_final_status,
+                        error=str(sys.exc_info()[1]) if sys.exc_info()[1] is not None else None,
+                    ))
 
 
 # Cap on the draft carried in the liveness snapshot. Large enough for a real
@@ -15813,6 +15872,11 @@ async def _stream_team_run(
             agent_name="Coordinator", execution_type="coordinator",
             parent_execution_id=_run_ctx.root_execution_id,
         )
+        # Phase C: durable Execution row for this retry, mirroring the
+        # in-memory ExecutionRecord just created. Fail-open, awaited inline,
+        # and wrapped in guard() as a second, last-resort defense layer.
+        await execution_store.guard(execution_store.persist_execution_created(
+            _run_ctx.executions[_retry_execution_id]))
     activity = {
         "last_call_name": None, "last_call_at": time.monotonic(),
         "stream_event_count": 0, "last_progress_at": time.monotonic(),
@@ -15924,6 +15988,9 @@ async def _stream_team_run(
                 _retry_execution_id,
                 status="failed" if sys.exc_info()[0] is not None else "ok",
             )
+            # Phase C: durable completion, mirroring the in-memory update above.
+            await execution_store.guard(execution_store.persist_execution_completed(
+                _run_ctx.executions[_retry_execution_id]))
     accumulated = "".join(full_content) or "(no response)"
     final_segment = "".join(full_content[last_segment_start:]).strip()
     content = _first_surviving_answer(
@@ -16256,6 +16323,17 @@ async def run_task_async(
         team._run_context = execution_context.RunContext(session_id, _run_id)
         team._run_context.start_execution(
             agent_name="Coordinator", execution_type="coordinator", parent_execution_id=None)
+        # Phase C: durable Run + root Execution, one transaction (see
+        # swarm/execution_store.py). Fail-open, awaited inline -- any failure
+        # is caught and logged inside the store itself, never raised here.
+        # One /run_chunked chunk is one run_task_async call, so this naturally
+        # persists one Run row per chunk; the optional synthesis call is
+        # distinguished via its own existing synthesis_run flag, not a new
+        # Chunk concept.
+        await execution_store.guard(execution_store.persist_run_started(
+            team._run_context, team_name=team_name,
+            run_type="synthesis" if synthesis_run else "single",
+            task_preview=(task or "")[:200]))
 
         # ContextPack (Phase 2, Experiment 2). Resolved ONCE here, before the team
         # runs, so the delegation hook does no I/O. Targets come from the TASK rather
@@ -16437,6 +16515,15 @@ async def run_task_async(
                                 _run_ctx.root_execution_id,
                                 status="failed" if sys.exc_info()[0] is not None else "ok",
                             )
+                            # Phase C: durable completion for the root execution
+                            # specifically -- NOT the run itself. Retries (new
+                            # sibling coordinator executions via _verified_answer/
+                            # _stream_team_run) can still happen after this point,
+                            # so the run's own completion is persisted separately,
+                            # once, at run_task_async's true end (see the outer
+                            # finally below).
+                            await execution_store.guard(execution_store.persist_execution_completed(
+                                _run_ctx.executions[_run_ctx.root_execution_id]))
                 accumulated = "".join(full_content) or "(no response)"
                 final_segment = "".join(full_content[last_segment_start:]).strip()
                 content = _first_surviving_answer(
@@ -16595,6 +16682,20 @@ async def run_task_async(
                     time.perf_counter() - t0,
                     {"project_id": project_id},
                 )
+                # Phase C: the run's OWN completion, persisted exactly once here
+                # -- this finally wraps both return points above (the
+                # clarification early-return and the main success return) AND
+                # the exception/re-raise path, and runs strictly after any
+                # retries (_verified_answer/_stream_team_run) have already
+                # finished, unlike the root execution's own completion above,
+                # which fires earlier, before retries can happen.
+                _run_ctx = getattr(team, "_run_context", None)
+                if _run_ctx is not None:
+                    _exc = sys.exc_info()[1]
+                    await execution_store.guard(execution_store.persist_run_completed(
+                        _run_ctx, status="failed" if _exc is not None else "ok",
+                        error=str(_exc) if _exc is not None else None,
+                    ))
 
 
 def _warn_on_single_site_guards() -> None:
