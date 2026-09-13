@@ -13,6 +13,12 @@ async def _fresh_db(monkeypatch):
     monkeypatch.setattr(config, "database_url", "sqlite+aiosqlite:///:memory:")
     monkeypatch.setattr(config, "postgres_uri", "")
     await db.reset_engine_for_tests()
+    # Phase B: ensure_schema() is now a version check only (see swarm/db.py) --
+    # a real deployment runs `hive migrate` before first use, and these tests
+    # exercise sessions.py's own logic, not the migration system itself (that
+    # has its own tests/test_migrations.py), so they bootstrap the schema
+    # directly rather than needing every test to run Alembic first.
+    await db.create_all_for_tests()
     yield
 
 

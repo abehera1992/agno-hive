@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import time
 from contextlib import AsyncExitStack, suppress
 
@@ -23,6 +24,7 @@ from .tool_fix import peak_input_tokens
 from config.config import config
 from swarm import phase0
 from swarm import context_pack
+from swarm import execution_context
 
 _tracer = trace.get_tracer("agno-hive.team")
 
@@ -10957,6 +10959,23 @@ def _make_tool_interception_hook(
                 args["task"] = f"{_task_now}\n\n{_TAG_INVARIANT_TEXT}"
                 print("[taginvariant] injected the providesTags/tagTypes invariant "
                       "into a coder delegation", flush=True)
+        # Phase A (durable execution/evidence backbone, runtime identity only --
+        # no persistence here, see swarm/execution_context.py). `_tool_call` is
+        # created against whatever execution is CURRENT right now -- i.e. the
+        # CALLING execution -- before a delegation pushes its own child below, so
+        # a delegate_task_to_member call itself is attributed to its caller, not
+        # to the member execution it is about to start.
+        run_context = getattr(team, "_run_context", None)
+        _is_delegation = function_name.startswith("delegate_task_to_member")
+        _tool_call = (run_context.start_tool_call(function_name, args)
+                      if run_context is not None else None)
+        _delegation_execution_id = None
+        if run_context is not None and _is_delegation and isinstance(args, dict):
+            _delegation_execution_id = run_context.start_execution(
+                agent_name=_member_key(args.get("member_id", "")),
+                execution_type="delegation",
+                parent_execution_id=run_context.current_execution_id,
+            )
         started = time.monotonic()
         if activity is not None:
             activity["last_call_name"] = function_name
@@ -10964,6 +10983,15 @@ def _make_tool_interception_hook(
         try:
             result = await function(**args)
             elapsed = time.monotonic() - started
+            # Phase A: the EXACT, unmodified result -- captured here, before any of
+            # the logging/mechverify/delegation-telemetry code below (none of which
+            # mutates `result` for a non-delegation call; the mechverify branch
+            # further down MAY reassign `result` for `apply_diff`, which is a
+            # pre-existing, unrelated behavior this does not change -- the Evidence
+            # recorded is for THIS tool call, i.e. what `function(**args)` itself
+            # returned).
+            if _tool_call is not None:
+                run_context.finish_tool_call(_tool_call, content=result, success=True, error=None)
             print(f"[team] tool_hook: {function_name}({args}) -> {elapsed:.2f}s", flush=True)
             # Write-action observation (2026-09-11). Pure observer: it reads the call
             # and its result and records them, and cannot alter either. This hook is
@@ -11015,12 +11043,24 @@ def _make_tool_interception_hook(
             return result
         except Exception as exc:
             elapsed = time.monotonic() - started
+            if _tool_call is not None:
+                run_context.finish_tool_call(_tool_call, content=None, success=False, error=str(exc))
+            if _delegation_execution_id is not None:
+                run_context.finish_execution(_delegation_execution_id, status="failed", error=str(exc))
+                _delegation_execution_id = None
             print(f"[team] tool_hook: {function_name}({args}) RAISED {type(exc).__name__}: {exc} after {elapsed:.2f}s", flush=True)
             if activity is not None:
                 now = time.monotonic()
                 activity["last_call_at"] = now
                 activity["last_progress_at"] = now
             raise
+        finally:
+            # Phase A: close the delegation's child execution here so it happens
+            # exactly once regardless of which branch above ran -- the except
+            # branch already closed it (as "failed") and cleared the id, so this
+            # only fires for the success path.
+            if _delegation_execution_id is not None:
+                run_context.finish_execution(_delegation_execution_id, status="ok")
 
     return _tool_interception_hook
 
@@ -12116,6 +12156,15 @@ async def run_task_stream(
         # _unresolvable_delegation_targets); _build_team has no MCP url in scope.
         team._hive_mcp_url = _hive_for_targets
         team._session_summary = session_summary or ""
+        # Phase A (durable execution/evidence backbone, runtime identity only --
+        # no persistence here, see swarm/execution_context.py). run_task_stream
+        # does not use Phase0 (no phase0.start_run() call exists on this path
+        # today), so the canonical run_id is always freshly minted here, using
+        # the identical scheme Phase0Run.run_id uses.
+        team._run_context = execution_context.RunContext(
+            session_id, execution_context.new_id())
+        team._run_context.start_execution(
+            agent_name="Coordinator", execution_type="coordinator", parent_execution_id=None)
 
         full_content: list[str] = []
         # See _stream_team_run's own docstring for the narration-leak incident this
@@ -12234,6 +12283,15 @@ async def run_task_stream(
                 raise
             finally:
                 task_duration.record(time.perf_counter() - t0, {"project_id": project_id})
+                # Phase A: close the root coordinator execution -- this finally
+                # already runs on both normal completion and any exception from
+                # the try block above, so identity/status stay available either way.
+                _run_ctx = getattr(team, "_run_context", None)
+                if _run_ctx is not None and _run_ctx.root_execution_id is not None:
+                    _run_ctx.finish_execution(
+                        _run_ctx.root_execution_id,
+                        status="failed" if sys.exc_info()[0] is not None else "ok",
+                    )
 
 
 # Cap on the draft carried in the liveness snapshot. Large enough for a real
@@ -15742,6 +15800,19 @@ async def _stream_team_run(
     must be given a liveness_path to actually close this -- omitting it (the
     default) reproduces the exact unprotected behavior above, so every caller of
     this function needs updating alongside this fix, not just this function itself."""
+    # Phase A: every call to this function is a coordinator RE-invocation (the
+    # original top-level call never goes through here -- see this docstring's own
+    # "today, that means every retry inside _verified_answer"), so each call opens
+    # its own new Execution, parented to the run's root coordinator execution --
+    # not a mutation of the execution being retried. Behavior/return value below
+    # are completely unchanged; this only records identity around the existing call.
+    _run_ctx = getattr(team, "_run_context", None)
+    _retry_execution_id = None
+    if _run_ctx is not None:
+        _retry_execution_id = _run_ctx.start_execution(
+            agent_name="Coordinator", execution_type="coordinator",
+            parent_execution_id=_run_ctx.root_execution_id,
+        )
     activity = {
         "last_call_name": None, "last_call_at": time.monotonic(),
         "stream_event_count": 0, "last_progress_at": time.monotonic(),
@@ -15844,6 +15915,15 @@ async def _stream_team_run(
         heartbeat_task.cancel()
         with suppress(asyncio.CancelledError):
             await heartbeat_task
+        # Phase A: close this retry's execution here -- runs on both normal
+        # completion and any exception raised out of the loop above, so identity/
+        # status stay available either way without a new try/except around the
+        # whole function.
+        if _run_ctx is not None and _retry_execution_id is not None:
+            _run_ctx.finish_execution(
+                _retry_execution_id,
+                status="failed" if sys.exc_info()[0] is not None else "ok",
+            )
     accumulated = "".join(full_content) or "(no response)"
     final_segment = "".join(full_content[last_segment_start:]).strip()
     content = _first_surviving_answer(
@@ -16167,6 +16247,15 @@ async def run_task_async(
         # which is always after construction. None when telemetry is off, and every
         # read site is guarded on that.
         team._phase0 = _phase0
+        # Phase A (durable execution/evidence backbone, runtime identity only --
+        # no persistence here, see swarm/execution_context.py). Canonical run_id
+        # is Phase0Run.run_id when telemetry happens to be on (same string, not a
+        # second identifier); otherwise a fresh id from the identical scheme, since
+        # a Run identity must exist regardless of whether telemetry is enabled.
+        _run_id = _phase0.run_id if _phase0 is not None else execution_context.new_id()
+        team._run_context = execution_context.RunContext(session_id, _run_id)
+        team._run_context.start_execution(
+            agent_name="Coordinator", execution_type="coordinator", parent_execution_id=None)
 
         # ContextPack (Phase 2, Experiment 2). Resolved ONCE here, before the team
         # runs, so the delegation hook does no I/O. Targets come from the TASK rather
@@ -16337,6 +16426,17 @@ async def run_task_async(
                         heartbeat_task.cancel()
                         with suppress(asyncio.CancelledError):
                             await heartbeat_task
+                        # Phase A: close the root coordinator execution here -- this
+                        # finally already runs on both normal completion and any
+                        # exception raised out of the loop above (e.g. _BackendRunError),
+                        # so identity/status stay available in either case without a new
+                        # try/except wrapping the whole function.
+                        _run_ctx = getattr(team, "_run_context", None)
+                        if _run_ctx is not None and _run_ctx.root_execution_id is not None:
+                            _run_ctx.finish_execution(
+                                _run_ctx.root_execution_id,
+                                status="failed" if sys.exc_info()[0] is not None else "ok",
+                            )
                 accumulated = "".join(full_content) or "(no response)"
                 final_segment = "".join(full_content[last_segment_start:]).strip()
                 content = _first_surviving_answer(

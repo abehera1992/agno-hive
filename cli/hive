@@ -1688,6 +1688,96 @@ def _cmd_mcp_status() -> None:
     print()
 
 
+def _cmd_migrate() -> None:
+    """Bring agno-hive's OWN app-storage database up to the migration head this
+    checkout expects -- chat_sessions/session_messages/failure_log/
+    task_outcome_queue plus the durable execution/evidence backbone (runs/
+    executions/tool_calls/evidence/claims/claim_evidence). See
+    swarm/migrations.py's module docstring: never touches the routing database
+    (model_catalog/team_role_models) or any connected project's own database.
+    Delegates every actual schema change to Alembic (swarm/migrations.py's
+    run_upgrade()/stamp()) -- this function only classifies the database's
+    current state and decides which Alembic operation(s) that state calls for.
+
+    Must run on the SAME host/checkout as agno-api.service (e.g. on ZGX) --
+    swarm/db.py resolves the database URL and connects directly, exactly like
+    the server process itself does. This is not a remote/HTTP operation the
+    way the rest of this CLI's commands are (they talk to agno-api.service
+    over the network); it is a local database operation, the same category as
+    main.py's own --run-worker/--stream-worker entry points, which is also
+    only ever run on that same host.
+
+    Five states, all reachable through inspect_migration_state()'s three facts
+    (has_alembic, has_baseline, current):
+
+      1. Fresh (no chat_sessions, no alembic_version): `upgrade head` runs
+         0001_baseline then 0002_durable_backbone from scratch. No prompt.
+      2. Existing, unversioned (chat_sessions exists, no alembic_version):
+         requires an explicit y/N confirmation BEFORE any mutation -- `alembic
+         stamp` does not itself verify the live schema actually matches
+         0001_baseline's DDL (Alembic's own documented behavior, not a gap in
+         this wrapper), so a human confirms that assumption here. Declining
+         makes zero database calls beyond the read-only inspection above.
+      3. (the decline path of case 2, called out separately by the spec this
+         implements) -- prints a message and exits non-zero; no stamp, no
+         upgrade, no alembic_version row created.
+      4. Already versioned, at head: no-op, prints and returns -- `alembic
+         upgrade head` would also no-op here, but the explicit check avoids
+         even opening a migration context for the common case.
+      5. Already versioned, behind head (e.g. at 0001_baseline only): `upgrade
+         head` applies just the remaining revisions (0002_durable_backbone) --
+         no confirmation needed, since an existing alembic_version row means
+         this database is already under this tool's management, not an
+         unknown legacy schema being assumed correct for the first time.
+    """
+    import asyncio
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    # cli/hive's own sys.path[0] is cli/, not the repo root -- swarm/config are
+    # siblings of cli/, so they are not importable without this, regardless of
+    # which directory this script is invoked from.
+    _repo_root = str(_Path(__file__).resolve().parent.parent)
+    if _repo_root not in _sys.path:
+        _sys.path.insert(0, _repo_root)
+
+    from swarm.db import resolve_database_url
+    from swarm.migrations import expected_head, inspect_migration_state, run_upgrade, stamp
+
+    db_url = resolve_database_url()
+    head = expected_head()
+    print(f"database:     {db_url}")
+    print(f"code expects: {head}")
+
+    has_alembic, has_baseline, current = asyncio.run(inspect_migration_state())
+    print(f"current:      {current or 'unversioned'}")
+
+    if current == head:
+        print("already at head -- nothing to do")
+        return
+
+    if not has_alembic and has_baseline:
+        print()
+        print("This database already has chat_sessions/session_messages/failure_log/")
+        print("task_outcome_queue (created before migrations existed) but has never")
+        print("recorded an Alembic version.")
+        print()
+        print("About to: stamp 0001_baseline (marks it applied WITHOUT running its DDL --")
+        print("this assumes your existing schema already matches it), then upgrade to")
+        print("head (applies 0002_durable_backbone: the new runs/executions/tool_calls/")
+        print("evidence/claims/claim_evidence tables, and repairs a known missing unique")
+        print("index on task_outcome_queue).")
+        print()
+        answer = input("Proceed? [y/N] ").strip().lower()
+        if answer != "y":
+            print("aborted -- no changes made")
+            _sys.exit(1)
+        stamp("0001_baseline")
+
+    run_upgrade("head")
+    print(f"migrated to {head}")
+
+
 # ── Interactive REPL ──────────────────────────────────────────────────────────
 
 def repl(
@@ -1932,10 +2022,23 @@ def main() -> None:
                         help="re-index all files even if unchanged (use with --bootstrap or --scan)")
     parser.add_argument("--scan",              action="store_true",
                         help="generate or update hive.md project context file and exit")
+    parser.add_argument("--migrate",           action="store_true",
+                        help="apply pending Alembic migrations to agno-hive's own app-storage "
+                             "database (chat_sessions/session_messages/failure_log/task_outcome_queue "
+                             "+ the durable execution/evidence backbone) and exit")
     parser.add_argument("--verbose-tools",    action="store_true",
                         help="always show full tool-call args/results, not collapsed (default: HIVE_VERBOSE_TOOLS env var, or collapsed)")
 
     args = parser.parse_args()
+
+    if args.migrate:
+        # No project/MCP/host resolution needed at all -- this is a pure local
+        # database operation against agno-hive's own app-storage DB (see
+        # swarm/migrations.py's module docstring). Checked first, before any of
+        # the MCP-URL auto-detection below, so `hive --migrate` never depends on
+        # hive-mcp or ZGX being reachable.
+        _cmd_migrate()
+        return
 
     if args.verbose_tools:
         global _VERBOSE_TOOLS

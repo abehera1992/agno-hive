@@ -26,6 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     Column,
     DateTime,
@@ -182,6 +183,127 @@ def _existing_task_outcome_queue_columns(sync_conn) -> set[str]:
     if not insp.has_table("task_outcome_queue"):
         return set()
     return {c["name"] for c in insp.get_columns("task_outcome_queue")}
+
+
+# ── Durable execution/evidence backbone (Phase B) ───────────────────────────────
+#
+# Schema only in this phase -- nothing in swarm/team.py or swarm/execution_context.py
+# writes to these tables yet (see that module's own docstring: Phase A is runtime-
+# memory only). Column names mirror Phase A's RunContext/ExecutionRecord/
+# ToolCallRecord/EvidenceRecord (swarm/execution_context.py) directly, so a later
+# phase can persist them without renaming anything.
+#
+# Bound to the SAME `metadata` as chat_sessions/session_messages/failure_log/
+# task_outcome_queue above -- same engine, same effective database/schema, no
+# relocation (see the accepted architecture review's schema-relocation finding:
+# moving only NEW tables to a different schema than the existing four would create
+# a cross-schema split, not resolve anything -- deferred, not decided here).
+#
+# session_id is deliberately NOT duplicated onto executions/tool_calls/evidence/
+# claim_evidence. Postgres (and SQLite, once PRAGMA foreign_keys=ON is set -- see
+# _build_engine below) cascades ON DELETE TRANSITIVELY through a multi-level FK
+# chain on its own: deleting a chat_sessions row already reaches every descendant
+# via runs.session_id alone, so a redundant session_id column on a deeper table
+# would only be able to drift from its own ancestor, never help deletion work.
+runs = Table(
+    "runs", metadata,
+    Column("run_id", Uuid(as_uuid=False), primary_key=True),
+    Column("session_id", Uuid(as_uuid=False),
+           ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False),
+    # 'single' | 'chunk' | 'synthesis' -- set by a later phase; nullable here since
+    # Phase A's RunContext does not track this field today.
+    Column("run_type", Text, nullable=True),
+    Column("team_name", Text, nullable=True),
+    Column("task_preview", Text, nullable=True),
+    Column("status", Text, nullable=False, default="running"),  # 'running' | 'ok' | 'failed'
+    Column("started_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("completed_at", DateTime(timezone=True), nullable=True),
+    Column("error_message", Text, nullable=True),
+)
+Index("runs_session_idx", runs.c.session_id, runs.c.started_at.asc())
+
+executions = Table(
+    "executions", metadata,
+    Column("execution_id", Uuid(as_uuid=False), primary_key=True),
+    Column("run_id", Uuid(as_uuid=False), ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False),
+    # Self-referencing. CASCADE (not RESTRICT/SET NULL): deleting an execution
+    # should take its own subtree with it, matching the execution-tree semantics
+    # Phase A's RunContext already enforces at the application layer (parent
+    # closed only after every child under it has finished). In practice this FK
+    # is only ever exercised transitively via runs.run_id -> chat_sessions.id
+    # cascading -- no code path deletes a single execution on its own.
+    Column("parent_execution_id", Uuid(as_uuid=False),
+           ForeignKey("executions.execution_id", ondelete="CASCADE"), nullable=True),
+    Column("agent_name", Text, nullable=False),
+    Column("execution_type", Text, nullable=False),   # 'coordinator' | 'delegation'
+    Column("attempt_number", Integer, nullable=False, default=1),
+    Column("status", Text, nullable=False, default="running"),  # 'running' | 'ok' | 'failed'
+    Column("started_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("completed_at", DateTime(timezone=True), nullable=True),
+    Column("error_message", Text, nullable=True),
+)
+Index("executions_run_idx", executions.c.run_id, executions.c.started_at.asc())
+Index("executions_parent_idx", executions.c.parent_execution_id)
+
+tool_calls = Table(
+    "tool_calls", metadata,
+    Column("tool_call_id", Uuid(as_uuid=False), primary_key=True),
+    Column("execution_id", Uuid(as_uuid=False),
+           ForeignKey("executions.execution_id", ondelete="CASCADE"), nullable=False),
+    Column("tool_name", Text, nullable=False),
+    Column("arguments", JSON, nullable=True),
+    Column("status", Text, nullable=False, default="running"),  # 'running' | 'ok' | 'error'
+    Column("error_message", Text, nullable=True),
+    Column("started_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("completed_at", DateTime(timezone=True), nullable=True),
+)
+Index("tool_calls_execution_idx", tool_calls.c.execution_id, tool_calls.c.started_at.asc())
+
+evidence = Table(
+    "evidence", metadata,
+    Column("evidence_id", Uuid(as_uuid=False), primary_key=True),
+    Column("tool_call_id", Uuid(as_uuid=False),
+           ForeignKey("tool_calls.tool_call_id", ondelete="CASCADE"), nullable=False),
+    # The EXACT tool result, never the 200-char preview team._tool_evidence keeps
+    # for LLM context (swarm/team.py's _tool_evidence cap is a runtime/model-
+    # context optimisation only -- see execution_context.py's EvidenceRecord
+    # docstring). Text is unbounded on both SQLite and Postgres; no truncation.
+    Column("content", Text, nullable=True),
+    Column("content_hash", Text, nullable=False),
+    Column("success", Boolean, nullable=False),
+    Column("error_message", Text, nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+Index("evidence_tool_call_idx", evidence.c.tool_call_id)
+Index("evidence_content_hash_idx", evidence.c.content_hash)
+
+claims = Table(
+    "claims", metadata,
+    Column("claim_id", Uuid(as_uuid=False), primary_key=True),
+    Column("run_id", Uuid(as_uuid=False), ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False),
+    # SET NULL, not CASCADE: a claim's supporting execution is incidental context,
+    # not what makes the claim exist -- deleting one execution (e.g. a superseded
+    # retry) must not silently delete a claim that cited its output. The claim
+    # still disappears when the whole RUN (and therefore session) is deleted, via
+    # claims.run_id's own CASCADE above.
+    Column("execution_id", Uuid(as_uuid=False),
+           ForeignKey("executions.execution_id", ondelete="SET NULL"), nullable=True),
+    Column("statement", Text, nullable=False),
+    Column("status", Text, nullable=False, default="unverified"),  # 'unverified' | 'grounded' | 'ungrounded'
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+Index("claims_run_idx", claims.c.run_id)
+
+claim_evidence = Table(
+    "claim_evidence", metadata,
+    Column("claim_id", Uuid(as_uuid=False),
+           ForeignKey("claims.claim_id", ondelete="CASCADE"), primary_key=True),
+    Column("evidence_id", Uuid(as_uuid=False),
+           ForeignKey("evidence.evidence_id", ondelete="CASCADE"), primary_key=True),
+    # The composite primary key above IS the uniqueness constraint -- the same
+    # (claim_id, evidence_id) pair cannot be inserted twice.
+)
+
 
 # model_catalog / team_role_models (AGNOHive 2.3.2 addendum) — replaces
 # swarm/agents.py's old _VLLM_MODEL_MAP dict + _CLOUD_ALIASES set. See
@@ -427,24 +549,99 @@ def _existing_team_role_models_columns(sync_conn) -> set[str]:
     return {c["name"] for c in inspect(sync_conn).get_columns("team_role_models")}
 
 
+async def _current_app_db_revision(conn) -> str | None:
+    """The Alembic revision actually applied to whatever database `conn` is
+    connected to -- None if the alembic_version table doesn't exist at all (a
+    fresh, never-migrated database). A plain introspection query against the
+    EXISTING app engine, not a call into Alembic's own (synchronous) runtime --
+    this needs to stay cheap since ensure_schema() is called on nearly every
+    session/feedback operation (see this module's docstring's "TWO separate
+    engines" note for why get_engine() is the right engine here)."""
+    has_table = await conn.run_sync(lambda sync_conn: inspect(sync_conn).has_table("alembic_version"))
+    if not has_table:
+        return None
+    row = (await conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1"))).first()
+    return row[0] if row else None
+
+
 async def ensure_schema() -> None:
-    """Idempotent bootstrap for chat_sessions/session_messages/failure_log —
-    create_all() only creates tables that don't already exist, so this is safe to
-    call on every startup against either a fresh SQLite file or an existing ZGX
-    Postgres database that already has these tables from prior deployments.
-    model_catalog/team_role_models are handled separately by
-    ensure_routing_schema() against get_routing_engine()."""
+    """VERSION CHECK ONLY (Phase B) -- does NOT create or alter any table.
+
+    Before Phase B this function called metadata.create_all() (plus a couple of
+    hand-rolled ALTER TABLE statements for columns added after initial deploy).
+    That silent-bootstrap behavior is deliberately retired: schema changes now
+    come from Alembic migrations (see swarm/migrations.py, alembic/versions/),
+    applied explicitly via `hive migrate` -- never implicitly, at startup or on
+    the first session/feedback call that happens to touch the database. See the
+    accepted architecture review's migration-strategy section for the reasoning
+    (existing installations must not have their schema mutated without the
+    operator choosing to run a migration).
+
+    Every one of this function's existing callers (api/server.py's startup
+    event, and eight lazy per-call sites across swarm/sessions.py and
+    swarm/feedback.py) is UNCHANGED and still calls this exact function name —
+    only its body changed, from "create what's missing" to "confirm nothing is
+    missing, or explain clearly why it is." Raising here at startup causes
+    FastAPI to fail to start rather than serve requests against an unmigrated
+    schema; raising from one of the lazy per-call sites surfaces the same clear
+    error the first time that code path is actually exercised.
+    """
+    from swarm.migrations import expected_head
+
+    head = expected_head()
+    engine = get_engine()
+    async with engine.connect() as conn:
+        current = await _current_app_db_revision(conn)
+    if current != head:
+        current_desc = repr(current) if current else "unversioned (no migrations applied)"
+        raise RuntimeError(
+            f"agnohive database schema is out of date "
+            f"(at {current_desc}, this code expects {head!r}). Run `hive migrate` "
+            f"(or `alembic upgrade head`) before starting agno-hive against this "
+            f"database. See docs/guide/migrations.md."
+        )
+
+
+async def create_all_for_tests() -> None:
+    """TEST-ONLY equivalent of the old ensure_schema() bootstrap -- creates every
+    table in `metadata` (chat_sessions/session_messages/failure_log/
+    task_outcome_queue plus the Phase B durable-backbone tables) directly via
+    create_all(), then STAMPS the resulting database at the current code's
+    expected Alembic head (a plain INSERT into alembic_version — not a real
+    `alembic stamp` invocation, which would re-enter Alembic's own env.py and
+    is unnecessary just to satisfy a version check).
+
+    The stamp step is required, not cosmetic: sessions.py/feedback.py's own
+    functions call ensure_schema() internally on nearly every operation (see
+    that function's own docstring — Phase B made it a version check), so a
+    schema created by create_all() alone, with no alembic_version row, would
+    still make every one of those calls raise "database schema is out of
+    date" — silently swallowed by their own try/except, producing a session
+    that "creates" successfully but was never actually inserted. This exact
+    failure mode is why this function stamps as well as creates.
+
+    Production code must never call this: an operator's real database is
+    expected to already be migrated via `hive migrate` (see ensure_schema()'s
+    own docstring) before the app starts. Tests that only need a working
+    schema to exercise sessions.py/feedback.py's own logic — not the migration
+    system itself, which has its own tests/test_migrations.py — call this
+    instead. Mirrors reset_engine_for_tests()'s naming and test-only scope in
+    this same module.
+    """
+    from swarm.migrations import expected_head
+
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)
-        # task_outcome_queue shipped 2026-08-29 and was widened the same day; an
-        # already-populated deployment needs the ALTERs create_all() will not issue.
-        existing = await conn.run_sync(_existing_task_outcome_queue_columns)
-        if existing:
-            for col_name, col_type in _TASK_OUTCOME_QUEUE_NEW_COLUMNS.items():
-                if col_name not in existing:
-                    await conn.execute(text(
-                        f"ALTER TABLE task_outcome_queue ADD COLUMN {col_name} {col_type}"))
+        await conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS alembic_version "
+            "(version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+        ))
+        await conn.execute(text("DELETE FROM alembic_version"))
+        await conn.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES (:v)"),
+            {"v": expected_head()},
+        )
 
 
 async def ensure_routing_schema() -> None:
