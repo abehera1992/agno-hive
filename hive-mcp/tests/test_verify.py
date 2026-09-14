@@ -59,8 +59,7 @@ def test_code_block_and_prose_idents_are_deduplicated(monkeypatch):
 
 
 def _reset_repeat_tracking():
-    verify._last_checked_answer = None
-    verify._repeat_count = 0
+    verify._checked_answer_counts = {}
 
 
 def test_identical_answer_checked_twice_hard_stops(monkeypatch):
@@ -128,3 +127,115 @@ def test_stopped_message_still_classifies_as_bad_for_the_orchestrator(monkeypatc
 
     assert "STOPPED" in second
     assert "could NOT be found" in second
+
+
+def test_stopped_message_is_safe_if_pasted_verbatim_into_a_final_answer(monkeypatch):
+    """Phase P (T1-13 live battery) forensics: a model called verify_claims twice
+    on its own unchanged draft, got the STOPPED message back as an ordinary tool
+    result, and pasted it verbatim into its delivered, user-facing answer. The
+    OLD text ("Either (a) revise the answer... or (b) if you cannot find...")
+    is a second-person imperative addressed to whoever reads it -- correct
+    when the caller is the model deciding what to do next, wrong and confusing
+    when the caller is a human reading the final answer. swarm/team.py's own
+    SERVER-CONSTRUCTED reports get rewritten for a human reader before being
+    shown (_reader_facing_report) -- this tool's return value has no such
+    rewrite step downstream, so the raw string itself must already be safe.
+    This does not (and structurally cannot) guarantee a model never echoes a
+    tool result -- it only ensures that if it does, the text does not misread
+    as a command issued to the person receiving the answer."""
+    _reset_repeat_tracking()
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+    answer = "Uses `item.stock_quantity`."
+
+    verify.verify_claims(answer)
+    second = verify.verify_claims(answer)
+
+    # The load-bearing substrings for the orchestrator's own classifier stay.
+    assert "STOPPED" in second
+    assert "could NOT be found" in second
+    # The second-person imperative that read as a command to a human reader
+    # is gone -- neither "Either (a)" nor a bare "you" addressing the reader
+    # survives.
+    assert "Either (a)" not in second
+    assert "you cannot find" not in second
+    assert " you " not in second.lower()
+
+
+# ── Phase 4 (AGNOHive Reliability Program): cross-caller dedup isolation ────
+#
+# hive-mcp is one process; this module's tracking state is shared across
+# every concurrent tool call from every agent in every run pointed at it.
+# The single-scalar design being replaced here (_last_checked_answer/
+# _repeat_count) meant an interleaved, unrelated call on DIFFERENT text
+# silently overwrote another caller's pending "first-seen" state, defeating
+# that caller's own stuck-loop detection. These are synthetic reproductions
+# (direct module-state interleaving, not a live concurrent server) of that
+# exact mechanism, and a regression pin for the still-open residual case
+# (two callers whose text is byte-identical by coincidence).
+
+def test_interleaved_different_text_no_longer_corrupts_the_other_caller_s_tracking(monkeypatch):
+    """Two 'runs' (A and B) interleave one call each on DIFFERENT text, then
+    both submit their SECOND, unchanged call. Each must independently see
+    its own repeat -- neither should be reset by the other's traffic."""
+    _reset_repeat_tracking()
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+    text_a = "Uses `item.stock_quantity`."
+    text_b = "Uses `item.sku`."
+
+    a1 = verify.verify_claims(text_a)   # Run A, 1st call
+    b1 = verify.verify_claims(text_b)   # Run B, 1st call -- interleaves
+    a2 = verify.verify_claims(text_a)   # Run A, 2nd call -- its own genuine repeat
+    b2 = verify.verify_claims(text_b)   # Run B, 2nd call -- its own genuine repeat
+
+    assert "STOPPED" not in a1 and "STOPPED" not in b1
+    assert "STOPPED" in a2, "Run A's own repeat must be caught despite Run B's interleaved call"
+    assert "STOPPED" in b2, "Run B's own repeat must be caught despite Run A's interleaved call"
+
+
+def test_three_way_interleave_each_caller_s_own_repeat_is_still_isolated(monkeypatch):
+    """x, y, z are each checked once, interleaved. Only y then repeats: y's
+    slot must reset (its own stuck-loop signal was consumed), but x's and
+    z's tracking must survive untouched -- proving one caller's repeat/reset
+    cannot wipe a DIFFERENT caller's still-pending first-seen state."""
+    _reset_repeat_tracking()
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+    x, y, z = "Uses `item.x`.", "Uses `item.y`.", "Uses `item.z`."
+
+    verify.verify_claims(x)  # 1st: x seen
+    verify.verify_claims(y)  # 1st: y seen -- must not disturb x's tracking
+    verify.verify_claims(z)  # 1st: z seen -- must not disturb x's or y's tracking
+
+    assert "STOPPED" in verify.verify_claims(y)  # y's own genuine repeat, correctly caught
+    # y's reset must be scoped to y alone -- x and z are still tracked as
+    # "seen once", so THEIR eventual repeats remain detectable.
+    assert x in verify._checked_answer_counts
+    assert z in verify._checked_answer_counts
+    assert y not in verify._checked_answer_counts
+
+
+def test_tracking_is_bounded_and_does_not_grow_without_limit(monkeypatch):
+    _reset_repeat_tracking()
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+
+    for i in range(verify._MAX_TRACKED_ANSWERS + 5):
+        verify.verify_claims(f"Uses `item.field_{i}`.")
+
+    assert len(verify._checked_answer_counts) <= verify._MAX_TRACKED_ANSWERS
+
+
+def test_residual_known_limitation_byte_identical_text_from_different_callers_still_collides(monkeypatch):
+    """Documents what this fix does NOT solve, so it is never mistaken for a
+    complete fix later: two callers whose answer text is byte-identical by
+    coincidence still share one dedup slot, because nothing here carries a
+    caller/session identity. The second caller is told STOPPED without its
+    own claims ever having been checked once. Resolving this needs
+    provenance this module does not have -- see the Phase 4 report."""
+    _reset_repeat_tracking()
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+    identical_text = "Uses `item.stock_quantity`."
+
+    run_a_first_ever_check = verify.verify_claims(identical_text)
+    run_b_first_ever_check = verify.verify_claims(identical_text)  # different caller, same text
+
+    assert "STOPPED" not in run_a_first_ever_check
+    assert "STOPPED" in run_b_first_ever_check  # known, documented residual gap

@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import time
 from contextlib import AsyncExitStack, suppress
 
@@ -17,12 +18,14 @@ from .agents import (
     update_session_state,
 )
 from .feedback import (record_success, record_failure, load_failure_context,
-                       load_success_context)
+                       load_success_context, load_project_memory_context)
 from . import model_routing, team_config
 from .tool_fix import peak_input_tokens
 from config.config import config
 from swarm import phase0
 from swarm import context_pack
+from swarm import execution_context
+from swarm import execution_store
 
 _tracer = trace.get_tracer("agno-hive.team")
 
@@ -2256,7 +2259,7 @@ def _second_side_from_answer(content: str, already: str) -> str:
 
 async def _computed_comparison(task: str, enumerations: dict | None,
                                hive_mcp_url: str | None, hive_mcp_tools=None,
-                               content: str = "") -> str:
+                               content: str = "", team=None) -> str:
     """Run compare_enumerations over the two files this run read, and return the diff.
 
     The answer to a question three measured escalations could not answer: how do you
@@ -2384,15 +2387,49 @@ async def _computed_comparison(task: str, enumerations: dict | None,
     if not left or not right or left == right:
         return _skip(f"could not resolve two distinct sides (left={left!r}, right={right!r}; "
                      f"{len(enumerations)} enumeration(s) recorded)")
+    # Phase E: this is a genuine tool call (compare_enumerations, over hive-mcp)
+    # but reaches it via a bespoke `session.call_tool` -- the SAME pattern
+    # _verify_claims uses for its own one-shot session -- rather than through
+    # _tool_interception_hook, so Phase D's durable ToolCall/Evidence never saw
+    # it. A durable Claim reconciled against this comparison needs a REAL
+    # evidence_id to link to (never a fabricated one, never no link at all),
+    # so this call is bracketed with the identical start_tool_call/
+    # finish_tool_call/persist_tool_call_created/persist_tool_call_completed
+    # sequence _tool_interception_hook already uses -- same primitives, same
+    # fail-open guard(), a new call site only. team._last_comparison_evidence_id
+    # is transient per-run scratch state (same convention as team._read_state/
+    # team._tool_evidence elsewhere in this file), read back by
+    # _reconcile_completeness_claim_with_comparison.
+    run_context = getattr(team, "_run_context", None)
+    _tool_call = (run_context.start_tool_call(
+        "compare_enumerations", {"left_path": left, "right_path": right})
+        if run_context is not None else None)
+    _tool_call_db_id = (
+        await execution_store.guard(execution_store.persist_tool_call_created(_tool_call))
+        if _tool_call is not None else None)
     try:
         session = await hive_mcp_tools.get_session_for_run()
         res = await session.call_tool(
             "compare_enumerations", {"left_path": left, "right_path": right})
         text = "\n".join(getattr(c, "text", "") for c in (res.content or [])).strip()
     except Exception as exc:
+        if _tool_call is not None:
+            _evidence = run_context.finish_tool_call(
+                _tool_call, content=None, success=False, error=str(exc))
+            await execution_store.guard(execution_store.persist_tool_call_completed(
+                _tool_call_db_id, _tool_call, _evidence))
+        if team is not None:
+            team._last_comparison_evidence_id = None
         print(f"[team] computed comparison unavailable: "
               f"{type(exc).__name__}: {str(exc)[:80]}", flush=True)
         return ""
+    if _tool_call is not None:
+        _evidence = run_context.finish_tool_call(
+            _tool_call, content=text, success=True, error=None)
+        _evidence_id = await execution_store.guard(execution_store.persist_tool_call_completed(
+            _tool_call_db_id, _tool_call, _evidence))
+        if team is not None:
+            team._last_comparison_evidence_id = _evidence_id
     if not text or text.startswith("compare_enumerations failed"):
         # The last silent return, and the one that actually fired: subset8's T2 produced
         # NO log line at all, which ruled out every branch above it and left only this.
@@ -3899,6 +3936,36 @@ def _comparison_body(cmp_note: str) -> str:
     return m.group(1).strip() if m else (cmp_note or "").strip()
 
 
+async def _persist_completeness_claim(team, statement: str, status: str) -> None:
+    """Phase E: durable Claim (+ ClaimEvidence, when a real evidence_id is
+    available) for a completeness assertion reconciled against
+    compare_enumerations' deterministic result -- called only from
+    _reconcile_completeness_claim_with_comparison, for exactly the two
+    verdicts (supported/contradicted) that function's own gap-count check
+    can actually produce.
+
+    Fail-open via execution_store.guard, exactly like every other durable
+    write in this file: a persistence failure here can never affect
+    reconciliation, the retry decision, or the shipped answer -- this
+    function's own return value is never even inspected by its caller.
+
+    team._last_comparison_evidence_id is transient per-run scratch state set
+    by _computed_comparison right after it persists the compare_enumerations
+    ToolCall/Evidence pair this claim is being reconciled against -- None
+    when that persistence failed or was skipped (e.g. no run_context), in
+    which case the Claim is still recorded (the verdict itself came from
+    parsing cmp_note, not from the durable row), just without a
+    ClaimEvidence link.
+    """
+    run_context = getattr(team, "_run_context", None)
+    if run_context is None:
+        return
+    evidence_id = getattr(team, "_last_comparison_evidence_id", None)
+    await execution_store.guard(execution_store.persist_claim(
+        run_context, statement, status,
+        evidence_ids=[evidence_id] if evidence_id else None))
+
+
 async def _reconcile_completeness_claim_with_comparison(
         content: str, task: str, team, all_results, result,
         liveness_path: str | None, cmp_note: str, synthesis_run: bool):
@@ -3938,20 +4005,46 @@ async def _reconcile_completeness_claim_with_comparison(
         # spending a second full pipeline re-run.
         return content, result, False
     gap = _comparison_gap_counts(cmp_note)
+    # Phase E: computed BEFORE the gap early-return below (moved up from its
+    # original position, just after this comment's former location) so the
+    # gap==(0,0) branch can also see it -- _reconcile_completeness_claims is a
+    # pure regex scan over `content` with no side effects, so reordering it
+    # ahead of the gap check changes nothing about which branch below runs or
+    # what it does; it only lets the SUPPORTED case (gap==(0,0) but a
+    # completeness claim was made) durably record that the claim held, instead
+    # of that case being observationally identical to "no claim existed".
+    claims = _reconcile_completeness_claims(content)
     if not gap or (gap[0] == 0 and gap[1] == 0):
         # Either the comparison could not be parsed (should not happen given
         # compare_enumerations' fixed format) or it found nothing left/right-
-        # only -- nothing to reconcile.
+        # only -- nothing to reconcile against, i.e. this run's OWN control
+        # flow is unchanged from before Phase E. If the draft asserted
+        # completeness anyway, that assertion is exactly what
+        # compare_enumerations' zero gap counts deterministically SUPPORT --
+        # durably recorded here, additively, with no effect on the return
+        # value or on any later guard in this pipeline.
+        if gap == (0, 0) and claims:
+            await _persist_completeness_claim(team, claims[0], "supported")
         return content, result, False
-    claims = _reconcile_completeness_claims(content)
     if not claims:
         # The draft never claimed completeness in the first place -- e.g. it
-        # already said "6 endpoints have no hook". Nothing to reconcile.
+        # already said "6 endpoints have no hook". Nothing to reconcile, and
+        # nothing to persist -- there is no assertion to validate, so no Claim
+        # row is written (not persisted as "unverifiable": that would imply an
+        # assertion existed when none did).
         return content, result, False
 
     setattr(team, _COMPARISON_RECONCILE_FLAG, True)
     left_only, right_only = gap
     evidence = _comparison_body(cmp_note)
+    # Phase E: the actual claim being reconciled below, persisted with its
+    # deterministic verdict BEFORE the retry prompt is built -- this call's
+    # own gap != (0, 0) is exactly what CONTRADICTS the draft's completeness
+    # claim (see _comparison_gap_counts' fixed left-only/right-only shape).
+    # Whether the coordinator's retry is later ADOPTED does not change what
+    # the DRAFT claimed or what the evidence established at the moment this
+    # fired -- that provenance is what Phase E durably records.
+    await _persist_completeness_claim(team, claims[0], "contradicted")
     retry_prompt = (
         f"{task}\n\nIMPORTANT: your previous answer said \"{claims[0]}\", but "
         f"compare_enumerations -- a deterministic tool, not a re-read -- found "
@@ -4137,7 +4230,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         task,
         (getattr(team, "_read_state", None) or {}).get("enumerations")
         if isinstance(getattr(team, "_read_state", None), dict) else None,
-        hive_mcp_url, hive_mcp_tools, content)
+        hive_mcp_url, hive_mcp_tools, content, team=team)
     content, result, _reconciled = await _reconcile_completeness_claim_with_comparison(
         content, task, team, all_results, result, liveness_path, _cmp_note, synthesis_run)
     if _reconciled:
@@ -4148,7 +4241,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             task,
             (getattr(team, "_read_state", None) or {}).get("enumerations")
             if isinstance(getattr(team, "_read_state", None), dict) else None,
-            hive_mcp_url, hive_mcp_tools, content)
+            hive_mcp_url, hive_mcp_tools, content, team=team)
 
     # Fabrication detection runs FIRST, and its finding rides along with whichever
     # guard fires (2026-09-02). Every guard below ends in a `return`, so the chain is
@@ -10957,6 +11050,52 @@ def _make_tool_interception_hook(
                 args["task"] = f"{_task_now}\n\n{_TAG_INVARIANT_TEXT}"
                 print("[taginvariant] injected the providesTags/tagTypes invariant "
                       "into a coder delegation", flush=True)
+        # Phase A (durable execution/evidence backbone, runtime identity only --
+        # no persistence here, see swarm/execution_context.py). `_tool_call` is
+        # created against whatever execution is CURRENT right now -- i.e. the
+        # CALLING execution -- before a delegation pushes its own child below, so
+        # a delegate_task_to_member call itself is attributed to its caller, not
+        # to the member execution it is about to start.
+        run_context = getattr(team, "_run_context", None)
+        # Phase A finding A (fixed for Phase C): exact match, not a prefix check.
+        # "delegate_task_to_member".startswith() also matched the PLURAL broadcast
+        # tool "delegate_task_to_members" (agno's own, see team.py's
+        # _DELEGATION_TOOL_NAMES) -- that call carries no `member_id` at all (it
+        # targets the whole team, see the read-cache hook's own "broadcasts to
+        # the whole team, no single target" branch), so treating it as a
+        # delegation here created a child Execution with an empty/meaningless
+        # agent_name. A broadcast call is still recorded as an ordinary ToolCall
+        # on the CALLING execution (via _tool_call below) -- it simply does not
+        # get a durable per-member child Execution, since it has no single
+        # member to attribute one to.
+        _is_delegation = function_name == "delegate_task_to_member"
+        _tool_call = (run_context.start_tool_call(function_name, args)
+                      if run_context is not None else None)
+        # Phase D: durable ToolCall row, created "running" before the real
+        # tool function is even awaited (see execution_store.
+        # persist_tool_call_created's own docstring for why: a hang or a
+        # cancellation still leaves a row). _tool_call_db_id is a FRESH,
+        # genuine UUID minted by that function -- deliberately NOT
+        # _tool_call.tool_call_id (execution_context.new_id()'s 12-hex-char
+        # scheme, not a well-formed UUID) -- and must be threaded through to
+        # every persist_tool_call_completed call below.
+        _tool_call_db_id = (
+            await execution_store.guard(execution_store.persist_tool_call_created(_tool_call))
+            if _tool_call is not None else None)
+        _delegation_execution_id = None
+        if run_context is not None and _is_delegation and isinstance(args, dict):
+            _delegation_execution_id = run_context.start_execution(
+                agent_name=_member_key(args.get("member_id", "")),
+                execution_type="delegation",
+                parent_execution_id=run_context.current_execution_id,
+            )
+            # Phase C: durable Execution row for this delegation, mirroring the
+            # in-memory ExecutionRecord just created. Fail-open, awaited inline,
+            # and wrapped in guard() as a second, last-resort defense layer on
+            # top of this function's own internal try/except (see
+            # execution_store.guard's own docstring).
+            await execution_store.guard(execution_store.persist_execution_created(
+                run_context.executions[_delegation_execution_id]))
         started = time.monotonic()
         if activity is not None:
             activity["last_call_name"] = function_name
@@ -10964,6 +11103,20 @@ def _make_tool_interception_hook(
         try:
             result = await function(**args)
             elapsed = time.monotonic() - started
+            # Phase A: the EXACT, unmodified result -- captured here, before any of
+            # the logging/mechverify/delegation-telemetry code below (none of which
+            # mutates `result` for a non-delegation call; the mechverify branch
+            # further down MAY reassign `result` for `apply_diff`, which is a
+            # pre-existing, unrelated behavior this does not change -- the Evidence
+            # recorded is for THIS tool call, i.e. what `function(**args)` itself
+            # returned).
+            if _tool_call is not None:
+                _evidence = run_context.finish_tool_call(
+                    _tool_call, content=result, success=True, error=None)
+                # Phase D: durable ToolCall completion + Evidence insert, one
+                # transaction (see execution_store.persist_tool_call_completed).
+                await execution_store.guard(execution_store.persist_tool_call_completed(
+                    _tool_call_db_id, _tool_call, _evidence))
             print(f"[team] tool_hook: {function_name}({args}) -> {elapsed:.2f}s", flush=True)
             # Write-action observation (2026-09-11). Pure observer: it reads the call
             # and its result and records them, and cannot alter either. This hook is
@@ -11015,12 +11168,68 @@ def _make_tool_interception_hook(
             return result
         except Exception as exc:
             elapsed = time.monotonic() - started
+            if _tool_call is not None:
+                _evidence = run_context.finish_tool_call(
+                    _tool_call, content=None, success=False, error=str(exc))
+                await execution_store.guard(execution_store.persist_tool_call_completed(
+                    _tool_call_db_id, _tool_call, _evidence))
+            if _delegation_execution_id is not None:
+                run_context.finish_execution(_delegation_execution_id, status="failed", error=str(exc))
+                # Phase C: durable completion, read before clearing the id below.
+                await execution_store.guard(execution_store.persist_execution_completed(
+                    run_context.executions[_delegation_execution_id]))
+                _delegation_execution_id = None
             print(f"[team] tool_hook: {function_name}({args}) RAISED {type(exc).__name__}: {exc} after {elapsed:.2f}s", flush=True)
             if activity is not None:
                 now = time.monotonic()
                 activity["last_call_at"] = now
                 activity["last_progress_at"] = now
             raise
+        finally:
+            # Phase D: close a ToolCall that never reached either
+            # finish_tool_call call above -- i.e. `await function(**args)`
+            # raised asyncio.CancelledError or any other BaseException, which
+            # `except Exception` does not catch. Same class of gap as Phase A
+            # finding B below, but for the generic ToolCall/Evidence boundary
+            # rather than the delegation Execution boundary -- Phase C never
+            # persisted ToolCall, so this gap was latent (in-memory only)
+            # until now. Without this, a cancelled tool call's
+            # ToolCallRecord.status stays "running" forever and no Evidence
+            # row is ever written for it. Guarded by the status check so this
+            # never double-runs after either branch above already finished
+            # the same _tool_call.
+            if _tool_call is not None and _tool_call.status == "running":
+                _exc_now = sys.exc_info()[1]
+                _cancel_error = (f"{type(_exc_now).__name__}: {_exc_now}"
+                                  if _exc_now is not None else "cancelled")
+                _evidence = run_context.finish_tool_call(
+                    _tool_call, content=None, success=False, error=_cancel_error)
+                await execution_store.guard(execution_store.persist_tool_call_completed(
+                    _tool_call_db_id, _tool_call, _evidence))
+            # Phase A: close the delegation's child execution here so it happens
+            # exactly once regardless of which branch above ran -- the except
+            # branch already closed it (as "failed") and cleared the id, so this
+            # only fires for the success path.
+            #
+            # Phase A finding B (fixed for Phase C): `except Exception` above
+            # does not catch asyncio.CancelledError (a BaseException since
+            # Python 3.8), so a cancelled delegation used to reach this finally
+            # with _delegation_execution_id still set and get marked "ok"
+            # unconditionally -- durably wrong once Phase C persists this
+            # status. sys.exc_info() reports whichever exception (if any) is
+            # currently propagating through this finally, including
+            # CancelledError, without changing what is caught/re-raised above
+            # or altering cancellation semantics in any way.
+            if _delegation_execution_id is not None:
+                run_context.finish_execution(
+                    _delegation_execution_id,
+                    status="failed" if sys.exc_info()[0] is not None else "ok",
+                )
+                # Phase C: durable completion, mirroring the in-memory update
+                # above exactly -- covers the success path AND a cancellation
+                # (or any BaseException) that bypassed the except block above.
+                await execution_store.guard(execution_store.persist_execution_completed(
+                    run_context.executions[_delegation_execution_id]))
 
     return _tool_interception_hook
 
@@ -11708,6 +11917,33 @@ def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:
     about a detected loop (that's the caller's job, e.g. declining to advance
     last_progress_at) -- it only answers "does this look like one segment being
     generated over and over," nothing about intent or correctness.
+
+    Phase 5 (T12 context/liveness, 2026-09-12): the three tiers above all window
+    to _REPETITION_LOOKBACK_CHARS (4000 chars) -- correct for the sentence- and
+    phrase-scale repeats they were built for, but blind to T12's own failure
+    shape. Live-confirmed on R6 T12 (session 59033df0, the
+    litellm.ContextWindowExceededError at 258,049/262,144 tokens): the
+    coordinator regenerated a whole multi-thousand-character report section
+    ("## Verified Findings" through a full router/model enumeration) FOUR times
+    in one run, each recurrence separated by 8,000-25,000 chars of intervening
+    (also-repeated) text -- always outside the 4000-char window, so every tier
+    above stayed silent on every single cycle and nothing ever withheld
+    last_progress_at credit for it. Confirmed via direct byte comparison of the
+    persisted transcript: the first ~150 characters of two of those recurrences
+    are byte-identical 24,748 chars apart.
+    A fourth tier reuses the SAME prefix already extracted for tier 3, checked
+    against the full prior content instead of only its tail -- but requires it
+    to have already occurred TWICE there (this new one would be the third),
+    not merely once. A single far-apart reuse is deliberately still not
+    flagged: test_repetition_only_outside_the_lookback_window_is_not_flagged
+    pins exactly that as intentional ("targets recent, SUSTAINED repetition,
+    not any-time-ever reuse"), and _REPETITION_PREFIX_CHARS' own comment
+    already named this exact lever in advance ("require the prefix to recur
+    MULTIPLE times ... not a further threshold increase") for a case just
+    like this one. A genuine runaway loop keeps re-emitting the same block
+    every cycle, so it still reaches three occurrences with only one extra
+    cycle of delay versus flagging on the second; a phrase that legitimately
+    recurs once, far away, for an unrelated reason is left alone.
     """
     normalized_new = " ".join(new_segment.split())
     if len(normalized_new) < _REPETITION_MIN_SEGMENT_LEN:
@@ -11728,7 +11964,17 @@ def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:
     prefix = filler_stripped_new[:_REPETITION_PREFIX_CHARS]
     if len(prefix) < _REPETITION_MIN_SEGMENT_LEN:
         return False
-    return prefix in filler_stripped_prior
+    if prefix in filler_stripped_prior:
+        return True
+
+    # Tier 4 (Phase 5): same prefix, same floor, checked against the WHOLE
+    # prior content rather than only its tail -- catches a large-block repeat
+    # separated by more than _REPETITION_LOOKBACK_CHARS of intervening text.
+    # Requires 2 PRIOR occurrences (this would be the 3rd) rather than 1, so a
+    # single far-apart reuse (the existing, deliberately-permitted case) is
+    # still not flagged -- only sustained, repeated recurrence is.
+    full_filler_stripped_prior = _normalize_for_repetition_check(prior_content)
+    return full_filler_stripped_prior.count(prefix) >= 2
 
 
 _REPETITION_DECAY_WINDOW_CHARS = 1500
@@ -11892,11 +12138,12 @@ async def run_task_stream(
 
     # Success context rides in the SAME gather, not a second await: it is one indexed
     # SQL query against task_outcome_queue and must not add a serial hop to run startup.
-    (failure_context, success_context, (session_summary, session_messages),
-     skill_catalog) = (
+    (failure_context, success_context, project_memory_context,
+     (session_summary, session_messages), skill_catalog) = (
         await asyncio.gather(
             load_failure_context(project_id, current_task=task),
             load_success_context(project_id, current_task=task),
+            load_project_memory_context(project_id, current_task=task),
             _load_session_context(),
             _fetch_skill_catalog(_pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)),
         )
@@ -11948,6 +12195,8 @@ async def run_task_stream(
         _evidence_sink += ["", failure_context]
     if success_context:
         _evidence_sink += ["", success_context]
+    if project_memory_context:
+        _evidence_sink += ["", project_memory_context]
     if session_summary:
         is_chain_handoff = session_summary.startswith("── Chain handoff")
         instructions += [
@@ -12079,6 +12328,30 @@ async def run_task_stream(
         # _unresolvable_delegation_targets); _build_team has no MCP url in scope.
         team._hive_mcp_url = _hive_for_targets
         team._session_summary = session_summary or ""
+        # Phase A (durable execution/evidence backbone, runtime identity only --
+        # no persistence here, see swarm/execution_context.py). run_task_stream
+        # does not use Phase0 (no phase0.start_run() call exists on this path
+        # today), so the canonical run_id is always freshly minted here, using
+        # the identical scheme Phase0Run.run_id uses.
+        team._run_context = execution_context.RunContext(
+            session_id, execution_context.new_id())
+        team._run_context.start_execution(
+            agent_name="Coordinator", execution_type="coordinator", parent_execution_id=None)
+        # Phase C: durable Run + root Execution, one transaction (see
+        # swarm/execution_store.py). Fail-open -- awaited inline since it's
+        # already async, but any failure is caught and logged inside the
+        # store itself; this line can never raise into the run. guard() adds a
+        # second, last-resort defense layer on top of that (see its own
+        # docstring).
+        await execution_store.guard(execution_store.persist_run_started(
+            team._run_context, team_name=team_name, run_type="stream",
+            task_preview=(task or "")[:200]))
+        # Phase H: baseline checkpoint -- the run has started, nothing has
+        # completed yet. See execution_store.persist_checkpoint's own
+        # docstring for why this and the terminal checkpoint below are the
+        # only two boundaries this phase ever checkpoints at.
+        await execution_store.guard(execution_store.persist_checkpoint(
+            team._run_context, run_status="running"))
 
         full_content: list[str] = []
         # See _stream_team_run's own docstring for the narration-leak incident this
@@ -12197,6 +12470,31 @@ async def run_task_stream(
                 raise
             finally:
                 task_duration.record(time.perf_counter() - t0, {"project_id": project_id})
+                # Phase A: close the root coordinator execution -- this finally
+                # already runs on both normal completion and any exception from
+                # the try block above, so identity/status stay available either way.
+                _run_ctx = getattr(team, "_run_context", None)
+                if _run_ctx is not None and _run_ctx.root_execution_id is not None:
+                    _final_status = "failed" if sys.exc_info()[0] is not None else "ok"
+                    _run_ctx.finish_execution(_run_ctx.root_execution_id, status=_final_status)
+                    # Phase C: durable completion, mirroring the in-memory update
+                    # above exactly. run_task_stream never retries (no
+                    # _verified_answer/_stream_team_run call on this path), so the
+                    # root execution's own completion IS the run's completion here
+                    # -- unlike run_task_async, no later retry can still be running.
+                    _root_record = _run_ctx.executions[_run_ctx.root_execution_id]
+                    await execution_store.guard(
+                        execution_store.persist_execution_completed(_root_record))
+                    await execution_store.guard(execution_store.persist_run_completed(
+                        _run_ctx, status=_final_status,
+                        error=str(sys.exc_info()[1]) if sys.exc_info()[1] is not None else None,
+                    ))
+                    # Phase H: terminal checkpoint -- the run reached a clean,
+                    # in-process-observable end (never written for a SIGKILL,
+                    # which is the whole point: see persist_checkpoint's own
+                    # docstring).
+                    await execution_store.guard(execution_store.persist_checkpoint(
+                        _run_ctx, run_status=_final_status))
 
 
 # Cap on the draft carried in the liveness snapshot. Large enough for a real
@@ -14046,6 +14344,127 @@ def _salient_tokens(text: str) -> frozenset[str]:
     return frozenset(out)
 
 
+def _fidelity_agent_name(run_context, execution_id: str | None) -> str | None:
+    """The agent_name of the Execution that owns `execution_id`, or None --
+    used only by _evidence_fidelity_report below to attribute one piece of
+    Evidence to the member whose relay (team._member_results) it should be
+    checked against."""
+    if execution_id is None or run_context is None:
+        return None
+    rec = run_context.executions.get(execution_id)
+    return rec.agent_name if rec is not None else None
+
+
+def _evidence_fidelity_report(run_context, member_results: dict | None, final_answer: str) -> dict:
+    """Phase N -- a deterministic, token-level fidelity trace answering
+    "tool evidence != model input != model output != relay != final
+    synthesis" WITHOUT capturing a single raw model request or completion.
+
+    For each piece of DURABLE, EXACT Evidence this run captured (Phase A's
+    RunContext.evidence -- never team._tool_evidence, the lossy preview
+    cache), computes how many of its salient tokens (_salient_tokens, the
+    SAME shape-based extraction _answer_supported_by_evidence already uses
+    -- not a second, competing heuristic) survive into (a) the owning
+    member's own relayed report to the coordinator
+    (team._member_results[agent_name]) and (b) the final answer that
+    shipped.
+
+    Phase N's own forensic finding this function exists to make
+    observable, not to fix: member-report compression (a member reading
+    548k chars and relaying 17k, ~30.6:1 -- see this project's own carried-
+    forward limitation) is the single largest, most consistently
+    documented fidelity-loss point in this whole pipeline (T9's canonical
+    incident: a 1,547-char real tool result relayed as 56 chars, the
+    coordinator never seeing the real text at all), and it is entirely
+    visible from data this codebase ALREADY collects for its own ordinary
+    purposes. Raw model request/completion capture was evaluated and
+    judged unnecessary to prove or disprove a fidelity claim about
+    relay/synthesis loss specifically -- see docs/guide/deferred-
+    limitations-ledger.md's Phase N entry for the full reasoning.
+
+    Read-only and non-mutating: never writes to run_context.evidence,
+    member_results, or the answer text -- diagnostic only, never
+    authoritative state (an EvidenceRecord, and its durable Evidence row
+    if persisted, remain the sole authoritative record of what a tool
+    returned; this function's own report carries no identity and is
+    never itself persisted).
+
+    Deliberately NOT wired into the live answer-generation pipeline as of
+    this phase -- there is no live model available in this environment to
+    validate its signal-to-noise ratio against a real battery, and wiring
+    an unvalidated diagnostic into the hot path of a pipeline this
+    extensively live-tuned (see the T2/T3/T8/T9/T11/T12/T13a/T13b guards
+    elsewhere in this file) risks adding untested noise to every future
+    run. Standalone and independently callable/testable, matching this
+    project's own established pattern for primitives built ahead of a
+    proven wiring need (e.g. execution_store's run-rehydration and
+    run-ownership-lease primitives from earlier phases).
+
+    Returns:
+        {
+          "items": [
+            {"tool_call_id", "tool_name", "agent_name",
+             "evidence_tokens": int,
+             "tokens_in_relay": int, "relay_retention": float | None,
+             "tokens_in_answer": int, "answer_retention": float | None},
+            ...
+          ],
+          "overall_relay_retention": float | None,
+          "overall_answer_retention": float | None,
+        }
+    A retention ratio is None (never 0.0) when evidence_tokens == 0 for
+    that item -- "nothing citable to lose" is a different claim from
+    "lost everything," and collapsing the two would make an evidence item
+    with no salient tokens at all (e.g. a bare success acknowledgement)
+    look like a total fidelity failure.
+    """
+    member_results = member_results or {}
+    answer_tokens = _salient_tokens(final_answer or "")
+    items: list[dict] = []
+    total_evidence = 0
+    total_in_relay = 0
+    total_in_answer = 0
+    for ev in (run_context.evidence if run_context is not None else []):
+        agent_name = _fidelity_agent_name(run_context, ev.execution_id)
+        ev_tokens = _salient_tokens(_result_text(ev.content))
+        if not ev_tokens:
+            items.append({
+                "tool_call_id": ev.tool_call_id, "tool_name": ev.tool_name,
+                "agent_name": agent_name,
+                "evidence_tokens": 0,
+                "tokens_in_relay": 0, "relay_retention": None,
+                "tokens_in_answer": 0, "answer_retention": None,
+            })
+            continue
+        # member_results is keyed by _member_key(agent_name) (see
+        # _capture_member_result's own "Keyed by _member_key so
+        # 'context-router' and 'contextrouter' land in one bucket"
+        # comment) -- the raw ExecutionRecord.agent_name is NOT
+        # necessarily spelled the same way, so the lookup must normalize
+        # too, or every item silently misses its own relay text.
+        relay_text = member_results.get(_member_key(agent_name), "") if agent_name else ""
+        relay_tokens = _salient_tokens(relay_text)
+        in_relay = ev_tokens & relay_tokens
+        in_answer = ev_tokens & answer_tokens
+        items.append({
+            "tool_call_id": ev.tool_call_id, "tool_name": ev.tool_name,
+            "agent_name": agent_name,
+            "evidence_tokens": len(ev_tokens),
+            "tokens_in_relay": len(in_relay),
+            "relay_retention": len(in_relay) / len(ev_tokens),
+            "tokens_in_answer": len(in_answer),
+            "answer_retention": len(in_answer) / len(ev_tokens),
+        })
+        total_evidence += len(ev_tokens)
+        total_in_relay += len(in_relay)
+        total_in_answer += len(in_answer)
+    return {
+        "items": items,
+        "overall_relay_retention": (total_in_relay / total_evidence) if total_evidence else None,
+        "overall_answer_retention": (total_in_answer / total_evidence) if total_evidence else None,
+    }
+
+
 # A whole run's accumulated evidence vocabulary. Bounded so a long run cannot grow it
 # without limit; 200k distinct tokens is far more than any real run produces.
 _EVIDENCE_TOKEN_CEILING = 200_000
@@ -15705,6 +16124,24 @@ async def _stream_team_run(
     must be given a liveness_path to actually close this -- omitting it (the
     default) reproduces the exact unprotected behavior above, so every caller of
     this function needs updating alongside this fix, not just this function itself."""
+    # Phase A: every call to this function is a coordinator RE-invocation (the
+    # original top-level call never goes through here -- see this docstring's own
+    # "today, that means every retry inside _verified_answer"), so each call opens
+    # its own new Execution, parented to the run's root coordinator execution --
+    # not a mutation of the execution being retried. Behavior/return value below
+    # are completely unchanged; this only records identity around the existing call.
+    _run_ctx = getattr(team, "_run_context", None)
+    _retry_execution_id = None
+    if _run_ctx is not None:
+        _retry_execution_id = _run_ctx.start_execution(
+            agent_name="Coordinator", execution_type="coordinator",
+            parent_execution_id=_run_ctx.root_execution_id,
+        )
+        # Phase C: durable Execution row for this retry, mirroring the
+        # in-memory ExecutionRecord just created. Fail-open, awaited inline,
+        # and wrapped in guard() as a second, last-resort defense layer.
+        await execution_store.guard(execution_store.persist_execution_created(
+            _run_ctx.executions[_retry_execution_id]))
     activity = {
         "last_call_name": None, "last_call_at": time.monotonic(),
         "stream_event_count": 0, "last_progress_at": time.monotonic(),
@@ -15807,6 +16244,18 @@ async def _stream_team_run(
         heartbeat_task.cancel()
         with suppress(asyncio.CancelledError):
             await heartbeat_task
+        # Phase A: close this retry's execution here -- runs on both normal
+        # completion and any exception raised out of the loop above, so identity/
+        # status stay available either way without a new try/except around the
+        # whole function.
+        if _run_ctx is not None and _retry_execution_id is not None:
+            _run_ctx.finish_execution(
+                _retry_execution_id,
+                status="failed" if sys.exc_info()[0] is not None else "ok",
+            )
+            # Phase C: durable completion, mirroring the in-memory update above.
+            await execution_store.guard(execution_store.persist_execution_completed(
+                _run_ctx.executions[_retry_execution_id]))
     accumulated = "".join(full_content) or "(no response)"
     final_segment = "".join(full_content[last_segment_start:]).strip()
     content = _first_surviving_answer(
@@ -15885,11 +16334,12 @@ async def run_task_async(
 
     # Success context rides in the SAME gather, not a second await: it is one indexed
     # SQL query against task_outcome_queue and must not add a serial hop to run startup.
-    (failure_context, success_context, (session_summary, session_messages),
-     skill_catalog) = (
+    (failure_context, success_context, project_memory_context,
+     (session_summary, session_messages), skill_catalog) = (
         await asyncio.gather(
             load_failure_context(project_id, current_task=task),
             load_success_context(project_id, current_task=task),
+            load_project_memory_context(project_id, current_task=task),
             _load_session_context(),
             _fetch_skill_catalog(_pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)),
         )
@@ -15941,6 +16391,8 @@ async def run_task_async(
         _evidence_sink += ["", failure_context]
     if success_context:
         _evidence_sink += ["", success_context]
+    if project_memory_context:
+        _evidence_sink += ["", project_memory_context]
     if session_summary:
         is_chain_handoff = session_summary.startswith("── Chain handoff")
         instructions += [
@@ -16130,6 +16582,32 @@ async def run_task_async(
         # which is always after construction. None when telemetry is off, and every
         # read site is guarded on that.
         team._phase0 = _phase0
+        # Phase A (durable execution/evidence backbone, runtime identity only --
+        # no persistence here, see swarm/execution_context.py). Canonical run_id
+        # is Phase0Run.run_id when telemetry happens to be on (same string, not a
+        # second identifier); otherwise a fresh id from the identical scheme, since
+        # a Run identity must exist regardless of whether telemetry is enabled.
+        _run_id = _phase0.run_id if _phase0 is not None else execution_context.new_id()
+        team._run_context = execution_context.RunContext(session_id, _run_id)
+        team._run_context.start_execution(
+            agent_name="Coordinator", execution_type="coordinator", parent_execution_id=None)
+        # Phase C: durable Run + root Execution, one transaction (see
+        # swarm/execution_store.py). Fail-open, awaited inline -- any failure
+        # is caught and logged inside the store itself, never raised here.
+        # One /run_chunked chunk is one run_task_async call, so this naturally
+        # persists one Run row per chunk; the optional synthesis call is
+        # distinguished via its own existing synthesis_run flag, not a new
+        # Chunk concept.
+        await execution_store.guard(execution_store.persist_run_started(
+            team._run_context, team_name=team_name,
+            run_type="synthesis" if synthesis_run else "single",
+            task_preview=(task or "")[:200]))
+        # Phase H: baseline checkpoint -- see persist_checkpoint's own
+        # docstring for why this and run_task_async's own terminal checkpoint
+        # (in this function's outermost finally) are the only two boundaries
+        # this phase ever checkpoints at.
+        await execution_store.guard(execution_store.persist_checkpoint(
+            team._run_context, run_status="running"))
 
         # ContextPack (Phase 2, Experiment 2). Resolved ONCE here, before the team
         # runs, so the delegation hook does no I/O. Targets come from the TASK rather
@@ -16300,6 +16778,26 @@ async def run_task_async(
                         heartbeat_task.cancel()
                         with suppress(asyncio.CancelledError):
                             await heartbeat_task
+                        # Phase A: close the root coordinator execution here -- this
+                        # finally already runs on both normal completion and any
+                        # exception raised out of the loop above (e.g. _BackendRunError),
+                        # so identity/status stay available in either case without a new
+                        # try/except wrapping the whole function.
+                        _run_ctx = getattr(team, "_run_context", None)
+                        if _run_ctx is not None and _run_ctx.root_execution_id is not None:
+                            _run_ctx.finish_execution(
+                                _run_ctx.root_execution_id,
+                                status="failed" if sys.exc_info()[0] is not None else "ok",
+                            )
+                            # Phase C: durable completion for the root execution
+                            # specifically -- NOT the run itself. Retries (new
+                            # sibling coordinator executions via _verified_answer/
+                            # _stream_team_run) can still happen after this point,
+                            # so the run's own completion is persisted separately,
+                            # once, at run_task_async's true end (see the outer
+                            # finally below).
+                            await execution_store.guard(execution_store.persist_execution_completed(
+                                _run_ctx.executions[_run_ctx.root_execution_id]))
                 accumulated = "".join(full_content) or "(no response)"
                 final_segment = "".join(full_content[last_segment_start:]).strip()
                 content = _first_surviving_answer(
@@ -16458,6 +16956,28 @@ async def run_task_async(
                     time.perf_counter() - t0,
                     {"project_id": project_id},
                 )
+                # Phase C: the run's OWN completion, persisted exactly once here
+                # -- this finally wraps both return points above (the
+                # clarification early-return and the main success return) AND
+                # the exception/re-raise path, and runs strictly after any
+                # retries (_verified_answer/_stream_team_run) have already
+                # finished, unlike the root execution's own completion above,
+                # which fires earlier, before retries can happen.
+                _run_ctx = getattr(team, "_run_context", None)
+                if _run_ctx is not None:
+                    _exc = sys.exc_info()[1]
+                    _final_status = "failed" if _exc is not None else "ok"
+                    await execution_store.guard(execution_store.persist_run_completed(
+                        _run_ctx, status=_final_status,
+                        error=str(_exc) if _exc is not None else None,
+                    ))
+                    # Phase H: terminal checkpoint -- runs strictly after any
+                    # retries have already finished (this finally wraps the
+                    # whole function, including _verified_answer's own
+                    # _stream_team_run calls), so it reflects the run's TRUE
+                    # final state, not just the root execution's own.
+                    await execution_store.guard(execution_store.persist_checkpoint(
+                        _run_ctx, run_status=_final_status))
 
 
 def _warn_on_single_site_guards() -> None:

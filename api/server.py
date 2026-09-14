@@ -8,6 +8,7 @@ from pathlib import Path
 
 import yaml
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from api.models import (
     AgentSpec, RunRequest, RunResponse, PlanResponse, ScanRequest, ScanResponse,
@@ -24,7 +25,7 @@ from swarm.team import (
     render_member_findings,
 )
 from swarm.feedback import record_failure, record_success, drain_background_tasks
-from swarm import db, model_routing, team_config
+from swarm import db, execution_store, model_routing, team_config
 from config.config import config
 from observability.setup import setup_telemetry
 from swarm.sessions import (
@@ -325,6 +326,20 @@ async def _outcome_drain_loop():
 @app.get("/health")
 async def health():
     return {"status": "ok", "mcp_url": config.mcp_url}
+
+
+@app.get("/health/db")
+async def health_db():
+    """Phase I -- durable-storage readiness, distinct from /health above
+    (which only proves the FastAPI process itself is responding). A 200
+    here means the database is reachable AND its schema is at the revision
+    this running code expects; a 503 means at least one of those is false
+    -- see swarm/db.check_storage_readiness's own docstring for exactly
+    what is (and, deliberately, is not) checked, and why no connection
+    string or other secret ever appears in the response."""
+    result = await db.check_storage_readiness()
+    status_code = 200 if (result["db_reachable"] and result["schema_current"]) else 503
+    return JSONResponse(status_code=status_code, content=result)
 
 
 @app.get("/teams")
@@ -927,8 +942,25 @@ async def run(request: RunRequest, http_request: Request):
             title=request.task,
             persist=request.persist,
         )
-    elif request.persist:
-        await _persist_session(session_id)
+    else:
+        # Phase M: verify the RESUMED session actually belongs to
+        # request.project_id before reading its history or appending
+        # anything to it. Before this check, a caller could chain onto
+        # (i.e. session_id=) ANY project's existing session while
+        # claiming a DIFFERENT project_id for this request -- that
+        # project's entire prior conversation would be loaded into THIS
+        # run's coordinator context (get_context, a few lines below) and
+        # new turns appended to it, all under a run durably tagged with
+        # the WRONG project_id. This is the exact same class of gap
+        # Phase J closed for the standalone /sessions/{id} endpoints --
+        # unguarded here in the PRIMARY /run path (and /stream's
+        # identical pattern) the whole time. Reuses
+        # _authorize_session_access directly (not a re-implementation)
+        # so this inherits the exact same fail-closed, existence-hiding
+        # behavior Phase J already established and tested.
+        await _authorize_session_access(session_id, request.project_id)
+        if request.persist:
+            await _persist_session(session_id)
 
     # Capture context size before run (for footer metadata)
     session_summary, prior_messages = await get_context(session_id)
@@ -1259,8 +1291,13 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
             title=request.task,
             persist=request.persist,
         )
-    elif request.persist:
-        await _persist_session(session_id)
+    else:
+        # Phase M: same ownership check as /run's identical resume path --
+        # see that endpoint's own comment for the full reasoning. A
+        # mismatch (or a session_id that does not exist) fails closed.
+        await _authorize_session_access(session_id, request.project_id)
+        if request.persist:
+            await _persist_session(session_id)
 
     session_summary, prior_messages = await get_context(session_id)
     session_before = await get_session(session_id)
@@ -1386,6 +1423,43 @@ async def scan(request: ScanRequest):
     )
 
 
+async def _authorize_session_access(session_id: str, project_id: str | None) -> dict:
+    """Phase J -- the single explicit authorization boundary for every
+    session-scoped endpoint below. Returns the already-fetched session row
+    (so callers reuse it instead of re-querying) when access is
+    authorized; raises HTTPException(404) otherwise -- FAILS CLOSED, never
+    silently lets a project_id mismatch through, and never distinguishes
+    "wrong project" from "does not exist" in its response (a 403 would
+    confirm to an unauthorized caller that the session_id is real, which
+    404 does not).
+
+    Found by this phase's own forensics: before this check existed, every
+    one of GET/DELETE/PATCH /sessions/{id}, /tree, and /branch identified
+    their target by session_id ALONE -- any caller holding (or guessing)
+    ANY session_id could read, delete, or mutate ANY project's session,
+    with its entire durable Run/Execution/ToolCall/Evidence/Claim/
+    Checkpoint tree deleted right along with it via the existing cascade.
+
+    `project_id` is OPTIONAL (None = not supplied) for backward
+    compatibility with every existing caller of these endpoints, which
+    have never sent one -- and with this deployment's documented,
+    pre-existing trust model (see the /admin/model-routes section above:
+    "same unauthenticated-over-Tailscale trust boundary every other
+    endpoint above already relies on"). This phase cannot make identity
+    verification mandatory without inventing an authentication system
+    (explicitly out of scope) that does not exist anywhere in this
+    codebase today; what it CAN and DOES do is make the check available
+    and airtight the moment a caller supplies project_id -- never
+    converted into fail-open behavior once supplied.
+    """
+    session = await get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    if project_id is not None and session["project_id"] != project_id:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    return session
+
+
 @app.get("/sessions")
 async def list_sessions_endpoint(project_id: str = "default", limit: int = 20):
     from api.models import SessionListItem
@@ -1407,14 +1481,16 @@ async def list_sessions_endpoint(project_id: str = "default", limit: int = 20):
 
 
 @app.get("/sessions/{session_id}")
-async def get_session_endpoint(session_id: str):
+async def get_session_endpoint(session_id: str, project_id: str | None = None):
     from api.models import SessionDetail, SessionMessage
+
+    # Authorization BEFORE anything else, including imports only the success
+    # path needs (psycopg here) -- an unauthorized/forged request must fail
+    # on the ownership check alone, never on an unrelated downstream error.
+    session = await _authorize_session_access(session_id, project_id)
+
     import psycopg
     from config.config import config as _config
-
-    session = await get_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found or expired")
 
     try:
         async with await psycopg.AsyncConnection.connect(_config.postgres_uri) as conn:
@@ -1445,7 +1521,8 @@ async def get_session_endpoint(session_id: str):
 
 
 @app.delete("/sessions/{session_id}")
-async def delete_session_endpoint(session_id: str):
+async def delete_session_endpoint(session_id: str, project_id: str | None = None):
+    await _authorize_session_access(session_id, project_id)
     deleted = await _delete_session(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -1453,7 +1530,8 @@ async def delete_session_endpoint(session_id: str):
 
 
 @app.patch("/sessions/{session_id}/persist")
-async def persist_session_endpoint(session_id: str):
+async def persist_session_endpoint(session_id: str, project_id: str | None = None):
+    await _authorize_session_access(session_id, project_id)
     updated = await _persist_session(session_id)
     if not updated:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -1461,13 +1539,16 @@ async def persist_session_endpoint(session_id: str):
 
 
 @app.get("/sessions/{session_id}/tree")
-async def get_session_tree_endpoint(session_id: str):
+async def get_session_tree_endpoint(session_id: str, project_id: str | None = None):
+    await _authorize_session_access(session_id, project_id)
     messages = await list_session_tree(session_id)
     return {"messages": messages}
 
 
 @app.post("/sessions/{session_id}/branch")
-async def branch_session_endpoint(session_id: str, request: BranchRequest):
+async def branch_session_endpoint(session_id: str, request: BranchRequest,
+                                   project_id: str | None = None):
+    await _authorize_session_access(session_id, project_id)
     messages = await list_session_tree(session_id)
     target = next((m for m in messages if m["id"] == request.message_id), None)
     if target is None:
@@ -1479,6 +1560,17 @@ async def branch_session_endpoint(session_id: str, request: BranchRequest):
 
 @app.post("/sessions/{session_id}/fork")
 async def fork_session_endpoint(session_id: str, request: ForkRequest):
+    # Phase J: unlike the other session-scoped endpoints above, ForkRequest
+    # has ALWAYS required project_id (no backward-compat tradeoff to make
+    # here -- every existing caller already supplies one). Before this
+    # check, that project_id was used ONLY to tag the brand-new forked
+    # session, never verified against the SOURCE session_id's own project
+    # -- so a caller could fork ANY project's session (its full message
+    # history) into a session tagged under a project_id THEY chose,
+    # exfiltrating that content across the project boundary. Fails closed,
+    # same as _authorize_session_access: forking across projects is
+    # refused outright, not silently allowed or downgraded to a warning.
+    await _authorize_session_access(session_id, request.project_id)
     new_session_id = await fork_session(session_id, request.project_id, request.title)
     if new_session_id is None:
         raise HTTPException(status_code=404, detail="source session has no messages to fork")
@@ -1519,6 +1611,18 @@ async def feedback(request: FeedbackRequest):
         # extraction, and the row survives a restart in between.
         await _queue_outcome(
             request.task, request.notes or "user marked as correct", request.project_id)
+        # Phase F: promote any deterministically-validated ("supported") Claims from
+        # this session into project_memory_promotions -- a SEPARATE, project-owned
+        # table, independent of the LightRAG experience-namespace write above (see
+        # execution_store.py's own module docstring for why both signals -- Phase E's
+        # deterministic verdict AND this endpoint's human rating=="good" -- are
+        # required together, and why neither alone is enough). A no-op when
+        # request.session_id is empty (most existing callers never send it) or when
+        # the session has no supported claims -- the ordinary case, not a failure.
+        # Fail-open: a promotion failure can never change this endpoint's response.
+        if request.session_id:
+            await execution_store.guard(execution_store.promote_session_claims(
+                request.session_id, request.project_id, feedback_notes=request.notes or None))
         return FeedbackResponse(recorded=True, message="Success pattern recorded to memory")
 
 

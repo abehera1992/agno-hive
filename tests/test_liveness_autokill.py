@@ -25,6 +25,7 @@ def _thresholds(monkeypatch):
     monkeypatch.setattr(config, "liveness_silence_threshold_s", 300.0)
     monkeypatch.setattr(config, "liveness_stub_serve_threshold", 8)
     monkeypatch.setattr(config, "liveness_aggregate_stub_threshold", 15)
+    monkeypatch.setattr(config, "liveness_repetition_threshold", 4)
 
 
 # ── _liveness_kill_reason ───────────────────────────────────────────────────────
@@ -137,6 +138,60 @@ def test_aggregate_signal_missing_from_an_older_snapshot_defaults_to_healthy():
     """Backward compat: a snapshot written before this field existed (or any
     caller that never sets it) must default to 0, not crash or false-trigger."""
     snapshot = {"stagnant_seconds": 0, "max_stub_serve_count": 0}
+    assert _liveness_kill_reason(snapshot) is None
+
+
+# ── Tier 5: repetition_count, recalibrated 2026-09-14 (Phase Q) ────────────────
+#
+# Original threshold (6) never fired across 48 hours of real production-adjacent
+# traffic pulled from the live journal (32 firings, 13 distinct runs, every
+# single-run streak <= 3), while T1-T13 battery test T11 ran 15+ minutes
+# regenerating the same verbatim block ~5 times with no synthesized final answer
+# and was never killed. Lowered to 4 -- one firing of margin above every streak
+# actually observed live, closing most of the gap that let T11's run continue
+# unbounded. See config.py's own comment on liveness_repetition_threshold for
+# the full calibration evidence.
+
+def test_repetition_count_below_the_threshold_does_not_trigger():
+    snapshot = {"stagnant_seconds": 0, "repetition_count": 3}
+    assert _liveness_kill_reason(snapshot) is None
+
+
+def test_repetition_count_at_the_threshold_triggers():
+    """Tier 5 uses >=, not > (unlike Tier 1's strict > threshold) -- exactly at
+    the configured threshold already triggers, matching _liveness_kill_reason's
+    own `if repeats >= config.liveness_repetition_threshold` check."""
+    snapshot = {"stagnant_seconds": 0, "repetition_count": 4}
+    reason = _liveness_kill_reason(snapshot)
+    assert reason is not None
+    assert "4" in reason
+
+
+def test_repetition_reason_names_looping_not_stagnation():
+    """Distinguishes this tier's own failure mode in the message -- a repetition
+    kill is NOT a silence/stall kill, and an operator reading the reason should
+    not have to guess which tier fired."""
+    snapshot = {"stagnant_seconds": 0, "repetition_count": 6}
+    reason = _liveness_kill_reason(snapshot)
+    assert reason is not None
+    assert "looping" in reason.lower()
+
+
+def test_the_observed_max_benign_streak_from_the_live_journal_never_triggers():
+    """Direct regression for the calibration evidence itself: every streak this
+    phase actually observed across 48h of real traffic (max 3, spread across 13
+    distinct runs) must stay healthy under the new threshold -- the whole point
+    of choosing 4 rather than something tighter."""
+    for observed_streak in (1, 2, 3):
+        snapshot = {"stagnant_seconds": 0, "repetition_count": observed_streak}
+        assert _liveness_kill_reason(snapshot) is None
+
+
+def test_repetition_signal_missing_from_an_older_snapshot_defaults_to_healthy():
+    """Backward compat: a snapshot written before this field existed (or a
+    caller, e.g. _stream_team_run's older activity dicts, that never sets it)
+    must default to 0, not crash or false-trigger."""
+    snapshot = {"stagnant_seconds": 0}
     assert _liveness_kill_reason(snapshot) is None
 
 

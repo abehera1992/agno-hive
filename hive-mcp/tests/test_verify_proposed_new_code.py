@@ -37,8 +37,7 @@ def _reset_repeat_tracking():
     that unrelated mechanism depending on test order. Same reset test_verify.py's
     own test_identical_answer_checked_twice_hard_stops uses, just autoused here
     since nothing in this file is testing THAT mechanism."""
-    verify._last_checked_answer = None
-    verify._repeat_count = 0
+    verify._checked_answer_counts = {}
 
 
 # ── mechanism 1: backtick-prose "new/add" cue ───────────────────────────────────

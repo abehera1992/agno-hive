@@ -201,8 +201,30 @@ def db_schema(table: str | None = None) -> str:
             rows = cur.fetchall()
             if not rows:
                 return f"(no such table: {table})"
+            # Phase 3 (T8 forensic fix, 2026-09-12): this branch used to hand back the
+            # schema per COLUMN ROW ("inventory | party_id | uuid | NO") and the bare
+            # name only in the header ("parties (found in...)"), never the single
+            # concatenated "inventory.parties" string a subsequent db_query call
+            # actually needs. Live T8 (three separate battery runs): the model called
+            # db_schema('parties'), got exactly this output, and then wrote
+            # `SELECT COUNT(*) FROM inventory.party_id` -- mistaking the COLUMN name
+            # in the first data row for a table name -- followed by a guessed
+            # `inventory.party`. Both failed with an accurate "relation does not
+            # exist" from db_query; the real, already-discovered `inventory.parties`
+            # was never tried. The schema evidence was correct throughout; nothing
+            # ever stated the one string that would have made reconstruction
+            # unnecessary. Stating it here is the same principle as compare_
+            # enumerations' Phase 1 fix and db_query's own _err() hint below --
+            # deterministic information already in hand, made explicit instead of
+            # left for the caller to re-derive.
+            qualified = sorted({f"{r[0]}.{table}" for r in rows})
             body = "\n".join(f"{r[0]} | {r[1]} | {r[2]} | {r[3]}" for r in rows)
-            return f"{table} (found in one or more schemas):\nschema | column | type | nullable\n{body}"
+            return (
+                f"'{table}' resolves to: {', '.join(qualified)}\n"
+                f"Use one of the qualified name(s) above in db_query -- none of the "
+                f"column names listed below are table names.\n"
+                f"schema | column | type | nullable\n{body}"
+            )
     except Exception as e:
         return _err(str(e).strip())
     finally:

@@ -182,6 +182,34 @@ def compare_enumerations(left_path: str, right_path: str) -> str:
                 f"{left_path} and {right_kind} from {right_path}; if these are not "
                 f"route-defining files, this tool is the wrong one for them.")
 
+    # One side empty, the other not: the "both empty" guard above cannot see this,
+    # and everything below treats a one-sided-empty result identically to a genuine
+    # gap -- a real one at that scale ("13 left-only, 0 right") is legitimately rare
+    # even for actually-incomplete coverage. Live incident, Groundedness Battery R5
+    # T2 (2026-09-11): the Coordinator delegated a wrong frontend target, and this
+    # tool was called with the wrong (but real, parseable) file as the empty side --
+    # 13 real backend routes against 0 extracted frontend endpoints, reported as a
+    # bare "LEFT ONLY (13)" that read exactly like a real, checkable gap. Mechanical
+    # and project-agnostic: it fires on the extraction COUNT alone, never on which
+    # file is "correct" -- the same check fires whichever side is empty, and does not
+    # know or care what a right answer would have contained. Warns rather than
+    # refuses, because a side can legitimately have zero of a construct (a brand-new
+    # router file with no routes yet is real); the data stays fully visible below so
+    # the reader can judge it, per this tool's own "the basis is visible" design.
+    if bool(left) != bool(right):
+        empty_path, empty_kind = (right_path, right_kind) if not right else (left_path, left_kind)
+        full_path, full_count = (left_path, len(left)) if not right else (right_path, len(right))
+        warning = (
+            f"WARNING: {empty_path} yielded ZERO {empty_kind} while {full_path} "
+            f"yielded {full_count}. A result this lopsided usually means {empty_path} "
+            f"is the wrong file for this comparison (empty file, wrong extension "
+            f"family, or a file that legitimately defines none of this construct) "
+            f"rather than a real {full_count}-item gap. Confirm {empty_path} is the "
+            f"intended target before treating anything below as a finding."
+        )
+    else:
+        warning = None
+
     matched, left_only = [], []
     matched_right = set()
     for l in left:
@@ -202,6 +230,10 @@ def compare_enumerations(left_path: str, right_path: str) -> str:
     parts = [
         f"compare_enumerations — {left_path}  vs  {right_path}",
         f"join: HTTP method + path-boundary suffix match (exact string, no inference)",
+    ]
+    if warning:
+        parts += ["", warning]
+    parts += [
         "",
         block(f"LEFT — {left_kind} in {left_path}", left),
         "",
