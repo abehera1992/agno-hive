@@ -409,15 +409,27 @@ class Config:
     liveness_refused_call_threshold_s: float = float(
         os.getenv("LIVENESS_REFUSED_CALL_THRESHOLD_S", "90"))
 
-    # Tier 5 (2026-08-27): stop after this many repetition-detector firings.
+    # Tier 5 (2026-08-27, recalibrated 2026-09-14 -- Phase Q): stop after this many
+    # repetition-detector firings.
     #
-    # 6 sits above the one-or-two incidental echoes a heavily templated document
-    # produces (see _REPETITION_PREFIX_CHARS' calibration notes on section headers)
-    # and far below the 21 reached by the live run that emitted the same block seven
-    # times over 736 seconds -- it would have stopped that one around the second
-    # duplicate rather than the seventh.
+    # 6 was chosen against a single known-bad incident (21 firings over 736s) with a
+    # wide, unvalidated margin -- "well short of the 21 reached." Phase Q pulled 48
+    # hours of real production-adjacent traffic from the live journal (32 firings
+    # across 13 distinct runs, all of them benign/recovering repeats a templated
+    # document or enumeration produces) and found the observed max streak for any
+    # SINGLE run was 3 -- Tier 5 had NEVER fired in that entire window, despite the
+    # underlying detector clearly working throughout. In the same window, a T1-T13
+    # battery rep (T11, cross-service chain trace) ran 15+ minutes emitting the same
+    # verbatim block ~5 times with zero synthesized final answer, and was never
+    # killed -- consistent with repetition_count never reaching a threshold of 6.
+    #
+    # 4 is the smallest value still above every observed benign streak (max 3, one
+    # firing of margin preserved) while meaningfully closing the gap that let T11's
+    # run continue unbounded. Still well below any single templated-document echo
+    # count measured live; still far below the 21-firing incident this tier was
+    # built for in the first place.
     liveness_repetition_threshold: int = int(
-        os.getenv("LIVENESS_REPETITION_THRESHOLD", "6"))
+        os.getenv("LIVENESS_REPETITION_THRESHOLD", "4"))
 
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))
