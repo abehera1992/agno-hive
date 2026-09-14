@@ -226,7 +226,14 @@ async def test_expired_session_cleanup_cascades_through_the_entire_tree():
 
     await hook("get_file_content", fake_tool, {"path": "a.py"}, team=team)
     claim_id = await execution_store.persist_claim(rc, "a claim", "supported")
-    await execution_store.persist_checkpoint(rc, run_status="running")
+    # Phase K: cleanup now skips a session with a still-"running" run (see
+    # swarm/sessions._cleanup_expired's own docstring) -- complete the run
+    # first, matching the realistic scenario this test means to exercise
+    # (a FINISHED run whose session later expires), not an active one.
+    rc.finish_execution(rc.root_execution_id, status="ok")
+    await execution_store.persist_execution_completed(rc.executions[rc.root_execution_id])
+    await execution_store.persist_run_completed(rc, status="ok")
+    await execution_store.persist_checkpoint(rc, run_status="ok")
 
     assert await _table_row_count(db.runs) == 1
     assert await _table_row_count(db.executions) == 1
@@ -263,10 +270,16 @@ async def test_expired_session_cleanup_never_deletes_project_memory():
 
     sid = await _create_session()
     team = await _team_with_persisted_run(sid)
-    claim_id = await execution_store.persist_claim(team._run_context, "a claim", "supported")
+    rc = team._run_context
+    claim_id = await execution_store.persist_claim(rc, "a claim", "supported")
     promoted = await execution_store.promote_session_claims(sid, "p")
     assert len(promoted) == 1
     assert await _table_row_count(db.project_memory_promotions) == 1
+    # Phase K: cleanup now skips a session with a still-"running" run --
+    # complete it first (see the sibling test above for the same fix).
+    rc.finish_execution(rc.root_execution_id, status="ok")
+    await execution_store.persist_execution_completed(rc.executions[rc.root_execution_id])
+    await execution_store.persist_run_completed(rc, status="ok")
 
     from datetime import datetime, timedelta, timezone
     past = datetime.now(timezone.utc) - timedelta(days=1)

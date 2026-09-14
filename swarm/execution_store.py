@@ -66,6 +66,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid as _uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, TypeVar
 
 import sqlalchemy as sa
@@ -1179,4 +1180,170 @@ async def resolve_tenant_for_project(project_id: str) -> str | None:
         print(f"[execution_store] resolve_tenant_for_project failed "
               f"(project_id={project_id!r}): {type(exc).__name__}: {exc}",
               flush=True)
+        return None
+
+
+# ============================================================================
+# Phase K -- run ownership/exclusivity (database-backed, no queue/broker).
+# ============================================================================
+
+# Forensic finding this whole section exists to defend against, not to
+# retrofit into a currently-broken path: as of Phase K, run_id is ALWAYS
+# freshly minted (execution_context.new_id(), never supplied by a caller)
+# by exactly ONE process -- run_task_async/run_task_stream mint it, and
+# _run_worker_subprocess (api/server.py) spawns exactly one dedicated
+# ephemeral worker process per /run, /run_chunked chunk, or /stream call,
+# each with its own fresh run_id. No code path today lets a caller hand an
+# EXISTING run_id back in to be "resumed" by a second worker --
+# rehydrate_run (Phase H) is deliberately read-only and never launches,
+# drives, or continues execution itself (verified again this phase: still
+# true, still tested). So the specific race this section is required to
+# prevent -- "two workers advance the same run_id concurrently" -- is not
+# reachable through any existing code path, and run_task_async/
+# run_task_stream do NOT call acquire_run_ownership below at all; wiring
+# it into them would add locking overhead and complexity to a flow that
+# structurally cannot race today, contradicting this phase's own "do not
+# solve hypothetical problems" instruction.
+#
+# What IS built here is the PRIMITIVE the invariant asks for, available
+# now and tested now, for the day a caller DOES take a rehydrate_run
+# verdict and launch a continuation (a future phase's concern -- Phase K
+# explicitly forbids redesigning rehydration/the agent runtime to wire
+# this in prematurely). A single atomic UPDATE...WHERE against two new
+# nullable columns on `runs` (owner_worker_id, owner_lease_expires_at) --
+# not a new table, not an in-process lock, not a queue/broker/scheduler:
+# mutual exclusion over ONE row's advancement needs none of that
+# infrastructure. The UPDATE's own WHERE clause is atomic at the database
+# engine level identically on SQLite and PostgreSQL (no dialect-specific
+# locking clause like SELECT...FOR UPDATE SKIP LOCKED), which is also
+# exactly why SQLite's test behavior stays fully deterministic.
+
+# Ownership acquisition/release are AUTHORIZATION-shaped decisions (do I,
+# specifically, currently hold exclusive advancement rights over this
+# run?), not ordinary persistence -- so unlike almost everything else in
+# this module, a DB failure here FAILS SAFE (returns False -- "you do NOT
+# have confirmed ownership, do not proceed as though you do"), never
+# fail-open ("assume you own it"). This mirrors Phase J's own established
+# distinction: authorization fails closed, persistence fails open;
+# ownership acquisition is the former, not the latter.
+
+DEFAULT_RUN_OWNERSHIP_LEASE_SECONDS = 300
+
+
+async def acquire_run_ownership(
+    run_id: str, worker_id: str, lease_seconds: int = DEFAULT_RUN_OWNERSHIP_LEASE_SECONDS,
+) -> bool:
+    """Atomically claim (or renew) exclusive advancement rights over
+    `run_id` for `worker_id`. Returns True iff THIS call's UPDATE matched
+    and changed the row -- i.e. this worker now holds the lease -- False
+    otherwise (another worker holds a live lease, or run_id does not
+    exist).
+
+    Succeeds when the row is currently UNOWNED (owner_worker_id IS NULL),
+    already owned by THIS SAME worker_id (re-entrant -- a worker renewing
+    its own lease before it expires is not a race with itself), or the
+    existing lease has EXPIRED (owner_lease_expires_at is in the past --
+    stale-owner recovery: a worker that died without releasing does not
+    block the run forever, only until its lease runs out). One statement,
+    one round trip: the WHERE clause's own conditions ARE the atomicity --
+    no separate SELECT-then-UPDATE, so there is no window between
+    "checked" and "claimed" for a second caller to land in.
+
+    `lease_seconds` bounds how long a claim survives without being
+    renewed -- a crashed worker's ownership expires on its own; nothing
+    else needs to detect or clean up after it. Logged with run_id/
+    worker_id/outcome for observability (see this module's own
+    docstring's "minimal structured information" list) -- the log is
+    diagnostic only, never authoritative (the row itself is).
+    """
+    new_expiry = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+    try:
+        async with get_engine().begin() as conn:
+            result = await conn.execute(
+                db.runs.update()
+                .where(db.runs.c.run_id == run_id)
+                .where(sa.or_(
+                    db.runs.c.owner_worker_id.is_(None),
+                    db.runs.c.owner_worker_id == worker_id,
+                    db.runs.c.owner_lease_expires_at < func.now(),
+                ))
+                .values(owner_worker_id=worker_id, owner_lease_expires_at=new_expiry)
+            )
+        acquired = result.rowcount == 1
+        print(f"[execution_store] acquire_run_ownership: run_id={run_id!r} "
+              f"worker_id={worker_id!r} -> {'ACQUIRED' if acquired else 'DENIED'}",
+              flush=True)
+        return acquired
+    except Exception as exc:  # noqa: BLE001
+        print(f"[execution_store] acquire_run_ownership failed -- FAILING SAFE "
+              f"(treated as NOT acquired) (run_id={run_id!r}, "
+              f"worker_id={worker_id!r}): {type(exc).__name__}: {exc}", flush=True)
+        return False
+
+
+async def release_run_ownership(run_id: str, worker_id: str) -> bool:
+    """Clear ownership of `run_id`, ONLY if `worker_id` is still the
+    current owner -- a stale/expired former owner releasing late can never
+    clear a DIFFERENT, newer worker's live claim (the WHERE clause makes
+    that structurally impossible, not just unlikely). Returns True iff
+    this call's UPDATE matched a row (this worker really did hold and just
+    released it); False if it did not own the run (already released,
+    lease already expired and reclaimed by someone else, or run_id does
+    not exist) -- a safe, informational no-op, never an error.
+
+    A failure to release is not dangerous: the lease still has its own
+    `lease_seconds` bound and expires on its own (see
+    acquire_run_ownership) -- so this fails safe by simply returning False
+    and logging, rather than raising.
+    """
+    try:
+        async with get_engine().begin() as conn:
+            result = await conn.execute(
+                db.runs.update()
+                .where(db.runs.c.run_id == run_id, db.runs.c.owner_worker_id == worker_id)
+                .values(owner_worker_id=None, owner_lease_expires_at=None)
+            )
+        released = result.rowcount == 1
+        print(f"[execution_store] release_run_ownership: run_id={run_id!r} "
+              f"worker_id={worker_id!r} -> {'RELEASED' if released else 'NOT_OWNER'}",
+              flush=True)
+        return released
+    except Exception as exc:  # noqa: BLE001
+        print(f"[execution_store] release_run_ownership failed "
+              f"(run_id={run_id!r}, worker_id={worker_id!r}): "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return False
+
+
+async def run_ownership_state(run_id: str) -> dict | None:
+    """Read-only observability snapshot of run_id's current ownership --
+    NEVER used by acquire_run_ownership/release_run_ownership themselves
+    to make a decision (their own atomic UPDATE...WHERE is the sole
+    authority; this is a diagnostic view for a human/log, not a second
+    source of truth to race against the first). Returns None if run_id
+    does not exist; otherwise a dict with owner_worker_id (None means
+    unowned), owner_lease_expires_at, and `owned` (True only while a
+    lease is present -- this function does NOT evaluate expiry itself,
+    since "expired" is a judgment acquire_run_ownership's own WHERE
+    clause makes atomically against the database's current time, not
+    something worth recomputing approximately here with this process's
+    own clock).
+    """
+    try:
+        async with get_engine().begin() as conn:
+            row = (await conn.execute(
+                sa.select(db.runs.c.owner_worker_id, db.runs.c.owner_lease_expires_at)
+                .where(db.runs.c.run_id == run_id)
+            )).mappings().first()
+        if row is None:
+            return None
+        return {
+            "run_id": run_id,
+            "owner_worker_id": row["owner_worker_id"],
+            "owner_lease_expires_at": row["owner_lease_expires_at"],
+            "owned": row["owner_worker_id"] is not None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        print(f"[execution_store] run_ownership_state failed "
+              f"(run_id={run_id!r}): {type(exc).__name__}: {exc}", flush=True)
         return None

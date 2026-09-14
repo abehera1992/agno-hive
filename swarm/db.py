@@ -235,6 +235,20 @@ runs = Table(
     Column("started_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("completed_at", DateTime(timezone=True), nullable=True),
     Column("error_message", Text, nullable=True),
+    # Phase K -- run ownership/exclusivity. NULL/NULL means "unowned" (the
+    # state of every run created before this phase, and of the vast
+    # majority created after it too: as of Phase K, run_task_async/
+    # run_task_stream never call acquire_run_ownership at all, because no
+    # code path today lets two workers ever attempt to advance the SAME
+    # run_id -- see execution_store.acquire_run_ownership's own module-
+    # level docstring for the forensic finding this reflects). These two
+    # columns exist so that WHEN a future caller (e.g. a continuation
+    # launched from a rehydrate_run verdict) needs mutual exclusion over a
+    # specific run_id, the primitive is already here, tested, and reusing
+    # the EXISTING runs row rather than a second table -- see
+    # execution_store.acquire_run_ownership/release_run_ownership.
+    Column("owner_worker_id", Text, nullable=True),
+    Column("owner_lease_expires_at", DateTime(timezone=True), nullable=True),
 )
 Index("runs_session_idx", runs.c.session_id, runs.c.started_at.asc())
 

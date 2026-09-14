@@ -338,12 +338,39 @@ async def persist_session(session_id: str) -> bool:
 
 
 async def _cleanup_expired() -> int:
-    """Delete expired non-persisted sessions. Returns count deleted."""
+    """Delete expired non-persisted sessions. Returns count deleted.
+
+    Phase K: skips a session that owns a Run still in progress
+    (runs.status == "running"), even if that session's own expires_at has
+    already passed. Without this, a session sitting idle long enough to
+    expire, with a genuinely long-running (or SIGKILLed-without-a-terminal-
+    checkpoint -- see swarm/execution_store.persist_checkpoint's own
+    docstring) run still attached, would have its ENTIRE durable tree
+    (runs -> checkpoints/executions -> tool_calls/evidence/claims) deleted
+    out from under that run via the existing FK cascade -- every further
+    persist_* call for it then fails (its parent rows are gone), silently
+    swallowed by this whole backbone's own fail-open design, but leaving
+    an incomplete/orphaned durable record for a run that was still
+    genuinely active. A session with only "ok"/"failed" (or no) runs is
+    cleaned up exactly as before -- this changes nothing for the ordinary
+    case.
+    """
     try:
         await db.ensure_schema()
         async with db.get_engine().begin() as conn:
+            has_active_run = (
+                select(literal(1))
+                .select_from(db.runs)
+                .where(db.runs.c.session_id == chat_sessions.c.id,
+                       db.runs.c.status == "running")
+                .exists()
+            )
             result = await conn.execute(
-                delete(chat_sessions).where(chat_sessions.c.expires_at < func.now(), chat_sessions.c.persist.is_(False))
+                delete(chat_sessions).where(
+                    chat_sessions.c.expires_at < func.now(),
+                    chat_sessions.c.persist.is_(False),
+                    ~has_active_run,
+                )
             )
             return result.rowcount
     except Exception as exc:
