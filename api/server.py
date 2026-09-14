@@ -24,7 +24,7 @@ from swarm.team import (
     render_member_findings,
 )
 from swarm.feedback import record_failure, record_success, drain_background_tasks
-from swarm import db, model_routing, team_config
+from swarm import db, execution_store, model_routing, team_config
 from config.config import config
 from observability.setup import setup_telemetry
 from swarm.sessions import (
@@ -1519,6 +1519,18 @@ async def feedback(request: FeedbackRequest):
         # extraction, and the row survives a restart in between.
         await _queue_outcome(
             request.task, request.notes or "user marked as correct", request.project_id)
+        # Phase F: promote any deterministically-validated ("supported") Claims from
+        # this session into project_memory_promotions -- a SEPARATE, project-owned
+        # table, independent of the LightRAG experience-namespace write above (see
+        # execution_store.py's own module docstring for why both signals -- Phase E's
+        # deterministic verdict AND this endpoint's human rating=="good" -- are
+        # required together, and why neither alone is enough). A no-op when
+        # request.session_id is empty (most existing callers never send it) or when
+        # the session has no supported claims -- the ordinary case, not a failure.
+        # Fail-open: a promotion failure can never change this endpoint's response.
+        if request.session_id:
+            await execution_store.guard(execution_store.promote_session_claims(
+                request.session_id, request.project_id, feedback_notes=request.notes or None))
         return FeedbackResponse(recorded=True, message="Success pattern recorded to memory")
 
 

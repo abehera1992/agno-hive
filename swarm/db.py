@@ -37,6 +37,7 @@ from sqlalchemy import (
     MetaData,
     Table,
     Text,
+    UniqueConstraint,
     Uuid,
     event,
     inspect,
@@ -335,6 +336,55 @@ claim_evidence = Table(
     # The composite primary key above IS the uniqueness constraint -- the same
     # (claim_id, evidence_id) pair cannot be inserted twice.
 )
+
+# Phase F -- PROJECT-owned, deliberately outside the session-owned tree above.
+# `project_id` is a bare string scope key, exactly like failure_log.project_id/
+# task_outcome_queue.project_id elsewhere in this file -- there is no `projects`
+# table in this schema to foreign-key into (a project here is just an id agreed
+# on by convention between the caller and hive-mcp/hive.md, not a row).
+#
+# claim_id/run_id/execution_id are PLAIN REFERENCE COPIES, never ForeignKeys
+# into runs/executions/claims -- a promoted memory must survive session
+# deletion (see swarm/execution_context.py's Session->Run cascade), and an FK
+# with ondelete="CASCADE"/"SET NULL" into that tree would either delete this
+# row when the session is (defeating the entire point of promotion) or require
+# ondelete="SET NULL" everywhere, which still couples this table's lifecycle to
+# the session tree's existence in a way Phase F's own instructions forbid.
+# statement/evidence_snapshot/evidence_hash are SNAPSHOTS taken at promotion
+# time, not live joins -- reading them back never touches runs/claims/evidence,
+# so they remain readable after the originating session (and its claim/
+# evidence rows) has been deleted.
+project_memory_promotions = Table(
+    "project_memory_promotions", metadata,
+    Column("id", Uuid(as_uuid=False), primary_key=True),
+    Column("project_id", Text, nullable=False),
+    Column("claim_id", Uuid(as_uuid=False), nullable=False),
+    Column("run_id", Text, nullable=True),
+    Column("execution_id", Text, nullable=True),
+    Column("statement", Text, nullable=False),
+    # The claim's deterministic verdict AT PROMOTION TIME (always "supported" --
+    # see execution_store.promote_session_claims, which is the only writer of
+    # this table and refuses anything else) -- kept as its own column rather
+    # than assumed, so a reader never has to trust an invariant it cannot see.
+    Column("claim_status", Text, nullable=False),
+    Column("evidence_snapshot", Text, nullable=True),
+    Column("evidence_hash", Text, nullable=True),
+    # A fixed, short descriptor of the dual gate that approved this promotion
+    # (deterministic reconciliation + explicit human /feedback rating=good) --
+    # see execution_store.py's own module docstring for why NEITHER signal
+    # alone is sufficient. Never freeform: this is "who/what validated it",
+    # not a notes field.
+    Column("validated_by", Text, nullable=False),
+    Column("feedback_notes", Text, nullable=True),
+    Column("promoted_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    # Idempotency: the same Claim can never be promoted twice for the same
+    # project. A caller that retries the same /feedback call, or that feeds
+    # back on the same session twice, gets the existing row rather than a
+    # duplicate -- see promote_session_claims' own pre-check.
+    UniqueConstraint("project_id", "claim_id", name="project_memory_promotions_dedupe_uq"),
+)
+Index("project_memory_promotions_project_idx",
+      project_memory_promotions.c.project_id, project_memory_promotions.c.promoted_at)
 
 
 # model_catalog / team_role_models (AGNOHive 2.3.2 addendum) — replaces

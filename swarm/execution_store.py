@@ -1,5 +1,5 @@
-"""Phase C/D/E -- durable persistence for Run, Execution, ToolCall, Evidence,
-Claim and ClaimEvidence.
+"""Phase C/D/E/F -- durable persistence for Run, Execution, ToolCall,
+Evidence, Claim, ClaimEvidence and (Phase F) project-owned memory promotion.
 
 LLM messages remain a view of execution state; this module is what makes the
 underlying execution state itself durable, in the Phase B schema
@@ -12,10 +12,29 @@ computed.
 Phase E adds Claim/ClaimEvidence persistence plus one deterministic
 reconciliation primitive (reconcile_claim). It does NOT add project-memory
 promotion of any kind -- no LightRAG/Qdrant/AGE write, no record_success/
-task_outcome_queue call, appears anywhere in this module; see this module's
-own test suite for an explicit regression guard on that boundary. A
-validated Claim is the END of Phase E's responsibility, not the beginning of
-Phase F's.
+task_outcome_queue call, appears anywhere in the Phase E functions in this
+module; a validated Claim was the END of Phase E's responsibility.
+
+Phase F adds exactly that promotion, but into a NEW, project-owned table
+(swarm/db.py's project_memory_promotions) that is deliberately SEPARATE from
+LightRAG/Qdrant/AGE's existing experience-namespace memory (swarm/feedback.py's
+record_success/_queue_outcome/task_outcome_queue) -- Phase F does not read,
+write, or otherwise touch that system at all; the two memory paths run side
+by side, fed by the same human trigger, never merged.
+
+Phase F's promotion boundary is deliberately narrower than "a Claim is
+supported": promote_session_claims is called from exactly one place --
+api/server.py's /feedback endpoint, only on its rating=="good" branch (the
+one existing, explicit, human-driven approval signal already established in
+this codebase; see swarm/feedback.py's own _queue_outcome docstring for the
+2026-08-29 incident that is the reason ordinary run completion or a
+deterministic "supported" verdict ALONE must never be enough: a fabrication
+no guard caught once became the top retrieved exemplar for its own question,
+purely because "no guard objected" was mistaken for "this was validated").
+So Phase F requires BOTH signals together: a Claim already deterministically
+verdicted "supported" by Phase E's reconciliation (evidence-backed, not mere
+absence of complaint), AND a human's explicit /feedback approval of the
+session that produced it. Neither signal alone triggers a promotion.
 
 Fail-open by design, and this is the one thing every function here must never
 violate: a persistence failure is logged and swallowed, never raised,
@@ -49,6 +68,7 @@ import json
 import uuid as _uuid
 from typing import Any, Awaitable, TypeVar
 
+import sqlalchemy as sa
 from sqlalchemy.sql import func
 
 from swarm import db
@@ -503,3 +523,157 @@ async def persist_claim(
               f"(run_id={run_context.run_id!r}): {type(exc).__name__}: {exc}",
               flush=True)
         return None
+
+
+# ============================================================================
+# Phase F -- project-owned memory promotion.
+# ============================================================================
+
+# The fixed, short descriptor stamped on every promotion this module writes --
+# see this module's own docstring for why BOTH halves are required together.
+VALIDATED_BY_DETERMINISTIC_PLUS_FEEDBACK = (
+    "phase_e_deterministic_reconciliation+feedback_rating_good")
+
+
+async def promote_claim(
+    project_id: str,
+    claim_row,
+    evidence_snapshot: str | None,
+    evidence_hash: str | None,
+    validated_by: str,
+    feedback_notes: str | None = None,
+) -> str | None:
+    """INSERT one `project_memory_promotions` row for an already-validated
+    Claim -- or, if this exact (project_id, claim_id) pair was already
+    promoted, return the EXISTING promotion's id unchanged (idempotent: a
+    repeated /feedback call or a second good rating on the same session can
+    never create a duplicate project memory, and never re-promotes or
+    overwrites the first one -- see this table's own UniqueConstraint in
+    swarm/db.py).
+
+    `claim_row` is a mapping with at least claim_id/run_id/execution_id/
+    statement/status (e.g. a row from `claims`, exactly what
+    promote_session_claims below reads and passes through). Its status MUST
+    be "supported" -- promoting a contradicted, partially_supported, or
+    unverifiable claim would durably record something that was never
+    actually validated, so this raises ValueError immediately (a caller
+    bug, not an I/O failure) rather than silently downgrading it, the same
+    convention persist_claim uses for its own status argument.
+
+    `evidence_snapshot`/`evidence_hash` are copied verbatim into the new row
+    -- never re-read from `evidence` later, and never used to look the
+    Evidence row up again; this table has no FK to it (see swarm/db.py's own
+    comment on this table for why: it must survive session deletion, and
+    the Evidence row it snapshots does not).
+    """
+    if claim_row["status"] != "supported":
+        raise ValueError(
+            f"promote_claim: refusing to promote a claim with "
+            f"status={claim_row['status']!r} -- only 'supported' claims may "
+            f"become project memory")
+    promotion_id = str(_uuid.uuid4())
+    try:
+        async with get_engine().begin() as conn:
+            existing = (await conn.execute(
+                sa.select(db.project_memory_promotions.c.id)
+                .where(db.project_memory_promotions.c.project_id == project_id,
+                       db.project_memory_promotions.c.claim_id == claim_row["claim_id"])
+            )).scalar()
+            if existing is not None:
+                return existing
+            await conn.execute(db.project_memory_promotions.insert().values(
+                id=promotion_id,
+                project_id=project_id,
+                claim_id=claim_row["claim_id"],
+                run_id=claim_row.get("run_id"),
+                execution_id=claim_row.get("execution_id"),
+                statement=claim_row["statement"],
+                claim_status=claim_row["status"],
+                evidence_snapshot=evidence_snapshot,
+                evidence_hash=evidence_hash,
+                validated_by=validated_by,
+                feedback_notes=feedback_notes,
+            ))
+        return promotion_id
+    except Exception as exc:  # noqa: BLE001
+        print(f"[execution_store] promote_claim failed "
+              f"(project_id={project_id!r}, "
+              f"claim_id={claim_row.get('claim_id')!r}): "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+async def promote_session_claims(
+    session_id: str,
+    project_id: str,
+    *,
+    feedback_notes: str | None = None,
+) -> list[str]:
+    """THE Phase F promotion boundary -- called from exactly one place,
+    api/server.py's /feedback endpoint, only on its rating=="good" branch.
+    See this module's own docstring for why that is the safest existing
+    explicit-validation boundary in this codebase, and why a "supported"
+    Claim by itself (an automatic, deterministic part of ordinary run
+    execution) is not sufficient on its own.
+
+    Finds every "supported" Claim belonging to any Run under `session_id`
+    that has not already been promoted for `project_id` (idempotent via
+    promote_claim), snapshots the content/content_hash of ONE linked
+    Evidence row for each (a claim need not have linked evidence -- e.g.
+    none was available to link at reconciliation time -- in which case both
+    snapshot fields are None), and promotes each one.
+
+    Fail-open, matching every other function in this module: a lookup or
+    insert failure here is logged and an empty (or partial) list is
+    returned, never raised -- callers use execution_store.guard(...) around
+    this call for the same last-resort protection every other call site
+    gets. Returns an empty list, not an error, for the ordinary "nothing to
+    promote" case (no session-owned run found, or no supported claim
+    found) -- this is the ordinary, common outcome for the vast majority of
+    /feedback calls that name no session_id or reference a run with no
+    validated completeness claim, not a failure.
+
+    Deliberately reads the database here: this runs entirely AFTER the
+    triggering run has already finished and its answer already returned
+    (via a separate, later /feedback POST) -- never during tool execution,
+    so it does not violate Phase D/E's write-only-during-execution
+    boundary, which is scoped to the live run, not to post-hoc human
+    review.
+    """
+    try:
+        async with get_engine().begin() as conn:
+            run_ids = (await conn.execute(
+                sa.select(db.runs.c.run_id).where(db.runs.c.session_id == session_id)
+            )).scalars().all()
+            if not run_ids:
+                return []
+            claim_rows = (await conn.execute(
+                sa.select(db.claims)
+                .where(db.claims.c.run_id.in_(run_ids), db.claims.c.status == "supported")
+            )).mappings().all()
+            evidence_by_claim: dict[str, tuple[str | None, str | None]] = {}
+            for claim in claim_rows:
+                ev = (await conn.execute(
+                    sa.select(db.evidence.c.content, db.evidence.c.content_hash)
+                    .select_from(db.claim_evidence.join(
+                        db.evidence,
+                        db.claim_evidence.c.evidence_id == db.evidence.c.evidence_id))
+                    .where(db.claim_evidence.c.claim_id == claim["claim_id"])
+                    .limit(1)
+                )).first()
+                evidence_by_claim[claim["claim_id"]] = (ev[0], ev[1]) if ev else (None, None)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[execution_store] promote_session_claims lookup failed "
+              f"(session_id={session_id!r}): {type(exc).__name__}: {exc}", flush=True)
+        return []
+
+    promoted: list[str] = []
+    for claim in claim_rows:
+        snapshot, content_hash = evidence_by_claim[claim["claim_id"]]
+        promotion_id = await promote_claim(
+            project_id, claim, snapshot, content_hash,
+            validated_by=VALIDATED_BY_DETERMINISTIC_PLUS_FEEDBACK,
+            feedback_notes=feedback_notes)
+        if promotion_id is not None:
+            promoted.append(promotion_id)
+    return promoted
