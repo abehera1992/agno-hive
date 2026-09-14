@@ -942,8 +942,25 @@ async def run(request: RunRequest, http_request: Request):
             title=request.task,
             persist=request.persist,
         )
-    elif request.persist:
-        await _persist_session(session_id)
+    else:
+        # Phase M: verify the RESUMED session actually belongs to
+        # request.project_id before reading its history or appending
+        # anything to it. Before this check, a caller could chain onto
+        # (i.e. session_id=) ANY project's existing session while
+        # claiming a DIFFERENT project_id for this request -- that
+        # project's entire prior conversation would be loaded into THIS
+        # run's coordinator context (get_context, a few lines below) and
+        # new turns appended to it, all under a run durably tagged with
+        # the WRONG project_id. This is the exact same class of gap
+        # Phase J closed for the standalone /sessions/{id} endpoints --
+        # unguarded here in the PRIMARY /run path (and /stream's
+        # identical pattern) the whole time. Reuses
+        # _authorize_session_access directly (not a re-implementation)
+        # so this inherits the exact same fail-closed, existence-hiding
+        # behavior Phase J already established and tested.
+        await _authorize_session_access(session_id, request.project_id)
+        if request.persist:
+            await _persist_session(session_id)
 
     # Capture context size before run (for footer metadata)
     session_summary, prior_messages = await get_context(session_id)
@@ -1274,8 +1291,13 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
             title=request.task,
             persist=request.persist,
         )
-    elif request.persist:
-        await _persist_session(session_id)
+    else:
+        # Phase M: same ownership check as /run's identical resume path --
+        # see that endpoint's own comment for the full reasoning. A
+        # mismatch (or a session_id that does not exist) fails closed.
+        await _authorize_session_access(session_id, request.project_id)
+        if request.persist:
+            await _persist_session(session_id)
 
     session_summary, prior_messages = await get_context(session_id)
     session_before = await get_session(session_id)

@@ -1159,7 +1159,7 @@ async def check_storage_integrity() -> dict:
     return result
 
 
-async def list_stale_runs(older_than_seconds: int = 3600) -> list[dict]:
+async def list_stale_runs(older_than_seconds: int = 3600, project_id: str | None = None) -> list[dict]:
     """Read-only: which specific runs are still status=="running" with no
     durably-observed forward progress (their own most recent checkpoint,
     or their own started_at if none exists yet) in at least
@@ -1175,6 +1175,17 @@ async def list_stale_runs(older_than_seconds: int = 3600) -> list[dict]:
     this phase's own explicit instruction not to introduce automatic
     resume merely because rehydrate_run exists.
 
+    Phase M: `project_id` is OPTIONAL and narrows the scan to runs whose
+    session belongs to that project -- this function is an operator/admin
+    diagnostic (there is no per-tenant HTTP endpoint exposing it), and an
+    operator legitimately sees across all projects by default, matching
+    check_storage_integrity's own established global-aggregate design;
+    the parameter exists so a project-scoped operator CAN narrow the view,
+    not because an unscoped call is itself a violation of the Phase M
+    ownership invariant (that invariant is about an OPERATION
+    "originating from Project A" reaching Project B's state, not about
+    what an operator's own diagnostic tooling is allowed to see).
+
     Fail-open: returns [] on any lookup failure (indistinguishable from
     "no stale runs found" -- both are the ordinary, harmless case from a
     caller's point of view; the failure itself is still logged).
@@ -1182,9 +1193,12 @@ async def list_stale_runs(older_than_seconds: int = 3600) -> list[dict]:
     try:
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)
         async with get_engine().begin() as conn:
-            running_runs = (await conn.execute(
-                sa.select(db.runs).where(db.runs.c.status == "running")
-            )).mappings().all()
+            query = sa.select(db.runs).where(db.runs.c.status == "running")
+            if project_id is not None:
+                query = query.select_from(
+                    db.runs.join(db.chat_sessions, db.runs.c.session_id == db.chat_sessions.c.id)
+                ).where(db.chat_sessions.c.project_id == project_id)
+            running_runs = (await conn.execute(query)).mappings().all()
             stale: list[dict] = []
             for run in running_runs:
                 latest_checkpoint_at = (await conn.execute(
@@ -1333,12 +1347,13 @@ DEFAULT_RUN_OWNERSHIP_LEASE_SECONDS = 300
 
 async def acquire_run_ownership(
     run_id: str, worker_id: str, lease_seconds: int = DEFAULT_RUN_OWNERSHIP_LEASE_SECONDS,
+    project_id: str | None = None,
 ) -> bool:
     """Atomically claim (or renew) exclusive advancement rights over
     `run_id` for `worker_id`. Returns True iff THIS call's UPDATE matched
     and changed the row -- i.e. this worker now holds the lease -- False
-    otherwise (another worker holds a live lease, or run_id does not
-    exist).
+    otherwise (another worker holds a live lease, run_id does not exist,
+    or -- Phase M -- `project_id` was supplied and does not match).
 
     Succeeds when the row is currently UNOWNED (owner_worker_id IS NULL),
     already owned by THIS SAME worker_id (re-entrant -- a worker renewing
@@ -1356,24 +1371,48 @@ async def acquire_run_ownership(
     worker_id/outcome for observability (see this module's own
     docstring's "minimal structured information" list) -- the log is
     diagnostic only, never authoritative (the row itself is).
+
+    Phase M: `project_id` is OPTIONAL, matching rehydrate_run's own
+    precedent -- nothing calls this function from a live code path yet
+    (see this section's own module docstring), so there is no existing
+    caller to break by adding it. When supplied, the SAME atomic UPDATE
+    statement additionally requires run_id's owning session to belong to
+    that project_id -- not a separate SELECT a second caller could race
+    against, an EXISTS subquery inside the identical WHERE clause. A
+    project_id mismatch is indistinguishable in the return value from
+    "another worker already holds this run" (both return False) --
+    deliberately: revealing WHY a claim was denied would confirm the
+    run_id's existence to a caller not authorized to know it, the same
+    reasoning _authorize_session_access (Phase J) uses for returning 404
+    rather than 403.
     """
     new_expiry = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
     try:
         async with get_engine().begin() as conn:
-            result = await conn.execute(
-                db.runs.update()
-                .where(db.runs.c.run_id == run_id)
-                .where(sa.or_(
+            where_clauses = [
+                db.runs.c.run_id == run_id,
+                sa.or_(
                     db.runs.c.owner_worker_id.is_(None),
                     db.runs.c.owner_worker_id == worker_id,
                     db.runs.c.owner_lease_expires_at < func.now(),
-                ))
+                ),
+            ]
+            if project_id is not None:
+                where_clauses.append(
+                    sa.select(db.chat_sessions.c.id)
+                    .where(db.chat_sessions.c.id == db.runs.c.session_id,
+                           db.chat_sessions.c.project_id == project_id)
+                    .exists()
+                )
+            result = await conn.execute(
+                db.runs.update()
+                .where(*where_clauses)
                 .values(owner_worker_id=worker_id, owner_lease_expires_at=new_expiry)
             )
         acquired = result.rowcount == 1
         print(f"[execution_store] acquire_run_ownership: run_id={run_id!r} "
-              f"worker_id={worker_id!r} -> {'ACQUIRED' if acquired else 'DENIED'}",
-              flush=True)
+              f"worker_id={worker_id!r} project_id={project_id!r} -> "
+              f"{'ACQUIRED' if acquired else 'DENIED'}", flush=True)
         return acquired
     except Exception as exc:  # noqa: BLE001
         print(f"[execution_store] acquire_run_ownership failed -- FAILING SAFE "
@@ -1382,32 +1421,50 @@ async def acquire_run_ownership(
         return False
 
 
-async def release_run_ownership(run_id: str, worker_id: str) -> bool:
+async def release_run_ownership(
+    run_id: str, worker_id: str, project_id: str | None = None,
+) -> bool:
     """Clear ownership of `run_id`, ONLY if `worker_id` is still the
     current owner -- a stale/expired former owner releasing late can never
     clear a DIFFERENT, newer worker's live claim (the WHERE clause makes
     that structurally impossible, not just unlikely). Returns True iff
     this call's UPDATE matched a row (this worker really did hold and just
     released it); False if it did not own the run (already released,
-    lease already expired and reclaimed by someone else, or run_id does
-    not exist) -- a safe, informational no-op, never an error.
+    lease already expired and reclaimed by someone else, run_id does not
+    exist, or -- Phase M -- `project_id` was supplied and does not match)
+    -- a safe, informational no-op, never an error.
 
     A failure to release is not dangerous: the lease still has its own
     `lease_seconds` bound and expires on its own (see
     acquire_run_ownership) -- so this fails safe by simply returning False
     and logging, rather than raising.
+
+    Phase M: `project_id` optional, same defense-in-depth reasoning as
+    acquire_run_ownership's own -- included in the SAME atomic WHERE
+    clause, never a separate check.
     """
     try:
         async with get_engine().begin() as conn:
+            where_clauses = [
+                db.runs.c.run_id == run_id,
+                db.runs.c.owner_worker_id == worker_id,
+            ]
+            if project_id is not None:
+                where_clauses.append(
+                    sa.select(db.chat_sessions.c.id)
+                    .where(db.chat_sessions.c.id == db.runs.c.session_id,
+                           db.chat_sessions.c.project_id == project_id)
+                    .exists()
+                )
             result = await conn.execute(
                 db.runs.update()
-                .where(db.runs.c.run_id == run_id, db.runs.c.owner_worker_id == worker_id)
+                .where(*where_clauses)
                 .values(owner_worker_id=None, owner_lease_expires_at=None)
             )
         released = result.rowcount == 1
         print(f"[execution_store] release_run_ownership: run_id={run_id!r} "
-              f"worker_id={worker_id!r} -> {'RELEASED' if released else 'NOT_OWNER'}",
-              flush=True)
+              f"worker_id={worker_id!r} project_id={project_id!r} -> "
+              f"{'RELEASED' if released else 'NOT_OWNER'}", flush=True)
         return released
     except Exception as exc:  # noqa: BLE001
         print(f"[execution_store] release_run_ownership failed "
