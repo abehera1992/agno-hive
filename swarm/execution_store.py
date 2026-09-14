@@ -1505,3 +1505,309 @@ async def run_ownership_state(run_id: str) -> dict | None:
         print(f"[execution_store] run_ownership_state failed "
               f"(run_id={run_id!r}): {type(exc).__name__}: {exc}", flush=True)
         return None
+
+
+# ============================================================================
+# Phase O -- operational observability & incident reconstruction.
+#
+# Forensics (this phase) traced every existing observability surface an
+# operator has after a worker process is gone: runs/executions/tool_calls/
+# evidence/claims/claim_evidence (Phase B-E), checkpoints (Phase H),
+# project_memory_promotions (Phase F), check_storage_integrity/list_stale_runs
+# (Phase I/L), run_ownership_state (Phase K), _evidence_fidelity_report
+# (Phase N, swarm/team.py -- a standalone simulated-input trace, never called
+# with a real RunContext by anything durable, so it is NOT part of this
+# reconstruction), and swarm/phase0.py's best-effort JSONL telemetry.
+#
+# The Phase 0 JSONL was read and deliberately excluded from this function: it
+# is explicitly an ephemeral, best-effort, fire-and-forget log (its own class
+# docstring: "Every public method is best-effort and returns None"), its own
+# run_id is a SEPARATE uuid4().hex[:12] minted independently in
+# Phase0Run.__init__ with no column anywhere carrying the real
+# execution_context/db run_id alongside it, and it can be silently absent
+# (disk write failure, disabled, rotated/deleted) with no durable trace of
+# that absence either. This phase's own core invariant --  reconstruction
+# "without depending on ephemeral logs" -- makes this exclusion the correct
+# reading of that requirement, not a gap: see the Phase O ledger entry this
+# phase adds for the resulting, honestly-stated limitation (Phase 0 JSONL
+# cannot be joined against a Run's durable identity at all).
+#
+# Everything below is read-only: no INSERT/UPDATE/DELETE anywhere in this
+# function or its helpers, and a failure to reconstruct NEVER touches the
+# Run being reconstructed (fail-open, matching every other diagnostic in this
+# module -- check_storage_integrity, list_stale_runs, run_ownership_state).
+# ============================================================================
+
+def _sort_key(row: dict, ts_field: str, id_field: str):
+    """Deterministic ordering for reconstruction lists: primary sort on the
+    row's own timestamp (matching the existing DB index order -- e.g.
+    executions_run_idx/tool_calls_execution_idx are both (parent, started_at
+    asc)), with the row's id as a stable tiebreak for same-timestamp rows
+    (SQLite/Postgres do not guarantee tie order without one)."""
+    ts = row.get(ts_field)
+    return (ts if ts is not None else datetime.min.replace(tzinfo=timezone.utc),
+            str(row.get(id_field)))
+
+
+def _classify_run_failures(run_row: dict, executions: list[dict],
+                            tool_calls: list[dict], claims: list[dict],
+                            checkpoint_reports: list[dict],
+                            ownership: dict | None) -> list[dict]:
+    """Deterministic failure classification built ONLY from already-fetched
+    durable rows -- no inference, no LLM-content interpretation. Every
+    category here answers a WHETHER question (did this row end in a failed/
+    non-terminal/inconsistent state) never a WHY question. This function
+    deliberately does NOT attempt "model/LLM-level uncertainty" or
+    "persistence_failure" categories -- see reconstruct_run's own docstring
+    for why those two are structurally undeterminable from durable state and
+    are surfaced instead as explicit, named limitations of the report."""
+    findings: list[dict] = []
+
+    for tc in tool_calls:
+        if tc["status"] == "error":
+            is_cancellation = "CancelledError" in (tc.get("error_message") or "")
+            findings.append({
+                "category": "cancellation" if is_cancellation else "tool_failure",
+                "subject_type": "tool_call",
+                "subject_id": str(tc["tool_call_id"]),
+                "detail": tc.get("error_message"),
+            })
+
+    for ex in executions:
+        if ex["status"] == "failed":
+            is_cancellation = "CancelledError" in (ex.get("error_message") or "")
+            findings.append({
+                "category": "cancellation" if is_cancellation else "execution_failure",
+                "subject_type": "execution",
+                "subject_id": ex["execution_id"],
+                "detail": ex.get("error_message"),
+            })
+
+    if run_row["status"] == "failed":
+        is_cancellation = "CancelledError" in (run_row.get("error_message") or "")
+        findings.append({
+            "category": "cancellation" if is_cancellation else "run_failure",
+            "subject_type": "run",
+            "subject_id": run_row["run_id"],
+            "detail": run_row.get("error_message"),
+        })
+
+    for cp in checkpoint_reports:
+        if not cp["hash_valid"]:
+            findings.append({
+                "category": "checkpoint_invalidity",
+                "subject_type": "checkpoint",
+                "subject_id": str(cp["id"]),
+                "detail": f"stored state_hash does not match the recomputed "
+                          f"hash for sequence {cp['sequence']}",
+            })
+
+    for cl in claims:
+        if cl["status"] in ("contradicted", "partially_supported", "unverifiable"):
+            findings.append({
+                "category": "unsupported_contradicted_claim",
+                "subject_type": "claim",
+                "subject_id": str(cl["claim_id"]),
+                "detail": f"claim status={cl['status']!r}",
+            })
+
+    if ownership and ownership["owner_worker_id"] is not None:
+        expires = ownership["owner_lease_expires_at"]
+        # SQLite returns naive datetimes for DateTime(timezone=True) columns on
+        # read-back even though the value was written as UTC-aware (the exact
+        # gap Phase L's list_stale_runs hit and fixed the same way) -- normalize
+        # a naive read-back to UTC before comparing to the aware "now".
+        if expires is not None and expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if expires is not None and expires < datetime.now(timezone.utc):
+            findings.append({
+                "category": "stale_ownership",
+                "subject_type": "run",
+                "subject_id": run_row["run_id"],
+                "detail": f"owner_worker_id={ownership['owner_worker_id']!r} still "
+                          f"set with an expired lease "
+                          f"(owner_lease_expires_at={expires!r})",
+            })
+
+    return findings
+
+
+_RECONSTRUCTION_LIMITATIONS = [
+    "persistence_failure (a write that should have happened but silently "
+    "did not, e.g. this module's own fail-open guard() swallowing an "
+    "exception) has no durable trace by design -- an absence looks "
+    "identical to 'this event never occurred'. Undetectable from durable "
+    "state alone; a full accounting requires correlating against ephemeral "
+    "application logs (print() output) from the worker process at the time, "
+    "which this function deliberately does not depend on.",
+    "model/LLM-level uncertainty (why a model produced a given answer, "
+    "whether it reasoned correctly) cannot be inferred from durable state. "
+    "Status codes, hashes, and retention ratios say WHETHER something "
+    "failed structurally, never WHY at a reasoning level -- this report "
+    "never attempts that classification and never states an LLM root cause "
+    "the durable evidence does not actually support.",
+    "Phase 0 telemetry (data/phase0/delegations.jsonl) is intentionally "
+    "excluded: it is ephemeral, best-effort, and its own run_id is not "
+    "correlated with this run's durable run_id anywhere in the schema.",
+]
+
+
+async def reconstruct_run(run_id: str, project_id: str | None = None,
+                           include_evidence_content: bool = False) -> dict | None:
+    """Reconstruct the complete durable incident timeline for one Run:
+    Run -> Execution -> ToolCall -> Evidence -> Claim -> Checkpoint ->
+    completion/failure/ownership state -- everything an operator needs to
+    answer "what happened to Run X" from the durable backbone alone, after
+    the worker process that ran it is gone.
+
+    Returns None if run_id does not exist at all.
+
+    Returns {"authorized": False, "run_id": ..., "reason": ...} -- and
+    nothing else -- when `project_id` is supplied and does not match this
+    run's own session's chat_sessions.project_id. FAILS CLOSED, exactly like
+    rehydrate_run's own project_id check (Phase J/M's authorization
+    boundary): no run detail is returned to a caller that does not own the
+    project, not even ownership/execution counts. Without a project_id
+    argument (the internal, same-process caller case), no authorization
+    check is performed at all -- matching every other function in this
+    module that predates Phase J/M.
+
+    On success, returns a dict with "authorized": True plus:
+      run, ownership, rehydration, executions, tool_calls, evidence, claims,
+      checkpoints, project_memory_promotions, failure_classification,
+      known_limitations (see _RECONSTRUCTION_LIMITATIONS above).
+
+    Evidence.content is OMITTED by default (only evidence_id, tool_call_id,
+    content_hash, success, error_message, created_at are returned) --
+    Evidence content is exact, unbounded tool output and may contain
+    arbitrary sensitive material (file contents, credentials echoed by a
+    misconfigured tool, etc); an operator who genuinely needs the exact text
+    must opt in with include_evidence_content=True. This mirrors this
+    project's existing MCP-side guidance on not retaining raw payloads
+    beyond what a task actually needs.
+
+    Every list is returned in a single deterministic order (timestamp
+    ascending, id as tiebreak) -- calling this function twice against the
+    same, unchanged durable state returns byte-identical lists every time
+    (idempotent reconstruction).
+
+    Read-only: no table is written by this function. Fail-open on a DB
+    error mid-gather -- returns {"error": ...} rather than raising or
+    returning a partial report that looks complete; this NEVER touches the
+    Run's own rows (no repair, no cleanup, no status mutation) -- a
+    diagnostic failure must never alter the Run being diagnosed.
+    """
+    try:
+        async with get_engine().begin() as conn:
+            run_row = (await conn.execute(
+                sa.select(db.runs).where(db.runs.c.run_id == run_id)
+            )).mappings().first()
+            if run_row is None:
+                return None
+            run_row = dict(run_row)
+
+            owner_project_id = (await conn.execute(
+                sa.select(db.chat_sessions.c.project_id)
+                .where(db.chat_sessions.c.id == run_row["session_id"])
+            )).scalar()
+            if project_id is not None and owner_project_id != project_id:
+                print(f"[execution_store] reconstruct_run: REFUSED -- "
+                      f"run_id={run_id!r} belongs to project "
+                      f"{owner_project_id!r}, not the supplied "
+                      f"{project_id!r}", flush=True)
+                return {
+                    "authorized": False,
+                    "run_id": run_id,
+                    "reason": "this run does not belong to the supplied project_id",
+                }
+
+            executions = [dict(r) for r in (await conn.execute(
+                sa.select(db.executions).where(db.executions.c.run_id == run_id)
+            )).mappings().all()]
+            execution_ids = [e["execution_id"] for e in executions]
+
+            tool_calls: list[dict] = []
+            if execution_ids:
+                tool_calls = [dict(r) for r in (await conn.execute(
+                    sa.select(db.tool_calls)
+                    .where(db.tool_calls.c.execution_id.in_(execution_ids))
+                )).mappings().all()]
+            tool_call_ids = [tc["tool_call_id"] for tc in tool_calls]
+
+            evidence: list[dict] = []
+            if tool_call_ids:
+                evidence = [dict(r) for r in (await conn.execute(
+                    sa.select(db.evidence)
+                    .where(db.evidence.c.tool_call_id.in_(tool_call_ids))
+                )).mappings().all()]
+                if not include_evidence_content:
+                    for ev in evidence:
+                        ev.pop("content", None)
+
+            claims = [dict(r) for r in (await conn.execute(
+                sa.select(db.claims).where(db.claims.c.run_id == run_id)
+            )).mappings().all()]
+            claim_ids = [cl["claim_id"] for cl in claims]
+            claim_evidence_links: dict = {}
+            if claim_ids:
+                rows = (await conn.execute(
+                    sa.select(db.claim_evidence)
+                    .where(db.claim_evidence.c.claim_id.in_(claim_ids))
+                )).mappings().all()
+                for row in rows:
+                    claim_evidence_links.setdefault(str(row["claim_id"]), []).append(
+                        str(row["evidence_id"]))
+            for cl in claims:
+                cl["evidence_ids"] = sorted(claim_evidence_links.get(str(cl["claim_id"]), []))
+
+            checkpoints = [dict(r) for r in (await conn.execute(
+                sa.select(db.checkpoints)
+                .where(db.checkpoints.c.run_id == run_id)
+                .order_by(db.checkpoints.c.sequence.asc())
+            )).mappings().all()]
+            checkpoint_reports = []
+            for cp in checkpoints:
+                expected_hash = _checkpoint_state_hash(
+                    cp["run_id"], cp["sequence"], cp["last_execution_id"], cp["run_status"])
+                cp["hash_valid"] = (cp["state_hash"] == expected_hash)
+                checkpoint_reports.append(cp)
+
+            promotions = [dict(r) for r in (await conn.execute(
+                sa.select(db.project_memory_promotions)
+                .where(db.project_memory_promotions.c.run_id == run_id)
+            )).mappings().all()]
+
+        # Reuse, never duplicate: the resumability verdict and the ownership
+        # snapshot are computed by their own established functions.
+        rehydration = await rehydrate_run(run_id, project_id=project_id)
+        ownership = await run_ownership_state(run_id)
+
+        executions.sort(key=lambda r: _sort_key(r, "started_at", "execution_id"))
+        tool_calls.sort(key=lambda r: _sort_key(r, "started_at", "tool_call_id"))
+        evidence.sort(key=lambda r: _sort_key(r, "created_at", "evidence_id"))
+        claims.sort(key=lambda r: _sort_key(r, "created_at", "claim_id"))
+        promotions.sort(key=lambda r: _sort_key(r, "promoted_at", "id"))
+
+        failure_classification = _classify_run_failures(
+            run_row, executions, tool_calls, claims, checkpoint_reports, ownership)
+
+        return {
+            "authorized": True,
+            "run_id": run_id,
+            "run": run_row,
+            "project_id": owner_project_id,
+            "ownership": ownership,
+            "rehydration": rehydration,
+            "executions": executions,
+            "tool_calls": tool_calls,
+            "evidence": evidence,
+            "claims": claims,
+            "checkpoints": checkpoint_reports,
+            "project_memory_promotions": promotions,
+            "failure_classification": failure_classification,
+            "known_limitations": list(_RECONSTRUCTION_LIMITATIONS),
+        }
+    except Exception as exc:  # noqa: BLE001
+        print(f"[execution_store] reconstruct_run failed "
+              f"(run_id={run_id!r}): {type(exc).__name__}: {exc}", flush=True)
+        return {"error": f"{type(exc).__name__}: {exc}"}
