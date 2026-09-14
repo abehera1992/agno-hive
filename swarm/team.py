@@ -4176,6 +4176,395 @@ async def _reask_after_syntax_loss(content: str, task: str, team, all_results,
     return adopted, adopted_result
 
 
+# ============================================================================
+# Phase R -- Coordinator evidence integrity (2026-09-14).
+#
+# Objective: prevent the Coordinator from confidently asserting a conclusion
+# that contradicts authoritative structured evidence THIS RUN ALREADY HOLDS.
+#
+# Forensics (Phase P/Q battery, T13a/T13b): the dominant failure across the
+# whole battery was never "no evidence" -- it was a draft contradicting
+# evidence that was correctly gathered and already sitting in team state
+# (compare_enumerations' own output, a db_schema listing, a failed glob).
+# Several existing checks in this file already DETECT this shape correctly
+# (_table_claimed_missing_but_present, _contradicted_by_failed_lookup,
+# _miscounted_against_tool, _reconcile_completeness_claim_with_comparison's
+# own gap check) -- confirmed by reading each one directly. What they do NOT
+# do, except the last, is retry; the rest are disclosure-only footnotes
+# threaded through _tail(): the wrong claim still ships as the answer's own
+# primary text, with a correction appended below it. A reader -- and this
+# battery's own accuracy scoring -- can miss a footnote a confident opening
+# sentence already contradicted.
+#
+# This section does NOT replace any of those checks and does NOT touch
+# compare_enumerations, hive-mcp, the shared one-retry-total budget
+# mechanism, or any evidence cap -- per this phase's own explicit scope. It
+# adds exactly one new, narrow, LAST-RESORT guard, positioned at the very
+# end of _verified_answer's own guard chain (see its own call site): if
+# every existing guard has already run and the content STILL contradicts
+# one of five explicit, structured evidence categories (file/path
+# existence, enumerations/counts, comparison completeness/gaps, DB row
+# counts, environment/branch facts), this makes ONE targeted reconciliation
+# attempt (reusing the SAME shared retry budget and _adopt_retry every other
+# guard here uses -- never a second, parallel budget), rechecks
+# deterministically, and -- if still contradicted -- forces the final
+# answer to state uncertainty about the SPECIFIC contradicted claim(s)
+# instead of shipping them as confident fact. Running last means it never
+# preempts any existing, more specific guard: everything that already
+# worked continues to fire exactly as before, and this only ever catches
+# what survives the entire existing chain untouched -- zero regression risk
+# to anything currently caught, by construction.
+#
+# Deliberately NOT a generic LLM judge (Rule 3): every check below is a
+# structural/regex comparison against a tool's own previously-captured
+# output, the same idiom every other checker in this file already uses.
+# ============================================================================
+
+# A completed answer resolving this run's guard chain and the flag name used
+# to make this check run at most once per _verified_answer() call, matching
+# every other single-fire guard's own flag convention in this file (e.g.
+# _SYNTAX_REASK_FLAG, _COMPARISON_RECONCILE_FLAG).
+_EVIDENCE_INTEGRITY_FLAG = "_evidence_integrity_checked"
+
+# Claimed row-count sentences: "N rows", "contains N rows", "0 rows returned". Scoped to
+# a number immediately followed by "row(s)" so a claim about something else entirely
+# (endpoint counts, file counts -- already covered by _miscounted_against_tool /
+# _count_contradicts_own_list) is never misread as a DB claim.
+_DB_ROW_COUNT_CLAIM_RE = re.compile(
+    r"\b(\d[\d,]*)\s+rows?\b", re.IGNORECASE)
+# What a db_query/db_schema tool preview actually says about a row count, the same
+# shape count_matches/db_query results take in this project's own tool output.
+_DB_ROW_COUNT_EVIDENCE_RE = re.compile(
+    r"\b(\d[\d,]*)\s+rows?\b|^\s*(\d+)\s*$", re.IGNORECASE)
+
+# Claimed OS/Python-version/branch sentences the answer might assert. Narrow and
+# structural, matching get_env_info's own field labels and git's own branch-name shape
+# -- never a free-text semantic read.
+_ENV_OS_CLAIM_RE = re.compile(r"\bOS\s*:?\s*([A-Za-z][\w.\- ]{2,40})", re.IGNORECASE)
+_ENV_PY_CLAIM_RE = re.compile(r"\bPython\s*:?\s+(\d+\.\d+(?:\.\d+)?)")
+_ENV_BRANCH_CLAIM_RE = re.compile(
+    r"\b(?:current |git )?branch\s*(?:is|:)\s*[`\"']?([\w./-]+)", re.IGNORECASE)
+
+
+def _integrity_db_count_contradiction(content: str, team) -> tuple[str, str] | None:
+    """(claimed, real) row-count text pair when the answer states a row count that
+    contradicts a db_query/db_schema tool preview THIS RUN actually captured, or None.
+
+    Reuses team._tool_evidence (Phase 18's own capture point, populated at the same
+    stream-event boundary _captured_tool_evidence already reads) -- no new evidence
+    capture, no new tool call. Silent (returns None) whenever no DB tool was called,
+    no row-count claim was made, or the claim and the evidence agree.
+    """
+    m = _DB_ROW_COUNT_CLAIM_RE.search(content or "")
+    if not m:
+        return None
+    claimed = m.group(1).replace(",", "")
+    evidence = getattr(team, "_tool_evidence", None)
+    if not isinstance(evidence, list):
+        return None
+    for item in evidence:
+        if item.get("name") not in _DB_TOOLS:
+            continue
+        preview = item.get("preview") or ""
+        em = _DB_ROW_COUNT_EVIDENCE_RE.search(preview)
+        if not em:
+            continue
+        real = (em.group(1) or em.group(2) or "").replace(",", "")
+        if real and real != claimed:
+            return claimed, real
+    return None
+
+
+def _integrity_env_fact_contradiction(content: str, team) -> tuple[str, str, str] | None:
+    """(field, claimed, real) when the answer states an OS or Python-version fact
+    that contradicts get_env_info's own captured preview THIS RUN made, or None.
+
+    T9's own historical incident (see _captured_tool_evidence's docstring) is exactly
+    this shape: a coordinator asserted "Ubuntu 22.04.4 LTS / Python 3.11.6" while
+    get_env_info actually returned Linux/3.12.14 -- three fabricated facts the
+    existing verify_claims/count/table checks are all structurally blind to (none of
+    them read OS or interpreter-version strings). This is the deterministic backstop
+    for that specific, previously-uncaught shape.
+    """
+    evidence = getattr(team, "_tool_evidence", None)
+    if not isinstance(evidence, list):
+        return None
+    env_previews = [item.get("preview") or "" for item in evidence
+                    if item.get("name") == "get_env_info"]
+    if not env_previews:
+        return None
+    combined = " ".join(env_previews)
+
+    py_claim = _ENV_PY_CLAIM_RE.search(content or "")
+    if py_claim:
+        py_real = _ENV_PY_CLAIM_RE.search(combined)
+        if py_real and py_claim.group(1) != py_real.group(1):
+            return "Python version", py_claim.group(1), py_real.group(1)
+
+    os_claim = _ENV_OS_CLAIM_RE.search(content or "")
+    if os_claim:
+        os_real = _ENV_OS_CLAIM_RE.search(combined)
+        if os_real:
+            claimed_os = os_claim.group(1).strip().rstrip(".")
+            real_os = os_real.group(1).strip().rstrip(".")
+            # First word only ("Linux" vs "Ubuntu", "Windows" vs "Darwin") -- the
+            # full string legitimately varies in punctuation/detail run to run, and
+            # this only needs to catch a genuinely different operating system.
+            if claimed_os.split()[0].lower() != real_os.split()[0].lower():
+                return "operating system", claimed_os, real_os
+    return None
+
+
+def _integrity_branch_contradiction(content: str, team) -> tuple[str, str] | None:
+    """(claimed, real) branch-name pair when the answer states a git branch that
+    contradicts a git_status/git tool preview THIS RUN actually captured, or None."""
+    m = _ENV_BRANCH_CLAIM_RE.search(content or "")
+    if not m:
+        return None
+    claimed = m.group(1).strip().rstrip(".,")
+    evidence = getattr(team, "_tool_evidence", None)
+    if not isinstance(evidence, list):
+        return None
+    for item in evidence:
+        if item.get("name") != "git_status":
+            continue
+        real_m = re.search(r"\bbranch\s+([\w./-]+)", item.get("preview") or "",
+                           re.IGNORECASE)
+        if real_m and real_m.group(1) != claimed:
+            return claimed, real_m.group(1)
+    return None
+
+
+async def _evidence_integrity_findings(
+        content: str, task: str, team, hive_mcp_url: str | None,
+        hive_mcp_tools, cmp_note: str) -> list[dict]:
+    """Deterministic, structural check across the five explicit evidence
+    categories this phase scopes (Rule 3 in this section's own header
+    comment). Returns a list of finding dicts (empty when nothing
+    contradicts), each: {"category", "claimed", "real"}.
+
+    Every check here reuses an EXISTING function or an EXISTING evidence
+    capture point unchanged -- see this section's own header comment for
+    which. Pure with respect to team state: reads team._read_state/
+    team._tool_evidence, never writes them.
+    """
+    findings: list[dict] = []
+
+    # 1. File/path existence -- reuses _contradicted_by_failed_lookup exactly as the
+    # existing disclosure-only guard already calls it (same two-line fetch, not a new
+    # extraction).
+    _rs = getattr(team, "_read_state", None)
+    contradicted_paths = _contradicted_by_failed_lookup(
+        content, _rs.get("globs") if isinstance(_rs, dict) else None)
+    for p in contradicted_paths:
+        findings.append({"category": "file/path existence", "claimed": p,
+                          "real": "a lookup for this path in this run returned no matches"})
+
+    # 2. File enumerations/counts -- reuses _miscounted_against_tool's own
+    # count_matches-backed check unchanged.
+    count_note = await _miscounted_against_tool(content, hive_mcp_url, hive_mcp_tools)
+    if count_note:
+        findings.append({"category": "file enumeration/count", "claimed": "(see note)",
+                          "real": count_note})
+
+    # 3. Comparison completeness/gaps -- reuses _comparison_gap_counts and
+    # _reconcile_completeness_claims, the SAME two pure functions
+    # _reconcile_completeness_claim_with_comparison already uses, unmodified --
+    # this only re-asks the same question against whatever content survived to this
+    # point in the chain, never recomputes or reinterprets compare_enumerations'
+    # own output.
+    gap = _comparison_gap_counts(cmp_note)
+    if gap and (gap[0] or gap[1]):
+        claims = _reconcile_completeness_claims(content)
+        if claims:
+            findings.append({
+                "category": "comparison completeness/gap",
+                "claimed": claims[0],
+                "real": f"compare_enumerations found {gap[0]} left-only and "
+                        f"{gap[1]} right-only item(s) for the same two files",
+            })
+
+    # 4. DB row counts -- new, narrow (see _integrity_db_count_contradiction).
+    db = _integrity_db_count_contradiction(content, team)
+    if db:
+        claimed, real = db
+        findings.append({"category": "DB row count", "claimed": f"{claimed} rows",
+                          "real": f"{real} rows (db_query/db_schema, this run)"})
+
+    # 5. Environment/branch facts -- new, narrow (see _integrity_env_fact_contradiction
+    # / _integrity_branch_contradiction).
+    env = _integrity_env_fact_contradiction(content, team)
+    if env:
+        field, claimed, real = env
+        findings.append({"category": f"environment fact ({field})", "claimed": claimed,
+                          "real": real + " (get_env_info, this run)"})
+    branch = _integrity_branch_contradiction(content, team)
+    if branch:
+        claimed, real = branch
+        findings.append({"category": "environment fact (branch)", "claimed": claimed,
+                          "real": real + " (git_status, this run)"})
+
+    return findings
+
+
+def _force_uncertainty_answer(content: str, findings: list[dict]) -> str:
+    """Rewrite the answer's own framing so a contradicted claim ships as explicit
+    uncertainty, never as confident fact -- the forced-uncertainty half of this
+    section's contradiction-handling contract. Appends, never deletes: the
+    reader gets the full original text (so nothing else in it is lost) with an
+    unmissable header stating exactly what remains unresolved and why, followed
+    by the specific evidence that contradicts it.
+
+    Deliberately distinct from every existing disclosure-only footnote in this
+    file (_tail()'s own extras): those read as an addendum below a confident
+    answer. This reads as a correction to it, placed where a reader hits it
+    FIRST, because the success criterion this exists for is "zero confident
+    final answers asserting the known opposite of authoritative evidence" --
+    a footnote a reader skips does not satisfy that.
+    """
+    lines = "; ".join(
+        f"claimed {f['claimed']!r} ({f['category']}), but this run's own evidence "
+        f"says {f['real']!r}"
+        for f in findings)
+    return (
+        f"**UNRESOLVED — THIS ANSWER CONTRADICTS EVIDENCE THIS RUN ALREADY "
+        f"GATHERED, and one correction attempt did not resolve it: {lines}. "
+        f"Treat the claim(s) named above as UNCERTAIN, not established — the "
+        f"contradicting evidence came from this run's own tool calls, not a "
+        f"guess. Everything else below is the original answer, unmodified.**"
+        f"\n\n---\n{content}"
+    )
+
+
+async def _persist_evidence_integrity_trace(
+        team, findings: list[dict], resolved: bool, retried: bool) -> None:
+    """Durable forensic record of an evidence-integrity contradiction, reusing
+    Phase E's existing Claim persistence unchanged (execution_store.persist_claim)
+    -- one Claim row per finding, status 'contradicted' (still unresolved after
+    the one reconciliation attempt) or 'supported' (the retry's correction is what
+    shipped). Fail-open via execution_store.guard, exactly like every other
+    durable write in this file: a persistence failure here can never affect the
+    decision already made or the answer already assembled -- this function's
+    return value is never inspected by its caller.
+    """
+    run_context = getattr(team, "_run_context", None)
+    if run_context is None or not findings:
+        return
+    status = "supported" if resolved else "contradicted"
+    for f in findings:
+        statement = f"{f['category']}: claimed {f['claimed']!r}"
+        await execution_store.guard(execution_store.persist_claim(
+            run_context, statement, status))
+    print(f"[team] evidence-integrity: {len(findings)} finding(s), "
+          f"retried={retried} resolved={resolved} — trace persisted", flush=True)
+
+
+async def _evidence_integrity_check(
+        content: str, task: str, team, hive_mcp_url: str | None, hive_mcp_tools,
+        liveness_path: str | None = None, synthesis_run: bool = False) -> str:
+    """The one new guard this phase adds. Single choke point (see this section's
+    own header comment), applied at _verified_answer's own single call site --
+    the same "one choke point covers every path" placement _hoist_denied_premise
+    already uses right below it, rather than threading a new parameter through
+    _verified_answer's own ~20 internal return sites.
+
+    Takes content -> str, like _hoist_denied_premise, NOT the (content, result)
+    pair _verified_answer's own internal guards pass around -- this runs strictly
+    AFTER _verified_answer has already finished (including its own internal
+    retry, if any), so there is no shared internal `all_results`/`result` state
+    left to thread through from here. This check's own reconciliation attempt is
+    therefore its OWN small, separately-bounded budget (exactly one retry,
+    matching Rule 4's "perform ONE targeted reconciliation attempt" verbatim) --
+    not a second draw against _verified_answer's internal one. Worst case this
+    adds one more retry on top of whatever _verified_answer's own chain already
+    spent (at most one, since that chain is first-match-wins) -- bounded at two
+    total, nowhere near the 4-retries-in-one-call shape the internal budget was
+    built to prevent (see _verified_answer's own docstring).
+
+    A run whose final answer never contradicts any of the five explicit evidence
+    categories (the common case) costs one extra _miscounted_against_tool call
+    (already cheap, already awaited elsewhere in this file for the same reason)
+    and otherwise falls straight through -- no retry, no rewrite, no trace.
+    """
+    if synthesis_run or not content or getattr(team, _EVIDENCE_INTEGRITY_FLAG, False):
+        return content
+    setattr(team, _EVIDENCE_INTEGRITY_FLAG, True)
+
+    # Comparison completeness/gaps (category 3): recomputed fresh against the
+    # FINAL content, the same way _reconcile_completeness_claim_with_comparison
+    # itself already recomputes _cmp_note after adopting its own retry ("Awaited
+    # here with _cmp_note, for the same reason") -- reusing _computed_comparison
+    # unmodified, never reinterpreting or duplicating compare_enumerations' own
+    # join logic.
+    cmp_note = await _computed_comparison(
+        task,
+        (getattr(team, "_read_state", None) or {}).get("enumerations")
+        if isinstance(getattr(team, "_read_state", None), dict) else None,
+        hive_mcp_url, hive_mcp_tools, content, team=team)
+
+    findings = await _evidence_integrity_findings(
+        content, task, team, hive_mcp_url, hive_mcp_tools, cmp_note)
+    if not findings:
+        return content
+
+    print(f"[team] evidence-integrity: {len(findings)} contradiction(s) found in the "
+          f"final answer — {[f['category'] for f in findings]}", flush=True)
+
+    lines = "; ".join(
+        f"you claimed {f['claimed']!r} ({f['category']}), but this run's own tool "
+        f"evidence says {f['real']!r}"
+        for f in findings)
+    prompt = (
+        f"{task}\n\nIMPORTANT: your previous answer contradicts evidence THIS RUN "
+        f"already gathered: {lines}. Answer the original question again, and make "
+        f"sure your answer agrees with this run's own tool evidence on every point "
+        f"named above."
+    )
+    print("[team] evidence-integrity: one targeted reconciliation attempt", flush=True)
+    try:
+        retried, _retry_result = await _stream_team_run(
+            team, prompt, log_label="evidence-integrity", liveness_path=liveness_path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[team] evidence-integrity retry failed: {exc}", flush=True)
+        forced = _force_uncertainty_answer(content, findings)
+        await _persist_evidence_integrity_trace(team, findings, resolved=False, retried=True)
+        return forced
+
+    # Same defensive floor _adopt_retry applies to every other retry in this
+    # file -- a genuinely empty completion or one that strips to nothing (pure
+    # tool-call syntax) is never a candidate for adoption, whatever the recheck
+    # below says. _adopt_retry itself is not called: its OWN adoption criterion
+    # is _more_grounded (compares read counts against the ORIGINAL result
+    # object), which this check does not have at this call site and does not
+    # need -- the correct criterion here is narrower and stronger: did the
+    # retry stop contradicting the SPECIFIC evidence this check found.
+    if not retried or not _strip_leaked_tool_tags(retried).strip() \
+            or retried.strip() == _BUDGET_EXHAUSTED_ANSWER:
+        print("[team] evidence-integrity retry produced nothing usable", flush=True)
+        forced = _force_uncertainty_answer(content, findings)
+        await _persist_evidence_integrity_trace(team, findings, resolved=False, retried=True)
+        return forced
+
+    recheck_cmp_note = await _computed_comparison(
+        task,
+        (getattr(team, "_read_state", None) or {}).get("enumerations")
+        if isinstance(getattr(team, "_read_state", None), dict) else None,
+        hive_mcp_url, hive_mcp_tools, retried, team=team)
+    recheck = await _evidence_integrity_findings(
+        retried, task, team, hive_mcp_url, hive_mcp_tools, recheck_cmp_note)
+    if recheck:
+        print(f"[team] evidence-integrity: retry still contradicts "
+              f"{[f['category'] for f in recheck]} — forcing uncertainty", flush=True)
+        forced = _force_uncertainty_answer(retried, recheck)
+        await _persist_evidence_integrity_trace(team, recheck, resolved=False, retried=True)
+        return forced
+
+    print("[team] evidence-integrity: retry resolved every contradiction — adopting",
+          flush=True)
+    await _persist_evidence_integrity_trace(team, findings, resolved=True, retried=True)
+    return retried
+
+
 async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | None,
                            result=None, liveness_path: str | None = None,
                            hive_mcp_tools=None, synthesis_run: bool = False) -> str:
@@ -16907,6 +17296,15 @@ async def run_task_async(
                     # and shipped unguarded. One choke point covers every path.
                     content = await _hoist_denied_premise(
                         content, _hive_url, hive_mcp_tools=_hive_tools)
+                    # Phase R (2026-09-14): the same "one choke point" placement,
+                    # applied to _verified_answer's own FINAL output -- catches a
+                    # contradiction against structured evidence that survived every
+                    # guard inside _verified_answer's own chain untouched. See
+                    # _evidence_integrity_check's own docstring for why this sits
+                    # outside that chain rather than as one more guard inside it.
+                    content = await _evidence_integrity_check(
+                        content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
+                        liveness_path=liveness_path, synthesis_run=synthesis_run)
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
                 if _phase0 is not None:
