@@ -678,9 +678,41 @@ async def promote_session_claims(
     so it does not violate Phase D/E's write-only-during-execution
     boundary, which is scoped to the live run, not to post-hoc human
     review.
+
+    Phase J: `project_id` is never trusted blindly -- the FIRST thing this
+    function does is verify session_id's OWN chat_sessions.project_id
+    matches the supplied project_id, and fails CLOSED (returns [],
+    promotes nothing) on any mismatch or on a session_id that does not
+    exist. See the inline comment at that check for the concrete
+    cross-project promotion this closes.
     """
     try:
         async with get_engine().begin() as conn:
+            # Phase J authorization boundary: verify session_id ACTUALLY
+            # belongs to the caller-supplied project_id BEFORE reading or
+            # promoting anything under it. Before this check,
+            # promote_session_claims trusted project_id blindly -- a caller
+            # could pass session_id from Project A alongside project_id
+            # "B" and this function would happily promote Project A's
+            # validated claims into Project B's durable memory. This is an
+            # AUTHORIZATION decision, not a persistence failure: on
+            # mismatch (or a session_id that does not exist at all) this
+            # FAILS CLOSED -- returns [] immediately, promotes nothing --
+            # never falls through to "promote anyway", unlike this
+            # function's own fail-OPEN handling of genuine I/O failures
+            # below.
+            owner_project_id = (await conn.execute(
+                sa.select(db.chat_sessions.c.project_id)
+                .where(db.chat_sessions.c.id == session_id)
+            )).scalar()
+            if owner_project_id is None:
+                return []
+            if owner_project_id != project_id:
+                print(f"[execution_store] promote_session_claims: REFUSED -- "
+                      f"session_id={session_id!r} belongs to project "
+                      f"{owner_project_id!r}, not the supplied "
+                      f"{project_id!r}; promoting nothing", flush=True)
+                return []
             run_ids = (await conn.execute(
                 sa.select(db.runs.c.run_id).where(db.runs.c.session_id == session_id)
             )).scalars().all()
@@ -826,7 +858,7 @@ def _unresumable(run_id: str, reason: str, checkpoint=None, session_id: str | No
     }
 
 
-async def rehydrate_run(run_id: str) -> dict | None:
+async def rehydrate_run(run_id: str, project_id: str | None = None) -> dict | None:
     """Locate the latest checkpoint for `run_id`, validate its integrity and
     schema_version, and judge whether the run can be safely continued.
 
@@ -876,6 +908,22 @@ async def rehydrate_run(run_id: str) -> dict | None:
     Fail-open: any exception during lookup returns a `resumable: False` dict
     naming the failure as the reason, never raised and never mistaken for
     "yes, safe to resume."
+
+    Phase J: `project_id` is OPTIONAL (default None, preserving Phase H's
+    original behavior exactly for existing callers) -- but when a caller
+    DOES supply it, it is enforced STRICTLY and fails CLOSED: this run's
+    OWN session's chat_sessions.project_id must match, or `resumable` is
+    unconditionally False regardless of the run's actual technical
+    resumability (see checkpoint_id/checkpoint_sequence in that case are
+    still populated for audit purposes, but `resumable` never is). This is
+    an authorization decision, not a persistence failure -- it is never
+    converted into fail-open ("resumable anyway") behavior. Without a
+    project_id argument, any caller holding any run_id gets full
+    resumability details for that run regardless of which project it
+    belongs to -- acceptable only because, as of this phase, nothing in
+    api/server.py exposes rehydrate_run to an HTTP caller at all (it is an
+    internal function only); a future endpoint that DOES expose it MUST
+    supply project_id.
     """
     try:
         async with get_engine().begin() as conn:
@@ -884,6 +932,21 @@ async def rehydrate_run(run_id: str) -> dict | None:
             )).mappings().first()
             if run_row is None:
                 return None
+            if project_id is not None:
+                owner_project_id = (await conn.execute(
+                    sa.select(db.chat_sessions.c.project_id)
+                    .where(db.chat_sessions.c.id == run_row["session_id"])
+                )).scalar()
+                if owner_project_id != project_id:
+                    print(f"[execution_store] rehydrate_run: REFUSED -- "
+                          f"run_id={run_id!r} belongs to project "
+                          f"{owner_project_id!r}, not the supplied "
+                          f"{project_id!r}", flush=True)
+                    return _unresumable(
+                        run_id,
+                        "authorization failed: this run does not belong to "
+                        "the supplied project_id",
+                        session_id=run_row["session_id"])
             checkpoint = (await conn.execute(
                 sa.select(db.checkpoints)
                 .where(db.checkpoints.c.run_id == run_id)
@@ -1052,3 +1115,68 @@ async def check_storage_integrity() -> dict:
               f"{type(exc).__name__}: {exc}", flush=True)
         result["error"] = f"{type(exc).__name__}: {exc}"
     return result
+
+
+# ============================================================================
+# Phase J -- project/tenant ownership registry (read/write on `projects`,
+# the normalized parent Phase J's authorization checks above reference).
+# ============================================================================
+
+async def ensure_project(project_id: str, tenant_id: str | None = None) -> None:
+    """Idempotent upsert: registers `project_id` in the `projects` table if
+    it has no row yet, so every project this codebase has ever touched
+    (via the pre-existing bare project_id STRING convention -- chat_sessions/
+    failure_log/task_outcome_queue/project_memory_promotions all predate
+    this table) eventually gets a normalized anchor row without requiring a
+    backfill migration.
+
+    Never overwrites an existing row's tenant_id with None -- a project
+    already registered with a real tenant_id must not be silently
+    reset to "no tenant" by a later caller that simply didn't know it.
+    Passing a tenant_id for an already-registered project with a
+    DIFFERENT existing tenant_id is a caller/config error, not something
+    this function resolves; it leaves the existing row untouched either
+    way (last-write-wins tenant reassignment is not implemented -- not
+    justified by anything found in this phase's own forensics, which
+    found no code path that ever needs to REASSIGN a project's tenant).
+
+    Fail-open, matching every other function in this module: a lookup or
+    insert failure here is logged and swallowed, never raised -- this is
+    ordinary persistence, not an authorization decision (compare
+    promote_session_claims/rehydrate_run above, which fail CLOSED because
+    THEY gate access to data; this function only ever adds a row that
+    makes future ownership lookups possible, never removes or narrows
+    access to anything).
+    """
+    try:
+        async with get_engine().begin() as conn:
+            existing = (await conn.execute(
+                sa.select(db.projects.c.id).where(db.projects.c.id == project_id)
+            )).scalar()
+            if existing is not None:
+                return
+            await conn.execute(db.projects.insert().values(
+                id=project_id, tenant_id=tenant_id))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[execution_store] ensure_project failed "
+              f"(project_id={project_id!r}): {type(exc).__name__}: {exc}",
+              flush=True)
+
+
+async def resolve_tenant_for_project(project_id: str) -> str | None:
+    """The registered tenant_id for `project_id`, or None if the project has
+    no row (never registered via ensure_project) or is registered with no
+    tenant. Read-only; fail-open (returns None on any lookup failure,
+    exactly as if the project were simply unregistered -- indistinguishable
+    on purpose, since neither case licenses any different behavior from a
+    caller of this function)."""
+    try:
+        async with get_engine().begin() as conn:
+            return (await conn.execute(
+                sa.select(db.projects.c.tenant_id).where(db.projects.c.id == project_id)
+            )).scalar()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[execution_store] resolve_tenant_for_project failed "
+              f"(project_id={project_id!r}): {type(exc).__name__}: {exc}",
+              flush=True)
+        return None

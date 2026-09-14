@@ -429,6 +429,31 @@ checkpoints = Table(
 )
 Index("checkpoints_run_idx", checkpoints.c.run_id, checkpoints.c.sequence)
 
+# Phase J -- the normalized "project" parent every other table's bare
+# project_id STRING has always implicitly referenced, never actually had a
+# row for. chat_sessions/failure_log/task_outcome_queue/
+# project_memory_promotions' own project_id columns are DELIBERATELY NOT
+# given a ForeignKey to this table: those columns have existed since before
+# this table did, on installations that may already hold project_id values
+# with no corresponding row here, and a hard constraint would make an
+# existing installation's upgrade destructive (a value that doesn't yet
+# exist in `projects` would break every future INSERT under that
+# project_id the moment the constraint were added). Ownership is instead
+# established and verified at the APPLICATION layer -- see
+# execution_store.ensure_project/resolve_tenant_for_project, and the
+# specific authorization fixes in execution_store.promote_session_claims/
+# rehydrate_run and api/server.py's session-scoped endpoints -- exactly
+# the "prefer normalized ownership... do not add redundant tenant_id/
+# project_id columns everywhere" balance this phase's own instructions ask
+# for: ONE new table anchors the "project -> tenant" chain, rather than a
+# tenant_id column retrofitted onto every durable table.
+projects = Table(
+    "projects", metadata,
+    Column("id", Text, primary_key=True),   # the SAME string every other table's project_id already uses
+    Column("tenant_id", Text, nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
 
 # model_catalog / team_role_models (AGNOHive 2.3.2 addendum) — replaces
 # swarm/agents.py's old _VLLM_MODEL_MAP dict + _CLOUD_ALIASES set. See

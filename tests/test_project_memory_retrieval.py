@@ -33,11 +33,11 @@ def _fresh_migrated_db(monkeypatch):
     yield
 
 
-async def _create_session() -> str:
+async def _create_session(project_id: str = "p") -> str:
     sid = str(uuid.uuid4())
     async with db.get_engine().begin() as conn:
         await conn.execute(db.chat_sessions.insert().values(
-            id=sid, project_id="p", title="t", persist=False))
+            id=sid, project_id=project_id, title="t", persist=False))
     return sid
 
 
@@ -48,8 +48,17 @@ async def _promote_one(project_id: str, statement: str, session_id: str | None =
     session (idempotently re-confirming any already-promoted claim from an
     earlier call alongside the new one) -- callers that need an exact count
     should query project_memory_promotions directly rather than trust this
-    helper's return value in that case."""
-    sid = session_id or await _create_session()
+    helper's return value in that case.
+
+    The session is created under `project_id` itself (Phase J: promote_
+    session_claims now verifies the session actually belongs to the
+    project_id it is asked to promote under, and refuses otherwise --
+    see tests/test_tenant_isolation.py for that check's own dedicated
+    coverage; this helper must supply a genuinely matching pair so tests
+    that legitimately exercise DIFFERENT projects, like
+    test_wrong_project_memory_is_excluded below, still promote
+    successfully into the project they claim)."""
+    sid = session_id or await _create_session(project_id)
     team = types.SimpleNamespace()
     rc = RunContext(sid, f"run-{uuid.uuid4().hex[:8]}")
     rc.start_execution("Coordinator", "coordinator", parent_execution_id=None)

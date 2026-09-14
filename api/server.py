@@ -1401,6 +1401,43 @@ async def scan(request: ScanRequest):
     )
 
 
+async def _authorize_session_access(session_id: str, project_id: str | None) -> dict:
+    """Phase J -- the single explicit authorization boundary for every
+    session-scoped endpoint below. Returns the already-fetched session row
+    (so callers reuse it instead of re-querying) when access is
+    authorized; raises HTTPException(404) otherwise -- FAILS CLOSED, never
+    silently lets a project_id mismatch through, and never distinguishes
+    "wrong project" from "does not exist" in its response (a 403 would
+    confirm to an unauthorized caller that the session_id is real, which
+    404 does not).
+
+    Found by this phase's own forensics: before this check existed, every
+    one of GET/DELETE/PATCH /sessions/{id}, /tree, and /branch identified
+    their target by session_id ALONE -- any caller holding (or guessing)
+    ANY session_id could read, delete, or mutate ANY project's session,
+    with its entire durable Run/Execution/ToolCall/Evidence/Claim/
+    Checkpoint tree deleted right along with it via the existing cascade.
+
+    `project_id` is OPTIONAL (None = not supplied) for backward
+    compatibility with every existing caller of these endpoints, which
+    have never sent one -- and with this deployment's documented,
+    pre-existing trust model (see the /admin/model-routes section above:
+    "same unauthenticated-over-Tailscale trust boundary every other
+    endpoint above already relies on"). This phase cannot make identity
+    verification mandatory without inventing an authentication system
+    (explicitly out of scope) that does not exist anywhere in this
+    codebase today; what it CAN and DOES do is make the check available
+    and airtight the moment a caller supplies project_id -- never
+    converted into fail-open behavior once supplied.
+    """
+    session = await get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    if project_id is not None and session["project_id"] != project_id:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    return session
+
+
 @app.get("/sessions")
 async def list_sessions_endpoint(project_id: str = "default", limit: int = 20):
     from api.models import SessionListItem
@@ -1422,14 +1459,16 @@ async def list_sessions_endpoint(project_id: str = "default", limit: int = 20):
 
 
 @app.get("/sessions/{session_id}")
-async def get_session_endpoint(session_id: str):
+async def get_session_endpoint(session_id: str, project_id: str | None = None):
     from api.models import SessionDetail, SessionMessage
+
+    # Authorization BEFORE anything else, including imports only the success
+    # path needs (psycopg here) -- an unauthorized/forged request must fail
+    # on the ownership check alone, never on an unrelated downstream error.
+    session = await _authorize_session_access(session_id, project_id)
+
     import psycopg
     from config.config import config as _config
-
-    session = await get_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found or expired")
 
     try:
         async with await psycopg.AsyncConnection.connect(_config.postgres_uri) as conn:
@@ -1460,7 +1499,8 @@ async def get_session_endpoint(session_id: str):
 
 
 @app.delete("/sessions/{session_id}")
-async def delete_session_endpoint(session_id: str):
+async def delete_session_endpoint(session_id: str, project_id: str | None = None):
+    await _authorize_session_access(session_id, project_id)
     deleted = await _delete_session(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -1468,7 +1508,8 @@ async def delete_session_endpoint(session_id: str):
 
 
 @app.patch("/sessions/{session_id}/persist")
-async def persist_session_endpoint(session_id: str):
+async def persist_session_endpoint(session_id: str, project_id: str | None = None):
+    await _authorize_session_access(session_id, project_id)
     updated = await _persist_session(session_id)
     if not updated:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -1476,13 +1517,16 @@ async def persist_session_endpoint(session_id: str):
 
 
 @app.get("/sessions/{session_id}/tree")
-async def get_session_tree_endpoint(session_id: str):
+async def get_session_tree_endpoint(session_id: str, project_id: str | None = None):
+    await _authorize_session_access(session_id, project_id)
     messages = await list_session_tree(session_id)
     return {"messages": messages}
 
 
 @app.post("/sessions/{session_id}/branch")
-async def branch_session_endpoint(session_id: str, request: BranchRequest):
+async def branch_session_endpoint(session_id: str, request: BranchRequest,
+                                   project_id: str | None = None):
+    await _authorize_session_access(session_id, project_id)
     messages = await list_session_tree(session_id)
     target = next((m for m in messages if m["id"] == request.message_id), None)
     if target is None:
@@ -1494,6 +1538,17 @@ async def branch_session_endpoint(session_id: str, request: BranchRequest):
 
 @app.post("/sessions/{session_id}/fork")
 async def fork_session_endpoint(session_id: str, request: ForkRequest):
+    # Phase J: unlike the other session-scoped endpoints above, ForkRequest
+    # has ALWAYS required project_id (no backward-compat tradeoff to make
+    # here -- every existing caller already supplies one). Before this
+    # check, that project_id was used ONLY to tag the brand-new forked
+    # session, never verified against the SOURCE session_id's own project
+    # -- so a caller could fork ANY project's session (its full message
+    # history) into a session tagged under a project_id THEY chose,
+    # exfiltrating that content across the project boundary. Fails closed,
+    # same as _authorize_session_access: forking across projects is
+    # refused outright, not silently allowed or downgraded to a warning.
+    await _authorize_session_access(session_id, request.project_id)
     new_session_id = await fork_session(session_id, request.project_id, request.title)
     if new_session_id is None:
         raise HTTPException(status_code=404, detail="source session has no messages to fork")

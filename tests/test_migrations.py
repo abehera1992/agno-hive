@@ -57,8 +57,8 @@ def _index_names(table: str) -> list[dict]:
 
 # ── 1/2/4/5/15/16. Fresh migration path (SQLite here; Postgres DDL compiled below) ──
 
-def test_expected_head_is_the_checkpoints_revision():
-    assert expected_head() == "0004_checkpoints"
+def test_expected_head_is_the_projects_revision():
+    assert expected_head() == "0005_projects"
 
 
 def test_fresh_sqlite_upgrade_creates_all_ten_tables():
