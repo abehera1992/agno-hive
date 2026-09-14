@@ -229,7 +229,7 @@ def test_cmd_migrate_source_uses_no_second_connection_mechanism(load_cli_hive):
     assert "sqlite3.connect" not in source
 
 
-# ── 10. Expected Alembic head is 0003_project_memory_promotion ─────────────
+# ── 10. Expected Alembic head is 0004_checkpoints ───────────────────────────
 
-def test_expected_head_is_0003_project_memory_promotion():
-    assert expected_head() == "0003_project_memory_promotion"
+def test_expected_head_is_0004_checkpoints():
+    assert expected_head() == "0004_checkpoints"

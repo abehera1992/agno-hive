@@ -677,3 +677,272 @@ async def promote_session_claims(
         if promotion_id is not None:
             promoted.append(promotion_id)
     return promoted
+
+
+# ============================================================================
+# Phase H -- checkpoint + rehydration.
+# ============================================================================
+
+# Bumped only if this row's SHAPE changes incompatibly (a column added/
+# removed/repurposed) -- never for ordinary new data. rehydrate_run refuses
+# to interpret a checkpoint whose schema_version it does not recognize,
+# rather than guessing at a shape it was not written to understand.
+CHECKPOINT_SCHEMA_VERSION = 1
+
+def _checkpoint_state_hash(run_id: str, sequence: int,
+                            last_execution_id: str | None, run_status: str) -> str:
+    """A tamper/corruption checksum over THIS ROW's own other columns --
+    deliberately NOT a fingerprint of the run's live execution/tool_call
+    state (which changes constantly and legitimately as a run progresses;
+    hashing it here would make every checkpoint "stale" the instant
+    anything else happens). rehydrate_run recomputes this from the
+    checkpoint row it just read and compares -- a mismatch means the ROW
+    ITSELF is internally inconsistent (hand-edited, corrupted on disk),
+    not that the world has moved on since it was written.
+    """
+    canonical = (f"{run_id}:{sequence}:{last_execution_id or ''}:"
+                 f"{run_status}:{CHECKPOINT_SCHEMA_VERSION}")
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+async def persist_checkpoint(run_context: RunContext, run_status: str) -> str | None:
+    """INSERT one `checkpoints` row for run_context.run_id at the NEXT
+    sequence number for that run. Safe to call repeatedly for the same run
+    -- each call computes and inserts the next sequence, an append-only
+    ledger like claims/claim_evidence, never an update to a prior row.
+
+    Called from exactly 4 places (swarm/team.py's run_task_async and
+    run_task_stream, at the SAME points those functions already call
+    persist_run_started/persist_run_completed): once right after a run
+    starts (run_status="running", establishing the baseline -- nothing has
+    completed yet) and once in the outermost finally after the run reaches
+    a terminal status ("ok"/"failed"). Both are boundaries already reliably
+    observable IN-PROCESS by ordinary control flow -- unlike a SIGKILL
+    (api/server.py's `_run_worker_subprocess` kills the whole worker
+    process outright on disconnect/liveness-timeout; see that function's
+    own docstring), which no in-process code can ever observe or react to.
+    This is exactly why Phase H does not attempt "checkpoint on interrupt"
+    as its own event: the only run states this function can ever durably
+    record are "just started" and "reached a terminal outcome cleanly" --
+    a run that was SIGKILLed leaves no checkpoint newer than its last
+    "running" one, which is precisely the signal rehydrate_run's own
+    resumability judgment relies on (a run stuck at runs.status=="running"
+    forever, because nothing ever got the chance to persist_run_completed).
+
+    last_execution_id is always run_context.root_execution_id -- the one
+    execution guaranteed to exist and be identifiable at BOTH call sites
+    (at start, it is the only execution; at the end, delegation/retry
+    executions may have come and gone, but the root is the stable anchor
+    for "which run/attempt-tree this checkpoint belongs to"). Rehydration
+    does not rely on this pointer alone for resumability -- it always
+    re-reads the full, current executions/tool_calls state for the run
+    directly (see rehydrate_run).
+
+    A no-op (returns None) when run_context.session_id is None, the same
+    convention persist_run_started uses -- a run with no session has no
+    durable Run row for this checkpoint to reference either.
+    """
+    if run_context.session_id is None:
+        return None
+    checkpoint_id = str(_uuid.uuid4())
+    last_execution_id = run_context.root_execution_id
+    try:
+        async with get_engine().begin() as conn:
+            current_max = (await conn.execute(
+                sa.select(sa.func.max(db.checkpoints.c.sequence))
+                .where(db.checkpoints.c.run_id == run_context.run_id)
+            )).scalar()
+            sequence = (current_max or 0) + 1
+            state_hash = _checkpoint_state_hash(
+                run_context.run_id, sequence, last_execution_id, run_status)
+            await conn.execute(db.checkpoints.insert().values(
+                id=checkpoint_id,
+                run_id=run_context.run_id,
+                sequence=sequence,
+                schema_version=CHECKPOINT_SCHEMA_VERSION,
+                last_execution_id=last_execution_id,
+                run_status=run_status,
+                state_hash=state_hash,
+            ))
+        return checkpoint_id
+    except Exception as exc:  # noqa: BLE001
+        print(f"[execution_store] persist_checkpoint failed "
+              f"(run_id={run_context.run_id!r}): {type(exc).__name__}: {exc}",
+              flush=True)
+        return None
+
+
+def _unresumable(run_id: str, reason: str, checkpoint=None, session_id: str | None = None) -> dict:
+    return {
+        "run_id": run_id,
+        "resumable": False,
+        "reason": reason,
+        "checkpoint_id": checkpoint["id"] if checkpoint is not None else None,
+        "checkpoint_sequence": checkpoint["sequence"] if checkpoint is not None else None,
+        # checkpoint.last_execution_id IS the root execution id by construction
+        # (persist_checkpoint always sets it to run_context.root_execution_id).
+        "root_execution_id": checkpoint["last_execution_id"] if checkpoint is not None else None,
+        "attempt_number": None,
+        "session_id": session_id,
+    }
+
+
+async def rehydrate_run(run_id: str) -> dict | None:
+    """Locate the latest checkpoint for `run_id`, validate its integrity and
+    schema_version, and judge whether the run can be safely continued.
+
+    Returns None if the run has never been checkpointed at all (nothing to
+    rehydrate -- indistinguishable from "this run_id doesn't exist" from
+    this function's point of view; a caller should treat either case as
+    "start a fresh run").
+
+    Otherwise returns a dict with these keys, always:
+        run_id, resumable (bool), reason (str, always explains the verdict),
+        checkpoint_id, checkpoint_sequence, root_execution_id,
+        attempt_number, session_id.
+
+    `resumable` is True ONLY when ALL of the following hold:
+      1. the latest checkpoint's schema_version matches
+         CHECKPOINT_SCHEMA_VERSION exactly.
+      2. the checkpoint's own state_hash is internally consistent (not
+         corrupted/tampered) -- see _checkpoint_state_hash.
+      3. runs.status for this run is still "running" -- a run that already
+         reached "ok"/"failed" is DONE; there is nothing to resume, only a
+         new run to start.
+      4. NOT ONE ToolCall belonging to any Execution under this run is in a
+         non-terminal "running" state. This is deliberately absolute, per
+         this phase's own explicit instruction: a non-terminal ToolCall's
+         real-world effect is unknown (it may have already written a file,
+         run a command, applied a diff -- or not), and this function has no
+         way to know which tools are safe to re-issue and which are not.
+         Rather than guess, ANY non-terminal ToolCall makes the WHOLE run
+         non-resumable -- "when uncertain, mark the execution state
+         requiring manual/new-run recovery" is implemented literally here,
+         not approximated.
+      5. NOT ONE Execution belonging to this run is itself still "running"
+         (the same ambiguity, one level up -- covers a run killed between a
+         tool call finishing and its owning Execution being marked
+         complete).
+
+    When resumable, `root_execution_id`/`attempt_number` describe the run's
+    root coordinator Execution and how many attempts it has already made
+    (Phase A's attempt_number, already tracking exactly this) -- REFERENCES
+    for a caller to use when starting a genuinely NEW run that is aware of
+    this history, never something this function itself acts on. Phase H
+    does not launch, drive, or continue any execution itself: it only ever
+    answers "is this safe, and if so, here is the context" -- see this
+    module's own docstring for why (no job queue/worker, no distributed
+    locking -- both explicitly out of this phase's scope).
+
+    Fail-open: any exception during lookup returns a `resumable: False` dict
+    naming the failure as the reason, never raised and never mistaken for
+    "yes, safe to resume."
+    """
+    try:
+        async with get_engine().begin() as conn:
+            run_row = (await conn.execute(
+                sa.select(db.runs).where(db.runs.c.run_id == run_id)
+            )).mappings().first()
+            if run_row is None:
+                return None
+            checkpoint = (await conn.execute(
+                sa.select(db.checkpoints)
+                .where(db.checkpoints.c.run_id == run_id)
+                .order_by(db.checkpoints.c.sequence.desc())
+                .limit(1)
+            )).mappings().first()
+            if checkpoint is None:
+                return None
+
+            if checkpoint["schema_version"] != CHECKPOINT_SCHEMA_VERSION:
+                return _unresumable(
+                    run_id,
+                    f"unrecognized checkpoint schema_version "
+                    f"{checkpoint['schema_version']!r} (this code expects "
+                    f"{CHECKPOINT_SCHEMA_VERSION!r})",
+                    checkpoint, session_id=run_row["session_id"])
+            expected_hash = _checkpoint_state_hash(
+                checkpoint["run_id"], checkpoint["sequence"],
+                checkpoint["last_execution_id"], checkpoint["run_status"])
+            if checkpoint["state_hash"] != expected_hash:
+                return _unresumable(
+                    run_id,
+                    "checkpoint integrity hash mismatch -- this row may be "
+                    "corrupted or was modified outside persist_checkpoint",
+                    checkpoint, session_id=run_row["session_id"])
+            if run_row["status"] != "running":
+                # Anything other than literally "running" -- "ok", "failed", or
+                # any future/unrecognized status value -- is treated as NOT
+                # resumable by default, never accidentally as resumable.
+                return _unresumable(
+                    run_id,
+                    f"run already reached status {run_row['status']!r} -- "
+                    f"nothing to resume, start a new run instead",
+                    checkpoint, session_id=run_row["session_id"])
+
+            root = (await conn.execute(
+                sa.select(db.executions)
+                .where(db.executions.c.run_id == run_id,
+                       db.executions.c.parent_execution_id.is_(None))
+            )).mappings().first()
+            executions = (await conn.execute(
+                sa.select(db.executions).where(db.executions.c.run_id == run_id)
+            )).mappings().all()
+            execution_ids = [e["execution_id"] for e in executions]
+            # A "coordinator"-type execution (root, or a retry sibling) being
+            # "running" is EXPECTED and NORMAL for any run this function ever
+            # sees resumable=True for -- it IS the in-progress turn being
+            # rehydrated, not evidence of anything ambiguous (the root only
+            # ever finishes at the run's own terminal checkpoint, which the
+            # runs.status!="running" check above already gates on). A
+            # "delegation"-type execution left "running", by contrast, means
+            # _tool_interception_hook's own finally block (which always
+            # closes a delegation exactly once, including on cancellation --
+            # see Phase A finding B) never got the chance to run at all: the
+            # process died mid-delegation. THAT is the genuinely ambiguous
+            # case this check exists to catch.
+            running_delegations = [e for e in executions
+                                    if e["execution_type"] == "delegation" and e["status"] == "running"]
+            if running_delegations:
+                return _unresumable(
+                    run_id,
+                    f"{len(running_delegations)} delegation execution(s) are still "
+                    f"in a non-terminal 'running' state -- ambiguous, treated as "
+                    f"unresumable",
+                    checkpoint, session_id=run_row["session_id"])
+            non_terminal_tool_calls = []
+            if execution_ids:
+                non_terminal_tool_calls = (await conn.execute(
+                    sa.select(db.tool_calls.c.tool_call_id)
+                    .where(db.tool_calls.c.execution_id.in_(execution_ids),
+                           db.tool_calls.c.status == "running")
+                )).scalars().all()
+            if non_terminal_tool_calls:
+                return _unresumable(
+                    run_id,
+                    f"{len(non_terminal_tool_calls)} tool call(s) are still "
+                    f"in a non-terminal 'running' state -- their real-world "
+                    f"effect is unknown, and blindly replaying a tool call "
+                    f"that may already have taken effect (write_file, "
+                    f"apply_diff, run_command, ...) risks a duplicate side "
+                    f"effect; this run requires manual inspection or a new "
+                    f"run instead",
+                    checkpoint, session_id=run_row["session_id"])
+
+            return {
+                "run_id": run_id,
+                "resumable": True,
+                "reason": "run status is 'running' with no non-terminal executions "
+                          "or tool calls as of the latest checkpoint -- safe to "
+                          "start a NEW run using this context",
+                "checkpoint_id": checkpoint["id"],
+                "checkpoint_sequence": checkpoint["sequence"],
+                "root_execution_id": root["execution_id"] if root is not None else None,
+                "attempt_number": root["attempt_number"] if root is not None else None,
+                "session_id": run_row["session_id"],
+            }
+    except Exception as exc:  # noqa: BLE001
+        print(f"[execution_store] rehydrate_run failed "
+              f"(run_id={run_id!r}): {type(exc).__name__}: {exc}", flush=True)
+        return _unresumable(
+            run_id, f"rehydration lookup failed: {type(exc).__name__}: {exc}")

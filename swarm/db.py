@@ -386,6 +386,49 @@ project_memory_promotions = Table(
 Index("project_memory_promotions_project_idx",
       project_memory_promotions.c.project_id, project_memory_promotions.c.promoted_at)
 
+# Phase H -- RUN-owned (unlike project_memory_promotions above): a checkpoint
+# is prior EXECUTION STATE for one specific Run, not project knowledge, so it
+# DOES cascade-delete with its run (and therefore its session) -- the exact
+# opposite lifecycle choice from project_memory_promotions, deliberately.
+#
+# Append-only, like claims/claim_evidence: persist_checkpoint (swarm/
+# execution_store.py) only ever INSERTs a new row at the next sequence
+# number for a run, never updates or deletes an existing one -- "safe to
+# create repeatedly" by construction, not by a check-then-write race.
+#
+# last_execution_id is a plain reference (like project_memory_promotions'
+# claim_id/run_id), not a live join target for anything downstream --
+# SET NULL on the referenced execution's deletion (which in practice only
+# ever happens via this same row's own run cascading away with it) rather
+# than CASCADE, so a checkpoint's own historical record of "this WAS the
+# anchor execution" survives even in that edge case, matching claims.
+# execution_id's identical ondelete="SET NULL" reasoning.
+checkpoints = Table(
+    "checkpoints", metadata,
+    Column("id", Uuid(as_uuid=False), primary_key=True),
+    Column("run_id", Text, ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False),
+    # Monotonic per-run counter (1, 2, 3, ...) -- the ONLY thing rehydration
+    # trusts for "which checkpoint is latest", never created_at (two
+    # checkpoints for a fast run can share the same server_default second on
+    # SQLite/Postgres alike).
+    Column("sequence", Integer, nullable=False),
+    # Rehydration refuses to interpret a schema_version it does not
+    # recognize (see execution_store.CHECKPOINT_SCHEMA_VERSION) rather than
+    # guessing at an incompatible row shape from a future/older code version.
+    Column("schema_version", Integer, nullable=False),
+    Column("last_execution_id", Text,
+           ForeignKey("executions.execution_id", ondelete="SET NULL"), nullable=True),
+    Column("run_status", Text, nullable=False),  # mirrors runs.status at checkpoint time
+    # A tamper/corruption checksum over this row's OWN other columns (see
+    # execution_store._checkpoint_state_hash) -- NOT a fingerprint of the
+    # whole run's live state, which rehydration always re-reads fresh from
+    # executions/tool_calls directly rather than trusting a stale summary.
+    Column("state_hash", Text, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    UniqueConstraint("run_id", "sequence", name="checkpoints_run_sequence_uq"),
+)
+Index("checkpoints_run_idx", checkpoints.c.run_id, checkpoints.c.sequence)
+
 
 # model_catalog / team_role_models (AGNOHive 2.3.2 addendum) — replaces
 # swarm/agents.py's old _VLLM_MODEL_MAP dict + _CLOUD_ALIASES set. See

@@ -12346,6 +12346,12 @@ async def run_task_stream(
         await execution_store.guard(execution_store.persist_run_started(
             team._run_context, team_name=team_name, run_type="stream",
             task_preview=(task or "")[:200]))
+        # Phase H: baseline checkpoint -- the run has started, nothing has
+        # completed yet. See execution_store.persist_checkpoint's own
+        # docstring for why this and the terminal checkpoint below are the
+        # only two boundaries this phase ever checkpoints at.
+        await execution_store.guard(execution_store.persist_checkpoint(
+            team._run_context, run_status="running"))
 
         full_content: list[str] = []
         # See _stream_team_run's own docstring for the narration-leak incident this
@@ -12483,6 +12489,12 @@ async def run_task_stream(
                         _run_ctx, status=_final_status,
                         error=str(sys.exc_info()[1]) if sys.exc_info()[1] is not None else None,
                     ))
+                    # Phase H: terminal checkpoint -- the run reached a clean,
+                    # in-process-observable end (never written for a SIGKILL,
+                    # which is the whole point: see persist_checkpoint's own
+                    # docstring).
+                    await execution_store.guard(execution_store.persist_checkpoint(
+                        _run_ctx, run_status=_final_status))
 
 
 # Cap on the draft carried in the liveness snapshot. Large enough for a real
@@ -16469,6 +16481,12 @@ async def run_task_async(
             team._run_context, team_name=team_name,
             run_type="synthesis" if synthesis_run else "single",
             task_preview=(task or "")[:200]))
+        # Phase H: baseline checkpoint -- see persist_checkpoint's own
+        # docstring for why this and run_task_async's own terminal checkpoint
+        # (in this function's outermost finally) are the only two boundaries
+        # this phase ever checkpoints at.
+        await execution_store.guard(execution_store.persist_checkpoint(
+            team._run_context, run_status="running"))
 
         # ContextPack (Phase 2, Experiment 2). Resolved ONCE here, before the team
         # runs, so the delegation hook does no I/O. Targets come from the TASK rather
@@ -16827,10 +16845,18 @@ async def run_task_async(
                 _run_ctx = getattr(team, "_run_context", None)
                 if _run_ctx is not None:
                     _exc = sys.exc_info()[1]
+                    _final_status = "failed" if _exc is not None else "ok"
                     await execution_store.guard(execution_store.persist_run_completed(
-                        _run_ctx, status="failed" if _exc is not None else "ok",
+                        _run_ctx, status=_final_status,
                         error=str(_exc) if _exc is not None else None,
                     ))
+                    # Phase H: terminal checkpoint -- runs strictly after any
+                    # retries have already finished (this finally wraps the
+                    # whole function, including _verified_answer's own
+                    # _stream_team_run calls), so it reflects the run's TRUE
+                    # final state, not just the root execution's own.
+                    await execution_store.guard(execution_store.persist_checkpoint(
+                        _run_ctx, run_status=_final_status))
 
 
 def _warn_on_single_site_guards() -> None:
