@@ -587,6 +587,156 @@ async def load_failure_context(project_id: str, limit: int | None = None, curren
         return ""
 
 
+# ── Phase G: project memory retrieval ───────────────────────────────────────
+
+# Bounded on two axes, independently: how many promoted memories can ever be
+# injected in one run (this), and how many characters of any ONE memory's
+# statement can ever be injected (_PROJECT_MEMORY_STATEMENT_CHARS below) --
+# neither limit alone would prevent an unbounded prompt (many short items, or
+# few very long ones), so both apply together, the same way
+# load_failure_context bounds row count (`limit`) and per-row text
+# (err_msg[:800]) independently.
+_PROJECT_MEMORY_LIMIT_DEFAULT = 5
+_PROJECT_MEMORY_STATEMENT_CHARS = 300
+
+
+async def load_project_memory_context(
+    project_id: str, limit: int = _PROJECT_MEMORY_LIMIT_DEFAULT, current_task: str = "",
+) -> str:
+    """Phase G -- prior, human-VALIDATED project knowledge (Phase F's
+    project_memory_promotions), formatted for injection into COORDINATOR
+    instructions alongside load_failure_context/load_success_context (same
+    call site, same asyncio.gather, same "BACKGROUND ONLY" framing).
+
+    Core rule this function exists to encode in the text itself, not just in
+    a docstring: project memory is PRIOR validated knowledge, never current-
+    run Evidence. The block this returns says so explicitly and tells the
+    model that fresh, current-run findings win over anything listed here --
+    Phase G does not (and, per its own scope, must not) attempt to detect or
+    resolve an actual contradiction; it only ever *names* the precedence
+    rule so the model applies it. See swarm/execution_store.py's own
+    docstring for the write-side half of this: project_memory_promotions is
+    strictly append-only, never updated or deleted by anything in this
+    codebase, including this function -- a later contradicting Claim from a
+    fresh run becomes its OWN separate promoted row (Phase F), it never
+    edits this one.
+
+    Relevance-gated exactly like load_failure_context, reusing the SAME
+    _significant_tokens machinery rather than inventing a second filter:
+    only memories sharing at least one significant token with `current_task`
+    are returned; empty `current_task` falls back to recency-only (the same
+    convention load_failure_context uses for the same case). This closes the
+    same failure class load_failure_context's own docstring documents (the
+    "statusBadge" incident) -- unfiltered background injection from an
+    unrelated earlier task poisoning an unrelated one.
+
+    Bounded by `limit` (row count) AND _PROJECT_MEMORY_STATEMENT_CHARS (per-
+    row text) independently -- see the module-level constants above. Never
+    includes a promotion's evidence_snapshot body in the injected text, only
+    its evidence_hash (a short, fixed-length reference) -- the snapshot
+    itself can be arbitrarily large (it mirrors evidence.content, which is
+    deliberately unbounded, see swarm/db.py's own comment on that column),
+    so including it here would defeat the whole point of a bounded context
+    block. A reviewer who needs the full snapshot reads
+    project_memory_promotions directly, keyed by the promotion id this text
+    always includes.
+
+    Ordering is fully deterministic: promoted_at DESC, promotion id ASC as
+    the tiebreak (two promotions can share a timestamp at second
+    resolution) -- never Python dict/set iteration order, which is not
+    guaranteed stable in the presence of relevance-score ties.
+
+    Fail-open, matching every function in this module: any exception (a
+    missing table on an unmigrated database, a connection failure) is
+    logged and "" is returned -- exactly what "no project memory yet"
+    already returns, so a retrieval failure is indistinguishable from
+    (and exactly as harmless as) there being nothing to retrieve.
+    """
+    try:
+        from sqlalchemy import select
+
+        from swarm import db
+
+        await db.ensure_schema()
+        async with db.get_engine().begin() as conn:
+            rows = (await conn.execute(
+                select(
+                    db.project_memory_promotions.c.id,
+                    db.project_memory_promotions.c.claim_id,
+                    db.project_memory_promotions.c.run_id,
+                    db.project_memory_promotions.c.statement,
+                    db.project_memory_promotions.c.evidence_hash,
+                    db.project_memory_promotions.c.validated_by,
+                    db.project_memory_promotions.c.promoted_at,
+                )
+                .where(db.project_memory_promotions.c.project_id == project_id)
+                .order_by(db.project_memory_promotions.c.promoted_at.desc(),
+                          db.project_memory_promotions.c.id.asc())
+                .limit(max(limit * 5, 25))
+            )).all()
+        if not rows:
+            return ""
+
+        if current_task:
+            wanted = _significant_tokens(current_task)
+            if not wanted:
+                selected = rows[:limit]
+            else:
+                scored = []
+                for i, row in enumerate(rows):
+                    overlap = wanted & _significant_tokens(row.statement or "")
+                    if overlap:
+                        scored.append((len(overlap), -i, row))
+                if not scored:
+                    return ""  # nothing relevant -- the ordinary, ungated case
+                scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+                selected = [row for _, _, row in scored[:limit]]
+        else:
+            selected = rows[:limit]
+
+        # De-duplicate by promotion id, preserving order -- defensive, not
+        # reachable via the SQL above (a PRIMARY KEY column can't repeat in
+        # one result set), but the CONTRACT ("the same memory is never
+        # injected twice in one block") is worth asserting structurally
+        # rather than trusting the query shape to keep it true forever.
+        seen_ids: set[str] = set()
+        deduped = []
+        for row in selected:
+            if row.id in seen_ids:
+                continue
+            seen_ids.add(row.id)
+            deduped.append(row)
+
+        lines = [
+            "── PROJECT MEMORY / PRIOR VALIDATED KNOWLEDGE (BACKGROUND ONLY) ──",
+            "  Facts this PROJECT's earlier runs established and a human explicitly",
+            "  approved (via /feedback). This is PRIOR knowledge, NOT current-run",
+            "  Evidence -- it is never CURRENT TOOL EVIDENCE, CURRENT FILE CONTENT, or",
+            "  CURRENT DATABASE STATE. If anything you read or verify THIS run",
+            "  contradicts an item below, THIS RUN's fresh evidence wins -- say what you",
+            "  actually found; do not defer to a stale item below.",
+            "  * They are NOT your task and NOT something to report unless it answers",
+            "    your task.",
+            "  * They may be out of date -- the code may have changed since they were",
+            "    validated.",
+        ]
+        for row in deduped:
+            statement = (row.statement or "")[:_PROJECT_MEMORY_STATEMENT_CHARS]
+            if len(row.statement or "") > _PROJECT_MEMORY_STATEMENT_CHARS:
+                statement += "…"
+            hash_ref = (row.evidence_hash or "")[:12] or "none"
+            lines.append(f"  - {statement}")
+            lines.append(
+                f"      [promotion={row.id} claim={row.claim_id} run={row.run_id or 'n/a'} "
+                f"evidence_hash={hash_ref} validated_by={row.validated_by}]")
+        print(f"[feedback] project memory: injecting {len(deduped)} promoted "
+              f"memory item(s) for project {project_id!r}", flush=True)
+        return "\n".join(lines)
+    except Exception as exc:
+        print(f"[feedback] load_project_memory_context warning: {exc}")
+        return ""
+
+
 # Schema bootstrap: swarm/db.py's failure_log Table + ensure_schema() (called
 # above in record_failure/load_failure_context) replaces this module's old
 # hand-written CREATE TABLE/ALTER TABLE bootstrap.

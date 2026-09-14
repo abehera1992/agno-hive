@@ -18,7 +18,7 @@ from .agents import (
     update_session_state,
 )
 from .feedback import (record_success, record_failure, load_failure_context,
-                       load_success_context)
+                       load_success_context, load_project_memory_context)
 from . import model_routing, team_config
 from .tool_fix import peak_input_tokens
 from config.config import config
@@ -12138,11 +12138,12 @@ async def run_task_stream(
 
     # Success context rides in the SAME gather, not a second await: it is one indexed
     # SQL query against task_outcome_queue and must not add a serial hop to run startup.
-    (failure_context, success_context, (session_summary, session_messages),
-     skill_catalog) = (
+    (failure_context, success_context, project_memory_context,
+     (session_summary, session_messages), skill_catalog) = (
         await asyncio.gather(
             load_failure_context(project_id, current_task=task),
             load_success_context(project_id, current_task=task),
+            load_project_memory_context(project_id, current_task=task),
             _load_session_context(),
             _fetch_skill_catalog(_pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)),
         )
@@ -12194,6 +12195,8 @@ async def run_task_stream(
         _evidence_sink += ["", failure_context]
     if success_context:
         _evidence_sink += ["", success_context]
+    if project_memory_context:
+        _evidence_sink += ["", project_memory_context]
     if session_summary:
         is_chain_handoff = session_summary.startswith("── Chain handoff")
         instructions += [
@@ -16198,11 +16201,12 @@ async def run_task_async(
 
     # Success context rides in the SAME gather, not a second await: it is one indexed
     # SQL query against task_outcome_queue and must not add a serial hop to run startup.
-    (failure_context, success_context, (session_summary, session_messages),
-     skill_catalog) = (
+    (failure_context, success_context, project_memory_context,
+     (session_summary, session_messages), skill_catalog) = (
         await asyncio.gather(
             load_failure_context(project_id, current_task=task),
             load_success_context(project_id, current_task=task),
+            load_project_memory_context(project_id, current_task=task),
             _load_session_context(),
             _fetch_skill_catalog(_pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)),
         )
@@ -16254,6 +16258,8 @@ async def run_task_async(
         _evidence_sink += ["", failure_context]
     if success_context:
         _evidence_sink += ["", success_context]
+    if project_memory_context:
+        _evidence_sink += ["", project_memory_context]
     if session_summary:
         is_chain_handoff = session_summary.startswith("── Chain handoff")
         instructions += [
