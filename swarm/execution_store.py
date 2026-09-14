@@ -565,6 +565,20 @@ async def promote_claim(
     Evidence row up again; this table has no FK to it (see swarm/db.py's own
     comment on this table for why: it must survive session deletion, and
     the Evidence row it snapshots does not).
+
+    Phase I concurrency fix: the pre-check SELECT above and the INSERT
+    below are two separate statements, so two genuinely concurrent
+    /feedback calls for the same (project_id, claim_id) -- a real, plausible
+    trigger (a double-click, a client retry-on-timeout that actually
+    landed) -- can both pass the SELECT before either INSERTs. The SECOND
+    INSERT then hits project_memory_promotions' own UniqueConstraint and
+    raises sqlalchemy.exc.IntegrityError. Caught specifically (not by the
+    generic except below, which exists for genuine I/O failures) and
+    treated as the SAME idempotent outcome the pre-check SELECT would have
+    produced if it had run a moment later: re-query and return the row that
+    won the race, rather than reporting None (which would read as "this
+    promotion failed" when it did not -- it succeeded, just via the other
+    caller).
     """
     if claim_row["status"] != "supported":
         raise ValueError(
@@ -595,6 +609,31 @@ async def promote_claim(
                 feedback_notes=feedback_notes,
             ))
         return promotion_id
+    except sa.exc.IntegrityError:
+        # Lost the race -- another concurrent call already inserted the SAME
+        # (project_id, claim_id) between our SELECT and our INSERT. The
+        # `async with` block above has already rolled back on its own (the
+        # exception propagated out of it), so this is a FRESH
+        # connection/transaction, not a reuse of the failed one. Look up the
+        # row the winner just created and return ITS id -- the correct,
+        # idempotent outcome, not a failure.
+        try:
+            async with get_engine().begin() as conn:
+                winner = (await conn.execute(
+                    sa.select(db.project_memory_promotions.c.id)
+                    .where(db.project_memory_promotions.c.project_id == project_id,
+                           db.project_memory_promotions.c.claim_id == claim_row["claim_id"])
+                )).scalar()
+            print(f"[execution_store] promote_claim: lost a concurrent "
+                  f"promotion race for claim_id={claim_row['claim_id']!r} -- "
+                  f"returning the winner's id instead of a duplicate", flush=True)
+            return winner
+        except Exception as exc:  # noqa: BLE001
+            print(f"[execution_store] promote_claim: race-recovery lookup "
+                  f"failed (project_id={project_id!r}, "
+                  f"claim_id={claim_row.get('claim_id')!r}): "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            return None
     except Exception as exc:  # noqa: BLE001
         print(f"[execution_store] promote_claim failed "
               f"(project_id={project_id!r}, "
@@ -946,3 +985,70 @@ async def rehydrate_run(run_id: str) -> dict | None:
               f"(run_id={run_id!r}): {type(exc).__name__}: {exc}", flush=True)
         return _unresumable(
             run_id, f"rehydration lookup failed: {type(exc).__name__}: {exc}")
+
+
+# ============================================================================
+# Phase I -- operational integrity diagnostics (read-only, never repairs).
+# ============================================================================
+
+async def check_storage_integrity() -> dict:
+    """A read-only, deterministic operational snapshot of the durable
+    execution/evidence backbone -- COUNTS worth an operator's attention,
+    never a repair. Nothing in this function writes to any table; see this
+    module's own module docstring and every persist_*/promote_*/
+    rehydrate_run function above for where actual writes happen.
+
+    True referential orphans (an Evidence row with no matching ToolCall, a
+    ToolCall with no matching Execution, etc.) are already structurally
+    impossible when the database enforces its own FKs -- see swarm/db.py's
+    `_enable_sqlite_fk` (SQLite does not enforce FOREIGN KEY by default;
+    this engine turns it on for every connection) and Postgres's
+    unconditional enforcement. So this reports the class of problem FK
+    enforcement CANNOT catch: rows LOGICALLY stuck in a non-terminal state
+    with no live process left to finish them (the same condition
+    rehydrate_run judges per-run, aggregated here across the whole
+    database for a human to notice), and checkpoint rows whose own
+    self-consistency hash no longer matches what they claim (see
+    _checkpoint_state_hash) -- a sign of external tampering or corruption,
+    not of anything this codebase's own write paths could produce on
+    their own.
+
+    Fail-open, matching every other function in this module: a lookup
+    failure returns a dict with "error" set and every count as None,
+    never raised -- a diagnostic that cannot itself be checked without a
+    healthy database is not useful, but it also must never be allowed to
+    crash whatever is asking.
+    """
+    result: dict = {
+        "stuck_tool_calls": None, "stuck_executions": None, "stuck_runs": None,
+        "checkpoints_checked": None, "checkpoint_hash_mismatches": None,
+        "error": None,
+    }
+    try:
+        async with get_engine().begin() as conn:
+            result["stuck_tool_calls"] = (await conn.execute(
+                sa.select(sa.func.count()).select_from(db.tool_calls)
+                .where(db.tool_calls.c.status == "running")
+            )).scalar()
+            result["stuck_executions"] = (await conn.execute(
+                sa.select(sa.func.count()).select_from(db.executions)
+                .where(db.executions.c.status == "running")
+            )).scalar()
+            result["stuck_runs"] = (await conn.execute(
+                sa.select(sa.func.count()).select_from(db.runs)
+                .where(db.runs.c.status == "running")
+            )).scalar()
+            checkpoint_rows = (await conn.execute(
+                sa.select(db.checkpoints)
+            )).mappings().all()
+        result["checkpoints_checked"] = len(checkpoint_rows)
+        result["checkpoint_hash_mismatches"] = sum(
+            1 for c in checkpoint_rows
+            if c["state_hash"] != _checkpoint_state_hash(
+                c["run_id"], c["sequence"], c["last_execution_id"], c["run_status"])
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[execution_store] check_storage_integrity failed: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result

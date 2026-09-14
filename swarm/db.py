@@ -727,6 +727,59 @@ async def ensure_schema() -> None:
         )
 
 
+async def check_storage_readiness() -> dict:
+    """Phase I -- read-only readiness probe, DISTINCT from ensure_schema()'s
+    raise-on-mismatch startup gate: this NEVER raises, always returns a
+    structured result, so an HTTP health endpoint (api/server.py's
+    GET /health/db) can report durable-storage state without crashing the
+    request that asks about it.
+
+    Answers exactly the two things ensure_schema() checks, surfaced instead
+    of thrown: can the database be reached at all, and is its schema at the
+    revision this running code expects. Distinguishes "service alive" (the
+    existing GET /health, unchanged by this phase, which answers only
+    "is the FastAPI process responding") from "durable-storage ready"
+    (this function) -- a process can be alive while its database is
+    unreachable, mid-migration, or stale, and only this function can tell
+    the difference.
+
+    NEVER includes the resolved connection URL, DSN, or any other
+    connection detail in its return value -- only revision identifiers
+    (plain strings like "0004_checkpoints", not secrets) and a short error
+    message when something is wrong.
+
+    Return shape (always present, regardless of outcome):
+        db_reachable: bool
+        schema_current: bool
+        current_revision: str | None
+        expected_revision: str | None
+        error: str | None
+    """
+    from swarm.migrations import expected_head
+
+    result: dict = {
+        "db_reachable": False, "schema_current": False,
+        "current_revision": None, "expected_revision": None, "error": None,
+    }
+    try:
+        head = expected_head()
+        result["expected_revision"] = head
+        engine = get_engine()
+        async with engine.connect() as conn:
+            current = await _current_app_db_revision(conn)
+        result["db_reachable"] = True
+        result["current_revision"] = current
+        result["schema_current"] = (current == head)
+        if current != head:
+            current_desc = repr(current) if current else "unversioned (no migrations applied)"
+            result["error"] = (
+                f"schema out of date (at {current_desc}, this code expects "
+                f"{head!r}) -- run `hive migrate`")
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
 async def create_all_for_tests() -> None:
     """TEST-ONLY equivalent of the old ensure_schema() bootstrap -- creates every
     table in `metadata` (chat_sessions/session_messages/failure_log/

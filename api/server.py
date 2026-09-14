@@ -8,6 +8,7 @@ from pathlib import Path
 
 import yaml
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from api.models import (
     AgentSpec, RunRequest, RunResponse, PlanResponse, ScanRequest, ScanResponse,
@@ -325,6 +326,20 @@ async def _outcome_drain_loop():
 @app.get("/health")
 async def health():
     return {"status": "ok", "mcp_url": config.mcp_url}
+
+
+@app.get("/health/db")
+async def health_db():
+    """Phase I -- durable-storage readiness, distinct from /health above
+    (which only proves the FastAPI process itself is responding). A 200
+    here means the database is reachable AND its schema is at the revision
+    this running code expects; a 503 means at least one of those is false
+    -- see swarm/db.check_storage_readiness's own docstring for exactly
+    what is (and, deliberately, is not) checked, and why no connection
+    string or other secret ever appears in the response."""
+    result = await db.check_storage_readiness()
+    status_code = 200 if (result["db_reachable"] and result["schema_current"]) else 503
+    return JSONResponse(status_code=status_code, content=result)
 
 
 @app.get("/teams")
