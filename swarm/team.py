@@ -14344,6 +14344,127 @@ def _salient_tokens(text: str) -> frozenset[str]:
     return frozenset(out)
 
 
+def _fidelity_agent_name(run_context, execution_id: str | None) -> str | None:
+    """The agent_name of the Execution that owns `execution_id`, or None --
+    used only by _evidence_fidelity_report below to attribute one piece of
+    Evidence to the member whose relay (team._member_results) it should be
+    checked against."""
+    if execution_id is None or run_context is None:
+        return None
+    rec = run_context.executions.get(execution_id)
+    return rec.agent_name if rec is not None else None
+
+
+def _evidence_fidelity_report(run_context, member_results: dict | None, final_answer: str) -> dict:
+    """Phase N -- a deterministic, token-level fidelity trace answering
+    "tool evidence != model input != model output != relay != final
+    synthesis" WITHOUT capturing a single raw model request or completion.
+
+    For each piece of DURABLE, EXACT Evidence this run captured (Phase A's
+    RunContext.evidence -- never team._tool_evidence, the lossy preview
+    cache), computes how many of its salient tokens (_salient_tokens, the
+    SAME shape-based extraction _answer_supported_by_evidence already uses
+    -- not a second, competing heuristic) survive into (a) the owning
+    member's own relayed report to the coordinator
+    (team._member_results[agent_name]) and (b) the final answer that
+    shipped.
+
+    Phase N's own forensic finding this function exists to make
+    observable, not to fix: member-report compression (a member reading
+    548k chars and relaying 17k, ~30.6:1 -- see this project's own carried-
+    forward limitation) is the single largest, most consistently
+    documented fidelity-loss point in this whole pipeline (T9's canonical
+    incident: a 1,547-char real tool result relayed as 56 chars, the
+    coordinator never seeing the real text at all), and it is entirely
+    visible from data this codebase ALREADY collects for its own ordinary
+    purposes. Raw model request/completion capture was evaluated and
+    judged unnecessary to prove or disprove a fidelity claim about
+    relay/synthesis loss specifically -- see docs/guide/deferred-
+    limitations-ledger.md's Phase N entry for the full reasoning.
+
+    Read-only and non-mutating: never writes to run_context.evidence,
+    member_results, or the answer text -- diagnostic only, never
+    authoritative state (an EvidenceRecord, and its durable Evidence row
+    if persisted, remain the sole authoritative record of what a tool
+    returned; this function's own report carries no identity and is
+    never itself persisted).
+
+    Deliberately NOT wired into the live answer-generation pipeline as of
+    this phase -- there is no live model available in this environment to
+    validate its signal-to-noise ratio against a real battery, and wiring
+    an unvalidated diagnostic into the hot path of a pipeline this
+    extensively live-tuned (see the T2/T3/T8/T9/T11/T12/T13a/T13b guards
+    elsewhere in this file) risks adding untested noise to every future
+    run. Standalone and independently callable/testable, matching this
+    project's own established pattern for primitives built ahead of a
+    proven wiring need (e.g. execution_store's run-rehydration and
+    run-ownership-lease primitives from earlier phases).
+
+    Returns:
+        {
+          "items": [
+            {"tool_call_id", "tool_name", "agent_name",
+             "evidence_tokens": int,
+             "tokens_in_relay": int, "relay_retention": float | None,
+             "tokens_in_answer": int, "answer_retention": float | None},
+            ...
+          ],
+          "overall_relay_retention": float | None,
+          "overall_answer_retention": float | None,
+        }
+    A retention ratio is None (never 0.0) when evidence_tokens == 0 for
+    that item -- "nothing citable to lose" is a different claim from
+    "lost everything," and collapsing the two would make an evidence item
+    with no salient tokens at all (e.g. a bare success acknowledgement)
+    look like a total fidelity failure.
+    """
+    member_results = member_results or {}
+    answer_tokens = _salient_tokens(final_answer or "")
+    items: list[dict] = []
+    total_evidence = 0
+    total_in_relay = 0
+    total_in_answer = 0
+    for ev in (run_context.evidence if run_context is not None else []):
+        agent_name = _fidelity_agent_name(run_context, ev.execution_id)
+        ev_tokens = _salient_tokens(_result_text(ev.content))
+        if not ev_tokens:
+            items.append({
+                "tool_call_id": ev.tool_call_id, "tool_name": ev.tool_name,
+                "agent_name": agent_name,
+                "evidence_tokens": 0,
+                "tokens_in_relay": 0, "relay_retention": None,
+                "tokens_in_answer": 0, "answer_retention": None,
+            })
+            continue
+        # member_results is keyed by _member_key(agent_name) (see
+        # _capture_member_result's own "Keyed by _member_key so
+        # 'context-router' and 'contextrouter' land in one bucket"
+        # comment) -- the raw ExecutionRecord.agent_name is NOT
+        # necessarily spelled the same way, so the lookup must normalize
+        # too, or every item silently misses its own relay text.
+        relay_text = member_results.get(_member_key(agent_name), "") if agent_name else ""
+        relay_tokens = _salient_tokens(relay_text)
+        in_relay = ev_tokens & relay_tokens
+        in_answer = ev_tokens & answer_tokens
+        items.append({
+            "tool_call_id": ev.tool_call_id, "tool_name": ev.tool_name,
+            "agent_name": agent_name,
+            "evidence_tokens": len(ev_tokens),
+            "tokens_in_relay": len(in_relay),
+            "relay_retention": len(in_relay) / len(ev_tokens),
+            "tokens_in_answer": len(in_answer),
+            "answer_retention": len(in_answer) / len(ev_tokens),
+        })
+        total_evidence += len(ev_tokens)
+        total_in_relay += len(in_relay)
+        total_in_answer += len(in_answer)
+    return {
+        "items": items,
+        "overall_relay_retention": (total_in_relay / total_evidence) if total_evidence else None,
+        "overall_answer_retention": (total_in_answer / total_evidence) if total_evidence else None,
+    }
+
+
 # A whole run's accumulated evidence vocabulary. Bounded so a long run cannot grow it
 # without limit; 200k distinct tokens is far more than any real run produces.
 _EVIDENCE_TOKEN_CEILING = 200_000
