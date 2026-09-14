@@ -4335,6 +4335,103 @@ def _integrity_branch_contradiction(content: str, team) -> tuple[str, str] | Non
     return None
 
 
+# A sentence calling something absent/gapped/uncovered -- the vocabulary the
+# named-item check below looks for BEFORE checking whether the same line also
+# names something compare_enumerations' own output confirms exists.
+_GAP_CLAIM_LINE_RE = re.compile(
+    r"\b(?:gap|missing|absent|uncovered|no corresponding|"
+    r"not (?:defined|found|present|covered|implemented|exist(?:s|ing)?))\b",
+    re.IGNORECASE)
+
+# The two blocks compare_enumerations' own output always prints when there is
+# anything to report in them -- see hive-mcp/tools/compare.py's own `block()`
+# and the HOOKS EXPORTED section, verified directly against that source.
+_CMP_MATCHED_BLOCK_RE = re.compile(
+    r"MATCHED \(\d+\):\n((?:  .+\n?)+)")
+_CMP_MATCHED_PAIR_RE = re.compile(
+    r"^  \S+\s+(\S+)\s+<->\s+(\S+)\s*$", re.MULTILINE)
+_CMP_HOOKS_BLOCK_RE = re.compile(
+    r"HOOKS EXPORTED BY [^\n]*\((\d+)\):\n((?:  .+\n?)*)")
+_CMP_TOTALS_LINE_RE = re.compile(
+    r"TOTALS: left (\d+), right (\d+), matched (\d+)")
+
+
+def _cmp_confirmed_present(cmp_body: str) -> set[str]:
+    """Every name compare_enumerations' own output confirms exists on the
+    right (frontend) side: a MATCHED pair's own right-hand name, plus every
+    entry in a HOOKS EXPORTED block when one is printed. Both come straight
+    from compare.py's own fixed output shape (see this section's own comment
+    above) -- structural parsing, not inference."""
+    present: set[str] = set()
+    hooks_m = _CMP_HOOKS_BLOCK_RE.search(cmp_body or "")
+    if hooks_m:
+        present.update(h.strip() for h in hooks_m.group(2).splitlines() if h.strip())
+    matched_m = _CMP_MATCHED_BLOCK_RE.search(cmp_body or "")
+    if matched_m:
+        for pair in _CMP_MATCHED_PAIR_RE.finditer(matched_m.group(1)):
+            present.add(pair.group(1))
+            present.add(pair.group(2))
+    return present
+
+
+def _integrity_named_item_falsely_gapped(content: str, cmp_note: str) -> tuple[str, str] | None:
+    """(name, real) when the answer calls something a gap/missing/absent that
+    compare_enumerations' own MATCHED or HOOKS EXPORTED output, from the SAME
+    tool call this run already made, confirms exists.
+
+    Battery evidence (Phase R live rerun, 2026-09-14): T13b named
+    `/vouchers/{voucher_id}` a gap while the tool's own MATCHED(3) list showed
+    it paired two lines below; a second run claimed 8 gaps including 2 of the
+    tool's own 3 MATCHED items; a third claimed "only ONE hook is defined"
+    against the tool's own 49-entry HOOKS EXPORTED list. None of these are
+    completeness-ASSERTION phrasing (_reconcile_completeness_claims' own
+    lexicon: "there are no gaps", "all X are covered") -- they name a
+    SPECIFIC item instead, which is why the category-3 check above, alone,
+    caught zero of them. Checked per gap-claiming LINE, same discipline
+    _table_claimed_missing_but_present already uses, so an answer that
+    correctly calls something else a gap on an unrelated line is untouched.
+    """
+    body = _comparison_body(cmp_note)
+    if not body:
+        return None
+    present = _cmp_confirmed_present(body)
+    if not present:
+        return None
+    for line in (content or "").splitlines():
+        if not _GAP_CLAIM_LINE_RE.search(line):
+            continue
+        for name in present:
+            if name and re.search(rf"(?<![\w./-]){re.escape(name)}(?![\w./-])", line):
+                return name, "compare_enumerations' own MATCHED/HOOKS EXPORTED output lists this as present"
+    return None
+
+
+def _integrity_comparison_zero_claim_contradiction(content: str, cmp_note: str) -> tuple[str, str] | None:
+    """(claimed, real) when the answer asserts zero endpoints/hooks/matches
+    while compare_enumerations' own TOTALS line, from the SAME tool call this
+    run already made, reports a nonzero count.
+
+    Battery evidence: one run stated "no endpoints found, no hooks found"
+    while the tool's own TOTALS line reported left=9, matched=2 -- the
+    starkest version of the named-item shape above (nothing to name, because
+    the claim is that the whole category is empty)."""
+    body = _comparison_body(cmp_note)
+    if not body:
+        return None
+    totals = _CMP_TOTALS_LINE_RE.search(body)
+    if not totals:
+        return None
+    left, right, matched = (int(totals.group(1)), int(totals.group(2)),
+                            int(totals.group(3)))
+    zero_claim = re.search(
+        r"\bno (?:endpoints?|hooks?|matches?)\b|\b0\s+(?:endpoints?|hooks?)\b",
+        content or "", re.IGNORECASE)
+    if zero_claim and (left or right or matched):
+        return (zero_claim.group(0),
+                f"compare_enumerations found left={left}, right={right}, matched={matched}")
+    return None
+
+
 async def _evidence_integrity_findings(
         content: str, task: str, team, hive_mcp_url: str | None,
         hive_mcp_tools, cmp_note: str) -> list[dict]:
@@ -4383,6 +4480,22 @@ async def _evidence_integrity_findings(
                 "real": f"compare_enumerations found {gap[0]} left-only and "
                         f"{gap[1]} right-only item(s) for the same two files",
             })
+    # 3b/3c. The two narrower, empirically-observed variants of the same
+    # category (see each function's own docstring for the live battery
+    # evidence this closes): a specific named item claimed gapped/absent that
+    # the SAME tool call's own output confirms present, or a flat "zero"
+    # claim the SAME tool call's own TOTALS line contradicts. Both read
+    # cmp_note only -- never a second compare_enumerations call.
+    named = _integrity_named_item_falsely_gapped(content, cmp_note)
+    if named:
+        name, real = named
+        findings.append({"category": "comparison completeness/gap",
+                          "claimed": f"{name!r} is a gap/missing", "real": real})
+    zero = _integrity_comparison_zero_claim_contradiction(content, cmp_note)
+    if zero:
+        claimed, real = zero
+        findings.append({"category": "comparison completeness/gap",
+                          "claimed": claimed, "real": real})
 
     # 4. DB row counts -- new, narrow (see _integrity_db_count_contradiction).
     db = _integrity_db_count_contradiction(content, team)

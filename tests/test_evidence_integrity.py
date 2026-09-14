@@ -441,3 +441,123 @@ def test_evidence_integrity_check_never_calls_compare_enumerations_directly():
     src = inspect.getsource(team_mod._evidence_integrity_check)
     assert "compare_enumerations(" not in src
     assert "_computed_comparison(" in src
+
+
+# ── 25-31. Named-item and zero-claim variants (added after a live Phase R  --
+# rerun found the ORIGINAL category-3 check, alone, caught 0 of 4 textbook
+# contradictions in a 10-run T13a/T13b battery -- see
+# _integrity_named_item_falsely_gapped's own docstring for the exact battery
+# evidence these tests reproduce.) -----------------------------------------
+
+from swarm.team import (  # noqa: E402
+    _integrity_comparison_zero_claim_contradiction,
+    _integrity_named_item_falsely_gapped,
+)
+
+_REAL_CMP_BODY = """compare_enumerations — API/inventory-service/router/vouchers_api.py  vs  Client/.../inventoryApi.ts
+join: HTTP method + path-boundary suffix match (exact string, no inference)
+
+LEFT — @router routes in API/inventory-service/router/vouchers_api.py (9):
+  GET /vouchers
+  GET /vouchers/{voucher_id}
+  POST /vouchers
+
+RIGHT — RTK Query endpoints in Client/.../inventoryApi.ts (5):
+  GET /api/inventoryservice/vouchers
+  GET /api/inventoryservice/vouchers/{voucher_id}
+  POST /api/inventoryservice/vouchers
+
+MATCHED (3):
+  GET /vouchers   <->   useGetVouchersQuery
+  GET /vouchers/{voucher_id}   <->   useGetVoucherQuery
+  POST /vouchers   <->   useCreateVoucherMutation
+
+LEFT ONLY — defined on the left with no match on the right (6):
+  PUT /vouchers/{voucher_id}/post
+  PUT /vouchers/{voucher_id}/cancel
+
+RIGHT ONLY — present on the right with no match on the left (0):
+  (none)
+
+HOOKS EXPORTED BY Client/.../inventoryApi.ts (5):
+  useCancelVoucherMutation
+  useCreateVoucherMutation
+  useGetVoucherQuery
+  useGetVouchersQuery
+  usePostVoucherMutation
+
+TOTALS: left 9, right 5, matched 3, left-only 6, right-only 0."""
+
+
+def _cmp_note(body: str = _REAL_CMP_BODY) -> str:
+    return f"\n\n---\n**THE COMPARISON, COMPUTED**\n```\n{body}\n```"
+
+
+def test_named_matched_endpoint_falsely_called_a_gap():
+    """T13b live: `/vouchers/{voucher_id}` (GET) named a gap two paragraphs
+    above the tool's own MATCHED(3) list that pairs it."""
+    content = (
+        "Gaps identified: GET /vouchers/{voucher_id} has no corresponding "
+        "frontend hook."
+    )
+    found = _integrity_named_item_falsely_gapped(content, _cmp_note())
+    assert found is not None
+    name, real = found
+    assert name == "/vouchers/{voucher_id}"
+    assert "MATCHED" in real
+
+
+def test_named_matched_hook_falsely_called_a_gap():
+    """T13b live: claimed only one hook is defined, against the tool's own
+    HOOKS EXPORTED list."""
+    content = "useCreateVoucherMutation is missing from the frontend."
+    found = _integrity_named_item_falsely_gapped(content, _cmp_note())
+    assert found == ("useCreateVoucherMutation",
+                      "compare_enumerations' own MATCHED/HOOKS EXPORTED output "
+                      "lists this as present")
+
+
+def test_named_item_check_silent_when_gap_claim_names_a_genuine_left_only_item():
+    """The known, EXPECTED non-fix (Phase R's own explicit constraint): PUT
+    /vouchers/{id}/post is genuinely LEFT ONLY (never in MATCHED or HOOKS
+    EXPORTED), so calling it a gap is not a contradiction of this tool's own
+    output and must stay silent."""
+    content = "PUT /vouchers/{voucher_id}/post is a gap with no frontend hook."
+    assert _integrity_named_item_falsely_gapped(content, _cmp_note()) is None
+
+
+def test_named_item_check_silent_with_no_gap_claiming_language():
+    content = "GET /vouchers/{voucher_id} maps to useGetVoucherQuery."
+    assert _integrity_named_item_falsely_gapped(content, _cmp_note()) is None
+
+
+def test_named_item_check_silent_with_no_comparison_note():
+    content = "GET /vouchers/{voucher_id} is missing a hook."
+    assert _integrity_named_item_falsely_gapped(content, "") is None
+
+
+def test_zero_claim_contradicted_by_totals():
+    """T13a live: 'no endpoints found, no hooks found' against TOTALS left=9,
+    matched=2 (represented here via the same real body's left=9, matched=3)."""
+    content = "No endpoints found, no hooks found in this module."
+    found = _integrity_comparison_zero_claim_contradiction(content, _cmp_note())
+    assert found is not None
+    claimed, real = found
+    assert "left=9" in real
+
+
+def test_zero_claim_silent_when_totals_are_genuinely_zero():
+    body = _REAL_CMP_BODY.rsplit("TOTALS:", 1)[0] + "TOTALS: left 0, right 0, matched 0, left-only 0, right-only 0."
+    content = "No endpoints found in this module."
+    assert _integrity_comparison_zero_claim_contradiction(content, _cmp_note(body)) is None
+
+
+@pytest.mark.asyncio
+async def test_findings_catches_named_item_variant_end_to_end():
+    """The exact live-battery failure shape (T13b), run through the full
+    _evidence_integrity_findings entry point, not just the isolated helper."""
+    team = SimpleNamespace(_read_state={}, _tool_evidence=[])
+    content = "Gaps identified: GET /vouchers/{voucher_id} has no corresponding hook."
+    findings = await _evidence_integrity_findings(
+        content, "task", team, None, None, _cmp_note())
+    assert any(f["category"] == "comparison completeness/gap" for f in findings)
