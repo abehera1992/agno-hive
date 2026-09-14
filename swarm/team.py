@@ -10981,6 +10981,17 @@ def _make_tool_interception_hook(
         _is_delegation = function_name == "delegate_task_to_member"
         _tool_call = (run_context.start_tool_call(function_name, args)
                       if run_context is not None else None)
+        # Phase D: durable ToolCall row, created "running" before the real
+        # tool function is even awaited (see execution_store.
+        # persist_tool_call_created's own docstring for why: a hang or a
+        # cancellation still leaves a row). _tool_call_db_id is a FRESH,
+        # genuine UUID minted by that function -- deliberately NOT
+        # _tool_call.tool_call_id (execution_context.new_id()'s 12-hex-char
+        # scheme, not a well-formed UUID) -- and must be threaded through to
+        # every persist_tool_call_completed call below.
+        _tool_call_db_id = (
+            await execution_store.guard(execution_store.persist_tool_call_created(_tool_call))
+            if _tool_call is not None else None)
         _delegation_execution_id = None
         if run_context is not None and _is_delegation and isinstance(args, dict):
             _delegation_execution_id = run_context.start_execution(
@@ -11010,7 +11021,12 @@ def _make_tool_interception_hook(
             # recorded is for THIS tool call, i.e. what `function(**args)` itself
             # returned).
             if _tool_call is not None:
-                run_context.finish_tool_call(_tool_call, content=result, success=True, error=None)
+                _evidence = run_context.finish_tool_call(
+                    _tool_call, content=result, success=True, error=None)
+                # Phase D: durable ToolCall completion + Evidence insert, one
+                # transaction (see execution_store.persist_tool_call_completed).
+                await execution_store.guard(execution_store.persist_tool_call_completed(
+                    _tool_call_db_id, _tool_call, _evidence))
             print(f"[team] tool_hook: {function_name}({args}) -> {elapsed:.2f}s", flush=True)
             # Write-action observation (2026-09-11). Pure observer: it reads the call
             # and its result and records them, and cannot alter either. This hook is
@@ -11063,7 +11079,10 @@ def _make_tool_interception_hook(
         except Exception as exc:
             elapsed = time.monotonic() - started
             if _tool_call is not None:
-                run_context.finish_tool_call(_tool_call, content=None, success=False, error=str(exc))
+                _evidence = run_context.finish_tool_call(
+                    _tool_call, content=None, success=False, error=str(exc))
+                await execution_store.guard(execution_store.persist_tool_call_completed(
+                    _tool_call_db_id, _tool_call, _evidence))
             if _delegation_execution_id is not None:
                 run_context.finish_execution(_delegation_execution_id, status="failed", error=str(exc))
                 # Phase C: durable completion, read before clearing the id below.
@@ -11077,6 +11096,26 @@ def _make_tool_interception_hook(
                 activity["last_progress_at"] = now
             raise
         finally:
+            # Phase D: close a ToolCall that never reached either
+            # finish_tool_call call above -- i.e. `await function(**args)`
+            # raised asyncio.CancelledError or any other BaseException, which
+            # `except Exception` does not catch. Same class of gap as Phase A
+            # finding B below, but for the generic ToolCall/Evidence boundary
+            # rather than the delegation Execution boundary -- Phase C never
+            # persisted ToolCall, so this gap was latent (in-memory only)
+            # until now. Without this, a cancelled tool call's
+            # ToolCallRecord.status stays "running" forever and no Evidence
+            # row is ever written for it. Guarded by the status check so this
+            # never double-runs after either branch above already finished
+            # the same _tool_call.
+            if _tool_call is not None and _tool_call.status == "running":
+                _exc_now = sys.exc_info()[1]
+                _cancel_error = (f"{type(_exc_now).__name__}: {_exc_now}"
+                                  if _exc_now is not None else "cancelled")
+                _evidence = run_context.finish_tool_call(
+                    _tool_call, content=None, success=False, error=_cancel_error)
+                await execution_store.guard(execution_store.persist_tool_call_completed(
+                    _tool_call_db_id, _tool_call, _evidence))
             # Phase A: close the delegation's child execution here so it happens
             # exactly once regardless of which branch above ran -- the except
             # branch already closed it (as "failed") and cleared the id, so this

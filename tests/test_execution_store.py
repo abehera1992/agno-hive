@@ -408,10 +408,10 @@ async def test_chunked_execution_produces_n_runs_for_n_chunks():
     assert len({r["run_id"] for r in rows}) == 4  # no synthetic shared parent Run
 
 
-# ── 18/19/20. Explicitly no ToolCall/Evidence/Claim persistence ────────────
+# ── 18/19/20. Phase D writes ToolCall/Evidence; Claims stay untouched ──────
 
 @pytest.mark.asyncio
-async def test_no_tool_call_rows_are_written():
+async def test_tool_call_row_is_written():
     sid = await _create_session()
     team = await _team_with_persisted_run(sid)
     hook = _make_tool_interception_hook()
@@ -421,11 +421,11 @@ async def test_no_tool_call_rows_are_written():
 
     await hook("get_file_content", fake_tool, {"path": "a.py"}, team=team)
 
-    assert await _table_row_count(db.tool_calls) == 0
+    assert await _table_row_count(db.tool_calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_no_evidence_rows_are_written():
+async def test_evidence_row_is_written():
     sid = await _create_session()
     team = await _team_with_persisted_run(sid)
     hook = _make_tool_interception_hook()
@@ -435,12 +435,12 @@ async def test_no_evidence_rows_are_written():
 
     await hook("get_file_content", fake_tool, {"path": "a.py"}, team=team)
 
-    assert await _table_row_count(db.evidence) == 0
+    assert await _table_row_count(db.evidence) == 1
 
 
 @pytest.mark.asyncio
 async def test_no_claim_rows_are_written():
-    """Phase C never calls anything that would write claims -- confirmed by
+    """Phase D never calls anything that would write claims -- confirmed by
     the absence of any db.claims reference outside this table's own DDL/
     migration tests (see test_migrations.py), and re-confirmed empirically
     here across every other test in this file's own run."""
@@ -448,10 +448,10 @@ async def test_no_claim_rows_are_written():
     assert await _table_row_count(db.claim_evidence) == 0
 
 
-def test_execution_store_module_never_references_tool_calls_evidence_or_claims():
+def test_execution_store_module_never_references_claims_or_claim_evidence():
     import inspect as _inspect
     source = _inspect.getsource(execution_store)
-    for forbidden in ("db.tool_calls", "db.evidence", "db.claims", "db.claim_evidence"):
+    for forbidden in ("db.claims", "db.claim_evidence"):
         assert forbidden not in source
 
 

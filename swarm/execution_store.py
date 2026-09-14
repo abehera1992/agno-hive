@@ -1,15 +1,15 @@
-"""Phase C -- durable persistence for Run and Execution ONLY.
+"""Phase C/D -- durable persistence for Run, Execution, ToolCall and Evidence.
 
 LLM messages remain a view of execution state; this module is what makes the
 underlying execution state itself durable, in the Phase B schema
-(swarm/db.py's `runs`/`executions` tables), mirroring Phase A's in-memory
-runtime identity (swarm/execution_context.py's RunContext/ExecutionRecord)
-without changing anything about how that identity is computed.
+(swarm/db.py's `runs`/`executions`/`tool_calls`/`evidence` tables), mirroring
+Phase A's in-memory runtime identity (swarm/execution_context.py's
+RunContext/ExecutionRecord/ToolCallRecord/EvidenceRecord) without changing
+anything about how that identity is computed.
 
-Deliberately narrow: no ToolCall/Evidence/Claim persistence here (Phase A's
-ToolCallRecord/EvidenceRecord remain in-memory only, exactly as before) -- see
-this module's own test suite for an explicit regression guard on that
-boundary.
+Deliberately narrow: no Claim/claim_evidence persistence here (that is a
+later phase) -- see this module's own test suite for an explicit regression
+guard on that boundary.
 
 Fail-open by design, and this is the one thing every function here must never
 violate: a persistence failure is logged and swallowed, never raised,
@@ -19,24 +19,40 @@ mirrors the exact try/except-and-print convention already used throughout
 swarm/sessions.py and swarm/feedback.py for the same reason -- not a new
 failure-handling idiom, the established one.
 
-Identity is never re-derived or re-generated here: every run_id/execution_id
-written to the database is read verbatim from the RunContext/ExecutionRecord
-objects Phase A already created -- this module has no id-generation logic of
-its own, by design (Phase A's execution_context.new_id() remains the only
-minting point).
+Run/Execution identity is never re-derived or re-generated here: every
+run_id/execution_id written to the database is read verbatim from the
+RunContext/ExecutionRecord objects Phase A already created.
+
+ToolCall/Evidence identity is DIFFERENT, deliberately (Phase D): Phase A's
+ToolCallRecord.tool_call_id is execution_context.new_id() -- the same
+12-hex-char uuid4().hex[:12] scheme as run_id/execution_id, not a
+well-formed UUID -- but tool_calls.tool_call_id/evidence.evidence_id are
+genuine sa.Uuid columns (Phase C deliberately did NOT weaken those to Text
+the way it did for runs.run_id/executions.execution_id, since Phase C never
+wrote to them). Phase D's instructions are explicit that this must be
+resolved by minting real UUIDs here, not by repeating Phase C's column-type
+fix or by changing execution_context.py's identity scheme. So
+persist_tool_call_created below mints a fresh, genuine `uuid.uuid4()` for
+the durable row and hands it back to the caller -- a second, DB-only id
+that exists alongside (never replacing) ToolCallRecord.tool_call_id.
 """
 from __future__ import annotations
 
-from typing import Awaitable
+import hashlib
+import json
+import uuid as _uuid
+from typing import Any, Awaitable, TypeVar
 
 from sqlalchemy.sql import func
 
 from swarm import db
 from swarm.db import get_engine
-from swarm.execution_context import ExecutionRecord, RunContext
+from swarm.execution_context import EvidenceRecord, ExecutionRecord, RunContext, ToolCallRecord
+
+T = TypeVar("T")
 
 
-async def guard(awaitable: Awaitable[None]) -> None:
+async def guard(awaitable: Awaitable[T]) -> T | None:
     """Defense-in-depth wrapper every swarm/team.py call site uses around
     every function in this module. Each persist_* function below already has
     its own internal try/except (the realistic failure mode: a DB connection
@@ -49,13 +65,72 @@ async def guard(awaitable: Awaitable[None]) -> None:
     persist_run_started(run_context))` -- the call itself only builds a
     coroutine object; nothing runs until `guard` awaits it here, inside the
     try.
+
+    Returns the awaited value on success, or None if it raised (Phase D's
+    persist_tool_call_created returns a durable id its caller needs to pass
+    to persist_tool_call_completed -- None here means exactly what
+    persist_tool_call_created's own None return means: "no durable row
+    exists", handled identically either way).
     """
     try:
-        await awaitable
+        return await awaitable
     except Exception as exc:  # noqa: BLE001
         print(f"[execution_store] unexpected failure escaped a persist_* "
               f"call -- swallowed here as the last line of defense: "
               f"{type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+def _canonicalize_result(result: Any) -> str:
+    """The EXACT text of a tool result, canonicalized so identical results
+    always produce identical bytes (content_hash's whole contract depends on
+    this). Never a raw `str(obj)` repr for anything that isn't already text
+    or reliably serializable:
+
+      * a bare str -> stored verbatim.
+      * an MCP-style wrapper (e.g. CallToolResult, shaped with a
+        .content/.text/.data/.output/.result attribute) -> the wrapped text,
+        unwrapped the same way swarm/team.py's _result_text does. NOT a call
+        to _result_text itself -- that function exists for a different,
+        deliberately lossy purpose (phase0 telemetry/prompt text, whose own
+        docstring calls its str(result) fallback "the last resort... a
+        repr"), and importing it here would be circular (swarm/team.py
+        imports this module). The two are independently implemented but
+        must agree on what "the tool's real text" is, hence the mirrored
+        logic.
+      * a JSON-serializable value (dict/list/tuple/int/float/bool) that
+        isn't already covered above -> canonical JSON (sort_keys=True), so
+        key order never perturbs the hash.
+      * anything else (e.g. the async generator delegate_task_to_member can
+        return when "the run was handed back to be iterated") -> an
+        explicit, deterministic marker naming the type. str() on a generator
+        embeds its memory address, which would silently break "same result
+        -> same hash" -- this marker is reproducible (same type -> same
+        marker) instead.
+    """
+    if isinstance(result, str):
+        return result
+    if result is None:
+        return ""
+    for attr in ("content", "text", "data", "output", "result"):
+        val = getattr(result, attr, None)
+        if isinstance(val, str):
+            return val
+        if isinstance(val, (list, tuple)):
+            parts = [b if isinstance(b, str) else getattr(b, "text", None) for b in val]
+            parts = [p for p in parts if isinstance(p, str)]
+            if parts:
+                return "\n".join(parts)
+    if isinstance(result, (dict, list, tuple, int, float, bool)):
+        try:
+            return json.dumps(result, sort_keys=True, ensure_ascii=False)
+        except TypeError:
+            pass
+    return f"<non-text result: {type(result).__name__}>"
+
+
+def _content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 async def persist_run_started(
@@ -196,3 +271,90 @@ async def persist_execution_completed(record: ExecutionRecord) -> None:
         print(f"[execution_store] persist_execution_completed failed "
               f"(execution_id={record.execution_id!r}): {type(exc).__name__}: {exc}",
               flush=True)
+
+
+async def persist_tool_call_created(tool_call: ToolCallRecord) -> str | None:
+    """INSERT one `tool_calls` row in status "running", called right after
+    RunContext.start_tool_call() creates the in-memory ToolCallRecord
+    (swarm/team.py's _tool_interception_hook) -- before the real tool
+    function has even been awaited, so a tool call that never returns
+    (hangs, or is cancelled) still has a durable row rather than no record
+    at all.
+
+    Returns the freshly minted, genuine UUID4 string used as this row's
+    tool_call_id -- see this module's own docstring for why that is a NEW
+    id, not ToolCallRecord.tool_call_id verbatim. Callers must carry this
+    return value forward to persist_tool_call_completed(); None means no
+    durable row exists (either there was no current execution to attribute
+    the call to, or the INSERT failed) and the caller must skip completion
+    accordingly.
+    """
+    if tool_call.execution_id is None:
+        print(f"[execution_store] persist_tool_call_created: no current "
+              f"execution for tool_name={tool_call.tool_name!r} -- "
+              f"skipping", flush=True)
+        return None
+    durable_id = str(_uuid.uuid4())
+    try:
+        async with get_engine().begin() as conn:
+            await conn.execute(db.tool_calls.insert().values(
+                tool_call_id=durable_id,
+                execution_id=tool_call.execution_id,
+                tool_name=tool_call.tool_name,
+                arguments=tool_call.arguments,
+                status="running",
+            ))
+        return durable_id
+    except Exception as exc:  # noqa: BLE001
+        print(f"[execution_store] persist_tool_call_created failed "
+              f"(tool_name={tool_call.tool_name!r}, "
+              f"execution_id={tool_call.execution_id!r}): "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+async def persist_tool_call_completed(
+    durable_tool_call_id: str | None,
+    tool_call: ToolCallRecord,
+    evidence: EvidenceRecord,
+) -> None:
+    """UPDATE the `tool_calls` row's status/error/completed_at AND INSERT its
+    `evidence` row in ONE transaction, so a completed-but-evidence-less
+    ToolCall or an Evidence row pointing at a still-"running" ToolCall can
+    never happen -- either both land together or neither does (same
+    orphan-avoidance reasoning as persist_run_started's Run+root-Execution
+    transaction).
+
+    A no-op if durable_tool_call_id is None -- persist_tool_call_created
+    either failed or was skipped, so there is no row to complete and no
+    valid tool_calls.tool_call_id for evidence.tool_call_id's FK to
+    reference.
+
+    `evidence.content` is canonicalized (see _canonicalize_result) before
+    being stored and hashed -- content/content_hash are always computed
+    from the SAME canonicalized string, so "same result -> same hash" and
+    "different result -> different hash" both hold by construction.
+    """
+    if durable_tool_call_id is None:
+        return
+    content_text = _canonicalize_result(evidence.content)
+    try:
+        async with get_engine().begin() as conn:
+            await conn.execute(
+                db.tool_calls.update()
+                .where(db.tool_calls.c.tool_call_id == durable_tool_call_id)
+                .values(status=tool_call.status, error_message=tool_call.error,
+                        completed_at=func.now())
+            )
+            await conn.execute(db.evidence.insert().values(
+                evidence_id=str(_uuid.uuid4()),
+                tool_call_id=durable_tool_call_id,
+                content=content_text,
+                content_hash=_content_hash(content_text),
+                success=evidence.success,
+                error_message=evidence.error,
+            ))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[execution_store] persist_tool_call_completed failed "
+              f"(tool_call_id={durable_tool_call_id!r}): "
+              f"{type(exc).__name__}: {exc}", flush=True)
