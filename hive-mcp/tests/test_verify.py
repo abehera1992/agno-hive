@@ -129,6 +129,38 @@ def test_stopped_message_still_classifies_as_bad_for_the_orchestrator(monkeypatc
     assert "could NOT be found" in second
 
 
+def test_stopped_message_is_safe_if_pasted_verbatim_into_a_final_answer(monkeypatch):
+    """Phase P (T1-13 live battery) forensics: a model called verify_claims twice
+    on its own unchanged draft, got the STOPPED message back as an ordinary tool
+    result, and pasted it verbatim into its delivered, user-facing answer. The
+    OLD text ("Either (a) revise the answer... or (b) if you cannot find...")
+    is a second-person imperative addressed to whoever reads it -- correct
+    when the caller is the model deciding what to do next, wrong and confusing
+    when the caller is a human reading the final answer. swarm/team.py's own
+    SERVER-CONSTRUCTED reports get rewritten for a human reader before being
+    shown (_reader_facing_report) -- this tool's return value has no such
+    rewrite step downstream, so the raw string itself must already be safe.
+    This does not (and structurally cannot) guarantee a model never echoes a
+    tool result -- it only ensures that if it does, the text does not misread
+    as a command issued to the person receiving the answer."""
+    _reset_repeat_tracking()
+    monkeypatch.setattr(verify, "_rg", lambda *a, **k: [])
+    answer = "Uses `item.stock_quantity`."
+
+    verify.verify_claims(answer)
+    second = verify.verify_claims(answer)
+
+    # The load-bearing substrings for the orchestrator's own classifier stay.
+    assert "STOPPED" in second
+    assert "could NOT be found" in second
+    # The second-person imperative that read as a command to a human reader
+    # is gone -- neither "Either (a)" nor a bare "you" addressing the reader
+    # survives.
+    assert "Either (a)" not in second
+    assert "you cannot find" not in second
+    assert " you " not in second.lower()
+
+
 # ── Phase 4 (AGNOHive Reliability Program): cross-caller dedup isolation ────
 #
 # hive-mcp is one process; this module's tracking state is shared across
