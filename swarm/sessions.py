@@ -337,8 +337,13 @@ async def persist_session(session_id: str) -> bool:
         return False
 
 
-async def _cleanup_expired() -> int:
-    """Delete expired non-persisted sessions. Returns count deleted.
+async def _cleanup_expired(dry_run: bool = False) -> int:
+    """Delete expired non-persisted sessions. Returns count deleted (or, if
+    dry_run=True, the count that WOULD be deleted -- a plain SELECT COUNT,
+    no DELETE issued at all, so an operator can preview cleanup's impact
+    before running it for real; see swarm.execution_store.check_storage_
+    integrity/list_stale_runs for the companion read-only diagnostics this
+    is meant to be checked alongside).
 
     Phase K: skips a session that owns a Run still in progress
     (runs.status == "running"), even if that session's own expires_at has
@@ -354,6 +359,17 @@ async def _cleanup_expired() -> int:
     genuinely active. A session with only "ok"/"failed" (or no) runs is
     cleaned up exactly as before -- this changes nothing for the ordinary
     case.
+
+    Phase L: idempotent by construction, not merely by convention -- a
+    session already deleted by an earlier call (or a concurrent one; see
+    swarm/execution_store.acquire_run_ownership's own docstring for why
+    that is not a race this codebase needs to guard against further) is
+    simply not matched by the WHERE clause a second time, so calling this
+    repeatedly is always safe and never double-counts or errors. Fail-safe
+    on a DB error: returns 0 (no visible effect), never raises -- this
+    function is called from a background loop
+    (api/server.py's _session_cleanup_loop) that must never crash the
+    process it runs in.
     """
     try:
         await db.ensure_schema()
@@ -365,13 +381,16 @@ async def _cleanup_expired() -> int:
                        db.runs.c.status == "running")
                 .exists()
             )
-            result = await conn.execute(
-                delete(chat_sessions).where(
-                    chat_sessions.c.expires_at < func.now(),
-                    chat_sessions.c.persist.is_(False),
-                    ~has_active_run,
-                )
+            where_clause = (
+                chat_sessions.c.expires_at < func.now(),
+                chat_sessions.c.persist.is_(False),
+                ~has_active_run,
             )
+            if dry_run:
+                result = await conn.execute(
+                    select(func.count()).select_from(chat_sessions).where(*where_clause))
+                return result.scalar() or 0
+            result = await conn.execute(delete(chat_sessions).where(*where_clause))
             return result.rowcount
     except Exception as exc:
         print(f"[sessions] cleanup warning: {exc}")

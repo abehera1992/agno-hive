@@ -1071,11 +1071,24 @@ async def check_storage_integrity() -> dict:
     enforcement CANNOT catch: rows LOGICALLY stuck in a non-terminal state
     with no live process left to finish them (the same condition
     rehydrate_run judges per-run, aggregated here across the whole
-    database for a human to notice), and checkpoint rows whose own
+    database for a human to notice), checkpoint rows whose own
     self-consistency hash no longer matches what they claim (see
-    _checkpoint_state_hash) -- a sign of external tampering or corruption,
-    not of anything this codebase's own write paths could produce on
-    their own.
+    _checkpoint_state_hash), rows whose status/completed_at pair
+    contradicts itself (Phase L: e.g. status="ok" with completed_at still
+    NULL, or status="running" with completed_at already set -- neither is
+    possible through this codebase's own write paths, which always set
+    both together, so a row like this means external tampering or a
+    genuine code bug, not ordinary operation), promoted memories that
+    violate promote_claim's own enforced invariant (Phase L: claim_status
+    != "supported" -- the ONLY way such a row can exist, since promote_
+    claim raises ValueError rather than ever writing one), and duplicate
+    checkpoint sequences (Phase L: defensive -- the UniqueConstraint on
+    (run_id, sequence) already makes this structurally impossible when
+    enforced, counted here anyway as a second, independent signal rather
+    than trusting the constraint alone). None of these are ever repaired
+    automatically -- detection only, per this phase's own instruction that
+    repair must be demonstrably safe before it is automatic, and nothing
+    here has established that.
 
     Fail-open, matching every other function in this module: a lookup
     failure returns a dict with "error" set and every count as None,
@@ -1086,6 +1099,8 @@ async def check_storage_integrity() -> dict:
     result: dict = {
         "stuck_tool_calls": None, "stuck_executions": None, "stuck_runs": None,
         "checkpoints_checked": None, "checkpoint_hash_mismatches": None,
+        "impossible_lifecycle_states": None, "invalid_promotions": None,
+        "duplicate_checkpoint_sequences": None,
         "error": None,
     }
     try:
@@ -1105,17 +1120,103 @@ async def check_storage_integrity() -> dict:
             checkpoint_rows = (await conn.execute(
                 sa.select(db.checkpoints)
             )).mappings().all()
+
+            impossible = 0
+            for table, terminal in (
+                (db.runs, ("ok", "failed")),
+                (db.executions, ("ok", "failed")),
+                (db.tool_calls, ("ok", "error")),
+            ):
+                impossible += (await conn.execute(
+                    sa.select(sa.func.count()).select_from(table)
+                    .where(sa.or_(
+                        sa.and_(table.c.status.in_(terminal), table.c.completed_at.is_(None)),
+                        sa.and_(table.c.status == "running", table.c.completed_at.is_not(None)),
+                    ))
+                )).scalar()
+            result["impossible_lifecycle_states"] = impossible
+
+            result["invalid_promotions"] = (await conn.execute(
+                sa.select(sa.func.count()).select_from(db.project_memory_promotions)
+                .where(db.project_memory_promotions.c.claim_status != "supported")
+            )).scalar()
         result["checkpoints_checked"] = len(checkpoint_rows)
         result["checkpoint_hash_mismatches"] = sum(
             1 for c in checkpoint_rows
             if c["state_hash"] != _checkpoint_state_hash(
                 c["run_id"], c["sequence"], c["last_execution_id"], c["run_status"])
         )
+        seen_sequences: dict[tuple[str, int], int] = {}
+        for c in checkpoint_rows:
+            key = (c["run_id"], c["sequence"])
+            seen_sequences[key] = seen_sequences.get(key, 0) + 1
+        result["duplicate_checkpoint_sequences"] = sum(
+            1 for count in seen_sequences.values() if count > 1)
     except Exception as exc:  # noqa: BLE001
         print(f"[execution_store] check_storage_integrity failed: "
               f"{type(exc).__name__}: {exc}", flush=True)
         result["error"] = f"{type(exc).__name__}: {exc}"
     return result
+
+
+async def list_stale_runs(older_than_seconds: int = 3600) -> list[dict]:
+    """Read-only: which specific runs are still status=="running" with no
+    durably-observed forward progress (their own most recent checkpoint,
+    or their own started_at if none exists yet) in at least
+    `older_than_seconds`. The per-run companion to check_storage_
+    integrity's aggregate `stuck_runs` COUNT -- this is the listing an
+    operator actually needs to decide what to do about each one.
+
+    DETECTION ONLY. Never resumes, drives, cancels, or mutates anything --
+    see rehydrate_run for the per-run judgment ("is this specific one
+    actually safe to continue from") an operator would consult NEXT, for
+    each run_id this function surfaces; this function's only job is
+    surfacing candidates, not judging or acting on them. Consistent with
+    this phase's own explicit instruction not to introduce automatic
+    resume merely because rehydrate_run exists.
+
+    Fail-open: returns [] on any lookup failure (indistinguishable from
+    "no stale runs found" -- both are the ordinary, harmless case from a
+    caller's point of view; the failure itself is still logged).
+    """
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)
+        async with get_engine().begin() as conn:
+            running_runs = (await conn.execute(
+                sa.select(db.runs).where(db.runs.c.status == "running")
+            )).mappings().all()
+            stale: list[dict] = []
+            for run in running_runs:
+                latest_checkpoint_at = (await conn.execute(
+                    sa.select(db.checkpoints.c.created_at)
+                    .where(db.checkpoints.c.run_id == run["run_id"])
+                    .order_by(db.checkpoints.c.sequence.desc())
+                    .limit(1)
+                )).scalar()
+                last_activity = latest_checkpoint_at or run["started_at"]
+                # SQLite hands DateTime(timezone=True) columns back NAIVE on
+                # read (it has no real timezone-aware storage type; Postgres
+                # does not have this problem) -- every value this codebase
+                # ever writes to these columns is UTC (func.now() server-
+                # side, or datetime.now(timezone.utc) client-side), so a
+                # naive value read back is safely assumed UTC rather than
+                # left to raise "can't compare offset-naive and
+                # offset-aware datetimes" against `cutoff` below.
+                if last_activity is not None and last_activity.tzinfo is None:
+                    last_activity = last_activity.replace(tzinfo=timezone.utc)
+                if last_activity is not None and last_activity < cutoff:
+                    stale.append({
+                        "run_id": run["run_id"],
+                        "session_id": run["session_id"],
+                        "started_at": run["started_at"],
+                        "last_checkpoint_at": latest_checkpoint_at,
+                        "owner_worker_id": run["owner_worker_id"],
+                    })
+        return stale
+    except Exception as exc:  # noqa: BLE001
+        print(f"[execution_store] list_stale_runs failed: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        return []
 
 
 # ============================================================================
