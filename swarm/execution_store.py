@@ -1,15 +1,21 @@
-"""Phase C/D -- durable persistence for Run, Execution, ToolCall and Evidence.
+"""Phase C/D/E -- durable persistence for Run, Execution, ToolCall, Evidence,
+Claim and ClaimEvidence.
 
 LLM messages remain a view of execution state; this module is what makes the
 underlying execution state itself durable, in the Phase B schema
-(swarm/db.py's `runs`/`executions`/`tool_calls`/`evidence` tables), mirroring
-Phase A's in-memory runtime identity (swarm/execution_context.py's
-RunContext/ExecutionRecord/ToolCallRecord/EvidenceRecord) without changing
-anything about how that identity is computed.
+(swarm/db.py's `runs`/`executions`/`tool_calls`/`evidence`/`claims`/
+`claim_evidence` tables), mirroring Phase A's in-memory runtime identity
+(swarm/execution_context.py's RunContext/ExecutionRecord/ToolCallRecord/
+EvidenceRecord) without changing anything about how that identity is
+computed.
 
-Deliberately narrow: no Claim/claim_evidence persistence here (that is a
-later phase) -- see this module's own test suite for an explicit regression
-guard on that boundary.
+Phase E adds Claim/ClaimEvidence persistence plus one deterministic
+reconciliation primitive (reconcile_claim). It does NOT add project-memory
+promotion of any kind -- no LightRAG/Qdrant/AGE write, no record_success/
+task_outcome_queue call, appears anywhere in this module; see this module's
+own test suite for an explicit regression guard on that boundary. A
+validated Claim is the END of Phase E's responsibility, not the beginning of
+Phase F's.
 
 Fail-open by design, and this is the one thing every function here must never
 violate: a persistence failure is logged and swallowed, never raised,
@@ -317,7 +323,7 @@ async def persist_tool_call_completed(
     durable_tool_call_id: str | None,
     tool_call: ToolCallRecord,
     evidence: EvidenceRecord,
-) -> None:
+) -> str | None:
     """UPDATE the `tool_calls` row's status/error/completed_at AND INSERT its
     `evidence` row in ONE transaction, so a completed-but-evidence-less
     ToolCall or an Evidence row pointing at a still-"running" ToolCall can
@@ -325,19 +331,27 @@ async def persist_tool_call_completed(
     orphan-avoidance reasoning as persist_run_started's Run+root-Execution
     transaction).
 
-    A no-op if durable_tool_call_id is None -- persist_tool_call_created
-    either failed or was skipped, so there is no row to complete and no
-    valid tool_calls.tool_call_id for evidence.tool_call_id's FK to
-    reference.
+    A no-op (returns None) if durable_tool_call_id is None --
+    persist_tool_call_created either failed or was skipped, so there is no
+    row to complete and no valid tool_calls.tool_call_id for
+    evidence.tool_call_id's FK to reference.
 
     `evidence.content` is canonicalized (see _canonicalize_result) before
     being stored and hashed -- content/content_hash are always computed
     from the SAME canonicalized string, so "same result -> same hash" and
     "different result -> different hash" both hold by construction.
+
+    Returns the freshly minted evidence_id on success, or None on failure/
+    no-op -- Phase E's persist_claim needs this id to link a Claim to the
+    Evidence it was reconciled against (via claim_evidence), and this is the
+    only place that id is minted, so it must be surfaced rather than
+    discarded. Existing Phase D callers that never used a return value are
+    unaffected.
     """
     if durable_tool_call_id is None:
-        return
+        return None
     content_text = _canonicalize_result(evidence.content)
+    evidence_id = str(_uuid.uuid4())
     try:
         async with get_engine().begin() as conn:
             await conn.execute(
@@ -347,14 +361,145 @@ async def persist_tool_call_completed(
                         completed_at=func.now())
             )
             await conn.execute(db.evidence.insert().values(
-                evidence_id=str(_uuid.uuid4()),
+                evidence_id=evidence_id,
                 tool_call_id=durable_tool_call_id,
                 content=content_text,
                 content_hash=_content_hash(content_text),
                 success=evidence.success,
                 error_message=evidence.error,
             ))
+        return evidence_id
     except Exception as exc:  # noqa: BLE001
         print(f"[execution_store] persist_tool_call_completed failed "
               f"(tool_call_id={durable_tool_call_id!r}): "
               f"{type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+# ============================================================================
+# Phase E -- Claim + ClaimEvidence persistence, and one deterministic
+# reconciliation primitive.
+# ============================================================================
+
+# The full, closed vocabulary Phase E's schema/persistence layer accepts.
+# Only "supported" and "contradicted" are actually produced by the one wired
+# reconciliation boundary this phase instruments
+# (swarm/team.py's _reconcile_completeness_claim_with_comparison); the other
+# three are real, tested states of the reconcile_claim() primitive below,
+# available to a later phase's reconciliation boundary without inventing a
+# new ontology when it needs them. Deliberately NOT including a separate
+# "unsupported": for a set-based comparison, a claim that is not fully
+# supported is either partially supported (nonempty overlap with evidence),
+# fully contradicted (disjoint from non-empty evidence), or unverifiable (no
+# evidence to compare against) -- a fourth undifferentiated "unsupported"
+# bucket would just be contradicted+unverifiable relabeled.
+VALID_CLAIM_STATUSES = frozenset(
+    {"supported", "contradicted", "partially_supported", "unverifiable"})
+
+
+def reconcile_claim(claimed: set[str] | str, evidence_values: set[str]) -> str:
+    """Deterministic verdict for a claim expressed as a set of discrete,
+    exact values (filenames, field values, counts rendered as strings, etc.)
+    against the set of values Evidence actually establishes for the SAME
+    thing. This is a SET-COMPARISON primitive, not a natural-language claim
+    parser -- callers reduce a claim/evidence pair to comparable sets
+    themselves (e.g. compare_enumerations' left-only/right-only filenames,
+    or a single field=value pair as a one-element set).
+
+    Returns exactly one of VALID_CLAIM_STATUSES's four values:
+
+      "unverifiable"          -- claimed or evidence_values is empty:
+                                 nothing to compare, so nothing is asserted
+                                 either way. Never returned as "supported".
+      "supported"             -- claimed == evidence_values, exactly.
+      "contradicted"          -- claimed and evidence_values share NOTHING
+                                 (disjoint), and evidence_values is
+                                 non-empty: evidence positively rules out
+                                 everything the claim asserts.
+      "partially_supported"   -- some but not all overlap -- neither a full
+                                 match nor a full contradiction.
+
+    Never returns "supported" merely because a claim's WORDING resembles the
+    evidence, and never collapses a partial or contradicted claim into
+    "supported" -- see this module's own test suite for the field-relabeling
+    case this guards against: comparing VALUES only, never claimed field
+    NAMES, is a deliberate, narrow contract. A caller that passes
+    {"field_B=value_1"} as `claimed` and {"field_A=value_1"} as
+    `evidence_values` gets "contradicted", not "supported" -- the two
+    strings are literally different, and this function does no field-name-
+    aware matching of any kind.
+    """
+    claimed_set = claimed if isinstance(claimed, set) else {claimed}
+    if not claimed_set or not evidence_values:
+        return "unverifiable"
+    if claimed_set == evidence_values:
+        return "supported"
+    if not (claimed_set & evidence_values):
+        return "contradicted"
+    return "partially_supported"
+
+
+async def persist_claim(
+    run_context: RunContext,
+    statement: str,
+    status: str,
+    *,
+    evidence_ids: list[str] | None = None,
+) -> str | None:
+    """INSERT one `claims` row, plus one `claim_evidence` row per id in
+    `evidence_ids`, in ONE transaction -- so a ClaimEvidence row can never
+    reference a Claim that failed to insert, matching persist_run_started's
+    and persist_tool_call_completed's own orphan-avoidance reasoning.
+
+    claim_id is a freshly minted, genuine UUID4 string -- the identical
+    identity discipline Phase D established for tool_call_id/evidence_id
+    (see this module's own docstring): NOT execution_context.new_id()'s
+    12-hex-char runtime scheme, and NOT re-derived from `statement` or any
+    other prose.
+
+    run_id is read verbatim from run_context (never re-derived).
+    execution_id is whatever execution is CURRENT on run_context at call
+    time (None if none is open) -- claims.execution_id is SET NULL on
+    delete (see swarm/db.py's own comment: a claim's supporting execution is
+    incidental context, not what makes the claim exist), so this is
+    correctly optional.
+
+    `evidence_ids` must already exist as real evidence.evidence_id values
+    (e.g. returned by persist_tool_call_completed) -- this function NEVER
+    creates or duplicates an Evidence row, only links to rows that already
+    exist; the FK on claim_evidence.evidence_id enforces this at the
+    database level too. A no-op session (run_context.session_id is None,
+    the same convention persist_run_started uses) skips persistence
+    entirely -- there is no session-owned Run for the claim to attach to.
+
+    status must be one of VALID_CLAIM_STATUSES -- passing anything else is a
+    caller bug, not a database-reachability failure, so this raises
+    ValueError immediately rather than being swallowed by the fail-open
+    try/except below (which exists for I/O failures, not for programming
+    errors).
+    """
+    if status not in VALID_CLAIM_STATUSES:
+        raise ValueError(f"persist_claim: invalid status {status!r}, "
+                          f"must be one of {sorted(VALID_CLAIM_STATUSES)}")
+    if run_context.session_id is None:
+        return None
+    claim_id = str(_uuid.uuid4())
+    try:
+        async with get_engine().begin() as conn:
+            await conn.execute(db.claims.insert().values(
+                claim_id=claim_id,
+                run_id=run_context.run_id,
+                execution_id=run_context.current_execution_id,
+                statement=statement,
+                status=status,
+            ))
+            for evidence_id in (evidence_ids or []):
+                await conn.execute(db.claim_evidence.insert().values(
+                    claim_id=claim_id, evidence_id=evidence_id,
+                ))
+        return claim_id
+    except Exception as exc:  # noqa: BLE001
+        print(f"[execution_store] persist_claim failed "
+              f"(run_id={run_context.run_id!r}): {type(exc).__name__}: {exc}",
+              flush=True)
+        return None

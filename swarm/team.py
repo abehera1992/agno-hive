@@ -2259,7 +2259,7 @@ def _second_side_from_answer(content: str, already: str) -> str:
 
 async def _computed_comparison(task: str, enumerations: dict | None,
                                hive_mcp_url: str | None, hive_mcp_tools=None,
-                               content: str = "") -> str:
+                               content: str = "", team=None) -> str:
     """Run compare_enumerations over the two files this run read, and return the diff.
 
     The answer to a question three measured escalations could not answer: how do you
@@ -2387,15 +2387,49 @@ async def _computed_comparison(task: str, enumerations: dict | None,
     if not left or not right or left == right:
         return _skip(f"could not resolve two distinct sides (left={left!r}, right={right!r}; "
                      f"{len(enumerations)} enumeration(s) recorded)")
+    # Phase E: this is a genuine tool call (compare_enumerations, over hive-mcp)
+    # but reaches it via a bespoke `session.call_tool` -- the SAME pattern
+    # _verify_claims uses for its own one-shot session -- rather than through
+    # _tool_interception_hook, so Phase D's durable ToolCall/Evidence never saw
+    # it. A durable Claim reconciled against this comparison needs a REAL
+    # evidence_id to link to (never a fabricated one, never no link at all),
+    # so this call is bracketed with the identical start_tool_call/
+    # finish_tool_call/persist_tool_call_created/persist_tool_call_completed
+    # sequence _tool_interception_hook already uses -- same primitives, same
+    # fail-open guard(), a new call site only. team._last_comparison_evidence_id
+    # is transient per-run scratch state (same convention as team._read_state/
+    # team._tool_evidence elsewhere in this file), read back by
+    # _reconcile_completeness_claim_with_comparison.
+    run_context = getattr(team, "_run_context", None)
+    _tool_call = (run_context.start_tool_call(
+        "compare_enumerations", {"left_path": left, "right_path": right})
+        if run_context is not None else None)
+    _tool_call_db_id = (
+        await execution_store.guard(execution_store.persist_tool_call_created(_tool_call))
+        if _tool_call is not None else None)
     try:
         session = await hive_mcp_tools.get_session_for_run()
         res = await session.call_tool(
             "compare_enumerations", {"left_path": left, "right_path": right})
         text = "\n".join(getattr(c, "text", "") for c in (res.content or [])).strip()
     except Exception as exc:
+        if _tool_call is not None:
+            _evidence = run_context.finish_tool_call(
+                _tool_call, content=None, success=False, error=str(exc))
+            await execution_store.guard(execution_store.persist_tool_call_completed(
+                _tool_call_db_id, _tool_call, _evidence))
+        if team is not None:
+            team._last_comparison_evidence_id = None
         print(f"[team] computed comparison unavailable: "
               f"{type(exc).__name__}: {str(exc)[:80]}", flush=True)
         return ""
+    if _tool_call is not None:
+        _evidence = run_context.finish_tool_call(
+            _tool_call, content=text, success=True, error=None)
+        _evidence_id = await execution_store.guard(execution_store.persist_tool_call_completed(
+            _tool_call_db_id, _tool_call, _evidence))
+        if team is not None:
+            team._last_comparison_evidence_id = _evidence_id
     if not text or text.startswith("compare_enumerations failed"):
         # The last silent return, and the one that actually fired: subset8's T2 produced
         # NO log line at all, which ruled out every branch above it and left only this.
@@ -3902,6 +3936,36 @@ def _comparison_body(cmp_note: str) -> str:
     return m.group(1).strip() if m else (cmp_note or "").strip()
 
 
+async def _persist_completeness_claim(team, statement: str, status: str) -> None:
+    """Phase E: durable Claim (+ ClaimEvidence, when a real evidence_id is
+    available) for a completeness assertion reconciled against
+    compare_enumerations' deterministic result -- called only from
+    _reconcile_completeness_claim_with_comparison, for exactly the two
+    verdicts (supported/contradicted) that function's own gap-count check
+    can actually produce.
+
+    Fail-open via execution_store.guard, exactly like every other durable
+    write in this file: a persistence failure here can never affect
+    reconciliation, the retry decision, or the shipped answer -- this
+    function's own return value is never even inspected by its caller.
+
+    team._last_comparison_evidence_id is transient per-run scratch state set
+    by _computed_comparison right after it persists the compare_enumerations
+    ToolCall/Evidence pair this claim is being reconciled against -- None
+    when that persistence failed or was skipped (e.g. no run_context), in
+    which case the Claim is still recorded (the verdict itself came from
+    parsing cmp_note, not from the durable row), just without a
+    ClaimEvidence link.
+    """
+    run_context = getattr(team, "_run_context", None)
+    if run_context is None:
+        return
+    evidence_id = getattr(team, "_last_comparison_evidence_id", None)
+    await execution_store.guard(execution_store.persist_claim(
+        run_context, statement, status,
+        evidence_ids=[evidence_id] if evidence_id else None))
+
+
 async def _reconcile_completeness_claim_with_comparison(
         content: str, task: str, team, all_results, result,
         liveness_path: str | None, cmp_note: str, synthesis_run: bool):
@@ -3941,20 +4005,46 @@ async def _reconcile_completeness_claim_with_comparison(
         # spending a second full pipeline re-run.
         return content, result, False
     gap = _comparison_gap_counts(cmp_note)
+    # Phase E: computed BEFORE the gap early-return below (moved up from its
+    # original position, just after this comment's former location) so the
+    # gap==(0,0) branch can also see it -- _reconcile_completeness_claims is a
+    # pure regex scan over `content` with no side effects, so reordering it
+    # ahead of the gap check changes nothing about which branch below runs or
+    # what it does; it only lets the SUPPORTED case (gap==(0,0) but a
+    # completeness claim was made) durably record that the claim held, instead
+    # of that case being observationally identical to "no claim existed".
+    claims = _reconcile_completeness_claims(content)
     if not gap or (gap[0] == 0 and gap[1] == 0):
         # Either the comparison could not be parsed (should not happen given
         # compare_enumerations' fixed format) or it found nothing left/right-
-        # only -- nothing to reconcile.
+        # only -- nothing to reconcile against, i.e. this run's OWN control
+        # flow is unchanged from before Phase E. If the draft asserted
+        # completeness anyway, that assertion is exactly what
+        # compare_enumerations' zero gap counts deterministically SUPPORT --
+        # durably recorded here, additively, with no effect on the return
+        # value or on any later guard in this pipeline.
+        if gap == (0, 0) and claims:
+            await _persist_completeness_claim(team, claims[0], "supported")
         return content, result, False
-    claims = _reconcile_completeness_claims(content)
     if not claims:
         # The draft never claimed completeness in the first place -- e.g. it
-        # already said "6 endpoints have no hook". Nothing to reconcile.
+        # already said "6 endpoints have no hook". Nothing to reconcile, and
+        # nothing to persist -- there is no assertion to validate, so no Claim
+        # row is written (not persisted as "unverifiable": that would imply an
+        # assertion existed when none did).
         return content, result, False
 
     setattr(team, _COMPARISON_RECONCILE_FLAG, True)
     left_only, right_only = gap
     evidence = _comparison_body(cmp_note)
+    # Phase E: the actual claim being reconciled below, persisted with its
+    # deterministic verdict BEFORE the retry prompt is built -- this call's
+    # own gap != (0, 0) is exactly what CONTRADICTS the draft's completeness
+    # claim (see _comparison_gap_counts' fixed left-only/right-only shape).
+    # Whether the coordinator's retry is later ADOPTED does not change what
+    # the DRAFT claimed or what the evidence established at the moment this
+    # fired -- that provenance is what Phase E durably records.
+    await _persist_completeness_claim(team, claims[0], "contradicted")
     retry_prompt = (
         f"{task}\n\nIMPORTANT: your previous answer said \"{claims[0]}\", but "
         f"compare_enumerations -- a deterministic tool, not a re-read -- found "
@@ -4140,7 +4230,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         task,
         (getattr(team, "_read_state", None) or {}).get("enumerations")
         if isinstance(getattr(team, "_read_state", None), dict) else None,
-        hive_mcp_url, hive_mcp_tools, content)
+        hive_mcp_url, hive_mcp_tools, content, team=team)
     content, result, _reconciled = await _reconcile_completeness_claim_with_comparison(
         content, task, team, all_results, result, liveness_path, _cmp_note, synthesis_run)
     if _reconciled:
@@ -4151,7 +4241,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             task,
             (getattr(team, "_read_state", None) or {}).get("enumerations")
             if isinstance(getattr(team, "_read_state", None), dict) else None,
-            hive_mcp_url, hive_mcp_tools, content)
+            hive_mcp_url, hive_mcp_tools, content, team=team)
 
     # Fabrication detection runs FIRST, and its finding rides along with whichever
     # guard fires (2026-09-02). Every guard below ends in a `return`, so the chain is

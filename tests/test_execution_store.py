@@ -440,19 +440,14 @@ async def test_evidence_row_is_written():
 
 @pytest.mark.asyncio
 async def test_no_claim_rows_are_written():
-    """Phase D never calls anything that would write claims -- confirmed by
-    the absence of any db.claims reference outside this table's own DDL/
-    migration tests (see test_migrations.py), and re-confirmed empirically
-    here across every other test in this file's own run."""
+    """None of THIS file's own tests exercise Phase E's persist_claim (that
+    lives in tests/test_claim_reconciliation.py) -- Claim/ClaimEvidence
+    persistence itself is real, shipped Phase E functionality, not something
+    this module still forbids (see test_claim_reconciliation.py's own
+    source-level guards for what Phase E actually must never do: project-
+    memory promotion)."""
     assert await _table_row_count(db.claims) == 0
     assert await _table_row_count(db.claim_evidence) == 0
-
-
-def test_execution_store_module_never_references_claims_or_claim_evidence():
-    import inspect as _inspect
-    source = _inspect.getsource(execution_store)
-    for forbidden in ("db.claims", "db.claim_evidence"):
-        assert forbidden not in source
 
 
 # ── 21. Cancellation does not leave a durable execution "running" ─────────
