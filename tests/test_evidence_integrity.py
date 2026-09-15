@@ -561,3 +561,23 @@ async def test_findings_catches_named_item_variant_end_to_end():
     findings = await _evidence_integrity_findings(
         content, "task", team, None, None, _cmp_note())
     assert any(f["category"] == "comparison completeness/gap" for f in findings)
+
+
+# ── 32-33. Two more wordings, found in a SECOND live battery rerun ----------
+# (Phase R follow-up 2, same day): the first widening (above) still missed
+# "no frontend list function" (a qualifier between "no" and the noun) and "no
+# other frontend hooks ... were found" (same shape, in the zero-claim check).
+
+def test_named_item_check_catches_no_qualified_noun_function_phrasing():
+    content = "GET /vouchers has no frontend list function."
+    found = _integrity_named_item_falsely_gapped(content, _cmp_note())
+    assert found == ("/vouchers",
+                      "compare_enumerations' own MATCHED/HOOKS EXPORTED output "
+                      "lists this as present")
+
+
+def test_zero_claim_catches_qualified_noun_phrasing():
+    content = "No other frontend hooks or functions were found for this module."
+    found = _integrity_comparison_zero_claim_contradiction(content, _cmp_note())
+    assert found is not None
+    assert "left=9" in found[1]

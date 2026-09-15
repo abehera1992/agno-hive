@@ -4340,7 +4340,12 @@ def _integrity_branch_contradiction(content: str, team) -> tuple[str, str] | Non
 # names something compare_enumerations' own output confirms exists.
 _GAP_CLAIM_LINE_RE = re.compile(
     r"\b(?:gap|missing|absent|uncovered|no corresponding|"
-    r"not (?:defined|found|present|covered|implemented|exist(?:s|ing)?))\b",
+    r"not (?:defined|found|present|covered|implemented|exist(?:s|ing)?)|"
+    # "no frontend list function", "no corresponding action" -- up to 3 words
+    # of adjectives/qualifiers between "no" and the thing claimed absent, the
+    # exact shape live battery evidence found (Phase R follow-up 2):
+    # "Called GET /vouchers a gap ('no frontend list function')".
+    r"no\s+(?:\w+\s+){0,3}(?:function|action|hook|endpoint|route|method))\b",
     re.IGNORECASE)
 
 # The two blocks compare_enumerations' own output always prints when there is
@@ -4424,7 +4429,12 @@ def _integrity_comparison_zero_claim_contradiction(content: str, cmp_note: str) 
     left, right, matched = (int(totals.group(1)), int(totals.group(2)),
                             int(totals.group(3)))
     zero_claim = re.search(
-        r"\bno (?:endpoints?|hooks?|matches?)\b|\b0\s+(?:endpoints?|hooks?)\b",
+        # Up to 3 words of qualifiers between "no" and the noun -- "no OTHER
+        # FRONTEND hooks or functions were found" is the live shape this widens
+        # for (Phase R follow-up 2): the original adjacent-only pattern missed
+        # it because "other frontend" sits between "no" and "hooks".
+        r"\bno\s+(?:\w+\s+){0,3}(?:endpoints?|hooks?|matches?)\b"
+        r"|\b0\s+(?:endpoints?|hooks?)\b",
         content or "", re.IGNORECASE)
     if zero_claim and (left or right or matched):
         return (zero_claim.group(0),
