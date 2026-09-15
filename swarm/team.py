@@ -2257,6 +2257,82 @@ def _second_side_from_answer(content: str, already: str) -> str:
     return seen[0] if len(seen) == 1 else ""
 
 
+# ============================================================================
+# Phase S -- deterministic evidence target attribution (2026-09-14).
+#
+# Forensics (this phase): T13a's wrong-file comparison (Phase R's own live
+# battery, reproduced again independently this phase against the real ZGX
+# journal -- "computed the comparison for API/inventory-service/models.py vs
+# .../vouchers/page.tsx", repeated across multiple fresh T13a sessions) traces
+# to exactly one place: _pick_within_side's OWN max-count fallback, used only
+# when the task never names its files (T13a's own deliberate shape -- T13b,
+# which always names them, hits the "named" branch above and is untouched by
+# anything in this section). Raw declaration COUNT has no relationship to
+# whether a candidate is even the right SHAPE for compare_enumerations to
+# extract anything from: models.py (SQLAlchemy models) and page.tsx (a Next.js
+# page component that happens to live under a path literally containing
+# "vouchers") both out-counted the genuinely correct files on a bad day, and
+# neither would ever produce a real MATCHED/LEFT-ONLY/RIGHT-ONLY line in
+# compare_enumerations' own output -- confirmed directly against
+# hive-mcp/tools/compare.py's own extractor requirements (@router.<verb>(...)
+# for .py, endpoint:/use<Name>Query|Mutation for .ts), never modified here.
+#
+# This is a tool/path-resolution defect, not a Coordinator delegation/model
+# choice (the Coordinator never picks these paths -- _computed_comparison
+# does, deterministically, from the run's own already-recorded enumeration
+# ledger) and not an evidence-retrieval or comparison-invocation defect
+# (compare_enumerations itself, once given a real operand pair, has always
+# been exact -- see Phase Q's own direct verification of the PUT-vs-"post"
+# case, which this section leaves untouched by construction: it is never
+# consulted for the NAMED-file path at all, only the max-count fallback).
+# ============================================================================
+
+# The exact constructs compare_enumerations' own extractors require to produce
+# ANYTHING (hive-mcp/tools/compare.py's _PY_ROUTE_RE / _TS_ENDPOINT_RE /
+# _TS_HOOK_RE, read directly and mirrored here read-only for a sanity check on
+# an ALREADY-PICKED candidate -- never re-implementing, replacing, or fuzzing
+# the join itself, per this phase's own explicit constraint).
+_ROUTE_SHAPE_PY_RE = re.compile(r"@\w[\w.]*\.(?:get|post|put|patch|delete)\(", re.IGNORECASE)
+_ROUTE_SHAPE_TS_RE = re.compile(
+    r"\bendpoint\s*[:=]|\buse[A-Z]\w*(?:Query|Mutation)\b")
+
+
+def _candidate_has_route_shape(entry: dict) -> bool:
+    """Whether an enumerations[] entry's OWN already-captured lines (the SAME
+    `_enumerable_lines` capture the run's own read-cache hook already recorded
+    -- no new tool call, no new read) contain at least one construct
+    compare_enumerations' own extractor for that file's side would actually
+    recognise. A file that fails this check would contribute NOTHING to a
+    MATCHED/LEFT-ONLY/RIGHT-ONLY line regardless of how many other
+    declarations it has -- exactly the gap raw declaration count cannot see.
+
+    Rejects (returns False) ONLY on positive evidence of a mismatch: real,
+    non-empty captured lines containing none of the required constructs --
+    never merely because `lines` is empty/absent. "Never guess" cuts both
+    ways: absence of shape data is not evidence of bad shape, only evidence
+    that this check cannot judge, and defaulting to reject on that alone
+    would be exactly the kind of guess this phase's own gate must not make
+    (it would also silently reject every legitimate operand recorded by a
+    caller that never populated `lines`, which is not this function's
+    call to make). In production `lines` is always populated when an
+    enumerations[] entry exists at all (see the read-cache hook's own
+    population site: an entry is only ever created when `found` -- the
+    enumerable-line count -- is nonzero), so this fallback is a real-world
+    no-op there and only matters for a caller/test that constructs a
+    synthetic entry without it.
+    """
+    lines = entry.get("lines") or []
+    if not lines:
+        return True
+    path = str(entry.get("path", ""))
+    text = "\n".join(lines)
+    if path.lower().endswith(".py"):
+        return bool(_ROUTE_SHAPE_PY_RE.search(text))
+    if path.lower().endswith((".ts", ".tsx", ".js", ".jsx")):
+        return bool(_ROUTE_SHAPE_TS_RE.search(text))
+    return True
+
+
 async def _computed_comparison(task: str, enumerations: dict | None,
                                hive_mcp_url: str | None, hive_mcp_tools=None,
                                content: str = "", team=None) -> str:
@@ -2330,7 +2406,7 @@ async def _computed_comparison(task: str, enumerations: dict | None,
         by_group.setdefault(_extension_group(e.get("path", "")), []).append(e)
     groups_present = [g for g in by_group if by_group[g]]
 
-    def _pick_within_side(candidates: list[dict]) -> str:
+    def _pick_within_side(candidates: list[dict]) -> tuple[str, str]:
         """Among same-side candidates, prefer the one the TASK TEXT itself
         names -- every _TWO_SIDED_TASK_RE example names its left-hand file
         verbatim ("List every endpoint defined in <path>, then..."), and a run
@@ -2338,14 +2414,49 @@ async def _computed_comparison(task: str, enumerations: dict | None,
         business_admin_api.py and modules_api.py, both read while chasing the
         frontend file) must not let one of those outrank the file the task
         actually asked about just by having a higher raw declaration count.
+        An explicitly-named file is never second-guessed by the shape check
+        below -- the task naming it IS the authoritative signal (Phase S's own
+        "operates on the authoritative/requested artifacts" objective), and
+        T13b (files always named) must be byte-for-byte unaffected by this.
+
         Falls back to highest count only when the task names none of the
         candidates, or names more than one (still genuinely ambiguous) --
-        e.g. T13a, which deliberately never names its files at all.
+        e.g. T13a, which deliberately never names its files at all. Phase S
+        (2026-09-14): THIS is exactly where the real defect lived, confirmed
+        directly against the live journal -- "API/inventory-service/models.py
+        vs .../vouchers/page.tsx" and ".../router/vouchers_api.py vs
+        .../vouchers/page.tsx" both computed and returned as if genuine,
+        repeatedly, across a live T13a battery. Raw declaration COUNT has no
+        relationship to whether a file is even the RIGHT SHAPE for this tool:
+        models.py (SQLAlchemy models) has plenty of `class`/column
+        declarations and zero `@router` decorators; page.tsx (a Next.js page
+        component living under a `vouchers/` directory that a naive path
+        match would favor) has plenty of `export const`/JSX declarations and
+        zero RTK Query `endpoint:`/hook exports. Both would out-count the
+        genuinely correct file on a bad day yet extract NOTHING meaningful
+        in compare_enumerations itself -- the mismatch was invisible to a
+        raw count precisely because count says nothing about shape.
+
+        Returns (path, source) -- source is "named" (task named it directly,
+        never shape-checked), "shape-verified" (max-count candidate's own
+        captured lines contain a real route/endpoint/hook construct),
+        "shape-fallback" (the max-count candidate failed that check, but a
+        lower-count same-side candidate passed it and was used instead -- a
+        deterministic, bounded reconciliation using only already-enumerated
+        candidates, never a new tool call or model turn), or "" (no
+        candidate on this side passes the shape check at all -- caller must
+        treat this side as unresolved, never guess further).
         """
         named = [c for c in candidates
                  if c.get("path", "") and c.get("path", "") in (task or "")]
-        chosen = named[0] if len(named) == 1 else max(candidates, key=lambda e: e.get("count", 0))
-        return chosen.get("path", "")
+        if len(named) == 1:
+            return named[0].get("path", ""), "named"
+        by_count = sorted(candidates, key=lambda e: e.get("count", 0), reverse=True)
+        for e in by_count:
+            if _candidate_has_route_shape(e):
+                source = "shape-verified" if e is by_count[0] else "shape-fallback"
+                return e.get("path", ""), source
+        return "", ""
 
     if len(groups_present) >= 2:
         # files_only already restricts extensions to .py/.ts/.tsx/.js/.jsx, so
@@ -2356,8 +2467,10 @@ async def _computed_comparison(task: str, enumerations: dict | None,
         # only two _extension_group currently distinguishes). Ordering by count
         # instead of by side is exactly the bug being fixed here, so it is not
         # repeated for left/right selection either.
-        left = _pick_within_side(by_group["py"])
-        right = _pick_within_side(by_group["ts"])
+        left, left_source = _pick_within_side(by_group["py"])
+        right, right_source = _pick_within_side(by_group["ts"])
+        print(f"[team] comparison target selection: left={left!r} ({left_source or 'REJECTED -- no shape-safe candidate'}), "
+              f"right={right!r} ({right_source or 'REJECTED -- no shape-safe candidate'})", flush=True)
     else:
         # Every enumerated file is on the SAME side -- e.g. only backend .py files
         # were ever read this run, or only frontend .ts files were. There is no
@@ -2368,7 +2481,10 @@ async def _computed_comparison(task: str, enumerations: dict | None,
         # already provided for the single-file case, now also covering
         # multiple-candidates-one-side.
         only_group = groups_present[0] if groups_present else None
-        left = _pick_within_side(by_group[only_group]) if only_group else ""
+        left, left_source = _pick_within_side(by_group[only_group]) if only_group else ("", "")
+        print(f"[team] comparison target selection: left={left!r} "
+              f"({left_source or 'REJECTED -- no shape-safe candidate'}), right=(none enumerated this side)",
+              flush=True)
         right = _second_side_from_answer(content, left) if left else ""
         if right and _extension_group(right) == only_group:
             # The answer only named ANOTHER file of the same side -- still not a
