@@ -7734,6 +7734,27 @@ async def repair_unguarded_draft(task: str, content: str, mcp_url: str | None = 
     else:
         print(f"[team] draft repair: 0 guard(s) fired on the {len(content):,}-char "
               f"draft of a killed run", flush=True)
+    # Phase AA (2026-09-17): _run_repo_derived_guards' own docstring already names the
+    # gap this closes -- "not the scope check, not the integration check, not
+    # verify_claims" -- but only the first two ever got a parent-side repair. Every
+    # OTHER path that ships an answer, in or out of the worker, crosses verify_claims
+    # at least once (the worker's own up-front check, Phase Z's post-adoption
+    # re-check, Phase Y's post-reconciliation check); a liveness-killed draft is the
+    # one exception, not because verify_claims needs the dead worker -- it takes only
+    # `content` and a hive-mcp URL/session, the exact property this whole function
+    # exists to exploit for the other seven guards -- but because nobody had wired it
+    # here yet. Same fail-open discipline as _run_repo_derived_guards itself: a
+    # failure here costs the caller nothing more than the note it would have added.
+    try:
+        fab_report, fab_bad, _fab_unavailable = await _verify_claims(content, hive_url, None)
+        if fab_bad:
+            print(f"[team] draft repair: verify_claims flagged the killed run's draft — "
+                  f"{_verdict_digest(fab_report)}", flush=True)
+            fired.append(_flagged_draft_note(fab_report))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[team] draft repair: verify_claims check failed "
+              f"({type(exc).__name__}: {exc}) — returning the draft unchecked "
+              f"on this axis", flush=True)
     return "".join(fired)
 
 
