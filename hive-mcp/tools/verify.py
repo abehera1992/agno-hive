@@ -284,6 +284,31 @@ _ROUTE_RE = (
                + r")/[A-Za-z0-9_\-/{}.]+)")
     if config.ROUTE_PREFIXES else None
 )
+# A backtick span that IS a code declaration ("class Voucher(BaseModel)", "class
+# Voucher(Base):", "class Voucher", "def get_voucher(...)", "async def
+# get_voucher(...)") rather than a bare symbol name or a call. The old tokenizer
+# (`span.split("(", 1)[0]...`, see the extraction loop below) turned "class
+# Voucher(BaseModel)" into the two-word string "class Voucher", which _IDENT_RE/
+# _DOTTED_RE both reject outright (neither allows a space) -- the whole span was
+# silently dropped, never becoming a checkable claim at all.
+#
+# Confirmed live, Phase V, run b52f2825af38 (2026-09-17): an answer's "Backend
+# Database Tables" section named 8 backticked `class X(BaseModel)` declarations,
+# none of which exist, and every one slipped past verify_claims this exact way --
+# replaying the production tokenizer against that exact text is how the gap was
+# found and confirmed (`class Voucher` matches neither regex; W1 fixes exactly this).
+#
+# This regex recognizes the declaration shape FIRST and extracts just the declared
+# symbol name, so it flows through the SAME downstream checks (negation, proposed-
+# new-code framing, noise/MCP-tool exclusion, dedup) as any other identifier claim
+# -- see the extraction loop. `.match()`, not `.fullmatch()`, so trailing content
+# (a return-type arrow, an inline comment) after the parens never blocks extraction;
+# only the leading declaration keyword+name+optional-parens is required to match.
+_DECL_RE = re.compile(
+    r"^(?P<kind>class\b|(?:async\s+)?def\b)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\s*\((?P<args>[^)]*)\))?"
+)
+
 # A bare identifier worth grepping: not prose, not a number.
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{2,}$")
 # Dotted member expressions (styles.warning, obj.field, mod.CONST). These carry the claim
@@ -1214,6 +1239,58 @@ def _appears_in_file(rel_path: str, tok: str) -> bool:
     return re.search(rf"(?<!\w){re.escape(bare)}(?!\w)", src) is not None
 
 
+def _declared_bases_mismatch(tok: str, claimed_bases: list[str],
+                              glob_filter: str = "") -> str | None:
+    """Verdict line if `tok`'s claimed base class(es) contradict its real
+    declaration anywhere in the repo, or None when they match, or when no real
+    declaration of `tok` can be located at all.
+
+    W2 (2026-09-17): existence alone is not enough to support a declaration claim
+    like `class Voucher(BaseModel)` -- the base class is part of what was claimed,
+    the same discipline field_of()/_structural_verdict already apply to a claimed
+    field's owner. A symbol that merely EXISTS somewhere (the plain SYMBOLS check
+    above) is weaker evidence than the answer's own claim, exactly like the
+    `reg_id`/krakend.json case symbol_index.py's own docstring describes -- proving
+    existence, not the claimed structure.
+
+    Deliberately repo-wide, not scoped to files the answer named: the real Phase V
+    fabrication run never cited `models.py` by path anywhere near its "Database
+    Tables" section, so a check scoped to asserted_paths (as _structural_verdict is)
+    would never fire on the one case this exists to catch. Locates the real
+    declaration by grepping for the DECLARATION LINE itself (`class Tok(` / `class
+    Tok:` / `class Tok`), not just any mention of the bare name -- a class merely
+    imported or referenced elsewhere must never be read as its own declaration site.
+    Reuses symbol_index.class_bases (the AST-derived `classes[name]["bases"]"
+    _py_index already computes), never re-parses.
+
+    None is returned, not a rejection, when no real declaration line is found: this
+    check only ever ADDS a stronger rejection on top of an existing FOUND/DECLARED
+    verdict, never removes or weakens it -- an index that cannot locate the
+    declaration must not report the structure as wrong.
+    """
+    from .symbol_index import class_bases as _class_bases
+    hits = _rg(rf"^\s*class\s+{re.escape(tok)}\b", fixed=False, glob_filter=glob_filter)
+    for h in hits:
+        path = h.split(":", 1)[0]
+        if not path.lower().endswith(".py"):
+            continue
+        real_bases = _class_bases(path, tok)
+        if real_bases is None:
+            continue
+        # Compare bare base names only -- `BaseModel` vs `Base[T]`/`some.Base` would
+        # otherwise false-flag a real match over generics/qualification this check
+        # has no reason to care about.
+        claimed_set = {b.split("[", 1)[0].strip().rsplit(".", 1)[-1] for b in claimed_bases}
+        real_set = {b.split("[", 1)[0].strip().rsplit(".", 1)[-1] for b in real_bases}
+        if claimed_set & real_set:
+            return None
+        claimed_str = ", ".join(claimed_bases)
+        real_str = ", ".join(real_bases) if real_bases else "(no base class)"
+        return (f"  WRONG BASE {tok:36s} <-- claimed `class {tok}({claimed_str})`, "
+                f"but {path} declares `class {tok}({real_str})`")
+    return None
+
+
 def _rg(pattern: str, fixed: bool = True, glob_filter: str = "",
         whole_word: bool = False) -> list[str]:
     rg = shutil.which("rg")
@@ -1848,23 +1925,37 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     # Claims that something does NOT exist. Collected rather than discarded so the
     # opposite check can run -- see the ABSENCE CLAIMS section.
     negated_idents: list[str] = []
+    # W1/W2 (2026-09-17): claimed base class(es) for a `class X(Y)`-shaped
+    # declaration claim, keyed by the declared symbol name -- e.g. `class
+    # Voucher(BaseModel)` records decl_bases["Voucher"] = ["BaseModel"]. Consumed by
+    # _declared_bases_mismatch in the SYMBOLS verdict loop below. A bare `class X`
+    # (no parens) or a `def`/`async def` declaration never populates this -- there is
+    # no base-class claim to check for either shape.
+    decl_bases: dict[str, list[str]] = {}
     for m in _BACKTICK_RE.finditer(answer):
         span = m.group(1)
-        # Split at the first "(" so a backticked CALL is checked by its NAME.
-        #
-        # `rstrip("()")` alone handled a bare `foo()` and silently dropped every call
-        # carrying a signature: `createGRNFromPO(poId: string)` became
-        # "createGRNFromPO(poId: string", which matches neither _IDENT_RE nor
-        # _DOTTED_RE, so the token was discarded and never grepped. The exemption was
-        # accidental -- `foo()` checked, `foo(x)` not -- not a decision.
-        #
-        # T13b, 2026-09-01, is what it cost. The answer claimed every voucher endpoint
-        # had a frontend hook and named four to prove it --
-        # `createGRNFromPO(poId: string)`, `createCreditNoteFromInvoice(...)`,
-        # `createStockAdjustment(...)`, `createStockTransfer(...)`. All four appear
-        # ZERO times anywhere in the repo. verify_claims ran on that answer, found
-        # nothing to flag, and the fabricated coverage claim shipped clean.
-        tok = span.split("(", 1)[0].strip().rstrip("()").strip()
+        decl = _DECL_RE.match(span.strip())
+        if decl:
+            # See _DECL_RE's own comment: a declaration-shaped span is tokenized by
+            # its DECLARED NAME, not by the old split-at-first-"(" logic below (which
+            # would have produced the two-word, always-rejected "class Voucher").
+            tok = decl.group("name")
+        else:
+            # Split at the first "(" so a backticked CALL is checked by its NAME.
+            #
+            # `rstrip("()")` alone handled a bare `foo()` and silently dropped every call
+            # carrying a signature: `createGRNFromPO(poId: string)` became
+            # "createGRNFromPO(poId: string", which matches neither _IDENT_RE nor
+            # _DOTTED_RE, so the token was discarded and never grepped. The exemption was
+            # accidental -- `foo()` checked, `foo(x)` not -- not a decision.
+            #
+            # T13b, 2026-09-01, is what it cost. The answer claimed every voucher endpoint
+            # had a frontend hook and named four to prove it --
+            # `createGRNFromPO(poId: string)`, `createCreditNoteFromInvoice(...)`,
+            # `createStockAdjustment(...)`, `createStockTransfer(...)`. All four appear
+            # ZERO times anywhere in the repo. verify_claims ran on that answer, found
+            # nothing to flag, and the fabricated coverage claim shipped clean.
+            tok = span.split("(", 1)[0].strip().rstrip("()").strip()
         if (_IDENT_RE.match(tok) or _DOTTED_RE.match(tok)) and tok.lower() not in _NOISE:
             if tok in _MCP_TOOL_NAMES:
                 continue
@@ -1881,6 +1972,10 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                 continue
             if tok not in idents:
                 idents.append(tok)
+            if decl is not None and decl.group("kind").strip() == "class" and decl.group("args"):
+                bases = [b.strip() for b in decl.group("args").split(",") if b.strip()]
+                if bases and tok not in decl_bases:
+                    decl_bases[tok] = bases
     # Fenced-code-block identifiers whose block sits right after a new/add/propose
     # heading (e.g. "Proposed Code Insertion") go to proposed_idents too -- see
     # _proposed_code_block_idents' docstring. Everything else from _code_idents
@@ -2054,6 +2149,17 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                 tok, asserted_paths + [f for f, _ in file_lines]
             )
             if structural is not None:
+                # W2: a DECLARED/REFERENCED verdict says the symbol exists -- it says
+                # nothing about the base class the answer claimed for it. Only checked
+                # when this WAS a `class X(Y)`-shaped claim (decl_bases); a plain
+                # NOT IN FILE stands unchanged, since there is nothing to compare a
+                # base class against for a symbol structural_verdict already rejects.
+                if tok in decl_bases and not structural.lstrip().startswith("NOT IN FILE"):
+                    mismatch = _declared_bases_mismatch(tok, decl_bases[tok], glob_filter)
+                    if mismatch is not None:
+                        out.append(mismatch)
+                        problems += 1
+                        continue
                 out.append(structural)
                 if structural.lstrip().startswith("NOT IN FILE"):
                     problems += 1
@@ -2140,6 +2246,16 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                     problems += 1
                     out.append(f"  NOT FOUND  {tok:38s} <-- does not exist in the project")
                 continue
+            # W2: same base-class check as the structural DECLARED branch above, for
+            # the repo-wide-grep FOUND path -- the shape the real Phase V regression
+            # actually takes (no file named near the claim, so _structural_verdict
+            # never fires and this is the branch that must catch it).
+            if tok in decl_bases:
+                mismatch = _declared_bases_mismatch(tok, decl_bases[tok], glob_filter)
+                if mismatch is not None:
+                    out.append(mismatch)
+                    problems += 1
+                    continue
             out.append(f"  FOUND      {tok:38s} {code_hits[0][:90]}")
         out.append("")
 

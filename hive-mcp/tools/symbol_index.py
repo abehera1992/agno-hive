@@ -173,6 +173,25 @@ def declares(rel_path: str, symbol: str) -> tuple[bool | None, int | None, str]:
     return False, None, ""
 
 
+def class_bases(rel_path: str, class_name: str) -> list[str] | None:
+    """Real base class names of `class_name` as declared in `rel_path`.
+
+    Returns the (possibly empty) `bases` list `_py_index` already computed from the
+    AST -- e.g. `class Voucher(Base):` -> `["Base"]`, `class Foo:` -> `[]` (a real
+    class with no explicit base). Returns None when the file is not indexable, is
+    not Python, or does not declare this class at all -- distinct from `[]`, and the
+    caller (verify.py's `_declared_bases_mismatch`) must not treat "cannot
+    determine" as "declares no base".
+    """
+    idx = index_file(rel_path)
+    if idx is None or idx.get("lang") != "py":
+        return None
+    classes = idx.get("classes", {})
+    if class_name not in classes:
+        return None
+    return classes[class_name].get("bases", [])
+
+
 def field_of(rel_path: str, class_name: str, field: str) -> tuple[bool | None, str]:
     """Is `field` declared on `class_name` in `rel_path`?
 
