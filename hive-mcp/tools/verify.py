@@ -284,6 +284,35 @@ _ROUTE_RE = (
                + r")/[A-Za-z0-9_\-/{}.]+)")
     if config.ROUTE_PREFIXES else None
 )
+
+# Phase AF, defect 2: `@router.get('/vouchers/{voucher_id}/versions/')`-shaped
+# backend route DECLARATIONS, asserted directly rather than paraphrased into
+# prose. Confirmed live (Phase AE, T13b, three separate `verify_claims` calls
+# all returned bad=False): a backticked span like this reaches the extraction
+# loop above, fails _DECL_RE (it is neither `class` nor `def`), and falls to
+# the split-at-"(" fallback, which produces the bare token "@router.get" --
+# starting with "@", which BOTH _IDENT_RE and _DOTTED_RE reject outright
+# (neither anchor permits a leading "@"), so the entire claim is silently
+# discarded before any grep runs. Separately, _ROUTE_RE ALSO cannot catch
+# this shape: it only matches paths carrying one of config.ROUTE_PREFIXES
+# (default "/api"), and a decorator's own literal path is written relative
+# to wherever the router gets mounted -- "/vouchers/...", never "/api/...".
+# Six of eight endpoints an answer listed this way were entirely invented
+# (no such route exists anywhere in the file it claimed to be reading from)
+# and shipped with a clean verdict.
+#
+# This is deliberately NOT a general decorator/route parser -- it recognizes
+# only the documented common verb set and extracts nothing but the quoted
+# path string, then feeds that path into the SAME already-tested ROUTES
+# suffix-walk verification below (segs/probe/PLAUSIBLE/NOT FOUND) that
+# _ROUTE_RE-extracted paths already use, rather than inventing a second
+# verification mechanism. `@\w+\.` (not `@router\.`) so a differently-named
+# router variable (`@app.get(...)`, `@api_router.post(...)`) is still
+# recognized -- the object name varies by file, the verb set does not.
+_DECORATOR_ROUTE_RE = re.compile(
+    r"@\w+\.(?:get|post|put|patch|delete|options|head)\(\s*"
+    r"['\"]([^'\"]+)['\"]"
+)
 # A backtick span that IS a code declaration ("class Voucher(BaseModel)", "class
 # Voucher(Base):", "class Voucher", "def get_voucher(...)", "async def
 # get_voucher(...)") rather than a bare symbol name or a call. The old tokenizer
@@ -2062,6 +2091,27 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                 continue
             if r not in routes:
                 routes.append(r)
+
+    # Phase AF, defect 2: `@router.get('/path')`-shaped decorator citations, always
+    # prefix-less (see _DECORATOR_ROUTE_RE above), fed into the SAME routes list and
+    # the SAME suffix-walk check below. Guarded to >= 2 segments for the same reason
+    # the walk itself starts there (`range(len(segs) - 1)` just below never probes a
+    # single segment alone) -- a decorator route reduced to one segment ("/vouchers")
+    # would get zero candidates tried and read as NOT FOUND regardless of whether it
+    # is real, which is a false positive, not a stricter check. Silently not adding
+    # it to `routes` here is the same "absence of shape data is not evidence of bad
+    # shape" principle this file already applies elsewhere (_candidate_has_route_shape
+    # in swarm/team.py; _structural_verdict's own None-means-cannot-judge return) --
+    # never guess, and a one-segment route stays uncheckable by this mechanism rather
+    # than wrongly flagged.
+    for r in _DECORATOR_ROUTE_RE.findall(answer):
+        r = r.strip()
+        if not r.startswith("/"):
+            continue
+        if len([s for s in r.split("/") if s]) < 2:
+            continue
+        if r not in routes:
+            routes.append(r)
 
     # ── asserted paths ────────────────────────────────────────────────────────
     # Existence-only, and deliberately so: this says nothing about whether the file

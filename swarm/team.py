@@ -14331,6 +14331,30 @@ _ASKS_FOR_LIST_RE = re.compile(
 # gated on it stayed silent. That is why _under_answered_enumeration cannot see
 # endpoints in a file read today, and why the T2 comparison guard shipped inert: its
 # rule was validated against the file on disk, not against what the tool returns.
+#
+# Phase AF, defect 1: `export\s+(?:const|function|default)\s+\w+` requires a bare
+# identifier immediately after "const", so it never matched RTK Query's standard
+# destructured hook re-export --
+#
+#     export const {
+#       useGetFooQuery,
+#       useBarMutation,
+#     } = api;
+#
+# -- because the token right after "const " is "{", not a name. Confirmed live
+# (Phase AE, T2 and T13a/T13b's own frontend files both use this exact shape at
+# businessApi.ts:195 / inventoryApi.ts:915): the ONLY captured line from such a
+# file was the unrelated `export const businessApi = createApi({` declaration,
+# which then fails _candidate_has_route_shape's own hook-pattern check, so the
+# whole frontend side of the comparison ledger was rejected and
+# _computed_comparison silently never ran. The individual hook-name lines inside
+# the braces (`  useGetFooQuery,`) never matched any existing alternative either --
+# no bullet, no @, no def/class, no leading "export". Added below: a bare
+# use<Name>Query|Mutation identifier, alone on its line (its own trailing comma
+# optional, matching both a middle and a last destructured entry), which is
+# exactly and only the destructured-export/re-export line shape -- a real
+# invocation like "const { data } = useGetFooQuery();" still has trailing
+# "();" after the identifier and does not match the end-anchor below.
 _ENUMERABLE_LINE_RE = re.compile(
     r"^[ \t]*(?:\d{1,6}\t[ \t]*)?(?:"
     r"(?:[-*+•]|\d{1,3}[.)])\s+\S"
@@ -14338,6 +14362,7 @@ _ENUMERABLE_LINE_RE = re.compile(
     r"|(?:async\s+)?def\s+\w+"
     r"|class\s+\w+"
     r"|export\s+(?:const|function|default)\s+\w+"
+    r"|use[A-Z]\w*(?:Query|Mutation)\s*,?\s*$"
     r"|\[(?:FILE|DIR)\]\s+\S"
     r")",
     re.MULTILINE,
