@@ -4810,8 +4810,36 @@ async def _evidence_integrity_check(
     recheck = await _evidence_integrity_findings(
         retried, task, team, hive_mcp_url, hive_mcp_tools, recheck_cmp_note)
     if recheck:
-        print(f"[team] evidence-integrity: retry still contradicts "
-              f"{[f['category'] for f in recheck]} — forcing uncertainty", flush=True)
+        # Phase AC (2026-09-17): _force_uncertainty_answer's own docstring is exact
+        # about what this branch used to do -- "the reader gets the full original
+        # text... Everything else below is the original answer, unmodified" -- but
+        # `retried` is not the original text this run's own up-front verify_claims
+        # already checked; it is a FRESH, never-verified candidate, and this was the
+        # only one of this function's three _force_uncertainty_answer call sites that
+        # shipped one. The other two wrap `content` (already verify_claims-checked by
+        # _verified_answer before this function was ever called); the "resolved"
+        # branch just below explicitly verify_claims-checks `retried` before adopting
+        # it (Phase Y). This branch shipped `retried` on neither footing -- a
+        # candidate that still fails ONE check, dressed with a banner that only names
+        # THAT check, while anything verify_claims would have caught in the same
+        # text sailed through with no check at all. Same fix shape as Phase Y's,
+        # reused rather than duplicated: merge verify_claims' own findings into the
+        # SAME disclosure instead of adding a second banner or a second retry.
+        _retried_fab_report, _retried_fab_bad, _ = await _verify_claims(
+            retried, hive_mcp_url, hive_mcp_tools)
+        if _retried_fab_bad:
+            print(f"[team] evidence-integrity: retry still contradicts "
+                  f"{[f['category'] for f in recheck]} AND failed verify_claims — "
+                  f"{_verdict_digest(_retried_fab_report)} — forcing uncertainty "
+                  f"on both", flush=True)
+            recheck = recheck + [{
+                "claimed": "the reconciliation candidate's own rewritten claims",
+                "category": "fabricated claim (verify_claims)",
+                "real": _retried_fab_report.strip(),
+            }]
+        else:
+            print(f"[team] evidence-integrity: retry still contradicts "
+                  f"{[f['category'] for f in recheck]} — forcing uncertainty", flush=True)
         forced = _force_uncertainty_answer(retried, recheck)
         await _persist_evidence_integrity_trace(team, recheck, resolved=False, retried=True)
         return forced
