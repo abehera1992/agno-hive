@@ -17546,6 +17546,26 @@ async def run_task_async(
                         liveness_path=liveness_path, synthesis_run=synthesis_run)
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
+                # Phase V forensic instrumentation: log-only, never mutates `content`,
+                # never gates, never retries. Reuses Phase N's _evidence_fidelity_report
+                # (already built for exactly this question, previously unwired for lack
+                # of a live battery to validate it against) against the DURABLE, EXACT
+                # evidence this run's own RunContext already collected -- not the 200-
+                # char team._tool_evidence preview. Answers "tool evidence != member
+                # relay != final answer" with real token-retention ratios instead of
+                # guessing from a preview. Wrapped in its own try/except so a diagnostic
+                # can never affect the answer this run ships.
+                try:
+                    _fid = _evidence_fidelity_report(
+                        getattr(team, "_run_context", None),
+                        getattr(team, "_member_results", None),
+                        content)
+                    print(f"[team] evidence-fidelity (Phase V): "
+                          f"overall_relay_retention={_fid['overall_relay_retention']}, "
+                          f"overall_answer_retention={_fid['overall_answer_retention']}, "
+                          f"items={_fid['items']}", flush=True)
+                except Exception as exc:
+                    print(f"[team] evidence-fidelity diagnostic failed: {exc}", flush=True)
                 if _phase0 is not None:
                     # The ONE place this phase is allowed an MCP round trip: after the
                     # answer is final, resolving the deduped union of cited paths.
