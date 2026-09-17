@@ -1516,13 +1516,39 @@ def project_map(component: str) -> str:
                       "the file named above rather than searching for it again, and do "
                       "not assume a same-named file in another service is the one meant.")
 
-    raw = find_files(f"**/*{name}*/**/*", max_results=800)
-    paths = [ln.strip() for ln in raw.splitlines()
-             if ln.strip() and not _is_empty_result(ln) and not _is_summary_line(ln)]
-    if not paths:
-        raw = find_files(f"**/*{name}*", max_results=800)
-        paths = [ln.strip() for ln in raw.splitlines()
+    # Phase U (2026-09-16): BOTH lookups always run and are merged, never one
+    # short-circuiting the other. The directory-segment glob's own matches are
+    # always a strict subset of the broader glob's (anything inside a
+    # `*name*` directory also has `name` somewhere in its full path), so the
+    # old "only try the broader glob if the narrow one found nothing" order
+    # meant a real, relevant FILENAME match (vouchers_api.py) was never even
+    # looked for once an unrelated DIRECTORY match (a frontend `vouchers/`
+    # page route) was found first -- confirmed live (T13a battery,
+    # 2026-09-14/15): project_map('vouchers') returned facts only about
+    # Client/.../vouchers/page.tsx, and API/inventory-service/router/
+    # vouchers_api.py was never discovered at all, because the narrow glob's
+    # non-empty result suppressed the fallback that would have found it.
+    #
+    # Merging keeps the directory-derived matches FIRST (preserving the
+    # existing bucketing/ranking bias toward them -- a real behavior this
+    # function has always had and Phase U's own scope says to preserve),
+    # then appends whatever the broader glob adds that the narrow one did
+    # not already surface. Downstream bucketing/ranking is completely
+    # unchanged: this only widens the candidate POOL fed into it, it does
+    # not pick a winner -- that stays compare_enumerations'/Phase S's job.
+    dir_raw = find_files(f"**/*{name}*/**/*", max_results=800)
+    dir_paths = [ln.strip() for ln in dir_raw.splitlines()
                  if ln.strip() and not _is_empty_result(ln) and not _is_summary_line(ln)]
+    broad_raw = find_files(f"**/*{name}*", max_results=800)
+    broad_paths = [ln.strip() for ln in broad_raw.splitlines()
+                   if ln.strip() and not _is_empty_result(ln) and not _is_summary_line(ln)]
+    seen = set(dir_paths)
+    extra_paths = []
+    for p in broad_paths:
+        if p not in seen:
+            seen.add(p)
+            extra_paths.append(p)
+    paths = dir_paths + extra_paths
     if not paths:
         # No path carries the name. It may still be a SYMBOL -- searched with the
         # caller's original casing, not the lowered `name`, because declarations are
