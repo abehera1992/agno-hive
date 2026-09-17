@@ -4946,6 +4946,15 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # instead of silently losing it.
     _fab_report, _fab_bad, _fab_unavailable = await _verify_claims(
         content, hive_mcp_url, hive_mcp_tools)
+    # Phase Z (2026-09-17): identity of the exact text this verdict describes.
+    # The reuse site near this function's bottom ("Re-using the verdict computed
+    # up front, NOT re-running it") assumed content never changes between here and
+    # there -- true only when no guard in between adopts a retry. Six of them can
+    # (_adopt_retry under "unfinished-intent"/"write-claim"/"search-claim"/
+    # "no-evidence"/"db-evidence"/"enumeration"), and when one does, `content` is a
+    # genuinely different answer this verdict never examined. Comparing against
+    # this snapshot at the reuse site is what tells the two cases apart.
+    _content_at_verify = content
     _fab_note = ""
     if _fab_bad:
         _fab_note = (
@@ -6144,11 +6153,26 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"service/module.**"
         )
 
-    # Re-using the verdict computed up front, NOT re-running it: the check is a live
-    # MCP round trip and the answer has not changed since. An answer that reaches here
-    # is one no earlier guard claimed, so this path behaves exactly as it did before
-    # detection was hoisted -- same values, same retry, same returns.
-    report, bad, unavailable = _fab_report, _fab_bad, _fab_unavailable
+    # Re-using the verdict computed up front, NOT re-running it -- ONLY when true:
+    # the check is a live MCP round trip, worth skipping when the answer genuinely
+    # has not changed since. Phase Z (2026-09-17): that was previously assumed
+    # unconditionally, but six guards above this point (_adopt_retry under
+    # "unfinished-intent"/"write-claim"/"search-claim"/"no-evidence"/"db-evidence"/
+    # "enumeration") can replace `content` with a retry's own new text on grounds
+    # of it being MORE GROUNDED (more reads), which says nothing about whether it
+    # introduced a fabricated symbol the original draft never had. Re-verify
+    # exactly the text that would otherwise ship, when it differs from what was
+    # already checked -- the same one-extra-round-trip cost this file already
+    # pays at its OTHER re-verification site (the citation-correction retry
+    # below), not a new pattern.
+    if content != _content_at_verify:
+        print("[team] verify (post-adoption): content changed since the up-front "
+              "check (an earlier guard adopted a retry) — re-verifying the text "
+              "that will actually ship", flush=True)
+        report, bad, unavailable = await _verify_claims(
+            content, hive_mcp_url, hive_mcp_tools)
+    else:
+        report, bad, unavailable = _fab_report, _fab_bad, _fab_unavailable
     if unavailable:
         return content + _UNVERIFIED_DISCLAIMER + _summarize_actual_writes(*all_results)
     if not bad:
