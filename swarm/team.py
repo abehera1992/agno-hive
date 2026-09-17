@@ -4753,6 +4753,24 @@ async def _evidence_integrity_check(
         f"you claimed {f['claimed']!r} ({f['category']}), but this run's own tool "
         f"evidence says {f['real']!r}"
         for f in findings)
+    # Phase Y2 (2026-09-17) evaluated, and deliberately does NOT add, a forced
+    # "make at least one tool call" requirement on this reconciliation retry.
+    # Reasoning, not assumption: `_stream_team_run` below calls `team.arun(prompt,
+    # ...)` on the SAME `team` object the original run already used, so this retry
+    # is a continuation of the same session -- the evidence already read earlier
+    # in the run (and any tool results still in context) remains available without
+    # a fresh call, and the run_id=fd66e6422564 incident's own answer was not
+    # something a forced tool call would have obviously prevented: it fabricated an
+    # entirely different, self-consistent scenario rather than merely failing to
+    # look something up it lacked. A hard "must call a tool" gate would risk
+    # penalizing a genuinely correct reconciliation that only needed to re-read
+    # already-in-context evidence (exactly the case this project's own guidance
+    # elsewhere warns against -- requiring a tool call "for its own sake"). The Y1
+    # change above is the deterministic backstop for this failure mode instead: it
+    # does not care whether the candidate was grounded by re-reading, by reusing
+    # context, or by guessing -- it checks what the candidate actually CLAIMS
+    # against the repository, which is what caught this exact incident's
+    # fabrication and would catch a future zero-tool-call one the same way.
     prompt = (
         f"{task}\n\nIMPORTANT: your previous answer contradicts evidence THIS RUN "
         f"already gathered: {lines}. Answer the original question again, and make "
@@ -4796,6 +4814,42 @@ async def _evidence_integrity_check(
               f"{[f['category'] for f in recheck]} — forcing uncertainty", flush=True)
         forced = _force_uncertainty_answer(retried, recheck)
         await _persist_evidence_integrity_trace(team, recheck, resolved=False, retried=True)
+        return forced
+
+    # Phase Y (2026-09-17): the reconciliation candidate resolved the SPECIFIC
+    # comparison contradiction it was re-asked about, but that says nothing about
+    # whether it introduced a NEW, different problem while rewriting the answer --
+    # confirmed live, run fd66e6422564 (T13b): a reconciliation retry made ZERO
+    # tool calls, produced an entirely fabricated replacement answer (invented
+    # endpoint/table/hook names bearing no relation to the real module), "resolved"
+    # the one comparison-completeness contradiction it was asked about by pure
+    # coincidence (its own new numbers happened to agree with each other), and
+    # shipped -- because this function's only recheck was _evidence_integrity_findings
+    # (comparison-category contradictions), never verify_claims (fabricated-symbol
+    # detection). The candidate never crossed the SAME verification boundary every
+    # other path to a shipped answer crosses. One additional, bounded call -- not a
+    # second verifier, the existing one -- closes that gap.
+    _retried_fab_report, _retried_fab_bad, _retried_fab_unavailable = await _verify_claims(
+        retried, hive_mcp_url, hive_mcp_tools)
+    if _retried_fab_bad:
+        print(f"[team] evidence-integrity: reconciliation candidate resolved the "
+              f"comparison contradiction but failed verify_claims — "
+              f"{_verdict_digest(_retried_fab_report)} — forcing uncertainty instead "
+              f"of adopting", flush=True)
+        # Same disposition this function already uses for "retry failed" / "retry
+        # still contradicts" (_force_uncertainty_answer + _persist_evidence_integrity_
+        # trace, resolved=False) -- not a new policy, the existing one applied to a
+        # finding this function did not previously know how to detect. Reshaped into
+        # the same {claimed, category, real} shape _force_uncertainty_answer already
+        # expects, rather than adding a second rendering path for one extra case.
+        _fab_finding = [{
+            "claimed": "the reconciliation candidate's own rewritten claims",
+            "category": "fabricated claim (verify_claims)",
+            "real": _retried_fab_report.strip(),
+        }]
+        forced = _force_uncertainty_answer(retried, _fab_finding)
+        await _persist_evidence_integrity_trace(team, _fab_finding, resolved=False,
+                                                 retried=True)
         return forced
 
     print("[team] evidence-integrity: retry resolved every contradiction — adopting",
