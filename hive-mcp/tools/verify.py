@@ -338,6 +338,36 @@ _DECL_RE = re.compile(
     r"(?:\s*\((?P<args>[^)]*)\))?"
 )
 
+# Phase AH: the JS/TS-side siblings of _DECL_RE above -- same gap, same fix shape,
+# different language. `` `async function getVouchers(...)` `` and
+# `` `export const useGetVouchersQuery = (params) => useQuery({...})` `` both fail
+# _DECL_RE (neither starts with "class"/"def") and fall to the old split-at-"("
+# fallback, producing "async function getVouchers" / "export const
+# useGetVouchersQuery =" -- both contain spaces, both fail _IDENT_RE/_DOTTED_RE,
+# both silently dropped. Confirmed live (Phase AH, T13a and T13b): a member
+# fabricated a React-Query-style `useQuery`/`useMutation` wrapper-function shape
+# for hooks this codebase actually exports via RTK Query's destructured
+# `export const { useX, useY } = api;` re-export (never a hand-written wrapper),
+# and a separate run invented `async function` names for the same hooks -- neither
+# was ever checked, on the same principle as the Phase V class/def gap W1 already
+# fixed: a declaration-shaped span must be tokenized by its DECLARED NAME, not by
+# splitting at the first "(".
+#
+# Deliberately narrow: only the two JS/TS shapes actually observed. The arrow-const
+# form requires `(` (or `async` then `(`) immediately after "=", which is what
+# distinguishes a function assignment ("= (params) => ...") from an ordinary value
+# or call assignment ("= 5", "= createApi({...})") -- the latter is correctly left
+# to fall through unchanged, exactly as it already did before this phase (e.g.
+# `export const businessApi = createApi({` still tokenizes the old way and is
+# still dropped, matching its pre-existing, unaffected behavior).
+_JS_FUNCTION_DECL_RE = re.compile(
+    r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\("
+)
+_JS_CONST_FN_DECL_RE = re.compile(
+    r"^(?:export\s+)?const\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s+)?\("
+)
+
 # A bare identifier worth grepping: not prose, not a number.
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{2,}$")
 # Dotted member expressions (styles.warning, obj.field, mod.CONST). These carry the claim
@@ -977,10 +1007,24 @@ def _blocks_not_in_their_file(answer: str) -> list[tuple[str, str, int]]:
         runup = (answer or "")[max(0, m.start() - _BLOCK_LOOKBACK):m.start()]
         if _ILLUSTRATIVE_RE.search(runup):
             continue
-        names = _NEARBY_FILE_RE.findall(runup)
-        if not names:
+        name_matches = list(_NEARBY_FILE_RE.finditer(runup))
+        if not name_matches:
             continue
-        resolved, _ = _resolve_path(names[-1], hint_paths=names)
+        names = [nm.group(0) for nm in name_matches]
+        # Phase AH: pick the last NAMED-AND-ASSERTED file, not merely the last
+        # NAMED one. "...defined in `models.py` (not `business_profile.py` as
+        # might be expected):" names business_profile.py LAST, but negates it in
+        # the same breath -- the old `names[-1]` picked that negated, nonexistent
+        # name, _resolve_path correctly failed on it, and the function bailed out
+        # via `continue` without ever checking the real file named earlier in the
+        # same run-up. Reuses _is_negated_claim, the same primitive the SYMBOLS
+        # loop already applies to backticked identifiers, rather than adding a
+        # second negation mechanism. Falls back to the old `names[-1]` only when
+        # every candidate in the run-up is negated (nothing else to prefer).
+        asserted = [nm.group(0) for nm in name_matches
+                    if not _is_negated_claim(runup, nm.start(), nm.end())]
+        target = asserted[-1] if asserted else names[-1]
+        resolved, _ = _resolve_path(target, hint_paths=names)
         if resolved is None:
             continue
         lines = _distinctive_lines(block)
@@ -1964,6 +2008,12 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     for m in _BACKTICK_RE.finditer(answer):
         span = m.group(1)
         decl = _DECL_RE.match(span.strip())
+        if not decl:
+            # See _JS_FUNCTION_DECL_RE/_JS_CONST_FN_DECL_RE's own comment: the same
+            # declaration-shaped tokenization, for JS/TS function declarations and
+            # arrow-function const assignments instead of Python class/def.
+            decl = (_JS_FUNCTION_DECL_RE.match(span.strip())
+                    or _JS_CONST_FN_DECL_RE.match(span.strip()))
         if decl:
             # See _DECL_RE's own comment: a declaration-shaped span is tokenized by
             # its DECLARED NAME, not by the old split-at-first-"(" logic below (which
@@ -2001,7 +2051,13 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                 continue
             if tok not in idents:
                 idents.append(tok)
-            if decl is not None and decl.group("kind").strip() == "class" and decl.group("args"):
+            # .groupdict().get(...), not .group(...): the JS/TS fallback regexes
+            # above have no "kind"/"args" groups at all (a base-class claim is a
+            # Python-only concept), and .group() on a nonexistent name raises,
+            # while .groupdict() simply omits keys that don't exist in the pattern
+            # that actually matched.
+            _decl_kind = decl.groupdict().get("kind") if decl is not None else None
+            if _decl_kind and _decl_kind.strip() == "class" and decl.groupdict().get("args"):
                 bases = [b.strip() for b in decl.group("args").split(",") if b.strip()]
                 if bases and tok not in decl_bases:
                     decl_bases[tok] = bases
