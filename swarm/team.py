@@ -751,7 +751,10 @@ _FORWARD_INSTRUCTIONS = [
     "  This is a REAL tool call, like delegate_task_to_member -- not text for you to write.",
     "  Forward from as many members as the task needs. Then add ONLY what is genuinely",
     "  yours: the ordering, the connective explanation, and anything no member covered.",
-    "  Do not retype what you forward; it reaches the reader unchanged either way.",
+    "  Do not retype what you forward; it reaches the reader unchanged either way. A forwarded",
+    "  answer already names every item its member returned, so it satisfies any rule above that",
+    "  says to name every item or give the full list -- do not list them again yourself. The",
+    "  system places the forwarded text right after your answer; write only what is yours.",
     "  SELF-CHECK before you finish: if your answer contains a list you assembled from what",
     "  a member told you, you should have forwarded it instead. Forward it now.",
     "  This does NOT end your turn -- forward, then keep writing.",
@@ -1576,17 +1579,81 @@ def _squash_ws(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+def _squash_md(text: str) -> str:
+    """_squash_ws after dropping backticks and asterisks, so `x.py` and x.py compare equal."""
+    return _squash_ws(re.sub(r"[`*]", "", text or ""))
+
+
+# A line that is nothing but one list item: an optional bullet or number, an optional
+# [FILE]/[DIR] tag, then ONE whitespace-free, path- or identifier-like token (it must contain
+# one of _ . / - and end on a word character or "/", so "Done." and "utils" are not items).
+_BARE_ITEM_LINE_RE = re.compile(
+    r"^\s*(?:[-*•]|\d+[.)])?\s*(?:\[(?:FILE|DIR)\]\s*)?`?"
+    r"(?P<item>(?=[^\s`]*[_./-])\w[\w./-]*[\w/])`?\s*[,;]?\s*$")
+_MIN_LIST_ITEMS = 3
+_MAX_FRAMING_LINES = 3
+_MAX_FRAMING_CHARS = 400
+
+
+def _list_items_if_list_shaped(text: str) -> list[str] | None:
+    """The items of a member answer that IS an enumeration, or None if it is anything else.
+
+    List-shaped means: at least _MIN_LIST_ITEMS lines that are only an item (see
+    _BARE_ITEM_LINE_RE), outnumbering the remaining lines three to one, with at most
+    _MAX_FRAMING_LINES / _MAX_FRAMING_CHARS of other text, none of which names a source
+    file. Whatever the answer says around such a list is framing -- an intro and a closing
+    sentence -- and the list is the information. A line that pairs an item with more text
+    ("items.py: handles X") is not framing and disqualifies the answer, as does too much
+    surrounding prose; both fall back to exact containment, which can only append, never
+    lose. Ordinary prose has no bare item lines and is never treated as a list.
+    """
+    items: list[str] = []
+    framing: list[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = _BARE_ITEM_LINE_RE.match(line)
+        if m:
+            items.append(m.group("item"))
+        else:
+            framing.append(line)
+    if len(items) < _MIN_LIST_ITEMS or len(items) < 3 * len(framing):
+        return None
+    if len(framing) > _MAX_FRAMING_LINES or sum(map(len, framing)) > _MAX_FRAMING_CHARS:
+        return None
+    if any(_RELAY_FILENAME_RE.search(line) for line in framing):
+        return None
+    return items
+
+
+def _forwarded_text_carried(text: str, content: str) -> bool:
+    """Does `content` already carry the forwarded member answer `text`?
+
+    Either the whole answer appears (whitespace, backticks and asterisks aside), or the
+    answer is a list (_list_items_if_list_shaped) and EVERY item appears in `content` as a
+    whole token. One missing item is enough to say no, and the caller then appends the
+    member's text in full -- the exact-forwarding fallback is unchanged.
+    """
+    if _squash_md(text) in _squash_md(content):
+        return True
+    items = _list_items_if_list_shaped(text)
+    if items is None:
+        return False
+    return all(re.search(rf"(?<![\w./-]){re.escape(i)}(?![\w-])", content) for i in set(items))
+
+
 def _with_forwarded_evidence(content: str, team) -> str:
     """`content` plus, for every forwarded member answer it does not already carry, that
     answer verbatim.
 
     forward_member_answer records the exact text at forward time (team._forwarded_members)
     and the RUNTIME places it -- the coordinator is not relied on to copy it. An answer
-    the coordinator already reproduced (whitespace aside) is left alone, so nothing is
-    ever duplicated; one it paraphrased or dropped is appended, labelled, in forward
-    order. Nothing forwarded -> `content` returned untouched, so a run that never calls
-    the tool behaves exactly as before. Same append-never-substitute rule as
-    render_member_findings.
+    the coordinator already carries (see _forwarded_text_carried: verbatim, or, for a
+    list, every item present) is left alone, so nothing is duplicated; one it paraphrased
+    or dropped is appended in full, labelled, in forward order. Nothing forwarded ->
+    `content` returned untouched, so a run that never calls the tool behaves exactly as
+    before. Same append-never-substitute rule as render_member_findings.
     """
     forwarded = getattr(team, "_forwarded_members", None)
     if not isinstance(forwarded, dict) or not forwarded:
@@ -1600,9 +1667,8 @@ def _with_forwarded_evidence(content: str, team) -> str:
     if (not content or not _strip_leaked_tool_tags(content).strip()
             or content.strip() == _BUDGET_EXHAUSTED_ANSWER):
         return content
-    have = _squash_ws(content)
     missing = [(k, t) for k, t in forwarded.items()
-               if t and t.strip() and _squash_ws(t) not in have]
+               if t and t.strip() and not _forwarded_text_carried(t, content)]
     if not missing:
         return content
     print(f"[team] forwarded answer(s) not carried by the final answer -- appending "
@@ -1649,7 +1715,10 @@ def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = N
     # writing.
     @agno_tool
     async def forward_member_answer(member_id: str) -> str:
-        """Return one member's answer EXACTLY as that member wrote it.
+        """Deliver one member's answer to the reader EXACTLY as that member wrote it.
+
+        Returns a short receipt, not the text: the system places the member's text in
+        your final answer itself, so there is nothing to copy.
 
         Use this instead of restating a member's findings in your own words whenever the
         answer is a list, an enumeration, or a set of file paths, names or line numbers.
@@ -1658,7 +1727,7 @@ def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = N
 
         Forward as many members' answers as the task needs, then add only what is
         genuinely yours: the ordering, the connective explanation, and anything the
-        members did not cover. Do not paraphrase what you forward.
+        members did not cover. Do not re-list or paraphrase what you forward.
 
         Args:
             member_id: the member whose answer to forward, e.g. "researcher".
