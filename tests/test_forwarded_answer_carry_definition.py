@@ -1,21 +1,21 @@
-"""What counts as a forwarded member answer being "carried" by the final answer.
+"""Forwarded member evidence is preserved LINE BY LINE, with no judgement about meaning.
 
-Two live runs of forward_member_answer showed the Coordinator retyping the Researcher's
-24-file list under different surrounding prose. Whole-string containment called the member
-answer "not carried" and appended all of it, so the list appeared twice.
+Live runs of forward_member_answer showed the Coordinator retyping the Researcher's 24-file
+list under different surrounding prose. Whole-string containment then appended the entire
+member answer (list twice); later heuristics tried to decide which prose was harmless, and
+that cannot be made reliable ("Everything in here is bleeding-edge and unsupported." has no
+cue word and carries information).
 
-A forwarded answer is carried when it appears verbatim (whitespace, backticks and asterisks
-aside) or when it is LIST-SHAPED and the answer carries the list. The primary invariant is
-that nothing a member said may silently disappear, so "list-shaped" is a strict definition:
+The invariant now: EVERY line of a forwarded member answer is either represented in the final
+answer or appended verbatim, and a carried list item is never repeated.
 
-  * at least 3 contiguous item lines, ignoring blank lines and Markdown code fences;
-  * a header line (a path and/or "N items") only directly against the list, with a correct N;
-  * prose only before the first / after the last item, in a bounded amount;
-  * every prose line INERT: no digit but the item count, no number word, no source file,
-    no negation / caveat / quantity / obligation / change word, and any path or identifier it
-    names must appear in the answer too.
-
-Anything else is not a list, and the member's text is appended in full.
+  * an item line (bare bullet/number/[FILE]/[DIR]/backticked path or identifier) is
+    represented if the item appears in the answer as a whole token;
+  * every other line is represented only if it appears verbatim (whitespace, backticks and
+    asterisks aside) -- no vocabulary, no thresholds, no "is this prose harmless" decision;
+  * blank lines and code-fence markers are ignored;
+  * a member answer that is not a list (fewer than 3 item lines) is carried whole or appended
+    whole; a list none of whose lines is present is appended whole.
 """
 import re
 from types import SimpleNamespace
@@ -24,9 +24,7 @@ import pytest
 
 from swarm import team as team_mod
 from swarm.team import (
-    _MAX_FRAMING_CHARS, _MAX_FRAMING_LINES, _forwarded_text_carried, _header_counts,
-    _list_items_if_list_shaped, _list_shape, _make_forward_member_answer,
-    _with_forwarded_evidence,
+    _BARE_ITEM_LINE_RE, _forwarded_gap, _make_forward_member_answer, _with_forwarded_evidence,
 )
 
 DIR = "API/inventory-service/router/"
@@ -39,376 +37,365 @@ FILES = [
     "stock_transactions_api.py", "supplier_items_api.py", "tally_import_api.py",
     "uom_api.py", "vouchers_api.py",
 ]
+BULLETS = "\n".join(f"- `{f}`" for f in FILES)
+INTRO1 = (f"The directory `{DIR}` contains 24 files, each corresponding to a different API "
+          "endpoint or functionality within the inventory service. Here is the list of files:")
 CLOSE1 = ("Each file likely defines routes and handlers for a specific aspect of the inventory "
           "service, such as managing items, categories, suppliers, and stock transactions.")
 CLOSE2 = CLOSE1 + " If you need details about a specific API file, I can read its contents for you."
-BULLETS = "\n".join(f"- `{f}`" for f in FILES)
+INTRO2 = (f"The `{DIR}` directory contains 24 files, each corresponding to a different API "
+          "endpoint or functionality within the inventory service. Here is the raw output from "
+          "the directory listing:")
+HEADER2 = f"{DIR}  (24 items):"
+INTRO3 = f"Here are the files in the `{DIR}` directory:"
+CLOSE3 = "There are 24 files in total."
 
-# The two REAL Researcher answers from the live validation runs, byte for byte.
-RUN1_MEMBER = (
-    f"The directory `{DIR}` contains 24 files, each corresponding to a different API endpoint "
-    "or functionality within the inventory service. Here is the list of files:\n\n"
-    + BULLETS + "\n\n" + CLOSE1)
-RUN2_MEMBER = (
-    f"The `{DIR}` directory contains 24 files, each corresponding to a different API endpoint "
-    "or functionality within the inventory service. Here is the raw output from the directory "
-    f"listing:\n\n```\n{DIR}  (24 items):\n"
-    + "\n".join(f"[FILE] {f}" for f in FILES) + "\n```\n\n" + CLOSE2)
-# The two REAL Coordinator answers that followed them (before anything was appended).
-RUN1_COORD = (
-    f"The directory `{DIR}` contains the following 24 files, each corresponding to a "
-    "different API endpoint or functionality within the inventory service:\n\n" + BULLETS)
-RUN2_COORD = (
-    f"The `{DIR}` directory contains the following 24 files, each corresponding to a "
-    "different API endpoint or functionality within the inventory service:\n\n"
-    + BULLETS + "\n\n" + CLOSE2)
+# The three REAL Researcher answers and the REAL Coordinator answers that followed them
+# (before anything was appended), from the live validation runs.
+RUN1_MEMBER = INTRO1 + "\n\n" + BULLETS + "\n\n" + CLOSE1
+RUN2_MEMBER = (INTRO2 + f"\n\n```\n{HEADER2}\n" + "\n".join(f"[FILE] {f}" for f in FILES)
+               + "\n```\n\n" + CLOSE2)
+RUN3_MEMBER = INTRO3 + "\n\n" + BULLETS + "\n\n" + CLOSE3
+RUN1_COORD = (f"The directory `{DIR}` contains the following 24 files, each corresponding to a "
+              "different API endpoint or functionality within the inventory service:\n\n" + BULLETS)
+RUN2_COORD = (f"The `{DIR}` directory contains the following 24 files, each corresponding to a "
+              "different API endpoint or functionality within the inventory service:\n\n"
+              + BULLETS + "\n\n" + CLOSE2)
+RUN3_COORD = (f"Here are the files directly inside the `{DIR}` directory:\n\n" + BULLETS
+              + "\n\n" + CLOSE3)
 
 
 def _fwd(**members):
     return SimpleNamespace(_forwarded_members=members)
 
 
-def _coord(items=FILES, fmt="- `{f}`", path=True, intro="Router files"):
+def _coord(items=FILES, fmt="- `{f}`", intro="Router files", path=True):
     body = "\n".join(fmt.format(f=f, n=i) for i, f in enumerate(items, 1))
-    return f"{intro}" + (f" in `{DIR}`" if path else "") + ":\n\n" + body
+    return intro + (f" in `{DIR}`" if path else "") + ":\n\n" + body
 
 
-def _member(prose_before="", prose_after="", items=FILES, fmt="- `{f}`"):
+def _member(before="", after="", items=FILES, fmt="- `{f}`"):
     body = "\n".join(fmt.format(f=f, n=i) for i, f in enumerate(items, 1))
-    return "\n\n".join(p for p in (prose_before, body, prose_after) if p)
+    return "\n\n".join(p for p in (before, body, after) if p)
 
 
-def _appends(content, member):
-    """True if the runtime appends the member's text to `content`."""
-    return "FORWARDED FROM THE MEMBERS" in _with_forwarded_evidence(
-        content, _fwd(researcher=member))
+def _appended(content, member, key="researcher"):
+    """The text the runtime appends after `content` for one forwarded member ('' if none)."""
+    out = _with_forwarded_evidence(content, _fwd(**{key: member}))
+    assert out.startswith(content)
+    return out[len(content):]
 
 
-def _prose(n):
-    """One inert prose line of exactly n characters."""
-    text = ("alpha beta gamma delta " * (n // 10 + 2))[:n].rstrip()
-    return text + "x" * (n - len(text))
+def _lines_appended(content, member):
+    """The member lines appended in 'lines' mode, or None if another mode applied."""
+    tail = _appended(content, member)
+    marker = "(only the lines the answer above does not contain)\n"
+    return tail.split(marker, 1)[1].split("\n") if marker in tail else None
 
 
-# ── POSITIVE: real fixtures ──────────────────────────────────────────────────────────────
-
-def test_run1_real_member_answer_is_list_shaped_and_carried_by_the_real_coordinator_answer():
-    assert _list_items_if_list_shaped(RUN1_MEMBER) == FILES
-    assert not _appends(RUN1_COORD, RUN1_MEMBER)
-    assert _with_forwarded_evidence(RUN1_COORD, _fwd(researcher=RUN1_MEMBER)) == RUN1_COORD
+def _tok(text, name):
+    """How many times `name` appears in `text` as a whole token (not inside a longer name)."""
+    return len(re.findall(rf"(?<![\w./-]){re.escape(name)}(?![\w-])", text))
 
 
-def test_run2_real_member_answer_with_code_fences_is_list_shaped_and_carried():
-    assert _list_items_if_list_shaped(RUN2_MEMBER) == FILES
-    assert not _appends(RUN2_COORD, RUN2_MEMBER)
-    assert _with_forwarded_evidence(RUN2_COORD, _fwd(researcher=RUN2_MEMBER)) == RUN2_COORD
+def _every_line_represented(final, member):
+    """The invariant: each non-blank, non-fence member line is in `final` (items by whole
+    token, everything else verbatim)."""
+    have = re.sub(r"\s+", " ", re.sub(r"[`*]", "", final))
+    for raw in member.splitlines():
+        line = raw.strip()
+        if not line or re.match(r"^(?:`{3,}|~{3,})[\w+-]*$", line):
+            continue
+        m = _BARE_ITEM_LINE_RE.match(line)
+        if m:
+            assert re.search(rf"(?<![\w./-]){re.escape(m.group('item'))}(?![\w-])", final), line
+        else:
+            assert re.sub(r"\s+", " ", re.sub(r"[`*]", "", line)).strip() in have, line
 
 
-def test_the_real_answers_prose_lengths_are_within_the_cap_with_the_header_not_counted():
-    for member, expected in ((RUN1_MEMBER, 348), (RUN2_MEMBER, 452)):
-        prose = [ln.strip() for ln in member.splitlines()
-                 if ln.strip() and not re.match(r"^(`{3}|- |\[FILE\])", ln.strip())
-                 and _header_counts(ln.strip()) is None]
-        assert sum(map(len, prose)) == expected <= _MAX_FRAMING_CHARS
-    assert _MAX_FRAMING_CHARS == 460 and _MAX_FRAMING_LINES == 3
+# ── complete carry ───────────────────────────────────────────────────────────────────────
 
-
-def test_each_real_member_answer_is_carried_by_the_other_runs_coordinator_answer():
-    assert not _appends(RUN2_COORD, RUN1_MEMBER)
-    assert not _appends(RUN1_COORD, RUN2_MEMBER)
-
-
-def test_exact_member_text_appends_nothing():
-    for member in (RUN1_MEMBER, RUN2_MEMBER):
+def test_exact_full_text_containment_appends_nothing():
+    for member in (RUN1_MEMBER, RUN2_MEMBER, RUN3_MEMBER, "The auth service signs tokens."):
         content = "Here you go:\n\n" + member + "\n\nAnything else?"
         assert _with_forwarded_evidence(content, _fwd(researcher=member)) == content
 
 
-# ── POSITIVE: formats ────────────────────────────────────────────────────────────────────
-
-@pytest.mark.parametrize("fmt", ["- `{f}`", "* {f}", "- {f}", "• {f}", "{n}. {f}", "{n}) {f}",
-                                 "[FILE] {f}", "`{f}`", "{f}", "  -   {f}  ", "\t{f}"])
-def test_bullet_number_tag_backtick_and_whitespace_variants_are_list_shaped(fmt):
-    member = _member("Router files:", "That is all.", fmt=fmt)
-    assert _list_items_if_list_shaped(member) == FILES, fmt
-    assert not _appends(_coord(), member), fmt
+def test_every_member_line_carried_by_a_reformatted_answer_appends_nothing():
+    member = f"{INTRO3}\n\n{BULLETS}\n\n{CLOSE3}"
+    content = f"{INTRO3}\n" + "\n".join(f"{i}. {f}" for i, f in enumerate(FILES, 1)) + f"\n{CLOSE3}"
+    assert _forwarded_gap(member, content) == ("carried", [])
+    assert _with_forwarded_evidence(content, _fwd(researcher=member)) == content
 
 
-def test_dir_and_file_tagged_items_are_supported():
-    items = ["static/", "router/", "main.py", "app_config.py"]
-    member = "\n".join(["[DIR] static/", "[DIR] router/", "[FILE] main.py", "[FILE] app_config.py"])
-    assert _list_items_if_list_shaped(member) == items
-    assert not _appends("static/ router/ main.py app_config.py", member)
+@pytest.mark.parametrize("member,coord,expected_lines", [
+    (RUN1_MEMBER, RUN1_COORD, [INTRO1, CLOSE1]),
+    (RUN2_MEMBER, RUN2_COORD, [INTRO2, HEADER2]),
+    (RUN3_MEMBER, RUN3_COORD, [INTRO3]),
+], ids=["run1", "run2", "run3"])
+def test_real_live_runs_list_appears_once_and_only_the_missing_lines_are_appended(
+        member, coord, expected_lines):
+    out = _with_forwarded_evidence(coord, _fwd(researcher=member))
+    assert _tok(out, "__init__.py") == 1 and _tok(out, "vouchers_api.py") == 1
+    assert _lines_appended(coord, member) == expected_lines
+    assert len(out) - len(coord) < len(member)                # never a whole-answer copy
+    _every_line_represented(out, member)
 
 
-def test_blank_lines_between_items_and_crlf_line_endings_are_fine():
-    member = "\r\n\r\n".join(f"- {f}" for f in FILES[:6])
-    assert _list_items_if_list_shaped(member) == FILES[:6]
-    assert _list_items_if_list_shaped("\n\n".join(f"- {f}" for f in FILES[:6])) == FILES[:6]
+# ── missing prose ────────────────────────────────────────────────────────────────────────
+
+def test_list_carried_but_intro_omitted_appends_the_intro_verbatim():
+    member = _member("Here are the router files, grouped by domain:", "")
+    assert _lines_appended(_coord(), member) == ["Here are the router files, grouped by domain:"]
 
 
-@pytest.mark.parametrize("fence", ["```", "```text", "```plaintext", "``` ", "~~~", "````"])
-def test_standalone_code_fence_markers_are_ignored_whatever_their_language_tag(fence):
-    member = f"{fence.strip()}\n" + "\n".join(f"[FILE] {f}" for f in FILES[:5]) + f"\n{fence.strip()[:3]}"
-    assert _list_items_if_list_shaped(member) == FILES[:5]
+def test_list_carried_but_closing_omitted_appends_the_closing_verbatim():
+    member = _member("", "That is every file in the directory.")
+    assert _lines_appended(_coord(), member) == ["That is every file in the directory."]
 
 
-def test_a_header_directly_against_the_list_is_structure_not_prose():
-    for header in (f"{DIR}  (24 items):", f"`{DIR}`:", "(24 items)"):
-        member = f"```\n{header}\n" + "\n".join(f"[FILE] {f}" for f in FILES) + "\n```"
-        assert _list_items_if_list_shaped(member) == FILES, header
-    trailing = "\n".join(f"- {f}" for f in FILES) + f"\n{DIR}  (24 items)"
-    assert _list_items_if_list_shaped(trailing) == FILES
+def test_list_carried_but_caveat_omitted_appends_the_caveat_verbatim():
+    member = _member("", "Note: three of these are deprecated.")
+    assert _lines_appended(_coord(), member) == ["Note: three of these are deprecated."]
 
 
-def test_a_bare_path_line_is_an_item_so_it_must_be_carried_not_ignored():
-    member = f"{DIR}\n" + "\n".join(f"- {f}" for f in FILES)
-    assert _list_items_if_list_shaped(member) == [DIR] + FILES
-    assert _appends("\n".join(FILES), member)                 # path not mentioned -> append
-    assert not _appends(f"{DIR}\n" + "\n".join(FILES), member)
+# Vocabulary must not affect correctness: cue words or none, content-bearing or decorative,
+# every absent prose line is appended.
+PROSE = [
+    "Everything in here is bleeding-edge and unsupported.",          # no cue word
+    "Each file likely defines routes and handlers for a specific aspect of the service.",
+    "Only the Python files are listed; hidden files are excluded.",  # cue words
+    "Note: three of these are deprecated.",
+    "There are 30 files in total.",
+    "There are 24 files in total.",                                  # restates the count
+    "You should read stock_api.py first.",
+    "Thanks!",
+    "Here you go:",
+    "Most were recently modified, however the last two were not.",
+]
 
 
-def test_different_intro_and_closing_prose_with_every_item_present_is_not_appended():
-    member = RUN2_MEMBER
-    for content in (
-        _coord(intro="Sure. The files are"),
-        _coord(intro="Here they are") + "\n\nLet me know if you want more.",
-        "\n".join(FILES) + f"\n(all under {DIR})",
-    ):
-        assert not _appends(content, member), content
+@pytest.mark.parametrize("sentence", PROSE)
+@pytest.mark.parametrize("where", ["before", "after"])
+def test_any_absent_prose_line_is_appended_whatever_it_says(sentence, where):
+    member = _member(before=sentence) if where == "before" else _member(after=sentence)
+    assert _lines_appended(_coord(), member) == [sentence]
+    _every_line_represented(_with_forwarded_evidence(_coord(), _fwd(researcher=member)), member)
 
 
-def test_inert_closing_prose_is_dropped_by_design():
-    """Pins the accepted trade-off: a sentence with no cue word is decoration."""
-    assert not _appends(_coord(), RUN1_MEMBER)          # closing sentence not reproduced
+@pytest.mark.parametrize("sentence", PROSE)
+def test_a_prose_line_the_answer_already_contains_is_not_appended(sentence):
+    member = _member(after=sentence)
+    assert _with_forwarded_evidence(_coord() + "\n\n" + sentence, _fwd(researcher=member)) \
+        == _coord() + "\n\n" + sentence
 
 
-# ── NEGATIVE: the list itself ────────────────────────────────────────────────────────────
+def test_each_absent_prose_line_is_appended_and_a_carried_one_is_not():
+    member = _member("First intro line.", "Closing line one.\nClosing line two.")
+    content = _coord() + "\n\nClosing line one."
+    assert _lines_appended(content, member) == ["First intro line.", "Closing line two."]
 
-def test_one_missing_item_appends_the_full_member_answer():
+
+def test_appended_lines_keep_the_members_order():
+    member = "Alpha intro.\n" + BULLETS + "\nBeta middle.\nGamma end."
+    assert _lines_appended(_coord(), member) == ["Alpha intro.", "Beta middle.", "Gamma end."]
+
+
+# ── missing items ────────────────────────────────────────────────────────────────────────
+
+def test_one_missing_item_is_appended_alone_and_carried_items_are_not_repeated():
     content = _coord(items=[f for f in FILES if f != "vouchers_api.py"])
-    out = _with_forwarded_evidence(content, _fwd(researcher=RUN2_MEMBER))
-    assert out.startswith(content)
-    assert out.endswith(RUN2_MEMBER.strip())
-    assert "vouchers_api.py" in out.split("### From researcher\n", 1)[1]
+    out = _with_forwarded_evidence(content, _fwd(researcher=RUN3_MEMBER))
+    assert _lines_appended(content, RUN3_MEMBER) == [INTRO3, "- `vouchers_api.py`", CLOSE3]
+    assert _tok(out, "vouchers_api.py") == 1 and _tok(out, "__init__.py") == 1
+    _every_line_represented(out, RUN3_MEMBER)
+
+
+def test_multiple_missing_items_are_all_appended_and_none_repeated():
+    content = _coord(items=FILES[:20])
+    appended = _lines_appended(content, RUN3_MEMBER)
+    assert [ln for ln in appended if ln.startswith("- ")] == [f"- `{f}`" for f in FILES[20:]]
+    out = _with_forwarded_evidence(content, _fwd(researcher=RUN3_MEMBER))
+    assert all(_tok(out, f) == 1 for f in FILES)
+    _every_line_represented(out, RUN3_MEMBER)
 
 
 @pytest.mark.parametrize("dropped", range(24))
-def test_dropping_any_single_item_is_always_detected(dropped):
+def test_dropping_any_single_item_never_loses_it(dropped):
     content = _coord(items=[f for i, f in enumerate(FILES) if i != dropped])
-    for member in (RUN1_MEMBER, RUN2_MEMBER):
+    for member in (RUN1_MEMBER, RUN2_MEMBER, RUN3_MEMBER):
         out = _with_forwarded_evidence(content, _fwd(researcher=member))
-        assert out.endswith(member.strip()), FILES[dropped]        # nothing silently lost
-        assert FILES[dropped] in out.split("### From researcher\n", 1)[1]
+        assert _tok(out, FILES[dropped]) == 1
+        _every_line_represented(out, member)
 
 
-def test_multiple_missing_items_append_the_full_member_answer():
-    out = _with_forwarded_evidence(_coord(items=FILES[:12]), _fwd(researcher=RUN1_MEMBER))
-    assert out.endswith(RUN1_MEMBER.strip())
-    for f in FILES[12:]:
-        assert f in out.split("### From researcher\n", 1)[1]
+def test_missing_items_and_missing_prose_together_lose_nothing():
+    member = _member("Intro.", "Closing.")
+    content = _coord(items=FILES[::2])
+    out = _with_forwarded_evidence(content, _fwd(researcher=member))
+    _every_line_represented(out, member)
+    assert all(_tok(out, f) == 1 for f in FILES)
 
 
-def test_unrelated_answer_appends_the_full_member_answer():
-    out = _with_forwarded_evidence("I could not determine that.", _fwd(researcher=RUN2_MEMBER))
-    assert out.startswith("I could not determine that.") and out.endswith(RUN2_MEMBER.strip())
+def test_an_answer_that_carries_none_of_a_list_gets_the_whole_member_text():
+    for content in ("I could not determine that.", "Something entirely unrelated."):
+        out = _with_forwarded_evidence(content, _fwd(researcher=RUN2_MEMBER))
+        assert out.endswith("### From researcher\n" + RUN2_MEMBER.strip())
+        assert "only the lines" not in out
 
 
-def test_an_item_must_appear_as_a_whole_token():
+# ── matching correctness ─────────────────────────────────────────────────────────────────
+
+def test_items_match_whole_tokens_only():
     member = "\n".join(["- items_api.py", "- parties_api.py", "- stock_api.py"])
-    assert _appends("inventory_items_api.py all_parties_api.py xstock_api.py", member)
-    assert _appends("items_api.py.bak parties_api.py stock_api.pyc", member)
-    assert not _appends("items_api.py, parties_api.py, and stock_api.py.", member)
+    for content in ("inventory_items_api.py all_parties_api.py xstock_api.py",
+                    "items_api.py.bak parties_api.py stock_api.pyc"):
+        assert _forwarded_gap(member, content)[0] != "carried"
+    assert _forwarded_gap(member, "items_api.py, parties_api.py, and stock_api.py.") == ("carried", [])
 
 
-def test_a_bare_token_line_that_looks_like_an_item_but_is_a_message_must_still_be_carried():
-    """A line that merely LOOKS like a filename is treated as an item, so if the Coordinator
-    drops it the member's text is appended rather than the line being silently lost."""
+def test_items_api_does_not_match_inventory_items_api():
+    member = "\n".join(["- items_api.py", "- parties_api.py", "- stock_api.py"])
+    mode, lines = _forwarded_gap(member, "inventory_items_api.py parties_api.py stock_api.py")
+    assert mode == "lines" and lines == ["- items_api.py"]
+
+
+@pytest.mark.parametrize("fmt", ["- `{f}`", "* {f}", "- {f}", "• {f}", "{n}. {f}", "{n}) {f}",
+                                 "[FILE] {f}", "`{f}`", "{f}", "  -   {f}  ", "\t{f}"])
+def test_bullet_number_tag_backtick_and_whitespace_variants_are_all_items(fmt):
+    member = _member(items=FILES, fmt=fmt)
+    assert _forwarded_gap(member, _coord()) == ("carried", [])
+    assert _forwarded_gap(_member(), _coord(fmt=fmt)) == ("carried", [])
+
+
+def test_dir_and_file_tags_and_crlf_and_blank_lines_are_supported():
+    member = "\r\n\r\n".join(["[DIR] static/", "[DIR] router/", "[FILE] main.py", "[FILE] app_config.py"])
+    assert _forwarded_gap(member, "static/ router/ main.py app_config.py") == ("carried", [])
+    mode, lines = _forwarded_gap(member, "static/ router/ main.py")
+    assert mode == "lines" and lines == ["[FILE] app_config.py"]
+
+
+@pytest.mark.parametrize("fence", ["```", "```text", "```plaintext", "~~~", "````"])
+def test_code_fence_markers_are_ignored_never_appended(fence):
+    member = f"{fence}\n" + "\n".join(f"[FILE] {f}" for f in FILES[:5]) + f"\n{fence[:3]}"
+    assert _forwarded_gap(member, "\n".join(FILES[:4]))[1] == ["[FILE] " + FILES[4]]
+    assert _forwarded_gap(member, "\n".join(FILES[:5])) == ("carried", [])
+
+
+def test_prose_that_merely_mentions_a_file_is_not_an_item():
+    member = _member(after="See items_api.py for the details.")
+    mode, lines = _forwarded_gap(member, _coord())
+    assert (mode, lines) == ("lines", ["See items_api.py for the details."])
+    # ...and mentioning the file in the answer does not count as carrying the sentence
+    assert _forwarded_gap(member, _coord() + "\nitems_api.py")[1] == ["See items_api.py for the details."]
+
+
+def test_a_bare_token_line_that_is_really_a_message_is_still_carried_or_appended():
     member = "\n".join(["- a_one.py", "- b_two.py", "- c_three.py", "- IMPORTANT-read-first"])
-    assert _list_items_if_list_shaped(member)[-1] == "IMPORTANT-read-first"
-    assert _appends("a_one.py b_two.py c_three.py", member)
-    assert not _appends("a_one.py b_two.py c_three.py IMPORTANT-read-first", member)
+    assert _forwarded_gap(member, "a_one.py b_two.py c_three.py") == ("lines", ["- IMPORTANT-read-first"])
+    assert _forwarded_gap(member, "a_one.py b_two.py c_three.py IMPORTANT-read-first")[0] == "carried"
 
 
-# ── NEGATIVE: not a list ─────────────────────────────────────────────────────────────────
+# ── non-list responses stay safe ─────────────────────────────────────────────────────────
 
-def test_fewer_than_three_items_is_not_a_list():
-    assert _list_shape("- a_b.py\n- c_d.py") is None
-    assert _appends("a_b.py", "- a_b.py\n- c_d.py")
-
-
-def test_plain_prose_is_never_a_list_and_needs_exact_containment():
+def test_ordinary_prose_is_carried_whole_or_appended_whole():
     member = ("The auth service signs tokens with HS256 and rotates the key every 24 hours. "
               "Refresh tokens live in Redis under auth_refresh keys.")
-    assert _list_shape(member) is None
-    assert _appends("Tokens are HS256-signed and the key rotates daily; refresh tokens are in Redis.", member)
-    assert not _appends("Summary: " + member, member)
+    assert _forwarded_gap(member, "Summary: " + member) == ("carried", [])
+    paraphrase = "Tokens are HS256-signed and rotate daily; refresh tokens are in Redis."
+    assert _forwarded_gap(member, paraphrase) == ("full", [])
+    assert _appended(paraphrase, member).endswith("### From researcher\n" + member)
 
 
-def test_prose_that_merely_mentions_files_is_not_a_list():
-    member = "Look at items_api.py, parties_api.py and stock_api.py; they hold the routes."
-    assert _list_shape(member) is None
-    assert _appends("items_api.py parties_api.py stock_api.py", member)
+def test_prose_with_two_or_fewer_item_lines_is_not_treated_as_a_list():
+    member = "Intro sentence.\n- a_b.py\n- c_d.py\nClosing sentence."
+    assert _forwarded_gap(member, "a_b.py c_d.py Intro sentence.") == ("full", [])
+    assert _forwarded_gap(member, "Intro sentence.\n- a_b.py\n- c_d.py\nClosing sentence.")[0] == "carried"
+    assert _appended("nothing", member).endswith(member)
 
 
-def test_annotated_item_lines_are_not_reduced_to_their_names():
-    member = "\n".join(f"- items_api.py: {d}" for d in ("items", "a", "b", "c"))
-    assert _list_shape(member) is None
-    annotated_names = "\n".join(f"- {f} - handles {n}" for f, n in
-                                [("a_one.py", "auth"), ("b_two.py", "billing"), ("c_three.py", "stock")])
-    assert _list_shape(annotated_names) is None
-    assert _appends("a_one.py b_two.py c_three.py", annotated_names)
+def test_annotated_items_are_non_item_lines_and_are_never_reduced_to_names():
+    member = "\n".join(["- a_one.py: handles auth", "- b_two.py: handles billing",
+                        "- c_three.py: handles stock"])
+    assert _forwarded_gap(member, "a_one.py b_two.py c_three.py") == ("full", [])
+    assert _appended("a_one.py b_two.py c_three.py", member).endswith(member)
+    mixed = "\n".join(["- a_one.py", "- b_two.py", "- c_three.py", "- d_four.py: handles auth"])
+    assert _forwarded_gap(mixed, "a_one.py b_two.py c_three.py d_four.py") == \
+        ("lines", ["- d_four.py: handles auth"])
 
 
-def test_prose_interleaved_between_items_disqualifies_the_list():
-    member = "\n".join(["- alpha_one.py", "- Party: person record", "- beta_two.py",
-                        "- gamma_three.py", "- delta_four.py"])
-    assert _list_shape(member) is None
-    assert _appends("alpha_one.py beta_two.py gamma_three.py delta_four.py", member)
-    inserted = "\n".join(FILES[:12] + ["That was the first half."] + FILES[12:])
-    assert _list_shape(inserted) is None
+# ── multiple members ─────────────────────────────────────────────────────────────────────
+
+def test_each_forwarded_member_is_handled_independently():
+    other = "The reviewer found a race condition in the stock update path."
+    out = _with_forwarded_evidence(_coord(), _fwd(researcher=RUN3_MEMBER, reviewer=other))
+    assert out.startswith(_coord())
+    assert "### From researcher (only the lines the answer above does not contain)" in out
+    assert "### From reviewer\n" + other in out
+    assert out.count("**FORWARDED FROM THE MEMBERS") == 1
+    assert out.index("### From researcher") < out.index("### From reviewer")
+    assert out.count("__init__.py") == 1
 
 
-def test_a_header_among_the_items_or_away_from_them_disqualifies_the_list():
-    among = "\n".join([f"- {f}" for f in FILES[:6]] + [f"{DIR}  (24 items):"] + [f"- {f}" for f in FILES[6:]])
-    assert _list_shape(among) is None
-    away = f"{DIR}  (24 items):\nSome intro text here.\n" + "\n".join(f"- {f}" for f in FILES)
-    assert _list_shape(away) is None
-
-
-def test_two_headers_or_a_wrong_count_in_the_header_disqualify_the_list():
-    body = "\n".join(f"- {f}" for f in FILES)
-    assert _list_shape(f"{DIR}\n(24 items):\n{body}") is None
-    assert _list_shape(f"{DIR}  (30 items):\n{body}") is None
-    assert _list_shape(f"{DIR}  (24 items):\n{body}") is not None
-
-
-# ── NEGATIVE: information in the framing prose must never disappear ─────────────────────
-
-MEANINGFUL_FRAMING = {
-    "qualification (only/excluded)": ("Only the Python files are listed; hidden files are excluded.", ""),
-    "caveat after the list": ("", "Note: three of these are deprecated."),
-    "contrast": ("", "The list is complete, however the last entries are not routers."),
-    "negation": ("", "None of these files define models."),
-    "contraction of not": ("", "This listing doesn't include subdirectories."),
-    "count that is not the item count": ("", "There are 30 files in total, 24 shown."),
-    "count word": ("The last three are experimental.", ""),
-    "incomplete claim": ("", "There are some more files further down."),
-    "warning": ("", "Warning: parties_api.py is unfinished."),
-    "obligation": ("", "You should read stock_api.py first."),
-    "change over time": ("", "Most were recently modified."),
-    "source file named in prose": ("", "The routers are mounted from main.py."),
-    "wrong count in the intro": ("The directory contains 30 files. Here is the list:", ""),
-}
-
-
-@pytest.mark.parametrize("name", sorted(MEANINGFUL_FRAMING))
-def test_meaningful_framing_disqualifies_the_list_and_the_member_text_is_appended_whole(name):
-    before, after = MEANINGFUL_FRAMING[name]
-    member = _member(before, after)
-    assert _list_shape(member) is None, name
-    out = _with_forwarded_evidence(_coord(), _fwd(researcher=member))
-    assert out.endswith(member.strip()), name
-    for sentence in (before, after):
-        if sentence:
-            assert sentence in out.split("### From researcher\n", 1)[1], name
-
-
-def test_framing_that_names_an_identifier_the_answer_does_not_carry_is_appended():
-    member = _member(f"The routers live under `{DIR}`, mounted at /inventory/v2/.")
-    assert _list_shape(member) is not None                        # inert on its own
-    assert _appends(_coord(path=True), member)                    # /inventory/v2/ not carried
-    assert not _appends(_coord(path=True) + "\n(mounted at /inventory/v2/)", member)
-
-
-def test_framing_at_the_cap_is_accepted_and_one_character_more_is_not():
-    at, over = _prose(_MAX_FRAMING_CHARS), _prose(_MAX_FRAMING_CHARS + 1)
-    assert _list_shape(_member(at)) is not None
-    assert _list_shape(_member(over)) is None
-    assert _appends(_coord(), _member(over)) and not _appends(_coord(), _member(at))
-
-
-def test_the_cap_is_on_prose_in_total_across_lines():
-    half = _MAX_FRAMING_CHARS // 2
-    assert _list_shape(_member(_prose(half), _prose(_MAX_FRAMING_CHARS - half))) is not None
-    assert _list_shape(_member(_prose(half), _prose(_MAX_FRAMING_CHARS - half + 1))) is None
-
-
-def test_prose_line_count_boundary():
-    lines = [f"Alpha beta gamma {chr(97 + i) * 4}." for i in range(_MAX_FRAMING_LINES + 1)]
-    ok = "\n".join(lines[:_MAX_FRAMING_LINES]) + "\n" + BULLETS
-    too_many = "\n".join(lines) + "\n" + BULLETS
-    assert _list_shape(ok) is not None
-    assert _list_shape(too_many) is None
-
-
-def test_long_framing_prose_with_a_complete_list_still_appends_everything():
-    long_intro = " ".join(["The directory holds the API routers for the inventory service."] * 12)
-    member = _member(long_intro)
-    assert len(long_intro) > _MAX_FRAMING_CHARS
-    out = _with_forwarded_evidence(_coord(), _fwd(researcher=member))
-    assert out.endswith(member.strip())
-
-
-def test_items_must_dominate_the_framing_lines_three_to_one():
-    member = "Alpha beta.\nGamma delta.\n- a_one.py\n- b_two.py\n- c_three.py"
-    assert _list_shape(member) is None                   # 3 items vs 2 prose lines
-    assert _list_shape("Alpha beta.\n- a_one.py\n- b_two.py\n- c_three.py") is not None
-
-
-# ── multiple forwarded members ───────────────────────────────────────────────────────────
-
-def test_each_forwarded_member_is_judged_independently():
-    other = "The reviewer found a race condition in the stock update path and nothing else."
-    out = _with_forwarded_evidence(_coord(), _fwd(researcher=RUN2_MEMBER, reviewer=other))
-    assert out.startswith(_coord()) and "### From reviewer" in out and other in out
-    assert "### From researcher" not in out                       # carried by its items
-
-    reviewer_only = other
-    out2 = _with_forwarded_evidence(reviewer_only, _fwd(researcher=RUN2_MEMBER, reviewer=other))
-    assert "### From researcher" in out2 and "### From reviewer" not in out2
-    assert out2.index("### From researcher") == out2.rindex("### From researcher")
-
-
-def test_two_list_members_are_each_checked_against_their_own_items():
+def test_a_carried_member_is_left_alone_while_another_is_appended():
     a = "\n".join(["- a_one.py", "- a_two.py", "- a_three.py"])
     b = "\n".join(["- b_one.py", "- b_two.py", "- b_three.py"])
-    out = _with_forwarded_evidence("a_one.py a_two.py a_three.py b_one.py", _fwd(alpha=a, beta=b))
-    assert "### From beta" in out and "### From alpha" not in out
-    both = _with_forwarded_evidence("a_one.py a_two.py a_three.py b_one.py b_two.py b_three.py",
-                                    _fwd(alpha=a, beta=b))
-    assert "FORWARDED FROM THE MEMBERS" not in both
+    out = _with_forwarded_evidence("a_one.py a_two.py a_three.py b_one.py",
+                                   _fwd(alpha=a, beta=b))
+    assert "### From alpha" not in out
+    assert _lines_appended("a_one.py a_two.py a_three.py b_one.py", b) == ["- b_two.py", "- b_three.py"]
+    assert "FORWARDED FROM THE MEMBERS" not in _with_forwarded_evidence(
+        "a_one.py a_two.py a_three.py b_one.py b_two.py b_three.py", _fwd(alpha=a, beta=b))
 
 
-# ── regression behaviour ─────────────────────────────────────────────────────────────────
+# ── idempotence ──────────────────────────────────────────────────────────────────────────
 
-def test_the_list_never_appears_twice_and_a_second_pass_changes_nothing():
-    retyped = _coord(fmt="{n}. {f}")
-    once = _with_forwarded_evidence(retyped, _fwd(researcher=RUN2_MEMBER))
-    assert once == retyped and once.count("vouchers_api.py") == 1
-    appended = _with_forwarded_evidence("Nothing useful.", _fwd(researcher=RUN2_MEMBER))
-    assert _with_forwarded_evidence(appended, _fwd(researcher=RUN2_MEMBER)) == appended
-    assert appended.count("__init__.py") == 1
-
-
-def test_backtick_only_difference_on_verbatim_prose_is_carried_but_case_is_not_forgiven():
-    member = "The gate returns ALREADY DONE when a target repeats."
-    assert not _appends("Summary: The gate returns `ALREADY DONE` when a target repeats.", member)
-    assert _appends("Summary: the gate returns ALREADY DONE when a target repeats.", member)
+@pytest.mark.parametrize("content,member", [
+    (RUN1_COORD, RUN1_MEMBER), (RUN2_COORD, RUN2_MEMBER), (RUN3_COORD, RUN3_MEMBER),
+    (_coord(items=FILES[:10]), RUN3_MEMBER), ("Nothing useful.", RUN2_MEMBER),
+    ("Nothing useful.", "A prose answer that is not a list."),
+], ids=["run1", "run2", "run3", "partial", "unrelated-list", "unrelated-prose"])
+def test_applying_it_twice_never_appends_a_line_twice(content, member):
+    team = _fwd(researcher=member)
+    once = _with_forwarded_evidence(content, team)
+    assert _with_forwarded_evidence(once, team) == once
+    assert _with_forwarded_evidence(_with_forwarded_evidence(once, team), team) == once
 
 
-def test_carried_helper_agrees_with_the_public_behaviour():
-    assert _forwarded_text_carried(RUN1_MEMBER, _coord()) is True
-    assert _forwarded_text_carried(RUN1_MEMBER, _coord(items=FILES[:-1])) is False
-    assert _forwarded_text_carried(RUN1_MEMBER, "nothing here") is False
-    assert _forwarded_text_carried(RUN1_MEMBER, _coord(path=False)) is False   # framing names DIR
-
+# ── regression: guards and logging ───────────────────────────────────────────────────────
 
 def test_empty_and_canned_content_are_still_returned_unchanged():
-    team = _fwd(researcher=RUN2_MEMBER)
+    team = _fwd(researcher=RUN3_MEMBER)
     assert _with_forwarded_evidence("", team) == ""
     canned = team_mod._BUDGET_EXHAUSTED_ANSWER
     assert _with_forwarded_evidence(canned, team) == canned
+    leaked = '<tool_call>{"name": "get_file_content", "arguments": {}}</tool_call>'
+    assert _with_forwarded_evidence(leaked, team) == leaked
+
+
+def test_nothing_forwarded_or_nothing_missing_returns_the_same_object_content():
+    assert _with_forwarded_evidence("The answer.", _fwd()) == "The answer."
+    assert _with_forwarded_evidence("The answer.", SimpleNamespace()) == "The answer."
+    assert _with_forwarded_evidence("The answer.", None) == "The answer."
+
+
+def test_the_log_distinguishes_partial_carry_from_not_carried(capsys):
+    _with_forwarded_evidence(RUN3_COORD, _fwd(researcher=RUN3_MEMBER))
+    partial = capsys.readouterr().out
+    assert "forwarded list(s) carried but some of the member's lines are absent" in partial
+    assert "not carried by the final answer" not in partial
+    _with_forwarded_evidence("Unrelated.", _fwd(researcher=RUN3_MEMBER))
+    full = capsys.readouterr().out
+    assert "not carried by the final answer -- appending verbatim: ['researcher']" in full
+    _with_forwarded_evidence(RUN3_MEMBER, _fwd(researcher=RUN3_MEMBER))
+    assert capsys.readouterr().out == ""                      # fully carried: silent
+
+
+def test_the_obsolete_heuristic_machinery_is_gone():
+    for name in ("_QUALIFYING_WORDS", "_inert_prose_identifiers", "_header_counts", "_list_shape",
+                 "_MAX_FRAMING_CHARS", "_MAX_FRAMING_LINES", "_carry_check", "_forwarded_text_carried",
+                 "_list_items_if_list_shaped"):
+        assert not hasattr(team_mod, name), name
 
 
 # ── prompt / tool description ────────────────────────────────────────────────────────────

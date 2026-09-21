@@ -1591,173 +1591,67 @@ _BARE_ITEM_LINE_RE = re.compile(
     r"^\s*(?:[-*•]|\d+[.)])?\s*(?:\[(?:FILE|DIR)\]\s*)?`?"
     r"(?P<item>(?=[^\s`]*[_./-])\w[\w./-]*[\w/])`?\s*[,;]?\s*$")
 _MIN_LIST_ITEMS = 3
-_MAX_FRAMING_LINES = 3
-# Secondary bound on how much prose a list may carry around it. Measured on the two real
-# Researcher answers this exists for: 348 and 452 characters of prose (a header line such as
-# "path  (24 items):" is structure, not prose, and is not counted). 460 is the smallest round
-# value that accepts both. It limits exposure only; what makes prose safe to drop is the
-# inertness test below, not its length.
-_MAX_FRAMING_CHARS = 460
-
+# A line that is only a Markdown code-fence marker. Markup, not content: it says how the
+# text was formatted and nothing about what the member found.
 _FENCE_LINE_RE = re.compile(r"^(?:`{3,}|~{3,})[\w+-]*$")
-_LIST_HEADER_PATH_RE = re.compile(r"[\w.-]*/[\w./-]*")
-_COUNT_RE = re.compile(r"\(?\b(\d+)\s+(?:items?|files?|entries|results?)\b\)?", re.I)
-
-# Words that mean a sentence adds something a list does not say: a negation, exception or
-# contrast, an incomplete or partial claim, a quantity, a warning or state, an obligation, a
-# statement about change. A prose line containing ANY of them is not decorative framing, so a
-# list wrapped in it is not treated as carried on the strength of its items alone. The set is
-# closed and deliberately broad: a word missing from it lets a sentence be dropped, a word
-# too many only costs a full verbatim append.
-_QUALIFYING_WORDS = frozenset(
-    # negation, exception, contrast, restriction
-    "not no none never nor cannot without except excluding exclude excluded unless but "
-    "however although though yet only just instead otherwise "
-    # quantity / incompleteness
-    "some several few many most more others other another remaining rest additional "
-    "additionally also plus else extra total approximately roughly "
-    # numbers spelled out
-    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen "
-    "fifteen sixteen seventeen eighteen nineteen twenty thirty forty fifty sixty seventy "
-    "eighty ninety hundred thousand dozen half couple pair single double twice "
-    # warnings, states, problems
-    "note notice warning warn caution careful beware important deprecated legacy obsolete "
-    "outdated stale unused experimental broken missing omitted skipped ignored hidden "
-    "truncated partial partially incomplete error errors fail failed failure unable unknown "
-    "unclear unverified unconfirmed incorrect invalid todo fixme bug issue issues problem "
-    # obligation
-    "may might should must required recommend recommended avoid "
-    # change over time, ordering
-    "last first final latest newest oldest recent recently modified updated changed added "
-    "removed renamed created deleted".split()
-)
 
 
-def _header_counts(line: str) -> list[int] | None:
-    """[counts] if `line` is a list HEADER -- only a path and/or how many items follow, such
-    as "API/x/router/  (24 items):" -- else None. Anything else on the line makes it prose."""
-    s = line.replace("`", "")
-    counts = [int(n) for n in _COUNT_RE.findall(s)]
-    had_count = bool(counts)
-    s = _COUNT_RE.sub(" ", s)
-    had_path = bool(_LIST_HEADER_PATH_RE.search(s))
-    s = _LIST_HEADER_PATH_RE.sub(" ", s)
-    if re.search(r"[A-Za-z0-9]", s) or not (had_count or had_path):
-        return None
-    return counts
+def _forwarded_gap(text: str, content: str) -> tuple[str, list[str]]:
+    """How much of the forwarded member answer `text` is NOT in `content`.
 
+    Returns (mode, lines):
+      "carried" -- nothing to add;
+      "lines"   -- `text` is a list, some of its lines are absent from `content`; `lines` are
+                   exactly those, verbatim, in the member's order;
+      "full"    -- append the member's whole text.
 
-def _inert_prose_identifiers(line: str, n_items: int) -> list[str] | None:
-    """The identifier tokens `line` names, or None if the line is not inert prose.
-
-    Inert prose says nothing a list of `n_items` does not already say: no digit other than
-    the item count, no word from _QUALIFYING_WORDS, no contraction of "not", no source
-    filename. Identifiers and paths it does name (`API/x/router/`) are returned so the caller
-    can require that the answer names them too.
+    Line by line, with no judgement about what a line means:
+      * an ITEM line (_BARE_ITEM_LINE_RE) is present if its item appears in `content` as a
+        whole token, so `items_api.py` is not found inside `inventory_items_api.py`;
+      * every other line -- intro, header, caveat, closing, an annotated item -- is present
+        only if it appears in `content` verbatim (whitespace, backticks and asterisks aside);
+      * blank lines and code-fence markers are ignored.
+    Whatever is absent is returned, so no member line can be dropped and no carried item is
+    repeated. "Text is a list" means at least _MIN_LIST_ITEMS item lines; anything else is
+    carried only as a whole (verbatim), else appended whole. When none of a list's lines is
+    present it is appended whole too, which keeps its fences and blank lines.
     """
-    if _RELAY_FILENAME_RE.search(line):
-        return None
-    idents: list[str] = []
-    for tok in re.findall(r"[A-Za-z0-9_./'’-]+", line.replace("`", "")):
-        tok = tok.strip(".,;:!?'’-")
-        if not tok:
-            continue
-        low = tok.lower()
-        if tok.isdigit():
-            if int(tok) != n_items:
-                return None
-        elif low in _QUALIFYING_WORDS or low.endswith(("n't", "n’t")):
-            return None
-        elif any(c in tok for c in "_/.") or re.search(r"\d|[a-z][A-Z]", tok):
-            idents.append(tok)
-    return idents
-
-
-def _list_shape(text: str) -> tuple[list[str], list[str]] | None:
-    """(items, identifiers named by the framing prose) if `text` IS an enumeration, else None.
-
-    An answer is list-shaped when, ignoring blank lines and Markdown code-fence markers:
-      * at least _MIN_LIST_ITEMS lines are only an item (_BARE_ITEM_LINE_RE), and they are
-        CONTIGUOUS -- nothing sits between the first and the last;
-      * everything else lies before the first item or after the last: at most one HEADER line
-        (_header_counts) directly against the list, whose count, if it gives one, equals the
-        number of items, and at most _MAX_FRAMING_LINES prose lines, outnumbered three to one
-        by items, totalling at most _MAX_FRAMING_CHARS;
-      * every prose line is inert (_inert_prose_identifiers).
-    Code fences and a header are structure: they carry no information the list lacks. Prose is
-    the only place a member can say something the list does not, so it may be dropped only
-    when it demonstrably says nothing more. Anything else returns None, and the caller then
-    requires the whole text -- which can only append, never lose.
-    """
-    lines = [ln.strip() for ln in (text or "").splitlines()]
-    lines = [ln for ln in lines if ln and not _FENCE_LINE_RE.match(ln)]
-    kinds = ["I" if _BARE_ITEM_LINE_RE.match(ln) else "?" for ln in lines]
-    if kinds.count("I") < _MIN_LIST_ITEMS:
-        return None
-    first, last = kinds.index("I"), len(kinds) - 1 - kinds[::-1].index("I")
-    if any(k != "I" for k in kinds[first:last + 1]):
-        return None                                   # prose or a header among the items
-    items = [_BARE_ITEM_LINE_RE.match(ln).group("item") for ln in lines[first:last + 1]]
-    prose: list[str] = []
-    headers = 0
-    for idx, ln in enumerate(lines):
-        if kinds[idx] == "I":
-            continue
-        counts = _header_counts(ln)
-        if counts is not None:
-            if idx not in (first - 1, last + 1) or headers or any(c != len(items) for c in counts):
-                return None                           # not against the list / a second / wrong count
-            headers += 1
+    have = _squash_md(content)
+    if _squash_md(text) in have:
+        return "carried", []
+    rows = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if line and not _FENCE_LINE_RE.match(line):
+            m = _BARE_ITEM_LINE_RE.match(line)
+            rows.append((raw.rstrip(), m.group("item") if m else None))
+    if sum(1 for _, item in rows if item is not None) < _MIN_LIST_ITEMS:
+        return "full", []
+    missing = []
+    for line, item in rows:
+        if item is not None:
+            present = re.search(rf"(?<![\w./-]){re.escape(item)}(?![\w-])", content) is not None
         else:
-            prose.append(ln)
-    if len(items) < 3 * len(prose):
-        return None
-    if len(prose) > _MAX_FRAMING_LINES or sum(map(len, prose)) > _MAX_FRAMING_CHARS:
-        return None
-    idents: list[str] = []
-    for ln in prose:
-        found = _inert_prose_identifiers(ln, len(items))
-        if found is None:
-            return None
-        idents.extend(found)
-    return items, idents
-
-
-def _list_items_if_list_shaped(text: str) -> list[str] | None:
-    shape = _list_shape(text)
-    return shape[0] if shape else None
-
-
-def _forwarded_text_carried(text: str, content: str) -> bool:
-    """Does `content` already carry the forwarded member answer `text`?
-
-    Either the whole answer appears (whitespace, backticks and asterisks aside), or the
-    answer is a list (_list_shape), EVERY item appears in `content` as a whole token, and
-    every identifier its framing prose names appears in `content` too. One missing item is
-    enough to say no, and the caller then appends the member's text in full -- the
-    exact-forwarding fallback is unchanged.
-    """
-    if _squash_md(text) in _squash_md(content):
-        return True
-    shape = _list_shape(text)
-    if shape is None:
-        return False
-    items, idents = shape
-    return (all(re.search(rf"(?<![\w./-]){re.escape(i)}(?![\w-])", content) for i in set(items))
-            and all(i in content for i in idents))
+            present = _squash_md(line) in have
+        if not present:
+            missing.append(line)
+    if not missing:
+        return "carried", []
+    return ("full", []) if len(missing) == len(rows) else ("lines", missing)
 
 
 def _with_forwarded_evidence(content: str, team) -> str:
-    """`content` plus, for every forwarded member answer it does not already carry, that
-    answer verbatim.
+    """`content` plus whatever of each forwarded member answer it does not already contain.
 
     forward_member_answer records the exact text at forward time (team._forwarded_members)
-    and the RUNTIME places it -- the coordinator is not relied on to copy it. An answer
-    the coordinator already carries (see _forwarded_text_carried: verbatim, or, for a
-    list, every item present) is left alone, so nothing is duplicated; one it paraphrased
-    or dropped is appended in full, labelled, in forward order. Nothing forwarded ->
-    `content` returned untouched, so a run that never calls the tool behaves exactly as
-    before. Same append-never-substitute rule as render_member_findings.
+    and the RUNTIME places it -- the coordinator is not relied on to copy it. For each
+    member, _forwarded_gap says whether the answer carries it: if so nothing is added; if the
+    member's answer is a list and only some of its lines are absent, exactly those lines are
+    appended, verbatim and in order, so the list is never repeated and no line is lost;
+    otherwise the member's whole text is appended. Appended blocks are labelled and follow the
+    answer -- nothing is inserted into it. Nothing forwarded -> `content` returned untouched,
+    so a run that never calls the tool behaves exactly as before. Same append-never-substitute
+    rule as render_member_findings.
     """
     forwarded = getattr(team, "_forwarded_members", None)
     if not isinstance(forwarded, dict) or not forwarded:
@@ -1771,16 +1665,31 @@ def _with_forwarded_evidence(content: str, team) -> str:
     if (not content or not _strip_leaked_tool_tags(content).strip()
             or content.strip() == _BUDGET_EXHAUSTED_ANSWER):
         return content
-    missing = [(k, t) for k, t in forwarded.items()
-               if t and t.strip() and not _forwarded_text_carried(t, content)]
-    if not missing:
+    parts: list[str] = []
+    full: list[str] = []
+    partial: dict[str, str] = {}
+    for k, t in forwarded.items():
+        if not (t and t.strip()):
+            continue
+        mode, lines = _forwarded_gap(t, content)
+        if mode == "full":
+            full.append(k)
+            parts.append(f"\n\n### From {k}\n{t.strip()}")
+        elif mode == "lines":
+            partial[k] = f"{len(lines)} line(s), first: {lines[0].strip()[:70]!r}"
+            parts.append(f"\n\n### From {k} (only the lines the answer above does not contain)\n"
+                         + "\n".join(lines))
+    if not parts:
         return content
-    print(f"[team] forwarded answer(s) not carried by the final answer -- appending "
-          f"verbatim: {[k for k, _ in missing]}", flush=True)
-    parts = "".join(f"\n\n### From {k}\n{t.strip()}" for k, t in missing)
+    if full:
+        print(f"[team] forwarded answer(s) not carried by the final answer -- appending "
+              f"verbatim: {full}", flush=True)
+    if partial:
+        print(f"[team] forwarded list(s) carried but some of the member's lines are absent "
+              f"-- appending only those: {partial}", flush=True)
     return (content or "") + (
         "\n\n---\n**FORWARDED FROM THE MEMBERS — their own text, unedited, appended "
-        "because the answer above did not carry it.**" + parts)
+        "because the answer above did not carry all of it.**" + "".join(parts))
 
 
 def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = None):
