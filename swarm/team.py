@@ -20,7 +20,9 @@ from .agents import (
 from .feedback import (record_success, record_failure, load_failure_context,
                        load_success_context, load_project_memory_context)
 from . import model_routing, team_config
-from .tool_fix import peak_input_tokens
+from .tool_fix import (
+    peak_input_tokens, reset_unavailable_tool_state, unavailable_tool_snapshot,
+)
 from config.config import config
 from swarm import phase0
 from swarm import context_pack
@@ -740,16 +742,16 @@ _FORWARD_INSTRUCTIONS = [
     "── FORWARD a member's answer instead of retyping it ──────────────",
     "  When a member's answer contains a LIST -- file names, routers, endpoints, models,",
     "  line numbers, anything enumerable -- do NOT retype it in your own words. Call the",
-    "  `forward_member_answer` tool with that member_id. It returns their answer exactly as",
-    "  they wrote it, and you place that in your final answer.",
+    "  `forward_member_answer` tool with that member_id. It records their answer exactly as",
+    "  they wrote it, and the system puts that text in your final answer word for word -- the",
+    "  tool returns only a short receipt, so there is nothing for you to copy out.",
     "  WHY, measured on this system: a Researcher opened 24 router files, its own report",
     "  named 4, and the answer shipped with 4. Retyping a list loses items every time. A",
     "  forwarded list loses none.",
     "  This is a REAL tool call, like delegate_task_to_member -- not text for you to write.",
     "  Forward from as many members as the task needs. Then add ONLY what is genuinely",
     "  yours: the ordering, the connective explanation, and anything no member covered.",
-    "  Do NOT paraphrase, shorten, re-order or 'clean up' what you forward -- the point is",
-    "  that it arrives unchanged.",
+    "  Do not retype what you forward; it reaches the reader unchanged either way.",
     "  SELF-CHECK before you finish: if your answer contains a list you assembled from what",
     "  a member told you, you should have forwarded it instead. Forward it now.",
     "  This does NOT end your turn -- forward, then keep writing.",
@@ -788,8 +790,8 @@ _COORDINATOR_INSTRUCTIONS_MINIMAL = [
     "directories the member should look at.",
     "",
     "When a member's answer contains a list -- files, routers, endpoints, models, line",
-    "numbers -- call forward_member_answer(member_id=...) to place their exact words in",
-    "your answer. Do not retype a list yourself; retyping loses items.",
+    "numbers -- call forward_member_answer(member_id=...); the system places their exact",
+    "words in your answer. Do not retype a list yourself; retyping loses items.",
     "",
     "Then write the final answer: forward what the members found, and add the ordering,",
     "the explanation, and anything they did not cover. Answer the question that was",
@@ -846,6 +848,55 @@ def _instructions_without_scoped_recipe(lines: list[str]) -> list[str]:
                 "named in it is a SCOPED question, not a project question")
     out = [ln for ln in out if not any(p in ln for p in _pointer)]
     return out
+
+# _COORDINATOR_INSTRUCTIONS lines that tell the Coordinator to call get_file_content
+# ITSELF. True for a team whose Coordinator holds that tool; false for engineering, whose
+# Coordinator is deliberately disarmed (coordinator_tools: []) and can only delegate --
+# there the line instructs a call to a tool that does not exist on its surface.
+#
+# Exact-line keys mapped 1:1 to a replacement, so the list keeps its length and every
+# other line keeps its position. Applied per build by _coordinator_instructions_for_
+# surface, never edited into _COORDINATOR_INSTRUCTIONS itself: owners keep today's text
+# byte for byte, and the constant stays what the pinned composition tests inspect.
+# apply_diff/write_file instructions are deliberately not in this table.
+_COORDINATOR_FILE_READ_REWRITES = {
+    "  You have DIRECT access to most MCP tools (get_file_content, apply_diff, write_file, etc.).":
+        "  You have DIRECT access to most MCP tools (apply_diff, write_file, etc.).",
+    "  For tasks where the target file's path is already exact and known: call MCP tools DIRECTLY.":
+        "  For tasks where the target file's path is already exact and known: call MCP tools "
+        "DIRECTLY -- except file READS, which you delegate (you do not hold get_file_content).",
+    "  get_file_content() on that path directly — that tool IS still yours, no further":
+        "  delegate the READ of that path to the member that holds get_file_content — you do",
+    "  delegation needed for reading it, but it is for READING a path you already have, not":
+        "  not hold it yourself. That is for READING a path you already have, not",
+    "  for discovering one — do not call it repeatedly on guessed paths hoping one lands.":
+        "  for discovering one — do not guess paths.",
+    "  not calling those tools yourself. get_file_content() on a path you already have (from":
+        "  not calling those tools yourself. Reading a path you already have (from",
+    "  the user, this session, or Researcher's result) IS still yours to call directly.":
+        "  the user, this session, or Researcher's result) is also a delegation -- you do not hold get_file_content.",
+    "  2. For each top-level directory it returns: read one entry file yourself with get_file_content()":
+        "  2. For each top-level directory it returns: delegate reading one entry file",
+    "     (README, main.py, __init__.py, config).":
+        "     (README, main.py, __init__.py, config) to a member that holds get_file_content.",
+    "  2. get_file_content() yourself on the 2-3 most relevant files it returns.":
+        "  2. delegate_task_to_member('researcher', ...) to read the 2-3 most relevant files it returns.",
+    "  2. get_file_content(path) yourself on 1-2 files if you need more detail.":
+        "  2. delegate a read of 1-2 of those files to a member if you need more detail.",
+}
+
+
+def _coordinator_instructions_for_surface(lines: list[str], surface: set[str]) -> list[str]:
+    """`lines` with the get_file_content-ownership lines made true for `surface`.
+
+    A Coordinator that holds get_file_content gets `lines` back unchanged (same content,
+    new list). One that does not has each ownership line replaced by its delegate-the-read
+    form, so the instructions never tell it to call a tool it cannot.
+    """
+    if "get_file_content" in surface:
+        return list(lines)
+    return [_COORDINATOR_FILE_READ_REWRITES.get(ln, ln) for ln in lines]
+
 
 def _team_roster_preamble(agent_specs: list | None) -> list[str]:
     """A real, per-team member roster computed from the actual `agent_specs` this
@@ -995,8 +1046,38 @@ def _is_mutating(name: str) -> bool:
     return name in _MUTATING_TOOLS or name.startswith(_MUTATING_PREFIXES)
 
 
+def _instructions_without_removed_tool_lines(
+    lines: list[str], removed: set[str], kept: set[str],
+) -> list[str]:
+    """Drop instruction lines that name ONLY tools removed from this member's surface.
+
+    A member told "use apply_diff() for existing files" while apply_diff is not on its
+    surface is being instructed to call a tool that does not exist for it -- read_only
+    strips the tool but, until now, left every line that tells the member to use it.
+
+    Decided per line from THIS member's own removed and kept sets, never from a
+    universe-wide list of tool names: a line naming one removed and one kept tool is
+    still useful and survives, and a line naming no tool at all is never touched. With
+    nothing removed (including the second pass of an idempotent re-strip) the input is
+    returned unchanged.
+    """
+    if not removed:
+        return list(lines)
+
+    def _names(text: str, names: set[str]) -> bool:
+        return any(re.search(rf"(?<![A-Za-z0-9_]){re.escape(n)}(?![A-Za-z0-9_])", text)
+                   for n in names)
+
+    return [ln for ln in lines
+            if not (_names(ln, removed) and not _names(ln, kept))]
+
+
 def _strip_mutating(specs: list, tool_names: list[str] | None) -> tuple[list, list[str] | None]:
     """Return (agent_specs, coordinator_tools) with every mutating tool removed.
+
+    Member instruction lines that name only the tools removed from that member's surface
+    are dropped with them (see _instructions_without_removed_tool_lines). Idempotent:
+    a second pass over already-stripped specs removes nothing further.
 
     Enforces read-only at the TOOL SURFACE rather than by instruction. Measured
     2026-07-31: a task whose prompt said "do NOT call write_file or apply_diff, do not
@@ -1013,7 +1094,12 @@ def _strip_mutating(specs: list, tool_names: list[str] | None) -> tuple[list, li
     for s in specs:
         s2 = copy.deepcopy(s)
         if getattr(s2, "tools", None):
-            s2.tools = [t for t in s2.tools if not _is_mutating(t)]
+            _before = list(s2.tools)
+            s2.tools = [t for t in _before if not _is_mutating(t)]
+            _removed = set(_before) - set(s2.tools)
+            if _removed and getattr(s2, "instructions", None):
+                s2.instructions = _instructions_without_removed_tool_lines(
+                    list(s2.instructions), _removed, set(s2.tools))
         out.append(s2)
     # `is not None`, NOT truthiness (fixed 2026-08-21). An EXPLICITLY EMPTY allowlist is
     # a deliberate disarm and must survive read_only stripping; only an ABSENT one means
@@ -1486,8 +1572,55 @@ class ClarificationOption(BaseModel):
 FORWARD_MEMBER_ANSWER_TOOL = "forward_member_answer"
 
 
-def _make_forward_member_answer(member_answers: dict):
+def _squash_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _with_forwarded_evidence(content: str, team) -> str:
+    """`content` plus, for every forwarded member answer it does not already carry, that
+    answer verbatim.
+
+    forward_member_answer records the exact text at forward time (team._forwarded_members)
+    and the RUNTIME places it -- the coordinator is not relied on to copy it. An answer
+    the coordinator already reproduced (whitespace aside) is left alone, so nothing is
+    ever duplicated; one it paraphrased or dropped is appended, labelled, in forward
+    order. Nothing forwarded -> `content` returned untouched, so a run that never calls
+    the tool behaves exactly as before. Same append-never-substitute rule as
+    render_member_findings.
+    """
+    forwarded = getattr(team, "_forwarded_members", None)
+    if not isinstance(forwarded, dict) or not forwarded:
+        return content
+    # Content that is not a real answer -- empty, the canned budget-exhausted sentence, or
+    # nothing once leaked tool-call syntax is stripped -- is returned untouched. Appending
+    # to it would make a failed run or a failed retry look valid to the emptiness and
+    # canned-answer checks downstream (the empty-answer banner, _adopt_retry's canned
+    # check, every `if not retried`); _recovered_member_findings already covers the
+    # empty case.
+    if (not content or not _strip_leaked_tool_tags(content).strip()
+            or content.strip() == _BUDGET_EXHAUSTED_ANSWER):
+        return content
+    have = _squash_ws(content)
+    missing = [(k, t) for k, t in forwarded.items()
+               if t and t.strip() and _squash_ws(t) not in have]
+    if not missing:
+        return content
+    print(f"[team] forwarded answer(s) not carried by the final answer -- appending "
+          f"verbatim: {[k for k, _ in missing]}", flush=True)
+    parts = "".join(f"\n\n### From {k}\n{t.strip()}" for k, t in missing)
+    return (content or "") + (
+        "\n\n---\n**FORWARDED FROM THE MEMBERS — their own text, unedited, appended "
+        "because the answer above did not carry it.**" + parts)
+
+
+def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = None):
     """Build the coordinator's forward tool over the live member-results map.
+
+    `forwarded` (default None = no recording, the pre-2026-09-21 behaviour) receives the
+    member's exact text AT FORWARD TIME, keyed like member_answers. The tool then returns
+    a short receipt instead of the text, and _with_forwarded_evidence puts the recorded
+    text into the final answer -- the runtime carries it, so a coordinator that retypes,
+    paraphrases or forgets it cannot lose it.
 
     Why forwarding rather than another guard: LangChain's multi-agent benchmark found a
     supervisor architecture underperforming for exactly the reason measured here -- the
@@ -1543,7 +1676,14 @@ def _make_forward_member_answer(member_answers: dict):
             )
         print(f"[team] forward_member_answer: forwarding {key!r}'s answer verbatim "
               f"({len(text):,} chars)", flush=True)
-        return text
+        if forwarded is None:
+            return text
+        forwarded[key] = text
+        return (
+            f"FORWARDED: {key}'s answer ({len(text):,} characters) is recorded and will "
+            f"appear in your final answer exactly as written. Do not retype it; add only "
+            f"your own ordering, explanation and anything the members did not cover."
+        )
 
     return forward_member_answer
 
@@ -10644,6 +10784,47 @@ def _raw_audit_target(task_text) -> str:
     return str(m.group("target") or "").strip() if m else ""
 
 
+# Action words, checked in the order they appear in the task, mapped onto the audit
+# vocabulary. The FIRST one found wins, so "search_files for X then read it" is a search.
+_DERIVED_ACTION_WORDS = (
+    (re.compile(r"\b(?:search_files\w*|search|find_files|find|grep|locate)\b", re.I), "search"),
+    (re.compile(r"\b(?:implement|write_file|apply_diff|create|add|modify|edit|fix|"
+                r"refactor|rewrite)\b", re.I), "implement"),
+    (re.compile(r"\b(?:verify|check|confirm|validate)\b", re.I), "verify"),
+    (re.compile(r"\b(?:analy[sz]e|review|audit|compare|explain)\b", re.I), "analyze"),
+    (re.compile(r"\bplan\b", re.I), "plan"),
+    (re.compile(r"\b(?:read|get_file_content|get_files_batch|open|list\w*|return|show)\b",
+                re.I), "read"),
+)
+_DERIVED_PATH_RE = re.compile(
+    r"[\w./()\[\]-]+\.(?:py|ts|tsx|js|jsx|md|json|ya?ml|sql|scss)(?![\w])")
+
+
+def _derive_delegation_audit(raw_task) -> tuple[dict, bool]:
+    """(audit, from_text): the audit tuple a delegation would have carried, derived
+    mechanically from its own task text -- for a re-delegation that arrived WITHOUT the
+    <delegation_audit> tag.
+
+    Data only: the task text is never touched (a later step rewrites it, and every dedupe
+    tier compares it). `target` is the sorted set of file paths the task names, normalised
+    like a tagged target; `action` is the earliest action word mapped onto the audit
+    vocabulary. When either cannot be found, the target falls back to a hash of the
+    normalised task text with action "unknown", so the tuple can never equal another
+    delegation's by accident -- an unclassifiable call is treated as new, never as a
+    duplicate. `from_text` is False for that fallback.
+    """
+    import hashlib
+    text = str(raw_task or "")
+    paths = sorted({_normalize_delegation_target(p.split(":")[0])
+                    for p in _DERIVED_PATH_RE.findall(text)})
+    hits = [(m.start(), action) for rx, action in _DERIVED_ACTION_WORDS
+            for m in [rx.search(text)] if m]
+    if paths and hits:
+        return ({"component": "", "action": min(hits)[1], "target": ", ".join(paths)}, True)
+    digest = hashlib.sha1(_normalize_delegation_task(text).encode("utf-8")).hexdigest()[:12]
+    return ({"component": "", "action": "unknown", "target": f"task:{digest}"}, False)
+
+
 # A clarification question proposing WORK rather than resolving an ambiguity. Paired
 # with read_only it is decidable without judgement: the run cannot write, so no answer
 # to "should I implement or deprecate this" changes anything it is able to do.
@@ -11120,15 +11301,13 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
             if prior_entries:
                 audit = _parse_delegation_audit(raw_task)
                 if audit is None:
-                    return (
-                        f"REDIRECTED: {member_id!r} has already been delegated to earlier this "
-                        f"run — a re-delegation must open the task with an audit tag: "
-                        f"'<delegation_audit>component=<short label>; action=<one of: "
-                        f"{', '.join(sorted(_DELEGATION_AUDIT_ACTIONS))}>; target=<the exact file "
-                        f"path/module/entity this call is about></delegation_audit>' followed by "
-                        f"the real task text. This delegate_task_to_member call was NOT executed — "
-                        f"add the audit tag and retry."
-                    )
+                    # No tag: derive the audit from the task text instead of refusing to
+                    # run until the model learns to emit one. Metadata only -- args["task"]
+                    # is untouched, and a tag the model DID supply always wins (above).
+                    # An unclassifiable call gets a hash target that matches nothing, so
+                    # it is treated as new; the exact-text tier and the repeat ceiling
+                    # still apply to it.
+                    audit, _ = _derive_delegation_audit(raw_task)
                 for entry in prior_entries:
                     prior_audit = entry.get("audit")
                     if prior_audit and prior_audit["target"] == audit["target"] and prior_audit["action"] == audit["action"]:
@@ -11325,10 +11504,20 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
         _carry_prior_findings(function_name, args, run_context, team)
 
         result = await function(**args)
+        _logged_audit = _parse_delegation_audit(raw_task)
+        if _logged_audit is None and function_name == "delegate_task_to_member":
+            # An untagged delegation is recorded with the audit derived from its text so a
+            # later re-delegation of the same target and action still matches it. Only a
+            # real derivation is stored; the hash fallback would just pollute
+            # _covered_targets with an opaque target. The first delegation is unchanged --
+            # nothing is added to its task, and nothing is checked against it.
+            _derived, _from_text = _derive_delegation_audit(raw_task)
+            if _from_text:
+                _logged_audit = _derived
         log.append({
             "tool": function_name,
             "args": dict(args or {}),
-            "audit": _parse_delegation_audit(raw_task),
+            "audit": _logged_audit,
         })
         # isinstance(str) is load-bearing, not defensive (2026-08-24). delegate_task_to_member
         # returns an async_generator on the streaming path -- the sibling logger a few
@@ -12068,6 +12257,9 @@ def _build_team(
     # this exact object and team._member_results is bound to it below, so both sides read
     # one map rather than two that can drift.
     member_answers: dict[str, str] = {}
+    # Exact member text captured by forward_member_answer at forward time; bound to
+    # team._forwarded_members below and read by _with_forwarded_evidence.
+    forwarded_members: dict[str, str] = {}
     capability_routing_gate_hook = _make_capability_routing_gate_hook(member_tools)
     duplicate_delegation_gate_hook = _make_duplicate_delegation_gate_hook(read_only=read_only)
     delegation_log_hook = _make_delegation_log_hook()
@@ -12186,7 +12378,8 @@ def _build_team(
     # this process already holds, calls no tool, and changes no state.
     if FORWARD_MEMBER_ANSWER_TOOL in set(
             team_config.get_extra_tools(team_name or "", "Coordinator")):
-        coordinator_tools_list.append(_make_forward_member_answer(member_answers))
+        coordinator_tools_list.append(
+            _make_forward_member_answer(member_answers, forwarded_members))
         # Copied, never mutated in place: `instructions` belongs to the caller and is
         # reused across runs in the same process, so appending to it directly would make
         # the block accumulate once per run.
@@ -12202,6 +12395,10 @@ def _build_team(
     # resolved truth rather than re-deriving it.
     print(f"[team] coordinator surface ({len(coordinator_tools_list)}): "
           f"{[getattr(t, 'name', type(t).__name__) for t in coordinator_tools_list]}")
+    # Made true for the surface just resolved: a Coordinator that cannot call
+    # get_file_content must not be told to. Owners get their text back unchanged.
+    instructions = _coordinator_instructions_for_surface(
+        instructions, {getattr(t, "name", "") for t in coordinator_tools_list})
     team = Team(
         name=name,
         description=description,
@@ -12264,9 +12461,25 @@ def _build_team(
     # treats as "unknown" rather than "did not delegate" -- same -1-is-not-zero rule
     # _count_read_calls follows.
     team._delegation_state = delegation_log_hook.state
+    # A model that asks for a tool its owner does not hold twice in a row is flipped to
+    # text-only through the same actuator the budget and stub guards use. The models
+    # themselves cannot import this module, so each carries the callback.
+    def _wire_unavailable_tool(model, owner: str, force) -> None:
+        if model is not None:
+            model._unavailable_owner = owner
+            model._on_repeated_unavailable_tool = force
+
+    for _m in members:
+        _wire_unavailable_tool(
+            getattr(_m, "model", None), getattr(_m, "name", "") or "member",
+            lambda _m=_m: _force_text_only(_m))
+    _wire_unavailable_tool(
+        getattr(team, "model", None), "Coordinator",
+        lambda: _force_text_only(None, team=team))
     # Run-scoped read log, visible to _verified_answer's groundedness guards regardless
     # of delegation depth (2026-08-21) -- see the hook's own read_state comment.
     team._member_results = member_answers
+    team._forwarded_members = forwarded_members
     team._read_state = read_cache_hook.state
     # Set by the caller right after construction; the target-resolution gate reads it at
     # delegation time, which is always later. Same late-binding shape as member_tools.
@@ -12874,6 +13087,12 @@ async def run_task_stream(
     """
     effective_mcp_url = mcp_url or config.mcp_url
     effective_coordinator = coordinator_model or config.leader_model
+    # Rebound BEFORE the roster is composed: the Coordinator's roster preamble prints each
+    # member's tools, and a read_only run was advertising tools _strip_mutating removes
+    # later. Idempotent with the strip below, which then removes nothing further.
+    if read_only and agent_specs:
+        agent_specs, _ = _strip_mutating(agent_specs, None)
+    reset_unavailable_tool_state()
 
     from swarm.sessions import get_context as get_session_context
 
@@ -13172,11 +13391,11 @@ async def run_task_stream(
                         last_segment_start = len(full_content)
                 accumulated = "".join(full_content) or "(no response)"
                 final_segment = "".join(full_content[last_segment_start:]).strip()
-                combined = _first_surviving_answer(
+                combined = _with_forwarded_evidence(_first_surviving_answer(
                     final_run_output.content if final_run_output else None,
                     final_segment,
                     accumulated,
-                )
+                ), team)
                 # Tier-3 guard: fill [[COUNT ...]] markers in the final content (streamed
                 # chunks above are pre-substitution; the done-sentinel content is corrected).
                 try:
@@ -13424,6 +13643,11 @@ async def _run_heartbeat(
                     # this run. Detection was never the gap -- 217 firings across the
                     # journal, 21 in one 736s run -- the response was.
                     "repetition_count": activity.get("repetition_count", 0),
+                    # Calls to tools the caller does not hold (swarm/tool_fix.py's
+                    # _UnavailableToolMixin). Lets Tier 4 say WHY nothing executed
+                    # instead of blaming a spent budget. {} when there were none;
+                    # reset at the top of every run.
+                    "unavailable_tool_calls": unavailable_tool_snapshot(),
                     "no_tool_progress_seconds": since_last_tool,
                     "requests_advancing": (event_count is not None
                                            and event_count != prev_event_count),
@@ -17038,11 +17262,11 @@ async def _stream_team_run(
                 _run_ctx.executions[_retry_execution_id]))
     accumulated = "".join(full_content) or "(no response)"
     final_segment = "".join(full_content[last_segment_start:]).strip()
-    content = _first_surviving_answer(
+    content = _with_forwarded_evidence(_first_surviving_answer(
         final_run_output.content if final_run_output else None,
         final_segment,
         accumulated,
-    )
+    ), team)
     return content, final_run_output
 
 
@@ -17094,6 +17318,10 @@ async def run_task_async(
     """
     effective_mcp_url = mcp_url or config.mcp_url
     effective_coordinator = coordinator_model or config.leader_model
+    # Rebound BEFORE the roster is composed -- see run_task_stream for the reason.
+    if read_only and agent_specs:
+        agent_specs, _ = _strip_mutating(agent_specs, None)
+    reset_unavailable_tool_state()
 
     from swarm.sessions import get_context as get_session_context
 
@@ -17580,11 +17808,11 @@ async def run_task_async(
                                 _run_ctx.executions[_run_ctx.root_execution_id]))
                 accumulated = "".join(full_content) or "(no response)"
                 final_segment = "".join(full_content[last_segment_start:]).strip()
-                content = _first_surviving_answer(
+                content = _with_forwarded_evidence(_first_surviving_answer(
                     final_run_output.content if final_run_output else None,
                     final_segment,
                     accumulated,
-                )
+                ), team)
                 # Clarification check runs BEFORE the claim-verification/count-marker
                 # guards below, and short-circuits past both when found: those guards
                 # validate a completed factual answer, and a clarification block is

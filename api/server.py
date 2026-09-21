@@ -467,6 +467,14 @@ def _liveness_kill_reason(snapshot: dict) -> str | None:
     if (no_tool > config.liveness_refused_call_threshold_s
             and stagnant > config.liveness_refused_call_threshold_s
             and snapshot.get("requests_advancing")):
+        unavailable = snapshot.get("unavailable_tool_calls") or {}
+        if unavailable.get("count"):
+            return (
+                f"model kept issuing calls for {no_tool:.0f}s but none executed, and "
+                f"produced no content in that time — it kept asking for a tool it does "
+                f"not have ({unavailable.get('last_tool')!r}, "
+                f"{unavailable['count']} unavailable-tool call(s))"
+            )
         return (
             f"model kept issuing calls for {no_tool:.0f}s but none executed, and "
             f"produced no content in that time — tool budget is spent and every "

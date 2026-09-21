@@ -618,11 +618,112 @@ class _ForcedTextDirectiveMixin:
         return super().ainvoke_stream(messages, *a, **kw)
 
 
-class OllamaToolFix(_ForcedTextDirectiveMixin, _ToolCallRecoveryMixin, Ollama):
+# Per-run record of tool calls that named a tool the caller does not hold. Module scope,
+# one run per worker process -- same lifetime as the other run-scoped state in this
+# package -- and reset explicitly at the top of each run so an in-process caller (the CLI
+# one-shot path) can never read a previous run's value.
+_UNAVAILABLE_TOOL_PREFIX = "TOOL_UNAVAILABLE"
+_AGNO_UNKNOWN_TOOL_CONTENT = "Error: The requested tool does not exist or is not available."
+_unavailable_tool_state: dict = {}
+
+
+def reset_unavailable_tool_state() -> None:
+    _unavailable_tool_state.clear()
+
+
+def unavailable_tool_snapshot() -> dict:
+    """{} when nothing unavailable was requested this run, else a copy of the record."""
+    return dict(_unavailable_tool_state)
+
+
+def _record_unavailable_tool(owner: str, tool: str, forced: bool) -> None:
+    _unavailable_tool_state["count"] = _unavailable_tool_state.get("count", 0) + 1
+    _unavailable_tool_state["last_tool"] = tool
+    _unavailable_tool_state["last_owner"] = owner
+    if forced:
+        _unavailable_tool_state["forced_text_only"] = True
+
+
+def _msg_field(msg, name):
+    return msg.get(name) if isinstance(msg, dict) else getattr(msg, name, None)
+
+
+class _UnavailableToolMixin:
+    """Answer a call to a tool this agent does not hold with a structured reply, and
+    stop the model asking a second time in a row.
+
+    agno's dispatcher answers an unknown tool name with one generic sentence and nothing
+    else, so a model that has been told about a tool (by an instruction or a roster that
+    no longer matches its surface) just asks again -- the same failure repeats until the
+    tool-call budget is gone. The runtime knows the real surface, so it says what the
+    caller does hold, and if the very next round asks for another unavailable tool it
+    flips the agent to text-only via the callback _build_team installs.
+
+    "Consecutive" is derived from the message history each time, never counted in a
+    field: a round made ENTIRELY of unavailable calls extends the streak, and any round
+    containing a real tool call ends it.
+
+    Only ever REPLACES the content of the message agno already appended for the unknown
+    call, so every tool_call still has its matching tool-role message.
+    """
+
+    _unavailable_owner: str | None = None
+    _on_repeated_unavailable_tool = None   # callable() -> None, set per model by _build_team
+
+    def _previous_round_was_all_unavailable(self, messages, current) -> bool:
+        idx = len(messages) - 1
+        while idx >= 0 and messages[idx] is not current:
+            idx -= 1
+        # `current` is not in the list only if a caller passed it separately; then the
+        # whole list is history.
+        history = messages[:idx] if idx >= 0 else list(messages)
+        for pos in range(len(history) - 1, -1, -1):
+            m = history[pos]
+            if _msg_field(m, "role") != "assistant" or not _msg_field(m, "tool_calls"):
+                continue
+            ids = [(_tc.get("id") if isinstance(_tc, dict) else None)
+                   for _tc in _msg_field(m, "tool_calls")]
+            replies = {_msg_field(r, "tool_call_id"): _msg_field(r, "content")
+                       for r in history[pos + 1:] if _msg_field(r, "role") == "tool"}
+            return bool(ids) and all(
+                isinstance(replies.get(i), str) and replies[i].startswith(_UNAVAILABLE_TOOL_PREFIX)
+                for i in ids)
+        return False
+
+    def get_function_calls_to_run(self, assistant_message, messages, functions=None):
+        already = len(messages)
+        was_consecutive = self._previous_round_was_all_unavailable(messages, assistant_message)
+        calls = super().get_function_calls_to_run(
+            assistant_message=assistant_message, messages=messages, functions=functions)
+        # Anything agno answered with its generic unknown-tool sentence, in call order.
+        unknown = [m for m in messages[already:]
+                   if _msg_field(m, "content") == _AGNO_UNKNOWN_TOOL_CONTENT]
+        if not unknown:
+            return calls
+        available = sorted(functions or {})
+        shown = ", ".join(available[:40]) + (" ..." if len(available) > 40 else "")
+        for m in unknown:
+            name = _msg_field(m, "tool_name") or "?"
+            m.content = (
+                f"{_UNAVAILABLE_TOOL_PREFIX}: '{name}' is not a tool you have in this run. "
+                f"Tools you can call: {shown or '(none)'}. Do not call '{name}' again -- "
+                f"use one of those, or answer in text."
+            )
+        # A round that ALSO made a real call is not a stubborn repeat of an unavailable one.
+        repeated = was_consecutive and not calls
+        _record_unavailable_tool(
+            self._unavailable_owner or "model",
+            _msg_field(unknown[-1], "tool_name") or "?", forced=repeated)
+        if repeated and callable(self._on_repeated_unavailable_tool):
+            self._on_repeated_unavailable_tool()
+        return calls
+
+
+class OllamaToolFix(_UnavailableToolMixin, _ForcedTextDirectiveMixin, _ToolCallRecoveryMixin, Ollama):
     pass
 
 
-class VLLMToolFix(_ForcedTextDirectiveMixin, _ToolCallRecoveryMixin, OpenAILike):
+class VLLMToolFix(_UnavailableToolMixin, _ForcedTextDirectiveMixin, _ToolCallRecoveryMixin, OpenAILike):
     """Same recovery as OllamaToolFix, for the vLLM/OpenAILike path — see this
     module's own docstring for the live incident (2026-08-15) that motivated
     porting it here rather than leaving OllamaToolFix as Ollama-only."""

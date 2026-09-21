@@ -23,6 +23,8 @@ closure-local log (the same pattern _make_decompose_first_gate_hook's
 SEQUENTIAL calls through the SAME hook instance to exercise it, rather than
 pre-seeding a fake run_context's session_state.
 """
+from types import SimpleNamespace
+
 from swarm.team import (
     _normalize_delegation_task, _make_duplicate_delegation_gate_hook,
     _parse_delegation_audit, _normalize_delegation_target,
@@ -129,20 +131,24 @@ async def test_repeat_normalizes_whitespace_and_case_before_comparing():
     gate should also catch incidental whitespace/case drift from the model
     re-typing the same request slightly differently."""
     hook = _make_duplicate_delegation_gate_hook()
+    team = SimpleNamespace(_member_results={"researcher": "PRIOR RESULT"})
 
     first = await hook(
         "delegate_task_to_member", _fake_delegate,
         {"member_id": "researcher", "task": "Read x.md   and summarize it"},
-        run_context=None,
+        run_context=None, team=team,
     )
     second = await hook(
         "delegate_task_to_member", _fake_delegate,
         {"member_id": "Researcher", "task": "read x.md and summarize it"},
-        run_context=None,
+        run_context=None, team=team,
     )
 
     assert first.startswith("delegated:")
-    assert second.startswith("REDIRECTED:")
+    # The repeat is served the stored result instead of running again. (Until 2026-09-21
+    # this passed on the missing-audit-tag REDIRECT, which fired whether or not the gate
+    # had a result to serve; a repeat is now stopped by the exact-text tier itself.)
+    assert second.startswith("ALREADY DONE")
 
 
 async def test_repeat_matches_via_real_member_id_form_not_display_name():
@@ -150,20 +156,21 @@ async def test_repeat_matches_via_real_member_id_form_not_display_name():
     key), not a bare display-name comparison -- a multi-word member called as
     'context-router' must still match a later call spelled 'ContextRouter'."""
     hook = _make_duplicate_delegation_gate_hook()
+    team = SimpleNamespace(_member_results={"contextrouter": "PRIOR RESULT"})
 
     first = await hook(
         "delegate_task_to_member", _fake_delegate,
         {"member_id": "context-router", "task": "list_directory_tree()"},
-        run_context=None,
+        run_context=None, team=team,
     )
     second = await hook(
         "delegate_task_to_member", _fake_delegate,
         {"member_id": "ContextRouter", "task": "list_directory_tree()"},
-        run_context=None,
+        run_context=None, team=team,
     )
 
     assert first.startswith("delegated:")
-    assert second.startswith("REDIRECTED:")
+    assert second.startswith("ALREADY DONE")
 
 
 async def test_same_task_to_a_different_member_is_not_blocked():
@@ -184,14 +191,16 @@ async def test_same_task_to_a_different_member_is_not_blocked():
     assert second.startswith("delegated:")
 
 
-async def test_differently_worded_follow_up_to_same_member_without_audit_is_redirected():
+async def test_follow_up_to_same_member_without_audit_and_a_different_target_runs():
     """T1-T13 gap #2 follow-up (2026-08-16) changes this test's own expected
     behavior on purpose: a 2nd+ call to an already-delegated-to member can no
     longer skip straight through just because the wording differs -- it must
     carry a <delegation_audit> tag so the tuple-based check below can tell a
     genuinely different follow-up from a reworded duplicate (which the old
     exact-text check alone could never catch -- see the gate's own docstring).
-    A missing tag is redirected asking for it, same as every other tier."""
+    2026-09-21: a missing tag is no longer redirected. The audit is derived from the
+    task text (see _derive_delegation_audit), so a follow-up naming a different file
+    than the first delegation runs, exactly as if the model had tagged it."""
     hook = _make_duplicate_delegation_gate_hook()
 
     first = await hook(
@@ -206,8 +215,7 @@ async def test_differently_worded_follow_up_to_same_member_without_audit_is_redi
     )
 
     assert first.startswith("delegated:")
-    assert second.startswith("REDIRECTED:")
-    assert "delegation_audit" in second
+    assert second.startswith("delegated:")
 
 
 async def test_audited_follow_up_with_a_genuinely_different_target_is_not_blocked():
@@ -346,10 +354,11 @@ async def test_blocked_call_is_never_actually_invoked():
 
     hook = _make_duplicate_delegation_gate_hook()
     args = {"member_id": "Researcher", "task": "dup task"}
+    team = SimpleNamespace(_member_results={"researcher": "PRIOR RESULT"})
 
-    await hook("delegate_task_to_member", tracking_delegate, args, run_context=None)
+    await hook("delegate_task_to_member", tracking_delegate, args, run_context=None, team=team)
     calls.clear()  # only interested in whether the SECOND call reaches the function
-    await hook("delegate_task_to_member", tracking_delegate, args, run_context=None)
+    await hook("delegate_task_to_member", tracking_delegate, args, run_context=None, team=team)
 
     assert calls == []
 
@@ -359,14 +368,15 @@ async def test_a_third_identical_call_is_also_blocked():
     after the first block (e.g. by clearing itself)."""
     hook = _make_duplicate_delegation_gate_hook()
     args = {"member_id": "Researcher", "task": "dup task"}
+    team = SimpleNamespace(_member_results={"researcher": "PRIOR RESULT"})
 
-    first = await hook("delegate_task_to_member", _fake_delegate, args, run_context=None)
-    second = await hook("delegate_task_to_member", _fake_delegate, args, run_context=None)
-    third = await hook("delegate_task_to_member", _fake_delegate, args, run_context=None)
+    first = await hook("delegate_task_to_member", _fake_delegate, args, run_context=None, team=team)
+    second = await hook("delegate_task_to_member", _fake_delegate, args, run_context=None, team=team)
+    third = await hook("delegate_task_to_member", _fake_delegate, args, run_context=None, team=team)
 
     assert first.startswith("delegated:")
-    assert second.startswith("REDIRECTED:")
-    assert third.startswith("REDIRECTED:")
+    assert second.startswith("ALREADY DONE")
+    assert third.startswith("ALREADY DONE")
 
 
 # ── _make_duplicate_delegation_gate_hook: delegate_task_to_members (broadcast) ───
