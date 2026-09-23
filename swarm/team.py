@@ -4570,6 +4570,149 @@ def _comparison_body(cmp_note: str) -> str:
     return m.group(1).strip() if m else (cmp_note or "").strip()
 
 
+# ── Phase L (K4): deterministic reconstruction synthesis ────────────────────
+#
+# Phase K's forensic (T13b live trace) found the deterministic comparison layer
+# already correct -- MATCH/PARTIAL_MATCH/LEFT_ONLY/RIGHT_ONLY/AMBIGUOUS -- but
+# the reconstruction step handed that correct, already-classified data to a
+# free-form model generation that re-derived (and, live, miscategorized) the
+# same classification: PUT/POST PARTIAL_MATCH entries collapsed back into the
+# "no matching frontend hooks" list alongside the genuine LEFT_ONLY entries,
+# reproducing the historical "6 gaps" defect one layer downstream of J-C's own
+# fix. `_comparison_entries` parses the ACTUAL per-item lines (not just the
+# counts `_comparison_summary` already exposes) out of the same cmp_note text
+# `_comparison_body` already extracts -- still, unavoidably, a text parse (see
+# `_comparison_summary`'s own docstring: compare_enumerations is an MCP tool,
+# there is no wire-level structured channel), anchored ONLY on the five fixed
+# category headers compare.py's own `block()` helper always renders
+# (MATCHED / PARTIAL MATCHES / AMBIGUOUS / LEFT ONLY / RIGHT ONLY) -- the
+# tool's own fixed vocabulary, not a domain concept, and never conditioned on
+# any project-specific word (no "vouchers", "hooks", "endpoint", etc.).
+#
+# Requiring ALL FIVE headers to be present and parseable before treating a
+# note as synthesis-eligible is deliberate, not incidental: compare.py's
+# `parts` list unconditionally renders all five blocks (using "(none)" for an
+# empty one), so real tool output always has all five -- this doubles as the
+# signal that distinguishes real tool output from a hand-written test fixture
+# that only sketches one or two blocks. A note missing any header returns None
+# and the caller falls back to the pre-Phase-L free-form path unchanged.
+_COMPARISON_BLOCK_RE = {
+    "matched": re.compile(r"^MATCHED[^\n]*\((\d+)\):\n((?:  .*\n?)*)", re.MULTILINE),
+    "partial_match": re.compile(r"^PARTIAL MATCHES[^\n]*\((\d+)\):\n((?:  .*\n?)*)",
+                                 re.MULTILINE),
+    "ambiguous": re.compile(r"^AMBIGUOUS[^\n]*\((\d+)\):\n((?:  .*\n?)*)", re.MULTILINE),
+    "left_only": re.compile(r"^LEFT ONLY[^\n]*\((\d+)\):\n((?:  .*\n?)*)", re.MULTILINE),
+    "right_only": re.compile(r"^RIGHT ONLY[^\n]*\((\d+)\):\n((?:  .*\n?)*)", re.MULTILINE),
+}
+
+
+def _comparison_entries(cmp_note: str) -> dict | None:
+    """The actual per-item lines for each of the five comparison categories,
+    parsed from the SAME footnote text `_comparison_summary` already parses
+    for counts -- {"matched", "partial_match", "ambiguous", "left_only",
+    "right_only"}, each a list of exact strings copied verbatim from the
+    tool's own output (never renamed, reformatted, or case-converted). None
+    when `_comparison_summary` itself would return None (no TOTALS line --
+    no comparison ran), or when any of the five category headers cannot be
+    found (a non-real-tool-shaped note -- e.g. an older or hand-written
+    fixture) -- both cases fall back to the existing free-form reconstruction
+    path unchanged, exactly as before this phase.
+    """
+    if _comparison_summary(cmp_note) is None:
+        return None
+    body = _comparison_body(cmp_note)
+    out: dict[str, list[str]] = {}
+    for key, rx in _COMPARISON_BLOCK_RE.items():
+        m = rx.search(body)
+        if not m:
+            return None
+        lines = [ln[2:] for ln in m.group(2).splitlines() if ln.startswith("  ")]
+        out[key] = [ln for ln in lines if ln.strip() and ln.strip() != "(none)"]
+    return out
+
+
+def _synthesize_comparison_answer(cmp_note: str) -> str | None:
+    """K4: the whole answer built as PURE STRING TEMPLATING from
+    `_comparison_summary`'s counts and `_comparison_entries`' exact per-item
+    lines -- no model call, so the PARTIAL_MATCH/LEFT_ONLY conflation Phase K
+    traced (a free-form regeneration silently merging the two) is structurally
+    impossible here: each category is a distinct, fixed section built only
+    from that category's own parsed list, and nothing is ever moved between
+    sections or re-derived from prose. Returns None when `_comparison_entries`
+    itself returns None (see its own docstring for when that fires); the
+    caller falls back to the existing free-form path in that case, unchanged.
+    """
+    entries = _comparison_entries(cmp_note)
+    if entries is None:
+        return None
+    summary = _comparison_summary(cmp_note)
+
+    def _section(title: str, key: str, note: str) -> str:
+        items = entries[key]
+        body = "\n".join(f"  {e}" for e in items) if items else "  (none)"
+        return f"{title} ({summary[key]}) -- {note}:\n{body}"
+
+    return (
+        "Based on a deterministic comparison (compare_enumerations) -- every "
+        "item below is copied verbatim from that tool's own output, not "
+        "re-derived:\n\n"
+        + _section("MATCH", "matched", "present and agreeing on both sides")
+        + "\n\n"
+        + _section("PARTIAL_MATCH", "partial_match",
+                    "present on BOTH sides but differing on a named attribute "
+                    "-- these are NOT missing")
+        + "\n\n"
+        + _section("LEFT_ONLY", "left_only",
+                    "defined on the left with no match on the right at all")
+        + "\n\n"
+        + _section("RIGHT_ONLY", "right_only",
+                    "present on the right with no match on the left at all")
+        + "\n\n"
+        + _section("AMBIGUOUS", "ambiguous",
+                    "identity matched more than one candidate -- coverage for "
+                    "these is UNRESOLVED, neither missing nor complete")
+    )
+
+
+def _reconstruction_category_conflict(content: str, cmp_note: str) -> str | None:
+    """K7: narrow, deterministic defense-in-depth for the free-form
+    reconstruction fallback ONLY -- the K4 synthesis path above cannot
+    produce this by construction (each category is its own fixed section).
+    Flags a paragraph of `content` that names a PARTIAL_MATCH item's identity
+    together with a genuine LEFT_ONLY item's identity -- exact substring
+    co-occurrence within one blank-line-delimited block, nothing fuzzy, no
+    keyword/NLP classifier, generic to any two-sided comparison (no
+    project-specific vocabulary). This is exactly the shape of the live
+    T13b defect Phase K traced: `PUT .../post` (PARTIAL_MATCH) reported in
+    the same "no matching frontend hooks" list as the four genuine
+    LEFT_ONLY entries.
+    """
+    entries = _comparison_entries(cmp_note)
+    if not entries or not entries["partial_match"] or not entries["left_only"]:
+        return None
+
+    def _identity(e: str) -> str:
+        # Partial-match lines are rendered "{norm_path}   {method} {path}  <->
+        # ...", per hive-mcp/tools/compare.py's own _partial_fmt -- strip the
+        # leading normalized-path token (separated by 3 spaces) so the
+        # identity compared is the left side's real "{method} {path}", the
+        # form an answer would actually quote.
+        pre = e.split("  <->", 1)[0].strip()
+        parts = pre.split("   ", 1)
+        return parts[1].strip() if len(parts) > 1 else pre
+
+    partial_ids = [_identity(e) for e in entries["partial_match"]]
+    left_only_ids = [e.strip() for e in entries["left_only"]]
+    for para in re.split(r"\n\s*\n", content or ""):
+        hit_partial = next((p for p in partial_ids if p and p in para), None)
+        hit_left = next((l for l in left_only_ids if l and l in para), None)
+        if hit_partial and hit_left:
+            return (f"the same block names a PARTIAL_MATCH item ({hit_partial!r}) "
+                     f"and a LEFT_ONLY item ({hit_left!r}) together -- a partial "
+                     f"match must not be reported as missing")
+    return None
+
+
 async def _persist_completeness_claim(team, statement: str, status: str) -> None:
     """Phase E: durable Claim (+ ClaimEvidence, when a real evidence_id is
     available) for a completeness assertion reconciled against
@@ -8155,6 +8298,36 @@ async def _attempt_evidence_grounded_reconstruction(
               flush=True)
         return content
 
+    # Phase L (K4): try deterministic synthesis BEFORE any free-form model
+    # generation. When the comparison note is real-tool-shaped (all five
+    # category headers present -- see _comparison_entries' own docstring),
+    # this is the answer: built by pure string templating from the tool's own
+    # parsed counts/entries, so it cannot re-derive or conflate a category the
+    # comparison already established. Falls through to the pre-Phase-L
+    # free-form path, unchanged, when the note isn't synthesis-eligible.
+    summary = _comparison_summary(cmp_note)
+    synthesized = _synthesize_comparison_answer(cmp_note)
+    if synthesized is not None:
+        print(f"[team] deterministic reconstruction synthesis: match={summary['matched']} "
+              f"partial_match={summary['partial_match']} left_only={summary['left_only']} "
+              f"right_only={summary['right_only']} ambiguous={summary['ambiguous']}",
+              flush=True)
+        report_s, still_bad_s, unavailable_s = await _verify_claims(
+            synthesized, hive_mcp_url, hive_mcp_tools)
+        print(f"[team] deterministic reconstruction synthesis recheck: "
+              f"still_bad={still_bad_s} unavailable={unavailable_s} | "
+              f"{_verdict_digest(report_s)}", flush=True)
+        if not (unavailable_s or still_bad_s):
+            print("[team] deterministic reconstruction synthesis: passed verification "
+                  "— releasing the synthesized answer", flush=True)
+            return synthesized
+        print("[team] deterministic reconstruction synthesis did not pass verification "
+              "— falling back to free-form reconstruction", flush=True)
+    else:
+        print("[team] deterministic reconstruction synthesis: comparison note is not "
+              "synthesis-eligible (missing a category header) — falling back to "
+              "free-form reconstruction", flush=True)
+
     print("[team] evidence-grounded reconstruction: computed comparison available — "
           "attempting one bounded reconstruction", flush=True)
     try:
@@ -8173,6 +8346,15 @@ async def _attempt_evidence_grounded_reconstruction(
 
     report2, still_bad, unavailable2 = await _verify_claims(
         reconstructed, hive_mcp_url, hive_mcp_tools)
+    # K7: narrow, deterministic defense-in-depth -- see
+    # _reconstruction_category_conflict's own docstring. A no-op whenever
+    # cmp_note isn't synthesis-eligible (e.g. every existing pre-Phase-L test
+    # fixture), so this never changes behavior for those cases.
+    conflict = _reconstruction_category_conflict(reconstructed, cmp_note)
+    if conflict:
+        still_bad = True
+        print(f"[team] evidence-grounded reconstruction: category conflict — "
+              f"{conflict}", flush=True)
     print(f"[team] evidence-grounded reconstruction recheck: still_bad={still_bad} "
           f"unavailable={unavailable2} | {_verdict_digest(report2)}", flush=True)
     if unavailable2 or still_bad:
