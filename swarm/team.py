@@ -7887,6 +7887,181 @@ async def _enforce_verification_invariant(
     return content
 
 
+# ============================================================================
+# Phase I-A -- coverage verdict (2026-09-23).
+#
+# "Did we answer everything asked" is a DIFFERENT question from "is what we said
+# supported" (Phase H's question) -- T12's own live validation is the proof: every
+# router line it returned was real (verify_claims had nothing to flag), and the
+# answer was still badly incomplete (13 of 16 routers, 0 of 31 models, 0 of 3
+# integration sites). Nothing here is a new detector: _scoped_coverage_gap and
+# _declared_models_not_reported already compute exactly these numbers (now also
+# exposing their denominators, see "routers_total"/"models_total" above) and
+# _integration_mechanism_missing already returns "" exactly when covered. This is
+# only a normalizer over those existing, already-live-validated signals.
+# ============================================================================
+
+_COVERAGE_COMPLETE = "complete"
+_COVERAGE_INCOMPLETE = "incomplete"
+_COVERAGE_UNKNOWN = "unknown"
+
+
+def _coverage_verdict(
+        components: dict[str, "tuple[int, int] | bool | None"]) -> tuple[str, list[str]]:
+    """complete / incomplete / unknown over existing coverage signals -- never a new
+    detector, a caller-supplied dict of what this run's existing guards already found.
+
+    Each value is one of:
+      (found, expected) -- an enumerated component (e.g. _scoped_coverage_gap's own
+                            record["routers"], record["routers_total"]); found <
+                            expected is incomplete, expected in (None, 0) is unknown.
+      True               -- a boolean component the caller already resolved as covered
+                            (e.g. _integration_mechanism_missing returned "").
+      False              -- resolved as NOT covered (it returned a real finding).
+      None               -- could not be determined this run (a failed lookup, an
+                            unreadable file) -- NEVER treated as complete, per this
+                            phase's own explicit requirement.
+
+    Returns (verdict, unresolved) -- unresolved names every component that is
+    incomplete or undetermined, in the order given. incomplete outranks unknown: a
+    CONFIRMED gap is a stronger signal than an unresolved one.
+    """
+    if not components:
+        return _COVERAGE_UNKNOWN, []
+    incomplete: list[str] = []
+    undetermined: list[str] = []
+    for name, value in components.items():
+        if value is None:
+            undetermined.append(name)
+        elif value is False:
+            incomplete.append(name)
+        elif value is True:
+            continue
+        else:
+            found, expected = value
+            if expected is None or expected <= 0:
+                undetermined.append(name)
+            elif found < expected:
+                incomplete.append(name)
+    if incomplete:
+        return _COVERAGE_INCOMPLETE, incomplete
+    if undetermined:
+        return _COVERAGE_UNKNOWN, undetermined
+    return _COVERAGE_COMPLETE, []
+
+
+# ============================================================================
+# Phase I-C -- evidence-grounded recovery (2026-09-23).
+#
+# A SEPARATE, LATER stage from Phase H's own repair (_repair_verification_failure,
+# above) -- deliberately not folded into it, per this phase's own "keep Phase H and
+# Phase I as clear conceptual boundaries" requirement, and wired in at its OWN call
+# site rather than as a change to _enforce_verification_invariant. Phase H's
+# question is "is the conclusion supported?"; this stage's question is different:
+# given what this run actually, verifiably read, can a correct answer be
+# RECONSTRUCTED from that evidence alone, without asking the model to regenerate
+# facts from memory or pattern-matching?
+#
+# Runs ONLY when Phase H's own gate already concluded VERIFICATION FAILED -- never
+# in place of it, never before it, and it is the reconstruction's OWN verification
+# (not the caller's) that decides whether the reconstructed text is released; a
+# reconstruction that fails verification changes nothing, the original
+# VERIFICATION FAILED result ships exactly as Phase H produced it.
+#
+# Built specifically for the T13b shape this phase's root-cause investigation
+# traced: _computed_comparison/compare_enumerations is the existing deterministic
+# evidence source (proven exact against ground truth elsewhere in this file); if it
+# can now produce a real two-sided diff -- which, after the evidence-integrity gate
+# exception above, it may be able to for the first time once a corrective read
+# actually lands -- the reconstruction prompt states ONLY that computed diff,
+# verbatim, and nothing else. If compare_enumerations still cannot produce one (no
+# safe pair -- the SAME conservative check this file already relies on, untouched
+# per this phase's own explicit instruction), there is nothing to reconstruct from
+# and the original VERIFICATION FAILED result stands, unmodified.
+#
+# Bounded to exactly ONE reconstruction attempt via its own flag
+# (_RECONSTRUCTION_ATTEMPTED_FLAG), independent of Phase H's own
+# _REPAIR_ATTEMPTED_FLAG -- Phase H's repair and this reconstruction are two
+# distinct, separately-bounded stages, never one retried indefinitely.
+# ============================================================================
+
+# The exact literal prefix _verification_failed_answer (Phase H) always opens with
+# -- checked, not duplicated: this module never redefines what "still failed" means,
+# it only asks whether Phase H's own answer is still in that shape.
+_VERIFICATION_FAILED_PREFIX = "**VERIFICATION FAILED"
+_RECONSTRUCTION_ATTEMPTED_FLAG = "_phase_i_reconstruction_attempted"
+
+
+def _reconstruction_prompt(task: str, cmp_note: str) -> str:
+    """The reconstruction instruction, built from a DETERMINISTIC tool result --
+    compare_enumerations' own literal output -- never a bare "try answering again".
+    Every constraint below is this phase's own explicit list, not a paraphrase."""
+    return (
+        f"{task}\n\nIMPORTANT: verification could not confirm your previous answer's "
+        f"conclusion. Below is a deterministic comparison this run already computed "
+        f"by parsing the actual source files — not a re-read, not a re-derivation, "
+        f"the tool's own literal output:\n{cmp_note}\n\nAnswer the original question "
+        f"using ONLY what this comparison establishes. Do not invent any file, "
+        f"function, endpoint, model, table, or route not named above. Do not restate "
+        f"anything from your previous answer. If the comparison does not establish a "
+        f"value the question asks for, say that value is unresolved rather than "
+        f"guessing it. Preserve every name exactly as the comparison spells it."
+    )
+
+
+async def _attempt_evidence_grounded_reconstruction(
+        content: str, task: str, team, hive_mcp_url: str | None, hive_mcp_tools,
+        liveness_path: str | None) -> str:
+    """Phase I's own bounded recovery stage. Returns `content` unchanged unless a
+    reconstruction was both attempted AND passed verification -- see this section's
+    own module-level docstring above for the full flow and its boundedness.
+    """
+    if not (content or "").startswith(_VERIFICATION_FAILED_PREFIX):
+        return content
+    if getattr(team, _RECONSTRUCTION_ATTEMPTED_FLAG, False):
+        return content
+    setattr(team, _RECONSTRUCTION_ATTEMPTED_FLAG, True)
+
+    rs = getattr(team, "_read_state", None)
+    enumerations = rs.get("enumerations") if isinstance(rs, dict) else None
+    cmp_note = await _computed_comparison(
+        task, enumerations, hive_mcp_url, hive_mcp_tools, content, team=team)
+    if not cmp_note:
+        print("[team] evidence-grounded reconstruction: no computed comparison "
+              "available — nothing to reconstruct from, keeping VERIFICATION FAILED",
+              flush=True)
+        return content
+
+    print("[team] evidence-grounded reconstruction: computed comparison available — "
+          "attempting one bounded reconstruction", flush=True)
+    try:
+        reconstructed, _retry = await _stream_team_run(
+            team, _reconstruction_prompt(task, cmp_note),
+            log_label="evidence-grounded-reconstruction", liveness_path=liveness_path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[team] evidence-grounded reconstruction failed: {exc}", flush=True)
+        return content
+
+    if not reconstructed or not _strip_leaked_tool_tags(reconstructed).strip() \
+            or reconstructed.strip() == _BUDGET_EXHAUSTED_ANSWER:
+        print("[team] evidence-grounded reconstruction produced nothing usable — "
+              "keeping VERIFICATION FAILED", flush=True)
+        return content
+
+    report2, still_bad, unavailable2 = await _verify_claims(
+        reconstructed, hive_mcp_url, hive_mcp_tools)
+    print(f"[team] evidence-grounded reconstruction recheck: still_bad={still_bad} "
+          f"unavailable={unavailable2} | {_verdict_digest(report2)}", flush=True)
+    if unavailable2 or still_bad:
+        print("[team] evidence-grounded reconstruction did not pass verification — "
+              "keeping VERIFICATION FAILED", flush=True)
+        return content
+
+    print("[team] evidence-grounded reconstruction: passed verification — releasing "
+          "the reconstructed answer", flush=True)
+    return reconstructed
+
+
 async def _repo_db_schema(hive_mcp_url: str | None, hive_mcp_tools=None) -> str:
     """hive-mcp's db_schema listing (`schema.table` per line), or "" when unavailable.
 
@@ -8161,6 +8336,12 @@ async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None
 
     if record is not None:
         record["routers"] = len(named)
+        # Phase I: the denominator, alongside the existing numerator -- pure addition,
+        # `record["routers"]` itself is unchanged and every existing reader of it
+        # (_retry_lost_enumeration) is unaffected. Lets _coverage_verdict distinguish
+        # "13 of 16" (incomplete) from "13, denominator unknown" (unknown) without
+        # re-deriving the count itself, which stays computed exactly once, here.
+        record["routers_total"] = len(names)
     if len(named) > _SCOPED_COVERAGE_RATIO * len(names):
         print(f"[team] scope check: {service}-service has {len(names)} routers "
               f"({basis}), answer names {len(named)} — above threshold, silent",
@@ -8497,6 +8678,9 @@ async def _declared_models_not_reported(task: str, content: str,
     named = [c for c in declared if re.search(rf"(?<!\w){re.escape(c)}(?!\w)", content)]
     if record is not None:
         record["models"] = len(named)
+        # Phase I: same additive denominator as _scoped_coverage_gap's own
+        # "routers_total" -- record["models"] itself is unchanged.
+        record["models_total"] = len(declared)
     if len(named) > _MODELS_MAX_NAMED_RATIO * len(declared):
         print(f"[team] models check: {service}-service declares {len(declared)} models, "
               f"answer names {len(named)} — above threshold, silent", flush=True)
@@ -11634,6 +11818,86 @@ def _make_evidence_gate_hook(task: str | None = None):
     return _evidence_gate_hook
 
 
+# ============================================================================
+# Phase I -- evidence integrity (2026-09-23).
+#
+# Root-caused against the live T13b ZGX validation of Phase H: a member's report
+# CITED Client/.../inventoryApi.ts and invented `getVoucherById` from pattern-
+# matching, but never actually called get_file_content on it --
+# read_chars_this_delegation=0, cited_not_read=[".../inventoryApi.ts"] in that
+# run's own phase0 telemetry. When Phase H's repair attempt correctly tried to
+# re-delegate a REAL read of that file, the duplicate-delegation gate blocked it
+# ("STOP: you have now asked 'researcher' for this same target...") because the
+# gate's notion of "already done" is a text/target+action match with no
+# awareness of whether the prior delegation actually produced grounded evidence.
+# _repair_verification_failure's repair therefore had no way to obtain the
+# evidence it needed, and correctly fell through to VERIFICATION FAILED.
+#
+# This section makes "was the target actually read" a first-class, code-side
+# check the gate can consult -- reusing team._read_state["reads"] (already
+# populated live by the same tool-interception hook chain the gate is part of),
+# not phase0.py's own computation of the same idea: that module's docstring is
+# explicit that it "never gates, rewrites, or short-circuits anything" and a bug
+# there "can cost a telemetry record and never a task" -- gating off it would
+# silently break that contract. The comparison itself (normalized target path
+# vs. a member's real read records) is the same normalization
+# _normalize_delegation_target already uses for audit-target comparison, not a
+# new rule.
+# ============================================================================
+
+def _member_actually_read_target(team, member_id: str, target: str) -> bool:
+    """Whether `member_id` has a real, tool-backed read in this run's read_state
+    whose path matches `target` -- the evidence-integrity counterpart to a
+    duplicate-delegation match, which only compares TASK TEXT/target+action and
+    is blind to whether either delegation actually produced grounded evidence.
+
+    Path comparison is deliberately lenient in one direction only: an exact
+    match after normalization, or one path ending the other at a '/' boundary
+    (so 'inventoryApi.ts' passed as a bare relative_path from a different cwd
+    still matches the fuller audit target, and vice versa) -- never a bare
+    substring match, which could false-match 'Api.ts' inside 'inventoryApi.ts'.
+    Silent (False) on missing/malformed state: unknown is not "was read".
+    """
+    rs = getattr(team, "_read_state", None)
+    if not isinstance(rs, dict):
+        return False
+    norm_target = _normalize_delegation_target(target)
+    if not norm_target:
+        return False
+    who = _member_key(member_id)
+    for entry in (rs.get("reads") or []):
+        if _member_key(str(entry.get("read_by", ""))) != who:
+            continue
+        path = _normalize_delegation_target(entry.get("path", ""))
+        if not path:
+            continue
+        if path == norm_target or path.endswith("/" + norm_target) \
+                or norm_target.endswith("/" + path):
+            return True
+    return False
+
+
+def _read_tracking_active(team) -> bool:
+    """Whether this run has real read-state to check at all -- the gate's OWN
+    precondition for attempting the evidence-integrity exception, kept separate
+    from _member_actually_read_target's own pure "was this exact target read"
+    question.
+
+    This distinction is load-bearing, not defensive: _member_actually_read_target
+    correctly returns False both when a target genuinely was never read AND when
+    read_state is simply absent (a team object built without it, or a test double)
+    -- but those are different facts. Folding "we don't know" into
+    _member_actually_read_target's own False and reading that as "confirmed not
+    read" at the gate would grant a corrective-read exception to every run/test
+    that never wires up read tracking at all, silently defeating ordinary
+    duplicate-delegation protection everywhere else in this file's own existing
+    test suite. Caught by that exact regression while implementing this phase --
+    the gate must only attempt the evidence check when it can genuinely tell the
+    two cases apart.
+    """
+    return isinstance(getattr(team, "_read_state", None), dict)
+
+
 def _make_duplicate_delegation_gate_hook(read_only: bool = False):
     """Mechanical backstop for _COORDINATOR_INSTRUCTIONS' own prose-only rule
     ("Before delegate_task_to_member(s): check whether an equivalent delegation is
@@ -11740,6 +12004,14 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
     # purpose (2026-08-27): a coordinator alternating between the two forms is asking
     # the same question twice and must not get two budgets.
     repeats: dict[str, int] = {}
+    # Phase I: (member, normalized target) pairs already granted their ONE corrective
+    # re-read exception -- bounds the exception per-target, deliberately separate from
+    # `repeats` (which stays per-member and keeps incrementing on a granted exception
+    # too, so the existing global 3-strike STOP is still a backstop across however many
+    # distinct targets one member accumulates exceptions for). A second ask for the
+    # SAME target after its one exception is spent falls straight back through to the
+    # normal duplicate-delegation path below -- this set is checked, not re-added to.
+    corrective_reads_granted: set[tuple[str, str]] = set()
 
     async def _duplicate_delegation_gate_hook(function_name, function, args,
                                               run_context=None, team=None):
@@ -12041,8 +12313,45 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                 if entry.get("tool") == "delegate_task_to_member"
                 and _member_key(str((entry.get("args") or {}).get("member_id", "")).strip()) == member_id
             ]
+            # Phase I: set when the exact-text tier below grants a corrective-read
+            # exception, so the REWORDED tier's own `if prior_entries:` check further
+            # down does not immediately re-evaluate the SAME call (the two tiers are
+            # sequential, not mutually exclusive -- both scan `prior_entries`) and
+            # block what the exact-text tier just granted. Confirmed live in this
+            # phase's own tests: without this flag, a granted exception was served
+            # ALREADY DONE by the reworded tier one branch later, in the same call.
+            _evidence_exception_granted = False
             for entry in prior_entries:
                 if _normalize_delegation_task((entry.get("args") or {}).get("task")) == task_text:
+                    # Phase I evidence-integrity exception (2026-09-23), checked BEFORE
+                    # the ordinary repeat bookkeeping below: a prior identical-text
+                    # delegation whose stored result never actually read its own
+                    # target is not "already done" in any sense that helps the
+                    # coordinator -- it is the exact ungrounded-citation shape that
+                    # produced T13b's fabricated getVoucherById live. Bounded to
+                    # exactly once per (member, target) via corrective_reads_granted;
+                    # `repeats` still increments below on grant, so the global 3-strike
+                    # ceiling remains a backstop. Only fires when a prior result WAS
+                    # captured (the pre-existing "no prior result -- allow the retry"
+                    # exception two branches down already covers the no-result case).
+                    _prior_result = (getattr(team, "_member_results", None) or {}).get(member_id)
+                    _entry_audit = entry.get("audit") or {}
+                    _corrective_target = _entry_audit.get("target") or \
+                        _derive_delegation_audit(raw_task)[0].get("target", "")
+                    _corrective_key = (member_id, _corrective_target)
+                    if (_prior_result and _corrective_target
+                            and _read_tracking_active(team)
+                            and _corrective_key not in corrective_reads_granted
+                            and not _member_actually_read_target(
+                                team, member_id, _corrective_target)):
+                        corrective_reads_granted.add(_corrective_key)
+                        repeats[member_id] = repeats.get(member_id, 0) + 1
+                        _evidence_exception_granted = True
+                        print(f"[team] duplicate delegation to {member_id!r} for "
+                              f"{_corrective_target!r} — prior result cited this target "
+                              f"without ever reading it (evidence defect); permitting "
+                              f"exactly ONE corrective re-read", flush=True)
+                        break
                     # Serve the result, don't scold (2026-08-22). The old message said
                     # "use that result instead of delegating it again" and did NOT
                     # include the result -- unfollowable if the coordinator has lost it
@@ -12097,7 +12406,7 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                     print(f"[team] duplicate delegation to {member_id!r} but no usable "
                           f"prior result — allowing the retry", flush=True)
                     break
-            if prior_entries:
+            if prior_entries and not _evidence_exception_granted:
                 audit = _parse_delegation_audit(raw_task)
                 if audit is None:
                     # No tag: derive the audit from the task text instead of refusing to
@@ -12110,6 +12419,30 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                 for entry in prior_entries:
                     prior_audit = entry.get("audit")
                     if prior_audit and prior_audit["target"] == audit["target"] and prior_audit["action"] == audit["action"]:
+                        # Phase I evidence-integrity exception (2026-09-23) -- same
+                        # check and same reasoning as the exact-text tier above, for
+                        # the reworded-repeat shape: this is the tier T13b's own live
+                        # corrective retry actually hit ("STOP: you have now asked
+                        # 'researcher' for this same target...", confirmed against the
+                        # ZGX journal), because the repair prompt necessarily reworded
+                        # the task rather than repeating it verbatim. Same bound: once
+                        # per (member, target), via the SAME corrective_reads_granted
+                        # set the exact-text tier shares.
+                        _prior_result = (getattr(team, "_member_results", None) or {}).get(member_id)
+                        _corrective_key = (member_id, audit["target"])
+                        if (_prior_result and audit["target"]
+                                and _read_tracking_active(team)
+                                and _corrective_key not in corrective_reads_granted
+                                and not _member_actually_read_target(
+                                    team, member_id, audit["target"])):
+                            corrective_reads_granted.add(_corrective_key)
+                            repeats[member_id] = repeats.get(member_id, 0) + 1
+                            print(f"[team] duplicate delegation (reworded) to "
+                                  f"{member_id!r} for {audit['target']!r} — prior result "
+                                  f"cited this target without ever reading it (evidence "
+                                  f"defect); permitting exactly ONE corrective re-read",
+                                  flush=True)
+                            break
                         # Serve and escalate here too (2026-08-27). The 2026-08-22 fix
                         # above gave the exact-task-text path a real result, a repeat
                         # counter and a hard stop, and left THIS path -- the same target
@@ -18862,6 +19195,21 @@ async def run_task_async(
                         liveness_path=liveness_path, synthesis_run=synthesis_run)
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
+                # Phase I (2026-09-23): the LAST word, deliberately after Phase R above --
+                # only ever looks at content once every existing guard has already had
+                # its say, and only acts when that final content is STILL the
+                # VERIFICATION FAILED shape Phase H produces. A separate, later stage
+                # from Phase H's own repair (see _attempt_evidence_grounded_
+                # reconstruction's own docstring for why it is not folded into
+                # _repair_verification_failure) -- wrapped in its own try/except for the
+                # same reason every guard at this choke point is: a diagnostic or
+                # recovery attempt failing must never cost the run its answer.
+                try:
+                    content = await _attempt_evidence_grounded_reconstruction(
+                        content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
+                        liveness_path=liveness_path)
+                except Exception as exc:
+                    print(f"[team] evidence-grounded reconstruction warning: {exc}")
                 # Phase V forensic instrumentation: log-only, never mutates `content`,
                 # never gates, never retries. Reuses Phase N's _evidence_fidelity_report
                 # (already built for exactly this question, previously unwired for lack
