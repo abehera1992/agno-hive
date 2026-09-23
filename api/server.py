@@ -394,7 +394,17 @@ def _liveness_kill_reason(snapshot: dict) -> str | None:
     live incident)."""
     stagnant = snapshot.get("stagnant_seconds", 0)
     if stagnant > config.liveness_silence_threshold_s:
-        return f"no tool call or new stream content for over {config.liveness_silence_threshold_s:.0f}s"
+        base = f"no tool call or new stream content for over {config.liveness_silence_threshold_s:.0f}s"
+        # Phase G (2026-09-22): WHAT the run was observed doing when it went silent, not
+        # just THAT it was silent -- see swarm/team.py's _classify_liveness_state. Purely
+        # additive: the kill condition above (stagnant_seconds vs the threshold) is
+        # unchanged, and an older snapshot with no liveness_state key (a prior worker
+        # version, or a test fixture) gets the exact original message back, unmodified.
+        state = snapshot.get("liveness_state")
+        if state:
+            state_s = snapshot.get("liveness_state_seconds", 0)
+            return f"{base} (state: {state} for {state_s:.0f}s)"
+        return base
     stub_count = snapshot.get("max_stub_serve_count", 0)
     if stub_count > config.liveness_stub_serve_threshold:
         return f"repeated an identical call {stub_count} times despite being told to stop"

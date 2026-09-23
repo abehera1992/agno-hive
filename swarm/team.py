@@ -5,6 +5,7 @@ import re
 import sys
 import time
 from contextlib import AsyncExitStack, suppress
+from dataclasses import dataclass
 
 from opentelemetry import trace
 from pydantic import BaseModel, Field
@@ -1075,12 +1076,125 @@ def _instructions_without_removed_tool_lines(
             if not (_names(ln, removed) and not _names(ln, kept))]
 
 
-def _strip_mutating(specs: list, tool_names: list[str] | None) -> tuple[list, list[str] | None]:
+_TOOL_NAME_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _unavailable_tool_tokens(text: str, kept: set[str]) -> set[str]:
+    """Tool-name-shaped tokens in `text` that name a mutating tool NOT in `kept`.
+
+    Self-contained -- reads _is_mutating directly rather than taking a removed/kept pair
+    computed from one _strip_mutating pass's before/after tool-list delta. That delta is
+    empty by the SECOND pass (there is nothing left to remove), even though the same tools
+    are still unavailable, which would silently disable this check for any caller relying
+    on the delta. Description and skill filtering below use this instead of the pattern
+    _instructions_without_removed_tool_lines uses, for exactly that reason.
+    """
+    if not text:
+        return set()
+    return {tok for tok in _TOOL_NAME_TOKEN_RE.findall(text) if _is_mutating(tok) and tok not in kept}
+
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _description_without_unavailable_tool_mentions(description: str, kept: set[str]) -> str:
+    """`description` with sentences naming ONLY unavailable tools dropped, at sentence
+    granularity since a role description is prose, not a line list -- same "mixed survives,
+    tool-free survives" rule as _instructions_without_removed_tool_lines.
+
+    Fixes a real leak: engineering.yaml's Coder description reads "Implementation
+    specialist. Write clean, idiomatic code following existing patterns. Use apply_diff()
+    for existing files, write_file() only for new ones." -- read_only strips both tools from
+    Coder's surface but, until now, this text kept telling a read-only Coder to use them.
+    """
+    if not description:
+        return description
+    kept_sentences = []
+    for sent in _SENTENCE_SPLIT_RE.split(description):
+        unavailable = _unavailable_tool_tokens(sent, kept)
+        mentions_kept = bool(set(_TOOL_NAME_TOKEN_RE.findall(sent)) & kept)
+        if unavailable and not mentions_kept:
+            continue
+        kept_sentences.append(sent)
+    return " ".join(kept_sentences).strip()
+
+
+def _skills_without_unavailable_tool_refs(
+    skill_names: list, skill_catalog: list[dict] | None, kept: set[str],
+) -> list:
+    """`skill_names` with any whose catalog description names ONLY unavailable tools dropped.
+
+    Fixes a real leak: the Executor's granted `bash-sessions` skill describes
+    bash_session_start/bash_run/bash_session_close/bash_job_status/bash_job_kill in its own
+    L1 catalog line -- every one stripped under read_only -- so the catalog kept advertising
+    a workflow the Executor could not run, and it tried bash_session_start once (T8, 2026-09-
+    21 battery). A3 contained the resulting call; this removes the advertisement that caused
+    it in the first place.
+
+    No catalog (not fetched yet at the EARLY _strip_mutating pass in run_task_stream/async,
+    before the skill-catalog fetch) or no granted names -> returned unchanged: the later pass,
+    once the catalog is available, does the real filtering. A granted name absent from the
+    fetched catalog is left in place too -- this only removes what it can positively confirm
+    is unavailable-only, matching the "mixed/unknown survives" rule everywhere else here.
+    """
+    if not skill_names or not skill_catalog:
+        return skill_names
+    by_name = {c.get("name"): c.get("description", "") for c in skill_catalog if c.get("name")}
+    out = []
+    for name in skill_names:
+        desc = by_name.get(name)
+        if desc is None:
+            out.append(name)
+            continue
+        unavailable = _unavailable_tool_tokens(desc, kept)
+        mentions_kept = bool(set(_TOOL_NAME_TOKEN_RE.findall(desc)) & kept)
+        if unavailable and not mentions_kept:
+            continue
+        out.append(name)
+    return out
+
+
+def _apply_capability_policy(s2, removed: set[str], kept: set[str], skill_catalog) -> None:
+    """Mutate `s2` in place so every model-visible surface -- tools (already filtered by the
+    caller), instructions, role description, and granted skills -- agrees about what this
+    member can actually do under read_only.
+
+    One policy, four surfaces, the same underlying facts (`removed`/`kept`, both derived
+    from this spec's own tool list): a name that leaks through a role description or a
+    skill's catalog line is treated the same as one leaking through an instruction line (A2).
+    Nothing here is a new independent string-blacklist -- _is_mutating is the single source
+    of "what counts as mutating" throughout. A3's unavailable-tool containment remains the
+    runtime fallback for whatever a model still attempts despite all four agreeing.
+    """
+    if removed and getattr(s2, "instructions", None):
+        s2.instructions = _instructions_without_removed_tool_lines(
+            list(s2.instructions), removed, kept)
+    if getattr(s2, "description", None):
+        s2.description = _description_without_unavailable_tool_mentions(s2.description, kept)
+    if getattr(s2, "skills", None):
+        s2.skills = _skills_without_unavailable_tool_refs(
+            list(s2.skills), skill_catalog, kept)
+
+
+def _strip_mutating(
+    specs: list, tool_names: list[str] | None, skill_catalog: list[dict] | None = None,
+) -> tuple[list, list[str] | None]:
     """Return (agent_specs, coordinator_tools) with every mutating tool removed.
 
-    Member instruction lines that name only the tools removed from that member's surface
-    are dropped with them (see _instructions_without_removed_tool_lines). Idempotent:
-    a second pass over already-stripped specs removes nothing further.
+    Every model-visible surface derived from a spec's tools -- instructions, role
+    description, granted skills -- is filtered from the SAME kept-tool facts by
+    _apply_capability_policy, not four independently maintained rules. Idempotent: a
+    second pass over already-stripped specs removes nothing further (instructions,
+    gated on THIS pass's removed set, correctly no-ops; description/skills, gated on
+    the pass-independent `kept` set instead, give the same answer either pass -- see
+    _unavailable_tool_tokens).
+
+    `skill_catalog` (default None) enables skill-catalog filtering. It is None on the
+    EARLY rebind pass in run_task_stream/run_task_async (before the catalog is fetched)
+    and passed on the LATER pass, right before _build_team, where it's already in scope --
+    skills are rendered from that later pass's specs, so that is the one that has to be
+    correct; the early pass exists only to correct the roster preamble's tool/description
+    text before it's composed.
 
     Enforces read-only at the TOOL SURFACE rather than by instruction. Measured
     2026-07-31: a task whose prompt said "do NOT call write_file or apply_diff, do not
@@ -1100,9 +1214,7 @@ def _strip_mutating(specs: list, tool_names: list[str] | None) -> tuple[list, li
             _before = list(s2.tools)
             s2.tools = [t for t in _before if not _is_mutating(t)]
             _removed = set(_before) - set(s2.tools)
-            if _removed and getattr(s2, "instructions", None):
-                s2.instructions = _instructions_without_removed_tool_lines(
-                    list(s2.instructions), _removed, set(s2.tools))
+            _apply_capability_policy(s2, _removed, set(s2.tools), skill_catalog)
         out.append(s2)
     # `is not None`, NOT truthiness (fixed 2026-08-21). An EXPLICITLY EMPTY allowlist is
     # a deliberate disarm and must survive read_only stripping; only an ABSENT one means
@@ -1692,6 +1804,118 @@ def _with_forwarded_evidence(content: str, team) -> str:
         "because the answer above did not carry all of it.**" + "".join(parts))
 
 
+@dataclass
+class MemberResult:
+    """The structured handoff a member's raw report is reduced to before it reaches the
+    Coordinator's final answer (Phase E, 2026-09-22).
+
+    B's line-level carry guarantee (no loss, no duplication) is unchanged and untouched --
+    this only changes WHAT TEXT is handed to it. Before this, forward_member_answer recorded
+    the member's raw transcript verbatim, and B forwarded whatever of THAT the Coordinator's
+    answer didn't already carry. Live (T10/T11, 2026-09-21 battery): that raw transcript
+    included the model's own process narration ("I'll check for X... Let me try a different
+    approach...") and a runtime-injected debugging aid (the "[DECLARATION INDEX ... extracted
+    from the tool output by code, not written by the member]" block, addressed to the
+    Coordinator) -- neither authored FOR a reader, and both ended up quoted at one anyway.
+
+    status:     "COMPLETE" (real content, nothing flagged), "PARTIAL" (the runtime itself
+                flagged this report as disproportionately smaller than what the member read
+                -- _THIN_REPORT_MARKER, an EXISTING signal, not invented here), or "BLOCKED"
+                (nothing usable survives -- empty, or the canned budget-exhausted sentence).
+    answer:     `raw` with the runtime-injected tail notices and process-narration sentences
+                removed -- what actually reaches the reader. Never invented text: every word
+                in it came from the member.
+    evidence:   distinct filenames the RAW report names (_RELAY_FILENAME_RE -- the same
+                extractor _finalise_member_chunks already uses for its own relay-loss
+                fingerprint), independent of whether the prose sentence naming one survived
+                narration stripping. Locators only, never synthesised.
+    unresolved: the runtime-injected tail notice(s) verbatim, if any were present -- kept
+                here, not in `answer`, so the fact that something was flagged is never lost,
+                only kept out of user-facing prose.
+    raw:        the member's exact, unmodified text. Never read by the forwarding path below;
+                kept solely so the full transcript stays reachable for tracing/debugging
+                (team._member_results already holds this too, unchanged by this phase -- this
+                field just keeps it attached to the one structure a caller actually receives).
+    """
+    status: str
+    answer: str
+    evidence: list
+    unresolved: list
+    raw: str
+
+
+# Split just before an uppercase letter that follows sentence-ending punctuation, with or
+# without a space in between -- member reports observed live run sentences together with NO
+# separating space ("...in the codebase.I'll try a different approach...", T10's own raw
+# text), which a whitespace-requiring split misses entirely.
+_MEMBER_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s*(?=[A-Z])")
+
+# A small, FIXED set of sentence OPENERS that are always "what I am about to do," never a
+# finding -- chosen directly from real member reports that reached a user verbatim (T10, T11,
+# 2026-09-21 battery): "I'll check...", "Let me look at...", "Now that I have X, let me...".
+# Anchored to the sentence's own START (never searched mid-sentence), so a finding that merely
+# CONTAINS one of these words ("I found a rate-limiting function...") is never touched. A
+# variant this misses is simply kept -- the safe direction: this can only under-strip, never
+# drop a sentence that states real content.
+_MEMBER_NARRATION_OPENER_RE = re.compile(
+    r"^(?:First,?\s+)?(?:I'll\b|I will\b|Let me\b|Now,?\s+let me\b|Now that I have\b)",
+    re.IGNORECASE,
+)
+
+
+def _strip_member_narration(text: str) -> str:
+    """`text` with pure process-narration sentences removed -- see
+    _MEMBER_NARRATION_OPENER_RE for exactly which ones and why."""
+    if not text:
+        return text
+    sentences = _MEMBER_SENTENCE_SPLIT_RE.split(text)
+    kept = [s.strip() for s in sentences if not _MEMBER_NARRATION_OPENER_RE.match(s.strip())]
+    return " ".join(s for s in kept if s)
+
+
+def _build_member_result(raw_text: str) -> MemberResult:
+    """The structured handoff for one member's raw report -- see MemberResult's own
+    docstring for what each field means and why.
+
+    Pure function of `raw_text` alone: evidence is re-derived from it directly (the same
+    extractor _finalise_member_chunks already applies to the same text) rather than read
+    from a side-channel like team._member_items, which only the RunContent/
+    RunContentCompleted capture path populates -- run_task_async's separate dict-event path
+    (_record_stream_artifacts) does not, so relying on it would silently starve `evidence`
+    depending on which streaming path happened to be active for a given delegation.
+    """
+    raw = raw_text or ""
+    stripped = raw.strip()
+    if not stripped or stripped == _BUDGET_EXHAUSTED_ANSWER:
+        return MemberResult(status="BLOCKED", answer="", evidence=[], unresolved=[], raw=raw)
+
+    # Both notices, when present, are appended at the very tail of the raw text, in this
+    # fixed order (_record_stream_artifacts: thin-report first, then the declaration index)
+    # -- so truncating at the EARLIEST marker's position removes both in one step, and
+    # everything from there to the end (both, if both are present) is kept verbatim as one
+    # combined `unresolved` entry rather than pulled apart, which would need to assume more
+    # about their internal shape than this phase needs to.
+    positions = [p for p in (raw.find(_THIN_REPORT_MARKER), raw.find(_DECLARATION_INDEX_MARKER))
+                if p != -1]
+    unresolved = []
+    body = raw
+    if positions:
+        cut = min(positions)
+        unresolved = [raw[cut:].strip()]
+        body = raw[:cut].rstrip()
+
+    evidence = sorted(set(_RELAY_FILENAME_RE.findall(raw)))
+    answer = _strip_member_narration(body).strip()
+    if not answer:
+        # Nothing survived but the tail notice(s) -- e.g. a report that was ONLY a
+        # thin-report flag with no prose at all. Genuinely nothing to hand a reader.
+        return MemberResult(status="BLOCKED", answer="", evidence=evidence,
+                            unresolved=unresolved, raw=raw)
+    status = "PARTIAL" if _THIN_REPORT_MARKER in raw else "COMPLETE"
+    return MemberResult(status=status, answer=answer, evidence=evidence,
+                        unresolved=unresolved, raw=raw)
+
+
 def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = None):
     """Build the coordinator's forward tool over the live member-results map.
 
@@ -1756,15 +1980,29 @@ def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = N
                 f"Members with an answer this run: {', '.join(have) if have else 'none'}. "
                 f"Delegate first, then forward."
             )
-        print(f"[team] forward_member_answer: forwarding {key!r}'s answer verbatim "
-              f"({len(text):,} chars)", flush=True)
+        # Phase E: build the structured handoff from the raw transcript. `text` itself
+        # (== team._member_results[key]) is untouched by this -- the raw transcript stays
+        # reachable there for tracing/debugging exactly as before this phase existed.
+        result = _build_member_result(text)
+        if result.status == "BLOCKED" or not result.answer:
+            print(f"[team] forward_member_answer: {key!r}'s report had nothing forwardable "
+                  f"after stripping runtime notices/narration ({len(text):,} raw chars)",
+                  flush=True)
+            return (
+                f"NOTHING TO FORWARD: {member_id!r}'s answer has no forwardable content "
+                f"(empty, budget-exhausted, or only a runtime notice). Delegate again with "
+                f"a narrower task, or write the answer yourself from what you already know."
+            )
+        print(f"[team] forward_member_answer: forwarding {key!r}'s answer "
+              f"({len(result.answer):,} chars of {len(text):,} raw, status={result.status}"
+              f"{', unresolved' if result.unresolved else ''})", flush=True)
         if forwarded is None:
-            return text
-        forwarded[key] = text
+            return result.answer
+        forwarded[key] = result.answer
         return (
-            f"FORWARDED: {key}'s answer ({len(text):,} characters) is recorded and will "
-            f"appear in your final answer exactly as written. Do not retype it; add only "
-            f"your own ordering, explanation and anything the members did not cover."
+            f"FORWARDED: {key}'s answer ({len(result.answer):,} characters) is recorded and "
+            f"will appear in your final answer exactly as written. Do not retype it; add "
+            f"only your own ordering, explanation and anything the members did not cover."
         )
 
     return forward_member_answer
@@ -4570,10 +4808,75 @@ _EVIDENCE_INTEGRITY_FLAG = "_evidence_integrity_checked"
 # _count_contradicts_own_list) is never misread as a DB claim.
 _DB_ROW_COUNT_CLAIM_RE = re.compile(
     r"\b(\d[\d,]*)\s+rows?\b", re.IGNORECASE)
-# What a db_query/db_schema tool preview actually says about a row count, the same
-# shape count_matches/db_query results take in this project's own tool output.
-_DB_ROW_COUNT_EVIDENCE_RE = re.compile(
-    r"\b(\d[\d,]*)\s+rows?\b|^\s*(\d+)\s*$", re.IGNORECASE)
+# hive-mcp/tools/integrations/db.py's _render() -- the function that builds every real
+# db_query response -- always ends with this EXACT literal marker: "\n[{len(rows)} row(s)]",
+# optionally followed by " (truncated — refine with a tighter query)" on the same line. The
+# word is always singular "row" with a literal, non-pluralized "(s)" regardless of N -- never
+# "rows(s)" or any other spelling. This is the tool's own RESULT-SET-SIZE bookkeeping, not a
+# value the query returned.
+_DB_ROW_FOOTER_RE = re.compile(
+    r"^\[(\d+)\s+row\(s\)\](?:\s*\(.*\))?\s*$", re.IGNORECASE)
+# Legacy/simulated preview fallback: a bare "N rows" sentence with no structured
+# header/footer shape at all (pre-dates _render(), also how existing tests construct a
+# preview directly). "(?!\(s\))" is the one exclusion that actually fixes the T8 bug below --
+# it is the only thing that distinguishes a real "N rows" claim from the tool's own footer
+# marker text, which is the ONLY place "row(s)" (immediately parenthesized) ever appears.
+_DB_BARE_ROW_COUNT_RE = re.compile(r"\b(\d[\d,]*)\s+rows?\b(?!\(s\))", re.IGNORECASE)
+
+
+def _parse_db_row_count_evidence(preview: str) -> str | None:
+    """The real row-count number a db_query/db_schema preview supports for a claimed-count
+    check, or None if the preview doesn't have one this check can use.
+
+    Root cause (T8, 2026-09-21 post-deployment battery): the old evidence regex scanned the
+    WHOLE preview text for any "<digits> row(s)?" match with no structural awareness, so on
+    `SELECT COUNT(*) FROM inventory.parties` -- preview "count\n0\n[1 row(s)]" -- it matched
+    "1" straight out of the tool's OWN "[1 row(s)]" result-set-size footer, before ever
+    reaching the real value ("0") on the line above it. A table with 0 parties was reported
+    as contradicting the correct "0 rows" answer.
+
+    Those are two different numbers with two different meanings, and _render()'s shape (a
+    header line, one line per returned row, then the "[N row(s)]" footer) is fixed and
+    known, so this parses it structurally instead of pattern-matching text soup:
+
+      - exactly ONE data row of ONE column (the COUNT(*)/SUM/single-value shape this project
+        actually uses for count questions -- db_query's own docstring names "counts, totals...
+        the current value of a column" as its primary use, and T8's own Researcher ran
+        exactly `SELECT COUNT(*)`, not a row-enumerating SELECT) -- that cell's OWN value is
+        the real count. The footer is not consulted here: it would correctly say "1 row",
+        which is true and answers a different question than the one being checked;
+      - otherwise (zero rows, or more than one data row, or more than one column) -- the
+        footer's row count (len(rows)) is the real count, matching what "N rows" means for a
+        result no single cell speaks for;
+      - no structured shape at all (a bare "N rows" sentence, predating _render() or how the
+        existing tests construct a preview directly) -- the original free-text match, minus
+        the one exclusion that fixes the bug: never match text immediately followed by
+        "(s)", which real prose and a real data value never contain.
+
+    Silent (None) when none of these shapes apply -- a multi-column, multi-row preview has
+    no single obvious count to check a claim against, and this guard was never meant to
+    parse arbitrary tabular results; returning nothing is the safe direction; a false
+    "no contradiction" is a miss, not a false accusation.
+    """
+    lines = (preview or "").splitlines()
+    if not lines:
+        return None
+    footer = None
+    body = lines
+    fm = _DB_ROW_FOOTER_RE.match(lines[-1].strip())
+    if fm:
+        footer = fm.group(1)
+        body = lines[:-1]
+    if len(body) == 2:
+        header, row = body[0], body[1]
+        if "|" not in header and "|" not in row:
+            cell = row.strip()
+            if re.fullmatch(r"-?\d[\d,]*", cell):
+                return cell.replace(",", "")
+    if footer is not None:
+        return footer
+    bm = _DB_BARE_ROW_COUNT_RE.search(preview or "")
+    return bm.group(1).replace(",", "") if bm else None
 
 # Claimed OS/Python-version/branch sentences the answer might assert. Narrow and
 # structural, matching get_env_info's own field labels and git's own branch-name shape
@@ -4604,11 +4907,10 @@ def _integrity_db_count_contradiction(content: str, team) -> tuple[str, str] | N
         if item.get("name") not in _DB_TOOLS:
             continue
         preview = item.get("preview") or ""
-        em = _DB_ROW_COUNT_EVIDENCE_RE.search(preview)
-        if not em:
+        real = _parse_db_row_count_evidence(preview)
+        if not real:
             continue
-        real = (em.group(1) or em.group(2) or "").replace(",", "")
-        if real and real != claimed:
+        if real != claimed:
             return claimed, real
     return None
 
@@ -10917,6 +11219,137 @@ _ACTION_PROPOSAL_RE = re.compile(
 )
 
 
+
+# Phase F (2026-09-22) -- evidence-gated delegation. Deliberately narrow: recognises ONE
+# task shape mechanically, "from X to Y" (T3, 2026-09-21 battery, the run this exists for:
+# "Trace it from the API route to the database model" -- both endpoints were found by the
+# 3rd delegation, and the run then made 7 MORE, each naming a genuinely different,
+# task-unstated target, none of them an exact or reworded repeat of the first three, so the
+# duplicate-delegation gate above correctly let every one of them through). Any task NOT
+# matching this shape returns None (coverage undetermined) and is NEVER blocked -- no
+# generalised task-understanding, no judgement of what a target "means," just a count of
+# distinct (action, target) pairs (see _evidence_gate_audit below for exactly how those are
+# derived -- C's own primitives first, one additional narrow structural pattern second).
+_TRACE_TWO_ENDPOINT_RE = re.compile(r"\bfrom\s+.+?\s+to\s+(?:the\s+)?.+?[.?!]", re.IGNORECASE)
+
+# "Evidence gathering" actions only -- implement/plan are different kinds of work this gate
+# never touches; verify is excluded too, since checking a claim against an ALREADY-covered
+# target is not "exploring a new one" and must never be blocked by this gate.
+_EVIDENCE_GATHERING_ACTIONS = frozenset({"read", "search", "analyze"})
+
+# A grammatical shape, not semantic understanding: "the <Capitalized Name> model/class/
+# enum/table/schema". Kept SEPARATE from _derive_delegation_audit (C's own primitive, used
+# unmodified for target/action derivation everywhere else) because C's file-path-only
+# extraction genuinely could not see most of T3's real targets: of T3's 10 actual delegation
+# task strings (2026-09-21 battery), only ONE ("Read the business_admin_api.py file...")
+# names a literal file path -- the other nine name an ENTITY ("the BusinessProfile model
+# definition", "the VerificationCheck model definition", ...), which _derive_delegation_audit
+# correctly falls back to its hash-target "unknown" case for (safe for ITS purpose --
+# exact/reworded-repeat detection, where an unclassifiable target simply never matches
+# anything else by design). Verified directly against those 10 real strings before this was
+# written: this pattern extracts the real entity for 8 of the 9 non-file-path ones (the one
+# miss is a 3-item comma list, "the BusinessAddress, BankDetails, and ONDCConfig model
+# definitions", which stays unclassified -- silent, not a false block).
+_EVIDENCE_ENTITY_RE = re.compile(
+    r"\bthe\s+([A-Z][A-Za-z0-9]{2,})(?:\s+and\s+[A-Z][A-Za-z0-9]{2,})?\s+"
+    r"(?:model|class|enum|table|schema)\b")
+
+
+def _evidence_gate_audit(raw_task) -> tuple[str, str] | None:
+    """(action, target) for THIS gate's own purposes, or None if nothing usable was found.
+
+    Tries, in order: an explicit <delegation_audit> tag (_parse_delegation_audit -- an
+    explicit tag always wins, same precedence rule C itself follows); a real file path named
+    in the task (_derive_delegation_audit, reused exactly as C uses it -- not reimplemented,
+    not modified); and, only when neither found anything, _EVIDENCE_ENTITY_RE. The action for
+    an entity-shaped match still comes from _DERIVED_ACTION_WORDS (the same vocabulary
+    _derive_delegation_audit itself scores actions with), so "find and read the X model" is
+    read/search-shaped exactly as it would be if X were a literal file path -- and an
+    entity mentioned in a sentence with no read/search/analyze verb at all (e.g. a plan or
+    implement task that happens to name a model) is correctly left unclassified.
+    """
+    tagged = _parse_delegation_audit(raw_task)
+    if tagged is not None:
+        return tagged["action"], tagged["target"]
+    derived, from_text = _derive_delegation_audit(raw_task)
+    if from_text:
+        return derived["action"], derived["target"]
+    text = str(raw_task or "")
+    m = _EVIDENCE_ENTITY_RE.search(text)
+    if not m:
+        return None
+    hits = [(mm.start(), action) for rx, action in _DERIVED_ACTION_WORDS
+            for mm in [rx.search(text)] if mm]
+    if not hits:
+        return None
+    action = min(hits)[1]
+    if action not in _EVIDENCE_GATHERING_ACTIONS:
+        return None
+    return action, _normalize_delegation_target(m.group(1))
+
+
+def _required_coverage_count(task: str | None) -> int | None:
+    """How many distinct evidence targets `task`'s own wording asks for, or None if this
+    cannot be determined mechanically. None (never 0) means "unknown, not zero" -- the one
+    shape this recognises always asks for exactly two things, so 0 is not a real outcome
+    here; a task this can't classify is "unresolved required coverage," not "none needed."
+    """
+    if _TRACE_TWO_ENDPOINT_RE.search(task or ""):
+        return 2
+    return None
+
+
+def _make_evidence_gate_hook(task: str | None = None):
+    """Blocks a delegate_task_to_member call for a genuinely NEW, task-unstated target once
+    `task`'s own mechanically-determined coverage requirement (_required_coverage_count) is
+    already met by delegations that already ran this run.
+
+    Complementary to the duplicate-delegation gate below, not a replacement: that one stops
+    asking the SAME question again (same target+action, exact or reworded); this one stops
+    asking a DIFFERENT, unstated question once the STATED one is already answered -- see the
+    module comment above _TRACE_TWO_ENDPOINT_RE for the run that motivated it. The two never
+    compete for the same call: this only ever fires for a target NOT already in its own
+    `covered` set, which the duplicate-delegation gate's own target+action matching does not
+    reach (T3's #4-10 each named a different model/enum, none a repeat of #1-3).
+
+    `required` and `covered` are resolved/built ONCE per hook instance (one call, one run --
+    the same closure-per-run shape every other gate here uses), so a task this cannot
+    classify (`required is None`) costs a single regex search and then never checks anything
+    again for the rest of the run.
+    """
+    required = _required_coverage_count(task)
+    covered: set[str] = set()
+
+    async def _evidence_gate_hook(function_name, function, args, run_context=None, team=None):
+        if required is None or function_name != "delegate_task_to_member":
+            return await function(**args)
+        raw_task = (args or {}).get("task")
+        found = _evidence_gate_audit(raw_task)
+        if found is None:
+            return await function(**args)
+        action, target = found
+        if action not in _EVIDENCE_GATHERING_ACTIONS or not target:
+            return await function(**args)
+        if len(covered) >= required and target not in covered:
+            print(f"[team] evidence gate: {len(covered)}/{required} required target(s) "
+                  f"already covered {sorted(covered)} -- blocking a delegation for a new, "
+                  f"task-unstated target {target!r}", flush=True)
+            return (
+                f"DELEGATION_BLOCKED\nreason=EVIDENCE_SUFFICIENT\n"
+                f"This task named {required} thing(s) to trace/cover, and {len(covered)} "
+                f"have already been found: {', '.join(sorted(covered))}. This delegation "
+                f"targets {target!r}, which the task did not ask for. This call was NOT "
+                f"executed. If the answer is genuinely missing something the task DID ask "
+                f"for, name that specific target instead. Otherwise, write the final answer "
+                f"now from what you already have."
+            )
+        result = await function(**args)
+        covered.add(target)
+        return result
+
+    return _evidence_gate_hook
+
+
 def _make_duplicate_delegation_gate_hook(read_only: bool = False):
     """Mechanical backstop for _COORDINATOR_INSTRUCTIONS' own prose-only rule
     ("Before delegate_task_to_member(s): check whether an equivalent delegation is
@@ -12126,6 +12559,11 @@ def _make_tool_interception_hook(
         if activity is not None:
             activity["last_call_name"] = function_name
             activity["last_call_at"] = started
+            # Phase G: split from last_call_at, which this hook already sets both BEFORE
+            # dispatch and AFTER completion (at different points below) and therefore
+            # cannot itself distinguish "still running" from "just finished" -- exactly
+            # the gap _classify_liveness_state's TOOL_EXECUTING state needs closed.
+            activity["last_tool_call_at"] = started
         try:
             result = await function(**args)
             elapsed = time.monotonic() - started
@@ -12191,6 +12629,7 @@ def _make_tool_interception_hook(
                 now = time.monotonic()
                 activity["last_call_at"] = now
                 activity["last_progress_at"] = now
+                activity["last_tool_result_at"] = now
             return result
         except Exception as exc:
             elapsed = time.monotonic() - started
@@ -12210,6 +12649,9 @@ def _make_tool_interception_hook(
                 now = time.monotonic()
                 activity["last_call_at"] = now
                 activity["last_progress_at"] = now
+                # A raised call still COMPLETED (it just failed) -- TOOL_EXECUTING must
+                # end here too, or a failing tool would look permanently "still running".
+                activity["last_tool_result_at"] = now
             raise
         finally:
             # Phase D: close a ToolCall that never reached either
@@ -12343,6 +12785,12 @@ def _build_team(
     # team._forwarded_members below and read by _with_forwarded_evidence.
     forwarded_members: dict[str, str] = {}
     capability_routing_gate_hook = _make_capability_routing_gate_hook(member_tools)
+    # Phase F -- built from the SAME top-level `task` decompose_first_gate_hook/
+    # search_before_browse_gate_hook already receive, unconditionally (unlike those two,
+    # this has no team_gate_flags allowlist yet -- it never blocks at all unless `task`
+    # matches the one narrow shape it recognises, so there is no unconditional-team
+    # behaviour change to gate).
+    evidence_gate_hook = _make_evidence_gate_hook(task=task)
     duplicate_delegation_gate_hook = _make_duplicate_delegation_gate_hook(read_only=read_only)
     delegation_log_hook = _make_delegation_log_hook()
     interception_hook = _make_tool_interception_hook(activity=activity)
@@ -12385,7 +12833,7 @@ def _build_team(
     tool_hooks = [
         interception_hook, search_before_browse_gate_hook, read_cache_hook,
         decompose_first_gate_hook, capability_routing_gate_hook,
-        duplicate_delegation_gate_hook, delegation_log_hook,
+        evidence_gate_hook, duplicate_delegation_gate_hook, delegation_log_hook,
     ]
 
     def _hooks_for(role: str) -> list:
@@ -13325,8 +13773,8 @@ async def run_task_stream(
 
         # read_only strips mutating tools from both the agents and the coordinator, so a
         # read-only run cannot write regardless of what the model decides to do.
-        _specs, _ctools = (_strip_mutating(agent_specs, coordinator_tools) if read_only
-                           else (agent_specs, coordinator_tools))
+        _specs, _ctools = (_strip_mutating(agent_specs, coordinator_tools, skill_catalog)
+                           if read_only else (agent_specs, coordinator_tools))
         # DB-backed model routing (AGNOHive 2.3.2 addendum) — get_model() (called
         # inside _build_team, below) only ever reads model_routing's in-process
         # cache, never the DB directly. This covers BOTH the FastAPI server path
@@ -13616,6 +14064,63 @@ def best_draft() -> str:
     return _best_draft
 
 
+# Phase G (2026-09-22) -- liveness observability. Built to answer a question the EXISTING
+# auto-kill mechanism (stagnant_seconds, unchanged by this) could never answer: WHAT was the
+# run actually doing when it went silent. Confirmed against the real T12/T13a 300s stalls
+# (2026-09-21 post-deployment battery, commit 49579a9 -- this behaviour predates and is
+# unrelated to that patch): vLLM's OWN engine metrics (docker logs vllm-coord, captured
+# separately from this process) showed continuous non-zero generation throughput and exactly
+# ONE open HTTP request for the entire ~347s stall window, while THIS process's own
+# stream_event_count sat completely frozen the whole time -- team.arun()'s generator yielded
+# ZERO events of any kind, not "events arrived but were misclassified." Today's heartbeat
+# line and kill message cannot distinguish that (a single giant in-flight generation, still
+# consuming GPU) from a genuinely dead/hung process; both print the same generic "no tool
+# call or new stream content". This does not change WHEN the kill fires (stagnant_seconds,
+# the threshold, and every existing tier are untouched) -- only what it reports once it does.
+_LIVENESS_STATES = ("MODEL_GENERATING", "TOOL_EXECUTING", "PARSER_WAIT", "WORKFLOW_STALLED")
+
+
+def _classify_liveness_state(now: float, activity: dict, recent_s: float) -> str:
+    """One of _LIVENESS_STATES, from the four raw timestamps the interception hook and the
+    stream loops write into `activity` (last_token_at, last_tool_call_at,
+    last_tool_result_at, last_model_event_at) -- see their own call sites for exactly when
+    each one is set.
+
+    WAITING_FOR_TOOL is not a distinct return value here: it is the SAME observed window as
+    TOOL_EXECUTING (a tool call issued, its result not back yet), named from the other side
+    -- the run is waiting FOR the tool that is executing. One state, two names for two
+    vantage points; this reports the runtime's own side, TOOL_EXECUTING.
+
+    Priority order matters and is deliberate:
+      1. MODEL_GENERATING -- a content token landed recently. Checked first because active
+         generation is the ground truth "something is happening" signal T12's own vLLM
+         metrics confirmed independently; it should win even if a tool technically has an
+         open call (agno does not interleave the two, so this is mostly for safety).
+      2. TOOL_EXECUTING -- a tool call has started and has no LATER result timestamp.
+         Unbounded by `recent_s` deliberately: a tool call can legitimately run long (a slow
+         db_query, a large hive-mcp read), and "still executing" is true for as long as no
+         result has landed, not just for the first `recent_s` of it.
+      3. PARSER_WAIT -- some OTHER stream event landed recently (recognised or not) but
+         neither of the above explains it -- agno/our own code is between receiving that
+         event and its next observable action. Typically sub-second in normal operation;
+         a run stuck here for a full heartbeat interval is itself a finding.
+      4. WORKFLOW_STALLED -- none of the above. This is the case _liveness_kill_reason's
+         EXISTING tiers already catch; this function just gives it a name grounded in what
+         was and was not observed, instead of leaving the reader to guess.
+    """
+    token_at = activity.get("last_token_at")
+    if token_at is not None and (now - token_at) < recent_s:
+        return "MODEL_GENERATING"
+    call_at = activity.get("last_tool_call_at")
+    result_at = activity.get("last_tool_result_at")
+    if call_at is not None and (result_at is None or call_at > result_at):
+        return "TOOL_EXECUTING"
+    event_at = activity.get("last_model_event_at")
+    if event_at is not None and (now - event_at) < recent_s:
+        return "PARSER_WAIT"
+    return "WORKFLOW_STALLED"
+
+
 async def _run_heartbeat(
     activity: dict, run_started: float, interval: float = 30.0,
     liveness_path: str | None = None,
@@ -13654,11 +14159,20 @@ async def _run_heartbeat(
     an optional safety net, not allowed to take down the run it's watching."""
     last_event_count = activity.get("stream_event_count")
     stagnant_ticks = 0
+    # Phase G: the classified state as of the PREVIOUS tick, and when it last changed --
+    # heartbeat-local (like stagnant_ticks/last_event_count above), not written into
+    # `activity`, since only the heartbeat's own tick-to-tick comparison needs it.
+    last_state = None
+    last_state_transition_at = run_started
     while True:
         await asyncio.sleep(interval)
         now = time.monotonic()
         since_last_tool = now - activity["last_call_at"]
         last_name = activity["last_call_name"] or "(none yet)"
+        liveness_state = _classify_liveness_state(now, activity, interval)
+        if liveness_state != last_state:
+            last_state_transition_at = now
+            last_state = liveness_state
         event_count = activity.get("stream_event_count")
         event_count_str = f", {event_count} stream events received so far" if event_count is not None else ""
         # The two numbers that actually DECIDE the auto-kill, printed alongside the ones
@@ -13687,7 +14201,8 @@ async def _run_heartbeat(
             f"[team] heartbeat: {now - run_started:.0f}s since task start, "
             f"{since_last_tool:.0f}s since last tool call (last: {last_name})"
             f"{event_count_str}{_progress_str}, "
-            f"stall={stagnant_ticks * interval:.0f}s, coordinator still running",
+            f"stall={stagnant_ticks * interval:.0f}s, state={liveness_state} "
+            f"(for {now - last_state_transition_at:.0f}s), coordinator still running",
             flush=True,
         )
         last_progress_at = activity.get("last_progress_at")
@@ -13725,6 +14240,14 @@ async def _run_heartbeat(
                     # this run. Detection was never the gap -- 217 firings across the
                     # journal, 21 in one 736s run -- the response was.
                     "repetition_count": activity.get("repetition_count", 0),
+                    # Phase G: WHAT was observed at the moment of this tick, and for how
+                    # long it has been that way -- a DURATION, not a raw monotonic
+                    # timestamp, for the same cross-process-clock reason stagnant_seconds
+                    # itself is a duration (see this function's own docstring). Lets
+                    # _liveness_kill_reason (api/server.py) name the actual state a killed
+                    # run was in instead of a generic "no tool call or new stream content".
+                    "liveness_state": liveness_state,
+                    "liveness_state_seconds": now - last_state_transition_at,
                     # Calls to tools the caller does not hold (swarm/tool_fix.py's
                     # _UnavailableToolMixin). Lets Tier 4 say WHY nothing executed
                     # instead of blaming a spent budget. {} when there were none;
@@ -14023,6 +14546,14 @@ def _extract_declarations(text: str) -> list[str]:
 _MAX_INDEX_FILES = 6
 _MAX_INDEX_CHARS = 1_800
 
+# The two runtime-injected notices _record_stream_artifacts appends to a member's report,
+# below -- addressed to the COORDINATOR (what to do next), never written by the member.
+# Single source of truth for their opening text, so the Phase E handoff (_build_member_
+# result) recognises exactly the same strings the injection sites use, with no risk of the
+# two drifting apart. Matched against LITERALLY, never re-typed.
+_THIN_REPORT_MARKER = "[REPORT IS THIN:"
+_DECLARATION_INDEX_MARKER = "[DECLARATION INDEX"
+
 
 def _declaration_index_block(team) -> str:
     """The index for files read since the last member report, or "".
@@ -14052,8 +14583,8 @@ def _declaration_index_block(team) -> str:
         used += len(row)
     if not lines:
         return ""
-    return ("\n\n[DECLARATION INDEX — extracted from the tool output by code, not written "
-            "by the member. These are every declaration and route the files below "
+    return (f"\n\n{_DECLARATION_INDEX_MARKER} — extracted from the tool output by code, not "
+            "written by the member. These are every declaration and route the files below "
             "actually contain, with real line numbers. If the report above enumerates "
             "fewer than this list does, THIS list is the complete one; use it.]\n"
             + "\n".join(lines))
@@ -14160,7 +14691,7 @@ def _record_stream_artifacts(team, out: dict) -> None:
                   f"and returned {len(content):,} ({_delta // max(len(content), 1)}:1) "
                   f"— telling the coordinator", flush=True)
             content += (
-                f"\n\n[REPORT IS THIN: this member read {_delta:,} characters to produce "
+                f"\n\n{_THIN_REPORT_MARKER} this member read {_delta:,} characters to produce "
                 f"the {len(content):,} above. Most of what it opened is not in this "
                 f"report. If the task asked for an enumeration — every route, every "
                 f"class, every column — ask this member again for that specific list "
@@ -14195,7 +14726,7 @@ def _record_stream_artifacts(team, out: dict) -> None:
                 member=_who, content=content, read_delta=_delta,
                 reads=_reads,
                 elided=bool(locals().get("_before")),
-                thin_report="[REPORT IS THIN:" in content,
+                thin_report=_THIN_REPORT_MARKER in content,
                 # Both read from state the runtime already maintains for its own
                 # purposes -- no new tracker, and nothing here is written back.
                 tool_call_limit=_resolve_tool_call_limit(
@@ -17231,6 +17762,9 @@ async def _stream_team_run(
     activity = {
         "last_call_name": None, "last_call_at": time.monotonic(),
         "stream_event_count": 0, "last_progress_at": time.monotonic(),
+        # Phase G -- see the matching init in run_task_async / _classify_liveness_state.
+        "last_token_at": None, "last_model_event_at": None,
+        "last_tool_call_at": None, "last_tool_result_at": None,
     }
     heartbeat_task = asyncio.create_task(
         _run_heartbeat(activity, time.monotonic(), liveness_path=liveness_path)
@@ -17252,6 +17786,13 @@ async def _stream_team_run(
                 final_run_output = event
                 continue
             activity["stream_event_count"] += 1
+            # Phase G: EVERY event, unconditionally -- unlike last_progress_at below, this
+            # is never gated on content classification. A frozen last_model_event_at with
+            # stream_event_count also frozen means team.arun()'s own generator yielded
+            # nothing at all; that is WORKFLOW_STALLED. One still climbing (this line still
+            # running) with last_token_at frozen means events ARE arriving but none of them
+            # are content chunks -- a different, PARSER_WAIT-shaped situation.
+            activity["last_model_event_at"] = time.monotonic()
             out = _stream_event_to_chunk(event, team)
             if isinstance(out, str):
                 # Deliberately NOT updating last_progress_at here on every chunk --
@@ -17265,8 +17806,16 @@ async def _stream_team_run(
                 # continuously-detected repetition never tripped the 300s Tier-1
                 # auto-kill. Now last_progress_at only ever advances in the non-repeat
                 # branch below, once per 10s window.
+                #
+                # last_token_at (Phase G) is the deliberate EXCEPTION to that rule: every
+                # chunk, repeat or not, since its whole job is answering "is the model
+                # still generating ANYTHING right now" -- a question the repetition-gated
+                # last_progress_at cannot answer (a run stuck regenerating the same block
+                # is MODEL_GENERATING, not WORKFLOW_STALLED, even though it earns zero
+                # progress credit).
                 full_content.append(out)
                 now = time.monotonic()
+                activity["last_token_at"] = now
                 if now - last_logged_at >= 10:
                     joined = "".join(full_content)
                     _record_draft(joined)
@@ -17557,8 +18106,8 @@ async def run_task_async(
 
         # read_only strips mutating tools from both the agents and the coordinator, so a
         # read-only run cannot write regardless of what the model decides to do.
-        _specs, _ctools = (_strip_mutating(agent_specs, coordinator_tools) if read_only
-                           else (agent_specs, coordinator_tools))
+        _specs, _ctools = (_strip_mutating(agent_specs, coordinator_tools, skill_catalog)
+                           if read_only else (agent_specs, coordinator_tools))
         # DB-backed model routing (AGNOHive 2.3.2 addendum) — get_model() (called
         # inside _build_team, below) only ever reads model_routing's in-process
         # cache, never the DB directly. This covers BOTH the FastAPI server path
@@ -17626,6 +18175,11 @@ async def run_task_async(
         activity = {
             "last_call_name": None, "last_call_at": time.monotonic(),
             "stream_event_count": 0, "last_progress_at": time.monotonic(),
+            # Phase G (2026-09-22) -- see _classify_liveness_state. Four independent
+            # timestamps, None until first observed, so a genuinely never-happened event
+            # stays distinguishable from one that happened a long time ago.
+            "last_token_at": None, "last_model_event_at": None,
+            "last_tool_call_at": None, "last_tool_result_at": None,
         }
         _hive_for_targets = _pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)
         # Pre-flight in run_task_async runs AFTER the team is built (it needs `team`),
@@ -17788,15 +18342,21 @@ async def run_task_async(
                                 final_run_output = event
                                 continue
                             activity["stream_event_count"] += 1
+                            # Phase G: see _stream_team_run's identical line for the full
+                            # rationale -- kept in sync deliberately.
+                            activity["last_model_event_at"] = time.monotonic()
                             out = _stream_event_to_chunk(event, team)
                             if isinstance(out, str):
                                 # See _stream_team_run's identical block for the full
                                 # rationale -- kept in sync deliberately. Deliberately
                                 # NOT updating last_progress_at per-chunk here; only the
                                 # 10s-boundary check below advances it, and only on
-                                # confirmed non-repeat content.
+                                # confirmed non-repeat content. last_token_at (Phase G) IS
+                                # updated unconditionally below, for the same reason
+                                # _stream_team_run's identical block documents.
                                 full_content.append(out)
                                 now = time.monotonic()
+                                activity["last_token_at"] = now
                                 if now - last_logged_at >= 10:
                                     joined = "".join(full_content)
                                     _record_draft(joined)
