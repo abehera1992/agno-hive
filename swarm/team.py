@@ -7602,6 +7602,290 @@ async def _where_the_term_actually_is(task: str, term: str, hive_mcp_url: str | 
             + ". Check those before accepting the answer's citations.")
 
 
+# ============================================================================
+# Phase H -- Guard-coupled answer repair (2026-09-23).
+#
+# Problem, from the 2026-09-22 post-Phase-G battery (docs/runbooks/groundedness-
+# battery.md): verify_claims and the term-citation check above correctly DETECT bad
+# answers, but a failed check does not constrain what actually ships. Two distinct
+# gaps, both root-caused against that real battery run before this was written:
+#
+#   (1) T13b -- verify_claims flagged the exact 4 fabricated hooks
+#       (createGrnFromPo/createCreditNote/createStockAdjustment/createStockTransfer)
+#       up front, in _verified_answer's own _fab_bad/_fab_report (see its "Detection
+#       only here" comment). But the enumeration guard ("BOTH SIDES WERE NOT
+#       ENUMERATED") fired FIRST in _verified_answer's first-match-wins chain of 20+
+#       early-return guards and returned with _fab_note appended as pure disclosure.
+#       The correction-retry-and-reverify mechanism near _verified_answer's own
+#       bottom (the one that DOES attempt a fix -- see its "Re-using the verdict
+#       computed up front" section) never ran, because it sits below the guard that
+#       preempted it: the exact "cheapest guard silently suppresses the strongest
+#       one" ordering bug _verification_block's own docstring already names for a
+#       different call site.
+#
+#   (2) T12 -- the correction-retry DID run (no earlier guard preempted it that
+#       time), and it failed (a genuine ContextWindowExceededError -- re-triggering
+#       the whole pipeline from scratch, which is what that retry does, can hit the
+#       same limit again). The existing disposition on that failure ships the
+#       ORIGINAL, already-known-bad draft anyway, with _flagged_draft_note()
+#       appended as a footnote. Detected and disclosed correctly; still shipped.
+#
+#   (3) T10 -- _affirmed_term_absent_from_citations, directly above, is documented
+#       as "A disclosure, not a correction" BY DESIGN: it always rides along via
+#       _tail() as _term_note and never attempts a fix, the same shape as (1)/(2)
+#       minus the ordering bug -- there is no repair path here to be preempted,
+#       because none was ever built.
+#
+# All three are the same shape: detection is correct, disposition is not
+# authoritative. Rather than restructure _verified_answer's ~20 internal
+# early-return guards (real, carefully-tuned risk this phase's own scope excludes --
+# "do not redesign the verification system"), this reuses the file's OWN
+# established fix for exactly this class of problem: _hoist_denied_premise is
+# already applied as a single post-processing step at _verified_answer's ONE call
+# site "rather than at its 20+ return sites... One choke point covers every path"
+# (see that call site's own comment). This section adds a second step at the SAME
+# choke point: _enforce_verification_invariant, wired in immediately after
+# _hoist_denied_premise.
+#
+# Deliberately NOT a general provenance/claims architecture: one small frozen
+# dataclass describing what a verifier flagged, one function that repairs-then-
+# rechecks it against the SAME verifier, reusing this file's own existing
+# _stream_team_run / _verify_claims / _affirmed_term_absent_from_citations -- no new
+# retry mechanism, no new MCP tool, no change to any of _verified_answer's internal
+# guards, their ordering, or their own existing "one retry total" budget.
+#
+# Scoped narrowly to NOT FOUND (T13b/T12's own shape) for verify_claims, not the
+# broader `bad` flag: AMBIGUOUS/MISMATCH/lint findings are real but different
+# categories (a genuine "two files share this name" is not a fabrication), and
+# T3 of the same battery run shows why conflating them would be a regression --
+# its own verify_claims report was AMBIGUOUS-plus-one-unclear-BAD-line over an
+# otherwise well-grounded answer; forcing that into a bounded failure would throw
+# away a mostly-correct answer to enforce an invariant written for fabricated
+# claims specifically. NOT FOUND is precisely and only that: an identifier the
+# answer named that a repository grep cannot find at all.
+# ============================================================================
+
+@dataclass(frozen=True)
+class _RepairFinding:
+    """One verifier's finding, structured just enough to drive one repair-and-
+    recheck cycle -- not a general claim/provenance record. `claims` is the exact
+    flagged identifiers, used only for logging and for naming them concretely in the
+    repair prompt; the pass/fail decision itself is always the RECHECK's own
+    verdict, never a string match against this list, so a repair that legitimately
+    rephrases or retracts a claim is judged exactly as the verifier itself would
+    judge it."""
+    guard: str
+    report: str
+    claims: tuple[str, ...] = ()
+
+
+# One-shot flag, matching this file's own established idiom for a single-fire guard
+# (_SYNTAX_REASK_FLAG, _COMPARISON_RECONCILE_FLAG, _EVIDENCE_INTEGRITY_FLAG): at most
+# ONE Phase H repair attempt per call, so a run whose verify_claims finding already
+# spent it does not also spend a second full pipeline re-run on a term-citation
+# finding found immediately after. This is a SEPARATE, additive budget from
+# _verified_answer's own internal `len(all_results) > 1` guard -- not a way to
+# bypass that one's intent (bounding retries stacked WITHIN its own guard chain) --
+# and is exactly as narrow as _hoist_denied_premise's own single pass at this same
+# outer choke point.
+_REPAIR_ATTEMPTED_FLAG = "_phase_h_repair_attempted"
+
+# Exact substrings _verified_answer's OWN internal correction-retry mechanism already
+# uses when IT attempted a fix and could not ship a clean result (_flagged_draft_note
+# and its two sibling "budget already spent" disclosures near _verified_answer's own
+# bottom). Checked here, not duplicated logic -- just string identity -- so this
+# outer step never spends a SECOND expensive full-pipeline retry on text that
+# already went through one internally and failed or found the budget spent. Without
+# this, T12's crash (a genuine ContextWindowExceededError, from a task whose own
+# internal retry re-triggers the WHOLE pipeline) would be retried a third time here.
+_INTERNAL_REPAIR_ALREADY_ATTEMPTED_MARKERS = (
+    "AND THE CORRECTION ATTEMPT DID NOT COMPLETE",
+    "this run's one correction retry was already used",
+    "this run's one correction retry came back with less evidence",
+)
+
+
+def _not_found_claims(report: str) -> tuple[str, ...]:
+    """Extract exactly the NOT FOUND identifiers from a verify_claims report.
+
+    Same extraction shape _verified_answer's own correction-retry already uses (see
+    its _claim_token closure's docstring on why this is "rest[0] if rest else None",
+    not a fixed-index split -- split()[1] on "NOT FOUND parties_api.py" grabbed the
+    literal word "FOUND" once, a real 2026-08-04 bug). Duplicated here as a small,
+    pure, top-level function rather than reaching into that closure, so this outer
+    check does not depend on _verified_answer's internals.
+    """
+    claims: list[str] = []
+    for ln in report.splitlines():
+        s = ln.strip()
+        if s.startswith("NOT FOUND"):
+            rest = s[len("NOT FOUND"):].strip().split(None, 1)
+            if rest:
+                claims.append(rest[0])
+    return tuple(dict.fromkeys(claims))
+
+
+def _repair_prompt(task: str, finding: "_RepairFinding") -> str:
+    """The retry prompt, built from the verifier's OWN concrete findings -- never a
+    generic "fix the answer" (Phase H's own explicit requirement). Naming the exact
+    flagged identifiers mirrors this file's existing citation-correction retry
+    wording (_verified_answer's own missing_symbols instruction) rather than
+    inventing a new phrasing."""
+    if finding.claims:
+        named = ", ".join(finding.claims[:8])
+        return (
+            f"{task}\n\nIMPORTANT: verification ({finding.guard}) checked your "
+            f"previous answer against the repository and could not find these exact "
+            f"claims: {named}. Do not repeat any of them. Answer the original "
+            f"question again -- if something you previously claimed turns out not "
+            f"to exist, say so plainly instead of restating it, and only state "
+            f"something as fact once you have re-checked it with a tool this run."
+        )
+    return (
+        f"{task}\n\nIMPORTANT: verification ({finding.guard}) flagged your previous "
+        f"answer as unconfirmed:\n{finding.report.strip()}\n\nAnswer the original "
+        f"question again, addressing exactly this finding -- if the claim does not "
+        f"hold up, say so plainly instead of restating it."
+    )
+
+
+def _verification_failed_answer(original: str, finding: "_RepairFinding",
+                                 repaired_report: str | None = None) -> str:
+    """The bounded, explicit result Phase H ships in place of a known-invalid
+    answer (item 7 of the phase spec: never the known-invalid answer itself).
+
+    Not silent: names what verification found wrong, that a repair was attempted
+    and did not clear it, and -- for tracing, per the phase spec's "preserve raw
+    member/model transcripts" requirement -- quotes the original flagged draft
+    below a clear line so it is never confused with a confirmed answer.
+    """
+    tail = (f"\n\nThe repair attempt's own re-check still found: "
+            f"{repaired_report.strip()}" if repaired_report else "")
+    return (
+        f"**VERIFICATION FAILED — this answer could not be confirmed against the "
+        f"repository and is not being returned as fact.** Verification "
+        f"({finding.guard}) flagged: {finding.report.strip()}\n\nOne correction "
+        f"attempt was made and did not clear the flagged claim(s), so nothing "
+        f"unverified is being asserted here in its place.{tail}\n\n---\n**The "
+        f"flagged draft, kept below for tracing only — do not treat anything in it "
+        f"as confirmed:**\n{original}"
+    )
+
+
+async def _repair_verification_failure(
+        content: str, task: str, team, hive_mcp_url: str | None, hive_mcp_tools,
+        liveness_path: str | None, finding: "_RepairFinding", recheck) -> str:
+    """ANSWER -> VERIFY -> FAIL -> REPAIR -> VERIFY AGAIN -> PASS/FAIL (Phase H's own
+    flow, from the phase spec).
+
+    `recheck` is an async callable(text) -> (report, bad, unavailable), reusing
+    whichever check produced `finding` -- kept as a parameter rather than hardcoded
+    so this stays usable by a future guard's own verifier without this function
+    needing to know its shape.
+
+    Bounded at exactly ONE repair attempt this run (_REPAIR_ATTEMPTED_FLAG). On
+    success, returns the repaired, now-clean text. On any failure to clear the SAME
+    check -- the retry errors, comes back empty, or still fails on recheck --
+    returns a bounded, explicit verification-failed result. Never returns `content`
+    unmodified: a caller only reaches this function once its own finding says
+    `content` is invalid, so shipping it bare would be exactly the bug this phase
+    closes.
+    """
+    if getattr(team, _REPAIR_ATTEMPTED_FLAG, False):
+        print(f"[team] repair ({finding.guard}): one repair attempt already spent "
+              f"this run — disclosing without a second attempt", flush=True)
+        return _verification_failed_answer(content, finding)
+    if any(marker in content for marker in _INTERNAL_REPAIR_ALREADY_ATTEMPTED_MARKERS):
+        print(f"[team] repair ({finding.guard}): _verified_answer's own internal "
+              f"correction retry already ran against this text and did not clear "
+              f"it — not attempting a second full pipeline re-run", flush=True)
+        setattr(team, _REPAIR_ATTEMPTED_FLAG, True)
+        return _verification_failed_answer(content, finding)
+    setattr(team, _REPAIR_ATTEMPTED_FLAG, True)
+
+    print(f"[team] repair ({finding.guard}): attempting one bounded correction — "
+          f"{_verdict_digest(finding.report)}", flush=True)
+    try:
+        corrected, _retry = await _stream_team_run(
+            team, _repair_prompt(task, finding), log_label=f"repair-{finding.guard}",
+            liveness_path=liveness_path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[team] repair ({finding.guard}) failed: {exc}", flush=True)
+        return _verification_failed_answer(content, finding)
+
+    if not corrected or not _strip_leaked_tool_tags(corrected).strip() \
+            or corrected.strip() == _BUDGET_EXHAUSTED_ANSWER:
+        print(f"[team] repair ({finding.guard}) produced nothing usable", flush=True)
+        return _verification_failed_answer(content, finding)
+
+    report2, still_bad, unavailable2 = await recheck(corrected)
+    print(f"[team] repair ({finding.guard}) recheck: still_bad={still_bad} "
+          f"unavailable={unavailable2} | {_verdict_digest(report2)}", flush=True)
+    if unavailable2 or still_bad:
+        # Cannot confirm the repair (checker unreachable) or it plainly did not work
+        # (still flagged) -- either way, do not ship it as the answer.
+        return _verification_failed_answer(content, finding,
+                                            repaired_report=report2 if still_bad else None)
+
+    print(f"[team] repair ({finding.guard}): recheck passed — releasing repaired "
+          f"answer", flush=True)
+    return corrected
+
+
+async def _enforce_verification_invariant(
+        content: str, task: str, team, hive_mcp_url: str | None, hive_mcp_tools,
+        liveness_path: str | None) -> str:
+    """Single choke point (Phase H): re-verify the FINAL text -- whatever
+    _verified_answer's own internal guard chain produced, from whichever of its
+    20+ return sites shipped it -- and repair-or-fail rather than let a still-
+    invalid answer through. Mirrors _hoist_denied_premise's own placement and
+    stated reason at this same call site.
+
+    Deliberately re-runs the checks fresh against `content` rather than reusing any
+    verdict computed inside _verified_answer: an early-return guard there may have
+    shipped `content` WITHOUT that function's own internal re-verify ever running at
+    all (T13b's shape -- see this section's own docstring above). Checking here is
+    the only way to see what a reader will actually receive, no matter which
+    internal path produced it.
+
+    Scoped to verify_claims' NOT FOUND category and the term-citation check only --
+    see the module-level comment above this section for why AMBIGUOUS/MISMATCH/lint
+    findings are deliberately excluded from the strong "must repair or fail" path.
+    """
+    if not content or not (hive_mcp_url or hive_mcp_tools):
+        return content
+
+    fab_report, fab_bad, fab_unavailable = await _verify_claims(
+        content, hive_mcp_url, hive_mcp_tools)
+    if fab_bad and not fab_unavailable:
+        missing = _not_found_claims(fab_report)
+        if missing:
+            finding = _RepairFinding(guard="verify_claims", report=fab_report,
+                                      claims=missing)
+
+            async def _recheck(text: str):
+                return await _verify_claims(text, hive_mcp_url, hive_mcp_tools)
+
+            return await _repair_verification_failure(
+                content, task, team, hive_mcp_url, hive_mcp_tools, liveness_path,
+                finding, _recheck)
+
+    term_note = await _affirmed_term_absent_from_citations(
+        task, content, hive_mcp_url, hive_mcp_tools)
+    if term_note:
+        finding = _RepairFinding(guard="term-citation", report=term_note)
+
+        async def _recheck(text: str):
+            note = await _affirmed_term_absent_from_citations(
+                task, text, hive_mcp_url, hive_mcp_tools)
+            return note, bool(note), False
+
+        return await _repair_verification_failure(
+            content, task, team, hive_mcp_url, hive_mcp_tools, liveness_path,
+            finding, _recheck)
+
+    return content
+
 
 async def _repo_db_schema(hive_mcp_url: str | None, hive_mcp_tools=None) -> str:
     """hive-mcp's db_schema listing (`schema.table` per line), or "" when unavailable.
@@ -18557,6 +18841,16 @@ async def run_task_async(
                     # and shipped unguarded. One choke point covers every path.
                     content = await _hoist_denied_premise(
                         content, _hive_url, hive_mcp_tools=_hive_tools)
+                    # Phase H (2026-09-23): same choke-point reasoning as
+                    # _hoist_denied_premise directly above -- re-verify the FINAL
+                    # text and repair-or-fail rather than let a still-invalid
+                    # answer through, regardless of which of _verified_answer's
+                    # 20+ internal guards produced it. See that section's own
+                    # docstring (defined near _affirmed_term_absent_from_citations)
+                    # for the T13b/T12/T10 root causes this closes.
+                    content = await _enforce_verification_invariant(
+                        content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
+                        liveness_path=liveness_path)
                     # Phase R (2026-09-14): the same "one choke point" placement,
                     # applied to _verified_answer's own FINAL output -- catches a
                     # contradiction against structured evidence that survived every
