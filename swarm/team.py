@@ -4499,9 +4499,67 @@ _COMPARISON_RECONCILE_FLAG = "_comparison_reconcile_done"
 
 def _comparison_gap_counts(cmp_note: str) -> tuple[int, int] | None:
     """(left_only, right_only) from a _computed_comparison footnote, or None
-    when no comparison ran (empty note) or the totals line is missing."""
+    when no comparison ran (empty note) or the totals line is missing.
+
+    COMPATIBILITY function (Phase J-C, 2026-09-23): kept unchanged, byte-for-
+    byte, for any caller that only ever needed these two numbers. It is no
+    longer the source of truth for completeness interpretation -- that is
+    _comparison_summary below, which also sees partial_match and ambiguous.
+    _comparison_gap_counts cannot see either, by construction (it only ever
+    parsed the TOTALS line), so a caller still using it alone is blind to a
+    real completeness distinction: an all-zero (left_only, right_only) result
+    can still contain unresolved AMBIGUOUS relationships, which must never be
+    read as "nothing to reconcile" -- see _comparison_summary's own docstring.
+    """
     m = _COMPARISON_TOTALS_RE.search(cmp_note or "")
     return (int(m.group(4)), int(m.group(5))) if m else None
+
+
+# Phase J-A/J-B's own additive TOTALS-line siblings (hive-mcp/tools/compare.py's
+# `parts` list, same f-string convention as _COMPARISON_TOTALS_RE's own line --
+# added there deliberately as NEW, separate lines rather than new fields inside
+# the existing TOTALS line, specifically so _COMPARISON_TOTALS_RE and every
+# existing caller of it keep matching unchanged).
+_COMPARISON_PARTIAL_TOTAL_RE = re.compile(r"PARTIAL-MATCH TOTAL: (\d+)")
+_COMPARISON_AMBIGUOUS_TOTAL_RE = re.compile(r"AMBIGUOUS TOTAL: (\d+)")
+
+
+def _comparison_summary(cmp_note: str) -> dict | None:
+    """Phase J-C: the ONE authoritative parse of a _computed_comparison
+    footnote into every count downstream completeness/consistency logic
+    needs -- {"left", "right", "matched", "left_only", "right_only",
+    "partial_match", "ambiguous"} -- or None when no comparison ran.
+
+    This is still, unavoidably, a text parse: compare_enumerations is an MCP
+    tool, and MCP tools return text, not a structured object -- there is no
+    wire-level channel to make a Python dict "the" contract across that
+    boundary. What Phase J-C actually fixes is that every completeness/
+    consistency decision in this file now goes through THIS ONE function
+    instead of each caller running its own ad-hoc regex (_comparison_gap_
+    counts, and the near-duplicate _CMP_TOTALS_LINE_RE in the evidence-
+    integrity section below) -- one parse, reused, is what "the structured
+    result is authoritative" means on this side of an MCP text boundary.
+
+    partial_match/ambiguous default to 0 (not None) when their own totals
+    line is absent -- a cmp_note from BEFORE Phase J-A/J-B genuinely has
+    neither, and "the tool didn't report any" is a fact, not an unknown, for
+    those two specific counts. left/right/matched/left_only/right_only still
+    require the base TOTALS line to be present at all; its absence is what
+    makes the whole function return None, exactly as _comparison_gap_counts
+    already did.
+    """
+    m = _COMPARISON_TOTALS_RE.search(cmp_note or "")
+    if not m:
+        return None
+    pm = _COMPARISON_PARTIAL_TOTAL_RE.search(cmp_note or "")
+    am = _COMPARISON_AMBIGUOUS_TOTAL_RE.search(cmp_note or "")
+    return {
+        "left": int(m.group(1)), "right": int(m.group(2)),
+        "matched": int(m.group(3)), "left_only": int(m.group(4)),
+        "right_only": int(m.group(5)),
+        "partial_match": int(pm.group(1)) if pm else 0,
+        "ambiguous": int(am.group(1)) if am else 0,
+    }
 
 
 def _comparison_body(cmp_note: str) -> str:
@@ -4580,27 +4638,57 @@ async def _reconcile_completeness_claim_with_comparison(
         # footnote via _tail(), exactly as before this change, rather than
         # spending a second full pipeline re-run.
         return content, result, False
-    gap = _comparison_gap_counts(cmp_note)
-    # Phase E: computed BEFORE the gap early-return below (moved up from its
+    summary = _comparison_summary(cmp_note)
+    # Phase J-C: three separate questions, not one gap number (see this
+    # section's own module comment for the full contract) --
+    #   existence   (left_only / right_only): a claimed counterpart is
+    #               genuinely missing on one side.
+    #   certainty   (ambiguous): deterministic comparison could not establish
+    #               a unique relationship at all for some item(s) -- MUST
+    #               NEVER be read as "complete" (the hard invariant this
+    #               phase exists to enforce; before this change, an all-zero
+    #               left_only/right_only result with real ambiguous entries
+    #               was indistinguishable from a genuinely clean comparison
+    #               and was persisted as "supported").
+    #   consistency (partial_match): the identity exists on both sides but an
+    #               attribute disagrees (the real Ekam PUT-vs-POST shape).
+    #               This does NOT contradict an EXISTENCE claim -- the
+    #               operation IS there -- so it never triggers this retry on
+    #               its own; it rides along in the evidence text whenever the
+    #               retry fires for another reason, and is durably recorded
+    #               as its own status when nothing else is wrong, so a
+    #               consistency defect is never silently dropped the way the
+    #               original PUT/POST discovery found it could be.
+    existence_contradicted = bool(summary) and (
+        summary["left_only"] > 0 or summary["right_only"] > 0)
+    uncertain = bool(summary) and summary["ambiguous"] > 0
+    # Phase E: computed BEFORE the early-return below (moved up from its
     # original position, just after this comment's former location) so the
-    # gap==(0,0) branch can also see it -- _reconcile_completeness_claims is a
-    # pure regex scan over `content` with no side effects, so reordering it
-    # ahead of the gap check changes nothing about which branch below runs or
-    # what it does; it only lets the SUPPORTED case (gap==(0,0) but a
-    # completeness claim was made) durably record that the claim held, instead
-    # of that case being observationally identical to "no claim existed".
+    # "nothing contradicted" branch can also see it -- _reconcile_completeness_
+    # claims is a pure regex scan over `content` with no side effects, so
+    # reordering it ahead of the check changes nothing about which branch
+    # below runs or what it does; it only lets the SUPPORTED case (nothing
+    # contradicted, but a completeness claim was made) durably record that
+    # the claim held, instead of that case being observationally identical to
+    # "no claim existed".
     claims = _reconcile_completeness_claims(content)
-    if not gap or (gap[0] == 0 and gap[1] == 0):
+    if not summary or not (existence_contradicted or uncertain):
         # Either the comparison could not be parsed (should not happen given
-        # compare_enumerations' fixed format) or it found nothing left/right-
-        # only -- nothing to reconcile against, i.e. this run's OWN control
-        # flow is unchanged from before Phase E. If the draft asserted
-        # completeness anyway, that assertion is exactly what
-        # compare_enumerations' zero gap counts deterministically SUPPORT --
+        # compare_enumerations' fixed format), or nothing left/right-only and
+        # nothing ambiguous was found -- existence is not contradicted and
+        # certainty is not in question, i.e. this run's OWN control flow is
+        # unchanged from before Phase E for the completeness dimension. If
+        # the draft asserted completeness anyway, that assertion is exactly
+        # what the comparison deterministically SUPPORTS for existence --
         # durably recorded here, additively, with no effect on the return
-        # value or on any later guard in this pipeline.
-        if gap == (0, 0) and claims:
-            await _persist_completeness_claim(team, claims[0], "supported")
+        # value or on any later guard in this pipeline. A nonzero
+        # partial_match alongside an otherwise-clean result is recorded as
+        # its own, distinct status: the completeness (existence) claim held,
+        # but a consistency defect exists and must not be conflated with it.
+        if summary and claims:
+            status = ("supported_with_consistency_defect"
+                      if summary["partial_match"] > 0 else "supported")
+            await _persist_completeness_claim(team, claims[0], status)
         return content, result, False
     if not claims:
         # The draft never claimed completeness in the first place -- e.g. it
@@ -4611,30 +4699,54 @@ async def _reconcile_completeness_claim_with_comparison(
         return content, result, False
 
     setattr(team, _COMPARISON_RECONCILE_FLAG, True)
-    left_only, right_only = gap
+    left_only, right_only = summary["left_only"], summary["right_only"]
     evidence = _comparison_body(cmp_note)
     # Phase E: the actual claim being reconciled below, persisted with its
     # deterministic verdict BEFORE the retry prompt is built -- this call's
-    # own gap != (0, 0) is exactly what CONTRADICTS the draft's completeness
-    # claim (see _comparison_gap_counts' fixed left-only/right-only shape).
-    # Whether the coordinator's retry is later ADOPTED does not change what
-    # the DRAFT claimed or what the evidence established at the moment this
-    # fired -- that provenance is what Phase E durably records.
-    await _persist_completeness_claim(team, claims[0], "contradicted")
+    # own existence_contradicted/uncertain state is what CONTRADICTS the
+    # draft's completeness claim. Whether the coordinator's retry is later
+    # ADOPTED does not change what the DRAFT claimed or what the evidence
+    # established at the moment this fired -- that provenance is what Phase E
+    # durably records. "unresolved" (Phase J-C) is distinct from
+    # "contradicted": an ambiguous-only case is not proven wrong, it is
+    # proven UNPROVABLE, and must be recorded as such, never silently folded
+    # into either verdict.
+    await _persist_completeness_claim(
+        team, claims[0], "contradicted" if existence_contradicted else "unresolved")
+    if existence_contradicted:
+        existence_line = (
+            f"compare_enumerations -- a deterministic tool, not a re-read -- found "
+            f"{left_only} item(s) on the left with no match on the right and "
+            f"{right_only} on the right with no match on the left")
+    else:
+        existence_line = (
+            "compare_enumerations -- a deterministic tool, not a re-read -- could "
+            "not establish a unique relationship for some item(s) (see AMBIGUOUS "
+            "below); coverage for those specific items is UNRESOLVED, not "
+            "complete and not missing")
+    consistency_line = (
+        f" It also found {summary['partial_match']} item(s) that exist on both "
+        f"sides but disagree on an attribute (see PARTIAL MATCHES below) -- "
+        f"those are not missing, but your answer must not claim they fully "
+        f"agree either."
+        if summary["partial_match"] > 0 else "")
     retry_prompt = (
         f"{task}\n\nIMPORTANT: your previous answer said \"{claims[0]}\", but "
-        f"compare_enumerations -- a deterministic tool, not a re-read -- found "
-        f"{left_only} item(s) on the left with no match on the right and "
-        f"{right_only} on the right with no match on the left, for the SAME "
-        f"two files this answer is about:\n\n{evidence}\n\nAnswer the "
-        f"original question again. If any left-only or right-only item is "
-        f"real, your answer must name it and must not claim completeness."
+        f"{existence_line}, for the SAME two files this answer is about:"
+        f"{consistency_line}\n\n{evidence}\n\nAnswer the original question "
+        f"again. If any left-only or right-only item is real, name it and do "
+        f"not claim completeness. If an item is AMBIGUOUS, say plainly that "
+        f"it could not be resolved rather than guessing which side it "
+        f"belongs to. If an item is a PARTIAL MATCH, name both sides' real "
+        f"values and do not claim they agree."
     )
     reads_before = _run_read_count(team)
     print(f"[team] comparison reconciliation: draft claims completeness "
           f"(\"{claims[0][:80]}\") but compare_enumerations shows "
-          f"left-only={left_only}, right-only={right_only} — asking once "
-          f"more before finalising", flush=True)
+          f"left-only={left_only}, right-only={right_only}, "
+          f"partial_match={summary['partial_match']}, "
+          f"ambiguous={summary['ambiguous']} — asking once more before "
+          f"finalising", flush=True)
     try:
         retried, retry = await _stream_team_run(
             team, retry_prompt, log_label="comparison-reconciliation",
@@ -5114,21 +5226,32 @@ async def _evidence_integrity_findings(
         findings.append({"category": "file enumeration/count", "claimed": "(see note)",
                           "real": count_note})
 
-    # 3. Comparison completeness/gaps -- reuses _comparison_gap_counts and
-    # _reconcile_completeness_claims, the SAME two pure functions
+    # 3. Comparison completeness/gaps -- reuses _comparison_summary (Phase J-C)
+    # and _reconcile_completeness_claims, the SAME two pure functions
     # _reconcile_completeness_claim_with_comparison already uses, unmodified --
     # this only re-asks the same question against whatever content survived to this
     # point in the chain, never recomputes or reinterprets compare_enumerations'
-    # own output.
-    gap = _comparison_gap_counts(cmp_note)
-    if gap and (gap[0] or gap[1]):
+    # own output. Widened from _comparison_gap_counts (left_only/right_only only)
+    # to _comparison_summary so this LAST-RESORT guard is ALSO ambiguous-aware --
+    # a completeness claim surviving every earlier guard with zero left_only/
+    # right_only but real AMBIGUOUS entries must still be caught here, per this
+    # phase's own hard invariant that unknown must never reach the reader as
+    # complete.
+    summary = _comparison_summary(cmp_note)
+    if summary and (summary["left_only"] or summary["right_only"] or summary["ambiguous"]):
         claims = _reconcile_completeness_claims(content)
         if claims:
+            real = (f"compare_enumerations found {summary['left_only']} left-only and "
+                    f"{summary['right_only']} right-only item(s)")
+            if summary["ambiguous"]:
+                real += (f", and {summary['ambiguous']} item(s) it could not "
+                         f"resolve to a unique relationship (AMBIGUOUS) -- coverage "
+                         f"for those is unresolved, not complete")
+            real += " for the same two files"
             findings.append({
                 "category": "comparison completeness/gap",
                 "claimed": claims[0],
-                "real": f"compare_enumerations found {gap[0]} left-only and "
-                        f"{gap[1]} right-only item(s) for the same two files",
+                "real": real,
             })
     # 3b/3c. The two narrower, empirically-observed variants of the same
     # category (see each function's own docstring for the live battery
