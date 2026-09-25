@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -227,21 +228,19 @@ _COORDINATOR_INSTRUCTIONS = [
     "  A task naming ONE bounded, already-known thing to check does not need this — a small,",
     "  targeted delegation (or a direct tool call, per the rule above) is still correct there.",
     "",
-    "── PHASE R (2026-09-24) — bounded delegation contract, controlled test ─────",
-    "  EXPERIMENTAL, not yet validated production behavior; revert this section if the",
-    "  phase's own comparison does not support keeping it. For a delegation that is a real",
-    "  investigative unit (not the tiny single-tool-call delegations shown elsewhere in",
-    "  these instructions, e.g. 'call list_directory on X'), phrase the task text so it",
-    "  names, explicitly or by clear implication:",
-    "    TARGET — the one file/module/area this delegation is about",
-    "    OBJECTIVE — what finding is being asked for",
-    "    EVIDENCE REQUIRED — what kind of evidence would answer it (a quote, a line number,",
-    "      a list of matches)",
-    "    COMPLETION CRITERIA — when the member should stop and report back",
-    "  One delegation = one bounded research objective. Do not phrase a delegation as an",
-    "  open-ended 'investigate everything about X' — Researcher already has its own",
-    "  DECOMPOSE-FIRST rule for genuinely multi-part tasks; this is about keeping each",
-    "  individual delegation itself bounded, not about how work is split across them.",
+    "── PHASE S (2026-09-24) — delegate_structured_task ──────────────",
+    "  Real investigative delegations (not the tiny single-tool-call delegations shown",
+    "  elsewhere in these instructions, e.g. 'call list_directory on X') use",
+    "  delegate_structured_task(member_id, target, objective, evidence_required,",
+    "  completion_criteria) — its own tool description explains each field; you do not",
+    "  compose the member's task text yourself, the runtime builds it from what you",
+    "  provide. Decide what the member should investigate (one target, one objective per",
+    "  call); the tool enforces how that gets represented and handed to the member.",
+    "  Phase R's own prose version of this contract (asking the Coordinator to manually",
+    "  phrase delegations this way inside a free-form task string) is superseded by this",
+    "  tool and removed — see Phase R.1's forensic finding for why: the delegation text",
+    "  the model generated was byte-identical to the pre-instruction baseline, so",
+    "  telling the model to phrase things differently did not change what it phrased.",
     "",
     "── Locating unfamiliar files — you do not have find_files/search_files/list_directory ─",
     "  find_files, search_files, list_directory, list_directory_tree,",
@@ -13644,6 +13643,143 @@ def _make_tool_interception_hook(
     return _tool_interception_hook
 
 
+# PHASE S (2026-09-24): structural delegation contract.
+#
+# Phase R/R.1 established that a natural-language instruction telling the Coordinator
+# to PHRASE delegations with TARGET/OBJECTIVE/EVIDENCE REQUIRED/COMPLETION CRITERIA
+# did not change what the model actually generated for a well-rehearsed task -- the
+# D1/D2/D3 delegation task hashes were byte-identical to the pre-instruction baseline
+# (Phase R.1's own traced propagation chain). The instruction reached the Coordinator's
+# effective prompt; the model's completion for that specific slot was simply unaffected.
+#
+# This moves the same four fields out of prose the model must remember to compose
+# inside one string, and into separate, required tool-call parameters instead. The
+# Coordinator can no longer choose NOT to structure a delegation -- there is no
+# free-form `task` string in this tool's schema to fall back to.
+_STRUCTURED_DELEGATION_REQUIRED_FIELDS = (
+    "target", "objective", "evidence_required", "completion_criteria",
+)
+
+
+def _build_canonical_researcher_task(
+    target: str, objective: str, evidence_required: str, completion_criteria: str,
+) -> str:
+    """Pure, deterministic text construction -- Phase S Test B requires
+    canonical_task(x) == canonical_task(x) for identical inputs. No model call, no
+    inference, no fallback, no retry. Validation of required fields happens in the
+    caller (delegate_structured_task's own entrypoint, below) BEFORE this runs --
+    this function assumes it already received real content in every field.
+    """
+    return (
+        f"TARGET:\n{target}\n\n"
+        f"OBJECTIVE:\n{objective}\n\n"
+        f"EVIDENCE REQUIRED:\n{evidence_required}\n\n"
+        f"COMPLETION CRITERIA:\n{completion_criteria}\n\n"
+        f"BOUNDED EXECUTION:\n"
+        f"Investigate only the specified target. Use the minimum tool calls "
+        f"necessary to obtain the required evidence. Stop immediately once the "
+        f"completion criteria are satisfied and return the evidence obtained. "
+        f"Do not continue searching merely to increase confidence. Do not emit "
+        f"pseudo-tool syntax of any kind."
+    )
+
+
+class _StructuredDelegationTeam(Team):
+    """Replaces agno's own free-form `delegate_task_to_member(member_id, task)` tool
+    -- where `task` is a single string entirely composed by the Coordinator model --
+    with a structured `delegate_structured_task(member_id, target, objective,
+    evidence_required, completion_criteria)` tool whose separate fields are
+    runtime-assembled, deterministically, into the same kind of task string the old
+    tool received.
+
+    This overrides ONLY the one method agno itself provides for exactly this purpose
+    (`Team._get_delegate_task_function`), reuses the REAL underlying delegation engine
+    (session storage, member execution, results storage, forward_member_answer
+    compatibility -- all of agno's own `adelegate_task_to_member`/
+    `_setup_delegate_task_to_member`/`_process_delegate_task_to_member` machinery)
+    completely unchanged by calling straight through to the original entrypoint with a
+    synthesized `task` string, and modifies no installed agno file -- the same
+    "subclass and override one method" pattern `tool_fix.py`'s OllamaToolFix/
+    VLLMToolFix already use for the model classes.
+
+    `delegate_task_to_members` (the broadcast-to-all-members variant) and any other
+    agno-internal tool are untouched; only the single-member delegation path this
+    codebase's Coordinator actually uses is replaced.
+    """
+
+    def _get_delegate_task_function(self, *args, **kwargs):
+        from agno.tools.function import Function
+
+        original_function = super()._get_delegate_task_function(*args, **kwargs)
+        original_entrypoint = original_function.entrypoint
+
+        async def delegate_structured_task(
+            member_id: str,
+            target: str,
+            objective: str,
+            evidence_required: str,
+            completion_criteria: str,
+        ):
+            """Delegate ONE bounded research objective to a team member.
+
+            Provide each field separately -- the runtime builds the member's exact
+            task from them; you do not compose free-form task text yourself. One
+            call = one bounded objective, not an open-ended investigation.
+
+            Args:
+                member_id: the member to delegate to, e.g. "researcher".
+                target: the ONE file, module, or area this delegation is about.
+                objective: the specific finding being asked for.
+                evidence_required: what evidence would answer it -- an exact quote,
+                    a line number, a list of matches -- not a vague "find out about X".
+                completion_criteria: the condition under which the member should
+                    stop investigating and report back.
+            """
+            fields = {
+                "target": target, "objective": objective,
+                "evidence_required": evidence_required,
+                "completion_criteria": completion_criteria,
+            }
+            missing = [name for name in _STRUCTURED_DELEGATION_REQUIRED_FIELDS
+                      if not (fields[name] or "").strip()]
+            if missing:
+                print(f"[team] delegate_structured_task REJECTED: missing "
+                      f"{missing} for member_id={member_id!r}", flush=True)
+                # An async generator cannot `return <value>` -- yield the one
+                # result string, then bare `return` to end the generator, same
+                # contract original_entrypoint's own generator satisfies below.
+                yield (
+                    f"DELEGATION REJECTED: missing required field(s) {missing}. "
+                    f"Every field (target, objective, evidence_required, "
+                    f"completion_criteria) must be filled in with real, specific "
+                    f"content -- retry the call with all five fields provided."
+                )
+                return
+
+            canonical_task = _build_canonical_researcher_task(
+                target=target, objective=objective,
+                evidence_required=evidence_required,
+                completion_criteria=completion_criteria,
+            )
+            canonical_hash = hashlib.sha256(
+                canonical_task.encode("utf-8", errors="replace")).hexdigest()[:16]
+            print(f"[team] delegate_structured_task: member_id={member_id!r} "
+                  f"target={target!r} objective={objective!r} "
+                  f"evidence_required={evidence_required!r} "
+                  f"completion_criteria={completion_criteria!r} "
+                  f"canonical_task_hash={canonical_hash} "
+                  f"canonical_task_length={len(canonical_task)}", flush=True)
+
+            async for item in original_entrypoint(member_id=member_id, task=canonical_task):
+                yield item
+
+        new_function = Function.from_callable(
+            delegate_structured_task, name="delegate_structured_task")
+        new_function.stop_after_tool_call = original_function.stop_after_tool_call
+        new_function.show_result = original_function.show_result
+        return new_function
+
+
 def _build_team(
     agent_specs: list | None,
     coordinator_model: str,
@@ -13871,7 +14007,11 @@ def _build_team(
     # get_file_content must not be told to. Owners get their text back unchanged.
     instructions = _coordinator_instructions_for_surface(
         instructions, {getattr(t, "name", "") for t in coordinator_tools_list})
-    team = Team(
+    # PHASE S (2026-09-24): _StructuredDelegationTeam replaces agno's own free-form
+    # delegate_task_to_member(member_id, task) with a structured
+    # delegate_structured_task(member_id, target, objective, evidence_required,
+    # completion_criteria) tool -- see its own docstring above for why and how.
+    team = _StructuredDelegationTeam(
         name=name,
         description=description,
         mode=mode,
