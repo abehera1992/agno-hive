@@ -13684,100 +13684,181 @@ def _build_canonical_researcher_task(
     )
 
 
-class _StructuredDelegationTeam(Team):
-    """Replaces agno's own free-form `delegate_task_to_member(member_id, task)` tool
-    -- where `task` is a single string entirely composed by the Coordinator model --
-    with a structured `delegate_structured_task(member_id, target, objective,
-    evidence_required, completion_criteria)` tool whose separate fields are
-    runtime-assembled, deterministically, into the same kind of task string the old
-    tool received.
-
-    This overrides ONLY the one method agno itself provides for exactly this purpose
-    (`Team._get_delegate_task_function`), reuses the REAL underlying delegation engine
-    (session storage, member execution, results storage, forward_member_answer
-    compatibility -- all of agno's own `adelegate_task_to_member`/
+def _build_structured_delegation_tool(original_function):
+    """Wraps agno's real `delegate_task_to_member` Function (already built by agno's
+    own `_get_delegate_task_function`) into `delegate_structured_task(member_id,
+    target, objective, evidence_required, completion_criteria)` -- reusing the REAL
+    underlying delegation engine (session storage, member execution, results storage,
+    forward_member_answer compatibility -- all of agno's own `adelegate_task_to_member`/
     `_setup_delegate_task_to_member`/`_process_delegate_task_to_member` machinery)
-    completely unchanged by calling straight through to the original entrypoint with a
-    synthesized `task` string, and modifies no installed agno file -- the same
-    "subclass and override one method" pattern `tool_fix.py`'s OllamaToolFix/
-    VLLMToolFix already use for the model classes.
+    completely unchanged by calling straight through to `original_function.entrypoint`
+    with a synthesized `task` string.
+    """
+    from agno.tools.function import Function
 
-    `delegate_task_to_members` (the broadcast-to-all-members variant) and any other
-    agno-internal tool are untouched; only the single-member delegation path this
-    codebase's Coordinator actually uses is replaced.
+    original_entrypoint = original_function.entrypoint
+
+    async def delegate_structured_task(
+        member_id: str,
+        target: str,
+        objective: str,
+        evidence_required: str,
+        completion_criteria: str,
+    ):
+        """Delegate ONE bounded research objective to a team member.
+
+        Provide each field separately -- the runtime builds the member's exact
+        task from them; you do not compose free-form task text yourself. One
+        call = one bounded objective, not an open-ended investigation.
+
+        Args:
+            member_id: the member to delegate to, e.g. "researcher".
+            target: the ONE file, module, or area this delegation is about.
+            objective: the specific finding being asked for.
+            evidence_required: what evidence would answer it -- an exact quote,
+                a line number, a list of matches -- not a vague "find out about X".
+            completion_criteria: the condition under which the member should
+                stop investigating and report back.
+        """
+        fields = {
+            "target": target, "objective": objective,
+            "evidence_required": evidence_required,
+            "completion_criteria": completion_criteria,
+        }
+        missing = [name for name in _STRUCTURED_DELEGATION_REQUIRED_FIELDS
+                  if not (fields[name] or "").strip()]
+        if missing:
+            print(f"[team] delegate_structured_task REJECTED: missing "
+                  f"{missing} for member_id={member_id!r}", flush=True)
+            # An async generator cannot `return <value>` -- yield the one
+            # result string, then bare `return` to end the generator, same
+            # contract original_entrypoint's own generator satisfies below.
+            yield (
+                f"DELEGATION REJECTED: missing required field(s) {missing}. "
+                f"Every field (target, objective, evidence_required, "
+                f"completion_criteria) must be filled in with real, specific "
+                f"content -- retry the call with all five fields provided."
+            )
+            return
+
+        canonical_task = _build_canonical_researcher_task(
+            target=target, objective=objective,
+            evidence_required=evidence_required,
+            completion_criteria=completion_criteria,
+        )
+        canonical_hash = hashlib.sha256(
+            canonical_task.encode("utf-8", errors="replace")).hexdigest()[:16]
+        print(f"[team] delegate_structured_task: member_id={member_id!r} "
+              f"target={target!r} objective={objective!r} "
+              f"evidence_required={evidence_required!r} "
+              f"completion_criteria={completion_criteria!r} "
+              f"canonical_task_hash={canonical_hash} "
+              f"canonical_task_length={len(canonical_task)}", flush=True)
+
+        async for item in original_entrypoint(member_id=member_id, task=canonical_task):
+            yield item
+
+    new_function = Function.from_callable(
+        delegate_structured_task, name="delegate_structured_task")
+    new_function.stop_after_tool_call = original_function.stop_after_tool_call
+    new_function.show_result = original_function.show_result
+    return new_function
+
+
+class _StructuredDelegationTeam(Team):
+    """PHASE S.2 (2026-09-25) -- pure marker subclass, no method override.
+
+    Phase S originally overrode the instance method `Team._get_delegate_task_function`
+    on this class. The Phase S.1 live run proved that override was dead code in
+    production: agno's real tool-assembly path (agno/team/_tools.py's
+    `_determine_tools_for_model`, called from many sites in agno/team/_run.py) does a
+    function-body-LOCAL `from agno.team._default_tools import _get_delegate_task_function`
+    on every call and invokes it as a free function, `_get_delegate_task_function(team,
+    ...)` -- never as `team._get_delegate_task_function(...)`. A subclass method
+    override is only reachable through polymorphic dispatch, which that call shape
+    never uses, so the override was invisible to every live delegation (confirmed:
+    zero `delegate_structured_task` calls in the Phase S.1 run; see the Phase S.2
+    report).
+
+    The actual, complete interception point is `agno.team._default_tools.
+    _get_delegate_task_function` itself -- verified (source-read, not inferred) to be
+    the ONLY definition of this name anywhere in the installed agno package, and both
+    of its two callers (agno/team/team.py's own `Team._get_delegate_task_function`,
+    via `_default_tools.<name>` module-attribute access; and agno/team/_tools.py's
+    `_determine_tools_for_model`, via a fresh per-call `from ... import <name>`) both
+    re-resolve the name from `_default_tools`'s live module namespace at call time
+    rather than caching a reference at their own import time. That makes the name
+    itself -- not any class or instance -- the correct place to intercept: replacing
+    `agno.team._default_tools._get_delegate_task_function` (see
+    `_install_structured_delegation_interception`, below) transparently reaches BOTH
+    call shapes with one patch, scoped by `isinstance(team, _StructuredDelegationTeam)`
+    so every other Team instance keeps agno's stock behavior unchanged.
+
+    This class now exists ONLY as that isinstance marker -- `_build_team()` constructs
+    one instead of a plain `Team` so the module-level patch below can recognize it and
+    nothing else. It carries no overridden methods of its own; overriding
+    `_get_delegate_task_function` here again would double-wrap (the override's own
+    `super()` call would itself route through the now-patched `_default_tools.
+    _get_delegate_task_function`, which already returns the structured tool -- wrapping
+    it a second time).
     """
 
-    def _get_delegate_task_function(self, *args, **kwargs):
-        from agno.tools.function import Function
 
-        original_function = super()._get_delegate_task_function(*args, **kwargs)
-        original_entrypoint = original_function.entrypoint
+# The one-time marker this module's patch stamps onto its own wrapper function, so
+# `_install_structured_delegation_interception` can tell -- by reading the LIVE
+# `agno.team._default_tools._get_delegate_task_function` attribute itself, not a
+# local/global flag that a module reload could desynchronize from reality -- whether
+# installation already happened, and never stack a second wrapper around the first.
+_STRUCTURED_DELEGATION_PATCH_MARKER = "_ekam_structured_delegation_patch"
 
-        async def delegate_structured_task(
-            member_id: str,
-            target: str,
-            objective: str,
-            evidence_required: str,
-            completion_criteria: str,
-        ):
-            """Delegate ONE bounded research objective to a team member.
+# Set by _install_structured_delegation_interception() to the TRUE, unwrapped agno
+# `_get_delegate_task_function`, captured once at install time. Tests patch this name
+# directly (`monkeypatch.setattr("swarm.team._ORIGINAL_AGNO_GET_DELEGATE_TASK_FUNCTION",
+# fake)`) to control what "the real agno tool" is, while still exercising the REAL
+# `agno.team._default_tools._get_delegate_task_function(team, ...)` call shape
+# production actually uses.
+_ORIGINAL_AGNO_GET_DELEGATE_TASK_FUNCTION = None
 
-            Provide each field separately -- the runtime builds the member's exact
-            task from them; you do not compose free-form task text yourself. One
-            call = one bounded objective, not an open-ended investigation.
 
-            Args:
-                member_id: the member to delegate to, e.g. "researcher".
-                target: the ONE file, module, or area this delegation is about.
-                objective: the specific finding being asked for.
-                evidence_required: what evidence would answer it -- an exact quote,
-                    a line number, a list of matches -- not a vague "find out about X".
-                completion_criteria: the condition under which the member should
-                    stop investigating and report back.
-            """
-            fields = {
-                "target": target, "objective": objective,
-                "evidence_required": evidence_required,
-                "completion_criteria": completion_criteria,
-            }
-            missing = [name for name in _STRUCTURED_DELEGATION_REQUIRED_FIELDS
-                      if not (fields[name] or "").strip()]
-            if missing:
-                print(f"[team] delegate_structured_task REJECTED: missing "
-                      f"{missing} for member_id={member_id!r}", flush=True)
-                # An async generator cannot `return <value>` -- yield the one
-                # result string, then bare `return` to end the generator, same
-                # contract original_entrypoint's own generator satisfies below.
-                yield (
-                    f"DELEGATION REJECTED: missing required field(s) {missing}. "
-                    f"Every field (target, objective, evidence_required, "
-                    f"completion_criteria) must be filled in with real, specific "
-                    f"content -- retry the call with all five fields provided."
-                )
-                return
+def _patched_agno_get_delegate_task_function(team, *args, **kwargs):
+    """Installed in place of `agno.team._default_tools._get_delegate_task_function`.
+    Same signature and call shape as the function it replaces (`team` first, everything
+    else forwarded through unchanged) -- this is what makes it transparent to both of
+    agno's own call sites (see _StructuredDelegationTeam's docstring). Builds agno's
+    real tool first, always -- then, ONLY for this codebase's own Coordinator team,
+    wraps it into the structured contract. Every other Team instance (any other agno
+    user of this same installed package) gets agno's original, completely untouched.
+    """
+    original_function = _ORIGINAL_AGNO_GET_DELEGATE_TASK_FUNCTION(team, *args, **kwargs)
+    if isinstance(team, _StructuredDelegationTeam):
+        return _build_structured_delegation_tool(original_function)
+    return original_function
 
-            canonical_task = _build_canonical_researcher_task(
-                target=target, objective=objective,
-                evidence_required=evidence_required,
-                completion_criteria=completion_criteria,
-            )
-            canonical_hash = hashlib.sha256(
-                canonical_task.encode("utf-8", errors="replace")).hexdigest()[:16]
-            print(f"[team] delegate_structured_task: member_id={member_id!r} "
-                  f"target={target!r} objective={objective!r} "
-                  f"evidence_required={evidence_required!r} "
-                  f"completion_criteria={completion_criteria!r} "
-                  f"canonical_task_hash={canonical_hash} "
-                  f"canonical_task_length={len(canonical_task)}", flush=True)
 
-            async for item in original_entrypoint(member_id=member_id, task=canonical_task):
-                yield item
+setattr(_patched_agno_get_delegate_task_function, _STRUCTURED_DELEGATION_PATCH_MARKER, True)
 
-        new_function = Function.from_callable(
-            delegate_structured_task, name="delegate_structured_task")
-        new_function.stop_after_tool_call = original_function.stop_after_tool_call
-        new_function.show_result = original_function.show_result
-        return new_function
+
+def _install_structured_delegation_interception():
+    """Idempotent by construction: checks the LIVE `agno.team._default_tools.
+    _get_delegate_task_function` attribute for our marker before installing, rather
+    than trusting a local "already ran" flag -- so calling this more than once (or this
+    module being imported more than once in the same process) can never stack a second
+    wrapper around an already-wrapped function, and never re-captures an
+    already-wrapped function as if it were the "original". Does not modify any file on
+    disk; only reassigns one attribute on the already-imported `_default_tools` module
+    object in memory, for the lifetime of this process.
+    """
+    global _ORIGINAL_AGNO_GET_DELEGATE_TASK_FUNCTION
+    import agno.team._default_tools as _agno_default_tools
+
+    current = _agno_default_tools._get_delegate_task_function
+    if getattr(current, _STRUCTURED_DELEGATION_PATCH_MARKER, False):
+        return
+    _ORIGINAL_AGNO_GET_DELEGATE_TASK_FUNCTION = current
+    _agno_default_tools._get_delegate_task_function = _patched_agno_get_delegate_task_function
+
+
+_install_structured_delegation_interception()
 
 
 def _build_team(
@@ -14007,10 +14088,11 @@ def _build_team(
     # get_file_content must not be told to. Owners get their text back unchanged.
     instructions = _coordinator_instructions_for_surface(
         instructions, {getattr(t, "name", "") for t in coordinator_tools_list})
-    # PHASE S (2026-09-24): _StructuredDelegationTeam replaces agno's own free-form
-    # delegate_task_to_member(member_id, task) with a structured
-    # delegate_structured_task(member_id, target, objective, evidence_required,
-    # completion_criteria) tool -- see its own docstring above for why and how.
+    # PHASE S.2 (2026-09-25): _StructuredDelegationTeam is an isinstance marker only
+    # -- the actual free-form-to-structured delegation swap happens once, at module
+    # import time, via _install_structured_delegation_interception() patching
+    # agno.team._default_tools._get_delegate_task_function itself (see that class's
+    # own docstring above for why the interception moved there).
     team = _StructuredDelegationTeam(
         name=name,
         description=description,
