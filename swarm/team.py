@@ -227,6 +227,22 @@ _COORDINATOR_INSTRUCTIONS = [
     "  A task naming ONE bounded, already-known thing to check does not need this — a small,",
     "  targeted delegation (or a direct tool call, per the rule above) is still correct there.",
     "",
+    "── PHASE R (2026-09-24) — bounded delegation contract, controlled test ─────",
+    "  EXPERIMENTAL, not yet validated production behavior; revert this section if the",
+    "  phase's own comparison does not support keeping it. For a delegation that is a real",
+    "  investigative unit (not the tiny single-tool-call delegations shown elsewhere in",
+    "  these instructions, e.g. 'call list_directory on X'), phrase the task text so it",
+    "  names, explicitly or by clear implication:",
+    "    TARGET — the one file/module/area this delegation is about",
+    "    OBJECTIVE — what finding is being asked for",
+    "    EVIDENCE REQUIRED — what kind of evidence would answer it (a quote, a line number,",
+    "      a list of matches)",
+    "    COMPLETION CRITERIA — when the member should stop and report back",
+    "  One delegation = one bounded research objective. Do not phrase a delegation as an",
+    "  open-ended 'investigate everything about X' — Researcher already has its own",
+    "  DECOMPOSE-FIRST rule for genuinely multi-part tasks; this is about keeping each",
+    "  individual delegation itself bounded, not about how work is split across them.",
+    "",
     "── Locating unfamiliar files — you do not have find_files/search_files/list_directory ─",
     "  find_files, search_files, list_directory, list_directory_tree,",
     "  search_knowledge_graph, web_search, web_fetch, lightrag_query, and",
@@ -1976,9 +1992,13 @@ def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = N
             print(f"[team] forward_member_answer: nothing stored for {key!r} "
                   f"(have: {have})", flush=True)
             return (
-                f"NOTHING TO FORWARD: no answer is stored for member {member_id!r}. "
-                f"Members with an answer this run: {', '.join(have) if have else 'none'}. "
-                f"Delegate first, then forward."
+                f"NO RESULT FOR {member_id!r}: this is a terminal state for this call -- "
+                f"nothing has been produced by this member yet, and calling "
+                f"forward_member_answer for {member_id!r} again right now will return this "
+                f"exact same message, because nothing has changed since the last call. "
+                f"Members with a result so far: {', '.join(have) if have else 'none'}. "
+                f"To get something forwardable, call delegate_task_to_member for "
+                f"{member_id!r} first and wait for a NEW result, then forward that."
             )
         # Phase E: build the structured handoff from the raw transcript. `text` itself
         # (== team._member_results[key]) is untouched by this -- the raw transcript stays

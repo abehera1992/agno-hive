@@ -52,9 +52,14 @@ async def test_text_is_captured_at_forward_time_not_at_answer_time():
 
 @pytest.mark.asyncio
 async def test_nothing_stored_records_nothing_and_says_so():
+    # PHASE R (2026-09-24): reworded from "NOTHING TO FORWARD ... Delegate first, then
+    # forward" to an explicit terminal-state message -- the empty-store case is a dead
+    # end for THIS call, not an invitation to retry the same tool (see Q13/Q14's
+    # 56-call forward_member_answer retry loop this rewording targets).
     forwarded = {}
     out = await _forward(_tool({}, forwarded), "researcher")
-    assert forwarded == {} and out.startswith("NOTHING TO FORWARD")
+    assert forwarded == {} and out.startswith("NO RESULT FOR")
+    assert "terminal state" in out
 
 
 @pytest.mark.asyncio

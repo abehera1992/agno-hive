@@ -237,8 +237,13 @@ def test_only_narration_no_findings_is_blocked():
 
 @pytest.mark.asyncio
 async def test_nothing_stored_is_still_nothing_to_forward():
+    # PHASE R (2026-09-24): empty-store case now returns an explicit terminal-state
+    # message ("NO RESULT FOR ... terminal state") instead of "NOTHING TO FORWARD ...
+    # Delegate first, then forward" -- see test_forward_member_answer_handoff.py's
+    # test_nothing_stored_records_nothing_and_says_so for the full rationale.
     out = await _forward(_tool({}, {}), "researcher")
-    assert out.startswith("NOTHING TO FORWARD")
+    assert out.startswith("NO RESULT FOR")
+    assert "terminal state" in out
 
 
 @pytest.mark.asyncio
