@@ -28,6 +28,7 @@ from swarm.team import (
     _make_read_cache_tool_hook, _build_team, _CACHEABLE_READ_TOOLS,
     _collapse_prior_stub_messages, _COLLAPSED_STUB_MARKER,
     _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS,
+    _evidence_integrity_retry_active,
 )
 
 
@@ -1395,3 +1396,158 @@ async def test_model_voluntary_verify_claims_degrades_on_a_real_exception_too(mo
     result = await hook("verify_claims", broken_verify_claims, {"answer": "some answer"})
 
     assert "VERIFICATION UNAVAILABLE" in result
+
+
+# ── Phase Z14 (2026-09-26) -- evidence-integrity retry-context exemption ───────
+#
+# Z13 proved: _evidence_integrity_check's reconciliation retry reuses the SAME
+# team/hook closures as the original run, so a file already served once this run
+# is a cache hit whose serve-count still applies at the normal
+# _MAX_FULL_SERVES_PER_AGENT=1 limit -- a second, legitimate re-grounding ask for
+# that same file within the retry's own delegation was stubbed exactly like any
+# other repeat, and three such stubs crossed _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS,
+# forcing tool_choice="none" before the retry could re-ground itself.
+#
+# Fix: _evidence_integrity_retry_active (a ContextVar, not a plain module global --
+# see its own comment in swarm/team.py) is set True only for the duration of that
+# retry's own _stream_team_run(...) await. While set, the hook grants one extra
+# real serve per (agent, generation, tool, args) key before stubbing -- a 3rd+ ask
+# is still stubbed, and consecutive-stub escalation is completely untouched.
+
+@pytest.mark.asyncio
+async def test_z14_normal_delegation_duplicate_suppression_is_unchanged():
+    """Test 1 -- with the retry context NOT set (the default, every normal
+    delegation), a second ask for the same file is stubbed exactly as before
+    this change."""
+    assert _evidence_integrity_retry_active.get() is False  # default, untouched
+    hook = _make_read_cache_tool_hook()
+    researcher = _FakeAgent("Researcher")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    first = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+    second = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+
+    assert first == "file body"
+    assert second != "file body"  # unchanged: still stubbed on the 2nd ask
+
+
+@pytest.mark.asyncio
+async def test_z14_retry_context_allows_one_extra_real_serve():
+    """Test 2 / Test 5 -- the exact Z13 state transition: a file already served
+    once (simulating the original delegation's own read), then re-asked for
+    again while the retry-context flag is active, must return REAL content
+    instead of a stub. This is the test that fails against the pre-fix
+    implementation (before effective_max_serves existed, count=2 > 1 always
+    stubbed regardless of context)."""
+    hook = _make_read_cache_tool_hook()
+    researcher = _FakeAgent("Researcher")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    # Original delegation's own read (retry context not yet active).
+    original_read = await hook(
+        "get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+    assert original_read == "file body"
+
+    token = _evidence_integrity_retry_active.set(True)
+    try:
+        retry_read = await hook(
+            "get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+    finally:
+        _evidence_integrity_retry_active.reset(token)
+
+    assert retry_read == "file body"  # REAL content, not a stub -- the Z13 fix
+
+
+@pytest.mark.asyncio
+async def test_z14_retry_context_still_stubs_a_third_ask():
+    """Test 4 -- the exemption grants exactly one extra serve, not unlimited
+    re-reads. A 3rd ask for the same key, still within the retry context, must
+    still be stubbed -- pathological repetition inside the retry itself remains
+    bounded."""
+    hook = _make_read_cache_tool_hook()
+    researcher = _FakeAgent("Researcher")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    token = _evidence_integrity_retry_active.set(True)
+    try:
+        first = await hook(
+            "get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+        second = await hook(
+            "get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+        third = await hook(
+            "get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+    finally:
+        _evidence_integrity_retry_active.reset(token)
+
+    assert first == "file body"
+    assert second == "file body"   # the one extra serve the exemption grants
+    assert third != "file body"    # 3rd ask -- still stubbed, exemption is not unlimited
+
+
+@pytest.mark.asyncio
+async def test_z14_consecutive_stub_escalation_still_fires_inside_retry_context():
+    """Test 4 (safety) -- _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS is completely
+    untouched: enough genuinely pathological repeats WITHIN the retry context
+    still force tool_choice='none', exactly as for a normal delegation."""
+    hook = _make_read_cache_tool_hook()
+    researcher = _FakeAgent("Researcher")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    token = _evidence_integrity_retry_active.set(True)
+    try:
+        # 2 real serves (the exemption), then enough repeats to cross the
+        # consecutive-stub threshold.
+        for _ in range(2 + _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS):
+            await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+    finally:
+        _evidence_integrity_retry_active.reset(token)
+
+    assert researcher.model._tool_choice == "none"  # safety net still fires
+
+
+@pytest.mark.asyncio
+async def test_z14_retry_context_does_not_leak_to_a_later_normal_call():
+    """Test 3 -- after the retry's ContextVar token is reset, a SUBSEQUENT
+    normal (non-retry) call for the same key must go back to being stubbed on
+    the 2nd ask, exactly as before -- the exemption must not persist past the
+    one retry attempt that set it."""
+    hook = _make_read_cache_tool_hook()
+    researcher = _FakeAgent("Researcher")
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    token = _evidence_integrity_retry_active.set(True)
+    try:
+        await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+        await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+    finally:
+        _evidence_integrity_retry_active.reset(token)
+
+    assert _evidence_integrity_retry_active.get() is False  # confirmed reset
+
+    # A later ask (context back to normal) for the SAME key is the 3rd overall
+    # ask -- already over budget even without the exemption, so it must be
+    # stubbed regardless; the real proof is the assertion above (context
+    # actually reset) plus test_z14_normal_delegation_duplicate_suppression_is_unchanged
+    # (a fresh key, no retry ever involved, still stubs on ask #2).
+    third_overall = await hook(
+        "get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=researcher)
+    assert third_overall != "file body"
+
+
+@pytest.mark.asyncio
+async def test_z14_default_context_value_is_false_for_a_brand_new_hook():
+    """The exemption must never be accidentally active by default -- confirms
+    the ContextVar's own default, independent of any other test's .set() calls
+    (each test's .set()/.reset(token) pair is self-contained, but this pins the
+    module-level default explicitly)."""
+    assert _evidence_integrity_retry_active.get() is False

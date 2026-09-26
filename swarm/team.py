@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import hashlib
 import json
 import os
@@ -5673,6 +5674,13 @@ async def _evidence_integrity_check(
         f"named above."
     )
     print("[team] evidence-integrity: one targeted reconciliation attempt", flush=True)
+    # Phase Z14: mark this retry so the shared read-cache hook (same team, same
+    # closures as the original run -- see _evidence_integrity_retry_active's own
+    # comment) grants one extra real serve per (tool, args) key instead of
+    # stubbing a legitimate re-grounding read on the 2nd ask. Scoped to exactly
+    # this await via ContextVar .set()/.reset(token) -- never leaks to a
+    # concurrent normal run, and cannot outlive this one retry attempt.
+    _z14_token = _evidence_integrity_retry_active.set(True)
     try:
         retried, _retry_result = await _stream_team_run(
             team, prompt, log_label="evidence-integrity", liveness_path=liveness_path)
@@ -5681,6 +5689,8 @@ async def _evidence_integrity_check(
         forced = _force_uncertainty_answer(content, findings)
         await _persist_evidence_integrity_trace(team, findings, resolved=False, retried=True)
         return forced
+    finally:
+        _evidence_integrity_retry_active.reset(_z14_token)
 
     # Same defensive floor _adopt_retry applies to every other retry in this
     # file -- a genuinely empty completion or one that strips to nothing (pure
@@ -9956,6 +9966,30 @@ _MAX_FULL_SERVES_PER_AGENT = 1
 # not the same sentence a third time.
 _STUB_ESCALATION_SERVE = 5
 
+# Phase Z14 (2026-09-26): narrow retry-context exemption for the evidence-integrity
+# reconciliation retry (_evidence_integrity_check). Z13 proved the causal chain:
+# that retry reuses the SAME team/hook closures as the original run (no fresh
+# _build_team() call), so a file already served once this run is a cache hit, and
+# the per-delegation duplicate-suppression budget above (_MAX_FULL_SERVES_PER_AGENT)
+# still applies at its normal value -- a second ask for that same file within the
+# retry's own delegation is stubbed exactly as it would be for any other repeat,
+# three such stubs cross _FORCE_TEXT_ONLY_AFTER_CONSECUTIVE_STUBS, tool_choice is
+# forced to "none", and the retry is cut off from tools before it can re-ground
+# itself, producing a fabricated answer (later caught by verify_claims, but only
+# after wasting the retry's one attempt).
+#
+# ContextVar, not a plain module global: it must be visible to the read-cache
+# hook's closure (which lives for the whole team's lifetime, shared across every
+# concurrent run using that team) without leaking between unrelated concurrent
+# executions on the same event loop -- the same reasoning swarm/tool_fix.py's
+# peak-token tracking already established for this exact class of problem
+# (Phase Y). Set to True only for the duration of _evidence_integrity_check's own
+# _stream_team_run(...) call (via .set()/.reset(token) around that one await), so
+# a concurrent NORMAL run on a different asyncio Task never sees it, and it cannot
+# survive past the retry that set it.
+_evidence_integrity_retry_active: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_evidence_integrity_retry_active", default=False)
+
 # 2026-08-15: a THIRD escalation tier, keyed on the AGGREGATE total_stub_serve_count
 # (already computed for the Tier-3 liveness signal, config.liveness_aggregate_stub_threshold
 # = 15) rather than any single (agent, tool, args) key's own count. Confirmed live: a
@@ -11323,7 +11357,16 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
 
         serve_counts[serve_key] = serve_counts.get(serve_key, 0) + 1
         count = serve_counts[serve_key]
-        if count > _MAX_FULL_SERVES_PER_AGENT:
+        # Phase Z14: one additional real serve for this (agent, generation, tool,
+        # args) key when this call happens during an evidence-integrity
+        # reconciliation retry (see _evidence_integrity_retry_active's own comment).
+        # Still bounded -- a 3rd+ ask for the SAME key within the retry's own
+        # delegation is stubbed exactly as before, and consecutive-stub escalation
+        # is completely untouched, so genuine pathological repetition inside the
+        # retry is still caught the same way it always was.
+        effective_max_serves = _MAX_FULL_SERVES_PER_AGENT + (
+            1 if _evidence_integrity_retry_active.get() else 0)
+        if count > effective_max_serves:
             total = None
             if activity is not None:
                 activity["max_stub_serve_count"] = max(activity.get("max_stub_serve_count", 0), count)
