@@ -5294,6 +5294,21 @@ def _cmp_confirmed_present(cmp_body: str) -> set[str]:
     return present
 
 
+_LIST_ITEM_LINE_RE = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+")
+# A "this introduces a list" line -- typically a bolded sub-header ending in a
+# colon ("**Backend endpoints with no frontend counterpart:**") -- commonly
+# sits between a gap-declaring line and the actual bulleted list in real
+# answers. Matched with .search() (not .match()) since the colon is at the
+# END of the line, not the start. Bounded lookahead below keeps the overall
+# skip from ever wandering into unrelated later content.
+_LIST_INTRO_LINE_RE = re.compile(r":\s*\**\s*$")
+_GAP_LIST_LOOKAHEAD = 5
+
+
+def _is_blank_or_list_intro_line(line: str) -> bool:
+    return not line.strip() or bool(_LIST_INTRO_LINE_RE.search(line))
+
+
 def _integrity_named_item_falsely_gapped(content: str, cmp_note: str) -> tuple[str, str] | None:
     """(name, real) when the answer calls something a gap/missing/absent that
     compare_enumerations' own MATCHED or HOOKS EXPORTED output, from the SAME
@@ -5310,6 +5325,34 @@ def _integrity_named_item_falsely_gapped(content: str, cmp_note: str) -> tuple[s
     caught zero of them. Checked per gap-claiming LINE, same discipline
     _table_claimed_missing_but_present already uses, so an answer that
     correctly calls something else a gap on an unrelated line is untouched.
+
+    Widened (Phase Z2, 2026-09-26): a gap-declaring line and the item it
+    names are not always on the SAME physical line, and the actual bulleted
+    list is not always the very next line either. T1-T13 battery evidence
+    (T13b, run against commit d2a97eb) had this exact shape:
+
+        #### Backend-Frontend Gap Analysis          <- matches (has "Gap")
+        **Backend endpoints with no frontend counterpart:**   <- colon intro
+                                                      <- blank line
+        - `PUT /vouchers/{voucher_id}/post`          <- bullet, no keyword
+        - `PUT /vouchers/{voucher_id}/cancel`         <- bullet, no keyword
+        ...
+
+    Two of those bullets (`/post`, `/cancel`) named endpoints
+    compare_enumerations' own MATCHED output confirmed had a real hook.
+    Neither the gap-declaring line nor any bullet alone satisfied the
+    original one-line check: the header names no specific item, and no
+    bullet carries a gap-keyword of its own. A gap-declaring line is now
+    read as also covering a bulleted/numbered list that follows within a
+    short, bounded lookahead -- skipping over blank lines and colon-
+    terminated "intro" lines (the common shape of a sub-header introducing
+    a list) to find where the list actually starts, then scanning its
+    contiguous run of list-item lines. The lookahead is capped
+    (_GAP_LIST_LOOKAHEAD) and stops immediately at any real content line
+    that is neither blank nor colon-terminated, so this can never reach past
+    the actual list into unrelated later content -- and it never assumes any
+    specific item name, only list-item syntax, so it is not keyed to T13b's
+    or any other task's endpoint/hook names.
     """
     body = _comparison_body(cmp_note)
     if not body:
@@ -5317,12 +5360,38 @@ def _integrity_named_item_falsely_gapped(content: str, cmp_note: str) -> tuple[s
     present = _cmp_confirmed_present(body)
     if not present:
         return None
-    for line in (content or "").splitlines():
-        if not _GAP_CLAIM_LINE_RE.search(line):
-            continue
+
+    def _check_line(line: str) -> tuple[str, str] | None:
         for name in present:
             if name and re.search(rf"(?<![\w./-]){re.escape(name)}(?![\w./-])", line):
                 return name, "compare_enumerations' own MATCHED/HOOKS EXPORTED output lists this as present"
+        return None
+
+    lines = (content or "").splitlines()
+    n = len(lines)
+    for i, line in enumerate(lines):
+        if not _GAP_CLAIM_LINE_RE.search(line):
+            continue
+        hit = _check_line(line)
+        if hit:
+            return hit
+        # Skip forward past a short, bounded run of blank/colon-intro lines
+        # to find where an introduced list actually starts.
+        j = i + 1
+        lookahead = 0
+        while (j < n and lookahead < _GAP_LIST_LOOKAHEAD
+               and not _LIST_ITEM_LINE_RE.match(lines[j])
+               and _is_blank_or_list_intro_line(lines[j])):
+            j += 1
+            lookahead += 1
+        # Whether or not a list was found, scan its contiguous run (empty
+        # range if lines[j] is not a list-item line -- no-op, matches the
+        # original silent behavior for a gap-claim line with no following list).
+        while j < n and _LIST_ITEM_LINE_RE.match(lines[j]):
+            hit = _check_line(lines[j])
+            if hit:
+                return hit
+            j += 1
     return None
 
 

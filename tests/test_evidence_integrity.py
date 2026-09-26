@@ -581,3 +581,157 @@ def test_zero_claim_catches_qualified_noun_phrasing():
     found = _integrity_comparison_zero_claim_contradiction(content, _cmp_note())
     assert found is not None
     assert "left=9" in found[1]
+
+
+# ── Phase Z2 (2026-09-26) — list-item lookahead widening, Tests A-F ─────────
+# _integrity_named_item_falsely_gapped's docstring documents the T13b live
+# shape that motivated this widening: a gap-declaring header, a colon-
+# terminated sub-header, a blank line, THEN a bulleted list -- none of which
+# alone satisfied the original same-line check. These tests use a synthetic,
+# deliberately non-vouchers fixture (widgets/activate/deactivate) to prove
+# the widening is general-purpose, not keyed to T13b's own endpoint/hook
+# names, per Phase Z2's explicit constraint against task-specific hard-coding.
+#
+# Two of the LEFT-only endpoints below (activate/deactivate) have their hook
+# names listed in HOOKS EXPORTED anyway -- this mirrors the real T13b shape,
+# where compare_enumerations' HOOKS EXPORTED block is derived independently
+# of its endpoint-side LEFT ONLY/MATCHED/PARTIAL MATCH classification, so a
+# hook can be confirmed present even when its paired endpoint's own
+# comparison bucket lags or disagrees.
+
+_GENERIC_CMP_BODY = """compare_enumerations — a/left_module.py  vs  b/right_module.ts
+join: HTTP method + path-boundary suffix match (exact string, no inference)
+
+LEFT — @router routes in a/left_module.py (5):
+  GET /widgets
+  POST /widgets
+  PUT /widgets/{widget_id}/activate
+  PUT /widgets/{widget_id}/deactivate
+  DELETE /widgets/{widget_id}
+
+RIGHT — RTK Query endpoints in b/right_module.ts (3):
+  GET /api/widgets
+  POST /api/widgets
+  DELETE /api/widgets/{widget_id}
+
+MATCHED (2):
+  GET /widgets   <->   useGetWidgetsQuery
+  POST /widgets   <->   useCreateWidgetMutation
+
+LEFT ONLY — defined on the left with no match on the right (3):
+  PUT /widgets/{widget_id}/activate
+  PUT /widgets/{widget_id}/deactivate
+  DELETE /widgets/{widget_id}
+
+RIGHT ONLY — present on the right with no match on the left (0):
+  (none)
+
+HOOKS EXPORTED BY b/right_module.ts (4):
+  useActivateWidgetMutation
+  useCreateWidgetMutation
+  useDeactivateWidgetMutation
+  useGetWidgetsQuery
+
+TOTALS: left 5, right 3, matched 2, left-only 3, right-only 0."""
+
+
+def _generic_cmp_note(body: str = _GENERIC_CMP_BODY) -> str:
+    return f"\n\n---\n**THE COMPARISON, COMPUTED**\n```\n{body}\n```"
+
+
+def test_a_header_colon_intro_blank_then_list_is_scanned():
+    """The exact widened shape: gap header, colon-terminated sub-header,
+    blank line, then a bulleted list naming hooks HOOKS EXPORTED confirms
+    exist. Must be caught even though no single line has both the gap
+    keyword and the confirmed name."""
+    content = (
+        "#### Backend-Frontend Gap Analysis\n"
+        "**Backend endpoints with no corresponding frontend hook:**\n"
+        "\n"
+        "- `useActivateWidgetMutation`\n"
+        "- `useDeactivateWidgetMutation`\n"
+    )
+    found = _integrity_named_item_falsely_gapped(content, _generic_cmp_note())
+    assert found is not None
+    name, real = found
+    assert name == "useActivateWidgetMutation"
+    assert "HOOKS EXPORTED" in real or "MATCHED" in real
+
+
+def test_b_lookahead_is_bounded_and_does_not_wander_past_the_cap():
+    """More than _GAP_LIST_LOOKAHEAD blank lines between the gap-declaring
+    line and the list must NOT be bridged -- proves the skip is capped, not
+    an unbounded scan forward through the rest of the answer. The bullet
+    itself deliberately carries no gap-claim language of its own (a bare
+    name mention), so the only way this could be found is via the header's
+    own lookahead reaching it -- isolating exactly what this test targets."""
+    padding = "\n" * 10  # well past _GAP_LIST_LOOKAHEAD (5)
+    content = (
+        "The following endpoints are missing frontend coverage:" + padding +
+        "- `useActivateWidgetMutation`\n"
+    )
+    assert _integrity_named_item_falsely_gapped(content, _generic_cmp_note()) is None
+
+
+def test_c_a_real_content_line_stops_the_lookahead():
+    """A non-blank, non-colon-terminated, non-list-item line between the
+    gap-declaring line and the list must halt the skip immediately -- the
+    widening must never read through unrelated prose to reach a later list,
+    only through blank lines and colon-terminated intro lines. As in Test B,
+    the bullet carries no gap-claim language of its own."""
+    content = (
+        "The following endpoints are missing frontend coverage:\n"
+        "This paragraph is unrelated explanatory prose, not a list intro.\n"
+        "- `useActivateWidgetMutation`\n"
+    )
+    assert _integrity_named_item_falsely_gapped(content, _generic_cmp_note()) is None
+
+
+def test_d_mixed_list_a_genuine_gap_does_not_mask_a_falsely_gapped_sibling():
+    """A list with one genuinely-absent item followed by one falsely-gapped
+    item must still catch the second -- the scan checks every list-item
+    line, it does not stop or get satisfied at the first non-match."""
+    content = (
+        "The following endpoints are missing frontend coverage:\n"
+        "\n"
+        "- `DELETE /widgets/{widget_id}` -- genuinely no frontend hook\n"
+        "- `useActivateWidgetMutation`\n"
+    )
+    found = _integrity_named_item_falsely_gapped(content, _generic_cmp_note())
+    assert found is not None
+    assert found[0] == "useActivateWidgetMutation"
+
+
+@pytest.mark.asyncio
+async def test_e_generic_t13b_shaped_case_end_to_end_proves_generality():
+    """The full _evidence_integrity_findings entry point, not just the
+    isolated helper, on a synthetic fixture that shares T13b's *shape*
+    (header + colon intro + blank + bulleted list; some items partial-
+    overlap, not full 1:1 matches) but none of its literal names -- proof
+    this is a general reconciliation fix, not one keyed to voucher/post/
+    cancel specifically."""
+    team = SimpleNamespace(_read_state={}, _tool_evidence=[])
+    content = (
+        "#### Backend-Frontend Gap Analysis\n"
+        "**Backend endpoints with no corresponding frontend hook:**\n"
+        "\n"
+        "- `useDeactivateWidgetMutation`\n"
+    )
+    findings = await _evidence_integrity_findings(
+        content, "task", team, None, None, _generic_cmp_note())
+    assert any(f["category"] == "comparison completeness/gap" for f in findings)
+
+
+def test_f_no_false_positive_on_a_correct_answer_with_an_unrelated_bulleted_list():
+    """A bulleted list that follows a line which merely CONTAINS the
+    substring 'gap' in an unrelated, non-gap-claiming sense (or a list of
+    genuinely-confirmed items with no gap language at all) must not trigger
+    -- the widening only activates on an actual _GAP_CLAIM_LINE_RE match,
+    never merely because a list follows some line."""
+    content = (
+        "Matched endpoints:\n"
+        "\n"
+        "- `useActivateWidgetMutation`\n"
+        "- `useGetWidgetsQuery`\n"
+    )
+    assert _integrity_named_item_falsely_gapped(content, _generic_cmp_note()) is None
