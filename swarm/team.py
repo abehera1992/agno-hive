@@ -13739,12 +13739,38 @@ def _build_canonical_researcher_task(
     inference, no fallback, no retry. Validation of required fields happens in the
     caller (delegate_structured_task's own entrypoint, below) BEFORE this runs --
     this function assumes it already received real content in every field.
+
+    SCOPE PRECEDENCE clause (Phase Z8, 2026-09-26): Z7 traced T13b's over-
+    enumeration (Z6) to a genuine instruction-level contradiction, not a buried or
+    poorly-worded rule. The Coordinator's own OBJECTIVE/COMPLETION CRITERIA text is
+    free-form and routinely reads as absolute ("list all database tables" /
+    "when all tables are listed with their class definitions") -- live-observed
+    verbatim in the Z6 T13b run. Taken literally, that directly conflicts with the
+    Researcher's standing RELEVANCE-FILTER instruction (engineering.yaml), which
+    says to report only task-relevant declarations from a named multi-declaration
+    file. Every delegation funnels through this ONE function regardless of which
+    member or task generated it, making it the correct interception point: one
+    fixed clause here establishes precedence for every delegation, instead of the
+    rejected alternative of pasting relevance wording into every Coordinator-
+    generated completion criterion (which would still be free-form text the
+    Coordinator could omit or contradict again). This clause does not restate or
+    duplicate RELEVANCE-FILTER's own content -- it only establishes that OBJECTIVE
+    and COMPLETION CRITERIA above define WHEN a task is finished, never WHAT
+    content is in scope; scope is always the Researcher's own standing rules.
     """
     return (
         f"TARGET:\n{target}\n\n"
         f"OBJECTIVE:\n{objective}\n\n"
         f"EVIDENCE REQUIRED:\n{evidence_required}\n\n"
         f"COMPLETION CRITERIA:\n{completion_criteria}\n\n"
+        f"SCOPE PRECEDENCE:\n"
+        f"The objective and completion criteria above define WHEN this task is "
+        f"complete. They do NOT define WHAT content is in scope -- your own "
+        f"standing instructions are always authoritative for that. If completion "
+        f"criteria above say or imply 'all' or 'every' item in the target, that "
+        f"means all items your standing instructions consider relevant, never "
+        f"literally every declaration/item present in the target regardless of "
+        f"relevance. Never expand scope to satisfy a completion criterion.\n\n"
         f"BOUNDED EXECUTION:\n"
         f"Investigate only the specified target. Use the minimum tool calls "
         f"necessary to obtain the required evidence. Stop immediately once the "
