@@ -31,7 +31,8 @@ with the identical context -- a silent, repeating loop until the 300s liveness
 auto-kill (config.liveness_silence_threshold_s) fires with zero answer produced.
 """
 
-import os  # noqa: E402  (this module defines helpers above its imports)
+import contextvars  # noqa: E402  (this module defines helpers above its imports)
+import os  # noqa: E402
 
 # agno team internal tools — do not strip from content, let agno handle natively
 _AGNO_INTERNAL_TOOLS = {"delegate_task_to_member", "delegate_task_to_members", "get_member_information"}
@@ -52,18 +53,35 @@ _AGNO_INTERNAL_TOOLS = {"delegate_task_to_member", "delegate_task_to_members", "
 # model_response.response_usage from it. Nothing new is requested from the server;
 # the number was already arriving and simply never read.
 #
-# Module-level is per-RUN state, not global state: api/server.py runs each task in
-# its own subprocess (_run_worker_subprocess), so this module is freshly imported
-# per run and starts at zero. Peak rather than last-seen, because a run's prompt
-# does not grow monotonically -- a member's own turns are short, and taking the
-# most recent would read as "context freed up" right after a big coordinator turn.
-_peak_input_tokens = 0
-
+# PHASE Y (2026-09-25) correction: the comment this replaces claimed module-level
+# state was equivalent to per-run state because "api/server.py runs each task in its
+# own subprocess, so this module is freshly imported per run." That is true for
+# /run, /run_chunked, and /stream (all route through _run_worker_subprocess) but NOT
+# for /plan, which calls run_task_async() directly inside the long-lived FastAPI
+# process (api/server.py's plan() handler) -- confirmed by reading both call sites.
+# A plain module global there means a later /plan request silently inherits an
+# earlier one's peak, exactly like Phase W's Workload C -> D -> E cascade (reproduced
+# without a live LLM call in the Phase X investigation, against this exact module).
+#
+# ContextVar instead of a plain int -- and reset via reset_peak_token_state() at the
+# same run-start lifecycle boundary reset_unavailable_tool_state() already occupies
+# (run_task_async/run_task_stream in swarm/team.py) -- because /plan's requests are
+# NOT serialized: no lock exists, and FastAPI dispatches concurrent requests as
+# separate asyncio Tasks on the one event loop. A plain "reset the global to 0 at run
+# start" would let one concurrent request's start wipe out another's mid-flight peak.
+# asyncio.Task copies the current contextvars.Context at creation time and mutates its
+# own copy from there, so each request's own reset_peak_token_state() call establishes
+# a value only that request's own call tree (its own nested awaits/delegations, which
+# run as further awaits within the SAME Task, not separate Tasks) can see or change --
+# no lock required, and no cross-request interference.
+_peak_input_tokens_var: "contextvars.ContextVar[int]" = contextvars.ContextVar(
+    "peak_input_tokens", default=0)
 
 # Largest PRE-FLIGHT estimate this run, from the messages actually about to be sent.
 # Separate from the server-reported figure because they answer different questions and
-# only one of them survives a rejected request.
-_peak_estimated_input_tokens = 0
+# only one of them survives a rejected request. Same ContextVar rationale as above.
+_peak_estimated_input_tokens_var: "contextvars.ContextVar[int]" = contextvars.ContextVar(
+    "peak_estimated_input_tokens", default=0)
 
 # Characters per token. Measured against the served model's own /tokenize endpoint, not
 # assumed: 25,854 chars of Python source -> 5,985 tokens (4.32), 28,800 chars of English
@@ -132,19 +150,36 @@ def _trim_to_ceiling(messages) -> int:
 
 
 def peak_input_tokens() -> int:
-    """Largest prompt this run, server-reported or estimated -- whichever is larger.
+    """Largest prompt THIS logical run has produced, server-reported or estimated --
+    whichever is larger. "This run" means the current asyncio Task's own context
+    (see reset_peak_token_state) -- a concurrent or prior run's peak never leaks in.
 
     Returning the max, rather than only the server's figure, is the whole point. The
     server never reports a request it REFUSED, so on the run that matters most its
     number is stale by definition: T11 logged 133,446 from the last successful call
     while the request that killed it was 258,049.
     """
-    return max(_peak_input_tokens, _peak_estimated_input_tokens)
+    return max(_peak_input_tokens_var.get(), _peak_estimated_input_tokens_var.get())
 
 
 def measured_input_tokens() -> int:
-    """Only the server-reported figure. For telling a real count from an estimate."""
-    return _peak_input_tokens
+    """Only the server-reported figure, for this logical run. For telling a real
+    count from an estimate."""
+    return _peak_input_tokens_var.get()
+
+
+def reset_peak_token_state() -> None:
+    """Start this logical run's context-budget accounting from zero, independent of
+    whatever any other run measured -- see the PHASE Y comment above
+    _peak_input_tokens_var for why this must be per-Task (ContextVar), not a shared
+    module global reset in place. Call at the same run-start lifecycle boundary
+    reset_unavailable_tool_state() already occupies (run_task_async/run_task_stream
+    in swarm/team.py), not anywhere inside peak_input_tokens() itself -- resetting
+    there would make every read also a write and defeat the whole point of tracking
+    a peak across the run.
+    """
+    _peak_input_tokens_var.set(0)
+    _peak_estimated_input_tokens_var.set(0)
 
 
 def _estimate_prompt_tokens(messages) -> int:
@@ -177,12 +212,16 @@ def _estimate_prompt_tokens(messages) -> int:
 
 def record_prompt_estimate(messages) -> int:
     """Record the estimate, dump composition on a big jump, and trim past the ceiling."""
-    global _peak_estimated_input_tokens, _last_estimate
+    global _last_estimate
     est = _estimate_prompt_tokens(messages)
 
     # A jump nobody can explain from the existing counters. Dumped only here, so an
     # ordinary call costs nothing: T13a's member reports grew ~1k tokens while the
     # request grew ~100,000, and no log said where the rest came from.
+    # _last_estimate stays a plain module global (not per-run) deliberately: it is a
+    # diagnostic-only print trigger, not budget-gating state, so a stale value read
+    # across two concurrent/sequential runs costs at most a spurious or missed log
+    # line -- unlike the peak counters below, it was never the Phase W/X defect.
     if est - _last_estimate >= _PROMPT_JUMP_ALERT:
         print(f"[model] prompt jumped {_last_estimate:,} -> {est:,} tokens in one call "
               f"— {_describe_messages(messages)}", flush=True)
@@ -201,25 +240,25 @@ def record_prompt_estimate(messages) -> int:
                   f"{after:,}. Sending a trimmed request beats sending one the model "
                   f"will refuse, which ends the run with nothing.", flush=True)
             est = after
-    if est > _peak_estimated_input_tokens:
-        _peak_estimated_input_tokens = est
+    if est > _peak_estimated_input_tokens_var.get():
+        _peak_estimated_input_tokens_var.set(est)
         # Only when the estimate OVERTAKES what the server has confirmed: that is the
         # gap the budget guard was blind to, and saying it every call would bury it.
-        if est > _peak_input_tokens:
+        peak_measured = _peak_input_tokens_var.get()
+        if est > peak_measured:
             print(f"[model] pre-flight prompt estimate {est:,} tokens exceeds the "
-                  f"largest server-reported {_peak_input_tokens:,} — the budget guard "
+                  f"largest server-reported {peak_measured:,} — the budget guard "
                   f"would not have seen this without measuring first", flush=True)
     return est
 
 
 def _record_input_tokens(model_response) -> None:
-    global _peak_input_tokens
     usage = getattr(model_response, "response_usage", None)
     if usage is None:
         return
     seen = getattr(usage, "input_tokens", 0) or 0
-    if isinstance(seen, (int, float)) and seen > _peak_input_tokens:
-        _peak_input_tokens = int(seen)
+    if isinstance(seen, (int, float)) and seen > _peak_input_tokens_var.get():
+        _peak_input_tokens_var.set(int(seen))
 import json
 import re
 from typing import Any

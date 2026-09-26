@@ -23,7 +23,8 @@ from .feedback import (record_success, record_failure, load_failure_context,
                        load_success_context, load_project_memory_context)
 from . import model_routing, team_config
 from .tool_fix import (
-    peak_input_tokens, reset_unavailable_tool_state, unavailable_tool_snapshot,
+    peak_input_tokens, reset_peak_token_state, reset_unavailable_tool_state,
+    unavailable_tool_snapshot,
 )
 from config.config import config
 from swarm import phase0
@@ -14787,6 +14788,12 @@ async def run_task_stream(
     if read_only and agent_specs:
         agent_specs, _ = _strip_mutating(agent_specs, None)
     reset_unavailable_tool_state()
+    # PHASE Y (2026-09-25): /plan calls this function directly in-process (no
+    # subprocess isolation, unlike /run|/run_chunked|/stream) -- without this reset,
+    # a later /plan request inherits an earlier one's peak context-token usage from
+    # swarm/tool_fix.py's module state, exactly as Phase W's Workload C -> D -> E
+    # cascade demonstrated. Same run-start lifecycle boundary as the reset above.
+    reset_peak_token_state()
 
     from swarm.sessions import get_context as get_session_context
 
@@ -19117,6 +19124,12 @@ async def run_task_async(
     if read_only and agent_specs:
         agent_specs, _ = _strip_mutating(agent_specs, None)
     reset_unavailable_tool_state()
+    # PHASE Y (2026-09-25): /plan calls this function directly in-process (no
+    # subprocess isolation, unlike /run|/run_chunked|/stream) -- without this reset,
+    # a later /plan request inherits an earlier one's peak context-token usage from
+    # swarm/tool_fix.py's module state, exactly as Phase W's Workload C -> D -> E
+    # cascade demonstrated. Same run-start lifecycle boundary as the reset above.
+    reset_peak_token_state()
 
     from swarm.sessions import get_context as get_session_context
 
