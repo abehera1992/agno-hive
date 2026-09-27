@@ -19104,6 +19104,19 @@ async def _stream_team_run(
     final_run_output: "TeamRunOutput | None" = None
     last_logged_len = 0
     last_logged_at = time.monotonic()
+    # Z16 (2026-09-26): character offset of the end of the last CONFIRMED-non-repeat
+    # 10s window -- i.e. the boundary of the last content this function is willing to
+    # trust. Advances only in the non-repeat branch below, mirroring last_progress_at's
+    # own "only on confirmed new content" rule. See repetition_stopped's own comment
+    # for what this is used for.
+    last_good_len = 0
+    # Z16: True once this generation is cut off in-process for hitting the SAME
+    # repetition-count threshold api/server.py's Tier 5 liveness auto-kill already uses
+    # (config.liveness_repetition_threshold) -- see the threshold check below for the
+    # full rationale. Left False for the overwhelmingly common case (no repetition, or
+    # a repeat streak that never reaches the threshold), in which this function's
+    # behavior is byte-for-byte unchanged from before this phase.
+    repetition_stopped = False
     unrecognized_event_counts: dict[str, int] = {}
     try:
         async for event in team.arun(prompt, stream=True, yield_run_output=True):
@@ -19179,8 +19192,44 @@ async def _stream_team_run(
                                 f"docstring: ...{preview!r}",
                                 flush=True,
                             )
+                        # Z16 (2026-09-26): stop consuming THIS generation in-process at
+                        # the SAME repetition-count threshold api/server.py's Tier 5
+                        # liveness auto-kill already uses to justify a hard SIGKILL --
+                        # see config.liveness_repetition_threshold's own comment for the
+                        # data behind that number (max observed benign streak 3, so 4
+                        # leaves one firing of margin). Reusing it here, rather than a
+                        # new constant, means the in-process stop and the external kill
+                        # agree on "how many firings is a genuine loop" -- the only
+                        # difference is WHERE the stop happens and what survives it.
+                        #
+                        # Root cause (see this phase's own report): a stuck generation
+                        # doesn't discard its own already-complete answer before looping
+                        # past it, and the only prior stop was an EXTERNAL SIGKILL of the
+                        # whole worker process, which loses every in-memory guard/
+                        # verification pass and forces a lossy draft-plus-repair salvage
+                        # from disk. Breaking the stream here instead keeps the process
+                        # alive -- the truncation below discards the repeating tail, and
+                        # the answer that survives goes through the SAME guard chain
+                        # (verify_claims, evidence-integrity, etc.) any normal completion
+                        # does, rather than a parent-side repair of a raw draft.
+                        if activity["repetition_count"] >= config.liveness_repetition_threshold:
+                            print(
+                                f"[{log_label}] repetition threshold reached "
+                                f"({activity['repetition_count']} >= "
+                                f"{config.liveness_repetition_threshold}) -- stopping this "
+                                f"generation in-process and keeping the {last_good_len} "
+                                f"chars generated before the repeating segment began, "
+                                f"instead of waiting for an external liveness kill to "
+                                f"discard the whole run",
+                                flush=True,
+                            )
+                            repetition_stopped = True
+                            last_logged_at = now
+                            last_logged_len = len(joined)
+                            break
                     else:
                         activity["last_progress_at"] = now
+                        last_good_len = len(joined)
                         print(
                             f"[{log_label}] content: +{len(joined) - last_logged_len} chars "
                             f"({len(joined)} total) -- ...{preview!r}",
@@ -19218,6 +19267,15 @@ async def _stream_team_run(
                 _run_ctx.executions[_retry_execution_id]))
     accumulated = "".join(full_content) or "(no response)"
     final_segment = "".join(full_content[last_segment_start:]).strip()
+    # Z16: an in-process repetition stop never reaches natural stream exhaustion, so
+    # final_run_output is always None here -- both candidates below are built from our
+    # own accumulated chunks, which still include the repeating tail unless trimmed.
+    # Cut both back to last_good_len (the end of the last CONFIRMED-non-repeat window)
+    # so the repeating segment itself never reaches _first_surviving_answer, only the
+    # grounded content generated before it did.
+    if repetition_stopped:
+        accumulated = accumulated[:last_good_len].strip() or "(no response)"
+        final_segment = accumulated
     content = _with_forwarded_evidence(_first_surviving_answer(
         final_run_output.content if final_run_output else None,
         final_segment,
@@ -19637,6 +19695,10 @@ async def run_task_async(
                     final_run_output: "TeamRunOutput | None" = None
                     last_logged_len = 0
                     last_logged_at = time.monotonic()
+                    # Z16: see _stream_team_run's identical pair for the full rationale --
+                    # kept in sync deliberately, same as every other block in this loop.
+                    last_good_len = 0
+                    repetition_stopped = False
                     # See _stream_team_run's own docstring for the narration-leak incident
                     # this tracks -- reset to len(full_content) on every tool event so the
                     # final fallback (used only when final_run_output.content is empty) can
@@ -19727,8 +19789,26 @@ async def run_task_async(
                                                 f"...{preview!r}",
                                                 flush=True,
                                             )
+                                        # Z16: see _stream_team_run's identical block for the
+                                        # full rationale -- kept in sync deliberately.
+                                        if activity["repetition_count"] >= config.liveness_repetition_threshold:
+                                            print(
+                                                f"[team] repetition threshold reached "
+                                                f"({activity['repetition_count']} >= "
+                                                f"{config.liveness_repetition_threshold}) -- "
+                                                f"stopping this generation in-process and keeping "
+                                                f"the {last_good_len} chars generated before the "
+                                                f"repeating segment began, instead of waiting for "
+                                                f"an external liveness kill to discard the whole run",
+                                                flush=True,
+                                            )
+                                            repetition_stopped = True
+                                            last_logged_at = now
+                                            last_logged_len = len(joined)
+                                            break
                                     else:
                                         activity["last_progress_at"] = now
+                                        last_good_len = len(joined)
                                         print(
                                             f"[team] content: +{len(joined) - last_logged_len} chars "
                                             f"({len(joined)} total) -- ...{preview!r}",
@@ -19781,6 +19861,11 @@ async def run_task_async(
                                 _run_ctx.executions[_run_ctx.root_execution_id]))
                 accumulated = "".join(full_content) or "(no response)"
                 final_segment = "".join(full_content[last_segment_start:]).strip()
+                # Z16: see _stream_team_run's identical block for the full rationale --
+                # kept in sync deliberately.
+                if repetition_stopped:
+                    accumulated = accumulated[:last_good_len].strip() or "(no response)"
+                    final_segment = accumulated
                 content = _with_forwarded_evidence(_first_surviving_answer(
                     final_run_output.content if final_run_output else None,
                     final_segment,
