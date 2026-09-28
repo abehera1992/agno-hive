@@ -16,9 +16,8 @@ _tool_naming_hint_lines (swarm/team.py) closes this by injecting one
 instruction block, only when the task names a known member-only tool the
 Coordinator's own surface does not include, telling it to delegate instead of
 substituting a different tool it does hold. Deliberately narrow and silent
-whenever coordinator_tools is None (unrestricted) -- same "not ours to judge"
-rule _make_capability_routing_gate_hook already applies to the analogous
-delegation-side mistake.
+whenever coordinator_tools is None (unrestricted), where "does not hold"
+cannot be determined.
 """
 from swarm.team import _tool_naming_hint_lines, _NAMEABLE_MEMBER_ONLY_TOOLS
 
