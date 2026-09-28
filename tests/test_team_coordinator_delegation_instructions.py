@@ -149,8 +149,8 @@ def test_gap_analysis_section_always_delegates_to_reviewer_as_a_second_step():
     text = _joined()
     start = text.index("For gap-analysis / comparison questions")
     section = text[start:text.index("Project context (fetch on demand", start)]
-    assert "delegate_task_to_member('researcher'" in section
-    assert "ALWAYS delegate_task_to_member('reviewer'" in section
+    assert "delegate_structured_task to researcher" in section
+    assert "ALWAYS delegate_structured_task to reviewer" in section
     assert "never skip this step just because nothing is being written" in section
 
 
