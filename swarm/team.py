@@ -11790,6 +11790,52 @@ def _make_capability_routing_gate_hook(member_tools: dict):
 _BROWSE_TOOL_NAMES = {"list_directory_tree", "find_files", "get_file_content"}
 _SEARCH_TOOL_NAMES = {"search_files", "lightrag_query"}
 
+# Z19 (2026-09-28) -- see the task-text tool-naming hint in run_task_async/
+# run_task_stream, right after `instructions` is first composed, for the live
+# incident (T7) this closes. A small, explicit, hand-maintained set, same
+# discipline as _BROWSE_TOOL_NAMES/_SEARCH_TOOL_NAMES above: the tools an
+# investigation task is actually likely to name by name, held only by
+# Researcher/Coder/Executor on the engineering team, never by the Coordinator
+# itself (whose own surface is `coordinator_tools`, e.g. just ["project_map"]).
+_NAMEABLE_MEMBER_ONLY_TOOLS = (
+    "list_directory", "list_directory_tree", "find_files", "get_file_content",
+    "get_files_batch", "search_files", "search_files_batch", "count_matches",
+    "db_query", "db_schema",
+)
+
+
+def _tool_naming_hint_lines(task: str, coordinator_tools: list[str] | None) -> list[str]:
+    """Instruction lines telling the Coordinator to delegate, when `task` names a
+    _NAMEABLE_MEMBER_ONLY_TOOLS tool it does not itself hold -- or [] otherwise.
+
+    Pure and independently testable on purpose (called identically from
+    run_task_async and run_task_stream, right after `instructions` is first
+    composed): only fires when `coordinator_tools` is a concrete, known list
+    (never None/unrestricted, where "does not hold" cannot be determined -- same
+    "unknown member: not ours to judge" rule _make_capability_routing_gate_hook's
+    own hook already follows for the delegation-side version of this mistake).
+    """
+    if coordinator_tools is None or not task:
+        return []
+    for named_tool in _NAMEABLE_MEMBER_ONLY_TOOLS:
+        if named_tool in coordinator_tools:
+            continue
+        if re.search(rf"(?<!\w){re.escape(named_tool)}(?!\w)", task):
+            return [
+                "",
+                f"── This task names `{named_tool}`, which you do not hold (Z19) ──",
+                f"The task above names `{named_tool}`. Your own tools this run are: "
+                f"{sorted(coordinator_tools) or '(none)'} -- {named_tool} is not "
+                f"among them. Delegate this to the Researcher (delegate_structured_task "
+                f"or delegate_task_to_member), naming {named_tool} in the delegation "
+                f"objective, so the member that actually holds it calls it. Do NOT try "
+                f"to satisfy this by repeatedly calling a DIFFERENT tool you do hold "
+                f"instead (e.g. project_map) -- that does not produce {named_tool}'s "
+                f"actual output, and doing this has previously spent the entire "
+                f"Coordinator tool budget with zero delegations and zero real evidence.",
+            ]
+    return []
+
 # 2026-08-15 gate-scope extension -- resolution of the "AgnoHive - Engineering
 # Team 2.0 Update" plan's 4th open question. The two mechanical gates above were
 # ALREADY structurally unconditional (keyed only on _is_multi_part_task(task) and
@@ -15009,6 +15055,12 @@ async def run_task_stream(
         _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
         + list(_COORDINATOR_INSTRUCTIONS)
     )
+
+    # Z19 (2026-09-28): see _tool_naming_hint_lines' own docstring, and the T7
+    # incident it closes (Coordinator burned its entire tool budget on project_map,
+    # zero delegations, zero real evidence, then fabricated an answer -- caught by
+    # existing guards but the task went unanswered).
+    instructions += _tool_naming_hint_lines(task, coordinator_tools)
 
     if skill_catalog:
         instructions += ["", format_skill_catalog(skill_catalog, None)]
@@ -19404,6 +19456,12 @@ async def run_task_async(
         _project_id_preamble(project_id) + _team_roster_preamble(agent_specs)
         + list(_COORDINATOR_INSTRUCTIONS)
     )
+
+    # Z19 (2026-09-28): see _tool_naming_hint_lines' own docstring, and the T7
+    # incident it closes (Coordinator burned its entire tool budget on project_map,
+    # zero delegations, zero real evidence, then fabricated an answer -- caught by
+    # existing guards but the task went unanswered).
+    instructions += _tool_naming_hint_lines(task, coordinator_tools)
 
     if skill_catalog:
         instructions += ["", format_skill_catalog(skill_catalog, None)]
