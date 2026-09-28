@@ -1202,6 +1202,14 @@ def _proposed_code_block_idents(answer: str) -> set[str]:
 
 _MAX_CLAIMS = 25   # subprocess per claim; keep the whole check inside a few seconds
 
+# Z18R (2026-09-28): swarm/team.py's _with_forwarded_evidence appends a member's
+# raw, unedited answer under this exact banner text (team.py's own literal, "\n\n
+# ---\n**FORWARDED FROM THE MEMBERS ..."), whenever the Coordinator's own
+# synthesized prose does not already carry it. Reused verbatim as a plain
+# substring marker here -- no new detection, no cross-repo coupling beyond this
+# one already-public string both sides already emit/expect.
+_FORWARDED_MARKER = "FORWARDED FROM THE MEMBERS"
+
 
 def _decl_site(rel_path: str, symbol: str) -> tuple[bool, int | None, str]:
     """Where `symbol` is DECLARED in `rel_path`, per the structural index.
@@ -2005,6 +2013,10 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     # (no parens) or a `def`/`async def` declaration never populates this -- there is
     # no base-class claim to check for either shape.
     decl_bases: dict[str, list[str]] = {}
+    # Z18R: first-occurrence start position per ident, used only to prioritize
+    # idents from a forwarded-member section ahead of _MAX_CLAIMS truncation --
+    # see the reorder block right after this loop. Never read for anything else.
+    ident_first_pos: dict[str, int] = {}
     for m in _BACKTICK_RE.finditer(answer):
         span = m.group(1)
         decl = _DECL_RE.match(span.strip())
@@ -2051,6 +2063,7 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                 continue
             if tok not in idents:
                 idents.append(tok)
+                ident_first_pos[tok] = m.start()
             # .groupdict().get(...), not .group(...): the JS/TS fallback regexes
             # above have no "kind"/"args" groups at all (a base-class claim is a
             # Python-only concept), and .group() on a nonexistent name raises,
@@ -2074,6 +2087,31 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             proposed_idents.append(tok)
         else:
             idents.append(tok)
+
+    # Z18R (2026-09-28): when the answer contains a forwarded-member section AND
+    # the total unique claim count would exceed _MAX_CLAIMS, prioritize idents
+    # whose FIRST occurrence is inside that section ahead of idents that already
+    # occurred earlier in the answer. Without this, a forwarded section appended
+    # AFTER a long, legitimate synthesis can have every one of its own claims
+    # silently excluded by the cap before the SYMBOLS loop ever reaches them --
+    # proven live on T4 (2026-09-26, Phase Z18R): a correct 20-claim Party +
+    # PartyRegistration synthesis exhausted the cap before a single claim from a
+    # CONTRADICTING, fabricated forwarded PartyRegistration representation was
+    # ever examined; the report read "every checked claim exists" although 6 of
+    # the fabricated section's own fields do not exist anywhere in the project.
+    # Replaying the exact incident's full final text through this function
+    # (unpatched) reproduces that clean-but-wrong verdict; with this reorder it
+    # correctly reports the 6 as NOT FOUND. A code-level position swap, not a
+    # new contradiction/entity-resolution system -- it does not compare the two
+    # representations to each other, it only ensures the later one gets a turn.
+    # Stable partition (relative order preserved within each half), so a run
+    # with no forwarded section -- the overwhelming common case -- sees
+    # byte-identical idents ordering to before this change.
+    _fwd_pos = answer.find(_FORWARDED_MARKER)
+    if _fwd_pos >= 0 and len(idents) > _MAX_CLAIMS:
+        _forwarded_first = [t for t in idents if ident_first_pos.get(t, -1) >= _fwd_pos]
+        _earlier_first = [t for t in idents if ident_first_pos.get(t, -1) < _fwd_pos]
+        idents = _forwarded_first + _earlier_first
 
     file_lines: list[tuple[str, int]] = []
     content_claims: dict[tuple[str, int], str] = {}
