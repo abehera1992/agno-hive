@@ -355,7 +355,13 @@ async def test_verified_answer_never_tells_the_model_a_doc_only_symbol_does_not_
     assert len(fake_team.prompts) == 1
     prompt = fake_team.prompts[0]
     assert "totallyMadeUpSymbolXyz" in prompt
-    assert "inventory.party_module_settings" not in prompt
+    # Z21 (2026-09-28): the prompt now quotes the model's own prior draft verbatim,
+    # which legitimately contains the DOC ONLY symbol -- that's fine, it's the
+    # model's own text being handed back, not a claim it doesn't exist. What must
+    # still never happen is the symbol being named in the IMPORTANT instructions
+    # section as something fabricated to stop mentioning.
+    instructions_section = prompt.split("IMPORTANT:", 1)[1]
+    assert "inventory.party_module_settings" not in instructions_section
 
 
 @pytest.mark.asyncio
@@ -544,3 +550,82 @@ async def test_verified_answer_disclaimer_fires_on_the_post_retry_verify_claims_
     assert out.startswith("Uses realSymbolInstead.")
     assert "was unavailable this run" in out  # but the re-check couldn't confirm the fix, so say so
     assert "NOT FOUND" not in out  # must not show the FIRST call's stale report -- that citation was already retried
+
+
+# ---- Z21 (2026-09-28): citation-correction retry prompt carries the draft ---
+# Root cause (see the comment above swarm/team.py's retry_prompt, ~line 7339):
+# the retry prompt used to be ONLY {task}\n\nIMPORTANT: {instructions}, with no
+# copy of the model's own prior answer anywhere in it. With nothing to locally
+# patch, the model had to re-derive the whole answer from scratch, which for a
+# Coordinator-level retry meant re-delegating broadly -- T3 re-chased a single
+# citation via three further delegations; T13a re-delegated to all three
+# original files plus escalated to Reviewer, for what verify_claims flagged as
+# a handful of specific citation problems in an otherwise correct answer.
+# These tests confirm the fix: the retry prompt must now quote the prior draft
+# verbatim and tell the model to patch only what was flagged, while every
+# existing bound (one retry total, _adopt_retry accept/reject, honest
+# disclosure on failure) stays exactly as tested above.
+
+@pytest.mark.asyncio
+async def test_citation_correction_retry_prompt_includes_the_prior_draft(monkeypatch):
+    canned_report = (
+        "SYMBOLS (1 checked):\n"
+        "  MISMATCH   parties_api.py:450 <-- it actually appears at line(s) 236\n\n"
+        "VERDICT: 1 claim(s) could NOT be found in the project."
+    )
+
+    async def fake_verify_claims(content, hive_mcp_url, hive_mcp_tools=None):
+        return canned_report, True, False
+
+    monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
+
+    original_result = _msgs(_tool_msg("get_file_content", "parties_api.py"))
+    content = ("The PartyRegistration docstring lives at parties_api.py:450 and "
+               "explains the registration flow in detail.")
+    retry_result = SimpleNamespace(
+        content="The PartyRegistration docstring lives at parties_api.py:236.",
+        messages=[_tool_msg("get_file_content", "parties_api.py")],
+    )
+    fake_team = _FakeTeam(retry_result)
+
+    await team._verified_answer(content, "where is the docstring", fake_team, "http://fake/mcp", result=original_result)
+
+    assert len(fake_team.prompts) == 1
+    prompt = fake_team.prompts[0]
+    # The model's own prior draft is quoted verbatim -- something to locally patch.
+    assert content in prompt
+    # And told explicitly not to treat this as a from-scratch re-derivation.
+    assert "do not re-research or re-delegate for anything that was not flagged" in prompt
+    assert "do not" in prompt and "discard or rewrite content that was not named as a problem" in prompt
+
+
+@pytest.mark.asyncio
+async def test_citation_correction_retry_existing_bounds_are_unchanged(monkeypatch):
+    """Regression guard alongside the draft-inclusion fix: still exactly one
+    retry total, _adopt_retry still governs accept/reject, and a retry that
+    comes back with LESS evidence than the draft it would replace is still
+    discarded with the original report surfaced -- unchanged by Z21."""
+    canned_report = (
+        "SYMBOLS (1 checked):\n"
+        "  NOT FOUND  totallyMadeUpSymbolXyz\n\n"
+        "VERDICT: 1 claim(s) could NOT be found in the project."
+    )
+
+    async def fake_verify_claims(content, hive_mcp_url, hive_mcp_tools=None):
+        return canned_report, True, False
+
+    monkeypatch.setattr(team, "_verify_claims", fake_verify_claims)
+
+    original_result = _msgs(_tool_msg("get_file_content", "some_file.py"))
+    content = "Uses totallyMadeUpSymbolXyz, found via a real prior read."
+    # The retry's own trace has NO read tool calls at all -- less evidence than
+    # the original, so _adopt_retry must keep the original content.
+    retry_result = SimpleNamespace(content="Uses something else instead.", messages=[])
+    fake_team = _FakeTeam(retry_result)
+
+    out = await team._verified_answer(content, "describe the symbol", fake_team, "http://fake/mcp", result=original_result)
+
+    assert len(fake_team.prompts) == 1  # exactly one retry attempted, still bounded
+    assert out.startswith(content)  # original draft kept, not the weaker retry
+    assert "CORRECTION ATTEMPT DID NOT COMPLETE" in out  # still-bad + too-short retry discarded
+    assert "NOT FOUND" in out  # original report still surfaced, not silently dropped

@@ -7336,7 +7336,28 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"Re-read the file with get_file_content and either cite where the thing "
             f"really is, or say it is not there."
         )
-    retry_prompt = f"{task}\n\nIMPORTANT: " + " Also, ".join(instructions)
+    # Z21 (2026-09-28): the model's own prior draft was never included here -- the
+    # retry only ever saw {task}\n\nIMPORTANT: {specific citation instructions}, with
+    # nothing to edit. Live-observed root cause of T3/T13a's expensive, broad repair
+    # cycles (Z20's own finding): with no draft in front of it, the model has no
+    # choice but to re-derive the whole answer, which for a Coordinator-level retry
+    # means re-delegating broadly -- T3 re-chased a citation via THREE further
+    # delegations across two files; T13a re-delegated to all three original files
+    # plus escalated to Reviewer, for what verify_claims flagged as 3-8 SPECIFIC
+    # citation problems in an otherwise correct answer. Quoting the draft verbatim
+    # and saying so explicitly gives the model something to locally patch instead of
+    # reconstruct -- the existing one-retry bound, _adopt_retry accept/reject, and
+    # recheck-before-ship below are all unchanged; this only changes what the ONE
+    # allowed retry is told to do with its turn.
+    retry_prompt = (
+        f"{task}\n\nYou already produced an answer to this task below. Verification "
+        f"found SPECIFIC problems in it, listed after IMPORTANT. Your job now is to "
+        f"correct ONLY those specific problems in the answer below -- do not "
+        f"re-research or re-delegate for anything that was not flagged, and do not "
+        f"discard or rewrite content that was not named as a problem.\n\n"
+        f"── Your previous answer ──\n{content}\n── end of your previous answer ──\n\n"
+        f"IMPORTANT: " + " Also, ".join(instructions)
+    )
     # Snapshotted so the retry's OWN reads can be measured as a delta (2026-08-21).
     # The run-scoped log is cumulative, so comparing its total would always look like
     # "the retry read something" -- the original attempt's reads are in there too.
