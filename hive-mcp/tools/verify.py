@@ -88,7 +88,12 @@ _FILE_LINE_RE = re.compile(r"([A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6}):(\d{1,6})")
 _LABELED_LINE_RE = re.compile(
     r"\blines?[\s:*]*(\d{1,6})(?:\s*[-–—]\s*(\d{1,6}))?\b", re.IGNORECASE
 )
-_BACKTICK_PATH_RE = re.compile(r"`([A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6})`")
+# Parens included (2026-09-28, Z23) -- Next.js App Router route-group directories
+# are idiomatic and real (`app/(portal)/business/...`), and a path through one was
+# invisible to this regex entirely: not a candidate for labeled-line pairing below,
+# not a hint for _resolve_path, not recognized anywhere a "path" is checked. Confirmed
+# live in the Z22 T13a run -- `.../app/(portal)/.../page.tsx` never once matched.
+_BACKTICK_PATH_RE = re.compile(r"`([A-Za-z0-9_\-./()]+\.[A-Za-z0-9]{1,6})`")
 # How far back (chars) to look for the path a labeled line number belongs to. Wide
 # enough to span a markdown table cell or a short sentence, narrow enough that it
 # won't grab an unrelated path mentioned several claims earlier.
@@ -2140,22 +2145,49 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     # each labeled line number with the nearest preceding backticked path within a
     # bounded window — see _LABELED_LINE_RE's comment for why proximity, not a fixed
     # phrasing, is the matching strategy.
+    #
+    # Clamped to the neighbouring citations and nearest-wins across BOTH directions
+    # (2026-09-28, Z23) — this loop used to prefer ANY backward path within window
+    # unconditionally, never comparing it to a closer forward one, and never stopping
+    # at a citation boundary or markdown heading the way _find_nearby_quote and
+    # _find_anchor_symbols already do. Live case, the Z22 T13a run: an answer's
+    # Database Tables section ended "...File: `.../migration.py`, Line 26-39", then a
+    # NEW "### Frontend Hooks" section correctly wrote "`useGetVouchersQuery` at line
+    # 15 in `.../page.tsx`" — fully unambiguous, path given in the same sentence. The
+    # backward-nearest search still found `migration.py` (116 chars back, inside the
+    # 200-char window) and paired "line 15" to it, since the forward fallback below
+    # only ever ran when NO backward candidate existed at all, never when a nearer
+    # forward one did. Reusing the same clamp/heading/nearest-wins machinery already
+    # proven for quote pairing closes this without touching genuine mismatch detection
+    # — a backward path is still preferred when it is genuinely the nearer or only one.
     backtick_paths = list(_BACKTICK_PATH_RE.finditer(answer))
     for m in _LABELED_LINE_RE.finditer(answer):
         line_start = m.start()
-        nearest = None
+        lo, hi = _citation_bounds(answer, line_start)
+        heading = None
+        for h in _MD_HEADING_RE.finditer(answer[lo:line_start]):
+            heading = h
+        back_lo = lo if heading is None else lo + heading.end()
+
+        back = None
         for p in backtick_paths:
             if p.start() >= line_start:
                 break  # only paths mentioned BEFORE this line-number claim count
+            if p.start() < back_lo:
+                continue  # past the previous citation/heading boundary -- not ours
             if line_start - p.end() <= _LABELED_LINE_WINDOW:
-                nearest = p
-        if nearest is None:
-            # No path BEFORE this line number -- try the adjacent one after it
-            # ("line 102 in `models.py`"). See _LABELED_LINE_FORWARD_WINDOW.
-            for p in backtick_paths:
-                if p.start() >= m.end() and p.start() - m.end() <= _LABELED_LINE_FORWARD_WINDOW:
-                    nearest = p
-                    break
+                back = p
+        fwd = None
+        for p in backtick_paths:
+            if p.start() >= m.end() and p.start() < hi and p.start() - m.end() <= _LABELED_LINE_FORWARD_WINDOW:
+                fwd = p
+                break
+        if back is not None and fwd is not None:
+            # Nearest wins (mirrors _find_nearby_quote, 2026-08-21) rather than
+            # backward always winning merely because it was checked first.
+            nearest = back if (line_start - back.end()) <= (fwd.start() - m.end()) else fwd
+        else:
+            nearest = back if back is not None else fwd
         if nearest is None:
             continue
         line_nums = [int(m.group(1))]
