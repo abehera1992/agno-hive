@@ -5055,6 +5055,119 @@ async def _reask_after_syntax_loss(content: str, task: str, team, all_results,
     return adopted, adopted_result
 
 
+_REPETITION_COMPLETION_FLAG = "_repetition_completion_attempted"
+_TRUNCATED_ANSWER_NOTE = (
+    "\n\n---\n**INCOMPLETE ANSWER — this generation was cut off in-process by the "
+    "repetition-loop guard before it reached a conclusion, and one attempt to "
+    "complete it did not produce a more grounded result than what is shown above. "
+    "What is above may stop mid-thought or omit the final conclusion.**"
+)
+
+
+async def _complete_repetition_truncated_answer(content: str, task: str, team, all_results,
+                                                 result, liveness_path: str | None):
+    """One bounded completion pass when Z16's repetition guard cut a generation off
+    before it reached a conclusion.
+
+    Z31 (2026-09-29) live-confirmed the exact failure this closes: T13b's Coordinator
+    correctly delegated all three research targets, correctly received and synthesized
+    every finding, and was mid-way through writing the frontend-hooks section -- 9,049
+    chars in -- when it started repeating itself. Z16's guard (run_task_async's own
+    inline copy, not _stream_team_run's -- see below) correctly broke the stream and
+    kept only the confirmed-non-repeat prefix, exactly as designed. But that prefix
+    stops before the gap-analysis conclusion the task asked for was ever written, and
+    nothing downstream knew this content was cut short rather than finished: the
+    up-front _verify_claims call a few lines into _verified_answer submitted the exact
+    same (truncated) text hive-mcp's own dedup cache had already seen once this run
+    (the model's own voluntary verify_claims tool call during generation, before the
+    cutoff), got back a prose "STOPPED: already checked" result with none of the
+    structured NOT FOUND/BAD lines the citation-correction guard's extractors look
+    for, and the run shipped the incomplete draft with only a generic disclaimer.
+
+    This guard runs FIRST in _verified_answer, before that up-front check, so
+    verify_claims only ever examines the COMPLETED text -- sidestepping the dedup
+    collision as a side effect of fixing completeness, rather than teaching the
+    dedup cache a truncation-aware exception (a larger, separate-deployment change
+    for the same practical outcome).
+
+    Deliberately narrow: asks the team to FINISH the existing draft from where it
+    stopped, using only what it already gathered -- not a re-run of the research, not
+    a second delegation round. Shares the SAME `_stream_team_run` retry mechanism and
+    the SAME `all_results`-based aggregate one-retry-per-call budget every other guard
+    in this function already uses, so a completion attempt consumes the run's one
+    retry exactly like any other guard would -- no new or larger retry budget.
+    `_adopt_retry`/`_more_grounded` (unmodified, reused as-is) judge the completion by
+    the SAME read-count comparison every other retry already uses; on this team shape
+    (engineering's Coordinator holds no direct read tools -- everything is delegated),
+    the original draft's own coordinator-level read count is already ~0, so a
+    completion that makes no new reads still clears that bar and is adopted.
+
+    One-shot per call via team._repetition_completion_attempted, same discipline
+    _SYNTAX_REASK_FLAG already uses -- a completion attempt that itself gets cut short
+    by repetition must never recurse into a second completion attempt. The triggering
+    team._repetition_truncated flag is cleared immediately on entry, whether or not a
+    completion actually runs, so it can never be read twice.
+
+    Deliberately reads ONLY the flag _stream_team_run's copy of the Z16 logic never
+    sets (see run_task_async's own comment where team._repetition_truncated is set) --
+    a retry-path truncation inside an EXISTING guard's own _stream_team_run call is
+    left to that guard's own _adopt_retry comparison, unchanged, rather than folded in
+    here. Z16's truncation behavior itself, and _stream_team_run's copy of it, are
+    both completely unmodified by this function.
+    """
+    if not getattr(team, "_repetition_truncated", False):
+        return content, result
+    setattr(team, "_repetition_truncated", False)
+    if getattr(team, _REPETITION_COMPLETION_FLAG, False):
+        return content, result
+    setattr(team, _REPETITION_COMPLETION_FLAG, True)
+
+    prompt = (
+        f"{task}\n\nYou already produced an answer to this task below, but generation "
+        f"was cut off before it was finished -- it stops mid-answer and never reaches "
+        f"a conclusion. Continue and FINISH this exact answer: pick up from where it "
+        f"left off and complete it, ending with the actual conclusion the task asked "
+        f"for. Do NOT start over, do NOT re-research or re-delegate, and do NOT repeat "
+        f"any part of what is already written below -- use only what you already "
+        f"found. If what is below does not already contain everything needed to "
+        f"finish it, say plainly what is missing rather than guessing.\n\n"
+        f"── Your answer so far (incomplete) ──\n{content}\n── end of what you have so far ──"
+    )
+    reads_before = _run_read_count(team)
+    print(f"[team] repetition-truncated answer ({len(content):,} chars) — attempting "
+          f"one bounded completion", flush=True)
+    try:
+        completed, retry = await _stream_team_run(
+            team, prompt, log_label="repetition-completion", liveness_path=liveness_path)
+        all_results.append(retry)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[team] repetition-truncation completion failed: {exc} — keeping the "
+              f"truncated draft", flush=True)
+        return content + _TRUNCATED_ANSWER_NOTE, result
+    if not completed or completed.strip() == "(no response)":
+        # The literal fallback _stream_team_run/run_task_async's own Z16 copy both
+        # use when a generation yields zero content -- truthy as a string, so the
+        # bare `if not completed` above cannot catch it; without this it would sail
+        # past _adopt_retry (which compares read counts, not content) and could be
+        # "adopted" as a 13-character non-answer replacing a real, if incomplete,
+        # truncated draft.
+        print("[team] repetition-truncation completion returned nothing — keeping "
+              "the truncated draft", flush=True)
+        return content + _TRUNCATED_ANSWER_NOTE, result
+
+    adopted, adopted_result = _adopt_retry(
+        "repetition-completion", content, result, completed, retry,
+        member_reads=_member_reads_delta(team, reads_before))
+    if adopted is not completed:
+        print("[team] repetition-truncation completion was not more grounded than "
+              "the truncated draft — keeping the draft, disclosed as incomplete",
+              flush=True)
+        return content + _TRUNCATED_ANSWER_NOTE, result
+    print(f"[team] repetition-truncation completion adopted ({len(completed):,} chars)",
+          flush=True)
+    return completed, adopted_result
+
+
 # ============================================================================
 # Phase R -- Coordinator evidence integrity (2026-09-14).
 #
@@ -5837,6 +5950,16 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # trace made no further successful write call. See _summarize_actual_writes'
     # docstring for the live incident this closes.
     all_results = [result]
+    # Z32 (2026-09-29): before anything else, including the syntax-loss re-ask below --
+    # if Z16's repetition guard cut this generation off before it reached a conclusion,
+    # give it ONE chance to finish before any verification runs. Must run before the
+    # up-front _verify_claims call a few lines down: that call is what collided with
+    # hive-mcp's own dedup cache on the truncated text in the live Z31 incident (the
+    # model's own voluntary verify_claims call during generation had already checked
+    # the identical, not-yet-truncated-looking string). Completing first means
+    # verify_claims only ever examines finished text.
+    content, result = await _complete_repetition_truncated_answer(
+        content, task, team, all_results, result, liveness_path)
     # Before any guard looks at the draft: if a member's report was lost to the tool-call
     # syntax leak, get it back. A guard chain reasoning about an answer written without
     # findings that ARE recoverable is measuring the wrong artefact.
@@ -20026,6 +20149,18 @@ async def run_task_async(
                 if repetition_stopped:
                     accumulated = accumulated[:last_good_len].strip() or "(no response)"
                     final_segment = accumulated
+                    # Z32 (2026-09-29): repetition_stopped was computed and then thrown
+                    # away here -- the caller had no way to know this content was cut off
+                    # mid-answer rather than completed normally. Z31 found the exact
+                    # consequence live: a correctly-synthesized T13b draft, truncated
+                    # before its conclusion, shipped incomplete because nothing downstream
+                    # ever got a chance to finish it. Stashed on `team` (same pattern as
+                    # _delegation_state/_read_state/_member_results) rather than added as
+                    # a new return value, since this function already returns a fixed
+                    # 3-tuple every caller destructures positionally -- see
+                    # _complete_repetition_truncated_answer, the one place this is read,
+                    # for the bounded one-shot completion attempt this enables.
+                    setattr(team, "_repetition_truncated", True)
                 content = _with_forwarded_evidence(_first_surviving_answer(
                     final_run_output.content if final_run_output else None,
                     final_segment,
