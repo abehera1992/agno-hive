@@ -265,3 +265,46 @@ async def test_build_team_with_no_task_leaves_the_gate_hook_a_passthrough(monkey
     )
 
     assert out.startswith("delegated:")
+
+
+# ── delegate_structured_task (Z29) ────────────────────────────────────────────────
+# Phase S replaced delegate_task_to_member with delegate_structured_task for every
+# real production delegation; this hook's own entry check (_DELEGATION_TOOL_NAMES)
+# and its singular/broadcast distinction (_SINGULAR_DELEGATION_TOOL_NAMES) both had
+# to recognize the new name, or the whole gate silently became a pass-through for
+# every real call (Z28's audit finding).
+
+@pytest.mark.asyncio
+async def test_structured_multi_part_task_first_call_to_researcher_is_not_blocked():
+    hook = _make_decompose_first_gate_hook(task=_MULTI_PART_TASK)
+
+    result = await hook(
+        "delegate_structured_task", _fake_delegate,
+        {"member_id": "Researcher", "target": "the whole task", "objective": _MULTI_PART_TASK,
+         "evidence_required": "both sides enumerated", "completion_criteria": "comparison complete"},
+    )
+
+    assert result.startswith("delegated:")
+
+
+@pytest.mark.asyncio
+async def test_structured_multi_part_task_first_call_to_a_non_researcher_member_is_blocked():
+    calls = []
+
+    async def tracking_delegate(**kwargs):
+        calls.append(kwargs)
+        return f"delegated: {kwargs}"
+
+    hook = _make_decompose_first_gate_hook(task=_MULTI_PART_TASK)
+
+    result = await hook(
+        "delegate_structured_task", tracking_delegate,
+        {"member_id": "ContextRouter", "target": "party module", "objective": "search_files for party",
+         "evidence_required": "matching files", "completion_criteria": "files found"},
+    )
+
+    assert calls == []  # the real delegation NEVER happened -- gate actually engaged
+    assert "REDIRECTED" in result
+    assert "Researcher" in result
+    assert "ContextRouter" in result
+    assert "delegate_structured_task" in result  # the redirect's own example uses the current tool

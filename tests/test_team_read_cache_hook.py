@@ -345,6 +345,61 @@ async def test_repeat_within_the_same_delegation_is_stubbed_immediately():
     assert second != "file body"  # repeat within the SAME delegation -- stubbed
 
 
+# Z29 (2026-09-28): Phase S replaced delegate_task_to_member with
+# delegate_structured_task for every real production delegation; this hook's own
+# `function_name in _DELEGATION_TOOL_NAMES` entry check and its
+# `function_name in _SINGULAR_DELEGATION_TOOL_NAMES` singular/broadcast distinction
+# both had to recognize the new name, or the generation bump silently stopped
+# happening for every real delegation (Z28's audit finding) -- confirmed here by
+# reproducing the exact T6 incident shape with the current tool.
+
+@pytest.mark.asyncio
+async def test_structured_delegation_repeat_within_the_same_delegation_is_stubbed_immediately():
+    hook = _make_read_cache_tool_hook()
+    reviewer = _FakeAgent("Reviewer")
+
+    async def fake_delegate(**kwargs):
+        return "delegated result"
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    await hook("delegate_structured_task", fake_delegate,
+               {"member_id": "reviewer", "target": "x.py", "objective": "cross-check",
+                "evidence_required": "the file content", "completion_criteria": "checked"})
+    first = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+    second = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+
+    assert first == "file body"
+    assert second != "file body"  # repeat within the SAME delegation -- stubbed
+
+
+@pytest.mark.asyncio
+async def test_structured_delegation_fresh_separate_delegation_gets_its_own_full_budget():
+    hook = _make_read_cache_tool_hook()
+    reviewer = _FakeAgent("Reviewer")
+
+    async def fake_delegate(**kwargs):
+        return "delegated result"
+
+    async def fake_get_file_content(**kwargs):
+        return "file body"
+
+    async def _delegate(objective):
+        await hook("delegate_structured_task", fake_delegate,
+                   {"member_id": "reviewer", "target": "x.py", "objective": objective,
+                    "evidence_required": "the file content", "completion_criteria": "checked"})
+
+    await _delegate("first sub-task")
+    first = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+
+    await _delegate("second sub-task")
+    second = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
+
+    assert first == "file body"
+    assert second == "file body"  # a NEW delegation instance -- fresh budget, real content again
+
+
 @pytest.mark.asyncio
 async def test_a_fresh_separate_delegation_to_the_same_member_gets_its_own_full_budget():
     """The legitimate case _MAX_FULL_SERVES_PER_AGENT's own comment describes: a

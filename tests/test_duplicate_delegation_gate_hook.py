@@ -596,3 +596,163 @@ def test_target_normalization_strips_and_lowercases():
 
 def test_none_target_normalizes_to_empty_string():
     assert _normalize_delegation_target(None) == ""
+
+
+# ── _make_duplicate_delegation_gate_hook: delegate_structured_task (Z29) ──────────
+# Phase S (2026-09-24) replaced delegate_task_to_member with delegate_structured_task
+# for every real production delegation; _DELEGATION_TOOL_NAMES was never updated, so
+# this whole gate silently stopped engaging for real calls (Z28's audit). These tests
+# cover the phase's required cases A-E against the real structured argument shape --
+# member_id/target/objective/evidence_required/completion_criteria, no "task" key.
+
+def _structured_args(member_id="researcher", target="parties.py", objective="list its endpoints",
+                      evidence_required="the endpoint list", completion_criteria="all endpoints found"):
+    return {
+        "member_id": member_id, "target": target, "objective": objective,
+        "evidence_required": evidence_required, "completion_criteria": completion_criteria,
+    }
+
+
+# Case A -- first structured delegation is allowed.
+async def test_structured_first_delegation_this_run_is_never_blocked():
+    hook = _make_duplicate_delegation_gate_hook()
+
+    result = await hook(
+        "delegate_structured_task", _fake_delegate, _structured_args(), run_context=None,
+    )
+
+    assert result.startswith("delegated:")
+
+
+# Case B -- an exact repeat (same member, same target, same objective) is blocked,
+# same "ALREADY DONE" / escalation behavior as the old tool -- exercised with a real
+# prior result on `team`, matching this gate's actual, documented behavior when no
+# stored result exists ("blocking here is exactly backwards... allowing the retry",
+# the same rule the delegate_task_to_member branch already follows).
+async def test_structured_exact_repeat_serves_the_prior_result():
+    hook = _make_duplicate_delegation_gate_hook()
+    team = SimpleNamespace(_member_results={"researcher": "PRIOR STRUCTURED RESULT"})
+    args = _structured_args()
+
+    first = await hook("delegate_structured_task", _fake_delegate, args, run_context=None, team=team)
+    second = await hook("delegate_structured_task", _fake_delegate, args, run_context=None, team=team)
+
+    assert first.startswith("delegated:")
+    assert second.startswith("ALREADY DONE")
+    assert "PRIOR STRUCTURED RESULT" in second
+
+
+async def test_structured_same_target_reworded_objective_is_still_a_duplicate():
+    """Tier 2 equivalent: same member + same target, objective worded differently --
+    still a duplicate, using the REAL target field directly rather than a manually-
+    typed <delegation_audit> tag (which delegate_structured_task never carries)."""
+    hook = _make_duplicate_delegation_gate_hook()
+    team = SimpleNamespace(_member_results={"researcher": "PRIOR RESULT"})
+
+    first = await hook(
+        "delegate_structured_task", _fake_delegate,
+        _structured_args(objective="list its endpoints"), run_context=None, team=team,
+    )
+    second = await hook(
+        "delegate_structured_task", _fake_delegate,
+        _structured_args(objective="enumerate every endpoint it exposes"),
+        run_context=None, team=team,
+    )
+
+    assert first.startswith("delegated:")
+    assert second.startswith("ALREADY DONE")
+    assert "worded differently" in second
+
+
+# Case C -- a genuinely different target, or a different member, must never be
+# classified as the same delegation.
+async def test_structured_different_target_is_not_a_duplicate():
+    hook = _make_duplicate_delegation_gate_hook()
+    team = SimpleNamespace(_member_results={"researcher": "PRIOR RESULT"})
+
+    first = await hook(
+        "delegate_structured_task", _fake_delegate,
+        _structured_args(target="parties.py"), run_context=None, team=team,
+    )
+    second = await hook(
+        "delegate_structured_task", _fake_delegate,
+        _structured_args(target="vouchers.py"), run_context=None, team=team,
+    )
+
+    assert first.startswith("delegated:")
+    assert second.startswith("delegated:")
+
+
+async def test_structured_different_member_is_not_a_duplicate():
+    hook = _make_duplicate_delegation_gate_hook()
+
+    first = await hook(
+        "delegate_structured_task", _fake_delegate,
+        _structured_args(member_id="researcher"), run_context=None,
+    )
+    second = await hook(
+        "delegate_structured_task", _fake_delegate,
+        _structured_args(member_id="reviewer"), run_context=None,
+    )
+
+    assert first.startswith("delegated:")
+    assert second.startswith("delegated:")
+
+
+# Case D -- multiple legitimate, distinct structured delegations remain possible.
+async def test_structured_multiple_distinct_delegations_all_succeed():
+    hook = _make_duplicate_delegation_gate_hook()
+
+    r1 = await hook("delegate_structured_task", _fake_delegate,
+                     _structured_args(target="parties.py", objective="list endpoints"),
+                     run_context=None)
+    r2 = await hook("delegate_structured_task", _fake_delegate,
+                     _structured_args(target="vouchers.py", objective="list endpoints"),
+                     run_context=None)
+    r3 = await hook("delegate_structured_task", _fake_delegate,
+                     _structured_args(member_id="reviewer", target="parties.py",
+                                       objective="cross-check the endpoint list"),
+                     run_context=None)
+
+    assert r1.startswith("delegated:")
+    assert r2.startswith("delegated:")
+    assert r3.startswith("delegated:")
+
+
+async def test_structured_repeat_matches_via_real_member_id_form_not_display_name():
+    """Same _member_key() normalization the old-tool tests already cover, applied
+    to delegate_structured_task's member_id field."""
+    hook = _make_duplicate_delegation_gate_hook()
+    team = SimpleNamespace(_member_results={"contextrouter": "PRIOR RESULT"})
+
+    first = await hook(
+        "delegate_structured_task", _fake_delegate,
+        _structured_args(member_id="context-router"), run_context=None, team=team,
+    )
+    second = await hook(
+        "delegate_structured_task", _fake_delegate,
+        _structured_args(member_id="ContextRouter"), run_context=None, team=team,
+    )
+
+    assert first.startswith("delegated:")
+    assert second.startswith("ALREADY DONE")
+
+
+async def test_structured_and_native_tool_names_do_not_cross_contaminate():
+    """A delegate_task_to_member call and a delegate_structured_task call to the
+    same member/target must be tracked independently -- they are logged under
+    different `tool` keys and each branch only scans its own prior entries."""
+    hook = _make_duplicate_delegation_gate_hook()
+
+    native = await hook(
+        "delegate_task_to_member", _fake_delegate,
+        {"member_id": "researcher", "task": "list its endpoints"}, run_context=None,
+    )
+    structured = await hook(
+        "delegate_structured_task", _fake_delegate,
+        _structured_args(member_id="researcher", objective="list its endpoints"),
+        run_context=None,
+    )
+
+    assert native.startswith("delegated:")
+    assert structured.startswith("delegated:")

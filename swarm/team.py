@@ -10875,7 +10875,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
 
     async def _read_cache_tool_hook(function_name, function, args, agent=None, run_context=None):
         if function_name in _DELEGATION_TOOL_NAMES:
-            if function_name == "delegate_task_to_member":
+            if function_name in _SINGULAR_DELEGATION_TOOL_NAMES:
                 # _member_key, not _member_id: this is a BUCKETING key, so two
                 # spellings of the same member must land in one bucket (see
                 # _member_key's docstring for the live 'contextrouter' case).
@@ -11455,7 +11455,29 @@ _SCOPE_EXPANSION_RE = re.compile(
     re.IGNORECASE,
 )
 
-_DELEGATION_TOOL_NAMES = {"delegate_task_to_member", "delegate_task_to_members"}
+# Z29 (2026-09-28): Phase S (2026-09-24) replaced agno's native delegate_task_to_member
+# with delegate_structured_task for every real production call -- unconditionally, no
+# team is exempt (see _StructuredDelegationTeam / _install_structured_delegation_
+# interception). This set and its "singular" companion below were never updated, so
+# every hook keyed on them (read-cache delegation-generation bump, decompose-first
+# gate, duplicate-delegation gate, delegation log/counter, and everything downstream
+# of _count_delegations -- _narrated_unreachable_tool, the multi-part zero-delegation
+# guard, and the request_clarification-before-any-delegation guard) silently stopped
+# engaging for real delegations the day Phase S shipped, while still working perfectly
+# in every test that mocks the old name directly. Confirmed dead, not merely stale, by
+# tracing each consumer (Z28's audit). delegate_task_to_member is kept in both sets
+# rather than removed: it is agno's real, still-registered native tool for any Team
+# NOT wrapped by _StructuredDelegationTeam (none exist in this codebase today, but
+# nothing here asserts that can never change), so treating it as literally impossible
+# would be an assumption these sets have no way to enforce.
+_DELEGATION_TOOL_NAMES = {
+    "delegate_task_to_member", "delegate_task_to_members", "delegate_structured_task",
+}
+# The two tool names that carry a single member_id (as opposed to delegate_task_to_
+# members, which broadcasts to the whole team with no single target) -- everywhere the
+# old code tested `function_name == "delegate_task_to_member"` to mean "this is a
+# targeted, not broadcast, delegation", it must now also match delegate_structured_task.
+_SINGULAR_DELEGATION_TOOL_NAMES = {"delegate_task_to_member", "delegate_structured_task"}
 _MAX_LOGGED_TASK_CHARS = 300
 _MAX_DELEGATION_LOG_ENTRIES = 200
 
@@ -11731,7 +11753,7 @@ def _make_decompose_first_gate_hook(task: str | None, researcher_member_id: str 
             return await function(**args)
         state["decided"] = True
 
-        if function_name != "delegate_task_to_member":
+        if function_name not in _SINGULAR_DELEGATION_TOOL_NAMES:
             return await function(**args)
 
         member_id = _member_id(str((args or {}).get("member_id", "")).strip())
@@ -11744,9 +11766,10 @@ def _make_decompose_first_gate_hook(task: str | None, researcher_member_id: str 
             f"than one discrete, independently-checkable claim — and must be "
             f"delegated to {researcher_member_id} WHOLE first, not piecemeal to {target!r}. "
             f"{researcher_member_id} now also decomposes tasks internally (its own "
-            f"DECOMPOSE-FIRST rule): call delegate_task_to_member({target_id!r}, "
-            f"<the full original task, unabridged>) instead. This delegation to "
-            f"{target!r} was NOT executed."
+            f"DECOMPOSE-FIRST rule): call delegate_structured_task(member_id={target_id!r}, "
+            f"target=<the shared target>, objective=<the full original task, unabridged>, "
+            f"evidence_required=<what would answer it>, completion_criteria=<when to stop>) "
+            f"instead. This delegation to {target!r} was NOT executed."
         )
 
     return _decompose_first_gate_hook
@@ -12690,8 +12713,21 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                     issued_job_ids.add(match.group(1))
             return result
 
-        raw_task = (args or {}).get("task")
-        task_text = _normalize_delegation_task(raw_task)
+        # delegate_structured_task carries no "task" string -- its payload is the
+        # separate target/objective/evidence_required/completion_criteria fields
+        # (Z29, 2026-09-28). raw_task stays meaningful ONLY for the two agno-native
+        # tool names below; for the structured tool, task_text is derived from
+        # target+objective purely to preserve this shared "nothing to check yet on
+        # a blank call" gate -- the actual duplicate-detection tiers for
+        # delegate_structured_task (below) compare target/objective directly, not
+        # this derived text.
+        if function_name == "delegate_structured_task":
+            raw_task = None
+            task_text = _normalize_delegation_task(
+                f"{(args or {}).get('target', '')} {(args or {}).get('objective', '')}")
+        else:
+            raw_task = (args or {}).get("task")
+            task_text = _normalize_delegation_task(raw_task)
         if not task_text:
             return await function(**args)
 
@@ -12722,12 +12758,12 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
         # delegations, 54 identical refusals, run killed after 13 minutes."
         target_key = (
             _member_key(str((args or {}).get("member_id", "")).strip())
-            if function_name == "delegate_task_to_member" else "__broadcast__"
+            if function_name in _SINGULAR_DELEGATION_TOOL_NAMES else "__broadcast__"
         )
         executed = sum(
             1 for entry in log
             if (_member_key(str((entry.get("args") or {}).get("member_id", "")).strip())
-                if entry.get("tool") == "delegate_task_to_member" else "__broadcast__")
+                if entry.get("tool") in _SINGULAR_DELEGATION_TOOL_NAMES else "__broadcast__")
             == target_key
         )
         who = ("the whole team" if target_key == "__broadcast__"
@@ -12957,6 +12993,86 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                         print(f"[team] duplicate delegation (reworded) to {member_id!r} "
                               f"but no usable prior result — allowing the retry", flush=True)
                         break
+        elif function_name == "delegate_structured_task":
+            # Z29 (2026-09-28): the structured tool has no free-form task string to
+            # parse a <delegation_audit> tag out of -- it already carries `target`
+            # and `objective` as real, separate, directly-provided fields, supplied
+            # on every call (delegate_structured_task's own entrypoint rejects a
+            # call missing either). That makes the OLD tag-parsing machinery
+            # (_parse_delegation_audit/_derive_delegation_audit) unnecessary for
+            # this tool, not merely inapplicable -- there is nothing left to
+            # extract that isn't already sitting in `args` verbatim.
+            #
+            # Preserves the two-tier INTENT of the delegate_task_to_member branch
+            # above: an exact repeat (same target AND same objective, reworded or
+            # not) and a same-target-different-wording repeat are both treated as
+            # duplicates and share the same `repeats` counter and 3-strike
+            # escalation -- "a coordinator alternating between the two forms is
+            # asking the same question twice and must not get two budgets" applies
+            # here exactly as it did before. Comparing `target` directly (rather
+            # than a target parsed from a manually-typed tag the model could
+            # forget or mis-type) is strictly more reliable than the mechanism it
+            # replaces, not a redesign of what counts as a duplicate.
+            #
+            # NOT ported in this phase (Z29 is a targeted migration repair, not a
+            # feature-parity rewrite): the Phase-I corrective-read-evidence
+            # exception and the target-existence pre-check both remain scoped to
+            # delegate_task_to_member only. Flagged in the Z29 report as a
+            # deliberate, documented gap for a future phase.
+            member_id = _member_key(str((args or {}).get("member_id", "")).strip())
+            target_norm = _normalize_delegation_task((args or {}).get("target"))
+            objective_norm = _normalize_delegation_task((args or {}).get("objective"))
+            prior_entries = [
+                entry for entry in log
+                if entry.get("tool") == "delegate_structured_task"
+                and _member_key(str((entry.get("args") or {}).get("member_id", "")).strip()) == member_id
+            ]
+            for entry in prior_entries:
+                prior_args = entry.get("args") or {}
+                prior_target = _normalize_delegation_task(prior_args.get("target"))
+                if prior_target != target_norm:
+                    continue
+                prior_objective = _normalize_delegation_task(prior_args.get("objective"))
+                same_wording = prior_objective == objective_norm
+                repeats[member_id] = repeats.get(member_id, 0) + 1
+                n = repeats[member_id]
+                prior = (getattr(team, "_member_results", None) or {}).get(member_id)
+                print(f"[team] duplicate delegation ({'exact' if same_wording else 'reworded'}) "
+                      f"to {member_id!r} for {(args or {}).get('target')!r} (#{n}) — "
+                      f"{'serving prior result' if prior else 'no prior result captured'}",
+                      flush=True)
+                if n >= 3:
+                    _force_text_only(None, team=team)
+                    return (
+                        f"STOP: you have now asked {member_id!r} for this same target "
+                        f"({(args or {}).get('target')!r}) {n} times. No further "
+                        f"delegation for THAT target will run."
+                        + _move_on_hint(log, team)
+                        + (f"\n\nThe result, once more:\n{prior}" if prior else "")
+                    )
+                if prior:
+                    tail = ("" if n == 1 else
+                            "\n\nThis is the last time this will be served — use it "
+                            "and answer; asking again will not run anything.")
+                    return (
+                        f"ALREADY DONE — {member_id!r} was already asked about "
+                        f"{(args or {}).get('target')!r} earlier this run"
+                        + ("" if same_wording else ", worded differently,")
+                        + f" and returned:\n\n{prior}\n\n"
+                        f"Use this. Do not delegate it again." + tail
+                        + _move_on_hint(log, team)
+                    )
+                print(f"[team] duplicate delegation ({'exact' if same_wording else 'reworded'}) "
+                      f"to {member_id!r} but no usable prior result — allowing the retry",
+                      flush=True)
+                break
+            # A real {target, objective} tuple, not parsed from any tag -- both fields
+            # are already sitting in `args` verbatim. Read by the final logging step
+            # below, guarded there so this is never overwritten by the tag-parsing path.
+            _logged_audit = {
+                "target": (args or {}).get("target"),
+                "objective": (args or {}).get("objective"),
+            }
         else:
             prior_entries = [entry for entry in log if entry.get("tool") == "delegate_task_to_members"]
             for entry in prior_entries:
@@ -13098,16 +13214,22 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
         _carry_prior_findings(function_name, args, run_context, team)
 
         result = await function(**args)
-        _logged_audit = _parse_delegation_audit(raw_task)
-        if _logged_audit is None and function_name == "delegate_task_to_member":
-            # An untagged delegation is recorded with the audit derived from its text so a
-            # later re-delegation of the same target and action still matches it. Only a
-            # real derivation is stored; the hash fallback would just pollute
-            # _covered_targets with an opaque target. The first delegation is unchanged --
-            # nothing is added to its task, and nothing is checked against it.
-            _derived, _from_text = _derive_delegation_audit(raw_task)
-            if _from_text:
-                _logged_audit = _derived
+        if function_name == "delegate_structured_task":
+            # Already set above, in the delegate_structured_task tier -- a real
+            # {target, objective} dict, not parsed from any tag (there is none to
+            # parse; raw_task is None for this tool, see the task_text gate above).
+            pass
+        else:
+            _logged_audit = _parse_delegation_audit(raw_task)
+            if _logged_audit is None and function_name == "delegate_task_to_member":
+                # An untagged delegation is recorded with the audit derived from its text so a
+                # later re-delegation of the same target and action still matches it. Only a
+                # real derivation is stored; the hash fallback would just pollute
+                # _covered_targets with an opaque target. The first delegation is unchanged --
+                # nothing is added to its task, and nothing is checked against it.
+                _derived, _from_text = _derive_delegation_audit(raw_task)
+                if _from_text:
+                    _logged_audit = _derived
         log.append({
             "tool": function_name,
             "args": dict(args or {}),

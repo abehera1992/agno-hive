@@ -80,6 +80,49 @@ def test_delegation_hook_still_returns_the_real_tool_result():
     assert out == "member finished the subtask"
 
 
+# Z29 (2026-09-28): Phase S replaced delegate_task_to_member with
+# delegate_structured_task for every real production delegation; this closure-local
+# counter's own `function_name not in _DELEGATION_TOOL_NAMES` entry check had to
+# recognize the new name, or _count_delegations(team) always read 0 for a real run
+# regardless of how many delegations actually happened -- confirmed by Z28's audit to
+# feed _narrated_unreachable_tool, the multi-part zero-delegation guard, and the
+# request_clarification-before-any-delegation guard, all silently miscalibrated by it.
+
+def test_delegation_hook_counts_real_structured_delegations_in_its_closure():
+    hook = _make_delegation_log_hook()
+    state = hook.state
+    assert state["count"] == 0
+
+    _run(hook("delegate_structured_task", _noop_tool,
+              {"member_id": "researcher", "target": "x.py", "objective": "go look",
+               "evidence_required": "what it found", "completion_criteria": "done"}))
+    assert state["count"] == 1
+
+    _run(hook("delegate_structured_task", _noop_tool,
+              {"member_id": "reviewer", "target": "x.py", "objective": "cross-check",
+               "evidence_required": "confirmation", "completion_criteria": "checked"}))
+    assert state["count"] == 2
+
+
+def test_count_delegations_reflects_real_structured_delegation_count_end_to_end():
+    """Case E: wires the real hook to a real team-shaped object, exactly as
+    _build_team does (`team._delegation_state = hook.state`), and confirms
+    _count_delegations reads back the true count -- not always zero."""
+    hook = _make_delegation_log_hook()
+    team = SimpleNamespace(_delegation_state=hook.state)
+    assert _count_delegations(team) == 0
+
+    _run(hook("delegate_structured_task", _noop_tool,
+              {"member_id": "researcher", "target": "x.py", "objective": "go look",
+               "evidence_required": "what it found", "completion_criteria": "done"}))
+    assert _count_delegations(team) == 1
+
+    _run(hook("delegate_structured_task", _noop_tool,
+              {"member_id": "reviewer", "target": "y.py", "objective": "cross-check",
+               "evidence_required": "confirmation", "completion_criteria": "checked"}))
+    assert _count_delegations(team) == 2
+
+
 def test_count_delegations_reads_the_state_off_the_team():
     team = SimpleNamespace(_delegation_state={"count": 3})
     assert _count_delegations(team) == 3
