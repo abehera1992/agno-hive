@@ -13812,16 +13812,42 @@ def _make_tool_interception_hook(
             # delegate function returns before the member runs, so the hook's timing says
             # nothing -- but its RETURN VALUE distinguishes "agno refused the target" (a plain
             # error string) from "the run was handed back to be iterated" (a generator).
-            if function_name.startswith("delegate_task_to_member"):
+            #
+            # Z30 (2026-09-29): `.startswith("delegate_task_to_member")` was a deliberate
+            # single-condition match for BOTH agno-native tool names at once -- singular
+            # "delegate_task_to_member" and plural broadcast "delegate_task_to_members"
+            # (the plural literally has the singular as a prefix) -- but Phase S's
+            # delegate_structured_task shares no such prefix, so this telemetry silently
+            # stopped counting any real production delegation the day Phase S shipped.
+            # Live-confirmed during Z29's own validation: 2 real delegate_structured_task
+            # calls executed, phase0's final summary reported "delegations": 0. Switched to
+            # _DELEGATION_TOOL_NAMES (Z29's own canonical set) rather than reinventing the
+            # membership check -- it already means exactly "singular or plural, current or
+            # legacy", the same thing `.startswith()` was approximating.
+            if function_name in _DELEGATION_TOOL_NAMES:
                 _preview = result if isinstance(result, str) else ""
                 print(f"[team] delegate result: {type(result).__name__} "
                       f"{_preview[:200]!r}", flush=True)
                 _p0 = getattr(team, "_phase0", None)
                 if _p0 is not None:
+                    # delegate_structured_task carries target/objective as real, separate
+                    # fields -- no "task" key exists to read, and none of the legacy
+                    # tag-parsing (_raw_audit_target) has anything to parse. Use the real
+                    # fields directly, the same choice Z29 made for the duplicate-
+                    # delegation gate: `target` needs no derivation ("audit" source is
+                    # exactly right, it IS an authoritative, directly-provided target),
+                    # and `objective` is the closest analog to the old free-form task text
+                    # for length/preview purposes.
+                    if function_name == "delegate_structured_task":
+                        _task_text = str((args or {}).get("objective") or "")
+                        _audit_target = str((args or {}).get("target") or "")
+                    else:
+                        _task_text = str((args or {}).get("task") or "")
+                        _audit_target = _raw_audit_target((args or {}).get("task"))
                     _p0.record_delegation(
                         member=_member_key((args or {}).get("member_id", "")),
-                        task_text=str((args or {}).get("task") or ""),
-                        audit_target=_raw_audit_target((args or {}).get("task")),
+                        task_text=_task_text,
+                        audit_target=_audit_target,
                         result_kind=type(result).__name__,
                         result_preview=_preview,
                         duration_ms=int(elapsed * 1000),
