@@ -35,8 +35,8 @@
 | `index_project(project_id, lightrag_url, ...)` | Semantic bootstrap into LightRAG |
 | `web_search(query, max_results)` | DuckDuckGo search (requires `WEB_SEARCH_ENABLED=true`) |
 | `web_fetch(url, max_chars)` | Fetch a URL — GitHub repos return README + metadata via API (requires `WEB_SEARCH_ENABLED=true`) |
-| `db_schema(table)` | List `schema.table` or describe a table's columns (requires `HIVE_DB_URL`) |
-| `db_query(sql)` | Run one read-only `SELECT`/`WITH`/`EXPLAIN` — verify DB-backed facts against the live table, capped rows (requires `HIVE_DB_URL`) |
+| `db_schema(table)` | List `schema.table` or describe a table's columns (requires `DB_CONN_URL`) |
+| `db_query(sql)` | Run one read-only `SELECT`/`WITH`/`EXPLAIN` — verify DB-backed facts against the live table, capped rows (requires `DB_CONN_URL`) |
 
 ## Project MCP (supplementary — app-specific tools only)
 

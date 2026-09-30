@@ -21,6 +21,11 @@
 # External integrations (optional — leave unset to disable):
 #   NOTION_API_KEY                Notion integration token (notion.so/my-integrations)
 #   GOOGLE_SERVICE_ACCOUNT_JSON   Path to Google service account JSON file
+#   DB_CONN_URL                   Read-only DSN for db_query/db_schema grounding tools
+#                                 (e.g. postgresql://hive_ro:<pw>@host.docker.internal:5433/<db>).
+#                                 Generic — set it in .env to point at any project's DB; a
+#                                 different target is a one-line .env swap, no rebuild.
+#   DB_MAX_ROWS / DB_TIMEOUT_MS   db_query row cap / statement timeout (default: 1000 / 5000ms)
 #
 # Two-project setup (EkamApp + agno-hive):
 #   Run with --profile agno to also start hive-mcp-agno on port 9004.
@@ -58,7 +63,12 @@ services:
       - GOOGLE_SERVICE_ACCOUNT_JSON=${GOOGLE_SERVICE_ACCOUNT_JSON:-}
       # Read-only SQL grounding (db_schema/db_query) — set to a read-only role DSN to enable.
       # On Docker Desktop the host DB is reachable at host.docker.internal:<published-port>.
-      - HIVE_DB_URL=${HIVE_DB_URL:-}
+      # Generic name (not project-specific) — the value itself lives in .env, so pointing
+      # this at a different DB (different project, different environment) is a one-line
+      # .env edit, no compose-file change and no image rebuild.
+      - DB_CONN_URL=${DB_CONN_URL:-}
+      - DB_MAX_ROWS=${DB_MAX_ROWS:-1000}
+      - DB_TIMEOUT_MS=${DB_TIMEOUT_MS:-5000}
       - HIVE_BASH_TOOL_ENABLED=${HIVE_BASH_TOOL_ENABLED:-true}
 
   # ── agno-hive instance — points at the agno-hive repo itself ─────────────────

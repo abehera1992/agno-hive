@@ -86,7 +86,7 @@ if config.MIGRATIONS_ENABLED:
     from tools.integrations.migrations import run_migration
     _INTEGRATION_TOOLS += [run_migration]
 
-if config.HIVE_DB_URL:
+if config.DB_CONN_URL:
     from tools.integrations.db import db_query, db_schema
     _INTEGRATION_TOOLS += [db_query, db_schema]
 

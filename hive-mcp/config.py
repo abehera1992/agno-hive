@@ -56,14 +56,22 @@ WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "false").lower() == "true"
 NOTION_API_KEY             = os.getenv("NOTION_API_KEY", "")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")  # path to JSON file
 
-# ── Read-only SQL (optional — activate by setting HIVE_DB_URL) ──────────────────
+# ── Read-only SQL (optional — activate by setting DB_CONN_URL) ──────────────────
 # Generic read-only DB grounding: db_schema() + db_query() let hive VERIFY facts against
 # the live database instead of grepping files. Point at a READ-ONLY role's DSN, e.g.
 # postgresql://hive_ro:<pw>@host.docker.internal:5433/ekamApp — the tool holds no schema
 # knowledge; the access boundary is the role's grants. Tools register only when this is set.
-HIVE_DB_URL        = os.getenv("HIVE_DB_URL", "")
-HIVE_DB_MAX_ROWS   = int(os.getenv("HIVE_DB_MAX_ROWS", "1000"))
-HIVE_DB_TIMEOUT_MS = int(os.getenv("HIVE_DB_TIMEOUT_MS", "5000"))
+#
+# Deliberately named DB_CONN_URL, not project-specific (was HIVE_DB_URL until
+# 2026-09-29) — this is a generic read-only-SQL tool with no built-in opinion about
+# which project or database it points at. The value itself lives in .env (see
+# .env.example), NOT here or in docker-compose.hive.yml's committed defaults, so
+# swapping to a different DB (a different project, a different environment, a
+# throwaway local Postgres) is a one-line edit to .env — no code change, no image
+# rebuild, no compose-file edit.
+DB_CONN_URL   = os.getenv("DB_CONN_URL", "")
+DB_MAX_ROWS   = int(os.getenv("DB_MAX_ROWS", "1000"))
+DB_TIMEOUT_MS = int(os.getenv("DB_TIMEOUT_MS", "5000"))
 
 # ── Persistent bash sessions + background jobs (bash_* tools) ───────────────────
 # Session-scoped cwd persistence + background execution over plain subprocess

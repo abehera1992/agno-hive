@@ -7,9 +7,10 @@ truth only in the table — seed/migration/code text can be stale or incomplete.
   db_schema(table=None) — list schemas/tables, or describe one table's columns
   db_query(sql)         — run a single read-only SELECT / WITH / EXPLAIN and return rows
 
-Generic: registered only when HIVE_DB_URL is set (a DSN for a read-only DB role). The
+Generic: registered only when DB_CONN_URL is set (a DSN for a read-only DB role). The
 tool holds NO project/schema knowledge — the access boundary is the DB role's grants,
-not this code. Point it at any project's DB by changing HIVE_DB_URL.
+not this code. Point it at any project's DB by changing DB_CONN_URL in .env — no code
+change, no image rebuild.
 
 Safety (defense in depth):
   - connect as a read-only role (recommended: member of pg_read_all_data with
@@ -17,7 +18,7 @@ Safety (defense in depth):
   - the psycopg connection is forced read_only; a per-call statement_timeout is set
   - single-statement allowlist (SELECT / WITH / EXPLAIN / TABLE / VALUES / SHOW),
     no ';' chaining of multiple statements
-  - result rows capped at HIVE_DB_MAX_ROWS
+  - result rows capped at DB_MAX_ROWS
 """
 import re
 import sys
@@ -87,10 +88,10 @@ def _connect():
     """Open a forced-read-only connection. Returns (conn, None) or (None, error_str)."""
     if psycopg is None:
         return None, "psycopg not installed in the hive-mcp image"
-    if not config.HIVE_DB_URL:
-        return None, "HIVE_DB_URL not configured"
+    if not config.DB_CONN_URL:
+        return None, "DB_CONN_URL not configured"
     try:
-        conn = psycopg.connect(config.HIVE_DB_URL, connect_timeout=10, autocommit=False)
+        conn = psycopg.connect(config.DB_CONN_URL, connect_timeout=10, autocommit=False)
         conn.read_only = True  # SET SESSION CHARACTERISTICS ... READ ONLY (before any txn)
         return conn, None
     except Exception as e:
@@ -118,7 +119,7 @@ def db_query(sql: str) -> str:
 
     Only a single read query is allowed: SELECT / WITH … SELECT / EXPLAIN / TABLE / VALUES
     / SHOW. Writes and DDL are rejected here AND blocked by the database role. Results are
-    capped at HIVE_DB_MAX_ROWS rows. Call db_schema first to confirm exact table/column
+    capped at DB_MAX_ROWS rows. Call db_schema first to confirm exact table/column
     names — do not guess them from code.
 
     Args:
@@ -136,10 +137,10 @@ def db_query(sql: str) -> str:
         return _err(cerr)
     try:
         with conn.cursor() as cur:
-            cur.execute(f"SET statement_timeout = {int(config.HIVE_DB_TIMEOUT_MS)}")
+            cur.execute(f"SET statement_timeout = {int(config.DB_TIMEOUT_MS)}")
             cur.execute(s)
             cols = [d.name for d in cur.description] if cur.description else []
-            cap = int(config.HIVE_DB_MAX_ROWS)
+            cap = int(config.DB_MAX_ROWS)
             rows = cur.fetchmany(cap + 1) if cols else []
             truncated = len(rows) > cap
             return _render(cols, rows[:cap], truncated)
@@ -170,7 +171,7 @@ def db_schema(table: str | None = None) -> str:
         return _err(cerr)
     try:
         with conn.cursor() as cur:
-            cur.execute(f"SET statement_timeout = {int(config.HIVE_DB_TIMEOUT_MS)}")
+            cur.execute(f"SET statement_timeout = {int(config.DB_TIMEOUT_MS)}")
             if not table:
                 cur.execute(
                     "SELECT table_schema, table_name FROM information_schema.tables "
