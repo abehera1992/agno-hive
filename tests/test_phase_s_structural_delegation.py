@@ -45,6 +45,7 @@ is stubbed; everything downstream of that (isinstance routing, validation,
 canonical task construction, hashing, pass-through) is the real Phase S/S.2
 code.
 """
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -52,10 +53,13 @@ import pytest
 import swarm.team as team_mod
 from swarm.team import (
     _STRUCTURED_DELEGATION_REQUIRED_FIELDS, _StructuredDelegationTeam,
-    _build_canonical_researcher_task, _build_team,
+    _build_canonical_researcher_task, _build_team, _member_id,
 )
 
 import agno.team._default_tools as agno_default_tools
+from agno.tools.function import Function as AgnoFunction
+
+from api.models import AgentSpec
 
 
 class _FakeFunction:
@@ -167,13 +171,20 @@ def test_production_call_shape_schema_has_five_required_fields_no_task_param():
     team = _structured_team()
     new_function, _ = _call_production_path(team)
     param_names = set(new_function.parameters.get("properties", {}).keys())
+    # Phase Z21 (2026-09-30) added one further OPTIONAL field, required_capabilities
+    # -- see test_z21_required_capability_enforcement.py for its own coverage. The
+    # five original fields remain the only REQUIRED ones (checked below); this
+    # assertion only needed widening to admit the new optional property, not to
+    # change what "required" means.
     assert param_names == {
         "member_id", "target", "objective", "evidence_required", "completion_criteria",
+        "required_capabilities",
     }
     assert "task" not in param_names
     required = set(new_function.parameters.get("required", []))
     for field in ("member_id",) + _STRUCTURED_DELEGATION_REQUIRED_FIELDS:
         assert field in required, f"{field!r} must be a required parameter"
+    assert "required_capabilities" not in required  # optional -- Z21's whole point
 
 
 # ── Test 7 (spec Section 7): ordinary/non-structured Team is unaffected ──
@@ -346,3 +357,128 @@ def test_canonical_task_builder_never_emits_pseudo_tool_syntax():
     task = _build_canonical_researcher_task("a.py", "find X", "quote", "done")
     for forbidden in ("<function_call>", "[TOOL_CALLS]", "<tool_call>"):
         assert forbidden not in task
+
+
+# ── Phase Z19 (2026-09-30): capability-visibility unit proof ─────────────────
+# Z18 (forensic, no code change) found that _patched_agno_get_delegate_task_function
+# (team.py:14283-14295) already receives the real `team` object at the exact point
+# it decides whether to build delegate_structured_task -- the same object whose
+# .members[i].tools the "[team] member surface" log line (team.py:14466-14468)
+# already reads to print what each member can actually call. Z19 proves that claim
+# executably: a real team, built by the real _build_team/make_agent_from_spec path,
+# with two real AgentSpecs whose tool grants deliberately differ, run through the
+# exact same production call shape _call_production_path already exercises above,
+# then read via team.members directly -- the same resolver (_member_id) and the
+# same accessor (getattr(m, 'tools', [])) that log line already trusts. No roster
+# text is rendered or parsed anywhere in these tests.
+#
+# What's real: AgentSpec construction, make_agent_from_spec's tools-scoping logic,
+# real agno Agent construction, _build_team, and the production delegation-
+# construction call shape (agno.team._default_tools._get_delegate_task_function,
+# patched to _patched_agno_get_delegate_task_function exactly as production has it
+# installed). What's mocked: ONE fake MCP object standing in for a live MCP
+# connection, so its .functions dict can be populated without a real server --
+# same substitution _structured_team()'s mcp_list=[] already makes elsewhere in
+# this file, just non-empty here so tool scoping has something real to select from.
+#
+# Deliberately does NOT modify delegate_structured_task's own body or thread `team`
+# into it -- Z18 established production doesn't do that today, so there is nothing
+# to call there. This proves only that the information is reachable at the
+# boundary, not that production currently acts on it.
+
+def _z19_fake_tool(name: str) -> AgnoFunction:
+    """A real agno Function object, built the exact same way
+    _build_structured_delegation_tool builds delegate_structured_task itself
+    (team.py:14221-14222, Function.from_callable) -- not a duck-typed stand-in."""
+    def _entrypoint():
+        return None
+    return AgnoFunction.from_callable(_entrypoint, name=name)
+
+
+def _z19_fake_mcp(tool_names):
+    """The one mocked piece: stands in for a live MCPTools connection. Only
+    .functions (a name -> Function dict) is read by make_agent_from_spec
+    (swarm/agents.py:331-336), so that's all this needs to provide."""
+    return SimpleNamespace(functions={n: _z19_fake_tool(n) for n in tool_names})
+
+
+def _z19_team():
+    """A real _StructuredDelegationTeam, via the real _build_team, with two real
+    members whose tool grants deliberately differ: Researcher-equivalent owns
+    db_query/db_schema, Executor-equivalent does not -- mirroring team_role_tools'
+    actual production grant (Z15/Z18) without touching the DB at all."""
+    fake_mcp = _z19_fake_mcp([
+        "db_query", "db_schema", "get_file_content", "search_files",
+        "get_env_info", "run_command", "check_port",
+    ])
+    agent_specs = [
+        AgentSpec(
+            name="Researcher", role="Codebase investigator", model="qwen2.5-coder:32b",
+            instructions=["Investigate the codebase."],
+            tools=["db_query", "db_schema", "get_file_content", "search_files"],
+        ),
+        AgentSpec(
+            name="Executor", role="Command runner", model="qwen2.5-coder:32b",
+            instructions=["Run commands."],
+            tools=["get_env_info", "run_command", "check_port"],
+        ),
+    ]
+    return _build_team(
+        agent_specs=agent_specs, coordinator_model="qwen2.5-coder:32b",
+        coordinator_tools=None, mode="coordinate", mcp_list=[fake_mcp], instructions=[],
+    )
+
+
+def _z19_member_tool_names(team, display_name: str) -> set[str]:
+    """member_id -> real member object -> real .tools -> tool names. Uses
+    _member_id (team.py:11770, the SAME resolver the "member surface" log line
+    uses via _agno_member_id) and getattr(m, 'tools', []) (the SAME accessor
+    that line uses) -- no roster text is read or parsed anywhere here."""
+    target_id = _member_id(display_name)
+    for member in team.members:
+        if _member_id(getattr(member, "name", "")) == target_id:
+            return {getattr(t, "name", type(t).__name__)
+                    for t in (getattr(member, "tools", []) or [])}
+    raise AssertionError(f"no member resolved for {display_name!r} (id {target_id!r})")
+
+
+def test_z19_production_call_shape_receives_the_real_team_with_real_members():
+    """Groundwork for Assertions A/E: the exact production call shape (same as
+    every _call_production_path use above) is exercised with a REAL team
+    carrying two real, distinctly-provisioned members."""
+    team = _z19_team()
+    new_function, calls = _call_production_path(team)
+    assert new_function.name == "delegate_structured_task"  # boundary reached
+    assert calls == []
+    assert len(team.members) == 2  # both real AgentSpecs became real members
+
+
+def test_z19_researcher_resolves_and_has_db_query():
+    """Assertions A + B + C: member_id='researcher' resolves to the real member
+    object, its actual .tools is readable, and db_query/db_schema are present --
+    read from the object, not the rendered roster."""
+    team = _z19_team()
+    tool_names = _z19_member_tool_names(team, "Researcher")
+    assert "db_query" in tool_names
+    assert "db_schema" in tool_names
+
+
+def test_z19_executor_resolves_and_lacks_db_query():
+    """Assertions A + B + D: member_id='executor' resolves, its .tools is
+    readable, and db_query/db_schema are verifiably absent."""
+    team = _z19_team()
+    tool_names = _z19_member_tool_names(team, "Executor")
+    assert "db_query" not in tool_names
+    assert "db_schema" not in tool_names
+    assert "run_command" in tool_names  # sanity: real surface, not an empty list
+
+
+def test_z19_capability_distinction_comes_from_the_object_not_the_roster_text():
+    """Assertion E, explicit: never calls _team_roster_preamble or reads any
+    prompt/instruction text. The distinction below comes entirely from
+    team.members[i].tools."""
+    team = _z19_team()
+    researcher_tools = _z19_member_tool_names(team, "Researcher")
+    executor_tools = _z19_member_tool_names(team, "Executor")
+    assert researcher_tools != executor_tools
+    assert ("db_query" in researcher_tools) and ("db_query" not in executor_tools)

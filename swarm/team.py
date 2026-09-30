@@ -3693,6 +3693,35 @@ _DB_TASK_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Phase Z16 (2026-09-30) -- T8 delegation-target forensics (Phase Z15) found this
+# guard's retry only ever named the missing TOOL CALL ("call db_query now"), never
+# the reason it was missing: the member the Coordinator delegated to did not own
+# db_query/db_schema in the first place. Live evidence (run 32b1fc9e2f42): the
+# Coordinator delegated to Executor (no DB tools), got "I am unable to proceed...",
+# and on THIS guard's retry delegated to Executor again -- reproducing the exact
+# same incapable target -- which the (unmodified, out of scope for Z16) duplicate-
+# delegation gate then served the cached failed result for, so no second attempt
+# ever actually ran. The roster already tells the Coordinator which member owns
+# which tool and says to route by it; this guard's retry simply never pointed back
+# at that fact. Deliberately generic -- names db_query/db_schema (this guard's own
+# scope) and "the team roster", never a specific member id -- the routing decision
+# stays entirely the Coordinator's own, made from the same capability information
+# it already has. Extracted to a named constant (previously an inline f-string at
+# the call site) purely so this exact text is unit-testable without driving the
+# full _verified_answer guard chain; no other behavior changed.
+_DB_EVIDENCE_RETRY_INSTRUCTION = (
+    "IMPORTANT: a previous attempt answered this without calling db_query or "
+    "db_schema, even though the task explicitly requires a live-database check. "
+    "The member delegated to for that attempt did not have db_query/db_schema in "
+    "its own tool list, so it could not have succeeded no matter how it was asked "
+    "-- this is a capability mismatch, not a wording problem. Before delegating "
+    "again, check the team roster above for the member whose tools include "
+    "db_query/db_schema, and delegate this task to THAT member -- do not delegate "
+    "it to the same member as before. Call db_query/db_schema now and base your "
+    "answer on their actual output — do not answer from a file grep or a guess "
+    "about what the schema contains."
+)
+
 
 # Tools that actually ENUMERATE a directory, as opposed to reading one thing out of it.
 # find_files counts: a glob genuinely lists what matches, which is a real enumeration.
@@ -6471,11 +6500,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         try:
             retried, retry = await _stream_team_run(
                 team,
-                f"{task}\n\n" + _checkpoint_block(team) +
-                f"IMPORTANT: a previous attempt answered this without calling db_query or "
-                f"db_schema, even though the task explicitly requires a live-database check. "
-                f"Call db_query/db_schema now and base your answer on their actual output — "
-                f"do not answer from a file grep or a guess about what the schema contains.",
+                f"{task}\n\n" + _checkpoint_block(team) + _DB_EVIDENCE_RETRY_INSTRUCTION,
                 liveness_path=liveness_path,
             )
             all_results.append(retry)
@@ -14119,15 +14144,49 @@ def _build_canonical_researcher_task(
     )
 
 
-def _build_structured_delegation_tool(original_function):
+def _member_capability_tools(team, member_id: str) -> set[str] | None:
+    """Phase Z21 (2026-09-30) -- real tool names the RESOLVED member actually has,
+    for delegate_structured_task's optional `required_capabilities` check. Same
+    resolver (`_member_id`) and same accessor (`getattr(m, 'tools', [])`) already
+    proven in Z19/Z20's local proofs and already used, unchanged, by the
+    "[team] member surface" log line (~line 14466) -- no second lookup mechanism,
+    no roster-text parsing, no DB/registry query.
+
+    Returns None only when the member cannot be resolved at all (`team` is None,
+    or no member matches `member_id`) -- the caller treats that as "cannot verify"
+    and rejects, rather than silently skipping the check, which would defeat its
+    entire purpose.
+    """
+    if team is None:
+        return None
+    target = _member_id(member_id or "")
+    for member in getattr(team, "members", None) or []:
+        if _member_id(getattr(member, "name", "") or "") == target:
+            return {getattr(t, "name", type(t).__name__)
+                    for t in (getattr(member, "tools", []) or [])}
+    return None
+
+
+def _build_structured_delegation_tool(original_function, team=None):
     """Wraps agno's real `delegate_task_to_member` Function (already built by agno's
     own `_get_delegate_task_function`) into `delegate_structured_task(member_id,
-    target, objective, evidence_required, completion_criteria)` -- reusing the REAL
-    underlying delegation engine (session storage, member execution, results storage,
-    forward_member_answer compatibility -- all of agno's own `adelegate_task_to_member`/
+    target, objective, evidence_required, completion_criteria,
+    required_capabilities)` -- reusing the REAL underlying delegation engine
+    (session storage, member execution, results storage, forward_member_answer
+    compatibility -- all of agno's own `adelegate_task_to_member`/
     `_setup_delegate_task_to_member`/`_process_delegate_task_to_member` machinery)
     completely unchanged by calling straight through to `original_function.entrypoint`
     with a synthesized `task` string.
+
+    `team` (Phase Z21, 2026-09-30, default None for any caller that predates this
+    field) is the real team object `_patched_agno_get_delegate_task_function`
+    already receives as its own first argument -- Z18 traced this as already
+    reachable without a new registry; Z19 proved `team.members[i].tools` is the
+    canonical, already-logged capability source; Z20 proved a local
+    `required_capabilities: list[str]` (not a singular string -- see `_DB_TOOLS`,
+    which already treats `db_query`/`db_schema` as jointly-sufficient evidence)
+    can be validated deterministically against it, independent of delegation
+    wording. This wires that proof into the real contract.
     """
     from agno.tools.function import Function
 
@@ -14139,6 +14198,7 @@ def _build_structured_delegation_tool(original_function):
         objective: str,
         evidence_required: str,
         completion_criteria: str,
+        required_capabilities: list[str] | None = None,
     ):
         """Delegate ONE bounded research objective to a team member.
 
@@ -14154,6 +14214,12 @@ def _build_structured_delegation_tool(original_function):
                 a line number, a list of matches -- not a vague "find out about X".
             completion_criteria: the condition under which the member should
                 stop investigating and report back.
+            required_capabilities: optional -- names of tools where the selected
+                member must actually have AT LEAST ONE (not all) of them, e.g.
+                ["db_query", "db_schema"] for a live-database task. Omit for an
+                ordinary delegation; this is validated against the member's real
+                tool list before any work begins, and does not change behavior
+                at all when left unset.
         """
         fields = {
             "target": target, "objective": objective,
@@ -14175,6 +14241,27 @@ def _build_structured_delegation_tool(original_function):
                 f"content -- retry the call with all five fields provided."
             )
             return
+
+        # Phase Z21 -- optional, additive: `required_capabilities` absent/empty
+        # leaves every existing call byte-for-byte unaffected (see _member_
+        # capability_tools's own docstring for why an unresolvable member still
+        # rejects rather than silently passing through).
+        if required_capabilities:
+            available = _member_capability_tools(team, member_id)
+            if available is None or not (set(required_capabilities) & available):
+                print(f"[team] delegate_structured_task REJECTED: capability "
+                      f"mismatch member_id={member_id!r} "
+                      f"required_capabilities={required_capabilities!r} "
+                      f"available={sorted(available) if available is not None else None!r}",
+                      flush=True)
+                yield (
+                    f"DELEGATION REJECTED: member {member_id!r} does not satisfy "
+                    f"the required capabilities {required_capabilities!r}. "
+                    + (f"Its actual tools are: {sorted(available)!r}."
+                       if available is not None else
+                       f"The member could not be resolved to verify its tools.")
+                )
+                return
 
         canonical_task = _build_canonical_researcher_task(
             target=target, objective=objective,
@@ -14266,7 +14353,7 @@ def _patched_agno_get_delegate_task_function(team, *args, **kwargs):
     """
     original_function = _ORIGINAL_AGNO_GET_DELEGATE_TASK_FUNCTION(team, *args, **kwargs)
     if isinstance(team, _StructuredDelegationTeam):
-        return _build_structured_delegation_tool(original_function)
+        return _build_structured_delegation_tool(original_function, team)
     return original_function
 
 

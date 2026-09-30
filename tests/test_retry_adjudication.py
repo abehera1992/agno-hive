@@ -24,6 +24,7 @@ silently accepting it.
 from types import SimpleNamespace
 
 from swarm.team import (
+    _DB_EVIDENCE_RETRY_INSTRUCTION,
     _DB_TASK_RE,
     _DB_TOOLS,
     _adopt_retry,
@@ -169,3 +170,41 @@ def test_db_task_regex_ignores_ordinary_code_questions():
         "What does the Item model look like?",
     ):
         assert not _DB_TASK_RE.search(task), task
+
+
+# ── _DB_EVIDENCE_RETRY_INSTRUCTION (Phase Z16, 2026-09-30) ───────────────────────
+# Phase Z15 found this guard's retry named only the missing tool call ("call
+# db_query now"), never the reason it was missing (the delegated-to member never
+# owned db_query/db_schema) -- live run 32b1fc9e2f42 delegated to Executor twice
+# in a row, including on this guard's own retry. These assertions are the
+# "targeted code-level validation" step of Z16: they check the corrected text
+# carries the required semantics without driving the full _verified_answer guard
+# chain (mocking that chain end-to-end is a separate, broader undertaking than
+# this phase's single controlled change calls for).
+
+def test_db_evidence_retry_names_the_capability_mismatch_not_just_the_missing_call():
+    text = _DB_EVIDENCE_RETRY_INSTRUCTION.lower()
+    assert "did not have db_query" in text or "did not have db_query/db_schema" in text
+    assert "capability mismatch" in text
+
+
+def test_db_evidence_retry_points_back_at_the_roster_generically():
+    text = _DB_EVIDENCE_RETRY_INSTRUCTION.lower()
+    assert "roster" in text
+    assert "delegate this task to that member" in text
+    # Generic: names the tools this guard already owns, never a specific member.
+    assert "researcher" not in text
+    assert "executor" not in text
+
+
+def test_db_evidence_retry_explicitly_forbids_repeating_the_same_member():
+    text = _DB_EVIDENCE_RETRY_INSTRUCTION.lower()
+    assert "do not delegate it to the same member as before" in text
+
+
+def test_db_evidence_retry_still_instructs_calling_the_db_tools():
+    """The Z16 change is additive -- the original instruction to actually call
+    db_query/db_schema and answer from their real output must survive unchanged."""
+    text = _DB_EVIDENCE_RETRY_INSTRUCTION.lower()
+    assert "call db_query/db_schema now" in text
+    assert "do not answer from a file grep or a guess" in text
