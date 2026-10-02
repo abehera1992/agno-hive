@@ -5331,13 +5331,24 @@ def _make_member_control_box_hook(role: str | None = None):
         # be permanently frozen at None for a member's own tools, unlike
         # agent._team itself, read fresh here.
         print(f"[team] CONTROL_BOX_DIAG: who={who!r} function_name={function_name!r} "
-              f"team_kwarg_is_none={team is None} agent_is_none={agent is None} "
-              f"agent_team_attr={getattr(agent, '_team', 'NO_ATTR')!r}", flush=True)
-        before = _control_box_state_fingerprint(team) if team is not None else (0, 0, 0, 0)
+              f"team_kwarg_is_none={team is None} agent_is_none={agent is None}",
+              flush=True)
+        try:
+            before = _control_box_state_fingerprint(team) if team is not None else (0, 0, 0, 0)
+        except Exception:
+            import traceback
+            print(f"[team] CONTROL_BOX_DIAG_EXCEPTION (before-fingerprint):\n"
+                  f"{traceback.format_exc()}", flush=True)
+            before = (0, 0, 0, 0)
         result = await function(**args)
         if team is not None:
-            after = _control_box_state_fingerprint(team)
-            _record_member_action(team, who, function_name, args, before, after)
+            try:
+                after = _control_box_state_fingerprint(team)
+                _record_member_action(team, who, function_name, args, before, after)
+            except Exception:
+                import traceback
+                print(f"[team] CONTROL_BOX_DIAG_EXCEPTION (record-action):\n"
+                      f"{traceback.format_exc()}", flush=True)
         return result
     return _control_box_hook
 
