@@ -453,6 +453,136 @@ def test_e_no_actionable_comparison_does_not_fabricate_a_discrepancy(monkeypatch
     assert content == "All endpoints have a corresponding hook. There are no missing items."
 
 
+# ── Phase 3 (2026-10-02): deterministic path independent of the shared ─────
+# generative retry budget. Root cause of live Trial 3 (second-pass POC,
+# 4f1fb91): the `len(all_results) > 1` check used to sit ABOVE summary/
+# existence_contradicted/claims and above the deterministic synthesis
+# attempt -- so it blocked BOTH "permission to spend the shared LLM retry"
+# and "permission to process already-complete, zero-LLM evidence" behind
+# one guard, even though compare_enumerations had already produced a
+# complete, actionable result in that trial. The check now sits only in
+# front of the generative fallback (_stream_team_run) -- these tests
+# construct the exact budget-exhausted state (`all_results` already length
+# 2, i.e. a prior guard already spent the one retry) and assert the
+# deterministic path still fires.
+
+
+def test_budget_phase3_a_retry_available_and_actionable_comparison(monkeypatch):
+    """Test A: the ordinary case -- retry budget untouched (all_results has
+    only its initial entry), full comparison evidence, model made a
+    (false) completeness claim. Deterministic path fires, no model call."""
+    async def fake_stream(*a, **k):
+        raise AssertionError("deterministic path must not call the model")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    all_results = [None]
+    content, result, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+        "No gaps exist.", "Audit the vouchers module...", _Team(),
+        all_results, None, None, T13B_FULL_GAP_CMP_NOTE, False))
+    assert reconciled is True
+    assert len(all_results) == 1, "deterministic path must not append a retry"
+    assert "POST /vouchers/stock-transfer" in content
+
+
+def test_budget_phase3_b_retry_exhausted_actionable_comparison_still_fires(monkeypatch):
+    """Test B -- THE CRITICAL TEST (Trial 3's exact shape): the shared
+    retry budget is ALREADY exhausted (all_results already has 2 entries --
+    an earlier guard, e.g. _complete_repetition_truncated_answer, already
+    spent the one retry this call allows) AND a complete, actionable
+    comparison already exists. The deterministic path must still fire:
+    permission to process already-computed evidence must not depend on
+    permission to make another LLM call."""
+    async def fake_stream(*a, **k):
+        raise AssertionError(
+            "must not call the model -- the retry budget is already spent, "
+            "and the deterministic path does not need it anyway")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    all_results_before = [None, SimpleNamespace(messages=[])]  # budget spent
+    retry_count_before = len(all_results_before)
+    content, result, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+        "There is no apparent gap between the backend endpoints and "
+        "frontend hooks for the vouchers module.",
+        "Audit the vouchers module...", _Team(), all_results_before, None,
+        None, T13B_FULL_GAP_CMP_NOTE, False))
+    assert reconciled is True
+    assert "POST /vouchers/grn/{po_id}" in content
+    assert "POST /vouchers/credit-note/{invoice_id}" in content
+    assert "POST /vouchers/stock-adjustment" in content
+    assert "POST /vouchers/stock-transfer" in content
+    # Retry count preservation (Phase 2.2): the deterministic path must not
+    # itself consume or grow the shared budget.
+    assert len(all_results_before) == retry_count_before == 2
+
+
+def test_budget_phase3_c_repetition_recovery_then_actionable_comparison(monkeypatch):
+    """Test C: the full live shape -- a truncated draft (the real text
+    repetition-decay produces mid-cutoff) arrives alongside an already-
+    exhausted budget (simulating _complete_repetition_truncated_answer
+    having already run and appended its own attempt) and a complete
+    comparison. The correct deterministic result must survive."""
+    truncated_mid_sentence = (
+        "Here is the completed audit of the vouchers module:\n\n"
+        "### Endpoints (from `API/inventory-service/router/vouchers_api.py`)\n\n"
+        "1. **GET** `/vouchers`\n   - Lists vouchers wi"
+    )
+
+    async def fake_stream(*a, **k):
+        raise AssertionError("must not call the model when budget is exhausted")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    budget_exhausted_results = [None, SimpleNamespace(messages=[])]
+    content, result, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+        truncated_mid_sentence, "Audit the vouchers module...", _Team(),
+        budget_exhausted_results, None, None, T13B_FULL_GAP_CMP_NOTE, False))
+    assert reconciled is True
+    assert "POST /vouchers/stock-transfer" in content
+
+
+def test_budget_phase3_d_no_comparison_evidence_unchanged_with_budget_exhausted(monkeypatch):
+    """Test D: no comparison ran at all (cmp_note == "") -- existing no-op
+    behavior must be unchanged regardless of budget state."""
+    async def fake_stream(*a, **k):
+        raise AssertionError("must not retry when no comparison ran")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    budget_exhausted_results = [None, SimpleNamespace(messages=[])]
+    content, result, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+        "No gaps exist.", "task text", _Team(), budget_exhausted_results,
+        None, None, "", False))
+    assert reconciled is False
+    assert content == "No gaps exist."
+
+
+def test_budget_phase3_e_deterministic_template_never_echoes_fabricated_content(monkeypatch):
+    """Test E: even when the model's own draft contains fabricated-looking
+    symbol names, the deterministic template is built ENTIRELY from
+    compare_enumerations' own parsed output (_synthesize_comparison_answer
+    takes only `cmp_note`, never `content`) -- it cannot certify or echo
+    anything the model invented, fabricated or not."""
+    fabricated_draft = (
+        "The vouchers API exposes get_vouchers, update_voucher, "
+        "delete_voucher, get_voucher_by_id, and uses a voucher_redemptions "
+        "table. All endpoints have frontend counterparts."
+    )
+
+    async def fake_stream(*a, **k):
+        raise AssertionError("must not call the model")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    all_results = [None]
+    content, result, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+        fabricated_draft, "Audit the vouchers module...", _Team(),
+        all_results, None, None, T13B_FULL_GAP_CMP_NOTE, False))
+    assert reconciled is True
+    # None of the model's fabricated names appear -- the template is built
+    # solely from the tool's own real output.
+    for fabricated in ("get_vouchers", "update_voucher", "delete_voucher",
+                       "get_voucher_by_id", "voucher_redemptions"):
+        assert fabricated not in content
+    assert "POST /vouchers/stock-transfer" in content
+
+
 def test_retry_exception_keeps_the_draft(monkeypatch):
     async def fake_stream(*a, **k):
         raise RuntimeError("connection dropped")

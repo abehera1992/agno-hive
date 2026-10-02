@@ -4879,13 +4879,23 @@ async def _reconcile_completeness_claim_with_comparison(
     """
     if synthesis_run or not cmp_note or getattr(team, _COMPARISON_RECONCILE_FLAG, False):
         return content, result, False
-    if len(all_results) > 1:
-        # Aggregate one-retry-per-call budget (see _verified_answer's own
-        # docstring) already spent by an earlier guard this call -- e.g. the
-        # syntax-loss reask above. The contradiction still rides along as a
-        # footnote via _tail(), exactly as before this change, rather than
-        # spending a second full pipeline re-run.
-        return content, result, False
+    # T13b POC, third pass (2026-10-02): the aggregate one-retry-per-call
+    # budget check (see _verified_answer's own docstring) used to sit HERE,
+    # above summary/existence_contradicted/claims and above the deterministic
+    # synthesis attempt below -- meaning it blocked BOTH resources behind one
+    # guard: permission to spend the shared LLM retry, AND permission to
+    # process already-complete, zero-LLM deterministic evidence that doesn't
+    # touch that budget at all. Live-confirmed as Trial 3's exact root cause
+    # (second-pass POC, 4f1fb91): _complete_repetition_truncated_answer had
+    # already appended to `all_results` before this function ran, so this
+    # check returned early with len(all_results) == 2 -- before `summary` was
+    # even computed -- even though compare_enumerations had already produced
+    # a complete, actionable, already-correct result (confirmed present in
+    # that trial's own footnote). The budget check now moves to guard ONLY
+    # the generative fallback path below (immediately before its own
+    # _stream_team_run call) -- the one branch that actually spends the
+    # shared resource. Deterministic synthesis makes no model call, so it is
+    # no longer gated by permission to make one.
     summary = _comparison_summary(cmp_note)
     # Phase J-C: three separate questions, not one gap number (see this
     # section's own module comment for the full contract) --
@@ -4982,6 +4992,18 @@ async def _reconcile_completeness_claim_with_comparison(
         # no deterministic template is available either. Normal handling:
         # content ships as-is, nothing persisted (not "unverifiable" --
         # that would imply an assertion existed when none did).
+        return content, result, False
+
+    if len(all_results) > 1:
+        # Aggregate one-retry-per-call budget (see _verified_answer's own
+        # docstring) already spent by an earlier guard this call -- e.g. the
+        # syntax-loss reask above. Relocated here (2026-10-02, third pass) so
+        # it gates ONLY this generative fallback -- the deterministic
+        # synthesis attempt above already had its chance regardless of this
+        # budget, and only reaches this point at all when it was not
+        # synthesis-eligible. The contradiction still rides along as a
+        # footnote via _tail(), exactly as before this change, rather than
+        # spending a second full pipeline re-run.
         return content, result, False
 
     setattr(team, _COMPARISON_RECONCILE_FLAG, True)
