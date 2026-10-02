@@ -5096,6 +5096,240 @@ def _create_comparison_claim(team, evidence: "ComparisonEvidence") -> Claim:
     return claim
 
 
+# ── Member Control Box foundation (Phase B, 2026-10-02) ─────────────────────
+#
+# JEV-like control-box consolidation, Phase A->B: an explicit, run-scoped,
+# per-delegation record of objective -> action -> result -> progress, for
+# ONE concrete, evidenced gap Phase A's inventory found -- member-level tool
+# calls have no progress/repetition observer at all today (only the
+# coordinator's own _looks_like_repetition_loop does, and only over its own
+# generated TEXT, never over a member's tool-call stream). This is exactly
+# the gap run 6331f33a146f fell through: 58 identical update_session_state
+# calls, each one genuinely executing, none of them recognized anywhere as
+# "no new progress occurred."
+#
+# Phase B is explicitly additive-only, matching the phase's own "no behavior
+# change" contract: this box OBSERVES and RECORDS every member tool call and
+# computes whether it represented real progress, but nothing here blocks,
+# retries, terminates, or alters a tool's result. No existing control path
+# (duplicate-delegation gate, tool-budget guard, repetition detector,
+# _verified_answer's retry budget, EvidenceLedger/Claim) is touched, replaced,
+# or bypassed. Phase C (a later, separate phase) is where a real decision
+# would be allowed to read this box's state and act on it.
+#
+# "Progress" is deliberately NOT "another tool call happened" (Section 6's
+# own explicit warning, and the literal defect in run 6331f33a146f, where
+# the call COUNT climbed to 58 while nothing else changed at all). It is
+# instead: either (a) a genuinely different action (different tool, or the
+# same tool with different arguments) than the member's own immediately
+# prior action, or (b) for a REPEATED identical action, whether any of the
+# run's own already-existing, already-authoritative state counters grew as
+# a result -- EvidenceLedger size, ClaimStore size, team._read_state size,
+# team._member_results size. Reading existing counters rather than keeping
+# a second copy of their content is deliberate (Section 4's "avoid storing
+# duplicate representations of state that already exists").
+#
+# Keyed by (member_id, delegation_key) -- delegation_key reuses
+# delegate_structured_task's own canonical_hash (already computed,
+# deterministic, unique per distinct objective/target/evidence/
+# completion_criteria combination) rather than inventing a second id scheme,
+# the same "reuse what already exists" discipline the EvidenceLedger/Claim
+# phases followed for evidence_id/claim_id.
+@dataclass
+class MemberAction:
+    """One observed tool call. Mutable container, NOT frozen -- unlike
+    ComparisonEvidence/Claim, this is overwritten turn by turn (see
+    MemberControlState.current_action/previous_action), the same mutability
+    class team._read_state already uses for run-scoped scratch state."""
+    tool_name: str
+    args_fingerprint: str
+    at: float
+
+
+@dataclass
+class MemberControlState:
+    """Run-scoped, per-delegation control record. objective/evidence_required/
+    completion_criteria are copied verbatim from the SAME validated
+    delegate_structured_task arguments the canonical task text is already
+    built from -- never from an arbitrary model-chosen session-state key
+    (Section 7's explicit instruction: do not invent semantics for something
+    like a model-generated `task_completed` field). completion_status stays
+    the literal string "unevaluated" in this phase -- Phase B's job is to
+    make objective/evidence_required/completion_criteria visible in one
+    place and to correctly detect no-progress, not to adjudicate free-text
+    completion criteria, which is a later phase's job."""
+    member_id: str
+    delegation_key: str
+    objective: str
+    evidence_required: str
+    completion_criteria: str
+    previous_action: MemberAction | None = None
+    current_action: MemberAction | None = None
+    total_actions: int = 0
+    no_progress_streak: int = 0
+    max_no_progress_streak: int = 0
+    completion_status: str = "unevaluated"
+
+
+class _MemberControlBox:
+    """Minimum viable store -- same lifetime discipline as _EvidenceLedger/
+    _ClaimStore: one instance per run, owned by `team`
+    (team._member_control_box), never a module-level global, never
+    persisted, garbage-collected with the run."""
+
+    def __init__(self) -> None:
+        self._states: dict[str, MemberControlState] = {}
+
+    @staticmethod
+    def _key(member_id: str, delegation_key: str) -> str:
+        return f"{member_id}:{delegation_key}"
+
+    def start(self, state: MemberControlState) -> None:
+        self._states[self._key(state.member_id, state.delegation_key)] = state
+
+    def get(self, member_id: str, delegation_key: str) -> MemberControlState | None:
+        return self._states.get(self._key(member_id, delegation_key))
+
+    def latest_for_member(self, member_id: str) -> MemberControlState | None:
+        """Most recently started delegation for this member -- used by the
+        tool-call observer hook, which sees tool calls, not delegation_keys,
+        so it cannot address a specific delegation directly. Correct as long
+        as a member has one active delegation at a time, which matches the
+        existing sequential `seq` numbering phase0 telemetry already assumes
+        (see swarm/phase0.py's own delegation-seq counter)."""
+        for state in reversed(list(self._states.values())):
+            if state.member_id == member_id:
+                return state
+        return None
+
+    def list(self) -> "list[MemberControlState]":
+        return list(self._states.values())
+
+
+def _get_member_control_box(team) -> "_MemberControlBox":
+    box = getattr(team, "_member_control_box", None)
+    if box is None:
+        box = _MemberControlBox()
+        setattr(team, "_member_control_box", box)
+    return box
+
+
+def _control_box_state_fingerprint(team) -> tuple[int, int, int, int]:
+    """Cheap, comparable snapshot of the run's own EXISTING authoritative
+    counters -- never a copy of their content, only their sizes. Reads with
+    getattr/None-default rather than the lazy _get_evidence_ledger/
+    _get_claim_store accessors deliberately: this runs on EVERY member tool
+    call across the whole team, and must never itself create an evidence
+    ledger or claim store for a member (Coder/Reviewer/Executor) that has
+    no reason to ever have one."""
+    ledger = getattr(team, "_evidence_ledger", None)
+    claims = getattr(team, "_claim_store", None)
+    read_state = getattr(team, "_read_state", None)
+    member_results = getattr(team, "_member_results", None)
+    return (
+        len(ledger.list()) if ledger is not None else 0,
+        len(claims.list()) if claims is not None else 0,
+        len(read_state) if read_state is not None else 0,
+        len(member_results) if member_results is not None else 0,
+    )
+
+
+def _fingerprint_args(args: dict) -> str:
+    """Stable, deterministic string identity for a tool call's own arguments
+    -- used only to decide whether two calls are "the same action", never
+    stored as or compared against evidence. Falls back to repr() for the
+    rare non-JSON-serializable argument shape; this is purely observational
+    and must never raise into a real tool call."""
+    try:
+        return json.dumps(args, sort_keys=True, default=str)
+    except Exception:
+        return repr(args)
+
+
+def _start_member_objective(
+        team, member_id: str, delegation_key: str, objective: str,
+        evidence_required: str, completion_criteria: str) -> None:
+    """Called once per delegation, from delegate_structured_task immediately
+    after its own field validation passes -- the SAME point canonical_hash
+    (reused here as delegation_key) is already computed. Additive only: does
+    not change delegate_structured_task's own return value or control flow."""
+    state = MemberControlState(
+        member_id=member_id, delegation_key=delegation_key,
+        objective=objective, evidence_required=evidence_required,
+        completion_criteria=completion_criteria,
+    )
+    _get_member_control_box(team).start(state)
+    print(f"[team] CONTROL_BOX_OBJECTIVE_STARTED: member_id={member_id!r} "
+          f"delegation_key={delegation_key} objective={objective!r}", flush=True)
+
+
+def _record_member_action(
+        team, member_id: str, tool_name: str, args: dict,
+        before_fp: tuple, after_fp: tuple) -> None:
+    """Called from the control-box tool-call observer hook for EVERY member
+    tool call that actually executed. Finds the member's latest started
+    delegation (a no-op, logged once, if none was ever started -- e.g. a
+    call made outside delegate_structured_task's own flow) and records
+    whether this call represented progress.
+
+    Progress rule (Section 6): a call with different arguments (or a
+    different tool) than the member's own immediately prior action is
+    automatically progress -- a genuinely different action, never blocked
+    merely for being a repeat of the TOOL NAME. Only an EXACT repeat (same
+    tool, same arguments) falls through to the state-fingerprint check:
+    progress only if the run's own existing counters (evidence/claims/reads/
+    member results) actually grew. A repeated LEGITIMATE poll whose target
+    state keeps changing therefore still counts as progress, every time --
+    nothing here ever makes repetition itself illegal (Section 6's own
+    "must remain legal").
+    """
+    state = _get_member_control_box(team).latest_for_member(member_id)
+    if state is None:
+        return
+    fp = _fingerprint_args(args)
+    action = MemberAction(tool_name=tool_name, args_fingerprint=fp, at=time.monotonic())
+    prev = state.current_action
+    is_repeat = (prev is not None and prev.tool_name == tool_name
+                 and prev.args_fingerprint == fp)
+    progress = (not is_repeat) or (after_fp != before_fp)
+    state.previous_action = prev
+    state.current_action = action
+    state.total_actions += 1
+    if progress:
+        state.no_progress_streak = 0
+    else:
+        state.no_progress_streak += 1
+        state.max_no_progress_streak = max(
+            state.max_no_progress_streak, state.no_progress_streak)
+    print(f"[team] CONTROL_BOX_ACTION_RECORDED: member_id={member_id!r} "
+          f"tool={tool_name!r} repeat={is_repeat} progress={progress} "
+          f"no_progress_streak={state.no_progress_streak} "
+          f"total_actions={state.total_actions}", flush=True)
+
+
+def _make_member_control_box_hook(role: str | None = None):
+    """Tool-hook factory, same convention as _make_tool_budget_guard_hook
+    (team.py:10935) -- bound to one role at construction, appended to that
+    role's own tool_hooks list. Purely observational: calls through to
+    `function` unconditionally and returns its result completely unchanged
+    -- this hook can never block, stub, retry, or alter a tool call, only
+    watch it. Appended AFTER the budget guard in _hooks_for so it only
+    observes calls that the budget guard itself counted as genuinely
+    executed (same ordering reasoning the budget guard's own comment gives
+    for going last among the EXISTING hooks).
+    """
+    async def _control_box_hook(function_name, function, args, agent=None,
+                                 team=None, run_context=None):
+        who = role or getattr(agent, "name", None) or "Coordinator"
+        before = _control_box_state_fingerprint(team) if team is not None else (0, 0, 0, 0)
+        result = await function(**args)
+        if team is not None:
+            after = _control_box_state_fingerprint(team)
+            _record_member_action(team, who, function_name, args, before, after)
+        return result
+    return _control_box_hook
+
+
 def _synthesize_comparison_answer(cmp_note: str) -> str | None:
     """K4: the whole answer built as PURE STRING TEMPLATING from
     `_comparison_summary`'s counts and `_comparison_entries`' exact per-item
@@ -14757,6 +14991,16 @@ def _build_structured_delegation_tool(original_function, team=None):
               f"completion_criteria={completion_criteria!r} "
               f"canonical_task_hash={canonical_hash} "
               f"canonical_task_length={len(canonical_task)}", flush=True)
+        # Control Box Phase B: record the objective BEFORE the member ever
+        # runs, keyed by the same canonical_hash this call already computed
+        # -- no second id scheme, reusing the existing deterministic
+        # fingerprint of (target, objective, evidence_required,
+        # completion_criteria). Additive only: does not change this
+        # function's own return value or control flow.
+        if team is not None:
+            _start_member_objective(
+                team, member_id, canonical_hash, objective,
+                evidence_required, completion_criteria)
 
         async for item in original_entrypoint(member_id=member_id, task=canonical_task):
             yield item
@@ -15005,7 +15249,13 @@ def _build_team(
         only because make_agent_from_spec now hands each agent its own Function copies;
         with shared Functions, `tool_hooks` is one shared slot and the last writer won.
         """
-        return tool_hooks + [_make_tool_budget_guard_hook(team_name, activity, role=role)]
+        return tool_hooks + [
+            _make_tool_budget_guard_hook(team_name, activity, role=role),
+            # Control Box Phase B: purely observational, appended after the
+            # budget guard so it only sees calls already counted as genuinely
+            # executed. Never blocks, stubs, or alters a result.
+            _make_member_control_box_hook(role=role),
+        ]
 
     if agent_specs:
         members = [
