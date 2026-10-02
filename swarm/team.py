@@ -4984,10 +4984,10 @@ class _ClaimStore:
     def get(self, claim_id: str) -> Claim | None:
         return self._records.get(claim_id)
 
-    def list(self) -> list[Claim]:
+    def list(self) -> "list[Claim]":
         return [self._records[i] for i in self._order]
 
-    def list_for_evidence(self, evidence_id: str) -> list[Claim]:
+    def list_for_evidence(self, evidence_id: str) -> "list[Claim]":
         return [c for c in self.list() if evidence_id in c.evidence_ids]
 
 
