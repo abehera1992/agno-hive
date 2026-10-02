@@ -302,3 +302,63 @@ def test_control_box_state_fingerprint_reads_existing_counters_only():
     assert fp == (0, 0, 0, 0)
     assert not hasattr(team, "_evidence_ledger")
     assert not hasattr(team, "_claim_store")
+
+
+# ── Phase B.1 regression: display-cased vs. delegation-cased member_id ─────
+#
+# Live root cause (2026-10-02): delegate_structured_task's own member_id
+# argument arrives lowercase ("researcher" -- the Coordinator's own tool-call
+# argument, confirmed verbatim in the production journal), while the
+# tool-call observer hook's own `who` resolves from agent.name/role, which
+# is display-cased ("Researcher"). Before the fix, _start_member_objective
+# stored the MemberControlState under the lowercase key while the hook
+# looked it up under the capitalized one -- latest_for_member() never
+# matched, and _record_member_action's own `if state is None: return` fired
+# silently on EVERY member tool call, in every live trial, with no
+# exception and no telemetry. These tests reproduce that exact mismatch
+# directly (bypassing the hook, which now normalizes `who` itself via
+# _member_id()) to prove the stores/lookups are consistent regardless of
+# which casing a caller uses on either side.
+
+
+def test_phase_b1_regression_display_cased_lookup_matches_lowercase_start():
+    """The exact live mismatch: _start_member_objective is called with the
+    Coordinator's own lowercase delegation argument, but the lookup (as the
+    fixed hook now does internally via _member_id()) uses the display-cased
+    agent name. Both must resolve to the SAME stored state."""
+    team = _Team()
+    _start_member_objective(
+        team, "researcher", "delegation-key-1", "find gaps",
+        "a list of gaps", "all gaps identified")
+    # Simulates what the FIXED hook does: normalize the display name before
+    # looking up, exactly as _member_id("Researcher") would.
+    normalized_who = team_mod._member_id("Researcher")
+    assert normalized_who == "researcher"
+    state = _get_member_control_box(team).get("researcher", "delegation-key-1")
+    assert state is not None
+    assert _get_member_control_box(team).latest_for_member(normalized_who) is state
+
+
+def test_phase_b1_regression_action_recorded_fires_with_display_cased_role(capsys):
+    """End-to-end through the real hook: role bound at hook-construction
+    time is display-cased ("Researcher", matching agent.name/spec.name in
+    production), while the delegation was started with the Coordinator's
+    own lowercase argument ("researcher") -- CONTROL_BOX_ACTION_RECORDED
+    must fire, proving the hook's internal _member_id() normalization
+    closes the exact live gap."""
+    team = _Team()
+    _start_member_objective(
+        team, "researcher", "delegation-key-1", "find gaps",
+        "a list of gaps", "all gaps identified")
+    hook = _make_member_control_box_hook(role="Researcher")  # display-cased, like agent.name
+
+    async def real_tool(**kwargs):
+        return "real result"
+
+    result = _run(hook("get_file_content", real_tool, {"relative_path": "a.py"},
+                        agent=None, team=team, run_context=None))
+    assert result == "real result"
+    out = capsys.readouterr().out
+    assert "CONTROL_BOX_ACTION_RECORDED" in out
+    state = _get_member_control_box(team).get("researcher", "delegation-key-1")
+    assert state.total_actions == 1

@@ -5252,7 +5252,24 @@ def _start_member_objective(
     """Called once per delegation, from delegate_structured_task immediately
     after its own field validation passes -- the SAME point canonical_hash
     (reused here as delegation_key) is already computed. Additive only: does
-    not change delegate_structured_task's own return value or control flow."""
+    not change delegate_structured_task's own return value or control flow.
+
+    Phase B.1 fix (2026-10-02): member_id is normalized through the existing
+    _member_id() helper (team.py, "the real, canonical value a
+    delegate_task_to_member(member_id=...) call must use") -- the SAME
+    reconciliation _member_capability_tools already applies for the
+    identical mismatch. Proven root cause: delegate_structured_task's own
+    member_id argument arrives lowercase (e.g. 'researcher', the
+    Coordinator's own tool-call argument), while the tool-call observer
+    hook's `who` resolves from agent.name/role (e.g. 'Researcher',
+    capitalized) -- an exact, un-normalized dict-key comparison between the
+    two never matched, so _record_member_action's own early return
+    (`if state is None: return`) fired silently on every call, with no
+    exception and no telemetry, for every member tool call in every live
+    trial. Normalizing at this entry point (and the hook's `who`, see
+    _make_member_control_box_hook) closes the gap at its source rather than
+    patching the comparison in two internal call sites."""
+    member_id = _member_id(member_id)
     state = MemberControlState(
         member_id=member_id, delegation_key=delegation_key,
         objective=objective, evidence_required=evidence_required,
@@ -5320,35 +5337,23 @@ def _make_member_control_box_hook(role: str | None = None):
     """
     async def _control_box_hook(function_name, function, args, agent=None,
                                  team=None, run_context=None):
-        who = role or getattr(agent, "name", None) or "Coordinator"
-        # Phase B.1 forensics (2026-10-02): TEMPORARY diagnostic, unconditional,
-        # to establish live values -- not a behavior change, remove once the
-        # registration/invocation lifecycle is confirmed. Suspected cause:
-        # Function._team (what agno's _build_hook_args supplies as this
-        # hook's own `team` kwarg) is copied from agent._team at TOOL-WIRING
-        # time inside make_agent_from_spec/make_researcher, which runs BEFORE
-        # the agent is ever added to Team(members=[...]) -- so that copy may
-        # be permanently frozen at None for a member's own tools, unlike
-        # agent._team itself, read fresh here.
-        print(f"[team] CONTROL_BOX_DIAG: who={who!r} function_name={function_name!r} "
-              f"team_kwarg_is_none={team is None} agent_is_none={agent is None}",
-              flush=True)
-        try:
-            before = _control_box_state_fingerprint(team) if team is not None else (0, 0, 0, 0)
-        except Exception:
-            import traceback
-            print(f"[team] CONTROL_BOX_DIAG_EXCEPTION (before-fingerprint):\n"
-                  f"{traceback.format_exc()}", flush=True)
-            before = (0, 0, 0, 0)
+        # Phase B.1 fix (2026-10-02): `who` must be normalized through the
+        # same _member_id() canonicalization delegate_structured_task's own
+        # member_id argument already goes through (see
+        # _start_member_objective's docstring for the full root-cause
+        # trace) -- role/agent.name arrive display-cased ("Researcher"),
+        # while the stored MemberControlState is keyed by the Coordinator's
+        # own lowercase delegation argument ("researcher"). Without this,
+        # latest_for_member() never matches and _record_member_action's own
+        # `if state is None: return` fires silently on every call -- no
+        # exception, no telemetry, confirmed live across every trial before
+        # this fix.
+        who = _member_id(role or getattr(agent, "name", None) or "Coordinator")
+        before = _control_box_state_fingerprint(team) if team is not None else (0, 0, 0, 0)
         result = await function(**args)
         if team is not None:
-            try:
-                after = _control_box_state_fingerprint(team)
-                _record_member_action(team, who, function_name, args, before, after)
-            except Exception:
-                import traceback
-                print(f"[team] CONTROL_BOX_DIAG_EXCEPTION (record-action):\n"
-                      f"{traceback.format_exc()}", flush=True)
+            after = _control_box_state_fingerprint(team)
+            _record_member_action(team, who, function_name, args, before, after)
         return result
     return _control_box_hook
 
