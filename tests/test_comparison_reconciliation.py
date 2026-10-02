@@ -19,10 +19,13 @@ from types import SimpleNamespace
 import pytest
 
 import swarm.team as team_mod
+from swarm.execution_context import RunContext
 from swarm.team import (
     _comparison_body,
     _comparison_gap_counts,
     _COMPARISON_RECONCILE_FLAG,
+    _get_evidence_ledger,
+    _record_comparison_evidence,
     _reconcile_completeness_claim_with_comparison,
     _reconcile_completeness_claims,
     _verified_answer,
@@ -764,3 +767,217 @@ def test_e2e_non_comparison_task_no_regression(monkeypatch):
         "The register_seller function validates the GSTIN and creates a row.",
         "What does register_seller do?", team, None, result=None))
     assert "The register_seller function validates the GSTIN and creates a row." in out
+
+
+# ── EvidenceLedger foundation (Phase 4, 2026-10-02) ─────────────────────────
+#
+# These exercise the minimum-viable, execution-local ledger added to
+# _computed_comparison / _reconcile_completeness_claim_with_comparison:
+# ComparisonEvidence, _EvidenceLedger, _get_evidence_ledger,
+# _record_comparison_evidence. No new LLM call is introduced anywhere in
+# this phase -- every test below either asserts that directly (Test 6) or
+# monkeypatches _stream_team_run to raise if the model is ever invoked.
+
+
+def _team_with_run_context() -> _Team:
+    team = _Team()
+    team._run_context = RunContext(session_id=None, run_id="run-test")
+    return team
+
+
+def _record_t13b_evidence(
+        team,
+        left: str = "API/inventory-service/router/vouchers_api.py",
+        right: str = "Client/.../inventory/inventoryApi.ts"):
+    """Mirrors _computed_comparison's own real call sequence: start a tool
+    call on the run's RunContext, finish it with the tool's raw result text,
+    then record that result into the ledger -- the exact order
+    _computed_comparison uses, just without the real MCP round trip."""
+    tool_call = team._run_context.start_tool_call(
+        "compare_enumerations", {"left_path": left, "right_path": right})
+    team._run_context.finish_tool_call(
+        tool_call, content=T13B_FULL_GAP_CMP_NOTE, success=True, error=None)
+    return _record_comparison_evidence(team, tool_call, left, right,
+                                        T13B_FULL_GAP_CMP_NOTE)
+
+
+def test_ledger_1_record_and_retrieve_exact_equality():
+    """Test 1: what _record_comparison_evidence stores is exactly what
+    _get_evidence_ledger(...).get(...) returns back -- the same object, not
+    a copy or a re-derived approximation."""
+    team = _team_with_run_context()
+    record = _record_t13b_evidence(team)
+    assert record is not None
+    fetched = _get_evidence_ledger(team).get(record.evidence_id)
+    assert fetched is record
+    assert fetched == record
+
+
+def test_ledger_2_execution_isolation_between_separate_runs():
+    """Test 2: two independent team/RunContext instances (two separate runs)
+    never share ledger state -- recording on one must be invisible to the
+    other, by construction (team._evidence_ledger is lazily created per
+    team, never a module-level global)."""
+    team_a = _team_with_run_context()
+    team_b = _team_with_run_context()
+    record_a = _record_t13b_evidence(team_a)
+
+    assert _get_evidence_ledger(team_b).list() == []
+    assert _get_evidence_ledger(team_b).get(record_a.evidence_id) is None
+    assert _get_evidence_ledger(team_a).get(record_a.evidence_id) is record_a
+
+
+def test_ledger_3_consumption_independent_of_model_prose(monkeypatch, capsys):
+    """Test 3: the SAME ledger evidence is consumed (same evidence_id logged
+    via EVIDENCE_LEDGER_CONSUMED) regardless of what the model's own draft
+    said -- a false completeness claim and an honest disclosure of failure
+    both resolve to the identical recorded evidence."""
+    async def fake_stream(*a, **k):
+        raise AssertionError("deterministic path must not call the model")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    team = _team_with_run_context()
+    record = _record_t13b_evidence(team)
+
+    honest_disclosure = (
+        "I was unable to retrieve the frontend hooks and cannot identify "
+        "any gaps."
+    )
+    for content in ("No gaps exist.", honest_disclosure):
+        setattr(team, _COMPARISON_RECONCILE_FLAG, False)
+        all_results = [None]
+        _, _, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+            content, "Audit the vouchers module...", team, all_results, None,
+            None, T13B_FULL_GAP_CMP_NOTE, False))
+        assert reconciled is True
+        out = capsys.readouterr().out
+        assert f"EVIDENCE_LEDGER_CONSUMED: evidence_id={record.evidence_id} " in out
+
+
+def test_ledger_4_consumption_survives_retry_budget_exhaustion(monkeypatch, capsys):
+    """Test 4: the ledger lookup/consumption happens in the deterministic
+    synthesis branch, which fires before the generative-retry budget check
+    -- so a budget already spent by an earlier guard (all_results length > 1)
+    must not prevent the recorded evidence from being consulted and
+    consumed."""
+    async def fake_stream(*a, **k):
+        raise AssertionError("deterministic path must not call the model")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    team = _team_with_run_context()
+    record = _record_t13b_evidence(team)
+
+    all_results = [None, SimpleNamespace()]  # a prior guard already retried once
+    _, _, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+        "No gaps exist.", "Audit the vouchers module...", team, all_results, None,
+        None, T13B_FULL_GAP_CMP_NOTE, False))
+    assert reconciled is True
+    out = capsys.readouterr().out
+    assert f"EVIDENCE_LEDGER_CONSUMED: evidence_id={record.evidence_id} " in out
+
+
+def test_ledger_5_consumption_survives_truncated_repetition_decay_draft(monkeypatch, capsys):
+    """Test 5: a draft truncated mid-sentence -- the real shape repetition
+    decay produced in the original T13b incident -- must not prevent the
+    recorded evidence from being consulted and consumed either."""
+    async def fake_stream(*a, **k):
+        raise AssertionError("must not call the model on a truncated draft")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    team = _team_with_run_context()
+    record = _record_t13b_evidence(team)
+
+    truncated = "The vouchers module has the following API endpoints in path API/invent"
+    all_results = [None]
+    _, _, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+        truncated, "Audit the vouchers module...", team, all_results, None,
+        None, T13B_FULL_GAP_CMP_NOTE, False))
+    assert reconciled is True
+    out = capsys.readouterr().out
+    assert f"EVIDENCE_LEDGER_CONSUMED: evidence_id={record.evidence_id} " in out
+
+
+def test_ledger_6_recording_and_retrieval_are_synchronous_zero_llm_calls():
+    """Test 6: the ledger's own write/read path makes zero LLM calls -- not
+    just "doesn't happen to call the model in this test", but structurally
+    incapable of it: none of record/get/list/latest/_record_comparison_evidence
+    is a coroutine, and the whole record-then-fetch round trip succeeds with
+    no asyncio event loop running at all."""
+    import inspect
+
+    assert not inspect.iscoroutinefunction(_record_comparison_evidence)
+    assert not inspect.iscoroutinefunction(team_mod._EvidenceLedger.record)
+    assert not inspect.iscoroutinefunction(team_mod._EvidenceLedger.get)
+    assert not inspect.iscoroutinefunction(team_mod._EvidenceLedger.list)
+    assert not inspect.iscoroutinefunction(team_mod._EvidenceLedger.latest)
+
+    team = _team_with_run_context()
+    record = _record_t13b_evidence(team)  # no asyncio.run anywhere above this line
+    assert record is not None
+    assert _get_evidence_ledger(team).list() == [record]
+    assert _get_evidence_ledger(team).latest("compare_enumerations") is record
+
+
+def test_ledger_7_fabricated_reconciliation_never_populates_ledger(monkeypatch):
+    """Test 7: the deterministic synthesis/reconciliation path can fire (and
+    does, here) purely from cmp_note TEXT, with no tool call ever recorded on
+    this team's RunContext. That must never fabricate a ledger entry --
+    team._evidence_ledger must not even come into existence unless a real
+    compare_enumerations call (_record_comparison_evidence) created it."""
+    async def fake_stream(*a, **k):
+        raise AssertionError("must not call the model")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    team = _team_with_run_context()  # has a RunContext, but no tool call was ever made on it
+
+    all_results = [None]
+    _, _, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+        "No gaps exist.", "Audit the vouchers module...", team, all_results, None,
+        None, T13B_FULL_GAP_CMP_NOTE, False))
+    assert reconciled is True  # the deterministic template still fires from cmp_note alone
+    assert not hasattr(team, "_evidence_ledger"), (
+        "reconciliation/synthesis must never create or populate the ledger "
+        "-- only a real compare_enumerations call may")
+
+
+def test_ledger_8_exact_t13b_values_via_deterministic_parse_not_hardcoded():
+    """Test 8: the ledger's own fields must equal exactly what the SAME
+    deterministic parsers (_comparison_summary/_comparison_entries) produce
+    from the identical note -- the ledger is built FROM that parse, never a
+    second, independently-hardcoded set of numbers. The literal numbers
+    asserted here are the real T13b trial's own values (left=9, right=48,
+    matched=3, partial_match=2, 4 left-only gaps, 43 right-only), kept as a
+    fixed fixture (T13B_FULL_GAP_CMP_NOTE) rather than encoded into
+    production logic anywhere. T13B_FULL_GAP_CMP_NOTE's own TOTALS line
+    carries no separate "PARTIAL-MATCH TOTAL:"/"AMBIGUOUS TOTAL:" line (an
+    older-shaped fixture, pre-dating Phase J-A/J-B's additive totals), so
+    _comparison_summary correctly defaults partial_match/ambiguous to 0 for
+    this fixture even though the PARTIAL MATCHES section itself lists 2
+    entries -- the ledger must match that same (fixture-accurate) 0, not an
+    assumption read off the section header alone."""
+    team = _team_with_run_context()
+    record = _record_t13b_evidence(team)
+
+    summary = team_mod._comparison_summary(T13B_FULL_GAP_CMP_NOTE)
+    entries = team_mod._comparison_entries(T13B_FULL_GAP_CMP_NOTE)
+
+    assert record.left_count == summary["left"] == 9
+    assert record.right_count == summary["right"] == 48
+    assert record.match_count == summary["matched"] == 3
+    assert record.partial_match_count == summary["partial_match"] == 0
+    assert len(entries["partial_match"]) == 2
+    assert summary["left_only"] == 4
+    assert summary["right_only"] == 43
+    assert summary["ambiguous"] == 0
+
+    assert record.left_only == tuple(entries["left_only"]) == (
+        "POST /vouchers/grn/{po_id}",
+        "POST /vouchers/credit-note/{invoice_id}",
+        "POST /vouchers/stock-adjustment",
+        "POST /vouchers/stock-transfer",
+    )
+    assert record.right_only == tuple(entries["right_only"])
+    assert record.ambiguous == tuple(entries["ambiguous"]) == ()
+    assert record.authoritative is True
+    assert record.producer == "compare_enumerations"
+    assert record.evidence_type == "compare_enumerations"

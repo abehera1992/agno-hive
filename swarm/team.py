@@ -3085,6 +3085,14 @@ async def _computed_comparison(task: str, enumerations: dict | None,
         # A diagnostic pass that leaves one exit unnarrated diagnoses nothing.
         return _skip(f"tool returned no usable result for {left} vs {right}: "
                      f"{(text or '(empty)')[:120]}")
+    # EvidenceLedger foundation: record the structured result BEFORE wrapping
+    # `text` into the prose-decorated footnote below -- the ledger stores the
+    # tool's own raw result, never the decorated/rendered version. A no-op
+    # (returns None, records nothing) when `text` is not fully synthesis-
+    # shaped (missing a category header); the existing footnote/reconciliation
+    # path is completely unaffected either way.
+    if team is not None:
+        _record_comparison_evidence(team, _tool_call, left, right, text)
     print(f"[team] computed the comparison for {left} vs {right}", flush=True)
     return ("\n\n---\n**THE COMPARISON, COMPUTED — the answer above states a "
             "relationship between two files; this is that same relationship worked out "
@@ -4736,6 +4744,158 @@ def _comparison_entries(cmp_note: str) -> dict | None:
     return out
 
 
+# ── EvidenceLedger foundation (2026-10-02) ───────────────────────────────────
+#
+# Minimum viable, execution-local store for deterministic evidence -- NOT the
+# full control plane, NOT a Claim/Decision system (see this phase's own
+# explicit boundary). Scoped to exactly one producer: compare_enumerations,
+# the one deterministic tool T13b's own guard chain already depends on.
+#
+# Phase 0 forensic finding: team._run_context (swarm/execution_context.py,
+# "Phase A -- runtime identity for the durable execution/evidence backbone")
+# ALREADY records a generic EvidenceRecord for every compare_enumerations
+# call, via run_context.finish_tool_call() inside _computed_comparison below
+# -- in-memory only, run-scoped (one RunContext per run, attached to `team`,
+# garbage-collected with it), explicitly "no I/O, touches no database,
+# persists nothing" by that module's own docstring. That record's own
+# `content` field is the RAW TEXT the tool returned, not a structured
+# representation -- exactly the "raw text parsing" dependency this phase
+# exists to remove from the consumer side.
+#
+# This ledger is deliberately NOT a new identity scheme and NOT a new
+# storage location: it reuses the SAME tool_call_id execution_context.py's
+# own start_tool_call() already mints (new_id(), unique per run, no global
+# counter -- see that module's own docstring) as the evidence_id, and lives
+# as one more attribute directly on `team`, the exact convention
+# team._read_state/team._tool_evidence/team._last_comparison_evidence_id
+# already use. It is built from -- not instead of -- _comparison_summary/
+# _comparison_entries, the same two pure parse functions every existing
+# caller already trusts; this does not introduce a second parser.
+#
+# Deliberately separate from team._last_comparison_evidence_id (the EXISTING
+# attribute _persist_completeness_claim reads to link a durable Claim row to
+# a durable, database-generated Evidence row via execution_store -- Phase
+# B/D, out of this phase's scope). Reusing that name or that id would wire
+# this in-memory-only ledger into the persistence layer by accident; this
+# ledger's own id (team._last_comparison_ledger_id) and the database's id are
+# two different numbers answering two different questions, kept apart on
+# purpose.
+@dataclass(frozen=True)
+class ComparisonEvidence:
+    """Immutable record of one compare_enumerations result. Every field is
+    copied from _comparison_summary/_comparison_entries' own already-parsed,
+    already-tested output -- never from model prose, never from a retry's
+    content, never from `claims`. `left_only`/`right_only`/`ambiguous` are
+    tuples (not lists) specifically so the dataclass's own frozen-ness is not
+    just skin-deep: a caller cannot `.append()` a fabricated entry onto what
+    looks like a stored field, because there is no mutable list to append to.
+    """
+    evidence_id: str
+    evidence_type: str
+    producer: str
+    source: str
+    left_count: int
+    right_count: int
+    match_count: int
+    partial_match_count: int
+    left_only: tuple[str, ...]
+    right_only: tuple[str, ...]
+    ambiguous: tuple[str, ...]
+    authoritative: bool
+    started_at: float
+    completed_at: float
+
+
+class _EvidenceLedger:
+    """Minimum viable record/get/list store. One instance per run, owned by
+    `team` (team._evidence_ledger) -- never a module-level global, never
+    thread-local, never persisted outside this process/run; garbage-collected
+    with the team/run that created it, the identical lifetime discipline
+    execution_context.RunContext already documents for itself. Recording an
+    evidence_id a second time raises rather than silently overwriting --
+    evidence already produced by a deterministic operation must not mutate,
+    and a caller that tries to record the same id twice has a bug worth
+    surfacing, not papering over.
+    """
+
+    def __init__(self) -> None:
+        self._records: dict[str, ComparisonEvidence] = {}
+        self._order: list[str] = []
+
+    def record(self, evidence: ComparisonEvidence) -> None:
+        if evidence.evidence_id in self._records:
+            raise ValueError(
+                f"evidence_id {evidence.evidence_id!r} already recorded -- "
+                f"evidence is immutable and cannot be replaced")
+        self._records[evidence.evidence_id] = evidence
+        self._order.append(evidence.evidence_id)
+
+    def get(self, evidence_id: str) -> ComparisonEvidence | None:
+        return self._records.get(evidence_id)
+
+    def list(self) -> list[ComparisonEvidence]:
+        return [self._records[i] for i in self._order]
+
+    def latest(self, evidence_type: str | None = None) -> ComparisonEvidence | None:
+        for eid in reversed(self._order):
+            rec = self._records[eid]
+            if evidence_type is None or rec.evidence_type == evidence_type:
+                return rec
+        return None
+
+
+def _get_evidence_ledger(team) -> "_EvidenceLedger":
+    """Get-or-create team._evidence_ledger -- same lazy-init convention as
+    _get_evidence_ledger's sibling accessors elsewhere in this file
+    (team._read_state via _build_team, team._tool_evidence, etc.)."""
+    ledger = getattr(team, "_evidence_ledger", None)
+    if ledger is None:
+        ledger = _EvidenceLedger()
+        setattr(team, "_evidence_ledger", ledger)
+    return ledger
+
+
+def _record_comparison_evidence(team, tool_call, left: str, right: str,
+                                 text: str) -> "ComparisonEvidence | None":
+    """Build and record one ComparisonEvidence from compare_enumerations' own
+    raw result text -- called from _computed_comparison's success branch,
+    BEFORE that function wraps `text` into the prose-decorated cmp_note
+    footnote. Returns None (recording nothing) when `text` is not a real,
+    fully-shaped compare_enumerations result (_comparison_summary/_entries
+    both require the fixed TOTALS line and all five category headers) --
+    the same synthesis-eligibility test _synthesize_comparison_answer
+    already uses, so a ledger entry only ever exists for a result that
+    could ALSO be deterministically rendered.
+    """
+    summary = _comparison_summary(text)
+    entries = _comparison_entries(text)
+    if summary is None or entries is None or tool_call is None:
+        return None
+    record = ComparisonEvidence(
+        evidence_id=tool_call.tool_call_id,
+        evidence_type="compare_enumerations",
+        producer="compare_enumerations",
+        source=f"{left} vs {right}",
+        left_count=summary["left"],
+        right_count=summary["right"],
+        match_count=summary["matched"],
+        partial_match_count=summary["partial_match"],
+        left_only=tuple(entries["left_only"]),
+        right_only=tuple(entries["right_only"]),
+        ambiguous=tuple(entries["ambiguous"]),
+        authoritative=True,
+        started_at=tool_call.started_at,
+        completed_at=tool_call.completed_at or time.monotonic(),
+    )
+    _get_evidence_ledger(team).record(record)
+    team._last_comparison_ledger_id = record.evidence_id
+    print(f"[team] EVIDENCE_LEDGER_RECORDED: evidence_id={record.evidence_id} "
+          f"evidence_type={record.evidence_type} producer={record.producer} "
+          f"authoritative=True left_only={len(record.left_only)} "
+          f"right_only={len(record.right_only)}", flush=True)
+    return record
+
+
 def _synthesize_comparison_answer(cmp_note: str) -> str | None:
     """K4: the whole answer built as PURE STRING TEMPLATING from
     `_comparison_summary`'s counts and `_comparison_entries`' exact per-item
@@ -4975,12 +5135,30 @@ async def _reconcile_completeness_claim_with_comparison(
             await _persist_completeness_claim(
                 team, claims[0],
                 "contradicted" if existence_contradicted else "unresolved")
+        # EvidenceLedger consumption (2026-10-02): purely additive lineage
+        # proof -- looks up the SAME record _record_comparison_evidence
+        # stored inside _computed_comparison, by the SAME in-memory id, and
+        # logs it. Never changes `summary`, `synthesized`, or any decision
+        # above: the ledger lookup is None (and this block a no-op beyond
+        # the one log line) for every existing test/caller that builds
+        # cmp_note directly without ever going through a real
+        # _computed_comparison call -- i.e. every one of this file's own
+        # pre-existing unit tests, unchanged by construction.
+        _ledger_id = getattr(team, "_last_comparison_ledger_id", None)
+        _ledger_record = (_get_evidence_ledger(team).get(_ledger_id)
+                          if _ledger_id else None)
+        if _ledger_record is not None:
+            print(f"[team] EVIDENCE_LEDGER_CONSUMED: "
+                  f"evidence_id={_ledger_record.evidence_id} "
+                  f"consumer=_reconcile_completeness_claim_with_comparison",
+                  flush=True)
         print(f"[team] DETERMINISTIC_COMPARISON_GATE_FIRED: "
               f"match={summary['matched']} partial_match={summary['partial_match']} "
               f"left_only={summary['left_only']} right_only={summary['right_only']} "
               f"ambiguous={summary['ambiguous']} "
               f"model_made_completeness_claim={bool(claims)} "
-              f"generative_reconciliation_bypassed=True", flush=True)
+              f"generative_reconciliation_bypassed=True "
+              f"evidence_ledger_consulted={_ledger_record is not None}", flush=True)
         return synthesized, result, True
 
     if not claims:
