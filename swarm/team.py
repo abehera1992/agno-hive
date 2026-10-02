@@ -3092,7 +3092,14 @@ async def _computed_comparison(task: str, enumerations: dict | None,
     # shaped (missing a category header); the existing footnote/reconciliation
     # path is completely unaffected either way.
     if team is not None:
-        _record_comparison_evidence(team, _tool_call, left, right, text)
+        _evidence_record = _record_comparison_evidence(team, _tool_call, left, right, text)
+        # Claim layer foundation: derive a Claim from the EvidenceLedger record
+        # that call just produced -- NEVER from `text`/`content`/model prose.
+        # Same call-site convention as _record_comparison_evidence itself:
+        # one call, immediately after the evidence it describes exists, so
+        # the Claim can never outlive or precede its own evidence.
+        if _evidence_record is not None:
+            _create_comparison_claim(team, _evidence_record)
     print(f"[team] computed the comparison for {left} vs {right}", flush=True)
     return ("\n\n---\n**THE COMPARISON, COMPUTED — the answer above states a "
             "relationship between two files; this is that same relationship worked out "
@@ -4896,6 +4903,199 @@ def _record_comparison_evidence(team, tool_call, left: str, right: str,
     return record
 
 
+# ── Claim layer foundation (2026-10-02) ──────────────────────────────────────
+#
+# Minimum viable, execution-local Claim abstraction sitting ONE layer above
+# the EvidenceLedger just established above: Execution -> EvidenceLedger ->
+# Claim -> (future) Verification/Decision. Deliberately NOT a Decision or
+# VerificationResult, and deliberately NOT built on top of Phase E's EXISTING
+# database-backed Claim system (`_persist_completeness_claim` /
+# execution_store.persist_claim / db.claims / db.claim_evidence, further up
+# this file) -- that system is a durable, fail-open, best-effort audit log
+# (its own `persist_claim` no-ops entirely when run_context.session_id is
+# None, and swallows any I/O or validation failure via execution_store's
+# guard()); this one is an in-memory, execution-scoped, always-available
+# structure a caller can inspect and trust INSIDE the same run, mirroring the
+# EvidenceLedger's own "never a global, never persisted, garbage-collected
+# with the run" discipline. The two are kept deliberately separate -- same
+# reasoning ComparisonEvidence's own docstring already gives for keeping
+# team._last_comparison_ledger_id apart from team._last_comparison_evidence_id
+# (the Phase D database evidence id): wiring this new in-memory mechanism
+# into the persistence layer by accident would couple two systems with very
+# different failure semantics (this one must never silently no-op; the
+# database one is explicitly allowed to).
+#
+# Forensic note on the existing Phase E system, found while building this:
+# _reconcile_completeness_claim_with_comparison's two call sites pass
+# "supported_with_consistency_defect" and "unresolved" to
+# _persist_completeness_claim -- neither is in execution_store's own
+# VALID_CLAIM_STATUSES ({supported, contradicted, partially_supported,
+# unverifiable}), so persist_claim raises ValueError on those two paths every
+# time, silently swallowed by execution_store.guard(). Pre-existing, outside
+# this phase's scope (this phase does not touch persist_claim, its status
+# vocabulary, or either call site's status argument) -- noted here, not
+# fixed here.
+@dataclass(frozen=True)
+class Claim:
+    """An assertion ABOUT evidence, never an independent copy of it. Every
+    field after `statement` is what makes a Claim inspectable without
+    parsing model text: `evidence_ids` is the explicit C1->E1 link this
+    phase exists to prove, and `authoritative` is computed once, at
+    creation, from whether every one of those ids resolves in THIS team's
+    EvidenceLedger at that moment -- never from model prose, never mutated
+    afterward (frozen, like ComparisonEvidence). `statement` is descriptive
+    metadata for a human reader; the underlying left_only/right_only/counts
+    remain owned by the ComparisonEvidence record(s) in evidence_ids -- a
+    Claim is never consulted instead of that record, only alongside it (see
+    _validate_claim below, which re-checks the SAME ledger rather than
+    trusting this field as a cached verdict).
+    """
+    claim_id: str
+    claim_type: str
+    statement: str
+    evidence_ids: tuple[str, ...]
+    authoritative: bool
+    provenance: str
+
+
+class _ClaimStore:
+    """Minimum viable record/get/list store -- identical shape and lifetime
+    discipline to _EvidenceLedger above: one instance per run, owned by
+    `team` (team._claim_store), never a module-level global, never
+    persisted, garbage-collected with the team/run that created it.
+    Recording the same claim_id twice raises, for the same reason
+    _EvidenceLedger.record does: a Claim is immutable once created (Phase
+    4.1's requirement), so a second record() for the same id is a caller
+    bug, not a legitimate update.
+    """
+
+    def __init__(self) -> None:
+        self._records: dict[str, Claim] = {}
+        self._order: list[str] = []
+
+    def record(self, claim: Claim) -> None:
+        if claim.claim_id in self._records:
+            raise ValueError(
+                f"claim_id {claim.claim_id!r} already recorded -- "
+                f"a Claim is immutable and cannot be replaced")
+        self._records[claim.claim_id] = claim
+        self._order.append(claim.claim_id)
+
+    def get(self, claim_id: str) -> Claim | None:
+        return self._records.get(claim_id)
+
+    def list(self) -> list[Claim]:
+        return [self._records[i] for i in self._order]
+
+    def list_for_evidence(self, evidence_id: str) -> list[Claim]:
+        return [c for c in self.list() if evidence_id in c.evidence_ids]
+
+
+def _get_claim_store(team) -> "_ClaimStore":
+    """Get-or-create team._claim_store -- same lazy-init convention as
+    _get_evidence_ledger."""
+    store = getattr(team, "_claim_store", None)
+    if store is None:
+        store = _ClaimStore()
+        setattr(team, "_claim_store", store)
+    return store
+
+
+def _validate_claim_evidence(team, evidence_ids: tuple[str, ...]) -> bool:
+    """Phase 1.2's deterministic validation primitive: True iff EVERY id in
+    `evidence_ids` currently resolves in this team's EvidenceLedger. Pure,
+    synchronous, no LLM, no I/O, no exception on a missing id -- a missing
+    or empty reference simply makes this False, never raises. This is the
+    ONLY function that decides claim authority; both _make_claim (at
+    creation) and _validate_claim (at consumption) call it, so the same
+    rule is applied both times rather than two independently-maintained
+    checks drifting apart.
+    """
+    if not evidence_ids:
+        return False
+    ledger = _get_evidence_ledger(team)
+    return all(ledger.get(eid) is not None for eid in evidence_ids)
+
+
+def _make_claim(team, claim_type: str, statement: str,
+                 evidence_ids: "list[str] | tuple[str, ...]",
+                 provenance: str) -> Claim:
+    """General-purpose Claim constructor (Phase 0.4's chosen authority
+    behavior): claim creation NEVER raises or refuses -- it always succeeds
+    and always records the Claim, exactly like _record_comparison_evidence's
+    own never-raise convention elsewhere in this file. What varies is
+    `authoritative`, computed ONCE here from _validate_claim_evidence against
+    the CURRENT ledger state and then frozen. A claim built from a reference
+    that does not (yet, or ever) exist is recorded with authoritative=False
+    and is loud about it (CLAIM_RECORDED always prints the real value) --
+    this is the explicit, visible outcome Phase 0.4 asks for in place of
+    either a raise or a silent fallback: nothing downstream may treat an
+    authoritative=False claim as authoritative, and nothing here hides that
+    a claim failed validation.
+    """
+    eids = tuple(evidence_ids)
+    authoritative = _validate_claim_evidence(team, eids)
+    claim = Claim(
+        claim_id=execution_context.new_id(),
+        claim_type=claim_type,
+        statement=statement,
+        evidence_ids=eids,
+        authoritative=authoritative,
+        provenance=provenance,
+    )
+    _get_claim_store(team).record(claim)
+    print(f"[team] CLAIM_RECORDED: claim_id={claim.claim_id} "
+          f"claim_type={claim.claim_type} evidence_ids={list(claim.evidence_ids)} "
+          f"authoritative={claim.authoritative}", flush=True)
+    return claim
+
+
+def _validate_claim(team, claim: "Claim | None") -> bool:
+    """Explicit, separately-logged re-validation at the point of CONSUMPTION
+    (as opposed to _make_claim's validation at the point of CREATION) --
+    proves, at the moment a claim is actually used, that its evidence still
+    resolves in this run's ledger, the same no-stale-trust discipline the
+    EvidenceLedger lookup already applies on the evidence side. Pure and
+    idempotent: re-runs the identical _validate_claim_evidence check: never
+    mutates `claim` (frozen dataclass) and never re-derives a different
+    answer than _make_claim already computed for the same, unchanged
+    ledger. Returns False (and still logs) for claim=None, so a caller can
+    pass a possibly-missing lookup straight through without a separate
+    null check.
+    """
+    result = claim is not None and _validate_claim_evidence(team, claim.evidence_ids)
+    print(f"[team] CLAIM_VALIDATED: claim_id={claim.claim_id if claim else None} "
+          f"evidence_ids={list(claim.evidence_ids) if claim else []} "
+          f"validation_result={result}", flush=True)
+    return result
+
+
+def _create_comparison_claim(team, evidence: "ComparisonEvidence") -> Claim:
+    """Phase 2: the ONE deterministic Claim constructor for the T13b
+    comparison path. Built ONLY from an already-recorded ComparisonEvidence
+    row -- never from `text`, model prose, retry output, repetition-recovery
+    output, or the final answer (see this call's one call site, inside
+    _computed_comparison, immediately after _record_comparison_evidence
+    returns). `statement` is purely descriptive (Phase 2.2: never the
+    authoritative data itself -- the counts/left_only/right_only stay owned
+    by `evidence`, reachable only via evidence_ids). claim_type is the
+    single type this phase needs (Phase 0.2: avoid a speculative taxonomy).
+    """
+    statement = (
+        f"compare_enumerations over {evidence.source}: "
+        f"{evidence.match_count} matched, {evidence.partial_match_count} "
+        f"partial-match, {len(evidence.left_only)} left-only, "
+        f"{len(evidence.right_only)} right-only, {len(evidence.ambiguous)} "
+        f"ambiguous."
+    )
+    claim = _make_claim(
+        team, claim_type="comparison_summary", statement=statement,
+        evidence_ids=[evidence.evidence_id],
+        provenance="deterministic:compare_enumerations")
+    team._last_comparison_claim_id = claim.claim_id
+    return claim
+
+
 def _synthesize_comparison_answer(cmp_note: str) -> str | None:
     """K4: the whole answer built as PURE STRING TEMPLATING from
     `_comparison_summary`'s counts and `_comparison_entries`' exact per-item
@@ -5152,13 +5352,27 @@ async def _reconcile_completeness_claim_with_comparison(
                   f"evidence_id={_ledger_record.evidence_id} "
                   f"consumer=_reconcile_completeness_claim_with_comparison",
                   flush=True)
+        # Claim-layer consumption (2026-10-02): the SAME claim_id
+        # _create_comparison_claim minted inside _computed_comparison, looked
+        # up and explicitly re-validated (CLAIM_VALIDATED) at the moment this
+        # function actually consumes it -- additive only, same no-op-when-
+        # absent shape as the ledger lookup directly above it, and for the
+        # identical reason: every pre-existing test that builds cmp_note by
+        # hand (never going through a real _computed_comparison call) has no
+        # team._last_comparison_claim_id, so _claim is None and
+        # claim_authoritative_consumed is False, unchanged by construction.
+        _claim_id = getattr(team, "_last_comparison_claim_id", None)
+        _claim = _get_claim_store(team).get(_claim_id) if _claim_id else None
+        _claim_authoritative_consumed = _validate_claim(team, _claim) if _claim else False
         print(f"[team] DETERMINISTIC_COMPARISON_GATE_FIRED: "
               f"match={summary['matched']} partial_match={summary['partial_match']} "
               f"left_only={summary['left_only']} right_only={summary['right_only']} "
               f"ambiguous={summary['ambiguous']} "
               f"model_made_completeness_claim={bool(claims)} "
               f"generative_reconciliation_bypassed=True "
-              f"evidence_ledger_consulted={_ledger_record is not None}", flush=True)
+              f"evidence_ledger_consulted={_ledger_record is not None} "
+              f"claim_id={_claim.claim_id if _claim else None} "
+              f"claim_authoritative_consumed={_claim_authoritative_consumed}", flush=True)
         return synthesized, result, True
 
     if not claims:

@@ -18,16 +18,24 @@ from types import SimpleNamespace
 
 import pytest
 
+import dataclasses
+
 import swarm.team as team_mod
 from swarm.execution_context import RunContext
 from swarm.team import (
+    Claim,
     _comparison_body,
     _comparison_gap_counts,
     _COMPARISON_RECONCILE_FLAG,
+    _create_comparison_claim,
+    _get_claim_store,
     _get_evidence_ledger,
+    _make_claim,
     _record_comparison_evidence,
     _reconcile_completeness_claim_with_comparison,
     _reconcile_completeness_claims,
+    _validate_claim,
+    _validate_claim_evidence,
     _verified_answer,
 )
 
@@ -981,3 +989,241 @@ def test_ledger_8_exact_t13b_values_via_deterministic_parse_not_hardcoded():
     assert record.authoritative is True
     assert record.producer == "compare_enumerations"
     assert record.evidence_type == "compare_enumerations"
+
+
+# ── Claim layer foundation (Phase 4, 2026-10-02) ────────────────────────────
+#
+# Execution -> EvidenceLedger -> Claim -> (future) Verification/Decision.
+# These exercise Claim/_ClaimStore/_get_claim_store/_make_claim/
+# _validate_claim/_create_comparison_claim. No new LLM call anywhere in this
+# phase -- every test below either asserts that directly or monkeypatches
+# _stream_team_run to raise if the model is ever invoked.
+
+
+def test_claim_1_valid_claim_is_authoritative():
+    """Test 1: a Claim built from a real, just-recorded EvidenceLedger
+    record is authoritative, and its evidence_ids is the explicit C1->E1
+    link -- inspectable without parsing any model text."""
+    team = _team_with_run_context()
+    evidence = _record_t13b_evidence(team)
+    claim = _create_comparison_claim(team, evidence)
+    assert claim.authoritative is True
+    assert claim.evidence_ids == (evidence.evidence_id,)
+    assert _get_claim_store(team).get(claim.claim_id) is claim
+
+
+def test_claim_2_missing_evidence_is_not_authoritative():
+    """Test 2 (Phase 0.4's chosen contract): a Claim referencing an
+    evidence_id that does not exist in this team's ledger is still
+    recorded (creation never raises/refuses), but is explicitly, visibly
+    NOT authoritative -- never a silent fallback, never an exception."""
+    team = _team_with_run_context()
+    claim = _make_claim(
+        team, claim_type="comparison_summary",
+        statement="fabricated reference to evidence that was never recorded",
+        evidence_ids=["nonexistent-evidence-id"],
+        provenance="test")
+    assert claim.authoritative is False
+    assert _get_claim_store(team).get(claim.claim_id) is claim
+
+
+def test_claim_3_multiple_evidence_references_all_must_exist():
+    """Test 3: a Claim referencing two evidence ids is authoritative only
+    when BOTH resolve in the ledger -- one missing reference is enough to
+    make the whole claim non-authoritative."""
+    team = _team_with_run_context()
+    e1 = _record_t13b_evidence(team, left="a.py", right="a.ts")
+    e2 = _record_t13b_evidence(team, left="b.py", right="b.ts")
+    assert e1.evidence_id != e2.evidence_id
+
+    both_exist = _make_claim(
+        team, claim_type="comparison_summary", statement="both real",
+        evidence_ids=[e1.evidence_id, e2.evidence_id], provenance="test")
+    assert both_exist.authoritative is True
+
+    one_missing = _make_claim(
+        team, claim_type="comparison_summary", statement="one fabricated",
+        evidence_ids=[e1.evidence_id, "nonexistent-evidence-id"],
+        provenance="test")
+    assert one_missing.authoritative is False
+
+
+def test_claim_4_cross_run_isolation():
+    """Test 4: a Claim/evidence pair recorded on one team/RunContext cannot
+    be validated against, or even seen from, a separate team/RunContext --
+    same isolation guarantee as the EvidenceLedger itself (test_ledger_2),
+    now proven for the Claim layer sitting on top of it."""
+    team_a = _team_with_run_context()
+    team_b = _team_with_run_context()
+    evidence_a = _record_t13b_evidence(team_a)
+    claim_a = _create_comparison_claim(team_a, evidence_a)
+
+    assert _get_claim_store(team_b).list() == []
+    assert _get_claim_store(team_b).get(claim_a.claim_id) is None
+    # Team B's ledger has never seen team A's evidence_id, so revalidating
+    # team A's claim against team B's ledger must fail.
+    assert _validate_claim_evidence(team_b, claim_a.evidence_ids) is False
+
+
+def test_claim_5_model_prose_independence(monkeypatch, capsys):
+    """Test 5: the SAME claim_id is looked up, revalidated, and logged via
+    CLAIM_VALIDATED regardless of what the model's own draft said -- a
+    false completeness claim and an honest disclosure both resolve to the
+    identical Claim/Evidence lineage."""
+    async def fake_stream(*a, **k):
+        raise AssertionError("deterministic path must not call the model")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    team = _team_with_run_context()
+    evidence = _record_t13b_evidence(team)
+    claim = _create_comparison_claim(team, evidence)
+
+    for content in (
+        "No gaps exist.",
+        "I was unable to retrieve the frontend hooks and cannot identify "
+        "any gaps.",
+    ):
+        setattr(team, _COMPARISON_RECONCILE_FLAG, False)
+        all_results = [None]
+        _, _, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+            content, "Audit the vouchers module...", team, all_results, None,
+            None, T13B_FULL_GAP_CMP_NOTE, False))
+        assert reconciled is True
+        out = capsys.readouterr().out
+        assert f"CLAIM_VALIDATED: claim_id={claim.claim_id} " in out
+        assert "validation_result=True" in out
+        assert f"claim_id={claim.claim_id} claim_authoritative_consumed=True" in out
+
+
+def test_claim_6_retry_independence(monkeypatch, capsys):
+    """Test 6: Claim validation/consumption happens in the deterministic
+    synthesis branch, before the generative-retry budget check -- an
+    already-exhausted budget (all_results length > 1) must not prevent the
+    claim from being looked up, revalidated, and consumed."""
+    async def fake_stream(*a, **k):
+        raise AssertionError("deterministic path must not call the model")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    team = _team_with_run_context()
+    evidence = _record_t13b_evidence(team)
+    claim = _create_comparison_claim(team, evidence)
+
+    all_results = [None, SimpleNamespace()]  # a prior guard already retried once
+    _, _, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+        "No gaps exist.", "Audit the vouchers module...", team, all_results, None,
+        None, T13B_FULL_GAP_CMP_NOTE, False))
+    assert reconciled is True
+    out = capsys.readouterr().out
+    assert f"CLAIM_VALIDATED: claim_id={claim.claim_id} " in out
+    assert f"claim_id={claim.claim_id} claim_authoritative_consumed=True" in out
+
+
+def test_claim_7_repetition_independence(monkeypatch, capsys):
+    """Test 7: claim creation/consumption must work after the real shape
+    repetition-decay produced in the original T13b incident -- a draft
+    truncated mid-sentence."""
+    async def fake_stream(*a, **k):
+        raise AssertionError("must not call the model on a truncated draft")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    team = _team_with_run_context()
+    evidence = _record_t13b_evidence(team)
+    claim = _create_comparison_claim(team, evidence)
+
+    truncated = "The vouchers module has the following API endpoints in path API/invent"
+    all_results = [None]
+    _, _, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+        truncated, "Audit the vouchers module...", team, all_results, None,
+        None, T13B_FULL_GAP_CMP_NOTE, False))
+    assert reconciled is True
+    out = capsys.readouterr().out
+    assert f"CLAIM_VALIDATED: claim_id={claim.claim_id} " in out
+
+
+def test_claim_8_fabrication_independence(monkeypatch):
+    """Test 8: the deterministic synthesis/reconciliation path can fire (and
+    does, here) purely from cmp_note TEXT, with no evidence or claim ever
+    recorded on this team. Fabricated model text must never be able to
+    create an authoritative Claim out of nothing -- the claim store must
+    not even come into existence."""
+    async def fake_stream(*a, **k):
+        raise AssertionError("must not call the model")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    team = _team_with_run_context()  # has a RunContext, but no evidence/claim ever recorded
+
+    all_results = [None]
+    _, _, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+        "No gaps exist.", "Audit the vouchers module...", team, all_results, None,
+        None, T13B_FULL_GAP_CMP_NOTE, False))
+    assert reconciled is True  # the deterministic template still fires from cmp_note alone
+    assert not hasattr(team, "_claim_store"), (
+        "reconciliation/synthesis must never fabricate a Claim -- only a "
+        "real compare_enumerations call (_create_comparison_claim) may")
+
+
+def test_claim_9_actual_t13b_lineage_not_hardcoded():
+    """Test 9: Evidence E -> Claim C -> C.evidence_ids == [E.evidence_id],
+    and E.left_only is exactly the real T13b trial's 4 gaps -- read from the
+    actual deterministic evidence object this run produced, never
+    hard-coded into production logic (same discipline as test_ledger_8)."""
+    team = _team_with_run_context()
+    evidence = _record_t13b_evidence(team)
+    claim = _create_comparison_claim(team, evidence)
+
+    assert claim.evidence_ids == (evidence.evidence_id,)
+    assert claim.authoritative is True
+    assert _get_evidence_ledger(team).get(claim.evidence_ids[0]) is evidence
+    assert evidence.left_only == (
+        "POST /vouchers/grn/{po_id}",
+        "POST /vouchers/credit-note/{invoice_id}",
+        "POST /vouchers/stock-adjustment",
+        "POST /vouchers/stock-transfer",
+    )
+
+
+def test_claim_4_1_immutable_and_cannot_be_recorded_twice():
+    """Phase 4.1: a Claim's evidence_ids cannot be silently changed after
+    creation (frozen dataclass -> FrozenInstanceError on any attempted
+    mutation), and the store refuses a second record() for the same
+    claim_id -- the same immutability contract _EvidenceLedger already
+    enforces for ComparisonEvidence."""
+    team = _team_with_run_context()
+    evidence = _record_t13b_evidence(team)
+    claim = _create_comparison_claim(team, evidence)
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        claim.evidence_ids = ("tampered",)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        claim.authoritative = False
+
+    with pytest.raises(ValueError):
+        _get_claim_store(team).record(claim)
+
+
+def test_claim_4_2_claim_statement_never_overrides_evidence():
+    """Phase 4.2: a Claim's own (possibly wrong/stale) prose statement must
+    never be treated as authoritative over the EvidenceLedger record it
+    references. Here the claim's statement deliberately underclaims ("one
+    gap exists") against evidence that actually shows 4 left-only gaps --
+    the real evidence object, reached via claim.evidence_ids, must still
+    show all 4, proving nothing in the Claim machinery reads or trusts
+    `statement` as data."""
+    team = _team_with_run_context()
+    evidence = _record_t13b_evidence(team)
+    misleading_claim = _make_claim(
+        team, claim_type="comparison_summary",
+        statement="one gap exists",  # deliberately wrong/underclaiming prose
+        evidence_ids=[evidence.evidence_id],
+        provenance="test")
+
+    assert misleading_claim.authoritative is True  # the reference itself is valid
+    real_evidence = _get_evidence_ledger(team).get(misleading_claim.evidence_ids[0])
+    assert len(real_evidence.left_only) == 4
+    assert real_evidence.left_only == (
+        "POST /vouchers/grn/{po_id}",
+        "POST /vouchers/credit-note/{invoice_id}",
+        "POST /vouchers/stock-adjustment",
+        "POST /vouchers/stock-transfer",
+    )
+    assert real_evidence is evidence
