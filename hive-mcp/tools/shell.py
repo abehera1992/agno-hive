@@ -150,9 +150,9 @@ def run_docker(command: str, timeout: int = 60) -> str:
 
 # Incident 2026-09-30: get_env_info()'s old redaction was name-substring-only
 # (SECRET/PASSWORD/TOKEN/KEY/PRIVATE) -- it correctly caught GPG_KEY (via "KEY")
-# but a live run leaked DB_CONN_URL and HIVE_DB_URL in full, including the
-# embedded hive_ro password, because neither variable name contains any of
-# those words. A connection-string-shaped value (scheme://user:pass@host) can
+# but a live run leaked DB_CONN_URL in full, including the embedded hive_ro
+# password, because the variable name contains none of those words. A
+# connection-string-shaped value (scheme://user:pass@host) can
 # carry a credential under ANY name -- DB_CONN_URL today, REDIS_URL/AMQP_URL/
 # MONGO_URI/etc. tomorrow -- so name-matching alone can never be complete.
 # Two independent checks now gate redaction: the widened name list below, AND

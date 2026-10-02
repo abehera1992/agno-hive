@@ -62,8 +62,8 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")  # pa
 # postgresql://hive_ro:<pw>@host.docker.internal:5433/ekamApp — the tool holds no schema
 # knowledge; the access boundary is the role's grants. Tools register only when this is set.
 #
-# Deliberately named DB_CONN_URL, not project-specific (was HIVE_DB_URL until
-# 2026-09-29) — this is a generic read-only-SQL tool with no built-in opinion about
+# Deliberately named DB_CONN_URL, not project-specific — this is a generic
+# read-only-SQL tool with no built-in opinion about
 # which project or database it points at. The value itself lives in .env (see
 # .env.example), NOT here or in docker-compose.hive.yml's committed defaults, so
 # swapping to a different DB (a different project, a different environment, a

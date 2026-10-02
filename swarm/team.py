@@ -8694,9 +8694,9 @@ async def _repo_db_schema(hive_mcp_url: str | None, hive_mcp_tools=None) -> str:
     """hive-mcp's db_schema listing (`schema.table` per line), or "" when unavailable.
 
     Same live-session-then-fresh-connection shape as _repo_file_text. Empty means
-    UNKNOWN -- db_schema is gated on DB_CONN_URL (hive-mcp/.env; named HIVE_DB_URL
-    before 2026-09-29) and simply absent on a project with no database configured --
-    so every caller must treat "" as "cannot say", never as "no tables".
+    UNKNOWN -- db_schema is gated on DB_CONN_URL (hive-mcp/.env) and simply absent
+    on a project with no database configured -- so every caller must treat "" as
+    "cannot say", never as "no tables".
     """
     if not (hive_mcp_url or hive_mcp_tools):
         return ""
