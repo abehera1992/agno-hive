@@ -148,6 +148,38 @@ def run_docker(command: str, timeout: int = 60) -> str:
     return _run(["docker"] + command.split(), timeout=timeout)
 
 
+# Incident 2026-09-30: get_env_info()'s old redaction was name-substring-only
+# (SECRET/PASSWORD/TOKEN/KEY/PRIVATE) -- it correctly caught GPG_KEY (via "KEY")
+# but a live run leaked DB_CONN_URL and HIVE_DB_URL in full, including the
+# embedded hive_ro password, because neither variable name contains any of
+# those words. A connection-string-shaped value (scheme://user:pass@host) can
+# carry a credential under ANY name -- DB_CONN_URL today, REDIS_URL/AMQP_URL/
+# MONGO_URI/etc. tomorrow -- so name-matching alone can never be complete.
+# Two independent checks now gate redaction: the widened name list below, AND
+# a value-shape check for embedded userinfo in a URL, so a credential is
+# caught even under a name nobody thought to list. Deliberately scoped to this
+# one function's own os.environ dump; run_shell/run_docker are general-purpose
+# command execution with no analogous fixed-shape input to redact against ("env"
+# or "exec <container> env" can already return everything unredacted through
+# ordinary raw subprocess output) -- a materially different, larger problem,
+# not addressed here.
+_SENSITIVE_ENV_NAME_RE = re.compile(
+    r"SECRET|PASSWORD|PASSWD|TOKEN|KEY|PRIVATE|CREDENTIAL|DSN|"
+    r"CONN|URI|URL|DATABASE|_DB_|^DB_",
+)
+# scheme://user:pass@host -- the shape a leaked connection string has regardless
+# of what its variable is named. Matches postgres/postgresql/mysql/redis/mongodb/
+# amqp/etc. alike; doesn't need a per-scheme list because the userinfo delimiter
+# (":...@") is what actually carries the secret.
+_URL_WITH_CREDENTIALS_RE = re.compile(r"^[a-zA-Z][\w+.-]*://[^/\s:@]+:[^/\s@]+@")
+
+
+def _is_sensitive_env(key: str, value: str) -> bool:
+    if _SENSITIVE_ENV_NAME_RE.search(key.upper()):
+        return True
+    return bool(_URL_WITH_CREDENTIALS_RE.match(value or ""))
+
+
 def get_env_info() -> str:
     """
     Return a summary of the runtime environment: OS, Python version,
@@ -182,7 +214,7 @@ def get_env_info() -> str:
     for k, v in sorted(os.environ.items()):
         if k in skip_keys:
             continue
-        if any(s in k.upper() for s in ("SECRET", "PASSWORD", "TOKEN", "KEY", "PRIVATE")):
+        if _is_sensitive_env(k, v):
             lines.append(f"  {k}=<redacted>")
         else:
             lines.append(f"  {k}={v[:120]}")
