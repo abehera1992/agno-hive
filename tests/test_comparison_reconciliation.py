@@ -311,11 +311,12 @@ T13B_FULL_GAP_CMP_NOTE = (
 
 
 def test_t13b_full_comparison_note_synthesizes_deterministically_no_model_call(monkeypatch):
-    """The T13b POC (2026-10-02): when cmp_note carries all five real
-    compare_enumerations category headers, the reconciliation must release
-    Phase L's templated answer directly -- _stream_team_run must NEVER be
-    called, so the result cannot be corrupted by a second generative pass
-    (the exact mechanism that truncated the real T13b answer)."""
+    """Test A (always-on gate, 2026-10-02): when cmp_note carries all five real
+    compare_enumerations category headers AND the model made a (false)
+    completeness claim, the reconciliation must release Phase L's templated
+    answer directly -- _stream_team_run must NEVER be called, so the result
+    cannot be corrupted by a second generative pass (the exact mechanism that
+    truncated the real T13b answer)."""
     async def fake_stream(*a, **k):
         raise AssertionError(
             "must not re-invoke the model when the comparison note is "
@@ -339,6 +340,117 @@ def test_t13b_full_comparison_note_synthesizes_deterministically_no_model_call(m
     # into the LEFT_ONLY list (the historical PUT/POST conflation defect).
     assert "PARTIAL_MATCH" in content
     assert "LEFT_ONLY" in content
+
+
+def test_b_no_completeness_claim_honest_disclosure_still_fires_deterministic_gate(monkeypatch):
+    """Test B (the live-reproduced gap this second pass closes): the model
+    does NOT claim completeness -- it honestly reports it could not retrieve
+    the frontend hooks, exactly the real 3/3 live T13b trials after 701eb03.
+    `_reconcile_completeness_claims` finds nothing to reconcile in this text,
+    so the OLD gate (`if not claims: return` sitting ahead of synthesis)
+    would return the draft unchanged here. The always-on gate must still
+    fire: deterministic evidence exists and is actionable regardless of
+    whether the model asserted anything about it."""
+    honest_disclosure = (
+        "Here are the 9 endpoints and 31 tables.\n\n"
+        "I was unable to retrieve the frontend hooks and cannot identify "
+        "any gaps."
+    )
+    assert not _reconcile_completeness_claims(honest_disclosure), (
+        "test setup invalid: this text must NOT match the completeness-"
+        "claim lexicon, or Test B is not exercising the new code path")
+
+    async def fake_stream(*a, **k):
+        raise AssertionError(
+            "must not re-invoke the model -- the deterministic gate must "
+            "fire even though the model made no completeness claim")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    all_results = [None]
+    content, result, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+        honest_disclosure, "Audit the vouchers module...", _Team(),
+        all_results, None, None, T13B_FULL_GAP_CMP_NOTE, False))
+    assert reconciled is True
+    assert "unable to retrieve" not in content
+    assert "POST /vouchers/grn/{po_id}" in content
+    assert "POST /vouchers/credit-note/{invoice_id}" in content
+    assert "POST /vouchers/stock-adjustment" in content
+    assert "POST /vouchers/stock-transfer" in content
+
+
+def test_c_truncated_model_response_cannot_suppress_deterministic_evidence(monkeypatch):
+    """Test C: a response cut off mid-sentence (the real shape repetition-
+    decay produced in the original T13b incident) makes no completeness
+    claim at all -- the always-on gate must still fire."""
+    truncated = "The vouchers module has the following API endpoints in `API/invent"
+    assert not _reconcile_completeness_claims(truncated)
+
+    async def fake_stream(*a, **k):
+        raise AssertionError("must not re-invoke the model on a truncated draft")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    all_results = [None]
+    content, result, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+        truncated, "Audit the vouchers module...", _Team(), all_results, None,
+        None, T13B_FULL_GAP_CMP_NOTE, False))
+    assert reconciled is True
+    assert "POST /vouchers/stock-transfer" in content
+
+
+def test_d_empty_model_response_cannot_suppress_deterministic_evidence(monkeypatch):
+    """Test D: an empty/unusable draft -- the extreme case of 'no claim'.
+    Deterministic evidence must still reach the final answer."""
+    async def fake_stream(*a, **k):
+        raise AssertionError("must not re-invoke the model on an empty draft")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    all_results = [None]
+    content, result, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+        "", "Audit the vouchers module...", _Team(), all_results, None,
+        None, T13B_FULL_GAP_CMP_NOTE, False))
+    assert reconciled is True
+    assert "POST /vouchers/stock-transfer" in content
+
+
+def test_e_no_actionable_comparison_does_not_fabricate_a_discrepancy(monkeypatch):
+    """Test E: a full five-header note where NOTHING is left/right-only or
+    ambiguous must not fire the deterministic gate (nor the generative one)
+    -- 'always evaluate' is not 'always fire'. Reuses test_3's no-op
+    assertion style against a fully-eligible (not partially-shaped) note."""
+    clean_full_note = (
+        "\n\n---\n**THE COMPARISON, COMPUTED**\n```\n"
+        "compare_enumerations — a.py  vs  b.ts\n"
+        "\n"
+        "MATCHED (2):\n"
+        "  GET /x   <->   /api/x\n"
+        "  POST /y   <->   /api/y\n"
+        "\n"
+        "PARTIAL MATCHES (0):\n"
+        "  (none)\n"
+        "\n"
+        "AMBIGUOUS (0):\n"
+        "  (none)\n"
+        "\n"
+        "LEFT ONLY — defined on the left with no match on the right (0):\n"
+        "  (none)\n"
+        "\n"
+        "RIGHT ONLY — present on the right with no match on the left (0):\n"
+        "  (none)\n"
+        "\n"
+        "TOTALS: left 2, right 2, matched 2, left-only 0, right-only 0.\n"
+        "```"
+    )
+
+    async def fake_stream(*a, **k):
+        raise AssertionError("must not retry/synthesize when nothing is actionable")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    all_results = [None]
+    content, result, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+        "All endpoints have a corresponding hook. There are no missing items.",
+        "task text", _Team(), all_results, None, None, clean_full_note, False))
+    assert reconciled is False
+    assert content == "All endpoints have a corresponding hook. There are no missing items."
 
 
 def test_retry_exception_keeps_the_draft(monkeypatch):

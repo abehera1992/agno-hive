@@ -4938,12 +4938,50 @@ async def _reconcile_completeness_claim_with_comparison(
                       if summary["partial_match"] > 0 else "supported")
             await _persist_completeness_claim(team, claims[0], status)
         return content, result, False
+    # T13b always-on gate (2026-10-02, second pass): deterministic comparison
+    # evidence is now evaluated BEFORE checking whether the model's own prose
+    # made a completeness claim worth reconciling -- the first POC (701eb03)
+    # still sat behind `if not claims: return` below, which fires early
+    # whenever the model hadn't asserted completeness. Live-confirmed as the
+    # actual bottleneck, 3/3 T13b trials after 701eb03 deployed:
+    # compare_enumerations computed the exact 4-gap result in every trial,
+    # and every trial's own draft HONESTLY reported "I was unable to
+    # retrieve the frontend hooks... cannot identify any gaps" -- a true
+    # statement about the model's own tool-call failure, not a false
+    # completeness claim, so `claims` was empty and the function returned
+    # before ever trying _synthesize_comparison_answer. The model's
+    # inability to retrieve evidence must not be able to suppress evidence a
+    # DIFFERENT, deterministic tool call already established independently
+    # of the model's own reads. Only `existence_contradicted`/`uncertain`
+    # (established above -- i.e. the comparison is genuinely actionable)
+    # gates this; whether `claims` is empty, non-empty, or the draft is
+    # truncated/unusable text plays no part in the decision below.
+    synthesized = _synthesize_comparison_answer(cmp_note)
+    if synthesized is not None:
+        setattr(team, _COMPARISON_RECONCILE_FLAG, True)
+        if claims:
+            # A real claim exists and is being overridden -- durably record
+            # the contradiction exactly as Phase E always has.
+            await _persist_completeness_claim(
+                team, claims[0],
+                "contradicted" if existence_contradicted else "unresolved")
+        print(f"[team] DETERMINISTIC_COMPARISON_GATE_FIRED: "
+              f"match={summary['matched']} partial_match={summary['partial_match']} "
+              f"left_only={summary['left_only']} right_only={summary['right_only']} "
+              f"ambiguous={summary['ambiguous']} "
+              f"model_made_completeness_claim={bool(claims)} "
+              f"generative_reconciliation_bypassed=True", flush=True)
+        return synthesized, result, True
+
     if not claims:
-        # The draft never claimed completeness in the first place -- e.g. it
-        # already said "6 endpoints have no hook". Nothing to reconcile, and
-        # nothing to persist -- there is no assertion to validate, so no Claim
-        # row is written (not persisted as "unverifiable": that would imply an
-        # assertion existed when none did).
+        # Not synthesis-eligible (missing a category header) AND the draft
+        # never claimed completeness in the first place -- e.g. it already
+        # said "6 endpoints have no hook", or honestly disclosed it could
+        # not tell. Nothing for the generative fallback below to anchor a
+        # retry prompt on (it needs an actual claim sentence to quote), and
+        # no deterministic template is available either. Normal handling:
+        # content ships as-is, nothing persisted (not "unverifiable" --
+        # that would imply an assertion existed when none did).
         return content, result, False
 
     setattr(team, _COMPARISON_RECONCILE_FLAG, True)
@@ -4961,31 +4999,6 @@ async def _reconcile_completeness_claim_with_comparison(
     # into either verdict.
     await _persist_completeness_claim(
         team, claims[0], "contradicted" if existence_contradicted else "unresolved")
-
-    # T13b POC (2026-10-02): try Phase L's deterministic template FIRST, before
-    # ever re-invoking the model. _attempt_evidence_grounded_reconstruction
-    # already does exactly this for the separate VERIFICATION-FAILED recovery
-    # path (see _synthesize_comparison_answer's own docstring, "K4") -- this
-    # call site never got the same treatment, so a completeness-claim
-    # contradiction still paid for a full generative re-ask even when the
-    # comparison note was fully synthesis-eligible. Live on T13b: that re-ask
-    # is a second free-form generation competing with the same repetition-
-    # decay mechanism that corrupted the original draft, and it is the reason
-    # a correct, already-computed answer (compare_enumerations' own gap list)
-    # shipped truncated/un-synthesized instead of clean. Returns None, exactly
-    # as _attempt_evidence_grounded_reconstruction's call already treats it,
-    # when the note is missing a category header (e.g. this module's own
-    # GAP_CMP_NOTE test fixture, which only ever carries LEFT ONLY + TOTALS)
-    # -- in which case nothing below changes and the existing _stream_team_run
-    # retry still runs exactly as before this change.
-    synthesized = _synthesize_comparison_answer(cmp_note)
-    if synthesized is not None:
-        print(f"[team] comparison reconciliation: deterministic synthesis available "
-              f"(match={summary['matched']} partial_match={summary['partial_match']} "
-              f"left_only={left_only} right_only={right_only} "
-              f"ambiguous={summary['ambiguous']}) — releasing the templated answer "
-              f"with no further model call", flush=True)
-        return synthesized, result, True
 
     if existence_contradicted:
         existence_line = (
