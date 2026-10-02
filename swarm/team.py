@@ -246,6 +246,31 @@ _COORDINATOR_INSTRUCTIONS = [
     "  the model generated was byte-identical to the pre-instruction baseline, so",
     "  telling the model to phrase things differently did not change what it phrased.",
     "",
+    "── PHASE Z27 (2026-10-01) — required_capabilities for DB-required tasks ──",
+    "  Any delegation whose objective requires a LIVE DATABASE fact — a row count, a",
+    "  current column value, 'how many', schema inspection, or an explicit db_query/",
+    "  db_schema call — MUST include required_capabilities=['db_query', 'db_schema']",
+    "  on that delegate_structured_task call, alongside the other fields. Example:",
+    "    delegate_structured_task(member_id='researcher',",
+    "                              target='inventory.parties table',",
+    "                              objective='Count the rows in inventory.parties using",
+    "                               a live database query.',",
+    "                              evidence_required='the exact row count returned',",
+    "                              completion_criteria='the count has been retrieved',",
+    "                              required_capabilities=['db_query', 'db_schema'])",
+    "  The runtime validates this against the target member's real tools BEFORE any work",
+    "  begins and REJECTS the call if the member lacks both — so if you aren't sure which",
+    "  member currently holds db_query/db_schema, set required_capabilities anyway and let",
+    "  the rejection message tell you who actually qualifies, rather than guessing from the",
+    "  member's name or role description alone. A member whose role sounds execution-",
+    "  oriented is not a reason to skip this field — route by declared capability, not by",
+    "  how the task is worded. This closes a real historical failure (2026-09-01, 'T8'): a",
+    "  task phrased as 'Call db_query(...) and return its raw output verbatim' was delegated",
+    "  to a member with no db_query tool at all, which could not comply no matter how the",
+    "  request was reworded, and confidently reported the database itself was unavailable.",
+    "  Omit required_capabilities entirely for a delegation that does not need live",
+    "  database access — this field changes nothing for any other kind of task.",
+    "",
     "── PHASE Z10 (2026-09-26) — objective wording: bounded vs exhaustive ────",
     "  When the delegation's target is a shared file/directory that contains material for",
     "  MANY features, not just the one this task is actually about (e.g. one models.py",
@@ -3717,9 +3742,12 @@ _DB_EVIDENCE_RETRY_INSTRUCTION = (
     "-- this is a capability mismatch, not a wording problem. Before delegating "
     "again, check the team roster above for the member whose tools include "
     "db_query/db_schema, and delegate this task to THAT member -- do not delegate "
-    "it to the same member as before. Call db_query/db_schema now and base your "
-    "answer on their actual output — do not answer from a file grep or a guess "
-    "about what the schema contains."
+    "it to the same member as before. This time, include "
+    "required_capabilities=['db_query', 'db_schema'] on the delegate_structured_task "
+    "call (see PHASE Z27 above) so the runtime rejects it up front if you pick wrong "
+    "again, instead of letting another incapable attempt run to completion. Call "
+    "db_query/db_schema now and base your answer on their actual output — do not "
+    "answer from a file grep or a guess about what the schema contains."
 )
 
 
