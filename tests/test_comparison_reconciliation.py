@@ -273,6 +273,74 @@ def test_retry_returning_nothing_keeps_the_draft(monkeypatch):
     assert content == NO_GAPS_CLAIM_CONTENT
 
 
+T13B_FULL_GAP_CMP_NOTE = (
+    "\n\n---\n**THE COMPARISON, COMPUTED — the answer above states a "
+    "relationship between two files; this is that same relationship worked "
+    "out by string match over both, not by reading and comparing. Where the "
+    "two disagree, trust this one.**\n```\n"
+    "compare_enumerations — API/inventory-service/router/vouchers_api.py  vs  "
+    "Client/.../inventory/inventoryApi.ts\n"
+    "join: HTTP method + path-boundary suffix match (exact string, no inference)\n"
+    "\n"
+    "MATCHED (3):\n"
+    "  GET /vouchers   <->   /api/inventoryservice/vouchers?${qs}\n"
+    "  GET /vouchers/{voucher_id}   <->   /api/inventoryservice/vouchers/${id}\n"
+    "  POST /vouchers   <->   /api/inventoryservice/vouchers\n"
+    "\n"
+    "PARTIAL MATCHES (2):\n"
+    "  /vouchers/{}/post   PUT /vouchers/{voucher_id}/post  <->  "
+    "POST /api/inventoryservice/vouchers/${id}/post   (http_method: PUT != POST)\n"
+    "  /vouchers/{}/cancel   PUT /vouchers/{voucher_id}/cancel  <->  "
+    "POST /api/inventoryservice/vouchers/${id}/cancel   (http_method: PUT != POST)\n"
+    "\n"
+    "AMBIGUOUS (0):\n"
+    "  (none)\n"
+    "\n"
+    "LEFT ONLY — defined on the left with no match on the right (4):\n"
+    "  POST /vouchers/grn/{po_id}\n"
+    "  POST /vouchers/credit-note/{invoice_id}\n"
+    "  POST /vouchers/stock-adjustment\n"
+    "  POST /vouchers/stock-transfer\n"
+    "\n"
+    "RIGHT ONLY — present on the right with no match on the left (43):\n"
+    "  GET /api/inventoryservice/categories\n"
+    "\n"
+    "TOTALS: left 9, right 48, matched 3, left-only 4, right-only 43.\n"
+    "```"
+)
+
+
+def test_t13b_full_comparison_note_synthesizes_deterministically_no_model_call(monkeypatch):
+    """The T13b POC (2026-10-02): when cmp_note carries all five real
+    compare_enumerations category headers, the reconciliation must release
+    Phase L's templated answer directly -- _stream_team_run must NEVER be
+    called, so the result cannot be corrupted by a second generative pass
+    (the exact mechanism that truncated the real T13b answer)."""
+    async def fake_stream(*a, **k):
+        raise AssertionError(
+            "must not re-invoke the model when the comparison note is "
+            "fully synthesis-eligible -- the deterministic template must "
+            "be used instead")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+    all_results = [None]
+    content, result, reconciled = _run(_reconcile_completeness_claim_with_comparison(
+        "### Vouchers Module Audit\n\nNo gaps exist.",
+        "Audit the vouchers module...", _Team(), all_results, None,
+        None, T13B_FULL_GAP_CMP_NOTE, False))
+    assert reconciled is True
+    assert "No gaps exist" not in content
+    # The four real gaps, copied verbatim from the tool's own output.
+    assert "POST /vouchers/grn/{po_id}" in content
+    assert "POST /vouchers/credit-note/{invoice_id}" in content
+    assert "POST /vouchers/stock-adjustment" in content
+    assert "POST /vouchers/stock-transfer" in content
+    # The PARTIAL_MATCH items must appear in their own section, never folded
+    # into the LEFT_ONLY list (the historical PUT/POST conflation defect).
+    assert "PARTIAL_MATCH" in content
+    assert "LEFT_ONLY" in content
+
+
 def test_retry_exception_keeps_the_draft(monkeypatch):
     async def fake_stream(*a, **k):
         raise RuntimeError("connection dropped")

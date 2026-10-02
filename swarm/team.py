@@ -4961,6 +4961,32 @@ async def _reconcile_completeness_claim_with_comparison(
     # into either verdict.
     await _persist_completeness_claim(
         team, claims[0], "contradicted" if existence_contradicted else "unresolved")
+
+    # T13b POC (2026-10-02): try Phase L's deterministic template FIRST, before
+    # ever re-invoking the model. _attempt_evidence_grounded_reconstruction
+    # already does exactly this for the separate VERIFICATION-FAILED recovery
+    # path (see _synthesize_comparison_answer's own docstring, "K4") -- this
+    # call site never got the same treatment, so a completeness-claim
+    # contradiction still paid for a full generative re-ask even when the
+    # comparison note was fully synthesis-eligible. Live on T13b: that re-ask
+    # is a second free-form generation competing with the same repetition-
+    # decay mechanism that corrupted the original draft, and it is the reason
+    # a correct, already-computed answer (compare_enumerations' own gap list)
+    # shipped truncated/un-synthesized instead of clean. Returns None, exactly
+    # as _attempt_evidence_grounded_reconstruction's call already treats it,
+    # when the note is missing a category header (e.g. this module's own
+    # GAP_CMP_NOTE test fixture, which only ever carries LEFT ONLY + TOTALS)
+    # -- in which case nothing below changes and the existing _stream_team_run
+    # retry still runs exactly as before this change.
+    synthesized = _synthesize_comparison_answer(cmp_note)
+    if synthesized is not None:
+        print(f"[team] comparison reconciliation: deterministic synthesis available "
+              f"(match={summary['matched']} partial_match={summary['partial_match']} "
+              f"left_only={left_only} right_only={right_only} "
+              f"ambiguous={summary['ambiguous']}) — releasing the templated answer "
+              f"with no further model call", flush=True)
+        return synthesized, result, True
+
     if existence_contradicted:
         existence_line = (
             f"compare_enumerations -- a deterministic tool, not a re-read -- found "
