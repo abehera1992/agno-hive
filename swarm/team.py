@@ -5321,6 +5321,18 @@ def _make_member_control_box_hook(role: str | None = None):
     async def _control_box_hook(function_name, function, args, agent=None,
                                  team=None, run_context=None):
         who = role or getattr(agent, "name", None) or "Coordinator"
+        # Phase B.1 forensics (2026-10-02): TEMPORARY diagnostic, unconditional,
+        # to establish live values -- not a behavior change, remove once the
+        # registration/invocation lifecycle is confirmed. Suspected cause:
+        # Function._team (what agno's _build_hook_args supplies as this
+        # hook's own `team` kwarg) is copied from agent._team at TOOL-WIRING
+        # time inside make_agent_from_spec/make_researcher, which runs BEFORE
+        # the agent is ever added to Team(members=[...]) -- so that copy may
+        # be permanently frozen at None for a member's own tools, unlike
+        # agent._team itself, read fresh here.
+        print(f"[team] CONTROL_BOX_DIAG: who={who!r} function_name={function_name!r} "
+              f"team_kwarg_is_none={team is None} agent_is_none={agent is None} "
+              f"agent_team_attr={getattr(agent, '_team', 'NO_ATTR')!r}", flush=True)
         before = _control_box_state_fingerprint(team) if team is not None else (0, 0, 0, 0)
         result = await function(**args)
         if team is not None:
