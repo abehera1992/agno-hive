@@ -5402,11 +5402,26 @@ def _record_evidence_from_observation(ledger: "_EvidenceLedger", function_name: 
                 _add("file_read", str(path), int(line_s), None, name)
     elif function_name in ("search_files", "search_files_batch"):
         pattern = (args or {}).get("pattern")
-        for line in text.splitlines()[:_MAX_EVIDENCE_RECORDS_PER_CALL]:
-            m = _SEARCH_HIT_RE.match(line)
-            if not m:
-                continue
-            _add("lexical_search", m.group(1), int(m.group(2)), pattern, m.group(3))
+        stripped = text.strip()
+        # A genuine zero-hit search (C.5 live-validation fix, found running this
+        # phase's own battery on the pre-fix code: a correctly-answered NEGATIVE
+        # claim -- 8 real search_files calls, all confirming absence -- produced
+        # ZERO EvidenceRecords under the pre-fix logic below, which only ever
+        # added a record for a MATCHING line. That false-triggered
+        # _completion_decision's INSUFFICIENT_EVIDENCE gate on an answer that was
+        # actually well-evidenced. The absence itself is the evidence for a
+        # negative claim, so it is recorded as one real_record: no source_path/
+        # line (there is no file to point at), but a real observation all the
+        # same -- same prefix check C.3's own _is_empty_lexical_search_result
+        # already uses, reused by name rather than re-derived.
+        if (not stripped) or stripped.startswith(_EMPTY_LEXICAL_RESULT_PREFIXES):
+            _add("lexical_search", None, None, pattern, stripped[:_EVIDENCE_EXCERPT_CHARS])
+        else:
+            for line in text.splitlines()[:_MAX_EVIDENCE_RECORDS_PER_CALL]:
+                m = _SEARCH_HIT_RE.match(line)
+                if not m:
+                    continue
+                _add("lexical_search", m.group(1), int(m.group(2)), pattern, m.group(3))
     elif function_name == "lightrag_query":
         query = (args or {}).get("query")
         if text and not text.strip().lower().startswith(("no ", "error", "invalid")):
