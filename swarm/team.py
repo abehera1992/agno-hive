@@ -15315,40 +15315,70 @@ def _install_structured_delegation_interception():
 _install_structured_delegation_interception()
 
 
-# Phase C.3 (2026-10-03) -- TEMPORARY, READ-ONLY instrumentation. C.1 proved
-# share_member_interactions=True feeds EVERY prior member interaction this
-# run into every subsequent delegation's prompt (agno.utils.team.
-# get_team_member_interactions_str, called with no max_interactions bound
-# anywhere in this codebase's own call chain), and that agno's own fallback
+# Phase C.3 (2026-10-03). C.1 proved share_member_interactions=True feeds
+# EVERY prior member interaction this run into every subsequent delegation's
+# prompt (agno.utils.team.get_team_member_interactions_str, called by agno's
+# own _determine_team_member_interactions with no max_interactions bound
+# anywhere in this codebase's call chain -- confirmed, agno/team/_tools.py's
+# own call site never passes it), and that agno's own fallback
 # (interaction.content or ",".join(tool contents)) can embed raw tool output
-# when a member's own final content is empty -- but this codebase logs
-# NONE of team_run_context["member_responses"]'s actual contents, so C.1
-# could not identify WHICH interaction(s) caused T12's proven ~20.9K ->
-# ~110K token jump. This measures it directly, per the same
-# _patched_agno_get_delegate_task_function pattern already used for B.7/
-# Phase S.2 (patch the NAME as _tools.py's own module namespace holds it --
-# `from agno.utils.team import get_team_member_interactions_str` binds a
-# local name at import time, so patching agno.utils.team's own attribute
-# afterward would never be seen by _tools.py's call site). Calls straight
-# through to the REAL, unmodified function for the returned string -- never
-# alters behavior, only observes it. Remove once the root cause is
-# confirmed and the real fix is implemented and validated (Phase C.3's own
-# hard rule: temporary instrumentation, not a permanent diagnostic).
-_MEMBER_INTERACTIONS_DIAG_MARKER = "_ekam_member_interactions_diag_patch"
+# when a member's own final content is empty. Temporary read-only
+# instrumentation (this same function, first deployed diagnostic-only,
+# commit 48d6974) measured the real, live shape of this for the first time:
+# a 2-delegation T12 run forwarded 1 interaction at 2,008 serialized chars
+# (content_present=True, tool_output_chars=0) -- small and bounded in the
+# common case, but UNBOUNDED BY CONSTRUCTION as delegation count grows,
+# exactly matching C.1's proven mechanism for the historical 8-delegation
+# run that reached ~110K tokens. This confirms (does not merely assume) the
+# fix must act on INTERACTION COUNT, not an invented token threshold --
+# `max_interactions` is agno's own, already-tested parameter for exactly
+# this ("only include the most recent N interactions"); bounding here uses
+# agno's own mechanism, not a new truncation scheme.
+#
+# Bound chosen: 3. Smallest count that still lets a realistic 3-member relay
+# (Researcher -> Coder -> Reviewer) each see the step immediately before its
+# own -- the Jev-like "minimum required for coordination" principle this
+# phase was asked to apply -- while being far short of the 7+ accumulated
+# interactions C.1 proved caused the T12 explosion. Older interactions are
+# dropped entirely (never summarized/compacted) rather than kept in any
+# form: this phase's own hard rules forbid inventing a compaction scheme,
+# and agno's own `max_interactions` already implements "most recent N" as a
+# first-class, pre-existing capability -- reusing it is the smaller change.
+#
+# Patches agno.team._tools.get_team_member_interactions_str -- the NAME as
+# that module's own namespace holds it, not agno.utils.team's (`from
+# agno.utils.team import get_team_member_interactions_str` binds a LOCAL
+# name in _tools.py at import time, so patching agno.utils.team's own
+# attribute afterward would never be seen by _tools.py's call site; same
+# lesson already applied to the pre-existing _get_delegate_task_function
+# patch). Observability is retained (now proving the bound is actually
+# applied, not just measuring the defect) rather than removed -- this phase
+# explicitly asked for a deterministic, OBSERVABLE compaction.
+_MAX_FORWARDED_MEMBER_INTERACTIONS = 3
+_MEMBER_INTERACTIONS_PATCH_MARKER = "_ekam_member_interactions_patch"
 _ORIGINAL_AGNO_GET_TEAM_MEMBER_INTERACTIONS_STR = None
 
 
-def _diagnostic_get_team_member_interactions_str(team_run_context, max_interactions=None):
+def _bounded_get_team_member_interactions_str(team_run_context, max_interactions=None):
+    """Replaces agno's own get_team_member_interactions_str call site.
+    Ignores a non-None `max_interactions` from the caller (agno's real call
+    site never passes one, so this only matters for a future agno version
+    that might) only to the extent of taking whichever bound is SMALLER --
+    never widening what a future caller explicitly asked to narrow further.
+    """
+    total_available = len((team_run_context or {}).get("member_responses") or [])
+    effective_bound = (_MAX_FORWARDED_MEMBER_INTERACTIONS if max_interactions is None
+                        else min(max_interactions, _MAX_FORWARDED_MEMBER_INTERACTIONS))
     result = _ORIGINAL_AGNO_GET_TEAM_MEMBER_INTERACTIONS_STR(
-        team_run_context=team_run_context, max_interactions=max_interactions)
+        team_run_context=team_run_context, max_interactions=effective_bound)
     try:
         responses = (team_run_context or {}).get("member_responses") or []
+        forwarded = responses[-effective_bound:] if effective_bound else []
         total_serialized = len(result) if isinstance(result, str) else 0
         detail = []
-        for interaction in responses:
+        for interaction in forwarded:
             rr = interaction.get("run_response")
             member_name = interaction.get("member_name", "?")
-            task_chars = len(interaction.get("task") or "")
             content_present = False
             content_chars = 0
             tool_output_chars = 0
@@ -15364,34 +15394,33 @@ def _diagnostic_get_team_member_interactions_str(team_run_context, max_interacti
                 except Exception:
                     pass
             detail.append({
-                "member": member_name, "task_chars": task_chars,
-                "content_present": content_present, "content_chars": content_chars,
-                "tool_output_chars": tool_output_chars,
+                "member": member_name, "content_present": content_present,
+                "content_chars": content_chars, "tool_output_chars": tool_output_chars,
             })
-        print(f"[team] MEMBER_INTERACTIONS_DIAG: {len(responses)} interaction(s) "
-              f"forwarded, serialized_chars={total_serialized}, detail={detail}",
-              flush=True)
-    except Exception as exc:  # noqa: BLE001 -- measurement must never break a real call
-        print(f"[team] MEMBER_INTERACTIONS_DIAG: measurement failed (non-fatal): "
+        print(f"[team] MEMBER_INTERACTIONS_BOUNDED: {total_available} available, "
+              f"{len(forwarded)} forwarded (bound={effective_bound}), "
+              f"serialized_chars={total_serialized}, detail={detail}", flush=True)
+    except Exception as exc:  # noqa: BLE001 -- observability must never break a real call
+        print(f"[team] MEMBER_INTERACTIONS_BOUNDED: measurement failed (non-fatal): "
               f"{exc!r}", flush=True)
     return result
 
 
-setattr(_diagnostic_get_team_member_interactions_str, _MEMBER_INTERACTIONS_DIAG_MARKER, True)
+setattr(_bounded_get_team_member_interactions_str, _MEMBER_INTERACTIONS_PATCH_MARKER, True)
 
 
-def _install_member_interactions_diagnostic():
+def _install_bounded_member_interactions():
     global _ORIGINAL_AGNO_GET_TEAM_MEMBER_INTERACTIONS_STR
     import agno.team._tools as _agno_team_tools
 
     current = _agno_team_tools.get_team_member_interactions_str
-    if getattr(current, _MEMBER_INTERACTIONS_DIAG_MARKER, False):
+    if getattr(current, _MEMBER_INTERACTIONS_PATCH_MARKER, False):
         return
     _ORIGINAL_AGNO_GET_TEAM_MEMBER_INTERACTIONS_STR = current
-    _agno_team_tools.get_team_member_interactions_str = _diagnostic_get_team_member_interactions_str
+    _agno_team_tools.get_team_member_interactions_str = _bounded_get_team_member_interactions_str
 
 
-_install_member_interactions_diagnostic()
+_install_bounded_member_interactions()
 
 
 def _build_team(
