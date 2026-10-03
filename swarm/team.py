@@ -17535,6 +17535,12 @@ async def run_task_stream(
         # accumulated transcript (which interleaves every agent's own pre-tool-call
         # narration with the real final answer).
         last_segment_start = 0
+        # See _isolate_contaminated_fallback's own docstring (the T9 concurrent-source
+        # fix) for why these two sets exist: segment_agent_names tracks who contributed
+        # since the last tool-call boundary (reset alongside last_segment_start),
+        # run_agent_names tracks the whole run and is never reset.
+        segment_agent_names: set[str] = set()
+        run_agent_names: set[str] = set()
         final_run_output: "TeamRunOutput | None" = None
 
         with _tracer.start_as_current_span("agno.task.stream", attributes={
@@ -17582,6 +17588,9 @@ async def run_task_stream(
                     out = _stream_event_to_chunk(event, team)
                     if isinstance(out, str):
                         full_content.append(out)
+                        _src = getattr(event, "agent_name", "") or ""
+                        segment_agent_names.add(_src)
+                        run_agent_names.add(_src)
                         yield out
                     elif isinstance(out, dict) and out.get("__run_error__"):
                         raise _BackendRunError(out["message"])
@@ -17589,8 +17598,11 @@ async def run_task_stream(
                         if _consume_stream_event(team, out):
                             yield out
                         last_segment_start = len(full_content)
+                        segment_agent_names = set()
                 accumulated = "".join(full_content) or "(no response)"
                 final_segment = "".join(full_content[last_segment_start:]).strip()
+                final_segment, accumulated = _isolate_contaminated_fallback(
+                    final_segment, accumulated, segment_agent_names, run_agent_names, team)
                 combined = _with_forwarded_evidence(_first_surviving_answer(
                     final_run_output.content if final_run_output else None,
                     final_segment,
@@ -20371,6 +20383,74 @@ def render_member_findings(results) -> str:
             "unedited, not a re-derivation.**" + "".join(parts))
 
 
+# T9 (2026-10-03, live production): a collaborate-mode run (parallel-review) had its
+# Coordinator exhaust its tool-call budget before producing real final content, which
+# forced the transcript-reconstruction fallback below (final_segment/accumulated, built
+# from the single shared `full_content` list every caller of _stream_event_to_chunk
+# appends every text chunk to, regardless of which agent produced it). Researcher and
+# SecurityReviewer were streaming CONCURRENTLY under collaborate mode, so their chunks
+# arrived interleaved in the SAME window, and the flat join reconstructed them
+# token-by-token-interleaved ("I'll reviewI the'll authentication help you endpoints
+# review...") -- confirmed by direct comparison against each member's own isolated text
+# in team._member_results, which was never interleaved because _finalise_member_chunks
+# buffers per-agent_name, keyed, never concatenated across members.
+#
+# The violated invariant: full_content is written by every concurrently-streaming
+# source without attribution, then naively joined and trusted as one coherent
+# transcript. The existing last_segment_start reset (same file, see its own docstring)
+# only guards against a DIFFERENT, sequential failure (one agent's own pre-tool-call
+# narration leaking into its own later answer) -- it has no concept of a SECOND live
+# source writing into the same window, so it does nothing here.
+#
+# This is a no-op for the dominant case (sequential coordinate-mode teams: engineering,
+# sprint-master, planning): only one named agent is ever actively streaming between two
+# tool-call boundaries there, so segment/run agent-name sets never exceed size 1. It
+# only engages when 2+ DISTINCT named members contributed content chunks without an
+# intervening tool-call boundary -- structurally only possible under concurrent
+# execution (collaborate mode today; any future broadcast/parallel path tomorrow) --
+# never a text-pattern or task-specific heuristic.
+def _isolate_contaminated_fallback(
+    final_segment: str, accumulated: str,
+    segment_agent_names: set[str], run_agent_names: set[str], team,
+) -> tuple[str, str]:
+    """Rebuilds final_segment/accumulated from the source-isolated team._member_results
+    store (the SAME data render_member_findings already renders for the post-hoc
+    recovery disclosure) whenever more than one distinct named member contributed
+    content chunks into the respective window -- instead of trusting the flat,
+    unattributed full_content join, which event-arrival order can interleave
+    token-by-token across concurrent sources.
+
+    Each candidate (final_segment, accumulated) is checked against its OWN window's
+    agent-name set: final_segment only spans the segment since the last tool-call
+    boundary (segment_agent_names), accumulated spans the whole run
+    (run_agent_names) -- a candidate whose own window never saw two live sources is
+    returned unchanged.
+
+    Never fabricates content: when team._member_results has nothing usable either,
+    returns an explicit unavailable-synthesis string rather than silently falling
+    back to the still-contaminated original.
+    """
+    isolated_cache: list[str] = []
+
+    def _isolated() -> str:
+        if not isolated_cache:
+            text = render_member_findings(getattr(team, "_member_results", None)) or (
+                "(synthesis unavailable: concurrent member outputs could not be "
+                "safely merged into a single answer)"
+            )
+            isolated_cache.append(text)
+        return isolated_cache[0]
+
+    if len({n for n in segment_agent_names if n}) > 1:
+        print(f"[team] MULTI_SOURCE_SEGMENT_ISOLATED: {sorted(n for n in segment_agent_names if n)} "
+              f"contributed to the same uninterrupted segment -- using source-isolated "
+              f"member results instead of the contaminated flat join", flush=True)
+        final_segment = _isolated()
+    if len({n for n in run_agent_names if n}) > 1:
+        accumulated = _isolated()
+    return final_segment, accumulated
+
+
 def _member_findings_as_candidate(team) -> str:
     """Phase C.2: the single most substantial member finding, as a STAND-ALONE
     candidate answer -- not framed as a disclosure footnote the way
@@ -21536,6 +21616,12 @@ async def _stream_team_run(
     # the last tool call, from any agent. See this function's own docstring for the
     # narration-leak incident this exists to fix.
     last_segment_start = 0
+    # See _isolate_contaminated_fallback's own docstring (the T9 concurrent-source fix)
+    # for why these two sets exist: segment_agent_names tracks who contributed since the
+    # last tool-call boundary (reset alongside last_segment_start), run_agent_names
+    # tracks the whole run and is never reset.
+    segment_agent_names: set[str] = set()
+    run_agent_names: set[str] = set()
     final_run_output: "TeamRunOutput | None" = None
     last_logged_len = 0
     last_logged_at = time.monotonic()
@@ -21587,6 +21673,9 @@ async def _stream_team_run(
                 # is MODEL_GENERATING, not WORKFLOW_STALLED, even though it earns zero
                 # progress credit).
                 full_content.append(out)
+                _src = getattr(event, "agent_name", "") or ""
+                segment_agent_names.add(_src)
+                run_agent_names.add(_src)
                 now = time.monotonic()
                 activity["last_token_at"] = now
                 if now - last_logged_at >= 10:
@@ -21682,6 +21771,7 @@ async def _stream_team_run(
                 if _consume_stream_event(team, out):
                     print(f"[{log_label}] {_stream_event_log_line(out)}", flush=True)
                 last_segment_start = len(full_content)
+                segment_agent_names = set()
             else:
                 _log_unclassified_stream_event(log_label, event, unrecognized_event_counts)
     finally:
@@ -21711,6 +21801,8 @@ async def _stream_team_run(
     if repetition_stopped:
         accumulated = accumulated[:last_good_len].strip() or "(no response)"
         final_segment = accumulated
+    final_segment, accumulated = _isolate_contaminated_fallback(
+        final_segment, accumulated, segment_agent_names, run_agent_names, team)
     content = _with_forwarded_evidence(_first_surviving_answer(
         final_run_output.content if final_run_output else None,
         final_segment,
@@ -22146,6 +22238,13 @@ async def run_task_async(
                     # prefer just the text generated SINCE the last tool call, not the whole
                     # run's accumulated transcript.
                     last_segment_start = 0
+                    # See _isolate_contaminated_fallback's own docstring (the T9
+                    # concurrent-source fix) for why these two sets exist:
+                    # segment_agent_names tracks who contributed since the last
+                    # tool-call boundary (reset alongside last_segment_start),
+                    # run_agent_names tracks the whole run and is never reset.
+                    segment_agent_names: set[str] = set()
+                    run_agent_names: set[str] = set()
                     try:
                         # Consuming the stream internally (2026-08-10) instead of one opaque
                         # blocking team.arun(task) -- external behavior (return type, downstream
@@ -22189,6 +22288,9 @@ async def run_task_async(
                                 # updated unconditionally below, for the same reason
                                 # _stream_team_run's identical block documents.
                                 full_content.append(out)
+                                _src = getattr(event, "agent_name", "") or ""
+                                segment_agent_names.add(_src)
+                                run_agent_names.add(_src)
                                 now = time.monotonic()
                                 activity["last_token_at"] = now
                                 if now - last_logged_at >= 10:
@@ -22264,6 +22366,7 @@ async def run_task_async(
                                 if _consume_stream_event(team, out):
                                     print(f"[team] {_stream_event_log_line(out)}", flush=True)
                                 last_segment_start = len(full_content)
+                                segment_agent_names = set()
                             else:
                                 # Diagnostic (2026-08-10, revised): the first version of this
                                 # logged each unique event.event TYPE once -- but a live run
@@ -22319,6 +22422,8 @@ async def run_task_async(
                     # _complete_repetition_truncated_answer, the one place this is read,
                     # for the bounded one-shot completion attempt this enables.
                     setattr(team, "_repetition_truncated", True)
+                final_segment, accumulated = _isolate_contaminated_fallback(
+                    final_segment, accumulated, segment_agent_names, run_agent_names, team)
                 content = _with_forwarded_evidence(_first_surviving_answer(
                     final_run_output.content if final_run_output else None,
                     final_segment,
