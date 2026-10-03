@@ -7818,7 +7818,23 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # two shape-based versions this replaces and the runs that defeated each.
     _cmp_available = (_rs_enum.get("max_enumerable", 0)
                       if isinstance(_rs_enum, dict) else 0)
-    missing_cmp = _under_answered_comparison(content, task, _cmp_available)
+    # Phase C.2 live-validation fix: when _reconcile_completeness_claim_with_
+    # comparison already adopted a deterministic, authoritative synthesis this
+    # call (_COMPARISON_RECONCILE_FLAG set), content is already the adopted
+    # answer -- skip this guard ENTIRELY rather than re-evaluating it. Proven
+    # live (T13b): the deterministic synthesis's own output (plain indented
+    # "  GET /vouchers" lines) does not match _LIST_LINE_RE's bullet/numbered
+    # shape at all, so this guard's crude line-count heuristic misread an
+    # already-correct, already-authoritative answer as under-enumerated,
+    # spent an unnecessary retry (correctly rejected, but wasted ~90s), and
+    # appended a stale disclosure banner onto content that needed none. This
+    # guard was never designed to grade the deterministic synthesis's own
+    # format; once that mechanism has already delivered the authoritative
+    # answer, the generalized invariant this phase introduces -- "once
+    # adopted, downstream synthesis uses the adopted answer" -- applies to
+    # this guard too.
+    missing_cmp = (None if getattr(team, _COMPARISON_RECONCILE_FLAG, False)
+                   else _under_answered_comparison(content, task, _cmp_available))
     if missing_cmp is not None:
         # Phase C.2: this guard had NO correction path at all before this change
         # (C.1's T13a proof: raw lines appended, wrong draft still shipped) --

@@ -274,6 +274,31 @@ def test_t13a_shaped_comparison_gap_falls_back_to_disclosure_when_retry_unground
     assert "BOTH SIDES WERE NOT ENUMERATED" in out
 
 
+def test_t13b_deterministic_synthesis_skips_the_comparison_guard_entirely(monkeypatch):
+    """Live-validation finding (2026-10-03): once _reconcile_completeness_
+    claim_with_comparison's deterministic synthesis has already adopted an
+    authoritative answer this call (_COMPARISON_RECONCILE_FLAG set), the
+    under-answered-comparison guard must not re-evaluate it at all -- not
+    retry, not disclose. The deterministic synthesis's own plain-indented
+    format does not match _LIST_LINE_RE's bullet/numbered shape, so without
+    this skip the guard misreads an already-correct answer as under-
+    enumerated and spends an unnecessary retry on top of it."""
+    team = _comparison_team(_salient_tokens("irrelevant"))
+    setattr(team, team_mod._COMPARISON_RECONCILE_FLAG, True)
+
+    async def fake_stream(*a, **k):
+        raise AssertionError("must not retry once the deterministic synthesis "
+                              "already adopted this call")
+
+    monkeypatch.setattr(team_mod, "_stream_team_run", fake_stream)
+
+    out = _run(_verified_answer(
+        "Only /widgets/0 is exposed.", T13A_TASK, team, None, result=None))
+
+    assert "BOTH SIDES WERE NOT ENUMERATED" not in out
+    assert out.startswith("Only /widgets/0 is exposed.")
+
+
 def test_t13a_retry_not_attempted_when_budget_already_spent(monkeypatch):
     """When an earlier guard this same call already spent the shared retry
     budget, the new T13a wiring must not attempt a second one -- the existing
