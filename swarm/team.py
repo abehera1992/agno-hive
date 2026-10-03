@@ -12792,7 +12792,34 @@ def _make_decompose_first_gate_hook(task: str | None, researcher_member_id: str 
 
 
 _BROWSE_TOOL_NAMES = {"list_directory_tree", "find_files", "get_file_content"}
-_SEARCH_TOOL_NAMES = {"search_files", "lightrag_query"}
+# search_files_batch added C.3 (2026-10-03) -- found during the evidence-adequacy
+# investigation to be entirely invisible to this set: a real, frequently-used
+# discovery tool (14 of 106 Researcher discovery actions in the full retained
+# history, second only to get_file_content) that neither satisfied nor was
+# blocked by the search-before-browse gate below, simply because its name was
+# never added when the set was built. Harmless on its own, but it meant the
+# gate's own bookkeeping did not match the real tool surface.
+_SEARCH_TOOL_NAMES = {"search_files", "search_files_batch", "lightrag_query"}
+
+# Lexical search tools report "found nothing" as prose, not an empty string or an
+# exception -- mirrors hive-mcp's own context.py _is_empty_result convention
+# (same prefixes, same reasoning: "No matches for: ..." read as a path or as
+# satisfied evidence is the exact failure this exists to prevent). C.3 (2026-10-03,
+# C.3-PREFLIGHT's live Probe A): Researcher searched for the literal word
+# "verification", search_files correctly reported zero matches (the real term is
+# "KYC" -- confirmed in this project's own CLAUDE.md), and the pre-existing gate
+# below treated that zero-hit call as a fully satisfied search -- same as a real
+# hit -- clearing itself permanently for the rest of the run. The run's own answer
+# was then flagged by a SEPARATE, later guard ("THE ANSWER IS LONGER THAN ITS
+# EVIDENCE") -- evidence of the gap, not a fix for it: that guard fires after
+# synthesis, long after the one moment (right here) a cheap, bounded redirect
+# toward lightrag_query or a different term could still have changed the outcome.
+_EMPTY_LEXICAL_RESULT_PREFIXES = ("No matches", "No files", "Error", "Invalid")
+
+
+def _is_empty_lexical_search_result(result) -> bool:
+    text = _result_text(result).strip()
+    return (not text) or text.startswith(_EMPTY_LEXICAL_RESULT_PREFIXES)
 
 # Z19 (2026-09-28) -- see the task-text tool-naming hint in run_task_async/
 # run_task_stream, right after `instructions` is first composed, for the live
@@ -12913,29 +12940,72 @@ def _make_search_before_browse_gate_hook(task: str | None, researcher_agent_name
     tests/test_gate_team_scoping.py). `teams/sprint-master.yaml`'s equivalent
     agent is named `BacklogResearcher`, not `Researcher`.
     """
-    state = {"searched": False}
+    state = {"searched": False, "empty_lexical_searches": 0, "redirect_count": 0}
 
     async def _search_before_browse_gate_hook(function_name, function, args, agent=None, run_context=None):
         agent_key = getattr(agent, "name", None) or ""
         if agent_key != researcher_agent_name:
             return await function(**args)
         if function_name in _SEARCH_TOOL_NAMES:
-            state["searched"] = True
-            return await function(**args)
+            result = await function(**args)
+            # lightrag_query is the designated escalation target -- any outcome
+            # (including a thin one) counts as the attempt this gate exists to
+            # force, same as before C.3. Its own repeat-query cap (_LIGHTRAG_
+            # QUERY_CAP) bounds how many times it can be called; this gate does
+            # not need a second opinion on that. A LEXICAL search (search_files/
+            # search_files_batch) only counts if it actually found something --
+            # see _is_empty_lexical_search_result's own docstring for the live
+            # incident (C.3-PREFLIGHT Probe A) this distinction exists for.
+            if function_name == "lightrag_query" or not _is_empty_lexical_search_result(result):
+                state["searched"] = True
+            else:
+                state["empty_lexical_searches"] += 1
+            return result
         if function_name not in _BROWSE_TOOL_NAMES:
             return await function(**args)
         if state["searched"] or not _is_multi_part_task(task):
             return await function(**args)
 
+        if not state["empty_lexical_searches"]:
+            # Zero search attempts of ANY kind yet -- original, unconditional
+            # behavior, unchanged by C.3: this is Step 3a's entire point, and
+            # must keep blocking every browse call for as long as it takes.
+            return (
+                f"REDIRECTED: {function_name} was blocked — for a multi-part task, "
+                f"Researcher must run a content search FIRST (search_files(<the "
+                f"checklist item's own key domain term>, '**/*') and/or "
+                f"lightrag_query(<key term>)) before any directory/file browsing. "
+                f"This is what finds the actual owning file directly instead of "
+                f"guessing a service/directory from a domain-name association. Call "
+                f"search_files or lightrag_query now — every browse call after your "
+                f"first search this run will go through normally. This "
+                f"{function_name} call was NOT executed."
+            )
+
+        # At least one lexical search was genuinely tried and came back empty --
+        # one redirect toward escalating, then stand down. Same convention as the
+        # target-resolution gate elsewhere in this module ("Two is enough to
+        # correct a typo and far short of a loop... hit the same wall twice and
+        # gave up"): a second wall hit after the nudge means the term genuinely
+        # isn't in the repo, lightrag_query itself came back thin, or the model is
+        # stuck some other way -- blocking a third time would not produce a
+        # different result, only a stalled run. This bound is what keeps the fix
+        # from trading one failure mode (silent zero-hit pass) for another
+        # (permanent lock-out on a genuinely absent concept).
+        state["redirect_count"] += 1
+        if state["redirect_count"] > 1:
+            state["searched"] = True
+            return await function(**args)
+
         return (
-            f"REDIRECTED: {function_name} was blocked — for a multi-part task, "
-            f"Researcher must run a content search FIRST (search_files(<the checklist "
-            f"item's own key domain term>, '**/*') and/or lightrag_query(<key term>)) "
-            f"before any directory/file browsing. This is what finds the actual owning "
-            f"file directly instead of guessing a service/directory from a domain-name "
-            f"association. Call search_files or lightrag_query now — every browse call "
-            f"after your first search this run will go through normally. This "
-            f"{function_name} call was NOT executed."
+            f"REDIRECTED: {function_name} was blocked — your search so far found "
+            f"NOTHING (a zero-hit lexical search is not the same as having checked). "
+            f"The codebase may use different vocabulary than this task's own wording "
+            f"(a real incident: a task asking about 'verification' needed the term "
+            f"'KYC' instead — the two never appear together). Before browsing, either "
+            f"retry search_files with a genuinely different term, or call "
+            f"lightrag_query(<key term>) for semantic recall across that vocabulary "
+            f"gap. This {function_name} call was NOT executed."
         )
 
     return _search_before_browse_gate_hook
