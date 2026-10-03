@@ -17749,11 +17749,32 @@ def _record_draft(text: str, team=None, run_agent_names: set[str] | None = None)
     # deployed and doing nothing, because it was never reached. Applying the same
     # multi-named-source check here, on every periodic snapshot, closes that gap at
     # its one remaining entry point rather than adding a THIRD, parallel guard.
+    #
+    # Second live miss, same day: the FIRST version of this guard substituted the
+    # isolated reconstruction when available, but fell through to the raw (still
+    # contaminated) `cleaned` text when team._member_results was not yet populated --
+    # which is exactly the common case, since contamination starts WHILE two members
+    # are still mid-generation, before either has finished. That raw snapshot still
+    # became `_best_draft`. The run then stalled on refused tool calls (budget
+    # exhausted) -- no FURTHER content chunk ever arrived, so _record_draft was never
+    # called again, and the one contaminated snapshot survived untouched to the
+    # external SIGKILL recovery. Fix: a contaminated snapshot with no isolated
+    # replacement available yet must be SKIPPED, never recorded raw -- _best_draft
+    # would rather stay shorter (or empty) than ever hold interleaved text, since a
+    # later, larger corrupted snapshot could otherwise still out-grow and overwrite a
+    # smaller clean one under the pre-existing longest-wins rule.
     if cleaned and team is not None and run_agent_names and len(
         {n for n in run_agent_names if n}) > 1:
         isolated = render_member_findings(getattr(team, "_member_results", None))
-        if isolated:
-            cleaned = isolated
+        if not isolated:
+            print(f"[team] DRAFT_SNAPSHOT_SKIPPED: {sorted(n for n in run_agent_names if n)} "
+                  f"contaminated this snapshot and no isolated member_results exist yet -- "
+                  f"not recording a raw contaminated draft", flush=True)
+            return
+        print(f"[team] DRAFT_SNAPSHOT_ISOLATED: {sorted(n for n in run_agent_names if n)} "
+              f"contaminated this snapshot -- recording the source-isolated "
+              f"reconstruction instead of the raw join", flush=True)
+        cleaned = isolated
     if cleaned and len(cleaned) > len(_best_draft):
         _best_draft = cleaned
 
