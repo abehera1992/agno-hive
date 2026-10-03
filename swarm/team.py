@@ -14945,10 +14945,38 @@ def _build_structured_delegation_tool(original_function, team=None):
     which already treats `db_query`/`db_schema` as jointly-sufficient evidence)
     can be validated deterministically against it, independent of delegation
     wording. This wires that proof into the real contract.
+
+    Phase B.7 (2026-10-02): `original_function` is NOT always the singular
+    per-member entrypoint this docstring originally assumed. Agno's own
+    `_get_delegate_task_function` (agno/team/_default_tools.py:1153) branches
+    on `team.delegate_to_all_members` (set from `mode: broadcast` at team
+    init) and returns a DIFFERENT function -- `delegate_task_to_members`/
+    `adelegate_task_to_members` (plural, name="delegate_task_to_members") --
+    whose entrypoint signature is `(task: str)` ONLY, with no `member_id` at
+    all; it resolves `team.members` itself and dispatches to every one of
+    them internally. Calling it with `member_id=...` (the previous
+    unconditional call below) raised `TypeError: ...adelegate_task_to_members()
+    got an unexpected keyword argument 'member_id'` -- proven live, B.6,
+    `parallel-review` (mode=broadcast): `CONTROL_BOX_OBJECTIVE_STARTED` fired
+    correctly (that happens before this call), the TypeError then aborted the
+    generator before `member_agent.run()` was ever reached, so zero tool
+    calls and correctly zero `CONTROL_BOX_ACTION_RECORDED` -- not a Control
+    Box defect, a wrapper/entrypoint contract mismatch (this function assumed
+    every resolved entrypoint accepts `member_id`; it does not).
+
+    `is_broadcast` below is detected from `original_function.name` -- the
+    exact, intrinsic signal agno itself sets when building the Function
+    object (`Function.from_callable(delegate_function, name=...)`) -- never
+    from checking a team's name/type, so this applies uniformly to ANY
+    current or future `mode: broadcast` team, not just `parallel-review`.
     """
     from agno.tools.function import Function
 
     original_entrypoint = original_function.entrypoint
+    # getattr, not a bare attribute read: existing tests' _FakeFunction stand-in
+    # (tests/test_phase_s_structural_delegation.py et al.) has no `.name` at all,
+    # and must keep resolving to the singular (pre-B.7) path unchanged.
+    is_broadcast = getattr(original_function, "name", None) == "delegate_task_to_members"
 
     async def delegate_structured_task(
         member_id: str,
@@ -15040,13 +15068,39 @@ def _build_structured_delegation_tool(original_function, team=None):
         # fingerprint of (target, objective, evidence_required,
         # completion_criteria). Additive only: does not change this
         # function's own return value or control flow.
+        #
+        # Phase B.7: for a broadcast entrypoint, the SAME objective is about
+        # to be dispatched to EVERY resolved member (not just the one
+        # `member_id` the model happened to name -- that value is ignored
+        # for dispatch below, since `delegate_task_to_members` has no
+        # `member_id` parameter at all). Start one objective per REAL
+        # resolved member so each one's own Control Box state exists before
+        # its tool calls arrive -- otherwise every member except whichever
+        # one the model's `member_id` string happened to normalize-match
+        # would hit `_record_member_action`'s `if state is None: return`
+        # (correct per B.5, but would silently drop telemetry for the
+        # other real members doing real work). `_start_member_objective`
+        # itself is untouched -- this only calls it more than once, exactly
+        # as it already supports for any ordinary multi-delegation run.
         if team is not None:
-            _start_member_objective(
-                team, member_id, canonical_hash, objective,
-                evidence_required, completion_criteria)
+            if is_broadcast:
+                for real_member in (getattr(team, "members", None) or []):
+                    real_member_name = getattr(real_member, "name", None)
+                    if real_member_name:
+                        _start_member_objective(
+                            team, real_member_name, canonical_hash, objective,
+                            evidence_required, completion_criteria)
+            else:
+                _start_member_objective(
+                    team, member_id, canonical_hash, objective,
+                    evidence_required, completion_criteria)
 
-        async for item in original_entrypoint(member_id=member_id, task=canonical_task):
-            yield item
+        if is_broadcast:
+            async for item in original_entrypoint(task=canonical_task):
+                yield item
+        else:
+            async for item in original_entrypoint(member_id=member_id, task=canonical_task):
+                yield item
 
     new_function = Function.from_callable(
         delegate_structured_task, name="delegate_structured_task")
