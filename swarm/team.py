@@ -4297,6 +4297,64 @@ def _adopt_retry(label: str, content: str, result, retried: str, retry, member_r
     return content, result
 
 
+_AUTHORITATIVE_CORRECTION_FLAG = "_authoritative_correction_adopted"
+
+
+async def _adopt_authoritative_correction(
+        label: str, content: str, result, candidate: str, candidate_result,
+        team, all_results, *, consumed_llm_call: bool):
+    """Phase C.2: the generalized adoption gate every correction path can share.
+
+    C.1 proved T3 and T13a fail for two DIFFERENT reasons (a gated-off retry and a
+    retry that never existed), while T13b succeeds via a THIRD, already-correct
+    shape: a candidate built from already-captured evidence, with no new model
+    call, therefore never competing for the shared one-retry-per-call budget
+    ae32c41 introduced (2026-08-10, to stop guards individually re-running the
+    full agent pipeline and stacking into 20+-minute hangs). This function
+    generalizes that one distinction -- evidence-grounded + no-new-LLM-call is
+    exempt from the budget; anything that DOES call the model is not -- rather
+    than adding a fourth, bespoke shape.
+
+    A candidate becomes authoritative -- replacing `content`/`result` for every
+    later guard and final synthesis -- only if:
+      1. it is real text, not leaked tool-call syntax and not the canned
+         budget-exhausted sentence (the same stripping _adopt_retry already
+         applies, reused here rather than re-implemented);
+      2. it is evidence-supported per the EXISTING, UNCHANGED
+         _answer_supported_by_evidence -- never weakened to ease adoption;
+      3. ONLY when `consumed_llm_call` is True, the shared retry budget
+         (`len(all_results) <= 1`) has not already been spent by an earlier
+         guard this call -- the exact ae32c41 invariant, untouched.
+
+    `consumed_llm_call=False` is for a candidate assembled purely from
+    evidence this run already gathered (e.g. a member's own real report) --
+    no team.arun() call, so it cannot cause the cascading-retry hang the
+    budget exists to prevent, and is therefore never gated by it, mirroring
+    the exemption _reconcile_completeness_claim_with_comparison's deterministic
+    synthesis already established for T13b.
+
+    Returns (content, result, adopted). `adopted` is False in every rejection
+    path -- the caller's own existing fallback (retry, disclosure, or leaving
+    the draft alone) runs unchanged when this returns False.
+    """
+    if consumed_llm_call and len(all_results) > 1:
+        print(f"[team] {label}: shared retry budget already spent this call "
+              f"-- not attempting authoritative correction", flush=True)
+        return content, result, False
+    if not candidate or not _strip_leaked_tool_tags(candidate).strip():
+        return content, result, False
+    if candidate.strip() == _BUDGET_EXHAUSTED_ANSWER:
+        return content, result, False
+    if not _answer_supported_by_evidence(candidate, team):
+        print(f"[team] {label}: candidate correction not supported by captured "
+              f"evidence -- keeping the draft", flush=True)
+        return content, result, False
+    setattr(team, _AUTHORITATIVE_CORRECTION_FLAG, True)
+    print(f"[team] {label}: AUTHORITATIVE_CORRECTION_ADOPTED -- superseded draft "
+          f"replaced", flush=True)
+    return candidate, candidate_result, True
+
+
 # Tools that WRITE to the project. A "done" claim resting on one of these needs the
 # tool's OWN response to actually say so -- a FAILED apply_diff call is still a tool
 # call by name, and _count_read_calls-style presence checking cannot tell the two apart.
@@ -7761,6 +7819,42 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     _cmp_available = (_rs_enum.get("max_enumerable", 0)
                       if isinstance(_rs_enum, dict) else 0)
     missing_cmp = _under_answered_comparison(content, task, _cmp_available)
+    if missing_cmp is not None:
+        # Phase C.2: this guard had NO correction path at all before this change
+        # (C.1's T13a proof: raw lines appended, wrong draft still shipped) --
+        # unlike T3's under-delivery guard, which had a retry that was merely
+        # gated off, this one never attempted a retry in the first place. Give
+        # it the SAME generalized, budget-gated generative retry T3/T11 already
+        # use -- reusing _grounded_retry_from_evidence as-is, not a bespoke
+        # T13a routine -- before falling back to the unchanged disclosure below.
+        # If the shared budget was already spent by an earlier guard this call,
+        # or the retry's own content still doesn't resolve the gap, disclosure
+        # fires exactly as before -- this never fabricates completeness, it
+        # only gives a genuinely-correctable case one real chance to correct.
+        if (not synthesis_run and len(all_results) <= 1
+                and not getattr(team, _UNDER_ANSWERED_COMPARISON_RETRY_FLAG, False)):
+            setattr(team, _UNDER_ANSWERED_COMPARISON_RETRY_FLAG, True)
+            _recovered_cmp_for_retry = _recorded_enumeration_block(
+                _rs_enum.get("enumerable_block") if isinstance(_rs_enum, dict) else None,
+                missing_cmp)
+            retry_prompt = (
+                f"{task}\n\nIMPORTANT: your previous answer enumerated fewer "
+                f"items than this run's own tool calls already found -- at "
+                f"least one side of the comparison was not listed in full. "
+                f"Before answering, here is exactly what this run's own tools "
+                f"already returned:\n{_recovered_cmp_for_retry}\n\nAnswer the "
+                f"original question again: enumerate BOTH sides completely "
+                f"(reading whatever file is still needed for the side not "
+                f"shown above, with a real tool call) before stating which "
+                f"items have no counterpart. If you genuinely cannot obtain "
+                f"one side's full enumeration, say so plainly rather than "
+                f"guessing or declaring completeness."
+            )
+            content, result, _adopted = await _grounded_retry_from_evidence(
+                "under-answered-comparison", retry_prompt, content, task, team,
+                all_results, result, liveness_path)
+            if _adopted:
+                missing_cmp = _under_answered_comparison(content, task, _cmp_available)
     if missing_cmp is not None:
         # Items BEFORE the banner, disclosure as a footnote -- the same ordering the
         # enumeration guard already settled on. Appending them after the banner
@@ -18903,6 +18997,9 @@ async def _grounded_retry_from_evidence(
 
 
 _UNDER_DELIVERY_RECONCILE_FLAG = "_under_delivery_reconcile_done"
+# Phase C.2: once-per-run flag for the new retry attempt wired into the
+# under-answered-comparison guard in _verified_answer (previously disclosure-only).
+_UNDER_ANSWERED_COMPARISON_RETRY_FLAG = "_under_answered_comparison_retry_done"
 
 
 async def _reconcile_under_delivery_with_tool_evidence(
@@ -18933,12 +19030,34 @@ async def _reconcile_under_delivery_with_tool_evidence(
     back to disclosure, using whichever retry slot this call has not already
     spent.
 
+    Phase C.2 addition: C.1 proved the live T3 failure was this exact budget
+    check returning early (an EARLIER guard this same call -- in T3's case,
+    _complete_repetition_truncated_answer -- had already spent the one
+    generative retry), so the generative path below never ran at all, and the
+    only thing T3 shipped was a disclosure footnote. Before reaching that
+    budget check, try a candidate built from team._member_results itself --
+    already-captured, already-grounded evidence, no new model call -- via
+    _adopt_authoritative_correction's consumed_llm_call=False path, which is
+    therefore NOT gated by the spent budget (same exemption T13b's
+    deterministic synthesis already has). Only if that candidate is empty or
+    fails evidence validation does control reach the existing, unchanged
+    budget-gated generative retry below.
+
     Returns (content, result, reconciled) -- identical contract to
     _reconcile_thin_answer_with_tool_evidence.
     """
     if (synthesis_run or not tool_evidence_lines
             or getattr(team, _UNDER_DELIVERY_RECONCILE_FLAG, False)):
         return content, result, False
+
+    candidate = _member_findings_as_candidate(team)
+    content2, result2, adopted = await _adopt_authoritative_correction(
+        "under-delivery-deterministic", content, result, candidate, result,
+        team, all_results, consumed_llm_call=False)
+    if adopted:
+        setattr(team, _UNDER_DELIVERY_RECONCILE_FLAG, True)
+        return content2, result2, True
+
     if len(all_results) > 1:
         return content, result, False
 
@@ -19165,6 +19284,31 @@ def render_member_findings(results) -> str:
     return ("\n\n---\n**WHAT THE MEMBERS ACTUALLY REPORTED — recovered from this run "
             "because the answer above did not carry it. This is their own text, "
             "unedited, not a re-derivation.**" + "".join(parts))
+
+
+def _member_findings_as_candidate(team) -> str:
+    """Phase C.2: the single most substantial member finding, as a STAND-ALONE
+    candidate answer -- not framed as a disclosure footnote the way
+    _recovered_member_findings renders it. Same selection rule the existing
+    "solo" member-answer fallback already uses elsewhere in this file (longest
+    non-trivial, tool-syntax-stripped member result) -- reused, not reinvented,
+    so a candidate this returns is exactly the kind of text that fallback
+    already trusted enough to ship as a final answer outright. Built entirely
+    from team._member_results, already in memory from this run's own stream
+    capture -- no new tool call, no new model call, which is what makes this
+    eligible for _adopt_authoritative_correction's consumed_llm_call=False
+    exemption from the shared retry budget."""
+    results = getattr(team, "_member_results", None)
+    if not isinstance(results, dict) or not results:
+        return ""
+    candidates = []
+    for text in results.values():
+        clean = _strip_leaked_tool_tags(text or "").strip()
+        if clean:
+            candidates.append(clean)
+    if not candidates:
+        return ""
+    return max(candidates, key=len)
 
 
 def _hook_family_names(text) -> set[str]:
