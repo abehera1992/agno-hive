@@ -5324,31 +5324,46 @@ def _record_member_action(
           f"total_actions={state.total_actions}", flush=True)
 
 
-def _make_member_control_box_hook(role: str | None = None):
-    """Tool-hook factory, same convention as _make_tool_budget_guard_hook
-    (team.py:10935) -- bound to one role at construction, appended to that
-    role's own tool_hooks list. Purely observational: calls through to
-    `function` unconditionally and returns its result completely unchanged
-    -- this hook can never block, stub, retry, or alter a tool call, only
-    watch it. Appended AFTER the budget guard in _hooks_for so it only
-    observes calls that the budget guard itself counted as genuinely
-    executed (same ordering reasoning the budget guard's own comment gives
-    for going last among the EXISTING hooks).
+def _make_member_control_box_hook():
+    """Tool-hook factory -- Phase B.4: now a SINGLE SHARED instance (no bound
+    `role`), registered once in the shared `tool_hooks` prefix list built in
+    _hooks_for, the same convention _tool_interception_hook/
+    _read_cache_tool_hook/etc. already use (constructed once, reused across
+    the coordinator and every member). Previously bound per-role and
+    appended to the per-role tail AFTER the budget guard -- which placed it
+    INNER to _read_cache_tool_hook in the real composed chain, so a same-run
+    cache hit (read_cache_tool_hook's own `else: result = cache[cache_key]`
+    branch, which returns without ever calling its own `function` parameter)
+    skipped this hook entirely. Proven live (Phase B.2, run 2922dc790431):
+    D1/D2 fresh reads were recorded correctly; D3's two re-reads of
+    already-cached files produced zero CONTROL_BOX_ACTION_RECORDED, with no
+    exception, because the chain never reached this hook at all for a cache
+    hit.
+
+    Fix: move this hook to the shared prefix, positioned immediately after
+    _tool_interception_hook and before _read_cache_tool_hook -- the exact
+    position the Phase A/D durable evidence backbone already proved correct
+    (it observes every call, cache hit or miss, because it lives inside
+    _tool_interception_hook itself, which is unconditionally outermost).
+    `who` already had a non-role fallback (`getattr(agent, "name", None)`),
+    used unconditionally now that `role` no longer exists. Purely
+    observational, unchanged: calls through to `function` unconditionally
+    and returns its result completely unchanged -- can never block, stub,
+    retry, or alter a tool call, only watch it.
     """
     async def _control_box_hook(function_name, function, args, agent=None,
                                  team=None, run_context=None):
-        # Phase B.1 fix (2026-10-02): `who` must be normalized through the
-        # same _member_id() canonicalization delegate_structured_task's own
-        # member_id argument already goes through (see
-        # _start_member_objective's docstring for the full root-cause
-        # trace) -- role/agent.name arrive display-cased ("Researcher"),
-        # while the stored MemberControlState is keyed by the Coordinator's
-        # own lowercase delegation argument ("researcher"). Without this,
-        # latest_for_member() never matches and _record_member_action's own
-        # `if state is None: return` fires silently on every call -- no
-        # exception, no telemetry, confirmed live across every trial before
-        # this fix.
-        who = _member_id(role or getattr(agent, "name", None) or "Coordinator")
+        # Phase B.1 fix (2026-10-02, unchanged by B.4): `who` must be
+        # normalized through the same _member_id() canonicalization
+        # delegate_structured_task's own member_id argument already goes
+        # through (see _start_member_objective's docstring for the full
+        # root-cause trace) -- agent.name arrives display-cased
+        # ("Researcher"), while the stored MemberControlState is keyed by
+        # the Coordinator's own lowercase delegation argument
+        # ("researcher"). Without this, latest_for_member() never matches
+        # and _record_member_action's own `if state is None: return` fires
+        # silently on every call -- no exception, no telemetry.
+        who = _member_id(getattr(agent, "name", None) or "Coordinator")
         before = _control_box_state_fingerprint(team) if team is not None else (0, 0, 0, 0)
         result = await function(**args)
         if team is not None:
@@ -15259,8 +15274,26 @@ def _build_team(
     # own message without calling `function`, so the chain stops before reaching this).
     # Shared across every agent -- these are genuinely run-wide (one cache, one delegation
     # log, one interception trace).
+    #
+    # Control Box hook (Phase B.4, 2026-10-02): positioned immediately after
+    # interception_hook and BEFORE read_cache_hook -- deliberately, not
+    # arbitrarily. Phase B originally appended this to the per-role tail
+    # below (after the budget guard), which placed it INNER to
+    # read_cache_hook in the real composed chain (see
+    # _build_nested_execution_chain_async's reduce-over-reversed-list
+    # construction: the FIRST element of this list ends up OUTERMOST,
+    # called first). read_cache_tool_hook's own cache-hit branch
+    # (`else: result = cache[cache_key]`) returns without ever calling its
+    # own `function` parameter, which skips every hook positioned after it
+    # -- proven live (Phase B.2, run 2922dc790431) to silently drop 100% of
+    # Control Box telemetry for any same-run cache-hit read. Moving it here
+    # mirrors the one position already proven correct for this exact
+    # problem: the Phase A/D durable evidence backbone lives inside
+    # interception_hook itself, unconditionally outermost, and was never
+    # affected by the cache short-circuit for the same reason.
     tool_hooks = [
-        interception_hook, search_before_browse_gate_hook, read_cache_hook,
+        interception_hook, _make_member_control_box_hook(),
+        search_before_browse_gate_hook, read_cache_hook,
         decompose_first_gate_hook,
         evidence_gate_hook, duplicate_delegation_gate_hook, delegation_log_hook,
     ]
@@ -15279,10 +15312,6 @@ def _build_team(
         """
         return tool_hooks + [
             _make_tool_budget_guard_hook(team_name, activity, role=role),
-            # Control Box Phase B: purely observational, appended after the
-            # budget guard so it only sees calls already counted as genuinely
-            # executed. Never blocks, stubs, or alters a result.
-            _make_member_control_box_hook(role=role),
         ]
 
     if agent_specs:

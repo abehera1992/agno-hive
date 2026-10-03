@@ -42,6 +42,15 @@ class _Team:
     getattr/setattr on whatever object is passed as `team`."""
 
 
+class _Agent:
+    """Phase B.4: the hook resolves `who` entirely from agent.name now (no
+    bound `role` kwarg left) -- these tests need a stand-in agent object to
+    supply the member identity that `role=` used to provide directly."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+
 def _start(team, member_id="researcher", delegation_key="abc123",
            objective="find gaps", evidence_required="a list of gaps",
            completion_criteria="all gaps identified"):
@@ -212,13 +221,14 @@ def test_critical_regression_6331f33a146f_identical_calls_are_no_progress_not_co
 def test_hook_returns_real_result_unchanged_on_progress():
     team = _Team()
     _start(team)
-    hook = _make_member_control_box_hook(role="researcher")
+    hook = _make_member_control_box_hook()
+    agent = _Agent("researcher")
 
     async def real_tool(**kwargs):
         return "real result unaffected"
 
     result = _run(hook("get_file_content", real_tool, {"relative_path": "a.py"},
-                        agent=None, team=team, run_context=None))
+                        agent=agent, team=team, run_context=None))
     assert result == "real result unaffected"
 
 
@@ -228,7 +238,8 @@ def test_hook_returns_real_result_unchanged_on_no_progress():
     has no authority to block, stub, or decorate anything in this phase."""
     team = _Team()
     _start(team)
-    hook = _make_member_control_box_hook(role="researcher")
+    hook = _make_member_control_box_hook()
+    agent = _Agent("researcher")
     calls = {"n": 0}
 
     async def real_tool(**kwargs):
@@ -237,9 +248,9 @@ def test_hook_returns_real_result_unchanged_on_no_progress():
 
     args = {"session_state_updates": {"task_completed": "same"}}
     r1 = _run(hook("update_session_state", real_tool, args,
-                    agent=None, team=team, run_context=None))
+                    agent=agent, team=team, run_context=None))
     r2 = _run(hook("update_session_state", real_tool, args,
-                    agent=None, team=team, run_context=None))
+                    agent=agent, team=team, run_context=None))
     assert r1 == "result #1"
     assert r2 == "result #2"
     assert calls["n"] == 2  # both calls genuinely executed -- nothing was skipped
@@ -253,7 +264,7 @@ def test_hook_is_a_noop_when_no_delegation_was_started():
     delegate_structured_task) must not raise or affect the result -- the
     box silently has nothing to record."""
     team = _Team()
-    hook = _make_member_control_box_hook(role="Coordinator")
+    hook = _make_member_control_box_hook()
 
     async def real_tool(**kwargs):
         return "coordinator result"
@@ -268,7 +279,7 @@ def test_hook_handles_team_none_without_raising():
     """agno's own _build_hook_args only supplies `team` when the hook
     signature names it and agno can resolve it -- defensive, never assume
     it is always present."""
-    hook = _make_member_control_box_hook(role="researcher")
+    hook = _make_member_control_box_hook()
 
     async def real_tool(**kwargs):
         return "ok"
@@ -340,23 +351,24 @@ def test_phase_b1_regression_display_cased_lookup_matches_lowercase_start():
 
 
 def test_phase_b1_regression_action_recorded_fires_with_display_cased_role(capsys):
-    """End-to-end through the real hook: role bound at hook-construction
-    time is display-cased ("Researcher", matching agent.name/spec.name in
-    production), while the delegation was started with the Coordinator's
-    own lowercase argument ("researcher") -- CONTROL_BOX_ACTION_RECORDED
-    must fire, proving the hook's internal _member_id() normalization
-    closes the exact live gap."""
+    """End-to-end through the real hook: `who` now resolves entirely from
+    agent.name, which arrives display-cased ("Researcher", matching
+    agent.name/spec.name in production), while the delegation was started
+    with the Coordinator's own lowercase argument ("researcher") --
+    CONTROL_BOX_ACTION_RECORDED must fire, proving the hook's internal
+    _member_id() normalization closes the exact live gap."""
     team = _Team()
     _start_member_objective(
         team, "researcher", "delegation-key-1", "find gaps",
         "a list of gaps", "all gaps identified")
-    hook = _make_member_control_box_hook(role="Researcher")  # display-cased, like agent.name
+    hook = _make_member_control_box_hook()
+    agent = _Agent("Researcher")  # display-cased, like agent.name in production
 
     async def real_tool(**kwargs):
         return "real result"
 
     result = _run(hook("get_file_content", real_tool, {"relative_path": "a.py"},
-                        agent=None, team=team, run_context=None))
+                        agent=agent, team=team, run_context=None))
     assert result == "real result"
     out = capsys.readouterr().out
     assert "CONTROL_BOX_ACTION_RECORDED" in out

@@ -893,13 +893,19 @@ def test_build_team_shares_the_same_hook_instance_between_coordinator_and_fallba
         # Since 2026-08-21 each agent additionally carries its OWN tool-budget guard
         # (bound to its role), so the lists share a prefix rather than being equal:
         # the budget it guards is per-agent, and one shared instance counted the whole
-        # team into a single bucket against the wrong ceiling. Since 2026-10-02 (Control
-        # Box Phase B) each agent ALSO carries its own member-control-box observer hook,
-        # bound to its role the same way -- two per-agent hooks now, not one, so the
-        # shared prefix is everything except the last TWO elements.
-        assert member.tool_hooks[:-2] == result.tool_hooks[:-2]
-        assert member.tool_hooks[-2] is not result.tool_hooks[-2], "budget guard must be per-agent"
-        assert member.tool_hooks[-1] is not result.tool_hooks[-1], "control-box hook must be per-agent"
+        # team into a single bucket against the wrong ceiling. Control Box Phase B
+        # (2026-10-02) originally added a SECOND per-agent hook (role-bound,
+        # appended after the budget guard) -- Phase B.4 (2026-10-02) relocated it
+        # into the shared prefix instead (immediately after interception_hook), the
+        # exact position already proven correct for _tool_interception_hook itself,
+        # because the per-agent position put it inner to _read_cache_tool_hook in
+        # the real composed chain and a same-run cache hit silently skipped it. The
+        # hook is also no longer role-bound (`who` now resolves from agent.name at
+        # call time), so a single shared instance is correct. Only the budget guard
+        # remains per-agent -- the shared prefix is everything except the LAST
+        # element.
+        assert member.tool_hooks[:-1] == result.tool_hooks[:-1]
+        assert member.tool_hooks[-1] is not result.tool_hooks[-1], "budget guard must be per-agent"
 
 
 # ── _record_read: mechanical read_log in shared session_state (2026-08-13) ─────
@@ -1224,11 +1230,10 @@ def test_build_team_shares_the_same_hook_instance_with_spec_based_members(monkey
     )
 
     assert len(result.members) == 1
-    # Shared prefix identical; per-agent budget guard AND control-box hook distinct
-    # (see the fallback-path test above for why the last two elements deliberately
-    # differ -- two per-agent hooks since 2026-10-02's Control Box Phase B).
-    assert result.members[0].tool_hooks[:-2] == result.tool_hooks[:-2]
-    assert result.members[0].tool_hooks[-2] is not result.tool_hooks[-2]
+    # Shared prefix identical; only the per-agent budget guard distinct (see the
+    # fallback-path test above for why the control-box hook is no longer a second
+    # per-agent entry as of Phase B.4, 2026-10-02).
+    assert result.members[0].tool_hooks[:-1] == result.tool_hooks[:-1]
     assert result.members[0].tool_hooks[-1] is not result.tool_hooks[-1]
 
 
