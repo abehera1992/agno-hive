@@ -4961,6 +4961,40 @@ class EvidenceRecord:
     relevance_status: str       # "retained" | "needs_review"
 
 
+@dataclass(frozen=True)
+class Observation:
+    """One real tool call's own completeness metadata (C.6, 2026-10-03,
+    GAP A) -- separate from the EvidenceRecord(s) that call produced, because
+    "how many facts did we keep" and "how many facts actually existed" are
+    different questions the prior phase's own battery proved matter:
+    citing EvidenceRecord #117 out of 200 real hits when only 60 were
+    retained is a RETENTION gap, not a model inventing evidence, and nothing
+    before this recorded enough to tell the two apart.
+
+    `result_count` is the TRUE count when the observing code can establish
+    it without re-deriving a number the producing tool never gave (search_
+    files/search_files_batch: every real hit line, counted before any cap is
+    applied -- cheap, already have the full text). `None` means "the
+    underlying tool/extractor does not expose a count we can trust" -- e.g.
+    get_file_content's declarations are extracted by _extract_declarations,
+    which has its OWN internal cap (_MAX_INDEXED_PER_FILE) for its OWN
+    purpose (the declaration index) and returns early once hit, so this
+    module cannot know the true total beyond that cap without re-scanning
+    the file a second time for a different purpose -- `unknown`, never a
+    fabricated number, per this phase's own explicit instruction.
+    """
+    tool_call_id: str
+    tool_name: str
+    evidence_type: str
+    result_count: "int | None"     # None == unknown, never guessed
+    retained_count: int
+    truncated: bool
+    evidence_ids: tuple[str, ...]
+    source_path: "str | None"
+    retrieval_query: "str | None"
+    created_at: float
+
+
 class _EvidenceLedger:
     """Minimum viable record/get/list store. One instance per run, owned by
     `team` (team._evidence_ledger) -- never a module-level global, never
@@ -4974,12 +5008,16 @@ class _EvidenceLedger:
 
     Holds ComparisonEvidence AND EvidenceRecord rows side by side (C.4,
     2026-10-03) -- both are frozen dataclasses with an `evidence_id` field,
-    which is the only attribute this store itself ever touches.
+    which is the only attribute this store itself ever touches. Observation
+    rows (C.6) live in their own, separate list -- they are completeness
+    metadata ABOUT a tool call, not evidence to cite, and were never meant
+    to be looked up by evidence_id.
     """
 
     def __init__(self) -> None:
         self._records: "dict[str, ComparisonEvidence | EvidenceRecord]" = {}
         self._order: list[str] = []
+        self._observations: "list[Observation]" = []
 
     def record(self, evidence: "ComparisonEvidence | EvidenceRecord") -> None:
         if evidence.evidence_id in self._records:
@@ -5003,6 +5041,45 @@ class _EvidenceLedger:
         list, not a new index structure."""
         return [r for r in reversed(self.list())
                 if isinstance(r, EvidenceRecord) and r.source_path == source_path]
+
+    def record_observation(self, obs: "Observation") -> None:
+        self._observations.append(obs)
+
+    def observations(self) -> "list[Observation]":
+        return list(self._observations)
+
+    def observations_for_path(self, source_path: str) -> "list[Observation]":
+        return [o for o in self._observations if o.source_path == source_path]
+
+    def any_truncated_for_path(self, source_path: str) -> bool:
+        """Whether ANY observation that could plausibly have covered this
+        path was truncated -- the exact signal _unresolved_ledger_citations
+        needs to tell "this file was searched but the hit list was cut off
+        before we could see everything" apart from "this file was never
+        touched at all".
+
+        Also true for a TRUNCATED repo-wide search (source_path=None --
+        search_files/search_files_batch span many files, so no single path
+        is attached to the Observation itself). Found live-testing this
+        exact method: a 200-hit search capped to 60 retained a correctly
+        matched EvidenceRecord for file3.py but NONE for file117.py (real,
+        present in the raw output, simply past the cap) -- the untruncated-
+        lookalike citation for file117.py came back UNSUPPORTED instead of
+        UNRESOLVED_TRUNCATED, exactly the false-negative-provenance failure
+        GAP A exists to prevent, because the per-path-only match never
+        considered the repo-wide Observation's own truncated=True at all.
+        A file_read's own truncation is always path-specific already (a
+        get_file_content call's source_path is never None), so this is
+        precise there; for a search, "possibly truncated" for every path is
+        the deliberately conservative, honest answer when a repo-wide cap
+        was actually hit -- erring toward 'needs re-retrieval', never toward
+        a confident fabrication verdict, matching this phase's own
+        disclosure wording for either case.
+        """
+        for o in self._observations:
+            if o.truncated and (o.source_path == source_path or o.source_path is None):
+                return True
+        return False
 
     def latest(self, evidence_type: str | None = None) -> "ComparisonEvidence | EvidenceRecord | None":
         for eid in reversed(self._order):
@@ -5304,6 +5381,22 @@ _EVIDENCE_EXCERPT_CHARS = 160
 _SECRET_PATH_RE = re.compile(
     r"(^|/)\.env(\.|$)|\.pem$|\.key$|secrets?\.|credentials?\.|\.sql$", re.I)
 
+# Content-level redaction (C.6, 2026-10-03, spec Section 13) -- a secret can
+# appear inline in a file that is not itself named like a secret (a
+# config.py or docker-compose.yml legitimately holding a connection string),
+# so _SECRET_PATH_RE's path-only check is not sufficient on its own. Matches
+# the exact env-var names the spec names (PGPASSWORD/PGHOST/PGUSER/
+# DATABASE_URL and their common siblings) and the generic user:pass@host
+# connection-string shape, case-insensitive. Deliberately a short, named
+# list, not an attempt to catch every possible secret shape -- the goal is
+# "do not regress the existing redaction posture", not invent a new secrets
+# scanner.
+_SECRET_CONTENT_RE = re.compile(
+    r"\b(?:PGPASSWORD|PGUSER|PGHOST|PGDATABASE|DATABASE_URL|DB_PASSWORD|"
+    r"DB_USER|API_KEY|SECRET_KEY|ACCESS_TOKEN|AWS_SECRET|PRIVATE_KEY)\b"
+    r"\s*[=:]"
+    r"|://[^/\s:@]+:[^/\s@]+@", re.I)
+
 # Generic search terms too broad, on their own, to be a meaningful relevance
 # signal -- a real failure this session (business-service's own "status"
 # search returning mailcow_admin_api.py/outbox.py/saga_consumers.py mixed
@@ -5380,6 +5473,8 @@ def _record_evidence_from_observation(ledger: "_EvidenceLedger", function_name: 
     def _add(evidence_type, source_path, line, retrieval_query, excerpt):
         if source_path and _SECRET_PATH_RE.search(str(source_path)):
             return
+        if excerpt and _SECRET_CONTENT_RE.search(str(excerpt)):
+            return
         rec = EvidenceRecord(
             evidence_id=execution_context.new_id(), evidence_type=evidence_type,
             source_path=source_path, line=line, tool_name=function_name,
@@ -5391,10 +5486,28 @@ def _record_evidence_from_observation(ledger: "_EvidenceLedger", function_name: 
         ledger.record(rec)
         new_ids.append(rec.evidence_id)
 
+    # GAP A (C.6, 2026-10-03): result_count/truncated computed PER BRANCH below,
+    # since only the branch knows whether it can trust a true count or must
+    # report unknown (see Observation's own docstring). source_path here is
+    # the single path for get_file_content/None-keyed searches, or None for a
+    # repo-wide search -- Observation is one row per TOOL CALL, not per hit.
+    result_count: "int | None" = None
+    retained_count = 0
+    truncated = False
+    obs_source_path = (args or {}).get("relative_path")
+
     if function_name == "get_file_content":
         path = (args or {}).get("relative_path")
         if path:
             decls = declarations if declarations is not None else _extract_declarations(text)
+            retained_count = min(len(decls), _MAX_EVIDENCE_RECORDS_PER_CALL)
+            # _extract_declarations has its OWN internal cap (_MAX_INDEXED_
+            # PER_FILE, also 60) and returns early once hit -- reaching that
+            # cap means the true total beyond it is genuinely unknown to this
+            # module, not merely uncounted. Below the cap, what it found IS
+            # the true count (it scanned the whole file to get there).
+            truncated = len(decls) >= _MAX_INDEXED_PER_FILE
+            result_count = None if truncated else len(decls)
             for decl in decls[:_MAX_EVIDENCE_RECORDS_PER_CALL]:
                 name, _, line_s = decl.rpartition(":")
                 if not line_s.isdigit():
@@ -5402,6 +5515,7 @@ def _record_evidence_from_observation(ledger: "_EvidenceLedger", function_name: 
                 _add("file_read", str(path), int(line_s), None, name)
     elif function_name in ("search_files", "search_files_batch"):
         pattern = (args or {}).get("pattern")
+        obs_source_path = None  # a search spans many files; no single path to attach
         stripped = text.strip()
         # A genuine zero-hit search (C.5 live-validation fix, found running this
         # phase's own battery on the pre-fix code: a correctly-answered NEGATIVE
@@ -5415,46 +5529,82 @@ def _record_evidence_from_observation(ledger: "_EvidenceLedger", function_name: 
         # same -- same prefix check C.3's own _is_empty_lexical_search_result
         # already uses, reused by name rather than re-derived.
         if (not stripped) or stripped.startswith(_EMPTY_LEXICAL_RESULT_PREFIXES):
+            result_count, retained_count, truncated = 0, 1, False
             _add("lexical_search", None, None, pattern, stripped[:_EVIDENCE_EXCERPT_CHARS])
         else:
-            for line in text.splitlines()[:_MAX_EVIDENCE_RECORDS_PER_CALL]:
-                m = _SEARCH_HIT_RE.match(line)
-                if not m:
-                    continue
+            # The TRUE count, over the FULL text, before any cap -- this is the
+            # one branch where the tool's own raw output makes a real count
+            # cheaply available (GAP A's whole point: do not guess this number,
+            # and do not skip counting it just because retention is capped).
+            all_lines = text.splitlines()
+            all_hits = [m for m in (_SEARCH_HIT_RE.match(l) for l in all_lines) if m]
+            result_count = len(all_hits)
+            retained_hits = all_hits[:_MAX_EVIDENCE_RECORDS_PER_CALL]
+            retained_count = len(retained_hits)
+            truncated = result_count > retained_count
+            for m in retained_hits:
                 _add("lexical_search", m.group(1), int(m.group(2)), pattern, m.group(3))
     elif function_name == "lightrag_query":
         query = (args or {}).get("query")
-        if text and not text.strip().lower().startswith(("no ", "error", "invalid")):
+        obs_source_path = None
+        is_empty = not text or text.strip().lower().startswith(("no ", "error", "invalid"))
+        result_count, retained_count, truncated = (0, 0, False) if is_empty else (1, 1, False)
+        if not is_empty:
             _add("semantic_search", None, None, query, text)
+
+    if new_ids or function_name in ("get_file_content", "search_files",
+                                     "search_files_batch", "lightrag_query"):
+        ledger.record_observation(Observation(
+            tool_call_id=tool_call_id, tool_name=function_name,
+            evidence_type={"get_file_content": "file_read",
+                           "search_files": "lexical_search",
+                           "search_files_batch": "lexical_search",
+                           "lightrag_query": "semantic_search"}[function_name],
+            result_count=result_count, retained_count=retained_count,
+            truncated=truncated, evidence_ids=tuple(new_ids),
+            source_path=obs_source_path, retrieval_query=(args or {}).get("pattern")
+                or (args or {}).get("query"), created_at=time.monotonic(),
+        ))
 
     if new_ids:
         retained = sum(1 for eid in new_ids if ledger.get(eid).relevance_status == "retained")
         print(f"[team] EVIDENCE_RECORDED: {len(new_ids)} item(s) from {function_name} "
               f"by {read_by} ({retained} retained, {len(new_ids) - retained} needs_review) "
-              f"tool_call_id={tool_call_id}", flush=True)
+              f"tool_call_id={tool_call_id} result_count={result_count} "
+              f"truncated={truncated}", flush=True)
     return new_ids
 
 
-def _unresolved_ledger_citations(team, content: str) -> list[tuple[str, str]]:
-    """`(path, line)` citations in `content` that this run's own EvidenceLedger
-    cannot confirm -- either the path was never recorded as read/searched this
-    run at all, or it was, but never near the cited line (tolerance
-    _LINE_TOLERANCE, tighter than verify_claims' own 5-line window because
-    EvidenceRecord lines are exact, not fuzzy-quote-matched).
+def _unresolved_ledger_citations(team, content: str) -> list[tuple[str, str, str]]:
+    """`(path, line, status)` for every `path:line` citation in `content` this
+    run's own EvidenceLedger cannot confirm as SUPPORTED, where status is
+    "UNSUPPORTED" or "UNRESOLVED_TRUNCATED" (GAP A/Section 4, C.6, 2026-10-03).
 
-    Deliberately narrow: only the mechanical `path:line` shape (the one this
-    phase has live evidence of breaking down -- bare `Symbol:line`, same-
-    basename ambiguity), not an attempt to parse every citation prose shape
-    verify_claims already handles. A path never recorded by the ledger is not
-    automatically wrong (a different member's read that this run's ledger
-    wiring did not see, or legitimate recall) -- this is reported as
-    UNCONFIRMED, not as a fabrication verdict; verify_claims' own grep stays
-    the actual accuracy check (Section 22's 'final defense-in-depth').
+    The prior phase's own battery proved the binary version of this check was
+    unsafe: citing hit #117 of 200 real matches when only 60 were retained is
+    a RETENTION gap, not the model inventing evidence, and both used to come
+    back identically as "unresolved". Now:
+
+      - the path was never observed by ANY recorded Observation at all
+        -> UNSUPPORTED (nothing this run touched that file/search space)
+      - the path WAS observed, but that observation (or any observation
+        touching the same path) was truncated -> UNRESOLVED_TRUNCATED (the
+        cited fact may be among what was discarded, not necessarily invented)
+      - the path was observed, fully retained (not truncated), and the line
+        still is not near anything recorded -> UNSUPPORTED (the retention was
+        complete, so there was nothing left to miss)
+
+    Tolerance _LINE_TOLERANCE, tighter than verify_claims' own 5-line window
+    because EvidenceRecord lines are exact, not fuzzy-quote-matched.
+    Deliberately narrow: only the mechanical `path:line` shape, not an attempt
+    to parse every citation prose shape verify_claims already handles.
+    verify_claims' own grep stays the actual accuracy check (Section 22's
+    'final defense-in-depth'); neither status here is a fabrication verdict.
     """
     ledger = getattr(team, "_evidence_ledger", None)
     if ledger is None:
         return []
-    unresolved: list[tuple[str, str]] = []
+    unresolved: list[tuple[str, str, str]] = []
     seen: set[tuple[str, str]] = set()
     for m in list(_LEDGER_CITED_LINE_RE.finditer(content))[:_MAX_CITATIONS_CHECKED]:
         path, line_s = m.group(1), m.group(2)
@@ -5463,13 +5613,14 @@ def _unresolved_ledger_citations(team, content: str) -> list[tuple[str, str]]:
             continue
         seen.add(key)
         records = ledger.by_path(path)
+        truncated = ledger.any_truncated_for_path(path)
         if not records:
-            unresolved.append((path, line_s))
+            unresolved.append((path, line_s, "UNRESOLVED_TRUNCATED" if truncated else "UNSUPPORTED"))
             continue
         line = int(line_s)
         if not any(r.line is not None and abs(r.line - line) <= _LINE_TOLERANCE
                    for r in records):
-            unresolved.append((path, line_s))
+            unresolved.append((path, line_s, "UNRESOLVED_TRUNCATED" if truncated else "UNSUPPORTED"))
     return unresolved
 
 
@@ -5498,35 +5649,146 @@ def _fabricated_execution_claims(team, content: str) -> list[str]:
         if path in seen:
             continue
         seen.add(path)
-        if not ledger.by_path(path):
+        # A path observed but truncated is not "no matching record" the same
+        # way a never-touched path is (GAP A) -- skip it here, it will surface
+        # (correctly, as UNRESOLVED_TRUNCATED rather than UNSUPPORTED) via
+        # _unresolved_ledger_citations instead if the answer also cites a line.
+        if not ledger.by_path(path) and not ledger.any_truncated_for_path(path):
             unresolved.append(path)
     return unresolved
 
 
-def _completion_decision(team) -> tuple[str, str]:
-    """(status, reason) -- status is "COMPLETE" or "INSUFFICIENT_EVIDENCE"
-    (INV-11): the one, deliberately conservative, binary signal this phase
-    adds as an ACTIVE (not merely logged) completion check, placed at
-    _verified_answer's own established post-hoc "choke point" chain (the
-    same placement _hoist_denied_premise/_evidence_integrity_check/
-    _attempt_evidence_grounded_reconstruction already use -- see their own
-    comments at the one call site in run_task_async/run_task_stream).
+# ── Generic action-claim-without-lineage check (C.6, 2026-10-03, GAP C) ──────
+#
+# _fabricated_tool_use (pre-existing) already catches "X returned Y" claims
+# against team._tool_outcomes -- real, per-tool ok/err call counts, the SAME
+# kind of runtime grounding this check reuses rather than re-deriving. Its own
+# documented historical gap (groundedness-battery.md, T5/T9, 2026-08-23): a
+# claim of ACTION ("the executor already ran the requested commands") rather
+# than a claim of a RESULT ("the search returned...") never matched any entry
+# in _TOOL_USE_CLAIMS, because that tuple is deliberately a short, specific,
+# per-result-shape list -- adding a 4th tuple entry for "ran"/"executed" would
+# be "another regex to the list", the exact anti-pattern this phase's own
+# instructions forbid. Generalizing the DECISION instead: a run-wide claim of
+# completed action, cross-checked against whether ANY tool was called AT ALL
+# this run (team._tool_outcomes, summed across every tool, not one family) --
+# narrow, deliberately small phrase set (exactly the incidents this project's
+# own history has already named, not a growing blacklist), paired with a
+# structural, not phrase-specific, grounding check.
+_CLAIMED_COMPLETED_ACTION_RE = re.compile(
+    r"\balready\s+(?:ran|run|executed|performed|completed|returned)\b"
+    r"|\bhas\s+(?:already\s+)?(?:run|been\s+run|executed|been\s+executed)\b",
+    re.I)
 
-    Deliberately NOT built on team._evidence_fidelity_report's own
-    overall_answer_retention ratio -- that function's own comment already
-    recorded why: "previously unwired for lack of a live battery to validate
-    it against". A continuous retention ratio is noisy (a correct, well-
-    summarized answer can legitimately retain few of the gathered tokens
-    verbatim) and using it as a hard gate risks exactly the false-positive-
-    blocking failure this project's own history is full of. This check is
-    binary instead: INSUFFICIENT_EVIDENCE fires only when the ledger holds
-    ZERO records of ANY kind (file_read/lexical_search/semantic_search/
-    comparison) for a run where a member demonstrably produced real output
-    (team._member_result_chars > 0) -- i.e. an answer that was written
-    without a single real tool-backed observation behind it anywhere. Every
-    live run observed this session produced multiple EvidenceRecords; this
-    is near-zero-false-positive by construction, not a general sufficiency
-    judgment (that remains open -- see this phase's own final report).
+
+def _claimed_action_without_lineage(team, content: str) -> bool:
+    """True iff `content` claims a completed runtime action (the T5/T9
+    "already ran the commands" shape _fabricated_tool_use's own tool-specific
+    patterns cannot see) while team._tool_outcomes shows ZERO calls to ANY
+    tool this entire run -- the generalized, structural counterpart to
+    _fabricated_tool_use, reusing the SAME outcomes record rather than a
+    second one, and deliberately keyed on "no action happened at all" (a
+    near-zero-false-positive signal, same discipline as _completion_decision's
+    own ledger-emptiness check) rather than trying to match the claim to one
+    specific tool.
+    """
+    if not _CLAIMED_COMPLETED_ACTION_RE.search(content or ""):
+        return False
+    outcomes = getattr(team, "_tool_outcomes", None)
+    # None (no attribute at all -- a team built by another path) means "no
+    # record to check against", stay silent. {} (the attribute exists AND is
+    # empty) is a real, positive signal -- the tracker ran and recorded zero
+    # calls -- and must NOT be treated the same as "no tracker" (a real bug
+    # caught testing this directly: an empty dict is falsy in Python, and
+    # `not outcomes` alone silently returned False here, exactly backwards --
+    # an empty outcomes record is the STRONGEST case for firing, not a reason
+    # to stay silent).
+    if outcomes is None or not isinstance(outcomes, dict):
+        return False
+    total_calls = sum((v or {}).get("ok", 0) + (v or {}).get("err", 0)
+                       for v in outcomes.values())
+    return total_calls == 0
+
+
+# ── Requirement-driven evidence coverage (C.6, 2026-10-03, GAP B) ───────────
+#
+# _required_coverage_count (pre-existing) only ever answers "how many
+# targets" (always 2, or None) for one narrow regex shape -- confirmed by
+# reading it directly, not a general sufficiency primitive. This does NOT
+# replace it (duplicate-delegation gating still uses it unchanged) -- it adds
+# a SEPARATE, narrow, NAMED-obligation primitive for the completion decision,
+# scoped to exactly the two task shapes this codebase has real machinery for:
+# a "from X to Y" trace, and a task naming 2+ capitalized entities (the SAME
+# extraction _EVIDENCE_ENTITY_RE's own gate gives up after its first match).
+# Every other task shape mechanically returns None (UNKNOWN) -- per this
+# phase's own explicit instruction, UNKNOWN is the correct, safe answer far
+# more often than a guessed SATISFIED, and this is not a task-decomposition
+# engine.
+_NAMED_TRACE_RE = re.compile(r"\bfrom\s+(.+?)\s+to\s+(?:the\s+)?(.+?)[.?!]", re.I)
+
+
+def _task_evidence_obligations(task: "str | None") -> "list[str] | None":
+    """Mechanically-derived required evidence targets, or None (UNKNOWN,
+    never guessed as zero/satisfied) when the task's own wording does not
+    match either recognized shape. See this section's own header comment."""
+    if not task:
+        return None
+    m = _NAMED_TRACE_RE.search(task)
+    if m:
+        return [_normalize_delegation_target(m.group(1)),
+                _normalize_delegation_target(m.group(2))]
+    entities = [_normalize_delegation_target(e.group(1))
+                for e in _EVIDENCE_ENTITY_RE.finditer(task)]
+    if len(entities) >= 2:
+        return entities
+    return None
+
+
+def _evaluate_requirement_coverage(team, obligations: "list[str]") -> dict:
+    """{obligation: "satisfied"|"missing"} -- satisfied iff some RETAINED
+    EvidenceRecord's path/excerpt, or some ComparisonEvidence's source,
+    mentions the obligation's own normalized text. Deliberately a substring
+    check, not semantic matching -- the obligations themselves came from the
+    task's own literal wording (_task_evidence_obligations), so the evidence
+    naming that same literal text is the right-shaped signal, not a proxy
+    for it.
+    """
+    ledger = getattr(team, "_evidence_ledger", None)
+    if ledger is None:
+        return {o: "missing" for o in obligations}
+    haystacks = []
+    for r in ledger.list():
+        if isinstance(r, EvidenceRecord) and r.relevance_status == "retained":
+            haystacks.append(f"{r.source_path or ''} {r.excerpt or ''}".lower())
+        elif isinstance(r, ComparisonEvidence):
+            haystacks.append(r.source.lower())
+    coverage = {}
+    for ob in obligations:
+        coverage[ob] = ("satisfied" if ob and any(ob in h for h in haystacks)
+                         else "missing")
+    return coverage
+
+
+def _completion_decision(team, task: "str | None" = None) -> tuple[str, str]:
+    """(status, reason) -- status is "COMPLETE" or "INSUFFICIENT_EVIDENCE"
+    (INV-11). Two layered checks, both deliberately conservative:
+
+    1. The original, near-zero-false-positive signal (unchanged): a member
+       produced real output but the ledger recorded zero observations of any
+       kind. Deliberately NOT built on team._evidence_fidelity_report's own
+       overall_answer_retention ratio -- that function's own comment already
+       recorded why ("previously unwired for lack of a live battery...
+       noisy") -- a continuous ratio risks exactly the false-positive-
+       blocking failure this project's history is full of.
+
+    2. GAP B (C.6, 2026-10-03): requirement coverage, where `task` is a
+       recognized shape (_task_evidence_obligations returns something other
+       than None). SUFFICIENCYstays UNKNOWN (folded into COMPLETE, not
+       asserted as a separate state the completion gate blocks on) for every
+       task this cannot mechanically decompose -- per the explicit
+       instruction that UNKNOWN must never be guessed as SUFFICIENT, but
+       also must never itself become a blocking condition: only a
+       CONFIRMED-MISSING obligation blocks completion.
     """
     member_chars = getattr(team, "_member_result_chars", 0)
     if not member_chars:
@@ -5536,10 +5798,18 @@ def _completion_decision(team) -> tuple[str, str]:
         return ("INSUFFICIENT_EVIDENCE",
                 "a member produced output but this run's evidence ledger "
                 "recorded zero observations of any kind")
+    obligations = _task_evidence_obligations(task)
+    if obligations:
+        coverage = _evaluate_requirement_coverage(team, obligations)
+        missing = [o for o, s in coverage.items() if s == "missing"]
+        if missing:
+            return ("INSUFFICIENT_EVIDENCE",
+                    f"required coverage missing for: {', '.join(missing)} "
+                    f"(derived from the task's own wording)")
     return "COMPLETE", "evidence ledger holds at least one observation"
 
 
-async def _completion_control_check(content: str, team) -> str:
+async def _completion_control_check(content: str, team, task: "str | None" = None) -> str:
     """The completion-control choke point (INV-11): runs LAST in
     _verified_answer's established post-hoc chain, after every existing
     recovery mechanism (_hoist_denied_premise, _enforce_verification_
@@ -5548,50 +5818,61 @@ async def _completion_control_check(content: str, team) -> str:
     on what is STILL true after all of them. Never raises; a check that
     breaks the answer is worse than one that misses.
 
-    _completion_decision's own INSUFFICIENT_EVIDENCE is the one case this
-    function actively prepends a disclosure for, since it is the one
-    near-zero-false-positive signal available (Section above). The citation
-    (_unresolved_ledger_citations) and fabricated-execution
-    (_fabricated_execution_claims) findings are folded into the SAME
-    disclosure when either fires, rather than three separate banners racing
-    each other -- all three are the same underlying question (does this
-    answer's authority actually trace to a real observation this run made),
-    answered from the SAME ledger.
+    GAP A (C.6): citation/claim findings are now 3-way (UNSUPPORTED vs
+    UNRESOLVED_TRUNCATED, from _unresolved_ledger_citations'/
+    _fabricated_execution_claims' own updated return shapes) and rendered
+    with DIFFERENT wording -- a truncated-observation finding says "needs
+    re-retrieval", never "not authorized"/"unconfirmed" the same way a
+    never-observed path does. GAP C (C.6): _claimed_action_without_lineage
+    folds in as a third independent signal, same disclosure.
     """
     try:
-        status, reason = _completion_decision(team)
+        status, reason = _completion_decision(team, task)
         unresolved_cites = _unresolved_ledger_citations(team, content)
         unresolved_claims = _fabricated_execution_claims(team, content)
+        claimed_action_ungrounded = _claimed_action_without_lineage(team, content)
     except Exception as exc:
         print(f"[team] completion control check failed: {exc}", flush=True)
         return content
 
-    if status == "COMPLETE" and not unresolved_cites and not unresolved_claims:
+    if (status == "COMPLETE" and not unresolved_cites and not unresolved_claims
+            and not claimed_action_ungrounded):
         return content
+
+    unsupported_cites = [(p, l) for p, l, s in unresolved_cites if s == "UNSUPPORTED"]
+    truncated_cites = [(p, l) for p, l, s in unresolved_cites if s == "UNRESOLVED_TRUNCATED"]
 
     parts = []
     if status != "COMPLETE":
         print(f"[team] COMPLETION_CONTROL: {status} -- {reason}", flush=True)
-        parts.append(
-            f"this run's own evidence ledger recorded ZERO real observations "
-            f"({reason}) -- the answer above was not produced from any "
-            f"tool-backed read/search this run made")
-    if unresolved_cites:
-        cites = ", ".join(f"{p}:{l}" for p, l in unresolved_cites[:10])
+        parts.append(f"this run's own evidence ledger/coverage check found: {reason}")
+    if unsupported_cites:
+        cites = ", ".join(f"{p}:{l}" for p, l in unsupported_cites[:10])
         parts.append(f"citation(s) not confirmed by the ledger: {cites}")
+    if truncated_cites:
+        cites = ", ".join(f"{p}:{l}" for p, l in truncated_cites[:10])
+        parts.append(
+            f"citation(s) possibly correct but UNVERIFIABLE because the "
+            f"underlying search/read was truncated before retention "
+            f"(needs re-retrieval, not disbelief): {cites}")
     if unresolved_claims:
         parts.append(
             f"path(s) claimed as inspected with no matching ledger record: "
             f"{', '.join(unresolved_claims[:10])}")
+    if claimed_action_ungrounded:
+        parts.append(
+            f"the answer claims a runtime action already completed, but "
+            f"this run's own tool-outcome record shows zero tool calls of "
+            f"any kind")
     if not parts:
         return content
     print(f"[team] COMPLETION_CONTROL fired: {'; '.join(parts)}", flush=True)
     return (
         f"{content}\n\n---\n**NOT AUTHORIZED AS COMPLETE BY THIS RUN'S OWN "
-        f"EVIDENCE LEDGER — {'; '.join(parts)}. This is reported as "
-        f"unconfirmed, not as a proven error — a real observation this "
-        f"run's ledger wiring did not capture is possible. Treat the "
-        f"specifics above as unverified until checked by hand.**")
+        f"EVIDENCE LEDGER — {'; '.join(parts)}. Items marked UNVERIFIABLE "
+        f"need re-retrieval, not disbelief; everything else is reported as "
+        f"unconfirmed, not as a proven error. Treat the specifics above as "
+        f"unverified until checked by hand.**")
 
 
 # ── Member Control Box foundation (Phase B, 2026-10-02) ─────────────────────
@@ -22109,7 +22390,7 @@ async def run_task_async(
                 # the one binary, near-zero-false-positive signal described in
                 # _completion_decision's own docstring.
                 try:
-                    content = await _completion_control_check(content, team)
+                    content = await _completion_control_check(content, team, task)
                 except Exception as exc:
                     print(f"[team] completion control check failed: {exc}", flush=True)
                 if _phase0 is not None:
