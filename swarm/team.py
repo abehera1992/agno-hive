@@ -17723,7 +17723,7 @@ def best_member_results() -> dict[str, str]:
     return dict(_best_member_results)
 
 
-def _record_draft(text: str) -> None:
+def _record_draft(text: str, team=None, run_agent_names: set[str] | None = None) -> None:
     global _best_draft
     # Sanitise on the way IN, not on the way out (2026-08-25). The draft is read back
     # by api/server.py after a SIGKILL and returned to the caller verbatim, so raw
@@ -17737,6 +17737,23 @@ def _record_draft(text: str) -> None:
     if not text:
         return
     cleaned = _strip_leaked_tool_tags(text).strip()
+    # T9-FOLLOWUP (2026-10-03): this periodic mid-run snapshot is EXACTLY what
+    # api/server.py reads back after an external liveness SIGKILL -- a completely
+    # separate recovery path from the in-process tail _isolate_contaminated_fallback
+    # guards (run_task_stream/_stream_team_run/run_task_async's own return). The
+    # first deployed fix only guarded the in-process path; a SIGKILLed run never
+    # reaches it at all, so the externally-recovered draft was still built from the
+    # same raw, unattributed `joined` string -- live-confirmed the same day: a second
+    # parallel-review run hit the SAME token-interleaved corruption via THIS exact
+    # recovery path (api/server.py's "RUN STOPPED EARLY" banner), with the first fix
+    # deployed and doing nothing, because it was never reached. Applying the same
+    # multi-named-source check here, on every periodic snapshot, closes that gap at
+    # its one remaining entry point rather than adding a THIRD, parallel guard.
+    if cleaned and team is not None and run_agent_names and len(
+        {n for n in run_agent_names if n}) > 1:
+        isolated = render_member_findings(getattr(team, "_member_results", None))
+        if isolated:
+            cleaned = isolated
     if cleaned and len(cleaned) > len(_best_draft):
         _best_draft = cleaned
 
@@ -21680,7 +21697,7 @@ async def _stream_team_run(
                 activity["last_token_at"] = now
                 if now - last_logged_at >= 10:
                     joined = "".join(full_content)
-                    _record_draft(joined)
+                    _record_draft(joined, team=team, run_agent_names=run_agent_names)
                     new_segment = joined[last_logged_len:]
                     preview = new_segment[-300:]
                     loop_detected = _looks_like_repetition_loop(new_segment, joined[:last_logged_len])
@@ -22295,7 +22312,7 @@ async def run_task_async(
                                 activity["last_token_at"] = now
                                 if now - last_logged_at >= 10:
                                     joined = "".join(full_content)
-                                    _record_draft(joined)
+                                    _record_draft(joined, team=team, run_agent_names=run_agent_names)
                                     new_segment = joined[last_logged_len:]
                                     preview = new_segment[-300:]
                                     loop_detected = _looks_like_repetition_loop(new_segment, joined[:last_logged_len])
