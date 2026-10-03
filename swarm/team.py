@@ -5727,45 +5727,122 @@ def _claimed_action_without_lineage(team, content: str) -> bool:
 _NAMED_TRACE_RE = re.compile(r"\bfrom\s+(.+?)\s+to\s+(?:the\s+)?(.+?)[.?!]", re.I)
 
 
-def _task_evidence_obligations(task: "str | None") -> "list[str] | None":
-    """Mechanically-derived required evidence targets, or None (UNKNOWN,
-    never guessed as zero/satisfied) when the task's own wording does not
-    match either recognized shape. See this section's own header comment."""
+@dataclass(frozen=True)
+class EvidenceObligation:
+    """One explicit, structured evidence requirement (C.7, 2026-10-03,
+    Objective A). `obligation_id` is the Control Box delegation_key when
+    derived from a real delegation (CONTROL_BOX source -- the coordinator's
+    OWN stated evidence_required for that one delegation, already more
+    specific than re-parsing the original task's raw prose) or a synthetic
+    index for a TASK_TEXT-derived one (the older, narrower fallback). `source`
+    records which path produced it, so a caller/report can tell a coordinator-
+    stated requirement from a mechanically-guessed one.
+    """
+    obligation_id: str
+    target: str
+    source: str          # "control_box" | "task_text"
+
+
+def _control_box_evidence_obligations(team) -> "list[EvidenceObligation] | None":
+    """Preferred source (Objective A, Section 4.1): one EvidenceObligation per
+    real delegation this run, named from that delegation's OWN evidence_
+    required/objective text -- the coordinator's own stated requirement,
+    copied verbatim into MemberControlState at delegation time (never a
+    model-chosen free-form key, per that class's own docstring). Requires 2+
+    real delegations with an extractable target each; a single-delegation run
+    has nothing to compare coverage ACROSS, so this correctly returns None
+    (UNKNOWN) rather than manufacturing one obligation out of the only
+    delegation that happened to run. Reuses _EVIDENCE_ENTITY_RE/
+    _normalize_delegation_target exactly as the task-text fallback does --
+    same extraction, a narrower and more reliable INPUT (one delegation's own
+    stated requirement, not the whole task's raw prose).
+    """
+    states = _get_member_control_box(team).list()
+    obligations = []
+    for s in states:
+        # MemberControlState carries no separate `target` field (confirmed by
+        # reading the dataclass directly) -- evidence_required/objective are
+        # the only text to extract a named entity from for this delegation.
+        text = f"{s.evidence_required or ''} {s.objective or ''}"
+        m = _EVIDENCE_ENTITY_RE.search(text)
+        target = _normalize_delegation_target(m.group(1)) if m else None
+        if target:
+            obligations.append(EvidenceObligation(
+                obligation_id=s.delegation_key, target=target, source="control_box"))
+    # De-duplicate by target (two delegations naming the same thing are one
+    # obligation, not two) while preserving first-seen order.
+    seen: set[str] = set()
+    deduped = []
+    for ob in obligations:
+        if ob.target not in seen:
+            seen.add(ob.target)
+            deduped.append(ob)
+    return deduped if len(deduped) >= 2 else None
+
+
+def _task_evidence_obligations(team, task: "str | None") -> "list[EvidenceObligation] | None":
+    """Structured evidence obligations, or None (UNKNOWN, never guessed as
+    zero/satisfied). Tries the Control-Box-derived source FIRST (richer,
+    coordinator-stated -- Objective A's own preference order), falling back
+    to the original task-text regex extraction only when the Control Box has
+    fewer than 2 usable delegations to compare (e.g. this check runs before
+    delegation, or the run only ever delegated once).
+    """
+    from_box = _control_box_evidence_obligations(team)
+    if from_box:
+        return from_box
     if not task:
         return None
     m = _NAMED_TRACE_RE.search(task)
     if m:
-        return [_normalize_delegation_target(m.group(1)),
-                _normalize_delegation_target(m.group(2))]
+        return [EvidenceObligation(obligation_id="task_text:0",
+                                    target=_normalize_delegation_target(m.group(1)),
+                                    source="task_text"),
+                EvidenceObligation(obligation_id="task_text:1",
+                                    target=_normalize_delegation_target(m.group(2)),
+                                    source="task_text")]
     entities = [_normalize_delegation_target(e.group(1))
                 for e in _EVIDENCE_ENTITY_RE.finditer(task)]
     if len(entities) >= 2:
-        return entities
+        return [EvidenceObligation(obligation_id=f"task_text:{i}", target=t, source="task_text")
+                for i, t in enumerate(entities)]
     return None
 
 
-def _evaluate_requirement_coverage(team, obligations: "list[str]") -> dict:
-    """{obligation: "satisfied"|"missing"} -- satisfied iff some RETAINED
-    EvidenceRecord's path/excerpt, or some ComparisonEvidence's source,
-    mentions the obligation's own normalized text. Deliberately a substring
-    check, not semantic matching -- the obligations themselves came from the
-    task's own literal wording (_task_evidence_obligations), so the evidence
-    naming that same literal text is the right-shaped signal, not a proxy
-    for it.
+def _evaluate_requirement_coverage(team, obligations: "list[EvidenceObligation]") -> dict:
+    """{target: "satisfied"|"missing"} (Objective B). Tries structured
+    declaration IDENTITY first -- an exact (case-insensitive) match against a
+    RETAINED file_read EvidenceRecord's own `excerpt`, which IS the real
+    declared name _extract_declarations found (e.g. "PricingPlan", not a
+    paraphrase) -- so "PricingPlan"/"pricing_plan"/"Pricing Plan" in the
+    obligation's own normalized form still matches the one real declaration
+    without a growing synonym list (Section 6: exact identity where the
+    system already knows the declaration, UNKNOWN/substring-fallback
+    otherwise, never a semantic-similarity engine). Falls back to the
+    original substring-over-path-and-excerpt check (bounded fallback,
+    explicitly still permitted) only when no exact declaration match exists.
     """
     ledger = getattr(team, "_evidence_ledger", None)
     if ledger is None:
-        return {o: "missing" for o in obligations}
+        return {o.target: "missing" for o in obligations}
+    declared_exact: set[str] = set()
     haystacks = []
     for r in ledger.list():
         if isinstance(r, EvidenceRecord) and r.relevance_status == "retained":
+            if r.evidence_type == "file_read" and r.excerpt:
+                declared_exact.add(_normalize_delegation_target(r.excerpt))
             haystacks.append(f"{r.source_path or ''} {r.excerpt or ''}".lower())
         elif isinstance(r, ComparisonEvidence):
             haystacks.append(r.source.lower())
     coverage = {}
     for ob in obligations:
-        coverage[ob] = ("satisfied" if ob and any(ob in h for h in haystacks)
-                         else "missing")
+        t = ob.target
+        if t and t in declared_exact:
+            coverage[t] = "satisfied"
+        elif t and any(t in h for h in haystacks):
+            coverage[t] = "satisfied"
+        else:
+            coverage[t] = "missing"
     return coverage
 
 
@@ -5819,14 +5896,15 @@ def _completion_decision(team, task: "str | None" = None) -> tuple[str, str]:
         # environment/DB-style task whose evidence shape this ledger does not
         # extract) -- not a signal to block on; fall through to requirement
         # coverage (below), which is the only other blocking check.
-    obligations = _task_evidence_obligations(task)
+    obligations = _task_evidence_obligations(team, task)
     if obligations:
         coverage = _evaluate_requirement_coverage(team, obligations)
-        missing = [o for o, s in coverage.items() if s == "missing"]
+        missing = [t for t, s in coverage.items() if s == "missing"]
         if missing:
+            source = obligations[0].source
             return ("INSUFFICIENT_EVIDENCE",
                     f"required coverage missing for: {', '.join(missing)} "
-                    f"(derived from the task's own wording)")
+                    f"(obligations derived from {source})")
     if ledger_empty:
         return "COMPLETE", "no ledger-tracked evidence, but real tool activity occurred this run"
     return "COMPLETE", "evidence ledger holds at least one observation"
