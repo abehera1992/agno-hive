@@ -4928,6 +4928,25 @@ class EvidenceRecord:
     item would only be None if the producing tool itself returned no line
     (never happens for the two tools this is built from, kept Optional for
     honesty rather than asserting a guarantee this type cannot enforce).
+
+    `tool_call_id` (C.5, 2026-10-03): confirmed by reading the installed
+    agno's own Function._build_hook_args (tools/function.py) that tool_hooks
+    receive NO real per-invocation id -- the only injectable names are agent/
+    team/run_context/name/function_name/function/func/function_call(=the
+    continuation, not a ToolCall)/args/arguments. No id to preserve, so one
+    is generated here, once per real tool call, at this hook -- the earliest
+    deterministic, application-owned point in the chain -- and shared by
+    every EvidenceRecord produced from that SAME call (e.g. all declarations
+    extracted from one get_file_content response carry the same id, honestly
+    representing "N facts from 1 observation", not N independent calls).
+
+    `relevance_status` (C.5): "retained" or "needs_review" -- see
+    _classify_relevance's own docstring for the exact, deliberately narrow
+    rule per evidence_type. Computed once, at recording time, from
+    deterministic signals only (never a model judgment) -- the B->C
+    invariant this phase exists to establish: a non-empty result is not
+    automatically relevant, and this field is where that distinction is
+    actually retained rather than silently collapsed into "evidence exists".
     """
     evidence_id: str
     evidence_type: str          # "file_read" | "lexical_search" | "semantic_search"
@@ -4938,6 +4957,8 @@ class EvidenceRecord:
     retrieval_query: str | None
     excerpt: str
     created_at: float
+    tool_call_id: str
+    relevance_status: str       # "retained" | "needs_review"
 
 
 class _EvidenceLedger:
@@ -5272,6 +5293,54 @@ _SEARCH_HIT_RE = re.compile(r"^(.+?):(\d+): (.*)$")
 _MAX_EVIDENCE_RECORDS_PER_CALL = 60   # mirrors _MAX_INDEXED_PER_FILE / search_files' own max_results
 _EVIDENCE_EXCERPT_CHARS = 160
 
+# Secret-path redaction (C.5, 2026-10-03, spec Section 17) -- same filename-
+# shape convention hive-mcp's own indexer uses for _is_secret_file (memory:
+# "hive index secret files DONE: _is_secret_file skips *.env/SQL dumps").
+# Mirrored, not imported (hive-mcp is a separate process/server) -- a
+# get_file_content call against one of these is still served to the model
+# exactly as before; this only stops the EXCERPT from additionally being
+# copied into the in-memory evidence ledger, a second place a secret could
+# have leaked from that did not exist before this phase.
+_SECRET_PATH_RE = re.compile(
+    r"(^|/)\.env(\.|$)|\.pem$|\.key$|secrets?\.|credentials?\.|\.sql$", re.I)
+
+# Generic search terms too broad, on their own, to be a meaningful relevance
+# signal -- a real failure this session (business-service's own "status"
+# search returning mailcow_admin_api.py/outbox.py/saga_consumers.py mixed
+# with the actually-relevant BusinessStatus hits) is exactly a query this
+# short/generic matching real code everywhere in the repository.
+_GENERIC_SEARCH_TERMS = frozenset({
+    "status", "type", "name", "id", "data", "error", "value", "config",
+    "state", "key", "path", "url", "code", "info", "result", "item",
+})
+
+
+def _classify_relevance(evidence_type: str, retrieval_query: "str | None") -> str:
+    """"retained" or "needs_review" -- the B->C decision (INV-6), computed from
+    deterministic signals only, per the spec's own stated preference order
+    (metadata/query alignment before any model round-trip):
+
+    - file_read: a deliberate, explicitly-named read is a different act from
+      a search hit arriving unbidden -- retained by construction, same trust
+      level this architecture has always given a targeted get_file_content.
+    - lexical_search: retained only if the query itself is specific enough to
+      be a real relevance signal (longer than 4 chars and not one of the
+      generic terms above) -- a match on "status" proves nothing about
+      whether the FILE it landed in has anything to do with the task; a
+      match on "check_login_rate_limit" does.
+    - semantic_search: needs_review unconditionally -- lightrag_query returns
+      a synthesized paragraph, not a line-addressable fact, and this phase
+      does not pretend that is the same grade of evidence as a direct hit.
+    """
+    if evidence_type == "file_read":
+        return "retained"
+    if evidence_type == "lexical_search":
+        q = (retrieval_query or "").strip().lower()
+        if len(q) > 4 and q not in _GENERIC_SEARCH_TERMS:
+            return "retained"
+        return "needs_review"
+    return "needs_review"
+
 
 def _record_evidence_from_observation(ledger: "_EvidenceLedger", function_name: str,
                                        args: dict, result, agent_key: str,
@@ -5280,10 +5349,17 @@ def _record_evidence_from_observation(ledger: "_EvidenceLedger", function_name: 
 
     Pure with respect to the ledger's own contents (never re-reads, never
     re-searches -- only transcribes what the tool already returned this
-    call), and every evidence_id is execution_context.new_id(): runtime-
-    generated, never model-supplied (INV-3). Bounded the same way the
-    producing tool already is, so this never grows the ledger faster than
+    call), and every evidence_id/tool_call_id is execution_context.new_id():
+    runtime-generated, never model-supplied (INV-2/3). Bounded the same way
+    the producing tool already is, so this never grows the ledger faster than
     the tool call itself was already allowed to produce content.
+
+    One tool_call_id per OBSERVATION (this one call), shared by every
+    EvidenceRecord it produces (INV-1/INV-4 lineage) -- agno's own tool_hooks
+    injection (confirmed by reading Function._build_hook_args directly) does
+    not expose a real per-invocation id to a hook, so this is generated at
+    the earliest deterministic, application-owned point instead, per the
+    spec's own explicit fallback instruction.
 
     `declarations`, when the caller already ran _extract_declarations on this
     SAME result for the declaration index (the common case for an
@@ -5299,13 +5375,18 @@ def _record_evidence_from_observation(ledger: "_EvidenceLedger", function_name: 
     text = _result_text(result)
     read_by = agent_key or "coordinator"
     new_ids: list[str] = []
+    tool_call_id = execution_context.new_id()
 
     def _add(evidence_type, source_path, line, retrieval_query, excerpt):
+        if source_path and _SECRET_PATH_RE.search(str(source_path)):
+            return
         rec = EvidenceRecord(
             evidence_id=execution_context.new_id(), evidence_type=evidence_type,
             source_path=source_path, line=line, tool_name=function_name,
             read_by=read_by, retrieval_query=retrieval_query,
             excerpt=excerpt[:_EVIDENCE_EXCERPT_CHARS], created_at=time.monotonic(),
+            tool_call_id=tool_call_id,
+            relevance_status=_classify_relevance(evidence_type, retrieval_query),
         )
         ledger.record(rec)
         new_ids.append(rec.evidence_id)
@@ -5332,8 +5413,10 @@ def _record_evidence_from_observation(ledger: "_EvidenceLedger", function_name: 
             _add("semantic_search", None, None, query, text)
 
     if new_ids:
+        retained = sum(1 for eid in new_ids if ledger.get(eid).relevance_status == "retained")
         print(f"[team] EVIDENCE_RECORDED: {len(new_ids)} item(s) from {function_name} "
-              f"by {read_by}", flush=True)
+              f"by {read_by} ({retained} retained, {len(new_ids) - retained} needs_review) "
+              f"tool_call_id={tool_call_id}", flush=True)
     return new_ids
 
 
@@ -5358,7 +5441,7 @@ def _unresolved_ledger_citations(team, content: str) -> list[tuple[str, str]]:
         return []
     unresolved: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    for m in list(_CITED_LINE_RE.finditer(content))[:_MAX_CITATIONS_CHECKED]:
+    for m in list(_LEDGER_CITED_LINE_RE.finditer(content))[:_MAX_CITATIONS_CHECKED]:
         path, line_s = m.group(1), m.group(2)
         key = (path, line_s)
         if key in seen:
@@ -5373,6 +5456,127 @@ def _unresolved_ledger_citations(team, content: str) -> list[tuple[str, str]]:
                    for r in records):
             unresolved.append((path, line_s))
     return unresolved
+
+
+def _fabricated_execution_claims(team, content: str) -> list[str]:
+    """Paths the answer claims to have "inspected"/"read"/"searched"/etc. with
+    NO matching EvidenceRecord anywhere in this run's ledger (INV-10) --
+    _unresolved_ledger_citations' own sibling for the shape that carries no
+    `:line` at all ("I inspected API/foo.py", never "API/foo.py:42"), which
+    _LEDGER_CITED_LINE_RE structurally cannot see since its own pattern
+    requires a line number.
+
+    Same honesty convention as _unresolved_ledger_citations: a path this
+    returns is UNCONFIRMED by the ledger, not a proven fabrication -- a
+    member's real read this run's ledger wiring did not see for some reason
+    is possible, if rare; _fabricated_tool_use (prose-pattern, pre-existing)
+    stays the actual defense-in-depth verdict-maker for this shape, unchanged
+    and un-replaced, per the explicit instruction to keep it.
+    """
+    ledger = getattr(team, "_evidence_ledger", None)
+    if ledger is None:
+        return []
+    unresolved: list[str] = []
+    seen: set[str] = set()
+    for m in list(_CLAIMED_INSPECTION_RE.finditer(content))[:_MAX_INSPECTION_CLAIMS_CHECKED]:
+        path = m.group(1)
+        if path in seen:
+            continue
+        seen.add(path)
+        if not ledger.by_path(path):
+            unresolved.append(path)
+    return unresolved
+
+
+def _completion_decision(team) -> tuple[str, str]:
+    """(status, reason) -- status is "COMPLETE" or "INSUFFICIENT_EVIDENCE"
+    (INV-11): the one, deliberately conservative, binary signal this phase
+    adds as an ACTIVE (not merely logged) completion check, placed at
+    _verified_answer's own established post-hoc "choke point" chain (the
+    same placement _hoist_denied_premise/_evidence_integrity_check/
+    _attempt_evidence_grounded_reconstruction already use -- see their own
+    comments at the one call site in run_task_async/run_task_stream).
+
+    Deliberately NOT built on team._evidence_fidelity_report's own
+    overall_answer_retention ratio -- that function's own comment already
+    recorded why: "previously unwired for lack of a live battery to validate
+    it against". A continuous retention ratio is noisy (a correct, well-
+    summarized answer can legitimately retain few of the gathered tokens
+    verbatim) and using it as a hard gate risks exactly the false-positive-
+    blocking failure this project's own history is full of. This check is
+    binary instead: INSUFFICIENT_EVIDENCE fires only when the ledger holds
+    ZERO records of ANY kind (file_read/lexical_search/semantic_search/
+    comparison) for a run where a member demonstrably produced real output
+    (team._member_result_chars > 0) -- i.e. an answer that was written
+    without a single real tool-backed observation behind it anywhere. Every
+    live run observed this session produced multiple EvidenceRecords; this
+    is near-zero-false-positive by construction, not a general sufficiency
+    judgment (that remains open -- see this phase's own final report).
+    """
+    member_chars = getattr(team, "_member_result_chars", 0)
+    if not member_chars:
+        return "COMPLETE", "no delegation this run to hold accountable"
+    ledger = getattr(team, "_evidence_ledger", None)
+    if ledger is None or not ledger.list():
+        return ("INSUFFICIENT_EVIDENCE",
+                "a member produced output but this run's evidence ledger "
+                "recorded zero observations of any kind")
+    return "COMPLETE", "evidence ledger holds at least one observation"
+
+
+async def _completion_control_check(content: str, team) -> str:
+    """The completion-control choke point (INV-11): runs LAST in
+    _verified_answer's established post-hoc chain, after every existing
+    recovery mechanism (_hoist_denied_premise, _enforce_verification_
+    invariant, _evidence_integrity_check, _attempt_evidence_grounded_
+    reconstruction) has already had its chance to fix `content` -- only acts
+    on what is STILL true after all of them. Never raises; a check that
+    breaks the answer is worse than one that misses.
+
+    _completion_decision's own INSUFFICIENT_EVIDENCE is the one case this
+    function actively prepends a disclosure for, since it is the one
+    near-zero-false-positive signal available (Section above). The citation
+    (_unresolved_ledger_citations) and fabricated-execution
+    (_fabricated_execution_claims) findings are folded into the SAME
+    disclosure when either fires, rather than three separate banners racing
+    each other -- all three are the same underlying question (does this
+    answer's authority actually trace to a real observation this run made),
+    answered from the SAME ledger.
+    """
+    try:
+        status, reason = _completion_decision(team)
+        unresolved_cites = _unresolved_ledger_citations(team, content)
+        unresolved_claims = _fabricated_execution_claims(team, content)
+    except Exception as exc:
+        print(f"[team] completion control check failed: {exc}", flush=True)
+        return content
+
+    if status == "COMPLETE" and not unresolved_cites and not unresolved_claims:
+        return content
+
+    parts = []
+    if status != "COMPLETE":
+        print(f"[team] COMPLETION_CONTROL: {status} -- {reason}", flush=True)
+        parts.append(
+            f"this run's own evidence ledger recorded ZERO real observations "
+            f"({reason}) -- the answer above was not produced from any "
+            f"tool-backed read/search this run made")
+    if unresolved_cites:
+        cites = ", ".join(f"{p}:{l}" for p, l in unresolved_cites[:10])
+        parts.append(f"citation(s) not confirmed by the ledger: {cites}")
+    if unresolved_claims:
+        parts.append(
+            f"path(s) claimed as inspected with no matching ledger record: "
+            f"{', '.join(unresolved_claims[:10])}")
+    if not parts:
+        return content
+    print(f"[team] COMPLETION_CONTROL fired: {'; '.join(parts)}", flush=True)
+    return (
+        f"{content}\n\n---\n**NOT AUTHORIZED AS COMPLETE BY THIS RUN'S OWN "
+        f"EVIDENCE LEDGER — {'; '.join(parts)}. This is reported as "
+        f"unconfirmed, not as a proven error — a real observation this "
+        f"run's ledger wiring did not capture is possible. Treat the "
+        f"specifics above as unverified until checked by hand.**")
 
 
 # ── Member Control Box foundation (Phase B, 2026-10-02) ─────────────────────
@@ -17599,10 +17803,39 @@ _MAX_INDEXED_PER_FILE = 60
 # at CALL time so the function itself can live anywhere in this file, but a
 # module-level re.compile() runs at IMPORT time and needs the name to already
 # exist).
-_CITED_LINE_RE = re.compile(
+#
+# Named _LEDGER_CITED_LINE_RE, NOT _CITED_LINE_RE (C.5, 2026-10-03 fix) -- a
+# real, already-shipped (e387699) name collision: _CITED_LINE_RE already
+# existed at line ~9144 for _term_on_any_cited_line's own, narrower, py/ts/tsx-
+# only pattern. Module-level assignment order meant THIS one (textually later)
+# silently won every lookup of the name "_CITED_LINE_RE" anywhere in the file
+# from the moment the module finished loading -- found while adding C.5's
+# fabricated-execution check beside this one and re-deriving the exact line
+# number, not by original design. The pre-existing function's own behavior
+# was very likely unaffected in practice (same two capture groups, a superset
+# of file extensions, backticks were never part of either character class so
+# neither pattern ever depended on consuming them) -- still a real, undetected
+# collision, fixed here by giving this one its own name rather than leaving
+# two unrelated regexes sharing one.
+_LEDGER_CITED_LINE_RE = re.compile(
     r"([\w./-]+\.(?:" + "|".join(s.lstrip(".") for s in _INDEXABLE_SUFFIXES) + r")):(\d+)")
 _LINE_TOLERANCE = 3
 _MAX_CITATIONS_CHECKED = 40
+
+# Fabricated-execution check (C.5, 2026-10-03, INV-10): a claimed inspection
+# verb immediately followed by a path-like token, independent of whether a
+# :line citation is present -- "I inspected API/foo.py" never cites a line at
+# all, so _LEDGER_CITED_LINE_RE's own :(\d+) requirement structurally cannot
+# see it. Deliberately narrow verb list (the phrasing this project's own
+# history has actually recorded: "already ran", "already returned",
+# "inspected", "examined", "reviewed", "read", "searched" -- see
+# _fabricated_tool_use's own docstring for the prose-only detector this
+# supplements, not replaces).
+_CLAIMED_INSPECTION_RE = re.compile(
+    r"\b(?:inspected|examined|reviewed|read|searched|opened|checked)\s+"
+    r"(?:the\s+file\s+)?`?([\w./-]+\.(?:"
+    + "|".join(s.lstrip(".") for s in _INDEXABLE_SUFFIXES) + r"))`?", re.I)
+_MAX_INSPECTION_CLAIMS_CHECKED = 20
 
 
 def _extract_declarations(text: str) -> list[str]:
@@ -21852,6 +22085,18 @@ async def run_task_async(
                           f"items={_fid['items']}", flush=True)
                 except Exception as exc:
                     print(f"[team] evidence-fidelity diagnostic failed: {exc}", flush=True)
+                # C.5 (2026-10-03): the completion-control choke point (INV-11) --
+                # placed last, deliberately after every recovery mechanism above
+                # has already had its chance, same "last word" reasoning Phase I's
+                # own comment gives. Unlike Phase V immediately above (log-only,
+                # proven unsafe to gate on directly -- see that diagnostic's own
+                # comment), this DOES actively append a disclosure, but only for
+                # the one binary, near-zero-false-positive signal described in
+                # _completion_decision's own docstring.
+                try:
+                    content = await _completion_control_check(content, team)
+                except Exception as exc:
+                    print(f"[team] completion control check failed: {exc}", flush=True)
                 if _phase0 is not None:
                     # The ONE place this phase is allowed an MCP round trip: after the
                     # answer is final, resolving the deduped union of cited paths.
