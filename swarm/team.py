@@ -6789,6 +6789,19 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
         return content, result
     setattr(team, _REPETITION_COMPLETION_FLAG, True)
 
+    # T12-FOLLOWUP (2026-10-03): _checkpoint_block(team) is the SAME re-injection
+    # every other retry/reconciliation path in this file already uses (the
+    # "never-took-action" retry, the "claimed write" retry, the "zero reads" retry,
+    # the "zero db reads" retry, the "narrated-a-tool-it-doesn't-have" retry, and
+    # the evidence-reconciliation retries all pass `task + _checkpoint_block(team) +
+    # ...` into their own _stream_team_run call) -- this function was the one
+    # exception, passing only the task and the model's OWN lossy prior draft, never
+    # the raw findings behind it. Live-confirmed cost (T12): with nothing but its
+    # own already-incomplete draft to work from, the model generated new, hedged,
+    # unverified prose ("likely", "may have") instead of the 16 real routers and 31
+    # real model classes team._member_results already held. Adding the SAME
+    # checkpoint every other path already gets closes that one gap, not a new
+    # mechanism.
     prompt = (
         f"{task}\n\nYou already produced an answer to this task below, but generation "
         f"was cut off before it was finished -- it stops mid-answer and never reaches "
@@ -6796,9 +6809,11 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
         f"left off and complete it, ending with the actual conclusion the task asked "
         f"for. Do NOT start over, do NOT re-research or re-delegate, and do NOT repeat "
         f"any part of what is already written below -- use only what you already "
-        f"found. If what is below does not already contain everything needed to "
-        f"finish it, say plainly what is missing rather than guessing.\n\n"
-        f"── Your answer so far (incomplete) ──\n{content}\n── end of what you have so far ──"
+        f"found (the findings below, and your own draft further down). If what you "
+        f"already found does not already contain everything needed to finish it, say "
+        f"plainly what is missing rather than guessing.\n"
+        + _checkpoint_block(team) +
+        f"\n── Your answer so far (incomplete) ──\n{content}\n── end of what you have so far ──"
     )
     reads_before = _run_read_count(team)
     print(f"[team] repetition-truncated answer ({len(content):,} chars) — attempting "
@@ -6811,6 +6826,18 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
         print(f"[team] repetition-truncation completion failed: {exc} — keeping the "
               f"truncated draft", flush=True)
         return content + _TRUNCATED_ANSWER_NOTE, result
+    # T12-FOLLOWUP: the _stream_team_run call just above can ITSELF trip its own
+    # copy of the Z16 repetition-stop logic -- live-confirmed on T4 and T13a, where
+    # the completion pass restated content it had already written (the exact
+    # failure the checkpoint injection above reduces but cannot guarantee away: a
+    # model can still choose to restate rather than continue) and the restatement
+    # itself repeated, truncating the "completion" a second time. That inner stop
+    # now sets team._repetition_truncated (see _stream_team_run's own updated
+    # comment) exactly like the original, outer one did -- read and cleared here,
+    # once, so a still-incomplete completion is never adopted as if it were whole.
+    nested_truncation = getattr(team, "_repetition_truncated", False)
+    if nested_truncation:
+        setattr(team, "_repetition_truncated", False)
     if not completed or completed.strip() == "(no response)":
         # The literal fallback _stream_team_run/run_task_async's own Z16 copy both
         # use when a generation yields zero content -- truthy as a string, so the
@@ -6830,6 +6857,11 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
               "the truncated draft — keeping the draft, disclosed as incomplete",
               flush=True)
         return content + _TRUNCATED_ANSWER_NOTE, result
+    if nested_truncation:
+        print("[team] repetition-truncation completion was itself cut short by a "
+              "second repetition loop — adopting it but disclosing it as still "
+              "incomplete rather than shipping it silently", flush=True)
+        return completed + _TRUNCATED_ANSWER_NOTE, adopted_result
     print(f"[team] repetition-truncation completion adopted ({len(completed):,} chars)",
           flush=True)
     return completed, adopted_result
@@ -21839,6 +21871,21 @@ async def _stream_team_run(
     if repetition_stopped:
         accumulated = accumulated[:last_good_len].strip() or "(no response)"
         final_segment = accumulated
+        # T12-FOLLOWUP (2026-10-03): this copy of the Z16 logic previously computed
+        # repetition_stopped and then discarded it -- exactly the gap run_task_async's
+        # OWN copy already fixed (see Z32's comment there), but left open here with an
+        # explicit "left to that guard's own _adopt_retry comparison" rationale that
+        # turned out not to be true: _adopt_retry takes no `team` argument and has no
+        # way to read this. Live-confirmed the cost: _complete_repetition_truncated_
+        # answer's recovery pass calls exactly this function, and when the recovery
+        # itself re-triggers a SECOND repetition loop (T4, T13a -- the recovery
+        # restates content it already wrote because it was never shown the real
+        # evidence, then trips the same detector trying to restate the restatement),
+        # the caller had no way to know its own "completion" was itself cut short, and
+        # adopted it as if it were whole. Setting the same flag run_task_async's copy
+        # already sets closes that blind spot for every caller of this function, not
+        # just the one that exposed it.
+        setattr(team, "_repetition_truncated", True)
     final_segment, accumulated = _isolate_contaminated_fallback(
         final_segment, accumulated, segment_agent_names, run_agent_names, team)
     content = _with_forwarded_evidence(_first_surviving_answer(
