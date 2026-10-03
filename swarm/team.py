@@ -5771,33 +5771,54 @@ def _evaluate_requirement_coverage(team, obligations: "list[str]") -> dict:
 
 def _completion_decision(team, task: "str | None" = None) -> tuple[str, str]:
     """(status, reason) -- status is "COMPLETE" or "INSUFFICIENT_EVIDENCE"
-    (INV-11). Two layered checks, both deliberately conservative:
+    (INV-11). Layered checks, all deliberately conservative:
 
-    1. The original, near-zero-false-positive signal (unchanged): a member
-       produced real output but the ledger recorded zero observations of any
-       kind. Deliberately NOT built on team._evidence_fidelity_report's own
-       overall_answer_retention ratio -- that function's own comment already
-       recorded why ("previously unwired for lack of a live battery...
-       noisy") -- a continuous ratio risks exactly the false-positive-
-       blocking failure this project's history is full of.
+    1. The original, near-zero-false-positive signal, CORRECTED live on this
+       phase's own battery: a member produced real output, the ledger
+       recorded zero observations, AND team._tool_outcomes (recorded for
+       EVERY tool, confirmed by reading its own population comment directly,
+       not just the 4 evidence-producing ones this ledger tracks) ALSO shows
+       zero calls to anything. The uncorrected version fired on a genuinely
+       correct, fully-grounded answer live: a task whose correct tool is
+       get_env_info (an Executor environment check) was flagged
+       INSUFFICIENT_EVIDENCE purely because get_env_info is not one of the
+       4 evidence-producing tools this ledger's own _record_evidence_from_
+       observation knows how to turn into EvidenceRecords -- the ledger was
+       empty, but the run was not ungrounded; _tool_outcomes showed a real
+       get_env_info call. Checking both before concluding "nothing happened"
+       is what distinguishes "this task's evidence shape is not one we
+       extract" from "no tool was ever actually called", which the single-
+       signal version could not tell apart. Deliberately NOT built on
+       team._evidence_fidelity_report's own overall_answer_retention ratio
+       -- that function's own comment already recorded why ("previously
+       unwired for lack of a live battery... noisy").
 
     2. GAP B (C.6, 2026-10-03): requirement coverage, where `task` is a
        recognized shape (_task_evidence_obligations returns something other
-       than None). SUFFICIENCYstays UNKNOWN (folded into COMPLETE, not
-       asserted as a separate state the completion gate blocks on) for every
-       task this cannot mechanically decompose -- per the explicit
-       instruction that UNKNOWN must never be guessed as SUFFICIENT, but
-       also must never itself become a blocking condition: only a
-       CONFIRMED-MISSING obligation blocks completion.
+       than None). Sufficiency stays UNKNOWN (folded into COMPLETE, not
+       asserted as a separate blocking state) for every task this cannot
+       mechanically decompose -- UNKNOWN must never be guessed as
+       SUFFICIENT, but also must never itself become a blocking condition:
+       only a CONFIRMED-MISSING obligation blocks completion.
     """
     member_chars = getattr(team, "_member_result_chars", 0)
     if not member_chars:
         return "COMPLETE", "no delegation this run to hold accountable"
     ledger = getattr(team, "_evidence_ledger", None)
-    if ledger is None or not ledger.list():
-        return ("INSUFFICIENT_EVIDENCE",
-                "a member produced output but this run's evidence ledger "
-                "recorded zero observations of any kind")
+    ledger_empty = ledger is None or not ledger.list()
+    if ledger_empty:
+        outcomes = getattr(team, "_tool_outcomes", None)
+        any_tool_called = isinstance(outcomes, dict) and any(
+            (v or {}).get("ok", 0) + (v or {}).get("err", 0) for v in outcomes.values())
+        if not any_tool_called:
+            return ("INSUFFICIENT_EVIDENCE",
+                    "a member produced output but this run's evidence ledger "
+                    "recorded zero observations AND no tool of any kind was "
+                    "called this run")
+        # The ledger is empty but real tool activity happened (e.g. an
+        # environment/DB-style task whose evidence shape this ledger does not
+        # extract) -- not a signal to block on; fall through to requirement
+        # coverage (below), which is the only other blocking check.
     obligations = _task_evidence_obligations(task)
     if obligations:
         coverage = _evaluate_requirement_coverage(team, obligations)
@@ -5806,6 +5827,8 @@ def _completion_decision(team, task: "str | None" = None) -> tuple[str, str]:
             return ("INSUFFICIENT_EVIDENCE",
                     f"required coverage missing for: {', '.join(missing)} "
                     f"(derived from the task's own wording)")
+    if ledger_empty:
+        return "COMPLETE", "no ledger-tracked evidence, but real tool activity occurred this run"
     return "COMPLETE", "evidence ledger holds at least one observation"
 
 
