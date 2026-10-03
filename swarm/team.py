@@ -15315,6 +15315,85 @@ def _install_structured_delegation_interception():
 _install_structured_delegation_interception()
 
 
+# Phase C.3 (2026-10-03) -- TEMPORARY, READ-ONLY instrumentation. C.1 proved
+# share_member_interactions=True feeds EVERY prior member interaction this
+# run into every subsequent delegation's prompt (agno.utils.team.
+# get_team_member_interactions_str, called with no max_interactions bound
+# anywhere in this codebase's own call chain), and that agno's own fallback
+# (interaction.content or ",".join(tool contents)) can embed raw tool output
+# when a member's own final content is empty -- but this codebase logs
+# NONE of team_run_context["member_responses"]'s actual contents, so C.1
+# could not identify WHICH interaction(s) caused T12's proven ~20.9K ->
+# ~110K token jump. This measures it directly, per the same
+# _patched_agno_get_delegate_task_function pattern already used for B.7/
+# Phase S.2 (patch the NAME as _tools.py's own module namespace holds it --
+# `from agno.utils.team import get_team_member_interactions_str` binds a
+# local name at import time, so patching agno.utils.team's own attribute
+# afterward would never be seen by _tools.py's call site). Calls straight
+# through to the REAL, unmodified function for the returned string -- never
+# alters behavior, only observes it. Remove once the root cause is
+# confirmed and the real fix is implemented and validated (Phase C.3's own
+# hard rule: temporary instrumentation, not a permanent diagnostic).
+_MEMBER_INTERACTIONS_DIAG_MARKER = "_ekam_member_interactions_diag_patch"
+_ORIGINAL_AGNO_GET_TEAM_MEMBER_INTERACTIONS_STR = None
+
+
+def _diagnostic_get_team_member_interactions_str(team_run_context, max_interactions=None):
+    result = _ORIGINAL_AGNO_GET_TEAM_MEMBER_INTERACTIONS_STR(
+        team_run_context=team_run_context, max_interactions=max_interactions)
+    try:
+        responses = (team_run_context or {}).get("member_responses") or []
+        total_serialized = len(result) if isinstance(result, str) else 0
+        detail = []
+        for interaction in responses:
+            rr = interaction.get("run_response")
+            member_name = interaction.get("member_name", "?")
+            task_chars = len(interaction.get("task") or "")
+            content_present = False
+            content_chars = 0
+            tool_output_chars = 0
+            if rr is not None:
+                try:
+                    d = rr.to_dict()
+                    content = d.get("content")
+                    content_present = bool(content)
+                    content_chars = len(content) if isinstance(content, str) else 0
+                    tools = d.get("tools") or []
+                    tool_output_chars = sum(
+                        len(t.get("content") or "") for t in tools if isinstance(t, dict))
+                except Exception:
+                    pass
+            detail.append({
+                "member": member_name, "task_chars": task_chars,
+                "content_present": content_present, "content_chars": content_chars,
+                "tool_output_chars": tool_output_chars,
+            })
+        print(f"[team] MEMBER_INTERACTIONS_DIAG: {len(responses)} interaction(s) "
+              f"forwarded, serialized_chars={total_serialized}, detail={detail}",
+              flush=True)
+    except Exception as exc:  # noqa: BLE001 -- measurement must never break a real call
+        print(f"[team] MEMBER_INTERACTIONS_DIAG: measurement failed (non-fatal): "
+              f"{exc!r}", flush=True)
+    return result
+
+
+setattr(_diagnostic_get_team_member_interactions_str, _MEMBER_INTERACTIONS_DIAG_MARKER, True)
+
+
+def _install_member_interactions_diagnostic():
+    global _ORIGINAL_AGNO_GET_TEAM_MEMBER_INTERACTIONS_STR
+    import agno.team._tools as _agno_team_tools
+
+    current = _agno_team_tools.get_team_member_interactions_str
+    if getattr(current, _MEMBER_INTERACTIONS_DIAG_MARKER, False):
+        return
+    _ORIGINAL_AGNO_GET_TEAM_MEMBER_INTERACTIONS_STR = current
+    _agno_team_tools.get_team_member_interactions_str = _diagnostic_get_team_member_interactions_str
+
+
+_install_member_interactions_diagnostic()
+
+
 def _build_team(
     agent_specs: list | None,
     coordinator_model: str,
