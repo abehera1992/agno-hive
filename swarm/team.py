@@ -2366,10 +2366,20 @@ _UNVERIFIED_DISCLAIMER = (
 
 
 async def _verification_block(content: str, hive_mcp_url: str | None,
-                              hive_mcp_tools) -> str:
+                              hive_mcp_tools, team=None) -> str:
     """Citation verification rendered as an APPENDABLE block, for guards that return early.
 
     Returns "" when everything checks out, so a clean answer is unchanged.
+
+    C.4 (2026-10-03) adds a FIRST, cheap, in-process check against
+    team._evidence_ledger (_unresolved_ledger_citations) ahead of the
+    existing _verify_claims round-trip to hive-mcp -- Section 22's "the first
+    validation should already happen against the EvidenceLedger; verify_claims
+    remains the final defense-in-depth", not a replacement for it. `team`
+    defaults to None so a caller that genuinely has no team object (none
+    observed in this file's own 7 call sites, all inside _verified_answer
+    which already receives team) degrades to exactly the pre-C.4 behavior
+    rather than raising.
 
     Exists because of an ordering defect found 2026-08-28, tracing battery B15's T11.
     Every disclosure guard in the chain returns the moment it fires, and all of them sit
@@ -2397,17 +2407,37 @@ async def _verification_block(content: str, hive_mcp_url: str | None,
     on a degraded path and a second full pipeline re-run is exactly what the aggregate
     retry guard at the bottom of the chain refuses to do.
     """
+    ledger_block = ""
+    if team is not None:
+        try:
+            unresolved = _unresolved_ledger_citations(team, content)
+        except Exception as exc:                  # never let this check break the answer
+            print(f"[team] ledger citation check failed: {exc}", flush=True)
+            unresolved = []
+        if unresolved:
+            cites = ", ".join(f"{p}:{l}" for p, l in unresolved[:10])
+            print(f"[team] EVIDENCE_LEDGER_CITATION_UNRESOLVED: {len(unresolved)} "
+                  f"citation(s) this run's ledger cannot confirm: {cites}", flush=True)
+            ledger_block = (
+                f"\n\n---\n**NOT CONFIRMED BY THIS RUN'S EVIDENCE LEDGER — the "
+                f"following citation(s) do not match any file-read or search result "
+                f"this run actually recorded, within {_LINE_TOLERANCE} lines: "
+                f"{cites}. This may still be correct (a read this run's ledger did "
+                f"not capture, or legitimate recall) -- it is reported as unconfirmed, "
+                f"not as an error.**")
+
     try:
         report, bad, unavailable = await _verify_claims(
             content, hive_mcp_url, hive_mcp_tools)
     except Exception as exc:                      # never let a check break the answer
         print(f"[team] verification block failed: {exc}", flush=True)
-        return ""
+        return ledger_block
     if unavailable:
-        return _UNVERIFIED_DISCLAIMER
+        return ledger_block + _UNVERIFIED_DISCLAIMER
     if not bad:
-        return ""
-    return (f"\n\n---\n**Unverified claims flagged automatically (these could not be "
+        return ledger_block
+    return (ledger_block
+            + f"\n\n---\n**Unverified claims flagged automatically (these could not be "
             f"found in the repository):**\n```\n{_reader_facing_report(report)}\n```")
 
 
@@ -2463,6 +2493,10 @@ _GUARD_BANNERS = (
     # miscount that nearly filed a working guard as broken once already.
     "THE MODELS WERE ASKED FOR AND ARE NOT IN THE ANSWER",
     "A TABLE CALLED MISSING HERE EXISTS UNDER ANOTHER SCHEMA",
+    # C.4 (2026-10-03) -- _verification_block's new ledger-citation check,
+    # same reasoning as every entry above: an answer this fired on is not a
+    # clean exemplar even though it is a disclosure, not an error verdict.
+    "NOT CONFIRMED BY THIS RUN'S EVIDENCE LEDGER",
 )
 
 
@@ -4871,6 +4905,41 @@ class ComparisonEvidence:
     completed_at: float
 
 
+@dataclass(frozen=True)
+class EvidenceRecord:
+    """Generic counterpart to ComparisonEvidence (C.4, 2026-10-03): one
+    structured, deterministic fact about what a tool call actually observed --
+    a file declaration, a lexical search hit, or a semantic-search attempt --
+    recorded at OBSERVATION time from the tool's own real result text, never
+    reconstructed from a member's or the coordinator's later prose. Shares the
+    SAME _EvidenceLedger as ComparisonEvidence: record/get/list below only ever
+    touch `.evidence_id`, so one store genuinely holds both record shapes
+    without any ledger logic change -- this is the "EvidenceRecord ^
+    comparison-specific metadata" shape the generalization asked for, not a
+    second evidence system.
+
+    `evidence_id` is always execution_context.new_id() -- the model never
+    sees or supplies it (the invariant this phase exists to establish: an
+    evidence_id is runtime-generated, never model-generated).
+
+    `line` is None for semantic_search (lightrag_query returns a synthesized
+    answer, not a line-addressable hit -- recording a fabricated line number
+    here would be worse than recording none) and for a file_read/lexical_search
+    item would only be None if the producing tool itself returned no line
+    (never happens for the two tools this is built from, kept Optional for
+    honesty rather than asserting a guarantee this type cannot enforce).
+    """
+    evidence_id: str
+    evidence_type: str          # "file_read" | "lexical_search" | "semantic_search"
+    source_path: str | None
+    line: int | None
+    tool_name: str
+    read_by: str
+    retrieval_query: str | None
+    excerpt: str
+    created_at: float
+
+
 class _EvidenceLedger:
     """Minimum viable record/get/list store. One instance per run, owned by
     `team` (team._evidence_ledger) -- never a module-level global, never
@@ -4881,13 +4950,17 @@ class _EvidenceLedger:
     evidence already produced by a deterministic operation must not mutate,
     and a caller that tries to record the same id twice has a bug worth
     surfacing, not papering over.
+
+    Holds ComparisonEvidence AND EvidenceRecord rows side by side (C.4,
+    2026-10-03) -- both are frozen dataclasses with an `evidence_id` field,
+    which is the only attribute this store itself ever touches.
     """
 
     def __init__(self) -> None:
-        self._records: dict[str, ComparisonEvidence] = {}
+        self._records: "dict[str, ComparisonEvidence | EvidenceRecord]" = {}
         self._order: list[str] = []
 
-    def record(self, evidence: ComparisonEvidence) -> None:
+    def record(self, evidence: "ComparisonEvidence | EvidenceRecord") -> None:
         if evidence.evidence_id in self._records:
             raise ValueError(
                 f"evidence_id {evidence.evidence_id!r} already recorded -- "
@@ -4895,13 +4968,22 @@ class _EvidenceLedger:
         self._records[evidence.evidence_id] = evidence
         self._order.append(evidence.evidence_id)
 
-    def get(self, evidence_id: str) -> ComparisonEvidence | None:
+    def get(self, evidence_id: str) -> "ComparisonEvidence | EvidenceRecord | None":
         return self._records.get(evidence_id)
 
-    def list(self) -> list[ComparisonEvidence]:
+    def list(self) -> "list[ComparisonEvidence | EvidenceRecord]":
         return [self._records[i] for i in self._order]
 
-    def latest(self, evidence_type: str | None = None) -> ComparisonEvidence | None:
+    def by_path(self, source_path: str) -> "list[EvidenceRecord]":
+        """EvidenceRecord rows (never ComparisonEvidence, which has no path)
+        whose source_path matches, newest first -- the lookup the new
+        citation check (_unresolved_ledger_citations) uses; a thin,
+        intentionally simple linear scan over an already-bounded, per-run
+        list, not a new index structure."""
+        return [r for r in reversed(self.list())
+                if isinstance(r, EvidenceRecord) and r.source_path == source_path]
+
+    def latest(self, evidence_type: str | None = None) -> "ComparisonEvidence | EvidenceRecord | None":
         for eid in reversed(self._order):
             rec = self._records[eid]
             if evidence_type is None or rec.evidence_type == evidence_type:
@@ -5152,6 +5234,145 @@ def _create_comparison_claim(team, evidence: "ComparisonEvidence") -> Claim:
         provenance="deterministic:compare_enumerations")
     team._last_comparison_claim_id = claim.claim_id
     return claim
+
+
+def _create_factual_claim(team, statement: str,
+                           evidence_ids: "list[str] | tuple[str, ...]",
+                           provenance: str) -> Claim:
+    """General counterpart to _create_comparison_claim (C.4, 2026-10-03) --
+    the SAME _make_claim constructor, claim_type='factual_citation' instead
+    of 'comparison_summary'. Exists so a caller building a claim from a
+    file_read/lexical_search/semantic_search EvidenceRecord (rather than a
+    ComparisonEvidence row) has its own named entry point, without a second
+    validation rule: authoritative is still computed by the one shared
+    _validate_claim_evidence this file has always used for every claim type."""
+    return _make_claim(team, claim_type="factual_citation", statement=statement,
+                        evidence_ids=evidence_ids, provenance=provenance)
+
+
+# ── Generalized evidence recording (C.4, 2026-10-03) ─────────────────────────
+#
+# C.4's own forensic pass concluded the Evidence/Claim foundation above was
+# architecturally correct but scoped to exactly one producer
+# (compare_enumerations). This section is the generalization: the SAME
+# _EvidenceLedger, extended with EvidenceRecord rows for the three tool calls
+# that actually produce citable facts outside a comparison -- get_file_content
+# (via the identical _extract_declarations pass the declaration index already
+# runs, reused rather than recomputed), search_files/search_files_batch (the
+# tool's own real "path:line: content" lines, not re-derived), and
+# lightrag_query (one coarser record -- it returns a synthesized answer, not
+# a line-addressable hit, and this does not pretend otherwise).
+#
+# Called from inside _make_read_cache_tool_hook's own closure (see
+# `evidence_ledger = _EvidenceLedger()` there), the SAME common interception
+# point team._read_state["reads"] is already populated from -- not a new
+# choke point, the existing one, used once more for a second purpose.
+
+_SEARCH_HIT_RE = re.compile(r"^(.+?):(\d+): (.*)$")
+_MAX_EVIDENCE_RECORDS_PER_CALL = 60   # mirrors _MAX_INDEXED_PER_FILE / search_files' own max_results
+_EVIDENCE_EXCERPT_CHARS = 160
+
+
+def _record_evidence_from_observation(ledger: "_EvidenceLedger", function_name: str,
+                                       args: dict, result, agent_key: str,
+                                       declarations: "list[str] | None" = None) -> list[str]:
+    """Record zero or more EvidenceRecord rows from one real tool result.
+
+    Pure with respect to the ledger's own contents (never re-reads, never
+    re-searches -- only transcribes what the tool already returned this
+    call), and every evidence_id is execution_context.new_id(): runtime-
+    generated, never model-supplied (INV-3). Bounded the same way the
+    producing tool already is, so this never grows the ledger faster than
+    the tool call itself was already allowed to produce content.
+
+    `declarations`, when the caller already ran _extract_declarations on this
+    SAME result for the declaration index (the common case for an
+    _INDEXABLE_SUFFIXES file), is reused directly so get_file_content's
+    content is never regex-scanned twice. None (the default, and what a
+    non-indexable-suffix file gets) falls back to running it here.
+
+    Returns the new evidence_ids, for a caller that wants to build a Claim
+    immediately -- unused by the hook call site today (evidence is recorded
+    at observation time; the citation CHECK that consumes it runs later, at
+    synthesis time, in _verification_block/_unresolved_ledger_citations).
+    """
+    text = _result_text(result)
+    read_by = agent_key or "coordinator"
+    new_ids: list[str] = []
+
+    def _add(evidence_type, source_path, line, retrieval_query, excerpt):
+        rec = EvidenceRecord(
+            evidence_id=execution_context.new_id(), evidence_type=evidence_type,
+            source_path=source_path, line=line, tool_name=function_name,
+            read_by=read_by, retrieval_query=retrieval_query,
+            excerpt=excerpt[:_EVIDENCE_EXCERPT_CHARS], created_at=time.monotonic(),
+        )
+        ledger.record(rec)
+        new_ids.append(rec.evidence_id)
+
+    if function_name == "get_file_content":
+        path = (args or {}).get("relative_path")
+        if path:
+            decls = declarations if declarations is not None else _extract_declarations(text)
+            for decl in decls[:_MAX_EVIDENCE_RECORDS_PER_CALL]:
+                name, _, line_s = decl.rpartition(":")
+                if not line_s.isdigit():
+                    continue
+                _add("file_read", str(path), int(line_s), None, name)
+    elif function_name in ("search_files", "search_files_batch"):
+        pattern = (args or {}).get("pattern")
+        for line in text.splitlines()[:_MAX_EVIDENCE_RECORDS_PER_CALL]:
+            m = _SEARCH_HIT_RE.match(line)
+            if not m:
+                continue
+            _add("lexical_search", m.group(1), int(m.group(2)), pattern, m.group(3))
+    elif function_name == "lightrag_query":
+        query = (args or {}).get("query")
+        if text and not text.strip().lower().startswith(("no ", "error", "invalid")):
+            _add("semantic_search", None, None, query, text)
+
+    if new_ids:
+        print(f"[team] EVIDENCE_RECORDED: {len(new_ids)} item(s) from {function_name} "
+              f"by {read_by}", flush=True)
+    return new_ids
+
+
+def _unresolved_ledger_citations(team, content: str) -> list[tuple[str, str]]:
+    """`(path, line)` citations in `content` that this run's own EvidenceLedger
+    cannot confirm -- either the path was never recorded as read/searched this
+    run at all, or it was, but never near the cited line (tolerance
+    _LINE_TOLERANCE, tighter than verify_claims' own 5-line window because
+    EvidenceRecord lines are exact, not fuzzy-quote-matched).
+
+    Deliberately narrow: only the mechanical `path:line` shape (the one this
+    phase has live evidence of breaking down -- bare `Symbol:line`, same-
+    basename ambiguity), not an attempt to parse every citation prose shape
+    verify_claims already handles. A path never recorded by the ledger is not
+    automatically wrong (a different member's read that this run's ledger
+    wiring did not see, or legitimate recall) -- this is reported as
+    UNCONFIRMED, not as a fabrication verdict; verify_claims' own grep stays
+    the actual accuracy check (Section 22's 'final defense-in-depth').
+    """
+    ledger = getattr(team, "_evidence_ledger", None)
+    if ledger is None:
+        return []
+    unresolved: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for m in list(_CITED_LINE_RE.finditer(content))[:_MAX_CITATIONS_CHECKED]:
+        path, line_s = m.group(1), m.group(2)
+        key = (path, line_s)
+        if key in seen:
+            continue
+        seen.add(key)
+        records = ledger.by_path(path)
+        if not records:
+            unresolved.append((path, line_s))
+            continue
+        line = int(line_s)
+        if not any(r.line is not None and abs(r.line - line) <= _LINE_TOLERANCE
+                   for r in records):
+            unresolved.append((path, line_s))
+    return unresolved
 
 
 # ── Member Control Box foundation (Phase B, 2026-10-02) ─────────────────────
@@ -7462,7 +7683,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 f"called {tools}. Any list, count, or \"no such thing\" claim above is "
                 f"recalled rather than enumerated, and has been wrong by a factor of "
                 f"6-8x on this exact failure before.**"
-                + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
+                + await _verification_block(content, hive_mcp_url, hive_mcp_tools, team)
                 + _tail()
             )
 
@@ -7646,7 +7867,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             print(f"[team] under-delivery recovered — {len(content.strip()):,} "
                   f"chars, grounded in captured tool evidence", flush=True)
             return (content
-                    + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
+                    + await _verification_block(content, hive_mcp_url, hive_mcp_tools, team)
                     + _tail())
         print(f"[team] answer reports far less than was gathered "
               f"({len(content.strip()):,} chars against {withheld:,} chars of member "
@@ -7657,7 +7878,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"above is {len(content.strip()):,} characters. What is here may be "
             f"correct; most of what was researched is simply not in it.**"
             + _recovered_member_findings(team)
-            + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
+            + await _verification_block(content, hive_mcp_url, hive_mcp_tools, team)
             + _tail()
         )
 
@@ -7684,7 +7905,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                   f"{_relayed_thin:,} chars relayed to it — surfacing captured tool "
                   f"output{' (reconciled)' if _reconciled else ''}", flush=True)
             return (content + tool_evidence
-                    + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
+                    + await _verification_block(content, hive_mcp_url, hive_mcp_tools, team)
                     + _tail())
 
     # Under-answered enumeration check (2026-08-22). See _under_answered_enumeration
@@ -7807,7 +8028,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"still exist, but this run gathered no evidence for them, so treat the "
             f"enumeration as unverified — particularly if it was described as a "
             f"directory listing.**"
-            + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
+            + await _verification_block(content, hive_mcp_url, hive_mcp_tools, team)
             + _tail()
         )
 
@@ -8006,7 +8227,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             print(f"[team] relay drop recovered — {len(content.strip()):,} chars, "
                   f"grounded in captured tool evidence", flush=True)
             return (content
-                    + await _verification_block(content, hive_mcp_url, hive_mcp_tools)
+                    + await _verification_block(content, hive_mcp_url, hive_mcp_tools, team)
                     + _tail())
         _kept_n = len(_member_union) - len(_missing)
         print(f"[team] relay drop: members named {len(_member_union)}, answer kept "
@@ -11888,6 +12109,11 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # local log." session_state writes are LEFT IN PLACE and unchanged; this is a second,
     # independent source, so nothing that reads the old one regresses.
     read_state: dict = {"reads": []}
+    # Same per-run-closure lifetime as read_state above, attached to the hook
+    # function object the same way (see `.state = read_state` below) so
+    # _build_team can wire it onto `team._evidence_ledger` -- the generic
+    # evidence-recording counterpart to read_state (C.4, 2026-10-03).
+    evidence_ledger = _EvidenceLedger()
 
     async def _read_cache_tool_hook(function_name, function, args, agent=None, run_context=None):
         if function_name in _DELEGATION_TOOL_NAMES:
@@ -12292,15 +12518,30 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             # Index what this read actually declares, while the full text is in hand.
             # Costs ~2% of the file's size and is the only copy that survives the
             # member's own summary -- see _declaration_index_block.
+            _decls_for_evidence = None
             if function_name == "get_file_content":
                 _p = (args or {}).get("relative_path")
                 # Named constant, kept beside the keyword set it must agree with.
                 if _p and str(_p).lower().endswith(_INDEXABLE_SUFFIXES):
                     _decls = _extract_declarations(_result_text(result))
+                    _decls_for_evidence = _decls
                     if _decls:
                         read_state.setdefault("pending_declarations", {})[_p] = _decls
                         print(f"[team] indexed {len(_decls)} declaration(s) from {_p}",
                               flush=True)
+            # Generalized evidence recording (C.4, 2026-10-03) -- same
+            # observation, same already-computed result, a second purpose:
+            # feed the EvidenceRecord-generalized ledger so a later citation
+            # in the final answer can be checked structurally instead of
+            # re-grepped from scratch. Passes _decls_for_evidence through so
+            # get_file_content never runs _extract_declarations' regex a
+            # second time over the same text; None (a non-indexable suffix)
+            # just means _record_evidence_from_observation computes its own.
+            if function_name in ("get_file_content", "search_files",
+                                  "search_files_batch", "lightrag_query"):
+                _record_evidence_from_observation(
+                    evidence_ledger, function_name, args, result, agent_key,
+                    declarations=_decls_for_evidence)
             # Most enumerable items any single read returned (2026-08-25). The
             # under-answered-enumeration guard could only ever count DIRECTORY entries,
             # so a task asking to list what is inside a FILE had no evidence source and
@@ -12455,6 +12696,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # caller and test keeps working untouched -- same convention _make_delegation_log_hook
     # uses for its own closure-local counter.
     _read_cache_tool_hook.state = read_state
+    _read_cache_tool_hook.evidence_ledger = evidence_ledger
     return _read_cache_tool_hook
 
 
@@ -15818,6 +16060,14 @@ def _build_team(
     team._member_results = member_answers
     team._forwarded_members = forwarded_members
     team._read_state = read_cache_hook.state
+    # Generalized evidence ledger (C.4, 2026-10-03) -- wired here, BEFORE any
+    # tool call or synthesis call can run, the same timing guarantee
+    # team._read_state relies on above: _get_evidence_ledger's own lazy-init
+    # (getattr(team, "_evidence_ledger", None)) will find this one already set
+    # rather than creating a second, empty ledger, so every EvidenceRecord the
+    # hook writes and every ComparisonEvidence _record_comparison_evidence
+    # writes land in the SAME store team._evidence_ledger resolves to.
+    team._evidence_ledger = read_cache_hook.evidence_ledger
     # Set by the caller right after construction; the target-resolution gate reads it at
     # delegation time, which is always later. Same late-binding shape as member_tools.
     team._hive_mcp_url = None
@@ -17342,6 +17592,17 @@ _INDEXABLE_SUFFIXES = (".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go
                        ".rs", ".java", ".kt", ".rb", ".php", ".cs", ".swift", ".scala",
                        ".ex", ".exs", ".dart", ".c", ".cc", ".cpp", ".h", ".hpp")
 _MAX_INDEXED_PER_FILE = 60
+
+# Module-level constants for _unresolved_ledger_citations (C.4, 2026-10-03,
+# defined here rather than beside that function because they depend on
+# _INDEXABLE_SUFFIXES immediately above -- a function body resolves globals
+# at CALL time so the function itself can live anywhere in this file, but a
+# module-level re.compile() runs at IMPORT time and needs the name to already
+# exist).
+_CITED_LINE_RE = re.compile(
+    r"([\w./-]+\.(?:" + "|".join(s.lstrip(".") for s in _INDEXABLE_SUFFIXES) + r")):(\d+)")
+_LINE_TOLERANCE = 3
+_MAX_CITATIONS_CHECKED = 40
 
 
 def _extract_declarations(text: str) -> list[str]:
