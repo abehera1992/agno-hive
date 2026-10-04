@@ -12786,6 +12786,24 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     """
     cache: dict[tuple, object] = {}
     serve_counts: dict[tuple, int] = {}
+    # Cross-generation evidence reuse (Phase: Evidence-Deduplicated Reread Control).
+    # `cache` is already global to the whole run (no generation/agent component in
+    # cache_key), so a fresh fetch populated in generation 1 is silently served again,
+    # byte-identical, as an ORDINARY full result to generation 2's first ask -- proven
+    # live on Track A (business_admin_api.py) and Track C (models.py): each member
+    # delegation starts with NO conversation history of its own (agno's own default,
+    # add_history_to_context=False, confirmed never overridden in this codebase --
+    # team/_task_tools.py's _setup_member_for_task passes `history=None` and the member
+    # sees only the bare task string), so the member has no way to know this exact
+    # content already exists elsewhere in the run unless told. Recording which
+    # generation FIRST populated each cache entry lets the serve path distinguish
+    # "first-ever fetch" / "within-generation repeat" (unchanged, still
+    # serve_counts/_duplicate_read_stub's job) from "cross-generation reuse of
+    # already-cached evidence" (new: tagged, not silently indistinguishable from new
+    # discovery) -- Option B (restore existing evidence, explicitly marked), not
+    # suppression: a member in a new generation genuinely has no other way to obtain
+    # this content, so withholding it would be a real information-loss regression.
+    cache_origin_generation: dict[tuple, int] = {}
     # Separate from `cache`/`serve_counts` above -- keyed on relative_path ALONE
     # (no offset/limit, no agent), since a nonexistent file's absence is an
     # objective fact for the whole run, not per-argument or per-agent context.
@@ -13194,6 +13212,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         if is_fresh_fetch:
             result = await function(**args)
             cache[cache_key] = result
+            cache_origin_generation[cache_key] = generation
             # Record a whole-file serve so the NEXT ranged read of this path collapses
             # onto this entry. Read off hive-mcp's own marker rather than guessing from
             # size: the tool owns the threshold, and duplicating it here would drift.
@@ -13202,8 +13221,10 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     and _path not in whole_file_paths
                     and "offset/limit ignored" in _result_text(result)[:400]):
                 whole_file_paths.add(_path)
-                cache[(function_name,
-                       json.dumps({"relative_path": _path}, sort_keys=True))] = result
+                _collapsed_key = (function_name,
+                                  json.dumps({"relative_path": _path}, sort_keys=True))
+                cache[_collapsed_key] = result
+                cache_origin_generation.setdefault(_collapsed_key, generation)
                 print(f"[team] {_path} was served whole — later ranged reads of it "
                       f"will be served from cache, not re-fetched", flush=True)
         else:
@@ -13430,6 +13451,27 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 return _forced_answer_nudge(agent_key, total)
             return _duplicate_read_stub(function_name, args, agent_key, count, len(str(result)))
         consecutive_stub_count[norm_agent_key] = 0
+        # Cross-generation evidence reuse marker (Option B: restore, explicitly
+        # tagged -- see cache_origin_generation's own comment above). Fires only on
+        # the first-this-generation serve (count <= effective_max_serves, i.e. we did
+        # NOT just return a _duplicate_read_stub above) of a cache entry proven to
+        # have been populated in a DIFFERENT, earlier generation. `.get(cache_key)
+        # not in (None, generation)` deliberately treats an unknown origin as "do not
+        # mark" rather than guessing, so this never fires on a key this tracking
+        # cannot positively attribute. Prepended, not substituted: the member still
+        # gets the exact same real content it would have gotten anyway (withholding
+        # it would be a real information-loss regression -- member delegations carry
+        # no conversation history of their own, confirmed via agno's own
+        # add_history_to_context default), only the framing changes.
+        if isinstance(result, str) and cache_origin_generation.get(cache_key) not in (None, generation):
+            result = (
+                f"# EXISTING RUN EVIDENCE -- this exact {function_name} result was "
+                f"already retrieved earlier this run (content unchanged since). What "
+                f"follows is NOT a new discovery -- do not report it as newly found, "
+                f"and do not restate it a second time if it was already covered in an "
+                f"earlier report this run. Reason from it directly for the CURRENT "
+                f"task.\n\n" + result
+            )
         # The batch hint rides back attached to the real result, the same way the
         # delegation-volume warning does -- a print alone goes to the journal, where the
         # model cannot read it. Only for str results; a non-str would be corrupted by

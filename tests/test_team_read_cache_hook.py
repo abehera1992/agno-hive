@@ -397,7 +397,11 @@ async def test_structured_delegation_fresh_separate_delegation_gets_its_own_full
     second = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
 
     assert first == "file body"
-    assert second == "file body"  # a NEW delegation instance -- fresh budget, real content again
+    # a NEW delegation instance -- fresh budget, real content restored, now explicitly
+    # tagged as existing run evidence rather than indistinguishable from a new finding
+    # (Phase: Evidence-Deduplicated Reread Control)
+    assert "EXISTING RUN EVIDENCE" in second
+    assert second.endswith("file body")
 
 
 @pytest.mark.asyncio
@@ -421,7 +425,11 @@ async def test_a_fresh_separate_delegation_to_the_same_member_gets_its_own_full_
     second = await hook("get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer)
 
     assert first == "file body"
-    assert second == "file body"  # a NEW delegation instance -- fresh budget, real content again
+    # a NEW delegation instance -- fresh budget, real content restored, now explicitly
+    # tagged as existing run evidence rather than indistinguishable from a new finding
+    # (Phase: Evidence-Deduplicated Reread Control)
+    assert "EXISTING RUN EVIDENCE" in second
+    assert second.endswith("file body")
 
 
 @pytest.mark.asyncio
@@ -448,7 +456,11 @@ async def test_a_repeat_within_the_new_delegation_is_still_stubbed():
         "get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer
     )
 
-    assert first_in_new_generation == "file body"
+    # First ask this generation: real content restored, tagged as existing run
+    # evidence (Phase: Evidence-Deduplicated Reread Control) -- not bare "file body"
+    # any more, since this generation's cache entry originated in an earlier one.
+    assert "EXISTING RUN EVIDENCE" in first_in_new_generation
+    assert first_in_new_generation.endswith("file body")
     assert repeat_in_new_generation != "file body"
 
 
@@ -492,7 +504,10 @@ async def test_broadcast_delegate_task_to_members_resets_every_agents_generation
         "get_file_content", fake_get_file_content, {"relative_path": "x.py"}, agent=reviewer
     )
 
-    assert after_broadcast == "file body"  # fresh generation after the broadcast -- real content again
+    # fresh generation after the broadcast -- real content restored, now tagged as
+    # existing run evidence (Phase: Evidence-Deduplicated Reread Control)
+    assert "EXISTING RUN EVIDENCE" in after_broadcast
+    assert after_broadcast.endswith("file body")
 
 
 @pytest.mark.asyncio
