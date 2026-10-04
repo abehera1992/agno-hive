@@ -1985,8 +1985,105 @@ def _build_member_result(raw_text: str) -> MemberResult:
                         unresolved=unresolved, raw=raw)
 
 
-def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = None,
-                                 _phase_p_state: dict | None = None):
+def _arm_required_tool(target, tool_name: str, state: dict) -> None:
+    """Phase O (2026-10-04): generic version of Phase P's forward_member_answer-
+    specific forcing -- force ANY named tool on ANY agent/team object. Mirrors
+    the proven _force_text_only pattern (set both the dataclass field, read by
+    the NEXT not-yet-started model call, and the live model attribute, read on
+    every iteration of an already-in-flight loop -- see _force_text_only's own
+    docstring for why both are needed)."""
+    target.tool_choice = {"type": "function", "function": {"name": tool_name}}
+    model = getattr(target, "model", None)
+    if model is not None:
+        model._tool_choice = {"type": "function", "function": {"name": tool_name}}
+    state["active"] = True
+    state["tool_name"] = tool_name
+    state["target"] = target
+
+
+def _clear_required_tool(state: dict) -> None:
+    """Phase O: generic restoration, paired with _arm_required_tool. Safe to
+    call even if nothing is currently armed (idempotent no-op)."""
+    target = state.get("target")
+    if target is not None:
+        target.tool_choice = None
+        model = getattr(target, "model", None)
+        if model is not None:
+            model._tool_choice = None
+    state["active"] = False
+
+
+def _arm_required_tool_if_available(target, tool_name: str, state: dict,
+                                     role: str, team_name: str) -> bool:
+    """Phase O Case D: fail CLOSED if the policy-required tool is not actually
+    on this target's own tool surface -- never force a tool_choice naming a
+    function the model request doesn't define (which the backend would reject
+    outright), and never silently skip as if the requirement were satisfied.
+    Returns True if armed, False if it failed closed (nothing was forced)."""
+    available = {getattr(t, "name", "") for t in (getattr(target, "tools", None) or [])}
+    if tool_name not in available:
+        print(f"[team] Phase O: POLICY/TOOL-SURFACE MISMATCH (Case D, failing closed) -- "
+              f"team={team_name!r} role={role!r} required_tool={tool_name!r} is required "
+              f"by policy but not in available_tools={sorted(available)} "
+              f"policy_source=agent_capability_policy. NOT forcing -- this is a "
+              f"configuration error, not a run failure.", flush=True)
+        return False
+    _arm_required_tool(target, tool_name, state)
+    return True
+
+
+def _make_required_tool_clearing_hook(required_tool_states: dict):
+    """Phase O: a SINGLE SHARED instance, registered once in the shared
+    `tool_hooks` prefix list built in _build_team -- the same convention
+    _tool_interception_hook/_make_member_control_box_hook()/
+    _read_cache_tool_hook/etc. already use, and for the identical reason
+    _make_member_control_box_hook's own docstring documents: a per-role hook
+    APPENDED to the per-role tail (after the budget guard) sits INNER to
+    read_cache_tool_hook in the real composed chain, so a same-run cache hit
+    (which returns without calling its own `function` parameter) silently
+    skips it. Discovering role from `agent` at call time -- exactly
+    _control_box_hook's own `who` resolution -- avoids that position entirely
+    by living in the shared prefix instead, and incidentally keeps this hook
+    out of the per-role tail that
+    test_build_team_shares_the_same_hook_instance_with_spec_based_members
+    (tests/test_team_read_cache_hook.py) asserts is identical-by-object-
+    identity across every role except the one deliberately-per-agent budget
+    guard.
+
+    Restores tool_choice to auto once the tool a role's OWN resolved policy
+    was forcing actually executes. Tool-name-driven, not hardcoded to
+    forward_member_answer, so it clears correctly whichever tool a future
+    required-capability row names, for whichever role.
+
+    try/finally (Phase O section 16, "failure cleanup"): the forced state is
+    cleared even if the required tool's own call raises -- a failed required
+    call must not leave a later, unrelated run-less turn permanently pinned
+    to a tool_choice that no longer makes sense.
+
+    Clears on ANY tool call while that role's state is active, not only one
+    matching the state's own tool_name, as a defensive backstop: a forced
+    tool_choice naming one specific function contractually means the model
+    CANNOT call anything else, so a mismatch here would itself be evidence of
+    a deeper violation worth surfacing (the mismatch is logged), not a reason
+    to leave the force stuck indefinitely.
+    """
+    async def _required_tool_clearing_hook(function_name, function, args, agent=None, team=None):
+        who = getattr(agent, "name", None) or "Coordinator"
+        state = required_tool_states.get(who)
+        try:
+            result = await function(**args)
+        finally:
+            if state is not None and state.get("active"):
+                _matched = function_name == state.get("tool_name")
+                _clear_required_tool(state)
+                print(f"[team] Phase O: tool_choice restored to auto after "
+                      f"{function_name!r} for role={who!r} "
+                      f"(forced_tool_matched={_matched})", flush=True)
+        return result
+    return _required_tool_clearing_hook
+
+
+def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = None):
     """Build the coordinator's forward tool over the live member-results map.
 
     `forwarded` (default None = no recording, the pre-2026-09-21 behaviour) receives the
@@ -2039,21 +2136,11 @@ def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = N
         Args:
             member_id: the member whose answer to forward, e.g. "researcher".
         """
-        # Phase P (2026-10-04): this call satisfies the member.forwarding=REQUIRED
-        # protocol requirement for this run (if one was forced) -- restore tool_choice
-        # to auto right here, the forced trigger's natural completion point. Live-
-        # proved safe in Phase O.1: the Coordinator went on to call this tool three
-        # further times VOLUNTARILY, under auto, later in that same run.
-        if _phase_p_state and _phase_p_state.get("active"):
-            _pp_team = _phase_p_state.get("team")
-            if _pp_team is not None:
-                _pp_team.tool_choice = None
-                _pp_model = getattr(_pp_team, "model", None)
-                if _pp_model is not None:
-                    _pp_model._tool_choice = None
-            _phase_p_state["active"] = False
-            print("[team] Phase P: tool_choice restored to auto on "
-                  "forward_member_answer entry", flush=True)
+        # Phase O (2026-10-04): restoration used to be hardcoded here (Phase P);
+        # it is now handled generically by _make_required_tool_clearing_hook,
+        # wired into this role's tool_hooks via _hooks_for() -- the common
+        # execution boundary every tool call already passes through, for
+        # whichever tool policy ever names next, not just this one.
         key = _member_key(str(member_id or "").strip())
         text = (member_answers or {}).get(key)
         if not text:
@@ -16480,15 +16567,6 @@ def _build_team(
     # this exact object and team._member_results is bound to it below, so both sides read
     # one map rather than two that can drift.
     member_answers: dict[str, str] = {}
-    # Phase P (2026-10-04): shared, run-scoped mutable state for the capability-policy
-    # protocol-enforcement mechanism (see resolve_effective_policy() in team_config.py).
-    # Same late-binding shape as member_answers/forwarded_members above and the same
-    # reason: _make_forward_member_answer's closure is built before `team` exists.
-    # "required" is the resolved set of tool names this run's policy says MUST be
-    # called at least once; "fired_for" tracks which of those have already had their
-    # one-shot tool_choice force applied, so a later member result never re-forces a
-    # requirement this run already satisfied.
-    _phase_p_state: dict = {"team": None, "required": frozenset(), "fired_for": set()}
     # Exact member text captured by forward_member_answer at forward time; bound to
     # team._forwarded_members below and read by _with_forwarded_evidence.
     forwarded_members: dict[str, str] = {}
@@ -16554,15 +16632,34 @@ def _build_team(
     # problem: the Phase A/D durable evidence backbone lives inside
     # interception_hook itself, unconditionally outermost, and was never
     # affected by the cache short-circuit for the same reason.
+    # Phase O (2026-10-04): one reusable required-tool state per role, resolved
+    # generically for EVERY role (Coordinator and every member) from the SAME
+    # policy call -- no Coordinator-specific or Researcher-specific code path.
+    # Declared BEFORE tool_hooks (below) because the shared clearing hook
+    # closes over this exact dict, same late-binding shape as member_answers/
+    # _required_tool_states elsewhere in this file: populated by _hooks_for()
+    # per role, read by the one shared hook instance at call time.
+    _required_tool_states: dict[str, dict] = {}
+
     tool_hooks = [
         interception_hook, _make_member_control_box_hook(),
         search_before_browse_gate_hook, read_cache_hook,
         decompose_first_gate_hook,
         evidence_gate_hook, duplicate_delegation_gate_hook, delegation_log_hook,
+        # Phase O: single shared instance, same convention as
+        # _make_member_control_box_hook() just above and for the identical
+        # reason (see _make_required_tool_clearing_hook's own docstring) --
+        # a per-role instance appended to the per-role tail would sit INNER
+        # to read_cache_tool_hook and get silently skipped on a cache hit.
+        _make_required_tool_clearing_hook(_required_tool_states),
     ]
 
     def _hooks_for(role: str) -> list:
         """Shared hooks plus a budget guard bound to THIS role (2026-08-21).
+        Phase O (2026-10-04): also resolves and stores this role's
+        required-tool policy state into _required_tool_states, read by the
+        single shared clearing hook already in `tool_hooks` above -- no
+        second hook instance needed here, only the state it reads.
 
         Per-agent, not shared, because the budget it guards is per-agent: agno resets
         tool_call_limit per arun() and each Agent carries its own. One shared instance
@@ -16573,6 +16670,23 @@ def _build_team(
         only because make_agent_from_spec now hands each agent its own Function copies;
         with shared Functions, `tool_hooks` is one shared slot and the last writer won.
         """
+        _policy_required: frozenset[str] = frozenset()
+        try:
+            _policy = team_config.resolve_effective_policy(team_name or "", role)
+            _policy_required = frozenset(_policy.required_tools)
+        except Exception as _exc:  # noqa: BLE001 -- a policy bug must fail open, not break the run
+            print(f"[team] Phase O: policy resolution failed for role={role!r} "
+                  f"(non-fatal, no required-tool forcing this role): {_exc!r}", flush=True)
+        if len(_policy_required) > 1:
+            print(f"[team] Phase O: ambiguous required_tools for role={role!r}: "
+                  f"{sorted(_policy_required)} -- no sequencing policy exists, refusing "
+                  f"to force arbitrarily (Case B); normal multi-tool behavior preserved",
+                  flush=True)
+            _policy_required = frozenset()
+        _required_tool_states.setdefault(role, {
+            "active": False, "tool_name": None, "target": None,
+            "required": _policy_required, "fired_for": set(),
+        })
         return tool_hooks + [
             _make_tool_budget_guard_hook(team_name, activity, role=role),
         ]
@@ -16632,7 +16746,7 @@ def _build_team(
     if FORWARD_MEMBER_ANSWER_TOOL in set(
             team_config.get_extra_tools(team_name or "", "Coordinator")):
         coordinator_tools_list.append(
-            _make_forward_member_answer(member_answers, forwarded_members, _phase_p_state))
+            _make_forward_member_answer(member_answers, forwarded_members))
         # Copied, never mutated in place: `instructions` belongs to the caller and is
         # reused across runs in the same process, so appending to it directly would make
         # the block accumulate once per run.
@@ -16646,6 +16760,13 @@ def _build_team(
     # Coordinator/member.forwarding=REQUIRED). Wrapped in try/except: a bug in this
     # NEW layer must fail OPEN to the exact pre-Phase-P surface above, never closed
     # (never silently drop a tool the Tier-1 grant above already added).
+    #
+    # Required-tool resolution/forcing moved to _hooks_for()/_required_tool_states
+    # (Phase O, 2026-10-04) -- generic, per-role, shared by Coordinator and every
+    # member. Only forbidden-tool removal stays here: it has to run before
+    # coordinator_tools_list is finalized and handed to the Team constructor,
+    # which _hooks_for()'s own resolution (called as a constructor kwarg) is too
+    # late to influence.
     try:
         _effective_policy = team_config.resolve_effective_policy(team_name or "", "Coordinator")
         if _effective_policy.forbidden_tools:
@@ -16657,13 +16778,6 @@ def _build_team(
             print(f"[team] Phase P: removed forbidden tool(s) "
                   f"{sorted(_before_names & _effective_policy.forbidden_tools)} from "
                   f"Coordinator surface", flush=True)
-        _required_present = _effective_policy.required_tools & {
-            getattr(t, "name", "") for t in coordinator_tools_list
-        }
-        if _required_present:
-            _phase_p_state["required"] = frozenset(_required_present)
-            print(f"[team] Phase P: required_tools active for this run: "
-                  f"{sorted(_required_present)}", flush=True)
     except Exception as _exc:  # noqa: BLE001 -- a policy-layer bug must never break a run
         print(f"[team] Phase P: policy resolution failed (non-fatal, falling back to "
               f"pre-Phase-P behaviour): {_exc!r}", flush=True)
@@ -16766,7 +16880,7 @@ def _build_team(
     # of delegation depth (2026-08-21) -- see the hook's own read_state comment.
     team._member_results = member_answers
     team._forwarded_members = forwarded_members
-    team._phase_p_state = _phase_p_state
+    team._required_tool_states = _required_tool_states
     team._read_state = read_cache_hook.state
     # Generalized evidence ledger (C.4, 2026-10-03) -- wired here, BEFORE any
     # tool call or synthesis call can run, the same timing guarantee
@@ -16936,28 +17050,38 @@ def _finalise_member_chunks(team, agent_name: str) -> None:
     print(f"[team] member result captured: {agent_name} ({len(text)} chars, "
           f"{len(_names)} distinct filenames{': ' + _shown if _names else ''})",
           flush=True)
-    # Phase P (2026-10-04): protocol-requirement enforcement. If this run's resolved
-    # policy marked forward_member_answer REQUIRED (today, only engineering/
-    # Coordinator does), force the Coordinator's NEXT model turn to call it, exactly
-    # once per run -- not once per member result. One forced call was proven
-    # sufficient in Phase O.1's live experiment (the Coordinator went on to call it
-    # three further times voluntarily, under restored auto, later in that same run),
-    # and this codebase prefers the measured condition over the untested stronger one
-    # (forcing on every landing was never live-tested, so it is not implemented).
-    _pp = getattr(team, "_phase_p_state", None)
-    if (_pp is not None and FORWARD_MEMBER_ANSWER_TOOL in _pp.get("required", frozenset())
-            and FORWARD_MEMBER_ANSWER_TOOL not in _pp.get("fired_for", set())):
-        _pp["team"] = team
-        _pp_model = getattr(team, "model", None)
-        print(f"[team] Phase P: forcing tool_choice -> {FORWARD_MEMBER_ANSWER_TOOL} "
-              f"after member={key!r} result captured (member.forwarding=REQUIRED) | "
-              f"previous_tool_choice={team.tool_choice!r}", flush=True)
-        team.tool_choice = {"type": "function", "function": {"name": FORWARD_MEMBER_ANSWER_TOOL}}
-        if _pp_model is not None:
-            _pp_model._tool_choice = {"type": "function",
-                                       "function": {"name": FORWARD_MEMBER_ANSWER_TOOL}}
-        _pp["active"] = True
-        _pp.setdefault("fired_for", set()).add(FORWARD_MEMBER_ANSWER_TOOL)
+    # Phase O (2026-10-04): generic protocol-requirement enforcement -- "a member
+    # result just landed on the Coordinator" is the one proven domain trigger for
+    # forcing a required tool (today, only member.forwarding->forward_member_answer
+    # for engineering/Coordinator), but the loop below is not hardcoded to that one
+    # tool name: it forces WHATEVER the Coordinator's resolved policy names as
+    # required and not yet satisfied this run, so a future required capability
+    # triggered by this same event needs no new code here. One forced call per
+    # required tool per run, not once per member result -- Phase O.1's live
+    # experiment proved one forced call sufficient (the Coordinator went on to
+    # call it three further times voluntarily, under restored auto, later in that
+    # same run), and this codebase prefers the measured condition over the
+    # untested stronger one (forcing on every landing was never live-tested).
+    _states = getattr(team, "_required_tool_states", None)
+    _coord_state = _states.get("Coordinator") if _states else None
+    if _coord_state is not None:
+        _pending = _coord_state.get("required", frozenset()) - _coord_state.get("fired_for", set())
+        for _tool_name in sorted(_pending):
+            print(f"[team] Phase O: forcing tool_choice -> {_tool_name!r} after "
+                  f"member={key!r} result captured | previous_tool_choice="
+                  f"{team.tool_choice!r}", flush=True)
+            if _arm_required_tool_if_available(
+                    team, _tool_name, _coord_state, role="Coordinator", team_name=team_name or ""):
+                _coord_state.setdefault("fired_for", set()).add(_tool_name)
+            else:
+                # Case D: fail closed -- mark it "handled" anyway so this same
+                # mismatch isn't re-logged on every subsequent member result this
+                # run; the mismatch itself is a configuration error to fix in the
+                # policy data, not a transient condition that might resolve later.
+                _coord_state.setdefault("fired_for", set()).add(_tool_name)
+            break  # Case A only -- exactly one required tool is ever forced per
+            # trigger; >1 was already reduced to the empty set in _hooks_for
+            # (Case B), so `_pending` never legitimately has more than one member.
 
 
 class _BackendRunError(RuntimeError):

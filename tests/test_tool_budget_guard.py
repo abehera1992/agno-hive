@@ -222,6 +222,14 @@ def test_the_guard_is_appended_last_and_bound_per_role():
     so it never counts a call an outer gate is about to block or stub - those return
     their own message without calling `function`.
 
+    Updated for Phase O (2026-10-04): _hooks_for()'s per-role list gained a second
+    entry, _make_required_tool_clearing_hook(_state), appended BEFORE the budget
+    guard rather than after -- the substantive invariant this test protects is "the
+    budget guard is innermost," not "the budget guard is the list's only element,"
+    and that invariant still holds with a second hook present as long as the guard
+    stays last. The assertion below now checks exactly that: no other `_make_*_hook(`
+    call appears between the budget guard's own call and the closing bracket.
+
     BINDING: each agent gets its OWN instance with its role bound at construction. The
     first version discovered the role from `agent`, which agno stores on the Function
     object - shared across every agent listing the same tool, and live-measured as None
@@ -239,7 +247,18 @@ def test_the_guard_is_appended_last_and_bound_per_role():
 
     # The guard is NOT in the shared list - it is appended per agent by _hooks_for.
     assert "_make_tool_budget_guard_hook" not in shared_block
-    assert "return tool_hooks + [_make_tool_budget_guard_hook(" in src, "must be appended LAST"
+
+    # The per-role list: everything between "return tool_hooks + [" and its closing "]".
+    per_role_list = src[src.index("return tool_hooks + ["):]
+    per_role_list = per_role_list[:per_role_list.index("]")]
+
+    guard_call = "_make_tool_budget_guard_hook("
+    assert guard_call in per_role_list
+    # Nothing calling another _make_*_hook() factory may appear AFTER the guard's own
+    # call -- that is "last/innermost" exactly, without requiring the guard to be the
+    # list's only element (Phase O added a second, earlier entry; see docstring above).
+    after_guard = per_role_list[per_role_list.index(guard_call) + len(guard_call):]
+    assert "_make_" not in after_guard, "budget guard must be appended LAST (innermost)"
     assert "role=role" in src, "role must be bound at construction, not discovered"
 
     for site in ('_hooks_for(spec.name)', '_hooks_for("Coder")',
