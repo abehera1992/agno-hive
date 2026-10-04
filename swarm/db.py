@@ -602,6 +602,77 @@ team_gate_flags = Table(
     Column("enabled", Boolean, nullable=False),
 )
 
+# Phase P (2026-10-04) -- capability-oriented policy layer, additive on top of
+# the existing tool_registry/team_role_tools (both UNCHANGED above). Nothing
+# here replaces Tier 1: a team/role with zero rows in agent_capability_policy
+# behaves EXACTLY as before this migration -- team_role_tools alone still
+# decides its tool list. These five tables only ever ADD a further allow/
+# forbid/require layer on top, resolved by swarm/team_config.py's
+# resolve_effective_policy() and consumed defensively (try/except around the
+# whole call) by swarm/team.py's _build_team(), so a bug in this layer can
+# only fail OPEN to pre-Phase-P behavior, never closed.
+#
+# capability_id is a stable, tool-name-independent string (e.g.
+# "member.forwarding", "repository.discovery") -- never a literal tool name.
+# Tools IMPLEMENT capabilities via tool_capabilities below; task/agent policy
+# depends on capability_id, never on a concrete tool name directly, so a tool
+# can be swapped out without touching any policy row.
+capabilities = Table(
+    "capabilities", routing_metadata,
+    Column("capability_id", Text, primary_key=True),
+    Column("description", Text, nullable=True),
+    Column("enabled", Boolean, nullable=False, default=True),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+# tool_name is NOT a real FK into tool_registry: tool_registry rows are
+# upserted/pruned by refresh_registry() from a live MCP enumeration (see that
+# function's own docstring) and a capability assignment must be able to exist
+# BEFORE a tool is next seen live, exactly the same chicken-and-egg reason
+# tool_registry itself gives for not being a real FK target elsewhere in this
+# file. capability_id IS a real FK -- capabilities are hand-curated, not
+# externally discovered, so no such ordering problem exists for it.
+tool_capabilities = Table(
+    "tool_capabilities", routing_metadata,
+    Column("tool_name", Text, primary_key=True),
+    Column("capability_id", Text, ForeignKey("capabilities.capability_id"), primary_key=True),
+    Column("enabled", Boolean, nullable=False, default=True),
+)
+
+# Five-value mode vocabulary at the schema level (Phase P spec section 6), but
+# resolve_effective_policy() only gives three of them live runtime teeth this
+# phase -- FORBIDDEN, ALLOWED, REQUIRED. PREFERRED/FALLBACK are accepted and
+# stored (so the future Command & Control Center can represent them without a
+# later migration) but deliberately NOT YET enforced: both need a notion of
+# tool ranking/ordering that nothing in the current Agno integration
+# (team.tools is a flat list) has a consumer for yet. Storage only, same
+# "nothing reads this yet, deliberately" rule team.py's own _member_items
+# comment documents for exactly this reason -- an unused flag enforced
+# prematurely risks encoding a guess, not a measured need.
+agent_capability_policy = Table(
+    "agent_capability_policy", routing_metadata,
+    Column("team_name", Text, primary_key=True),
+    Column("role_name", Text, primary_key=True),
+    Column("capability_id", Text, ForeignKey("capabilities.capability_id"), primary_key=True),
+    Column("mode", Text, nullable=False),  # FORBIDDEN | ALLOWED | PREFERRED | REQUIRED | FALLBACK
+    Column("enabled", Boolean, nullable=False, default=True),
+)
+
+task_policies = Table(
+    "task_policies", routing_metadata,
+    Column("task_class", Text, primary_key=True),
+    Column("description", Text, nullable=True),
+    Column("enabled", Boolean, nullable=False, default=True),
+    Column("policy_version", Integer, nullable=False, default=1),
+)
+
+task_capabilities = Table(
+    "task_capabilities", routing_metadata,
+    Column("task_class", Text, ForeignKey("task_policies.task_class"), primary_key=True),
+    Column("capability_id", Text, ForeignKey("capabilities.capability_id"), primary_key=True),
+    Column("requirement", Text, nullable=False),  # REQUIRED | ALLOWED | FORBIDDEN
+)
+
 
 # ── Engine ────────────────────────────────────────────────────────────────────
 

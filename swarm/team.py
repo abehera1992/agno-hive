@@ -1985,7 +1985,8 @@ def _build_member_result(raw_text: str) -> MemberResult:
                         unresolved=unresolved, raw=raw)
 
 
-def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = None):
+def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = None,
+                                 _phase_p_state: dict | None = None):
     """Build the coordinator's forward tool over the live member-results map.
 
     `forwarded` (default None = no recording, the pre-2026-09-21 behaviour) receives the
@@ -2038,6 +2039,21 @@ def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = N
         Args:
             member_id: the member whose answer to forward, e.g. "researcher".
         """
+        # Phase P (2026-10-04): this call satisfies the member.forwarding=REQUIRED
+        # protocol requirement for this run (if one was forced) -- restore tool_choice
+        # to auto right here, the forced trigger's natural completion point. Live-
+        # proved safe in Phase O.1: the Coordinator went on to call this tool three
+        # further times VOLUNTARILY, under auto, later in that same run.
+        if _phase_p_state and _phase_p_state.get("active"):
+            _pp_team = _phase_p_state.get("team")
+            if _pp_team is not None:
+                _pp_team.tool_choice = None
+                _pp_model = getattr(_pp_team, "model", None)
+                if _pp_model is not None:
+                    _pp_model._tool_choice = None
+            _phase_p_state["active"] = False
+            print("[team] Phase P: tool_choice restored to auto on "
+                  "forward_member_answer entry", flush=True)
         key = _member_key(str(member_id or "").strip())
         text = (member_answers or {}).get(key)
         if not text:
@@ -16464,6 +16480,15 @@ def _build_team(
     # this exact object and team._member_results is bound to it below, so both sides read
     # one map rather than two that can drift.
     member_answers: dict[str, str] = {}
+    # Phase P (2026-10-04): shared, run-scoped mutable state for the capability-policy
+    # protocol-enforcement mechanism (see resolve_effective_policy() in team_config.py).
+    # Same late-binding shape as member_answers/forwarded_members above and the same
+    # reason: _make_forward_member_answer's closure is built before `team` exists.
+    # "required" is the resolved set of tool names this run's policy says MUST be
+    # called at least once; "fired_for" tracks which of those have already had their
+    # one-shot tool_choice force applied, so a later member result never re-forces a
+    # requirement this run already satisfied.
+    _phase_p_state: dict = {"team": None, "required": frozenset(), "fired_for": set()}
     # Exact member text captured by forward_member_answer at forward time; bound to
     # team._forwarded_members below and read by _with_forwarded_evidence.
     forwarded_members: dict[str, str] = {}
@@ -16607,13 +16632,41 @@ def _build_team(
     if FORWARD_MEMBER_ANSWER_TOOL in set(
             team_config.get_extra_tools(team_name or "", "Coordinator")):
         coordinator_tools_list.append(
-            _make_forward_member_answer(member_answers, forwarded_members))
+            _make_forward_member_answer(member_answers, forwarded_members, _phase_p_state))
         # Copied, never mutated in place: `instructions` belongs to the caller and is
         # reused across runs in the same process, so appending to it directly would make
         # the block accumulate once per run.
         instructions = list(instructions) + _FORWARD_INSTRUCTIONS
         print("[team] forward_member_answer granted — coordinator instructed to forward",
               flush=True)
+    # Phase P (2026-10-04): capability-policy layer, additive on top of everything
+    # above -- a (team, role) with no agent_capability_policy rows resolves to the
+    # empty policy (see resolve_effective_policy()'s own docstring), so this is a
+    # no-op for every team except the one row this migration seeds (engineering/
+    # Coordinator/member.forwarding=REQUIRED). Wrapped in try/except: a bug in this
+    # NEW layer must fail OPEN to the exact pre-Phase-P surface above, never closed
+    # (never silently drop a tool the Tier-1 grant above already added).
+    try:
+        _effective_policy = team_config.resolve_effective_policy(team_name or "", "Coordinator")
+        if _effective_policy.forbidden_tools:
+            _before_names = {getattr(t, "name", "") for t in coordinator_tools_list}
+            coordinator_tools_list = [
+                t for t in coordinator_tools_list
+                if getattr(t, "name", "") not in _effective_policy.forbidden_tools
+            ]
+            print(f"[team] Phase P: removed forbidden tool(s) "
+                  f"{sorted(_before_names & _effective_policy.forbidden_tools)} from "
+                  f"Coordinator surface", flush=True)
+        _required_present = _effective_policy.required_tools & {
+            getattr(t, "name", "") for t in coordinator_tools_list
+        }
+        if _required_present:
+            _phase_p_state["required"] = frozenset(_required_present)
+            print(f"[team] Phase P: required_tools active for this run: "
+                  f"{sorted(_required_present)}", flush=True)
+    except Exception as _exc:  # noqa: BLE001 -- a policy-layer bug must never break a run
+        print(f"[team] Phase P: policy resolution failed (non-fatal, falling back to "
+              f"pre-Phase-P behaviour): {_exc!r}", flush=True)
     # One line per run (2026-08-21). The coordinator's OWN tool surface is the single
     # most consequential thing _build_team decides and the hardest to confirm from
     # outside: engineering deliberately runs it disarmed (coordinator_tools: []), and a
@@ -16713,6 +16766,7 @@ def _build_team(
     # of delegation depth (2026-08-21) -- see the hook's own read_state comment.
     team._member_results = member_answers
     team._forwarded_members = forwarded_members
+    team._phase_p_state = _phase_p_state
     team._read_state = read_cache_hook.state
     # Generalized evidence ledger (C.4, 2026-10-03) -- wired here, BEFORE any
     # tool call or synthesis call can run, the same timing guarantee
@@ -16882,6 +16936,28 @@ def _finalise_member_chunks(team, agent_name: str) -> None:
     print(f"[team] member result captured: {agent_name} ({len(text)} chars, "
           f"{len(_names)} distinct filenames{': ' + _shown if _names else ''})",
           flush=True)
+    # Phase P (2026-10-04): protocol-requirement enforcement. If this run's resolved
+    # policy marked forward_member_answer REQUIRED (today, only engineering/
+    # Coordinator does), force the Coordinator's NEXT model turn to call it, exactly
+    # once per run -- not once per member result. One forced call was proven
+    # sufficient in Phase O.1's live experiment (the Coordinator went on to call it
+    # three further times voluntarily, under restored auto, later in that same run),
+    # and this codebase prefers the measured condition over the untested stronger one
+    # (forcing on every landing was never live-tested, so it is not implemented).
+    _pp = getattr(team, "_phase_p_state", None)
+    if (_pp is not None and FORWARD_MEMBER_ANSWER_TOOL in _pp.get("required", frozenset())
+            and FORWARD_MEMBER_ANSWER_TOOL not in _pp.get("fired_for", set())):
+        _pp["team"] = team
+        _pp_model = getattr(team, "model", None)
+        print(f"[team] Phase P: forcing tool_choice -> {FORWARD_MEMBER_ANSWER_TOOL} "
+              f"after member={key!r} result captured (member.forwarding=REQUIRED) | "
+              f"previous_tool_choice={team.tool_choice!r}", flush=True)
+        team.tool_choice = {"type": "function", "function": {"name": FORWARD_MEMBER_ANSWER_TOOL}}
+        if _pp_model is not None:
+            _pp_model._tool_choice = {"type": "function",
+                                       "function": {"name": FORWARD_MEMBER_ANSWER_TOOL}}
+        _pp["active"] = True
+        _pp.setdefault("fired_for", set()).add(FORWARD_MEMBER_ANSWER_TOOL)
 
 
 class _BackendRunError(RuntimeError):

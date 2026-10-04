@@ -380,10 +380,21 @@ def test_tool_interception_hook_source_has_no_new_db_calls():
 # ── 20. Existing routing metadata/engine remains untouched ──────────────────
 
 def test_routing_metadata_unaffected_by_the_new_durable_tables():
+    """Updated for Phase P (2026-10-04): five new tables (capabilities,
+    tool_capabilities, agent_capability_policy, task_policies,
+    task_capabilities) joined routing_metadata, additive and bootstrapped the
+    same way as every table already in this set (ensure_routing_schema()'s
+    create_all(), no Alembic involvement -- see that migration's own notes).
+    The invariant this test exists to prove is unchanged: routing_metadata
+    tables are never in the app-storage engine's durable-backbone set, proven
+    by the disjointness assertion below, which still runs against whatever
+    the real current table set is rather than a second hardcoded snapshot."""
     routing_table_names = {t.name for t in db.routing_metadata.tables.values()}
     assert routing_table_names == {
         "model_catalog", "team_role_models", "team_role_tools", "team_role_skills",
         "team_role_instruction_overlays", "team_gate_flags", "tool_registry", "skill_registry",
+        "capabilities", "tool_capabilities", "agent_capability_policy",
+        "task_policies", "task_capabilities",
     }
     assert not (routing_table_names & _DURABLE_TABLES)
 

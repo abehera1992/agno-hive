@@ -79,6 +79,39 @@ _skill_registry_cache: set[str] = set()
 _cache_loaded = False
 _load_lock = asyncio.Lock()
 
+# Phase P (2026-10-04) -- capability-policy caches, same "sync, cache-only,
+# refreshed by load_cache()/reload()" contract as every cache above. A team/
+# role absent from _agent_capability_cache resolves to "no policy" (today's
+# behaviour, unchanged) rather than KeyError, by construction of
+# resolve_effective_policy() below -- see that function for why.
+_capabilities_cache: dict[str, bool] = {}  # capability_id -> enabled
+_tool_capabilities_cache: dict[str, set[str]] = {}  # capability_id -> {tool_name}
+_agent_capability_cache: dict[tuple[str, str], dict[str, str]] = {}  # (team,role) -> {capability_id: mode}
+_task_capabilities_cache: dict[str, dict[str, str]] = {}  # task_class -> {capability_id: requirement}
+_task_policy_version_cache: dict[str, int] = {}  # task_class -> policy_version
+
+# Mode/requirement vocabularies accepted at the schema level (Phase P spec
+# section 6) -- kept here, not just as a comment, so a seed/admin write can be
+# validated against the SAME list the resolver's precedence logic switches
+# on, rather than two hand-kept lists silently drifting apart.
+CAPABILITY_MODES = frozenset({"FORBIDDEN", "ALLOWED", "PREFERRED", "REQUIRED", "FALLBACK"})
+TASK_REQUIREMENTS = frozenset({"REQUIRED", "ALLOWED", "FORBIDDEN"})
+
+
+@dataclass(frozen=True)
+class EffectivePolicy:
+    """The resolved, run-scoped output of resolve_effective_policy() -- never
+    the raw DB rows. swarm/team.py's _build_team() consumes only this, never
+    the caches directly, so the precedence rule (FORBIDDEN beats REQUIRED
+    beats ALLOWED/PREFERRED/FALLBACK) lives in exactly one place."""
+    team_name: str
+    role_name: str
+    task_class: str | None
+    allowed_tools: frozenset[str]
+    required_tools: frozenset[str]
+    forbidden_tools: frozenset[str]
+    policy_version: int | None
+
 
 def get_extra_tools(team_name: str, role_name: str) -> list[str]:
     """Sync, cache-only. The DB-granted tool list for this (team, role) —
@@ -153,6 +186,15 @@ async def load_cache() -> None:
         if existing is None:
             await _seed_defaults(conn)
 
+        # Separate emptiness check from the one above (Phase P, 2026-10-04):
+        # team_role_tools on an already-deployed instance is NEVER empty, so
+        # gating this seed on THAT check would mean it silently never runs on
+        # any pre-existing deployment. capabilities is its own fresh table on
+        # every deployment (new or old) until this seed has run once.
+        policy_existing = (await conn.execute(select(db.capabilities.c.capability_id).limit(1))).first()
+        if policy_existing is None:
+            await _seed_policy_defaults(conn)
+
         tool_rows = (await conn.execute(select(db.team_role_tools))).mappings().all()
         skill_rows = (await conn.execute(select(db.team_role_skills))).mappings().all()
         overlay_rows = (
@@ -161,6 +203,16 @@ async def load_cache() -> None:
         gate_rows = (await conn.execute(select(db.team_gate_flags))).mappings().all()
         tool_registry_rows = (await conn.execute(select(db.tool_registry.c.tool_name))).all()
         skill_registry_rows = (await conn.execute(select(db.skill_registry.c.skill_name))).all()
+        capability_rows = (await conn.execute(select(db.capabilities))).mappings().all()
+        tool_capability_rows = (await conn.execute(select(db.tool_capabilities))).mappings().all()
+        agent_capability_rows = (await conn.execute(select(db.agent_capability_policy))).mappings().all()
+        task_capability_rows = (
+            await conn.execute(
+                select(db.task_capabilities, db.task_policies.c.policy_version)
+                .join(db.task_policies, db.task_policies.c.task_class == db.task_capabilities.c.task_class)
+            )
+        ).mappings().all()
+        task_policy_rows = (await conn.execute(select(db.task_policies))).mappings().all()
 
     _tools_cache.clear()
     for r in tool_rows:
@@ -189,6 +241,32 @@ async def load_cache() -> None:
     _skill_registry_cache.clear()
     _skill_registry_cache.update(row[0] for row in skill_registry_rows)
 
+    _capabilities_cache.clear()
+    for r in capability_rows:
+        _capabilities_cache[r["capability_id"]] = bool(r["enabled"])
+
+    _tool_capabilities_cache.clear()
+    for r in tool_capability_rows:
+        if not r["enabled"]:
+            continue
+        _tool_capabilities_cache.setdefault(r["capability_id"], set()).add(r["tool_name"])
+
+    _agent_capability_cache.clear()
+    for r in agent_capability_rows:
+        if not r["enabled"]:
+            continue
+        key = (r["team_name"], r["role_name"])
+        _agent_capability_cache.setdefault(key, {})[r["capability_id"]] = r["mode"]
+
+    _task_capabilities_cache.clear()
+    for r in task_capability_rows:
+        _task_capabilities_cache.setdefault(r["task_class"], {})[r["capability_id"]] = r["requirement"]
+
+    _task_policy_version_cache.clear()
+    for r in task_policy_rows:
+        if r["enabled"]:
+            _task_policy_version_cache[r["task_class"]] = r["policy_version"]
+
 
 async def reload() -> dict:
     """Re-read the DB into the cache and return a diff, same "show what actually
@@ -197,6 +275,7 @@ async def reload() -> dict:
     before_tool_grants = {k: set(v) for k, v in _tools_cache.items()}
     before_skill_grants = {k: set(v) for k, v in _skills_cache.items()}
     before_gates = dict(_gate_flags_cache)
+    before_agent_capabilities = {k: dict(v) for k, v in _agent_capability_cache.items()}
 
     await load_cache()
 
@@ -215,6 +294,10 @@ async def reload() -> dict:
         f"{t}/{g}" for (t, g) in _gate_flags_cache
         if _gate_flags_cache[(t, g)] != before_gates.get((t, g))
     ]
+    agent_capabilities_changed = [
+        f"{t}/{r}" for (t, r) in _agent_capability_cache
+        if _agent_capability_cache[(t, r)] != before_agent_capabilities.get((t, r))
+    ]
     return {
         "tool_grants_added": tool_grants_added,
         "skill_grants_added": skill_grants_added,
@@ -222,6 +305,8 @@ async def reload() -> dict:
         "gates_changed": gates_changed,
         "tool_registry_size": len(_tool_registry_cache),
         "skill_registry_size": len(_skill_registry_cache),
+        "capability_registry_size": len(_capabilities_cache),
+        "agent_capabilities_changed": agent_capabilities_changed,
     }
 
 
@@ -307,6 +392,11 @@ async def reset_cache_for_tests() -> None:
     _gate_flags_cache.clear()
     _tool_registry_cache.clear()
     _skill_registry_cache.clear()
+    _capabilities_cache.clear()
+    _tool_capabilities_cache.clear()
+    _agent_capability_cache.clear()
+    _task_capabilities_cache.clear()
+    _task_policy_version_cache.clear()
     _cache_loaded = False
 
 
@@ -474,3 +564,131 @@ async def _seed_defaults(conn) -> None:
         await conn.execute(db.tool_registry.insert(), [{"tool_name": t} for t in sorted(all_tools)])
     if all_skills:
         await conn.execute(db.skill_registry.insert(), [{"skill_name": s} for s in sorted(all_skills)])
+
+
+async def _seed_policy_defaults(conn) -> None:
+    """One-time seed for the Phase P capability layer (2026-10-04), run once
+    against an empty `capabilities` table regardless of whether team_role_tools
+    was already populated (see this function's call site in load_cache() for
+    why that check has to be separate from _seed_defaults()'s).
+
+    Every mapping here is evidenced, not guessed: each tool->capability row
+    reflects what that tool actually does (confirmed this session against
+    real coordinator/member tool-surface logs), and the one agent policy row
+    (engineering/Coordinator/member.forwarding=REQUIRED) encodes exactly the
+    protocol requirement Phase O.1 live-proved -- forcing forward_member_answer
+    at the point a member result lands converts the historical prose bypass
+    into a real tool call, with zero regression to any run that never
+    satisfies the trigger. No other agent/task policy row is seeded: an empty
+    agent_capability_policy for every OTHER (team, role) means zero behaviour
+    change for every team this migration has not been deliberately pointed at.
+
+    "evidence.synthesis" from the Phase P spec's own worked example is
+    deliberately NOT seeded here -- it names a process requirement ("the
+    Coordinator must synthesize using evidence"), not a concrete callable
+    tool, and inventing a tool_capabilities row for it would be exactly the
+    "do NOT invent capability assignments without evidence" violation Phase P
+    section 21 warns against. Left for a future phase once/if a concrete tool
+    backs it.
+    """
+    await conn.execute(db.capabilities.insert(), [
+        {"capability_id": "member.forwarding",
+         "description": "Deliver one member's answer to the reader exactly as "
+                         "that member wrote it, without the Coordinator retyping it."},
+        {"capability_id": "repository.discovery",
+         "description": "Enumerate files/directories in the project (find files, "
+                         "list directories, map structure)."},
+        {"capability_id": "repository.file_read",
+         "description": "Read the contents of a specific file."},
+        {"capability_id": "database.query",
+         "description": "Execute a read query against the project's live database."},
+        {"capability_id": "database.schema_read",
+         "description": "Inspect the project's live database schema."},
+    ])
+    await conn.execute(db.tool_capabilities.insert(), [
+        {"tool_name": "forward_member_answer", "capability_id": "member.forwarding"},
+        {"tool_name": "project_map", "capability_id": "repository.discovery"},
+        {"tool_name": "list_directory", "capability_id": "repository.discovery"},
+        {"tool_name": "list_directory_tree", "capability_id": "repository.discovery"},
+        {"tool_name": "find_files", "capability_id": "repository.discovery"},
+        {"tool_name": "search_files", "capability_id": "repository.discovery"},
+        {"tool_name": "search_files_batch", "capability_id": "repository.discovery"},
+        {"tool_name": "get_file_content", "capability_id": "repository.file_read"},
+        {"tool_name": "get_files_batch", "capability_id": "repository.file_read"},
+        {"tool_name": "db_query", "capability_id": "database.query"},
+        {"tool_name": "db_schema", "capability_id": "database.schema_read"},
+    ])
+    await conn.execute(db.agent_capability_policy.insert(), [
+        {"team_name": "engineering", "role_name": "Coordinator",
+         "capability_id": "member.forwarding", "mode": "REQUIRED"},
+    ])
+    await conn.execute(db.task_policies.insert(), [
+        {"task_class": "repository_inventory",
+         "description": "Enumerate/describe part of the repository's structure "
+                         "or contents (the Phase P spec's own worked example).",
+         "policy_version": 1},
+    ])
+    await conn.execute(db.task_capabilities.insert(), [
+        {"task_class": "repository_inventory", "capability_id": "repository.discovery",
+         "requirement": "REQUIRED"},
+        {"task_class": "repository_inventory", "capability_id": "repository.file_read",
+         "requirement": "REQUIRED"},
+    ])
+
+
+def resolve_effective_policy(
+    team_name: str, role_name: str, task_class: str | None = None,
+) -> EffectivePolicy:
+    """Pure, deterministic, cache-only (Phase P, 2026-10-04). Same input ->
+    same output, no DB access, no LLM involvement -- see tests/
+    test_phase_p_capability_policy.py for the precedence proofs this contract
+    depends on.
+
+    Precedence (Phase P section 9): FORBIDDEN always wins. A capability
+    FORBIDDEN at either the agent level or the task level removes every tool
+    backing it from allowed_tools AND required_tools, even if some other
+    layer marks it REQUIRED or ALLOWED -- security restrictions are never
+    weakened by a lower-level override. REQUIRED (agent or task, whichever
+    is not overridden by a FORBIDDEN) adds its tools to required_tools.
+    Everything else named by an ALLOWED/PREFERRED/REQUIRED/FALLBACK row (and
+    not forbidden) is merely eligible, in allowed_tools.
+
+    A (team, role) with NO rows in agent_capability_policy, and no
+    task_class given (or a task_class with no rows in task_capabilities),
+    resolves to the empty policy -- allowed_tools/required_tools/
+    forbidden_tools all empty. _build_team() treats that as "this layer has
+    nothing to say," identical to every run before this feature existed.
+    """
+    agent_modes = _agent_capability_cache.get((team_name, role_name), {})
+    task_reqs = _task_capabilities_cache.get(task_class, {}) if task_class else {}
+
+    forbidden_caps = {c for c, m in agent_modes.items() if m == "FORBIDDEN"}
+    forbidden_caps |= {c for c, r in task_reqs.items() if r == "FORBIDDEN"}
+
+    required_caps = {c for c, m in agent_modes.items() if m == "REQUIRED"}
+    required_caps |= {c for c, r in task_reqs.items() if r == "REQUIRED"}
+    required_caps -= forbidden_caps  # FORBIDDEN wins even over REQUIRED
+
+    allowed_caps = {c for c, m in agent_modes.items() if m in ("ALLOWED", "PREFERRED", "FALLBACK")}
+    allowed_caps |= {c for c, r in task_reqs.items() if r == "ALLOWED"}
+    allowed_caps |= required_caps
+    allowed_caps -= forbidden_caps
+
+    def _tools_for(caps: set[str]) -> frozenset[str]:
+        out: set[str] = set()
+        for cap in caps:
+            if not _capabilities_cache.get(cap, False):
+                continue  # a disabled capability contributes no tools
+            out |= _tool_capabilities_cache.get(cap, set())
+        return frozenset(out)
+
+    forbidden_tools = _tools_for(forbidden_caps)
+    required_tools = _tools_for(required_caps) - forbidden_tools
+    allowed_tools = _tools_for(allowed_caps) - forbidden_tools
+
+    return EffectivePolicy(
+        team_name=team_name, role_name=role_name, task_class=task_class,
+        allowed_tools=allowed_tools, required_tools=required_tools,
+        forbidden_tools=forbidden_tools,
+        policy_version=_task_policy_version_cache.get(task_class) if task_class else None,
+    )
