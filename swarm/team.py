@@ -14917,7 +14917,12 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                     # ceiling remains a backstop. Only fires when a prior result WAS
                     # captured (the pre-existing "no prior result -- allow the retry"
                     # exception two branches down already covers the no-result case).
-                    _prior_result = (getattr(team, "_member_results", None) or {}).get(member_id)
+                    # Phase P.2: prefer THIS entry's own tagged result (matched by
+                    # exact task text, hence by target) over the member-wide slot,
+                    # which may have been overwritten by a different target since.
+                    _entry_result = entry.get("result")
+                    _prior_result = (_entry_result if isinstance(_entry_result, str) and _entry_result
+                                     else (getattr(team, "_member_results", None) or {}).get(member_id))
                     _entry_audit = entry.get("audit") or {}
                     _corrective_target = _entry_audit.get("target") or \
                         _derive_delegation_audit(raw_task)[0].get("target", "")
@@ -14950,7 +14955,10 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                     # answer with what it has.
                     repeats[member_id] = repeats.get(member_id, 0) + 1
                     n = repeats[member_id]
-                    prior = (getattr(team, "_member_results", None) or {}).get(member_id)
+                    # Phase P.2: same target-tagged-entry preference as above.
+                    _entry_result = entry.get("result")
+                    prior = (_entry_result if isinstance(_entry_result, str) and _entry_result
+                             else (getattr(team, "_member_results", None) or {}).get(member_id))
                     print(f"[team] duplicate delegation to {member_id!r} (#{n}) — "
                           f"{'serving prior result' if prior else 'no prior result captured'}",
                           flush=True)
@@ -15011,7 +15019,11 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                         # the task rather than repeating it verbatim. Same bound: once
                         # per (member, target), via the SAME corrective_reads_granted
                         # set the exact-text tier shares.
-                        _prior_result = (getattr(team, "_member_results", None) or {}).get(member_id)
+                        # Phase P.2: prefer THIS entry's own tagged result (matched
+                        # by target+action above) over the member-wide slot.
+                        _entry_result = entry.get("result")
+                        _prior_result = (_entry_result if isinstance(_entry_result, str) and _entry_result
+                                         else (getattr(team, "_member_results", None) or {}).get(member_id))
                         _corrective_key = (member_id, audit["target"])
                         if (_prior_result and audit["target"]
                                 and _read_tracking_active(team)
@@ -15047,7 +15059,10 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                         # one task is doing the same thing, and must not get two budgets.
                         repeats[member_id] = repeats.get(member_id, 0) + 1
                         n = repeats[member_id]
-                        prior = (getattr(team, "_member_results", None) or {}).get(member_id)
+                        # Phase P.2: same target-tagged-entry preference as above.
+                        _entry_result = entry.get("result")
+                        prior = (_entry_result if isinstance(_entry_result, str) and _entry_result
+                                 else (getattr(team, "_member_results", None) or {}).get(member_id))
                         print(f"[team] duplicate delegation (reworded) to {member_id!r} "
                               f"(#{n}) — {'serving prior result' if prior else 'no prior result captured'}",
                               flush=True)
@@ -15121,7 +15136,11 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                 same_wording = prior_objective == objective_norm
                 repeats[member_id] = repeats.get(member_id, 0) + 1
                 n = repeats[member_id]
-                prior = (getattr(team, "_member_results", None) or {}).get(member_id)
+                # Phase P.2: entry is already matched on target_norm above (line
+                # ~15118); prefer its own tagged result over the member-wide slot.
+                _entry_result = entry.get("result")
+                prior = (_entry_result if isinstance(_entry_result, str) and _entry_result
+                         else (getattr(team, "_member_results", None) or {}).get(member_id))
                 print(f"[team] duplicate delegation ({'exact' if same_wording else 'reworded'}) "
                       f"to {member_id!r} for {(args or {}).get('target')!r} (#{n}) — "
                       f"{'serving prior result' if prior else 'no prior result captured'}",
@@ -15320,6 +15339,20 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
             "args": dict(args or {}),
             "audit": _logged_audit,
         })
+        # Phase P.2 (2026-10-04): mark this freshly-appended entry as the one to tag
+        # once this member's result actually materializes. `result` above is an
+        # unconsumed async_generator at this point for both delegation tools (proven
+        # live, Phase P.1: result_kind was "async_generator" on every real dispatch,
+        # never "str") -- the text only exists later, when _finalise_member_chunks
+        # pops the member's accumulated stream chunks. log[-1] is the SAME dict
+        # object this appended; mutating it through the pending reference below
+        # updates this exact entry, not a copy, and needs no scan of `log`.
+        if function_name in ("delegate_task_to_member", "delegate_structured_task"):
+            _dispatch_member_id = _member_key(
+                str((args or {}).get("member_id", "")).strip())
+            if not isinstance(getattr(team, "_pending_log_entry_by_member", None), dict):
+                team._pending_log_entry_by_member = {}
+            team._pending_log_entry_by_member[_dispatch_member_id] = log[-1]
         # isinstance(str) is load-bearing, not defensive (2026-08-24). delegate_task_to_member
         # returns an async_generator on the streaming path -- the sibling logger a few
         # lines up prints `delegate result: async_generator` for exactly that reason and
@@ -16998,6 +17031,17 @@ def _finalise_member_chunks(team, agent_name: str) -> None:
     if not isinstance(getattr(team, "_member_results", None), dict):
         team._member_results = {}
     team._member_results[key] = text
+    # Phase P.2 (2026-10-04): tag the delegation-log entry this text actually belongs
+    # to, now that it exists -- the bridge set at dispatch time (see the duplicate-
+    # delegation gate's log.append call site). Popped, not just read: a member
+    # delegated to twice must not have its SECOND result retroactively tag the FIRST
+    # entry if something here were ever re-entered, and this mirrors the "overwrite,
+    # not accumulate" semantics team._member_results itself already uses one line up.
+    _pending_entries = getattr(team, "_pending_log_entry_by_member", None)
+    if isinstance(_pending_entries, dict):
+        _pending_entry = _pending_entries.pop(key, None)
+        if _pending_entry is not None:
+            _pending_entry["result"] = text
     # Mirrored to module scope for the same reason _best_draft is: the liveness
     # heartbeat has no `team` in scope, and on an auto-kill the parent process is the
     # only thing left alive. Without this, a killed run hands back the coordinator's
