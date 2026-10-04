@@ -14917,12 +14917,7 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                     # ceiling remains a backstop. Only fires when a prior result WAS
                     # captured (the pre-existing "no prior result -- allow the retry"
                     # exception two branches down already covers the no-result case).
-                    # Phase P.1: prefer THIS entry's own stored result (matched by
-                    # exact task text, hence by target) over the member-wide slot,
-                    # which may have been overwritten by a different target since.
-                    _entry_result = entry.get("result")
-                    _prior_result = (_entry_result if isinstance(_entry_result, str) and _entry_result
-                                     else (getattr(team, "_member_results", None) or {}).get(member_id))
+                    _prior_result = (getattr(team, "_member_results", None) or {}).get(member_id)
                     _entry_audit = entry.get("audit") or {}
                     _corrective_target = _entry_audit.get("target") or \
                         _derive_delegation_audit(raw_task)[0].get("target", "")
@@ -14955,10 +14950,7 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                     # answer with what it has.
                     repeats[member_id] = repeats.get(member_id, 0) + 1
                     n = repeats[member_id]
-                    # Phase P.1: same target-matched-entry preference as above.
-                    _entry_result = entry.get("result")
-                    prior = (_entry_result if isinstance(_entry_result, str) and _entry_result
-                             else (getattr(team, "_member_results", None) or {}).get(member_id))
+                    prior = (getattr(team, "_member_results", None) or {}).get(member_id)
                     print(f"[team] duplicate delegation to {member_id!r} (#{n}) — "
                           f"{'serving prior result' if prior else 'no prior result captured'}",
                           flush=True)
@@ -15019,11 +15011,7 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                         # the task rather than repeating it verbatim. Same bound: once
                         # per (member, target), via the SAME corrective_reads_granted
                         # set the exact-text tier shares.
-                        # Phase P.1: prefer THIS entry's own stored result (matched
-                        # by target+action above) over the member-wide slot.
-                        _entry_result = entry.get("result")
-                        _prior_result = (_entry_result if isinstance(_entry_result, str) and _entry_result
-                                         else (getattr(team, "_member_results", None) or {}).get(member_id))
+                        _prior_result = (getattr(team, "_member_results", None) or {}).get(member_id)
                         _corrective_key = (member_id, audit["target"])
                         if (_prior_result and audit["target"]
                                 and _read_tracking_active(team)
@@ -15059,10 +15047,7 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                         # one task is doing the same thing, and must not get two budgets.
                         repeats[member_id] = repeats.get(member_id, 0) + 1
                         n = repeats[member_id]
-                        # Phase P.1: same target-matched-entry preference as above.
-                        _entry_result = entry.get("result")
-                        prior = (_entry_result if isinstance(_entry_result, str) and _entry_result
-                                 else (getattr(team, "_member_results", None) or {}).get(member_id))
+                        prior = (getattr(team, "_member_results", None) or {}).get(member_id)
                         print(f"[team] duplicate delegation (reworded) to {member_id!r} "
                               f"(#{n}) — {'serving prior result' if prior else 'no prior result captured'}",
                               flush=True)
@@ -15136,11 +15121,7 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                 same_wording = prior_objective == objective_norm
                 repeats[member_id] = repeats.get(member_id, 0) + 1
                 n = repeats[member_id]
-                # Phase P.1: entry is already matched on target_norm above (line
-                # ~15118); prefer its own stored result over the member-wide slot.
-                _entry_result = entry.get("result")
-                prior = (_entry_result if isinstance(_entry_result, str) and _entry_result
-                         else (getattr(team, "_member_results", None) or {}).get(member_id))
+                prior = (getattr(team, "_member_results", None) or {}).get(member_id)
                 print(f"[team] duplicate delegation ({'exact' if same_wording else 'reworded'}) "
                       f"to {member_id!r} for {(args or {}).get('target')!r} (#{n}) — "
                       f"{'serving prior result' if prior else 'no prior result captured'}",
@@ -15338,13 +15319,6 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
             "tool": function_name,
             "args": dict(args or {}),
             "audit": _logged_audit,
-            # Phase P.1 (2026-10-04): the string result, when there is one, so a
-            # later duplicate-delegation lookup for THIS target can be served from
-            # this entry directly instead of team._member_results[member_id] -- a
-            # single slot per member, overwritten by whichever target was asked
-            # about most recently, which served the wrong member's content under
-            # an earlier target's label (proven live, T12 kq02eqph0).
-            "result": result if isinstance(result, str) else None,
         })
         # isinstance(str) is load-bearing, not defensive (2026-08-24). delegate_task_to_member
         # returns an async_generator on the streaming path -- the sibling logger a few
