@@ -123,10 +123,21 @@ async def test_completion_is_attempted_at_most_once_per_call():
     assert len(fake_team.prompts) == 1  # still just the one -- no second completion call
 
 
-# ---- Case D -- successful completion: the conclusion reaches the final answer ---
+# ---- Case D -- successful completion: original draft AND the conclusion both
+#      reach the final answer ----------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_successful_completion_is_adopted_and_contains_the_conclusion():
+    """Phase N / Track A (2026-10-03): adoption is now ADDITIVE, not replacing.
+
+    Before this change, a successfully-adopted completion REPLACED `content`
+    outright -- live-confirmed cost on T12: the original draft's own pre-repeat
+    content (here, "Endpoints: A, B. Tables: C. Frontend hooks: D, E") was
+    silently discarded the moment the completion cleared its grounding check,
+    even though that prefix was real, already-produced, never-repeating text
+    Z16 specifically keeps rather than throwing away. The fix: the final answer
+    must contain BOTH the original draft's real content and the completion's
+    conclusion -- never one at the cost of the other."""
     completed_text = (
         "Endpoints: A, B. Tables: C. Frontend hooks: D, E, F, G, H. "
         "Gap analysis: B and C have no frontend counterpart."
@@ -142,7 +153,8 @@ async def test_successful_completion_is_adopted_and_contains_the_conclusion():
     out_content, out_result = await team._complete_repetition_truncated_answer(
         content, "audit the module", fake_team, [result], result, None)
 
-    assert out_content == completed_text
+    assert content in out_content  # the original pre-repeat draft is NEVER discarded
+    assert completed_text in out_content  # the completion's own text is fully present
     assert "Gap analysis" in out_content
     assert "INCOMPLETE ANSWER" not in out_content  # no disclosure needed -- it completed
 
@@ -229,7 +241,15 @@ async def test_z31_shape_end_to_end_completion_reaches_verify_claims_before_dedu
 
     Demonstrates the OLD implementation's failure mode directly: WITHOUT the
     completion guard (simulated by never setting _repetition_truncated), the
-    truncated text reaches verify_claims as-is."""
+    truncated text reaches verify_claims as-is.
+
+    Phase N / Track A (2026-10-03): adoption is now additive -- verify_claims
+    sees ONE combined text (original draft + completion), not the completion
+    alone. This is correct: the original draft's own real content (here,
+    "Endpoints: 9. Tables: 3. Frontend hooks: 5. Gap analysis: g") must not be
+    silently absent from what gets checked either -- checking only the
+    completion's text would mean verify_claims never confirms the prefix the
+    reader actually sees."""
     checked_texts = []
 
     async def fake_verify_claims(content, hive_mcp_url, hive_mcp_tools=None):
@@ -245,7 +265,9 @@ async def test_z31_shape_end_to_end_completion_reaches_verify_claims_before_dedu
 
     import unittest.mock as mock
     with mock.patch.object(team, "_verify_claims", fake_verify_claims):
-        # NEW behavior: completion runs first, verify_claims only sees the finished text.
+        # NEW behavior: completion runs first, verify_claims sees the combined
+        # (original + completion) text exactly once, never the bare mid-truncation
+        # artifact on its own.
         fake_team = _FakeTeam(SimpleNamespace(
             content=completed_text, messages=[_tool_msg("get_file_content", "x")]))
         fake_team._repetition_truncated = True
@@ -253,9 +275,11 @@ async def test_z31_shape_end_to_end_completion_reaches_verify_claims_before_dedu
         out = await team._verified_answer(
             truncated_text, "audit the vouchers module", fake_team, "http://fake/mcp")
 
-    assert out == completed_text
-    assert checked_texts == [completed_text]  # verify_claims never saw the truncated text
-    assert truncated_text not in checked_texts
+    assert truncated_text in out  # original draft preserved in the final answer
+    assert completed_text in out  # completion's own conclusion present too
+    assert len(checked_texts) == 1  # verify_claims ran exactly once, on the combined text
+    assert checked_texts[0] == out
+    assert checked_texts[0] != truncated_text  # never the bare mid-truncation artifact alone
 
     # OLD behavior (no completion guard engaged, e.g. a normal completed answer):
     # verify_claims examines exactly what was handed to it, unchanged.

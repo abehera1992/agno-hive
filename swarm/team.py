@@ -6857,14 +6857,35 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
               "the truncated draft — keeping the draft, disclosed as incomplete",
               flush=True)
         return content + _TRUNCATED_ANSWER_NOTE, result
+    # PHASE N / TRACK A (2026-10-03): the prompt above tells the model it is
+    # CONTINUING `content`, not replacing it ("pick up from where it left off...
+    # do NOT repeat any part of what is already written below") -- but until now,
+    # once `completed` cleared the grounding bar, it alone became the WHOLE
+    # returned answer, discarding `content` outright. Live-confirmed cost (T12):
+    # the original draft's own pre-repeat 8,784 chars (produced before the
+    # repeating segment began, and already kept internally by Z16 specifically so
+    # they would NOT be thrown away) were silently discarded this way -- the final
+    # answer named 0 of 16 routers and 0 of 31 models despite the member having
+    # found all of them, because whatever the original draft had already written
+    # about them never survived this return. Concatenating, rather than
+    # replacing, is the fix: `content` is real, already-produced text (Z16 only
+    # ever keeps the CONFIRMED-non-repeat prefix, never the repeating tail
+    # itself), so it is never correct to throw it away just because `completed`
+    # passed its own grounding check. The model was asked not to restate
+    # `content`, so the common case is a clean continuation; on the rarer case
+    # where it restates anyway (T12, T13a), the result carries some repeated
+    # text -- strictly preferable to the silent, total loss this replaces, and
+    # bounded to at most one such duplication per call (this function is
+    # one-shot, per _REPETITION_COMPLETION_FLAG above).
+    combined = f"{content.rstrip()}\n\n{completed.strip()}" if content.strip() else completed
     if nested_truncation:
         print("[team] repetition-truncation completion was itself cut short by a "
               "second repetition loop — adopting it but disclosing it as still "
               "incomplete rather than shipping it silently", flush=True)
-        return completed + _TRUNCATED_ANSWER_NOTE, adopted_result
-    print(f"[team] repetition-truncation completion adopted ({len(completed):,} chars)",
-          flush=True)
-    return completed, adopted_result
+        return combined + _TRUNCATED_ANSWER_NOTE, adopted_result
+    print(f"[team] repetition-truncation completion adopted ({len(completed):,} chars) "
+          f"— preserving {len(content):,} pre-repeat chars alongside it", flush=True)
+    return combined, adopted_result
 
 
 # ============================================================================
