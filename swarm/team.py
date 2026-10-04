@@ -16359,6 +16359,18 @@ def _build_structured_delegation_tool(original_function, team=None):
                     team, member_id, canonical_hash, objective,
                     evidence_required, completion_criteria)
 
+        # Phase T15 (2026-10-04): mark which member this delegation actually targets,
+        # in the SAME team_run_context dict _bounded_get_team_member_interactions_str
+        # will read from in a moment (stashed onto `team` by
+        # _patched_agno_get_delegate_task_function above). A broadcast has no single
+        # target -- cleared to None so the self-filter never fires for it, rather than
+        # leaving a stale single-member value from an earlier, unrelated delegation.
+        _trc_ref = getattr(team, "_t15_team_run_context", None) if team is not None else None
+        if isinstance(_trc_ref, dict):
+            _trc_ref["_t15_current_target_member_id"] = (
+                None if is_broadcast else _member_key(member_id)
+            )
+
         if is_broadcast:
             async for item in original_entrypoint(task=canonical_task):
                 yield item
@@ -16436,7 +16448,25 @@ def _patched_agno_get_delegate_task_function(team, *args, **kwargs):
     real tool first, always -- then, ONLY for this codebase's own Coordinator team,
     wraps it into the structured contract. Every other Team instance (any other agno
     user of this same installed package) gets agno's original, completely untouched.
+
+    Phase T15 (2026-10-04): also stashes the SAME `team_run_context` dict agno just
+    built for this call onto `team` itself, as `team._t15_team_run_context`. agno
+    creates this dict fresh as a local variable at the top of each Team._run/_arun
+    (confirmed via source read: `team_run_context: Dict[str, Any] = {}`, never stored
+    as a team attribute) and threads it by reference through every delegation this run
+    -- it is never recreated mid-run and never shared across separate runs, since a
+    fresh Team (and therefore a fresh call here) is built per top-level run (see
+    _build_team's own call site). Stashing the reference lets delegate_structured_task
+    (below), which has `team` in closure but not this dict, write into the exact same
+    object that _bounded_get_team_member_interactions_str will later read from -- see
+    that function's own docstring for why this round-trip is the root-cause fix.
     """
+    _trc = kwargs.get("team_run_context")
+    if isinstance(_trc, dict):
+        try:
+            team._t15_team_run_context = _trc
+        except Exception:  # noqa: BLE001 -- best-effort; a failure here must not break delegation
+            pass
     original_function = _ORIGINAL_AGNO_GET_DELEGATE_TASK_FUNCTION(team, *args, **kwargs)
     if isinstance(team, _StructuredDelegationTeam):
         return _build_structured_delegation_tool(original_function, team)
@@ -16519,14 +16549,62 @@ def _bounded_get_team_member_interactions_str(team_run_context, max_interactions
     site never passes one, so this only matters for a future agno version
     that might) only to the extent of taking whichever bound is SMALLER --
     never widening what a future caller explicitly asked to narrow further.
+
+    Phase T15 (2026-10-04) -- ROOT-CAUSE FIX, not an addition to C.3's bound.
+    agno's own docstring for this string says "interactions with OTHER team
+    members", but the original implementation never actually excludes the
+    CURRENT delegation's own target: `member_responses` is forwarded unfiltered
+    by role. When a delegation targets the SAME member_id as an earlier, now-
+    completed delegation this run, that member's OWN prior task+response is
+    included in the "other members" block handed to it as part of its new
+    task text (via format_member_agent_task, independent of
+    add_history_to_context, independent of session_state, independent of the
+    canonical task builder -- confirmed by direct source read of
+    agno/team/_default_tools.py and agno/utils/team.py; none of those three
+    gates this). Live-traced consequence (T11 revalidation, 2026-10-04,
+    18:32:53-18:36:24): a delegation to Researcher regenerated, verbatim and
+    with zero intervening tool call, Researcher's own output from two earlier,
+    unrelated delegations -- tripping the repetition detector and, separately,
+    losing a successful file read's citation (forcing a later redundant
+    verify_claims reread).
+
+    Fix: before applying C.3's count bound, drop any interaction whose
+    member_name matches the CURRENT delegation's target (team_run_context['
+    _t15_current_target_member_id'], set by delegate_structured_task just
+    before dispatch -- see that function's own comment). Cross-ROLE sharing
+    (e.g. Coder seeing Researcher's finished result) is completely unaffected:
+    only a role seeing ITS OWN earlier, unrelated output is removed. A
+    broadcast delegation (no single target) clears the marker to None, so
+    nothing is filtered for it -- unchanged from C.3's original behavior.
     """
-    total_available = len((team_run_context or {}).get("member_responses") or [])
+    _current_target = (team_run_context or {}).get("_t15_current_target_member_id")
+    _all_responses = (team_run_context or {}).get("member_responses") or []
+    if _current_target:
+        _self_filtered_responses = [
+            r for r in _all_responses
+            if _member_key(str(r.get("member_name", ""))) != _current_target
+        ]
+    else:
+        _self_filtered_responses = _all_responses
+    _self_excluded_count = len(_all_responses) - len(_self_filtered_responses)
+    if _self_filtered_responses is _all_responses:
+        _filtered_team_run_context = team_run_context
+    else:
+        _filtered_team_run_context = dict(team_run_context or {})
+        _filtered_team_run_context["member_responses"] = _self_filtered_responses
+
+    total_available = len(_self_filtered_responses)
     effective_bound = (_MAX_FORWARDED_MEMBER_INTERACTIONS if max_interactions is None
                         else min(max_interactions, _MAX_FORWARDED_MEMBER_INTERACTIONS))
     result = _ORIGINAL_AGNO_GET_TEAM_MEMBER_INTERACTIONS_STR(
-        team_run_context=team_run_context, max_interactions=effective_bound)
+        team_run_context=_filtered_team_run_context, max_interactions=effective_bound)
+    if _self_excluded_count:
+        print(f"[team] T15_SELF_INTERACTION_FILTERED: target={_current_target!r} "
+              f"excluded {_self_excluded_count} of {len(_all_responses)} prior "
+              f"interaction(s) belonging to the same role before forwarding, "
+              f"{total_available} remain eligible", flush=True)
     try:
-        responses = (team_run_context or {}).get("member_responses") or []
+        responses = _self_filtered_responses
         forwarded = responses[-effective_bound:] if effective_bound else []
         total_serialized = len(result) if isinstance(result, str) else 0
         detail = []
