@@ -252,6 +252,19 @@ def _near_miss_hint(rel: str) -> str:
     A bare "does not exist" restates what the model already believed was false.
     "no 'routers' in API/inventory-service/ -- did you mean router?" is actionable,
     and this whole check exists because of that one-character plural.
+
+    Phase T3/T11 (2026-10-04): a second, separate mistake shape fuzzy sibling
+    matching can never catch -- the cited filename is exactly right, but an entire
+    intermediate directory level is missing (`API/storage-service/admin_api.py` cited
+    for the real `API/storage-service/router/admin_api.py`). "admin_api.py" and
+    "router" share no textual similarity, so this check's own sibling-fuzzy-match
+    found nothing and the caller fell back to an unrelated suggestion (main.py,
+    the nearest sibling BY STRING SHAPE alone). Tried only for the FINAL segment --
+    a file reference, never a directory-name typo, which the sibling check above
+    already owns -- and only when exactly one match exists elsewhere in the project,
+    the same one-candidate-only conservatism get_file_content's own _find_by_basename
+    fallback already uses for this identical shape of mistake (context.py); reused
+    here rather than re-implemented.
     """
     try:
         parts = [s for s in rel.strip("/").split("/") if s]
@@ -264,6 +277,21 @@ def _near_miss_hint(rel: str) -> str:
                 continue
             if not cursor.is_dir():
                 return ""
+            # Tried FIRST, final segment only: an exact basename match found
+            # elsewhere in the project is strictly stronger evidence than a fuzzy
+            # STRING guess among this directory's siblings -- a sibling fuzzy-match
+            # has no idea whether the file it names is even related, it only knows
+            # it looks similarly spelled (which is exactly how "admin_api.py" lost
+            # to the unrelated "main.py" before this existed). A directory-name
+            # typo (the non-final-segment case below, unchanged) has no basename to
+            # look up, so this never fires for that shape.
+            if part == parts[-1]:
+                from .context import _find_by_basename
+                matches = _find_by_basename(part, max_results=2)
+                if len(matches) == 1:
+                    shown = "/".join(walked) or "."
+                    return (f"  -- '{part}' is not directly in {shown}/; "
+                            f"the real path is {matches[0]}")
             siblings = [c.name for c in cursor.iterdir() if not c.name.startswith(".")]
             close = difflib.get_close_matches(part, siblings, n=2, cutoff=0.6)
             if not close:
