@@ -15389,7 +15389,17 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
         # pops the member's accumulated stream chunks. log[-1] is the SAME dict
         # object this appended; mutating it through the pending reference below
         # updates this exact entry, not a copy, and needs no scan of `log`.
-        if function_name in ("delegate_task_to_member", "delegate_structured_task"):
+        #
+        # Phase P.2.1 (2026-10-04) fix: `team` is this hook's own documented optional
+        # parameter (default None, same signature as run_context) -- the duplicate-
+        # detection decision above never dereferences it, only this bridge does, so a
+        # missing team is a safe no-op here, not a crash: there is no team object to
+        # attach the materialization-time bridge to, so this one entry simply does not
+        # get the Phase P.2 cross-call tagging enhancement. Confirmed live: every call
+        # in this file's own test module that omits `team=` (the vast majority, since
+        # the hook never needed one before this bridge existed) hit AttributeError
+        # unconditionally on the bare `team._pending_log_entry_by_member = {}` below.
+        if team is not None and function_name in ("delegate_task_to_member", "delegate_structured_task"):
             _dispatch_member_id = _member_key(
                 str((args or {}).get("member_id", "")).strip())
             if not isinstance(getattr(team, "_pending_log_entry_by_member", None), dict):

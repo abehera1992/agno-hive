@@ -531,6 +531,67 @@ async def test_missing_run_context_does_not_crash_and_never_blocks():
     assert result.startswith("delegated:")
 
 
+async def test_missing_team_does_not_crash_the_pending_log_entry_bridge():
+    """Phase P.2.1 fix: `team` is this hook's own optional parameter (default
+    None, same as run_context) -- team=None must be a safe no-op for the
+    materialization-time bridge Phase P.2 added, not a crash. Exercises the
+    exact call shape (team omitted entirely, defaulting to None) that every
+    pre-P.2.1 test in this module hit unconditionally."""
+    hook = _make_duplicate_delegation_gate_hook()
+
+    result = await hook(
+        "delegate_task_to_member", _fake_delegate,
+        {"member_id": "Researcher", "task": "Read x.md"},
+        run_context=None,
+    )
+
+    assert result.startswith("delegated:")  # not blocked solely for lacking team
+
+
+async def test_missing_team_also_safe_for_delegate_structured_task():
+    """Same guarantee, the other delegation tool shape."""
+    hook = _make_duplicate_delegation_gate_hook()
+
+    result = await hook(
+        "delegate_structured_task", _fake_delegate,
+        _structured_args(target="x.py", objective="read it"),
+        run_context=None,
+    )
+
+    assert result.startswith("delegated:")
+
+
+async def test_valid_team_still_gets_the_pending_log_entry_bridge():
+    """Case C/the inverse guarantee: when team DOES exist, Phase P.2's own
+    cross-call evidence-tagging bridge must still populate exactly as
+    before -- the team=None guard must not also skip this for a real team."""
+    hook = _make_duplicate_delegation_gate_hook()
+    team = SimpleNamespace(_member_results={})
+    args = {"member_id": "Researcher", "task": "Read x.md"}
+
+    await hook("delegate_task_to_member", _fake_delegate, args, run_context=None, team=team)
+
+    pending = getattr(team, "_pending_log_entry_by_member", None)
+    assert isinstance(pending, dict)
+    assert "researcher" in pending
+
+
+async def test_valid_duplicate_blocking_is_unaffected_by_the_team_none_guard():
+    """Case D/regression guard: the duplicate-blocking decision itself never
+    depended on `team` before Phase P.2, and the P.2.1 fix only wraps the
+    NEW bridge code -- a genuine duplicate with valid team context must
+    still be blocked exactly as it was before this fix."""
+    hook = _make_duplicate_delegation_gate_hook()
+    team = SimpleNamespace(_member_results={"researcher": "PRIOR RESULT"})
+    args = {"member_id": "Researcher", "task": "dup task"}
+
+    first = await hook("delegate_task_to_member", _fake_delegate, args, run_context=None, team=team)
+    second = await hook("delegate_task_to_member", _fake_delegate, args, run_context=None, team=team)
+
+    assert first.startswith("delegated:")
+    assert second.startswith("ALREADY DONE")
+
+
 async def test_empty_task_text_is_never_blocked():
     hook = _make_duplicate_delegation_gate_hook()
     args = {"member_id": "Researcher", "task": ""}
