@@ -16881,6 +16881,11 @@ def _build_team(
     team._member_results = member_answers
     team._forwarded_members = forwarded_members
     team._required_tool_states = _required_tool_states
+    # Phase O.1 fix (2026-10-04, live NameError on first smoke test): _finalise_
+    # member_chunks is a module-level function, not a closure inside _build_team
+    # -- it never had `team_name` in scope. Attached here, same pattern as every
+    # other run-scoped attribute above, purely for Case D's log message.
+    team._policy_team_name = team_name
     team._read_state = read_cache_hook.state
     # Generalized evidence ledger (C.4, 2026-10-03) -- wired here, BEFORE any
     # tool call or synthesis call can run, the same timing guarantee
@@ -17071,7 +17076,8 @@ def _finalise_member_chunks(team, agent_name: str) -> None:
                   f"member={key!r} result captured | previous_tool_choice="
                   f"{team.tool_choice!r}", flush=True)
             if _arm_required_tool_if_available(
-                    team, _tool_name, _coord_state, role="Coordinator", team_name=team_name or ""):
+                    team, _tool_name, _coord_state, role="Coordinator",
+                    team_name=getattr(team, "_policy_team_name", "") or ""):
                 _coord_state.setdefault("fired_for", set()).add(_tool_name)
             else:
                 # Case D: fail closed -- mark it "handled" anyway so this same
