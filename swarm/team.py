@@ -17471,6 +17471,56 @@ def _normalize_for_repetition_check(text: str) -> str:
     return " ".join(w for w in words if w.lower() not in _REPETITION_FILLER_WORDS)
 
 
+_IDENTIFIER_SHAPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_IDENTIFIER_MIN_LEN = 4
+# Phase T16 (2026-10-04): live-reproduced false positive, T3 post-T15, modules_api.py
+# -- two DIFFERENT route handlers (one querying TenantSubscription, one querying
+# TenantModule) share an identical FastAPI Depends()-chain opening
+# ("current_user: TokenUser = Depends(get_current_seller), db: AsyncSession =
+# Depends(get_async_db),): result = await db.execute( select(") that alone exceeds
+# _REPETITION_PREFIX_CHARS (100) -- confirmed by direct normalization, the two
+# routes' first 100 normalized chars are byte-identical, and the differing entity
+# name (TenantSubscription / TenantModule) falls entirely past that cutoff.
+# _looks_like_repetition_loop's tier-3/4 prefix checks therefore flag the SECOND
+# route as "repeating" the first, even though it introduces a brand new model/
+# symbol and represents genuine progress, not a no-progress loop.
+#
+# Tiers 1/2 (full exact / filler-stripped containment, above) are NEVER touched
+# by this: if the WHOLE segment matches, by construction no identifier in it can
+# be absent from the matched prior text either, so there is nothing for this check
+# to add there -- it only matters once the match has shrunk to a shared OPENING
+# with content on either side that tiers 1/2 never looked at. Deliberately
+# tokenizes by plain whitespace-split (the same convention _looks_like_repetition_
+# decay already uses, not a new one) and requires CamelCase or snake_case shape
+# specifically (route/model/function/class/file-like names, per the mission's own
+# preferred-signal list) -- a lowercase English word recurring is not treated as
+# "new" by this check, so ordinary prose rewording still falls through to tiers
+# 1/2 and the decay detector exactly as before.
+def _segment_introduces_new_identifier(new_segment: str, prior_window: str) -> bool:
+    """True if `new_segment` contains an identifier-shaped token (CamelCase or
+    snake_case, >= 4 chars -- a route, model, class, function, or file-like name)
+    that does not appear anywhere in `prior_window`. Used only to veto a tier-3/4
+    PREFIX-only repetition match: a shared opening followed by a genuinely new
+    symbol is progress, not a repeat, regardless of how the rest of the segment
+    is phrased."""
+    def _identifiers(text: str) -> set[str]:
+        # findall, not whitespace-split + strip: a token like "select(TenantModule)"
+        # has no internal space, so split() leaves "(" glued to "TenantModule" with
+        # nothing in strip()'s char set able to separate them (the "(" sits between
+        # two identifier characters, not at a token boundary) -- findall extracts
+        # the identifier-shaped run directly, regardless of what punctuation
+        # surrounds it.
+        return {
+            tok for tok in _IDENTIFIER_SHAPE_RE.findall(text)
+            if len(tok) >= _IDENTIFIER_MIN_LEN and (not tok.islower() or "_" in tok)
+        }
+
+    new_ids = _identifiers(new_segment)
+    if not new_ids:
+        return False
+    return bool(new_ids - _identifiers(prior_window))
+
+
 def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:
     """True if `new_segment` (freshly generated text, appended to the accumulated
     answer) is essentially a repeat of something generated recently, rather than
@@ -17554,7 +17604,13 @@ def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:
     if len(prefix) < _REPETITION_MIN_SEGMENT_LEN:
         return False
     if prefix in filler_stripped_prior:
-        return True
+        # Phase T16: a shared OPENING is not, by itself, proof of no progress --
+        # only tiers 1/2 (the whole segment matching) are. If the segment past
+        # this shared prefix names a new route/model/class/function/file, this
+        # is the structural-repetition-with-progress shape (see
+        # _segment_introduces_new_identifier's own docstring), not a loop.
+        if not _segment_introduces_new_identifier(new_segment, prior_content[-_REPETITION_LOOKBACK_CHARS:]):
+            return True
 
     # Tier 4 (Phase 5): same prefix, same floor, checked against the WHOLE
     # prior content rather than only its tail -- catches a large-block repeat
@@ -17563,7 +17619,12 @@ def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:
     # single far-apart reuse (the existing, deliberately-permitted case) is
     # still not flagged -- only sustained, repeated recurrence is.
     full_filler_stripped_prior = _normalize_for_repetition_check(prior_content)
-    return full_filler_stripped_prior.count(prefix) >= 2
+    if full_filler_stripped_prior.count(prefix) >= 2:
+        # Phase T16: same veto as tier 3, same reason -- a third (or later)
+        # occurrence of a shared opening still is not a loop if THIS occurrence
+        # introduces a symbol none of the earlier ones had.
+        return not _segment_introduces_new_identifier(new_segment, prior_content)
+    return False
 
 
 _REPETITION_DECAY_WINDOW_CHARS = 1500
