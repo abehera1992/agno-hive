@@ -17489,20 +17489,44 @@ _IDENTIFIER_MIN_LEN = 4
 # by this: if the WHOLE segment matches, by construction no identifier in it can
 # be absent from the matched prior text either, so there is nothing for this check
 # to add there -- it only matters once the match has shrunk to a shared OPENING
-# with content on either side that tiers 1/2 never looked at. Deliberately
-# tokenizes by plain whitespace-split (the same convention _looks_like_repetition_
-# decay already uses, not a new one) and requires CamelCase or snake_case shape
-# specifically (route/model/function/class/file-like names, per the mission's own
-# preferred-signal list) -- a lowercase English word recurring is not treated as
-# "new" by this check, so ordinary prose rewording still falls through to tiers
-# 1/2 and the decay detector exactly as before.
-def _segment_introduces_new_identifier(new_segment: str, prior_window: str) -> bool:
-    """True if `new_segment` contains an identifier-shaped token (CamelCase or
-    snake_case, >= 4 chars -- a route, model, class, function, or file-like name)
-    that does not appear anywhere in `prior_window`. Used only to veto a tier-3/4
-    PREFIX-only repetition match: a shared opening followed by a genuinely new
-    symbol is progress, not a repeat, regardless of how the rest of the segment
-    is phrased."""
+# with content on either side that tiers 1/2 never looked at. Requires true
+# CamelCase (an uppercase letter somewhere AFTER the first character) or
+# snake_case specifically -- NOT "starts with an uppercase letter", which also
+# matches an ordinary sentence-initial English word ("Mark", "Get") and defeated
+# an earlier version of this check live: the T3 rerun after the first T16
+# deploy still escalated on business_admin_api.py's bank-verification route,
+# because the narrow ~150-250-char window actually re-checked each 10s tick
+# contained only the shared Depends() boilerplate plus the docstring "Mark a
+# seller's bank details..." -- "Mark" alone was (wrongly) enough to pass the
+# original, too-permissive shape test and veto the match even though it carries
+# no real symbol information, while the genuinely new route name
+# (admin_verify_bank) had already streamed in and been counted in the PRECEDING
+# 10s window, not this one.
+#
+# RECENT_SPAN (below) exists for that exact reason: comparing only THIS
+# narrow tick's own text against everything prior is too tight a window --
+# the differentiating identifier for the route this tick belongs to may have
+# already streamed in on the immediately preceding tick. Widening the "new"
+# side to the prior content's own last RECENT_SPAN chars plus this tick's
+# text, compared against everything OLDER than that, catches a differentiator
+# landing one tick early or late without having to track tick boundaries
+# explicitly.
+_RECENT_IDENTIFIER_SPAN_CHARS = 500
+# Comfortably wider than one ~150-250-char 10s-tick window (the observed live
+# range at typical ~20 tok/s generation), so a differentiator that streamed in
+# either one tick early or one tick late is still inside the "recent" side of
+# the split, without being so wide it starts reaching back into an actually
+# different, earlier route's identifiers and treating those as "recent" too.
+
+
+def _segment_introduces_new_identifier(new_segment: str, prior_content: str) -> bool:
+    """True if the RECENT span (the end of `prior_content` plus `new_segment`)
+    contains an identifier-shaped token (true CamelCase or snake_case, >= 4
+    chars -- a route, model, class, function, or file-like name) that does not
+    appear anywhere OLDER than that span. Used only to veto a tier-3/4
+    PREFIX-only repetition match: a shared opening whose surrounding recent
+    text names a genuinely new symbol is progress, not a repeat, regardless of
+    exactly which 10s tick that symbol happened to stream in on."""
     def _identifiers(text: str) -> set[str]:
         # findall, not whitespace-split + strip: a token like "select(TenantModule)"
         # has no internal space, so split() leaves "(" glued to "TenantModule" with
@@ -17512,13 +17536,23 @@ def _segment_introduces_new_identifier(new_segment: str, prior_window: str) -> b
         # surrounds it.
         return {
             tok for tok in _IDENTIFIER_SHAPE_RE.findall(text)
-            if len(tok) >= _IDENTIFIER_MIN_LEN and (not tok.islower() or "_" in tok)
+            if len(tok) >= _IDENTIFIER_MIN_LEN
+            and ("_" in tok or any(c.isupper() for c in tok[1:]))
         }
 
-    new_ids = _identifiers(new_segment)
+    # prior_content shorter than the span has no "older" to meaningfully split
+    # off -- falling through to an empty older side would make every identifier
+    # in new_segment trivially "new" (nothing to subtract against) even when it
+    # is a plain repeat of content already in prior_content. Compare against
+    # the whole thing instead in that case.
+    if len(prior_content) <= _RECENT_IDENTIFIER_SPAN_CHARS:
+        return bool(_identifiers(new_segment) - _identifiers(prior_content))
+    recent = prior_content[-_RECENT_IDENTIFIER_SPAN_CHARS:] + new_segment
+    older = prior_content[:-_RECENT_IDENTIFIER_SPAN_CHARS]
+    new_ids = _identifiers(recent)
     if not new_ids:
         return False
-    return bool(new_ids - _identifiers(prior_window))
+    return bool(new_ids - _identifiers(older))
 
 
 def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:

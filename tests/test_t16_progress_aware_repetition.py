@@ -154,9 +154,27 @@ class TestT16_6SameFileSymbolClaimRepeatedWithoutNewEvidence:
         entity, just a trailing comment added) -- the identifier veto must not
         swallow this: there is no NEW identifier to excuse it (TenantSubscription
         already appeared), so it still falls through to tier 3's plain prefix
-        match exactly as before this phase's change."""
+        match exactly as before this phase's change.
+
+        Prior content is padded to realistic transcript scale (several
+        hundred chars beyond _RECENT_IDENTIFIER_SPAN_CHARS) -- at toy scale
+        (two ~250-char routes, ~500 chars total) the recent/older split's
+        "older" side can truncate mid-token and make everything in "recent"
+        spuriously look new; real transcripts are thousands of chars by the
+        time this check matters (the live incident escalated at 17,328
+        chars), so the test fixture should be too, not a smaller toy that
+        exercises a boundary production never actually hits."""
+        # The OTHER routes come first, well clear of _RECENT_IDENTIFIER_SPAN_CHARS
+        # from the tail, and the TenantSubscription route is repeated several
+        # times at the end -- otherwise a different route's unique identifier
+        # can fall inside the "recent" window purely by char-distance proximity
+        # and be mistaken for something new_segment itself introduced.
+        prior = (
+            ROUTE_MODULE + ROUTE_DEACTIVATION
+            + ROUTE_SUBSCRIPTION + ROUTE_SUBSCRIPTION + ROUTE_SUBSCRIPTION
+        )
         assert _looks_like_repetition_loop(
-            SAME_ROUTE_REWORDED_NO_NEW_EVIDENCE, ROUTE_SUBSCRIPTION + ROUTE_SUBSCRIPTION
+            SAME_ROUTE_REWORDED_NO_NEW_EVIDENCE, prior
         ) is True
 
 
@@ -220,6 +238,37 @@ class TestT16_10NormalLongStreamNoUnnecessaryRecovery:
 # docstring and the Phase T16 final report) and is pinned here as a literal
 # expected value so a future revert is caught by this same test.
 # ---------------------------------------------------------------------------
+
+class TestT16KnownResidualLimitation:
+    """Documented, not silently swept under the rug: _RECENT_IDENTIFIER_SPAN_CHARS
+    widens the veto's "new" side to catch a differentiator landing one tick
+    early or late -- but that same width means an identifier from a genuinely
+    DIFFERENT, recently-introduced route can still be sitting inside the
+    "recent" slice when an OLDER route gets restated verbatim right after it,
+    letting that unrelated nearby identifier excuse a real non-progress
+    restatement for one tick. Self-healing: as generation continues, that
+    identifier ages out of the sliding recent window, so a SUSTAINED restatement
+    of the older route is still caught shortly after. Only reachable through
+    tier 3/4 (prefix-only matches); tiers 1/2 are never affected."""
+
+    def test_old_route_restated_right_after_a_new_one_can_borrow_its_identifier_once(self):
+        prior = ROUTE_DEACTIVATION + ROUTE_SUBSCRIPTION
+        # Documents the known gap -- not the desired behavior, the ACTUAL one.
+        assert _looks_like_repetition_loop(
+            SAME_ROUTE_REWORDED_NO_NEW_EVIDENCE, prior
+        ) is False
+
+    def test_same_restatement_sustained_past_the_recent_window_is_still_caught(self):
+        prior = (
+            ROUTE_DEACTIVATION
+            + ROUTE_SUBSCRIPTION * 1
+            + "x" * 600  # ages ModuleDeactivationRequest out of the recent window
+            + ROUTE_SUBSCRIPTION
+        )
+        assert _looks_like_repetition_loop(
+            SAME_ROUTE_REWORDED_NO_NEW_EVIDENCE, prior
+        ) is True
+
 
 class TestT16CounterfactualMatrix:
     def test_structural_repetition_old_false_positive_new_no_escalation(self):
