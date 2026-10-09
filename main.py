@@ -198,6 +198,43 @@ def _run_worker_main() -> None:
     print(json.dumps(result), flush=True)
 
 
+def _json_safe_stream_chunk(chunk):
+    """Phase T17.1 (2026-10-08). `run_task_stream` yields exactly what
+    `swarm.team._stream_event_to_chunk` returns -- a str, or a dict tool-event
+    sentinel. That dict's DOCUMENTED shape (its own docstring) is JSON-safe,
+    but two fields added later for the thin-answer guard (commit 524f261,
+    2026-09-01) are not: `result_tokens` is a `frozenset[str]`
+    (team.py's `_salient_tokens`) and `names` is a plain `set[str]`
+    (`_filenames_in`) -- both legitimate internal state for team.py's own
+    same-process evidence-accumulation (e.g. `team._evidence_tokens |= toks`),
+    never meant to cross a process boundary.
+
+    Proven live: a hive CLI chat's first tool call with a string result (seen
+    with `lightrag_query`, but not specific to it -- `get_file_content`,
+    `search_files`, and every other string-returning tool build the identical
+    dict shape) crashed `json.dumps({"ok": True, "v": chunk})` below with
+    `TypeError: Object of type frozenset is not JSON serializable`, caught by
+    this function's own caller and surfaced to the CLI as a bare error instead
+    of the tool's real result. /run's worker (`_run_worker` above) never hit
+    this: it only ever prints the final accumulated string result, never the
+    raw per-chunk event dicts `_stream_event_to_chunk` produces.
+
+    Converts only what's actually unsafe (any set/frozenset VALUE in a flat
+    dict, generically -- not every set/frozenset in the codebase, and not a
+    registered global JSONEncoder) into a sorted list, so the ordering is at
+    least deterministic across runs. A str chunk passes through unchanged.
+    Only one level deep: every chunk shape `_stream_event_to_chunk` documents
+    is flat (no dict/list values that themselves nest a set), confirmed by
+    reading its full "start"/"end"/"__member_result__" construction directly.
+    """
+    if not isinstance(chunk, dict):
+        return chunk
+    return {
+        k: sorted(v) if isinstance(v, (set, frozenset)) else v
+        for k, v in chunk.items()
+    }
+
+
 async def _run_stream_worker(real_stdout) -> None:
     """Worker-process entrypoint for /stream's process-boundary execution --
     the incremental counterpart to _run_worker() above (Phase 3, see DOCS.md
@@ -243,7 +280,8 @@ async def _run_stream_worker(real_stdout) -> None:
             read_only=payload.get("read_only", False),
             team_name=payload.get("team_name"),
         ):
-            print(json.dumps({"ok": True, "v": chunk}), file=real_stdout, flush=True)
+            print(json.dumps({"ok": True, "v": _json_safe_stream_chunk(chunk)}),
+                  file=real_stdout, flush=True)
     except Exception as exc:
         print(
             json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}),
