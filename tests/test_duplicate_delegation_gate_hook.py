@@ -817,3 +817,115 @@ async def test_structured_and_native_tool_names_do_not_cross_contaminate():
 
     assert native.startswith("delegated:")
     assert structured.startswith("delegated:")
+
+
+# ── Phase T17 (2026-10-08): a genuinely different entity on the same target ──────
+# Live incident, T4 (groundedness battery, deployed commit 0bfe332): target=
+# 'API/inventory-service/models.py' for "read the Party model's fields" and, right
+# after, "read the PartyRegistration model's fields" (two different models defined
+# in the same file). The second, legitimate question was served Party's answer as
+# "ALREADY DONE", then hard-blocked on a 3rd attempt -- the Coordinator's final
+# answer claimed "repeated delegation errors" prevented retrieving PartyRegistration's
+# fields that were, in fact, already sitting in the FIRST get_file_content read.
+# Root cause: this branch matched on `target` alone once two calls shared one,
+# with `objective` reduced to a cosmetic exact/reworded log label rather than part
+# of the match key -- see test_structured_same_target_reworded_objective_is_still_
+# a_duplicate just above for why a blanket "objective differs -> not a duplicate"
+# fix would be wrong instead: these tests require BOTH shapes to coexist correctly.
+
+async def test_structured_different_entity_same_target_is_not_a_duplicate():
+    hook = _make_duplicate_delegation_gate_hook()
+    team = SimpleNamespace(_member_results={"researcher": "Party has 13 fields: ..."})
+
+    first = await hook(
+        "delegate_structured_task", _fake_delegate,
+        _structured_args(target="API/inventory-service/models.py",
+                          objective="Read the Party model's fields."),
+        run_context=None, team=team,
+    )
+    second = await hook(
+        "delegate_structured_task", _fake_delegate,
+        _structured_args(target="API/inventory-service/models.py",
+                          objective="Read the PartyRegistration model's fields."),
+        run_context=None, team=team,
+    )
+
+    assert first.startswith("delegated:")
+    assert second.startswith("delegated:"), (
+        f"a genuinely different entity (PartyRegistration) on the same file must "
+        f"not be served Party's answer or blocked as a duplicate, got: {second!r}"
+    )
+
+
+async def test_structured_third_distinct_entity_same_target_also_goes_through():
+    """Not merely a two-call exception -- a third, different entity on the same
+    target must also go through, and must not count toward the 3-strike STOP
+    that a genuine repeat of ONE entity would trigger."""
+    hook = _make_duplicate_delegation_gate_hook()
+    team = SimpleNamespace(_member_results={"researcher": "prior"})
+
+    r1 = await hook("delegate_structured_task", _fake_delegate,
+                     _structured_args(target="models.py", objective="Read Party's fields."),
+                     run_context=None, team=team)
+    r2 = await hook("delegate_structured_task", _fake_delegate,
+                     _structured_args(target="models.py", objective="Read PartyRegistration's fields."),
+                     run_context=None, team=team)
+    r3 = await hook("delegate_structured_task", _fake_delegate,
+                     _structured_args(target="models.py", objective="Read BankDetails' fields."),
+                     run_context=None, team=team)
+
+    assert r1.startswith("delegated:")
+    assert r2.startswith("delegated:")
+    assert r3.startswith("delegated:")
+
+
+async def test_structured_same_entity_asked_twice_on_same_target_is_still_blocked():
+    """The fix must not become "any objective text difference escapes the gate" --
+    asking about Party TWICE (reworded, no new entity named either time) must still
+    be caught, exactly as test_structured_same_target_reworded_objective_is_still_
+    a_duplicate already requires for the generic (no-entity-name) case."""
+    hook = _make_duplicate_delegation_gate_hook()
+    team = SimpleNamespace(_member_results={"researcher": "Party has 13 fields"})
+
+    first = await hook(
+        "delegate_structured_task", _fake_delegate,
+        _structured_args(target="models.py", objective="Read the Party model's fields."),
+        run_context=None, team=team,
+    )
+    second = await hook(
+        "delegate_structured_task", _fake_delegate,
+        _structured_args(target="models.py",
+                          objective="What fields does the Party model actually have?"),
+        run_context=None, team=team,
+    )
+
+    assert first.startswith("delegated:")
+    assert second.startswith("ALREADY DONE"), (
+        f"re-asking about the SAME entity (Party), just reworded, must still be "
+        f"a duplicate, got: {second!r}"
+    )
+
+
+async def test_objective_names_new_entity_helper_directly():
+    from swarm.team import _objective_names_new_entity
+
+    # Case-sensitivity matters for CamelCase detection -- the gate's own call
+    # site deliberately passes the RAW, un-normalized objective text (see its
+    # comment), never _normalize_delegation_task's lowercased form, since
+    # that would destroy "PartyRegistration"'s internal uppercase 'R'.
+    assert _objective_names_new_entity(
+        "read the partyregistration model's fields",
+        "read the party model's fields",
+    ) is False, "an already-lowercased pair has no CamelCase shape left to find"
+    assert _objective_names_new_entity(
+        "Read the PartyRegistration model's fields.",
+        "Read the Party model's fields.",
+    ) is True
+    assert _objective_names_new_entity(
+        "enumerate every endpoint it exposes",
+        "list its endpoints",
+    ) is False
+    assert _objective_names_new_entity(
+        "Read the Party model's fields again, please.",
+        "Read the Party model's fields.",
+    ) is False

@@ -7359,6 +7359,51 @@ def _integrity_named_item_falsely_gapped(content: str, cmp_note: str) -> tuple[s
     return None
 
 
+def _integrity_completeness_claim_without_comparison(
+        content: str, task: str, cmp_note: str) -> tuple[str, str] | None:
+    """(claimed, real) when a two-sided reconciliation task's answer makes a
+    completeness/zero-gap claim and NO compare_enumerations call happened at
+    all this run -- i.e. there is no cmp_note to even check for contradiction.
+
+    Phase T17 (2026-10-08). `_integrity_comparison_zero_claim_contradiction`
+    (immediately below) and the summary/named-item checks above it all share
+    one precondition: a real cmp_note from a compare_enumerations call this
+    run. Every one of them returns None, silently, when there is no cmp_note
+    -- correct for "nothing to contradict the claim with" in isolation, but
+    that silence is exactly what let T13a's live failure through: the task
+    ("list its endpoints... and identify anything... with no frontend
+    counterpart") matches _TWO_SIDED_TASK_RE as a genuine reconciliation
+    question, the Researcher found all 9 backend endpoints but read the wrong
+    file for hooks (a UI page importing 2 of them, not the file that exports
+    all 5) and compare_enumerations was never invoked at all, and the final
+    answer still stated "All backend endpoints have corresponding frontend
+    hooks, so there are no backend endpoints without frontend counterparts"
+    -- a flat completeness claim backed by nothing. Every EXISTING contradiction
+    check stayed silent because each one needs a real comparison to contradict
+    the claim WITH, and none existed to check against.
+
+    This function catches the absence itself: a two-sided task, a completeness
+    claim, and no comparison evidence at all is not a verified "no gaps" --
+    it is an unperformed reconciliation wearing a confident sentence. Does not
+    attempt to guess the right file, force a retry count, or require a
+    specific number of items found -- it only requires that a "nothing is
+    missing" claim on a task that asked for reconciliation be backed by an
+    actual reconciliation, exactly the same evidentiary bar the sibling
+    checks already hold a CONTRADICTED claim to.
+    """
+    if not task or not _TWO_SIDED_TASK_RE.search(task):
+        return None
+    if _comparison_body(cmp_note):
+        return None  # a real comparison ran -- the sibling checks own this case
+    claims = _reconcile_completeness_claims(content)
+    if not claims:
+        return None
+    return (claims[0],
+            "no compare_enumerations call was made this run -- this task asked "
+            "for a two-sided reconciliation, and nothing was ever actually "
+            "compared, so completeness cannot be verified from this run's own evidence")
+
+
 def _integrity_comparison_zero_claim_contradiction(content: str, cmp_note: str) -> tuple[str, str] | None:
     """(claimed, real) when the answer asserts zero endpoints/hooks/matches
     while compare_enumerations' own TOTALS line, from the SAME tool call this
@@ -7463,6 +7508,18 @@ async def _evidence_integrity_findings(
     zero = _integrity_comparison_zero_claim_contradiction(content, cmp_note)
     if zero:
         claimed, real = zero
+        findings.append({"category": "comparison completeness/gap",
+                          "claimed": claimed, "real": real})
+    # 3d. The absence variant of 3b/3c (Phase T17, 2026-10-08): a completeness
+    # claim on a two-sided task with NO compare_enumerations call at all this
+    # run -- see _integrity_completeness_claim_without_comparison's own
+    # docstring for the live T13a incident this closes. Checked last among the
+    # comparison-category checks since 3/3b/3c all require a real cmp_note and
+    # this one requires its absence -- mutually exclusive by construction, so
+    # ordering is cosmetic, not load-bearing.
+    missing_cmp = _integrity_completeness_claim_without_comparison(content, task, cmp_note)
+    if missing_cmp:
+        claimed, real = missing_cmp
         findings.append({"category": "comparison completeness/gap",
                           "claimed": claimed, "real": real})
 
@@ -14510,6 +14567,37 @@ def _read_tracking_active(team) -> bool:
     return isinstance(getattr(team, "_read_state", None), dict)
 
 
+def _objective_names_new_entity(objective_norm: str, prior_objective_norm: str) -> bool:
+    """True if `objective_norm` contains an identifier-shaped token (true
+    CamelCase or snake_case, >= 4 chars -- a model/class/function/field name)
+    that `prior_objective_norm` does not. Used by the duplicate-delegation
+    gate's delegate_structured_task branch (Phase T17, 2026-10-08) to tell
+    "same question, reworded" (no new identifier -- still a duplicate, e.g.
+    'list its endpoints' vs 'enumerate every endpoint it exposes') apart from
+    "genuinely different question about the same target" (introduces a real
+    symbol the prior objective never named, e.g. 'Party' vs
+    'PartyRegistration' -- not a duplicate, regardless of how similar the
+    surrounding English reads). Reuses the identical identifier-shape test
+    Phase T16 already applies to repetition detection, same reasoning: a
+    shared surface that introduces a real new symbol is not a repeat.
+
+    Order matters -- only checks for a symbol NEW to this objective, not the
+    reverse, so a narrower follow-up ("now just the email field on Party")
+    naming no new symbol at all is still correctly treated as the same
+    target+question and stays a duplicate.
+    """
+    def _identifiers(text: str) -> set[str]:
+        return {
+            tok for tok in _IDENTIFIER_SHAPE_RE.findall(text)
+            if len(tok) >= _IDENTIFIER_MIN_LEN
+            and ("_" in tok or any(c.isupper() for c in tok[1:]))
+        }
+    new_ids = _identifiers(objective_norm)
+    if not new_ids:
+        return False
+    return bool(new_ids - _identifiers(prior_objective_norm))
+
+
 def _make_duplicate_delegation_gate_hook(read_only: bool = False):
     """Mechanical backstop for _COORDINATOR_INSTRUCTIONS' own prose-only rule
     ("Before delegate_task_to_member(s): check whether an equivalent delegation is
@@ -15147,14 +15235,22 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
             #
             # Preserves the two-tier INTENT of the delegate_task_to_member branch
             # above: an exact repeat (same target AND same objective, reworded or
-            # not) and a same-target-different-wording repeat are both treated as
-            # duplicates and share the same `repeats` counter and 3-strike
-            # escalation -- "a coordinator alternating between the two forms is
-            # asking the same question twice and must not get two budgets" applies
-            # here exactly as it did before. Comparing `target` directly (rather
-            # than a target parsed from a manually-typed tag the model could
-            # forget or mis-type) is strictly more reliable than the mechanism it
-            # replaces, not a redesign of what counts as a duplicate.
+            # not -- `_normalize_delegation_task` absorbs the reworded case) is a
+            # duplicate; a genuinely different objective against the same target
+            # is NOT (Phase T17 correction, 2026-10-08 -- see the `continue` just
+            # below this block's own comment for the live incident this restores:
+            # an EARLIER version of this migration matched on `target` alone once
+            # two calls shared one, demoting `objective` to a cosmetic exact/
+            # reworded log label rather than part of the match key itself, which
+            # let a different, legitimate question about the same file get
+            # silently served the wrong prior answer and then hard-blocked).
+            # "a coordinator alternating between [exact and reworded] forms is
+            # asking the same question twice and must not get two budgets" still
+            # applies exactly as before -- only to the SAME objective, not any
+            # objective sharing a target. Comparing `target`/`objective` directly
+            # (rather than parsing them from a manually-typed tag the model could
+            # forget or mis-type) remains strictly more reliable than the
+            # audit-tag mechanism it replaced.
             #
             # NOT ported in this phase (Z29 is a targeted migration repair, not a
             # feature-parity rewrite): the Phase-I corrective-read-evidence
@@ -15176,6 +15272,44 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                     continue
                 prior_objective = _normalize_delegation_task(prior_args.get("objective"))
                 same_wording = prior_objective == objective_norm
+                # Phase T17 (2026-10-08): `target` matching ALONE, with `objective`
+                # consulted only for the "(exact)"/"(reworded)" log label below, let
+                # a genuinely different question about the SAME file get served the
+                # wrong prior answer and hard-blocked. Live-reproduced, T4: target=
+                # 'API/inventory-service/models.py' for BOTH "read the Party model's
+                # fields" and "read the PartyRegistration model's fields" (two
+                # different models defined in the same file) -- the second,
+                # legitimate delegation was served Party's answer as "ALREADY DONE",
+                # then blocked outright on a 3rd attempt, and the Coordinator's final
+                # answer claimed "repeated delegation errors" prevented retrieving
+                # PartyRegistration's fields that were, in fact, already sitting in
+                # the FIRST get_file_content read (confirmed: that read's own
+                # result_tokens contained 'partyregistration', 'registration_id',
+                # etc.) -- just never asked about, because this gate silently treated
+                # the second question as a repeat of the first and never let it
+                # through to a member who already held the answer.
+                #
+                # NOT fixed by gating on `same_wording` alone: an EXISTING, intentional
+                # test (test_structured_same_target_reworded_objective_is_still_a_
+                # duplicate) requires "list its endpoints" and "enumerate every
+                # endpoint it exposes" -- two plain rewordings of the identical
+                # question -- to STILL be treated as a duplicate, and that must keep
+                # working. The real discriminator is not "worded differently", it is
+                # "names a different ENTITY": T4's two objectives differ by a genuine
+                # CamelCase symbol (Party vs PartyRegistration); the rewording example
+                # differs only in ordinary English phrasing, naming no symbol at all.
+                # Reuses the identical identifier-shape test Phase T16 already applies
+                # to repetition detection for exactly this reason -- a shared surface
+                # that introduces a real new symbol is not a repeat, there as here.
+                # Raw (un-normalized) text, deliberately NOT objective_norm/
+                # prior_objective: _normalize_delegation_task lowercases (see its
+                # own docstring), which would destroy the CamelCase shape
+                # _objective_names_new_entity needs to see ("PartyRegistration" ->
+                # "partyregistration" has no internal uppercase letter left to find).
+                if not same_wording and _objective_names_new_entity(
+                        str((args or {}).get("objective") or ""),
+                        str(prior_args.get("objective") or "")):
+                    continue
                 repeats[member_id] = repeats.get(member_id, 0) + 1
                 n = repeats[member_id]
                 # Phase P.2: entry is already matched on target_norm above (line
@@ -19887,7 +20021,17 @@ def _completeness_claims(content: str) -> list[str]:
 _RECONCILE_EXTRA_COMPLETENESS_RE = re.compile(
     r"\bno\s+(?:missing|mismatched)(?:\s+or\s+\w+)?\s+items?\b"
     r"|\bno\s+gaps?\s+(?:exist|found|remain)\b"
-    r"|\ball\s+[\w\- ]{3,40}\s+have\s+a\s+corresponding\b"
+    # "a" optional (Phase T17, 2026-10-08): T13a's own live wording was "all
+    # backend endpoints have corresponding frontend hooks" -- no "a" before
+    # "corresponding" -- which the original, "a"-required pattern missed
+    # entirely, so the completeness claim this whole widening exists to catch
+    # went unflagged on the exact incident that motivated _integrity_
+    # completeness_claim_without_comparison (see that function's own docstring).
+    r"|\ball\s+[\w\- ]{3,40}\s+have\s+(?:a\s+)?corresponding\b"
+    # T13a's second half, same sentence: "no backend endpoints without
+    # frontend counterparts" -- the inverse phrasing of the same claim,
+    # unmatched by any existing alternative above.
+    r"|\bno\s+[\w\- ]{3,40}\s+without\s+(?:a\s+|an\s+)?[\w\- ]{0,20}counterparts?\b"
     r"|\bfully\s+covered\b"
     r"|\beverything\s+is\s+covered\b",
     re.IGNORECASE,

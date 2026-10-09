@@ -583,6 +583,93 @@ def test_zero_claim_catches_qualified_noun_phrasing():
     assert "left=9" in found[1]
 
 
+# ── Phase T17 (2026-10-08) — the ABSENCE variant: no comparison ran at all ──
+# Live incident, T13a (groundedness battery, deployed commit 0bfe332): the task
+# ("list its endpoints, its database tables, and its frontend hooks, and
+# identify anything present in the backend with no frontend counterpart")
+# matches _TWO_SIDED_TASK_RE as a genuine reconciliation question. The
+# Researcher found all 9 backend endpoints unaided but read the wrong file for
+# hooks (a UI page component importing 2 of them, not the file that exports
+# all 5) -- compare_enumerations was NEVER CALLED AT ALL this run. The final
+# answer still stated "All backend endpoints have corresponding frontend
+# hooks, so there are no backend endpoints without frontend counterparts."
+#
+# Distinct from test_zero_claim_contradicted_by_totals above (an OLDER, Phase R
+# incident, different wording, where compare_enumerations WAS called and its
+# own TOTALS line directly contradicted the claim): here there is no cmp_note
+# at all, so every EXISTING comparison-category check (3/3b/3c) stays silent
+# by design -- each needs a real comparison to contradict the claim WITH.
+
+from swarm.team import _integrity_completeness_claim_without_comparison  # noqa: E402
+
+_T13A_TASK = (
+    "Audit the vouchers module: list its endpoints, its database tables, and "
+    "its frontend hooks, and identify anything present in the backend with no "
+    "frontend counterpart."
+)
+
+
+def test_completeness_claim_flagged_when_no_comparison_ran_at_all():
+    content = (
+        "All backend endpoints have corresponding frontend hooks, so there "
+        "are no backend endpoints without frontend counterparts."
+    )
+    found = _integrity_completeness_claim_without_comparison(content, _T13A_TASK, "")
+    assert found is not None
+    claimed, real = found
+    assert "no compare_enumerations call was made" in real
+
+
+def test_completeness_claim_silent_when_task_is_not_two_sided():
+    """A completeness claim with no comparison is only a defect on a task
+    that actually asked for a two-sided reconciliation -- an unrelated task
+    making an unrelated "no X" statement must not be flagged."""
+    content = "No gaps were found."
+    found = _integrity_completeness_claim_without_comparison(
+        content, "What fields does the Party model have?", "")
+    assert found is None
+
+
+def test_completeness_claim_silent_when_a_real_comparison_already_ran():
+    """When compare_enumerations WAS called, this check steps aside entirely
+    -- the sibling contradiction checks (3/3b/3c) own that case, and this one
+    exists only for its absence."""
+    content = (
+        "All backend endpoints have corresponding frontend hooks, so there "
+        "are no backend endpoints without frontend counterparts."
+    )
+    found = _integrity_completeness_claim_without_comparison(
+        content, _T13A_TASK, _cmp_note())
+    assert found is None
+
+
+def test_completeness_claim_silent_with_no_completeness_language_at_all():
+    """A two-sided task with no comparison AND no completeness claim either
+    (e.g. the answer plainly disclosed it could not finish) must not be
+    flagged -- there is nothing false being asserted."""
+    content = "I was only able to find 2 of the frontend hooks; I could not locate the rest."
+    found = _integrity_completeness_claim_without_comparison(content, _T13A_TASK, "")
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_findings_catches_missing_comparison_variant_end_to_end():
+    """The exact live T13a failure shape, run through the full
+    _evidence_integrity_findings entry point, not just the isolated helper."""
+    team = SimpleNamespace(_read_state={}, _tool_evidence=[])
+    content = (
+        "All backend endpoints have corresponding frontend hooks, so there "
+        "are no backend endpoints without frontend counterparts."
+    )
+    findings = await _evidence_integrity_findings(
+        content, _T13A_TASK, team, None, None, "")
+    assert any(
+        f["category"] == "comparison completeness/gap"
+        and "no compare_enumerations call was made" in f["real"]
+        for f in findings
+    )
+
+
 # ── Phase Z2 (2026-09-26) — list-item lookahead widening, Tests A-F ─────────
 # _integrity_named_item_falsely_gapped's docstring documents the T13b live
 # shape that motivated this widening: a gap-declaring header, a colon-
