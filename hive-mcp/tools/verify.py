@@ -433,6 +433,74 @@ _STDLIB_PREFIXES = {
     "collections",
 }
 
+# T30 (2026-10-19): a bare, dotted-LOOKING backtick token is not automatically a
+# checkable "owner.attribute" symbol claim -- two concrete shapes were being
+# misclassified this way by `_DOTTED_RE` alone, both live-confirmed on the SAME
+# T29 live-validation run that proved T29's own fix working (see that phase's
+# final report, section 8):
+#
+# 1. A bare FILENAME with a single dot, e.g. `inventoryApi.ts` -- the model
+#    referred back to an already-read file by its short name (exactly the shape
+#    T29's asserted-path resolution exists to handle for PATH purposes), but the
+#    SAME token is ALSO picked up here as a dotted SYMBOL claim ("inventoryApi"
+#    is the owner, "ts" the attribute), which no real declaration backs. The
+#    downstream SPLIT-FOUND fallback then greps for the bare attribute ("ts")
+#    whole-word and reports whatever unrelated file happens to contain it
+#    (observed live: Client/EcommClient-Web/ekamweb/tsconfig.json's
+#    "next-env.d.ts" entry) as if it were evidence about the claim.
+# 2. A bare DECORATOR-METHOD reference, e.g. `router.post`, used descriptively
+#    in prose ("the backend uses `router.post` for creation endpoints") rather
+#    than as a specific route claim. A complete decorator CALL
+#    (`@router.post("/vouchers/grn/{po_id}")`) is already, separately, exactly
+#    verified by the ROUTES mechanism (_DECORATOR_ROUTE_RE below) -- re-checking
+#    the bare method reference as a dotted symbol is redundant with that check
+#    and, because the literal substring "router.post" also appears verbatim in
+#    every OTHER file's own @router.post(...) decorator, reports a misleading
+#    "FOUND" citing a file the answer never mentioned (observed live:
+#    API/storage-service/router/storage_api.py, cited for a vouchers-only
+#    answer).
+#
+# Both exclusions are narrow and structural, not a blanket ban on any mention of
+# these words: a GENUINE dotted claim (`ItemCategory.sku_prefix`, `Voucher.save`)
+# is untouched by either check and reaches the SAME structural-verdict/grep path
+# as before. See _looks_like_bare_filename and _is_generic_decorator_reference's
+# own docstrings for the exact, narrow conditions each requires.
+_FILENAME_LIKE_EXTS = (
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".json", ".yaml", ".yml", ".md", ".mdx",
+    ".txt", ".sql", ".html", ".css", ".scss", ".toml", ".ini", ".cfg", ".sh",
+    ".lock", ".env",
+)
+_DECORATOR_METHOD_ATTRS = {"get", "post", "put", "patch", "delete"}
+
+
+def _looks_like_bare_filename(tok: str) -> bool:
+    """True if `tok` (already confirmed to match _DOTTED_RE) is better read as a
+    bare filename than as an owner.attribute symbol claim -- exactly one dot,
+    and the segment after it is a recognized file extension. A real attribute
+    or method name is essentially never a bare 2-3 letter file extension, so
+    this is a safe, structural signal, not a name-based guess."""
+    if tok.count(".") != 1:
+        return False
+    return "." + tok.rsplit(".", 1)[-1].lower() in _FILENAME_LIKE_EXTS
+
+
+def _is_generic_decorator_reference(answer: str, tok: str) -> bool:
+    """True if `tok` (already confirmed to match _DOTTED_RE) is a bare
+    `owner.verb` reference to an HTTP-method decorator (router.post, app.get,
+    ...) that the SAME answer, elsewhere, also uses as a complete decorator
+    invocation (`@{tok}(`) -- i.e. a descriptive restatement of a call already
+    checked, specifically, by the ROUTES mechanism, not a new or different
+    claim. Deliberately requires BOTH the generic verb-attribute shape AND the
+    same-answer correlation with a real decorator usage -- a bare mention with
+    no corresponding `@tok(` anywhere in the answer still reaches the normal
+    dotted-claim check unchanged."""
+    owner, _, attr = tok.rpartition(".")
+    if attr.lower() not in _DECORATOR_METHOD_ATTRS:
+        return False
+    if not owner or not owner[0].islower():
+        return False
+    return f"@{tok}(" in answer
+
 # hive-mcp's OWN registered tool names (see main.py's _tool(...) calls). A backticked
 # mention of one of these in an answer's prose is virtually always the model naming
 # which tool it called ("verified using `search_files_batch`"), not a claim that a
@@ -980,6 +1048,11 @@ _OWN_REPORT_RE = re.compile(
 
 _BLOCK_LOOKBACK = 400
 
+# T30: a markdown ATX sub-heading line (##, ###, ...) inside captured "block
+# content" -- see _blocks_not_in_their_file's own call site for the full
+# rationale. Requires 2+ hashes: a single "#" is a normal Python/shell comment.
+_MD_HEADING_IN_BLOCK_RE = re.compile(r"(?:^|\n)[ \t]*#{2,6}[ \t]")
+
 
 def _distinctive_lines(block: str) -> list[str]:
     """Lines from a quoted block substantial enough to be worth checking.
@@ -1036,6 +1109,23 @@ def _blocks_not_in_their_file(answer: str) -> list[tuple[str, str, int]]:
         if lang in _NOT_FILE_CONTENT:
             continue
         if _OWN_REPORT_RE.search(block):
+            continue
+        if _MD_HEADING_IN_BLOCK_RE.search(block):
+            # T30: a markdown sub-heading (##+) INSIDE what _FENCED_RE captured
+            # as "block content" is strong evidence this span is not a real
+            # fenced quotation at all. Live-confirmed: Z16's repetition guard
+            # (or any other mid-stream cutoff) can leave a fence open
+            # (` ```typescript\nuse\n` with nothing closing it); _FENCED_RE's
+            # non-greedy match then pairs that unclosed opener with the NEXT,
+            # unrelated ``` it finds later in the answer -- swallowing whatever
+            # prose/markdown sits between the two as if it were the file's own
+            # content. Reconstructed and confirmed directly against the real
+            # T29 live-validation answer text: the captured "block" was
+            # "use\n\nI'll continue from where the previous answer left off...\n\n"
+            # "### Frontend Hooks (from `inventoryApi.ts`):\n", which produced a
+            # false BLOCK NOT IN finding. Requires 2+ hashes specifically so a
+            # single "#" Python/shell comment -- extremely common in genuine
+            # code -- never triggers this and loses real detection coverage.
             continue
         runup = (answer or "")[max(0, m.start() - _BLOCK_LOOKBACK):m.start()]
         if _ILLUSTRATIVE_RE.search(runup):
@@ -2082,6 +2172,14 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             tok = span.split("(", 1)[0].strip().rstrip("()").strip()
         if (_IDENT_RE.match(tok) or _DOTTED_RE.match(tok)) and tok.lower() not in _NOISE:
             if tok in _MCP_TOOL_NAMES:
+                continue
+            if not _IDENT_RE.match(tok) and (
+                _looks_like_bare_filename(tok)
+                or _is_generic_decorator_reference(answer, tok)
+            ):
+                # T30: a bare filename or a generic, already-separately-verified
+                # decorator reference -- not a checkable owner.attribute claim.
+                # See _FILENAME_LIKE_EXTS' own comment for the full rationale.
                 continue
             if _is_negated_claim(answer, m.start(), m.end()):
                 # NOT skipped any more -- inverted. See the ABSENCE section below:
