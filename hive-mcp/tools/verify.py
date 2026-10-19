@@ -1895,8 +1895,29 @@ def _find_anchor_symbols(answer: str, pos: int) -> list[str]:
     found: list[str] = []
     for m in _BACKTICK_RE.finditer(window):
         tok = m.group(1).strip()
-        if _PATHLIKE_RE.match(tok):          # a path is the citation's file, not its subject
-            continue
+        # T31 (2026-10-19): _PATHLIKE_RE's own "ends in a short alnum suffix"
+        # heuristic is broader than "this is a file extension" -- it also
+        # matches a genuine SHORT dotted symbol claim (`Voucher.save`,
+        # `Model.id`), silently excluding it from ever becoming an anchor
+        # candidate. Reproduced directly: a citation whose only nearby
+        # candidates are a bare filename (`inventoryApi.ts`) and a genuine
+        # short dotted symbol (`Voucher.save`) lost BOTH to this one check,
+        # leaving the citation with zero anchors and therefore never
+        # evaluated for a MISMATCH at all (see the CITATIONS loop's own
+        # `anchors = symbol_claims.get((path, num)) or []` -- an empty list
+        # skips the `for a in anchors` loop entirely, a silent false
+        # negative, not a crash or a visible warning). Reuses T30's own
+        # filename/decorator-reference helpers (same real extension list,
+        # same narrow contextual decorator check) instead of a second,
+        # conflicting filename heuristic -- _PATHLIKE_RE's definition and
+        # its other two call sites (_find_nearby_quote/_find_preceding_quote's
+        # quoted-content exclusion) are unmodified.
+        if not _IDENT_RE.match(tok) and (
+            _looks_like_bare_filename(tok)
+            or _is_generic_decorator_reference(answer, tok)
+        ):
+            continue          # a path/filename or generic decorator reference
+                               # is the citation's file/pattern, not its subject
         if tok.lower() in _NOISE:
             continue
         if (_IDENT_RE.match(tok) or _DOTTED_RE.match(tok)) and tok not in found:
