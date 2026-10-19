@@ -1014,7 +1014,83 @@ def _lint_text(text: str, label: str, check_require: bool) -> list[str]:
 
 
 # A fenced block, with its language hint if it has one.
-_FENCED_RE = re.compile(r"```([A-Za-z0-9_+-]*)[ \t]*\n(.*?)```", re.S)
+# T32 (2026-10-19): _FENCED_RE used to pair ANY later ``` with an earlier,
+# UNCLOSED one (its `(.*?)` has no way to tell "the real closer" from "the
+# next unrelated fence's own opener"). Live-confirmed (T30's own report) that
+# this swallowed a markdown heading into false "block content"; reproduced
+# directly here that it ALSO swallows plain prose with no heading at all
+# (two distinctive, non-matching prose lines are enough to pass the existing
+# "at least two distinctive lines" bar), AND separately loses the SECOND,
+# genuinely distinct block's own content entirely -- re.finditer's cursor
+# lands inside what it thought was the first match's "closer" and the
+# second block is never independently matched again.
+#
+# Replaced by _iter_fenced_blocks: a small, explicit line scanner applying
+# CommonMark's own actual fence rules (same character, closer length >=
+# opener length, closer line carries ONLY the fence + optional whitespace --
+# an info string disqualifies a line as a closer) rather than a single
+# regex's non-greedy guess. An unclosed fence terminates at end of input,
+# exactly like CommonMark -- never at a later, unrelated fence -- which
+# keeps a genuinely truncated quotation checkable (bounded, not silently
+# discarded) while never reaching past its own true end.
+#
+# This does NOT fully resolve the deepest ambiguity: CommonMark itself has
+# no way to treat a `` ```python `` line as closing an EARLIER, still-open
+# ``` fence (an info string disqualifies it as a closer, by spec), so two
+# genuinely separate, differently-labeled blocks separated by one truly
+# unclosed fence are -- correctly, per spec -- still one merged span. See
+# _EMBEDDED_FENCE_OPEN_RE below for the narrow, additional safety net this
+# residual case still needs.
+_FENCE_LINE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})[ \t]*([A-Za-z0-9_+-]*)[ \t]*$")
+
+
+def _iter_fenced_blocks(text: str):
+    """Yields (lang, content, start) for every fenced block in `text`,
+    scanning line-by-line per the CommonMark fence rules described above.
+    `start` is the character offset of the block's own opening fence line,
+    matching `_FENCED_RE.finditer`'s old `m.start()` for this module's one
+    caller (`_blocks_not_in_their_file`)."""
+    lines = text.splitlines(keepends=True)
+    i, n, pos = 0, len(lines), 0
+    while i < n:
+        open_m = _FENCE_LINE_RE.match(lines[i].rstrip("\n"))
+        if not open_m:
+            pos += len(lines[i])
+            i += 1
+            continue
+        fence_char, fence_len = open_m.group(1)[0], len(open_m.group(1))
+        lang = open_m.group(2)
+        start = pos
+        pos += len(lines[i])
+        i += 1
+        content_lines: list[str] = []
+        close_re = re.compile(
+            rf"^[ \t]{{0,3}}{re.escape(fence_char)}{{{fence_len},}}[ \t]*$")
+        while i < n:
+            if close_re.match(lines[i].rstrip("\n")):
+                pos += len(lines[i])
+                i += 1
+                break
+            content_lines.append(lines[i])
+            pos += len(lines[i])
+            i += 1
+        # Falls through to EOF unclosed exactly like this: content_lines
+        # already holds everything through the last line, and the outer
+        # while loop exits naturally once i == n.
+        yield lang, "".join(content_lines), start
+
+
+# A fence-OPENING-shaped line (3+ backticks/tildes + optional info string)
+# found INSIDE a captured block's own content is strong evidence the scanner
+# merged two genuinely distinct blocks -- CommonMark itself has no way to
+# treat an info-stringed line as a closer for an earlier fence (see
+# _iter_fenced_blocks' own docstring), so this is the one residual ambiguity
+# that correct, spec-compliant scanning still cannot resolve on its own.
+# Skipping rather than guessing matches this file's own established
+# conservative-default convention (T30's _MD_HEADING_IN_BLOCK_RE, same
+# principle applied to a different structural signal).
+_EMBEDDED_FENCE_OPEN_RE = re.compile(
+    r"(?:^|\n)[ \t]{0,3}(?:`{3,}|~{3,})[A-Za-z0-9_+-]*[ \t]*(?:\n|$)")
 
 # Languages whose blocks are commands or transcripts, not file content. Checking a
 # shell block against a source file would flag every correct answer that shows how to
@@ -1104,30 +1180,32 @@ def _blocks_not_in_their_file(answer: str) -> list[tuple[str, str, int]]:
     quotation is a reformatted quotation, not a fabrication.
     """
     findings = []
-    for m in _FENCED_RE.finditer(answer or ""):
-        lang, block = m.group(1).lower(), m.group(2)
+    for lang, block, start in _iter_fenced_blocks(answer or ""):
+        lang = lang.lower()
         if lang in _NOT_FILE_CONTENT:
             continue
         if _OWN_REPORT_RE.search(block):
             continue
         if _MD_HEADING_IN_BLOCK_RE.search(block):
-            # T30: a markdown sub-heading (##+) INSIDE what _FENCED_RE captured
-            # as "block content" is strong evidence this span is not a real
-            # fenced quotation at all. Live-confirmed: Z16's repetition guard
-            # (or any other mid-stream cutoff) can leave a fence open
-            # (` ```typescript\nuse\n` with nothing closing it); _FENCED_RE's
-            # non-greedy match then pairs that unclosed opener with the NEXT,
-            # unrelated ``` it finds later in the answer -- swallowing whatever
-            # prose/markdown sits between the two as if it were the file's own
-            # content. Reconstructed and confirmed directly against the real
-            # T29 live-validation answer text: the captured "block" was
-            # "use\n\nI'll continue from where the previous answer left off...\n\n"
-            # "### Frontend Hooks (from `inventoryApi.ts`):\n", which produced a
-            # false BLOCK NOT IN finding. Requires 2+ hashes specifically so a
-            # single "#" Python/shell comment -- extremely common in genuine
-            # code -- never triggers this and loses real detection coverage.
+            # T30: a markdown sub-heading (##+) INSIDE captured "block
+            # content" is strong evidence this span is not a real fenced
+            # quotation at all -- still a live possibility even with
+            # _iter_fenced_blocks' correct CommonMark-compliant pairing,
+            # whenever an unclosed fence runs all the way to end of input
+            # and genuinely swallows a later heading on its way there.
             continue
-        runup = (answer or "")[max(0, m.start() - _BLOCK_LOOKBACK):m.start()]
+        if _EMBEDDED_FENCE_OPEN_RE.search(block):
+            # T32: a fence-OPENING-shaped line (3+ backticks/tildes +
+            # optional info string) found INSIDE this block's own content
+            # means the scanner merged two genuinely distinct blocks --
+            # CommonMark itself has no way to treat an info-stringed line as
+            # a closer for an earlier, still-open fence (see
+            # _iter_fenced_blocks' own docstring), so this is the one
+            # residual ambiguity correct, spec-compliant scanning still
+            # cannot resolve alone. Skip rather than guess which half (or
+            # neither) is the real quotation.
+            continue
+        runup = (answer or "")[max(0, start - _BLOCK_LOOKBACK):start]
         if _ILLUSTRATIVE_RE.search(runup):
             continue
         name_matches = list(_NEARBY_FILE_RE.finditer(runup))
