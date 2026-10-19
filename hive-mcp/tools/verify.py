@@ -2298,6 +2298,39 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             continue          # "create API/x/new_file.py" describes future work
         asserted_paths.append(p)
 
+    # T29 (2026-10-19): a bare, backticked single-segment filename with a code
+    # extension -- `inventoryApi.ts` -- never matches _ASSERTED_PATH_RE above (it
+    # requires at least one "/" segment), so it was invisible to asserted_paths
+    # and therefore to _structural_verdict's per-symbol file selection entirely.
+    # Live-confirmed (T28's own verify_claims live validation run): the answer's
+    # own earlier heading named the frontend file only as "`inventoryApi.ts`" (no
+    # directory prefix -- already established by an earlier read this run), while
+    # the backend file was always named with its full path. Every frontend-hook
+    # symbol was then checked ONLY against the one path the regex above DID see --
+    # the unrelated backend router file -- producing a wall of false NOT IN FILE
+    # verdicts for real, correctly-named frontend hooks.
+    #
+    # Reuses the EXISTING _resolve_path mechanism (the exact same hint_paths
+    # pattern the CITATIONS section below already applies to bare file:line
+    # citations) rather than inventing new resolution logic. Deliberately
+    # conservative: a bare basename is folded into asserted_paths only when
+    # _resolve_path finds exactly one real candidate -- an ambiguous or
+    # unresolved name is left out of asserted_paths entirely (not guessed, not
+    # reported as a path-level problem here), which keeps _structural_verdict's
+    # own existing fallback-to-None/repo-wide-grep behavior as the safety net for
+    # every case this cannot safely settle, exactly as it already is for e.g. an
+    # unparseable file type.
+    _ASSERTED_BARE_CODE_EXTS = (".py", ".ts", ".tsx", ".js", ".jsx")
+    _all_backtick_paths = [m.group(1) for m in _BACKTICK_PATH_RE.finditer(answer)]
+    for _bare in _all_backtick_paths:
+        if "/" in _bare or not _bare.lower().endswith(_ASSERTED_BARE_CODE_EXTS):
+            continue  # multi-segment paths are already handled by the loop above
+        if _bare in asserted_paths:
+            continue
+        _resolved, _n_cands = _resolve_path(_bare, hint_paths=_all_backtick_paths)
+        if _resolved and _resolved not in asserted_paths:
+            asserted_paths.append(_resolved)
+
     # asserted_paths counts as a checkable claim: an answer whose ONLY assertion is a
     # path ("the routers live in `API/x/routers/items.py`") used to exit here as
     # "nothing to check", which made the path check inert on exactly the answers it
