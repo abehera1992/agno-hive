@@ -16251,14 +16251,52 @@ _STRUCTURED_DELEGATION_REQUIRED_FIELDS = (
 )
 
 
+# Phase T26: bounds how much of team._session_summary's own already-compact
+# digest (itself capped by _extract_handoff_summary -- ~8 file refs, ~5 outcome
+# bullets, up to 5x800-char excerpts) can land inside one delegation's task
+# text. A second, independent cap rather than trusting the first one never
+# grows -- cheap insurance against bloating every delegation in a long chain.
+_INHERITED_CONTEXT_CAP = 2000
+
+
 def _build_canonical_researcher_task(
     target: str, objective: str, evidence_required: str, completion_criteria: str,
+    inherited_context: str | None = None,
 ) -> str:
     """Pure, deterministic text construction -- Phase S Test B requires
     canonical_task(x) == canonical_task(x) for identical inputs. No model call, no
     inference, no fallback, no retry. Validation of required fields happens in the
     caller (delegate_structured_task's own entrypoint, below) BEFORE this runs --
     this function assumes it already received real content in every field.
+
+    `inherited_context` (Phase T26, 2026-10-19): the SAME compact chain-boundary
+    digest already built for the Coordinator itself (team._session_summary, from
+    _extract_handoff_summary) -- optional, None/empty for a fresh (non-chained)
+    call, same as every pre-existing caller. Proven root cause (T20.1/T23, live
+    ZGX telemetry, session 088cf7f6): this digest reliably reaches the
+    Coordinator's OWN prompt but reaches NO delegated member at all --
+    add_session_state_to_context only shares session_state (read_log,
+    delegations_made), never team._session_summary, and a thin Coordinator-
+    written objective ('review the evidence gathered in this run') carries none
+    of it across either. The member then sees an empty per-call read_log and
+    (reasonably, from its own narrow view) concludes no evidence exists for the
+    whole session, not just this one call -- and goes looking elsewhere.
+
+    This closes that boundary directly, independent of how well or poorly the
+    Coordinator's own target/objective/evidence_required/completion_criteria
+    wording carries context forward (T25's instruction-only attempt at the
+    Coordinator level was tested live and not supported -- a closest-
+    reproduction treatment still discarded the known findings for a generic
+    keyword search; this acts at the actual task text the member receives
+    instead of relying on the Coordinator's phrasing). Deliberately NOT a
+    relevance filter: T19 (Phase T19, 2026-10-xx) already established there is
+    no reliable programmatic signal for "is this prior content relevant to this
+    NEW objective" -- so the digest is attached whenever one exists, labeled as
+    unevaluated-for-relevance and explicitly unverified, exactly as T19's own
+    Track B/C design did at the Coordinator layer. A genuinely unrelated
+    delegation is not harmed: the label never asserts relevance, so a member
+    free to disregard it for a fresh, unrelated objective is not misled into
+    using it.
 
     SCOPE PRECEDENCE clause (Phase Z8, 2026-09-26): Z7 traced T13b's over-
     enumeration (Z6) to a genuine instruction-level contradiction, not a buried or
@@ -16278,11 +16316,33 @@ def _build_canonical_researcher_task(
     and COMPLETION CRITERIA above define WHEN a task is finished, never WHAT
     content is in scope; scope is always the Researcher's own standing rules.
     """
+    _inherited_block = ""
+    if inherited_context and inherited_context.strip():
+        _text = inherited_context.strip()
+        if len(_text) > _INHERITED_CONTEXT_CAP:
+            _text = _text[:_INHERITED_CONTEXT_CAP] + "\n... (truncated)"
+        _inherited_block = (
+            f"INHERITED CONTEXT (from this session's own prior-turn handoff -- "
+            f"NOT verified by this delegation):\n{_text}\n\n"
+            f"The shared read_log/delegations_made you may see elsewhere covers ONLY "
+            f"this one delegation -- it starts empty every time, even when the block "
+            f"above shows real prior-turn findings. An empty read_log does NOT mean "
+            f"no evidence exists for this session; it means nothing has been read in "
+            f"THIS call yet. Relevance of the block above to YOUR objective is not "
+            f"evaluated here -- it may be directly relevant, partially relevant, or "
+            f"unrelated. If it bears on your objective, use it and say in your answer "
+            f"that it is inherited/unverified unless you independently confirm it "
+            f"against the real source; do not promote it to a confirmed fact without "
+            f"checking. If it does not bear on your objective, ignore it and "
+            f"investigate your own target fresh -- do not force an unrelated answer "
+            f"to reuse it.\n\n"
+        )
     return (
         f"TARGET:\n{target}\n\n"
         f"OBJECTIVE:\n{objective}\n\n"
         f"EVIDENCE REQUIRED:\n{evidence_required}\n\n"
         f"COMPLETION CRITERIA:\n{completion_criteria}\n\n"
+        f"{_inherited_block}"
         f"SCOPE PRECEDENCE:\n"
         f"The objective and completion criteria above define WHEN this task is "
         f"complete. They do NOT define WHAT content is in scope -- your own "
@@ -16447,10 +16507,18 @@ def _build_structured_delegation_tool(original_function, team=None):
                 )
                 return
 
+        # Phase T26: the SAME compact digest already built for the Coordinator's
+        # own prompt (team._session_summary) -- constant for the lifetime of this
+        # run (set once, before any delegation can be made), so including it here
+        # does not destabilize canonical_hash's duplicate-delegation role within
+        # a single run. None/"" for a fresh, non-chained call, matching every
+        # pre-existing run exactly (see _build_canonical_researcher_task's own
+        # docstring for the full rationale).
         canonical_task = _build_canonical_researcher_task(
             target=target, objective=objective,
             evidence_required=evidence_required,
             completion_criteria=completion_criteria,
+            inherited_context=getattr(team, "_session_summary", None) if team is not None else None,
         )
         canonical_hash = hashlib.sha256(
             canonical_task.encode("utf-8", errors="replace")).hexdigest()[:16]
