@@ -4799,6 +4799,44 @@ def _ends_with_unfinished_intent(content: str) -> bool:
     return not _UNFINISHED_INTENT_COMPLETION_CUE_RE.search(m.group(0))
 
 
+_NATURAL_STOP_RE = re.compile(r'[.!?]["\')\]]*\s*$')
+
+
+def _ends_at_a_natural_stopping_point(content: str) -> bool:
+    """True if `content`'s own tail reads like a genuinely finished answer --
+    ends in real terminal punctuation (not mid-word, mid-clause, or an
+    ellipsis) and does not itself narrate an undone next action.
+
+    T28 (2026-10-19): _complete_repetition_truncated_answer's own one-shot
+    completion attempt previously decided "incomplete" purely from whether
+    ITS retry cleared _adopt_retry's read-count grounding bar -- never from
+    whether the ORIGINAL pre-repeat `content` had already reached its own
+    conclusion before the repeating segment began. Z16's truncation keeps
+    only the CONFIRMED-non-repeat prefix, which can legitimately already be
+    a complete, concluded answer if the model's later repetition was pure
+    restatement/padding after the real conclusion was written -- matching
+    T26's own observed shape: "the correct substantive voucher analysis" was
+    already in `content`, yet shipped tagged INCOMPLETE ANSWER because the
+    bounded completion pass had nothing left to usefully add and so never
+    cleared the grounding bar. Reuses _ends_with_unfinished_intent
+    (unmodified) as half the signal -- it already answers a closely related
+    question, "did the model stop mid-action," from the opposite direction
+    this needs.
+
+    Deliberately narrow and purely textual, matching this file's existing
+    convention for every other repetition-adjacent heuristic
+    (_looks_like_repetition_loop, _looks_like_repetition_decay,
+    _ends_with_unfinished_intent) -- no new model call, no broadening of an
+    existing threshold or retry budget.
+    """
+    tail = (content or "").rstrip()
+    if not tail or tail.endswith("..."):
+        return False
+    if not _NATURAL_STOP_RE.search(tail):
+        return False
+    return not _ends_with_unfinished_intent(content)
+
+
 _SYNTAX_REASK_FLAG = "_syntax_loss_reask_done"
 
 # The fixed totals line _computed_comparison's underlying tool always ends on
@@ -6948,6 +6986,15 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
         # past _adopt_retry (which compares read counts, not content) and could be
         # "adopted" as a 13-character non-answer replacing a real, if incomplete,
         # truncated draft.
+        if _ends_at_a_natural_stopping_point(content):
+            # T28: the completion attempt producing nothing is the CORRECT outcome
+            # when `content` already reached its own conclusion before the repeat
+            # began -- there was nothing left to add. Disclosing it as incomplete
+            # here would mislabel an already-finished answer.
+            print("[team] repetition-truncation completion returned nothing, but "
+                  "the pre-repeat draft already reads as complete — not disclosing "
+                  "it as incomplete", flush=True)
+            return content, result
         print("[team] repetition-truncation completion returned nothing — keeping "
               "the truncated draft", flush=True)
         return content + _TRUNCATED_ANSWER_NOTE, result
@@ -6956,6 +7003,14 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
         "repetition-completion", content, result, completed, retry,
         member_reads=_member_reads_delta(team, reads_before))
     if adopted is not completed:
+        if _ends_at_a_natural_stopping_point(content):
+            # T28: same reasoning as the "nothing returned" branch above -- a
+            # completion attempt that adds nothing MORE GROUNDED is expected, not a
+            # failure, when the original draft already concluded on its own.
+            print("[team] repetition-truncation completion was not more grounded, "
+                  "but the pre-repeat draft already reads as complete — not "
+                  "disclosing it as incomplete", flush=True)
+            return content, result
         print("[team] repetition-truncation completion was not more grounded than "
               "the truncated draft — keeping the draft, disclosed as incomplete",
               flush=True)

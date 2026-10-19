@@ -207,6 +207,84 @@ async def test_less_grounded_completion_is_rejected_with_a_disclosure():
     assert "INCOMPLETE ANSWER" in out_content
 
 
+# ---- Case G/H (T28) -- the pre-repeat draft ALREADY reached its own conclusion --
+# before the repeat began. _adopt_retry's read-count comparison has no way to see
+# this -- it only ever compares the TWO retries' own grounding, never asks whether
+# the ORIGINAL draft needed completing in the first place. Reproduces T26's own
+# observed shape: a correct, concluded voucher gap-analysis answer that still
+# shipped tagged INCOMPLETE ANSWER because the one bounded completion pass had
+# nothing left to usefully add.
+
+@pytest.mark.asyncio
+async def test_already_complete_draft_is_not_disclosed_incomplete_when_completion_returns_nothing():
+    fake_team = _FakeTeam(None)  # completion attempt produces nothing at all
+    fake_team._repetition_truncated = True
+    content = (
+        "Endpoints: 9. Tables: 3. Frontend hooks: 5. Gap analysis: grn, "
+        "credit-note, stock-adjustment, and stock-transfer have no frontend "
+        "counterpart."
+    )
+    result = _msgs()
+
+    out_content, out_result = await team._complete_repetition_truncated_answer(
+        content, "audit the module", fake_team, [result], result, None)
+
+    assert out_content == content  # untouched -- not even appended to
+    assert "INCOMPLETE ANSWER" not in out_content
+    assert out_result is result
+
+
+@pytest.mark.asyncio
+async def test_already_complete_draft_is_not_disclosed_incomplete_when_completion_is_less_grounded():
+    fake_team = _FakeTeam(SimpleNamespace(
+        content="Done.", messages=[_tool_msg("update_session_state", "noted")]))
+    fake_team._repetition_truncated = True
+    content = (
+        "Endpoints: 9. Tables: 3. Frontend hooks: 5. Gap analysis: grn, "
+        "credit-note, stock-adjustment, and stock-transfer have no frontend "
+        "counterpart."
+    )
+    result = _msgs(
+        _tool_msg("get_file_content", "a"),
+        _tool_msg("get_file_content", "b"),
+        _tool_msg("get_file_content", "c"),
+    )
+
+    out_content, out_result = await team._complete_repetition_truncated_answer(
+        content, "audit the module", fake_team, [result], result, None)
+
+    assert out_content == content
+    assert "INCOMPLETE ANSWER" not in out_content
+
+
+@pytest.mark.asyncio
+async def test_draft_ending_in_ellipsis_is_never_treated_as_a_natural_stop():
+    """Regression guard: a draft that merely ENDS in a period somewhere but was
+    truly cut off mid-thought (trailing "...") must still be disclosed -- the
+    natural-stop check is about the literal tail, not about the presence of any
+    period anywhere in the text."""
+    fake_team = _FakeTeam(None)
+    fake_team._repetition_truncated = True
+    content = "Endpoints: A, B. Tables: C. Frontend hooks: D, E, and then it just..."
+    result = _msgs()
+
+    out_content, _ = await team._complete_repetition_truncated_answer(
+        content, "audit the module", fake_team, [result], result, None)
+
+    assert "INCOMPLETE ANSWER" in out_content
+
+
+def test_ends_at_a_natural_stopping_point_unit():
+    assert team._ends_at_a_natural_stopping_point(
+        "Gap analysis: four endpoints have no frontend counterpart.") is True
+    assert team._ends_at_a_natural_stopping_point(
+        "Frontend hooks: D, E, and then it just...") is False
+    assert team._ends_at_a_natural_stopping_point(
+        "Let me search for the remaining files to confirm this.") is False
+    assert team._ends_at_a_natural_stopping_point("") is False
+    assert team._ends_at_a_natural_stopping_point(None) is False
+
+
 # ---- Case F -- ordinary already-verified duplicate is untouched by this guard ---
 
 @pytest.mark.asyncio

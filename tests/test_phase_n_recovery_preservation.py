@@ -76,13 +76,22 @@ def test_empty_original_draft():
 
 
 # ── 3. Empty recovery result -- original draft kept, disclosed incomplete ──
+#
+# T28 (2026-10-19): the draft fixture must itself look genuinely unfinished
+# (trailing "...") -- _ends_at_a_natural_stopping_point now correctly skips
+# the disclosure for a pre-repeat draft that already reached its own real
+# conclusion, which "original draft text." (ending in a plain period)
+# incidentally satisfied. That corrected behavior has its own dedicated
+# coverage in test_repetition_truncation_completion.py; this test's actual
+# subject -- a genuinely unfinished draft surviving an empty recovery pass,
+# disclosed as incomplete -- is unchanged and still exercised here.
 
 def test_empty_recovery_keeps_original_draft():
     team_mod._stream_team_run = _stub_stream_team_run("")
     team = _FakeTeam()
     content, result = _run(_complete_repetition_truncated_answer(
-        "original draft text.", "task", team, [], {"orig": True}, None))
-    assert "original draft text." in content
+        "original draft text that trails off...", "task", team, [], {"orig": True}, None))
+    assert "original draft text that trails off..." in content
     assert _TRUNCATED_ANSWER_NOTE in content
 
 
