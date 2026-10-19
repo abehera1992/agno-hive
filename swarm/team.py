@@ -16258,6 +16258,93 @@ _STRUCTURED_DELEGATION_REQUIRED_FIELDS = (
 # grows -- cheap insurance against bloating every delegation in a long chain.
 _INHERITED_CONTEXT_CAP = 2000
 
+# Phase T27: live testing of T26 found the inherited-context block attached
+# unconditionally (whenever team._session_summary was non-empty) bled into an
+# UNRELATED delegation's own output -- a hardcoded-credentials check on
+# cleanup.py came back with an unsolicited, redundant voucher comparison
+# re-derived from the attached block. T19 already established there is no
+# reliable programmatic relevance CLASSIFIER ("is this prior content relevant
+# to this new objective") -- so this does not add one. It instead reuses two
+# signals already available, deterministic, and zero-cost: (1) the exact file
+# paths _extract_handoff_summary already extracted into the digest's own
+# "Files referenced:" line (no new extraction logic -- same regex family this
+# file already uses for file paths elsewhere), and (2) a small, fixed keyword
+# vocabulary for self-reflective/continuity language, the SAME vocabulary
+# T25's (disproven, instruction-only) attempt already used -- the words
+# themselves were never the problem; relying on the MODEL to act on them was.
+# Checked against THIS TURN's own top-level task text (team._task, Phase T27),
+# never the per-delegation target/objective/etc -- a vague, pathless objective
+# like 'review the evidence gathered in this run' is exactly the T23 failure
+# shape this must still match, so the signal has to live one level up, where
+# the user's own continuity language ('reconsider...', 'based on the evidence
+# already gathered...') or absence of it ('Separately, check...') actually is.
+_SESSION_FILE_REFS_RE = re.compile(r"Files referenced:\s*(.+)")
+
+_CONTINUITY_SIGNAL_RE = re.compile(
+    r"\b(reconsider|re-?examine|already\s+(?:gathered|found|established|"
+    r"identified|discovered|determined)|evidence\s+already|that\s+you\s+just|"
+    r"you\s+just\s+(?:produced|found|gathered|identified)|prior\s+(?:task|turn|"
+    r"finding|answer)|previous\s+(?:task|turn|finding|answer)|earlier\s+in\s+"
+    r"this|from\s+the\s+(?:previous|prior)|continue\s+from|follow[\s-]?up\s+on|"
+    r"based\s+on\s+the\s+evidence)\b",
+    re.IGNORECASE,
+)
+
+
+def _session_summary_file_basenames(session_summary: str | None) -> set[str]:
+    """The file basenames _extract_handoff_summary already recorded in this
+    session's own digest (its 'Files referenced: a.py, b.ts' line) --
+    lowercased, no new extraction logic. Empty set for no summary, no match,
+    or no files line (e.g. a run that made zero file-backed delegations)."""
+    if not session_summary:
+        return set()
+    m = _SESSION_FILE_REFS_RE.search(session_summary)
+    if not m:
+        return set()
+    out = set()
+    for raw in m.group(1).split(","):
+        name = raw.strip().strip("`").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if name:
+            out.add(name.lower())
+    return out
+
+
+def _inherited_context_is_relevant(
+        session_summary: str | None, top_level_task: str | None,
+        target: str, objective: str, evidence_required: str,
+        completion_criteria: str) -> bool:
+    """Phase T27 relevance gate -- decides whether THIS delegation should
+    receive the inherited-context block at all, not how much of it.
+
+    Conservative by construction (Section 3.D's 'ambiguity is never proof of
+    dependency'): returns True only on a POSITIVE signal, never defaults to
+    True just because a session_summary happens to exist. Checks, in order:
+
+    1. Continuity language in the turn's own top-level task (team._task) --
+       catches the real T23/T26 Test A shape, where the per-delegation
+       objective is often vague/pathless but the USER'S OWN request plainly
+       says it is reflecting on prior work.
+    2. Either side naming one of the session's own known file basenames --
+       catches a partially-dependent follow-up that references a known path
+       without reflective language (e.g. 'does vouchers_api.py have tests').
+
+    No match on either -> False (exclude), which is also the correct answer
+    when session_summary itself is empty/None (a fresh, non-chained call) --
+    _build_canonical_researcher_task already no-ops on an empty/None
+    inherited_context regardless, so this gate is pure defense in depth, not
+    the only thing standing between a fresh call and a spurious block."""
+    if not session_summary or not session_summary.strip():
+        return False
+    task_text = top_level_task or ""
+    if _CONTINUITY_SIGNAL_RE.search(task_text):
+        return True
+    known_files = _session_summary_file_basenames(session_summary)
+    if not known_files:
+        return False
+    combined = " ".join((task_text, target or "", objective or "",
+                         evidence_required or "", completion_criteria or "")).lower()
+    return any(name in combined for name in known_files)
+
 
 def _build_canonical_researcher_task(
     target: str, objective: str, evidence_required: str, completion_criteria: str,
@@ -16507,18 +16594,32 @@ def _build_structured_delegation_tool(original_function, team=None):
                 )
                 return
 
-        # Phase T26: the SAME compact digest already built for the Coordinator's
-        # own prompt (team._session_summary) -- constant for the lifetime of this
-        # run (set once, before any delegation can be made), so including it here
-        # does not destabilize canonical_hash's duplicate-delegation role within
-        # a single run. None/"" for a fresh, non-chained call, matching every
-        # pre-existing run exactly (see _build_canonical_researcher_task's own
-        # docstring for the full rationale).
+        # Phase T26/T27: the SAME compact digest already built for the
+        # Coordinator's own prompt (team._session_summary) -- constant for the
+        # lifetime of this run (set once, before any delegation can be made),
+        # so including it here does not destabilize canonical_hash's
+        # duplicate-delegation role within a single run. None/"" for a fresh,
+        # non-chained call, matching every pre-existing run exactly (see
+        # _build_canonical_researcher_task's own docstring). T27 adds the
+        # relevance gate (_inherited_context_is_relevant) in front of it --
+        # see that function's own docstring for why team._task (not this
+        # delegation's own target/objective) is the signal that has to be
+        # checked, and the T27 module comment above _SESSION_FILE_REFS_RE for
+        # the live incident (an unrelated cleanup.py credentials check came
+        # back with an unsolicited, redundant voucher comparison) this closes.
+        _session_summary = getattr(team, "_session_summary", None) if team is not None else None
+        _top_level_task = getattr(team, "_task", None) if team is not None else None
+        _relevant = _inherited_context_is_relevant(
+            _session_summary, _top_level_task, target, objective,
+            evidence_required, completion_criteria)
+        print(f"[team] T27 inherited-context relevance: included={_relevant} "
+              f"member_id={member_id!r} session_summary_present={bool(_session_summary)}",
+              flush=True)
         canonical_task = _build_canonical_researcher_task(
             target=target, objective=objective,
             evidence_required=evidence_required,
             completion_criteria=completion_criteria,
-            inherited_context=getattr(team, "_session_summary", None) if team is not None else None,
+            inherited_context=_session_summary if _relevant else None,
         )
         canonical_hash = hashlib.sha256(
             canonical_task.encode("utf-8", errors="replace")).hexdigest()[:16]
@@ -18232,6 +18333,14 @@ async def run_task_stream(
         # _unresolvable_delegation_targets); _build_team has no MCP url in scope.
         team._hive_mcp_url = _hive_for_targets
         team._session_summary = session_summary or ""
+        # Phase T27: the original top-level task string for THIS turn -- same
+        # late-binding slot convention as team._session_summary immediately
+        # above (set once here, read by delegate_structured_task's closure at
+        # call time). Used only to decide whether THIS turn's own request
+        # carries continuity language or names an already-known path before
+        # attaching inherited context to a delegation -- see
+        # _inherited_context_is_relevant's own docstring.
+        team._task = task or ""
         # Phase A (durable execution/evidence backbone, runtime identity only --
         # no persistence here, see swarm/execution_context.py). run_task_stream
         # does not use Phase0 (no phase0.start_run() call exists on this path
@@ -22937,6 +23046,8 @@ async def run_task_async(
         # _unresolvable_delegation_targets); _build_team has no MCP url in scope.
         team._hive_mcp_url = _hive_for_targets
         team._session_summary = session_summary or ""
+        # Phase T27: see the matching line + comment in run_task_stream above.
+        team._task = task or ""
         # Same late-binding slot as the two above: the hooks read it at call time,
         # which is always after construction. None when telemetry is off, and every
         # read site is guarded on that.
