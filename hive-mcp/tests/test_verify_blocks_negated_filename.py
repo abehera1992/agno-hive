@@ -79,7 +79,8 @@ def test_the_exact_t3_live_failure_now_produces_a_finding():
     )
     findings = verify._blocks_not_in_their_file(answer)
     assert len(findings) == 1
-    resolved, sample, n = findings[0]
+    kind, resolved, sample, n = findings[0]
+    assert kind == "ABSENT"
     assert resolved == "API/business-service/models.py"
     assert n == 9
 
@@ -125,7 +126,8 @@ def test_positive_case_unaffected_last_name_still_wins_when_not_negated(tmp_path
     )
     findings = verify._blocks_not_in_their_file(answer)
     assert len(findings) == 1
-    assert findings[0][0] == "API/business-service/models.py"
+    assert findings[0][0] == "ABSENT"
+    assert findings[0][1] == "API/business-service/models.py"
 
 
 def test_negation_of_a_nonexistent_file_does_not_block_the_real_earlier_file_reversed_order():
@@ -143,7 +145,8 @@ def test_negation_of_a_nonexistent_file_does_not_block_the_real_earlier_file_rev
     )
     findings = verify._blocks_not_in_their_file(answer)
     assert len(findings) == 1
-    assert findings[0][0] == "API/business-service/models.py"
+    assert findings[0][0] == "ABSENT"
+    assert findings[0][1] == "API/business-service/models.py"
 
 
 def test_all_candidates_negated_falls_back_to_old_behavior_not_a_crash():

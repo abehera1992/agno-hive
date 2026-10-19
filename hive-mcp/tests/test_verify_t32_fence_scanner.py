@@ -49,6 +49,11 @@ def _mk_models_py(tmp_path, monkeypatch):
 def test_unclosed_fence_plus_later_same_lang_fence_produces_no_false_positive(
     tmp_path, monkeypatch,
 ):
+    """T33 (2026-10-19): the swallowed span must never be reported as a
+    confident ABSENT/BLOCK NOT IN finding (that was the T32 false positive)
+    -- but it must also no longer be silently discarded. It is now reported
+    AMBIGUOUS, counted, visible: "could not be checked" is distinct from
+    both "found absent" and "found clean"."""
     _mk_models_py(tmp_path, monkeypatch)
     answer = (
         "Defined in `models.py`:\n```python\ncla\n"
@@ -56,7 +61,9 @@ def test_unclosed_fence_plus_later_same_lang_fence_produces_no_false_positive(
         "This explanation covers several more attributes before the summary concludes.\n\n"
         "```python\nuseGetVouchersQuery\n```\n"
     )
-    assert verify._blocks_not_in_their_file(answer) == []
+    findings = verify._blocks_not_in_their_file(answer)
+    assert len(findings) == 1
+    assert findings[0][0] == "AMBIGUOUS"
 
 
 def test_unclosed_fence_plus_later_different_lang_fence_produces_no_false_positive(
@@ -69,7 +76,9 @@ def test_unclosed_fence_plus_later_different_lang_fence_produces_no_false_positi
         "This explanation covers several more attributes before the summary concludes.\n\n"
         "```typescript\nuseGetVouchersQuery\n```\n"
     )
-    assert verify._blocks_not_in_their_file(answer) == []
+    findings = verify._blocks_not_in_their_file(answer)
+    assert len(findings) == 1
+    assert findings[0][0] == "AMBIGUOUS"
 
 
 # ── 4. Complete valid quotation followed by ordinary prose ─────────────────
@@ -96,7 +105,8 @@ def test_fabricated_standalone_quotation_is_still_flagged(tmp_path, monkeypatch)
     )
     findings = verify._blocks_not_in_their_file(answer)
     assert len(findings) == 1
-    assert findings[0][0] == "models.py"
+    assert findings[0][0] == "ABSENT"
+    assert findings[0][1] == "models.py"
 
 
 # ── 6. Valid quotation remains accepted ─────────────────────────────────────
@@ -126,7 +136,10 @@ def test_t30_markdown_heading_in_truncated_block_regression_preserved(
         "useGetVouchersQuery,\n"
         "```\n"
     )
-    assert verify._blocks_not_in_their_file(answer) == []
+    findings = verify._blocks_not_in_their_file(answer)
+    assert len(findings) == 1
+    assert findings[0][0] == "AMBIGUOUS"
+    assert "BLOCK NOT IN" not in str(findings)
 
 
 # ── 8. Fence variants: tilde fences, different lengths ──────────────────────
@@ -142,6 +155,7 @@ def test_tilde_fence_fabrication_is_detected(tmp_path, monkeypatch):
     )
     findings = verify._blocks_not_in_their_file(answer)
     assert len(findings) == 1
+    assert findings[0][0] == "ABSENT"
 
 
 def test_longer_fence_length_is_closed_correctly_not_by_a_shorter_embedded_run(
@@ -173,6 +187,7 @@ def test_unclosed_fence_at_end_of_input_is_bounded_not_discarded(tmp_path, monke
     )
     findings = verify._blocks_not_in_their_file(answer)
     assert len(findings) == 1
+    assert findings[0][0] == "ABSENT"
 
 
 # ── Preserved invariants: T29 path resolution, genuine route/symbol checks ──

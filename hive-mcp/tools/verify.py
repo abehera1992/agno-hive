@@ -1145,10 +1145,28 @@ def _distinctive_lines(block: str) -> list[str]:
     return out
 
 
-def _blocks_not_in_their_file(answer: str) -> list[tuple[str, str, int]]:
+def _blocks_not_in_their_file(answer: str) -> list[tuple[str, str, str, int]]:
     """Blocks the answer attributes to a file that do not appear in that file.
 
-    (resolved_path, sample_absent_line, n_lines_checked) per finding.
+    (kind, resolved_path, sample_or_reason, n_lines_checked) per finding.
+    kind is "ABSENT" (none of the distinctive lines are present -- confirmed
+    unsupported) or "AMBIGUOUS" (T33, 2026-10-19: the fence's own boundary
+    could not be reliably determined -- a markdown heading or an embedded
+    fence-open was found inside the captured span -- so its content was
+    NEVER compared against the file at all).
+
+    T33's own reason for AMBIGUOUS existing as a separate, counted finding:
+    before this, a block whose boundary was ambiguous (T30's heading guard,
+    T32's embedded-fence-open guard) was silently skipped via a bare
+    `continue` -- live-reproduced cost: an answer whose ENTIRE fenced
+    "evidence" was one such ambiguous span produced a clean
+    "VERDICT: every checked claim exists in the project", identical in
+    wording to a genuinely fully-examined answer, even though the quoted
+    block the answer itself presented as evidence was never inspected at
+    all. A skipped check and a passed check must not render identically.
+    AMBIGUOUS counts toward `problems` (forcing a disclosure/retry), the
+    same precedent an AMBIGUOUS file:line citation already sets elsewhere
+    in this module -- unparseable is not evidence of correctness.
 
     The gap this closes: every other check here works from a `path:line` citation, and
     an answer that shows a code block while merely GESTURING at a file supplies none.
@@ -1186,25 +1204,6 @@ def _blocks_not_in_their_file(answer: str) -> list[tuple[str, str, int]]:
             continue
         if _OWN_REPORT_RE.search(block):
             continue
-        if _MD_HEADING_IN_BLOCK_RE.search(block):
-            # T30: a markdown sub-heading (##+) INSIDE captured "block
-            # content" is strong evidence this span is not a real fenced
-            # quotation at all -- still a live possibility even with
-            # _iter_fenced_blocks' correct CommonMark-compliant pairing,
-            # whenever an unclosed fence runs all the way to end of input
-            # and genuinely swallows a later heading on its way there.
-            continue
-        if _EMBEDDED_FENCE_OPEN_RE.search(block):
-            # T32: a fence-OPENING-shaped line (3+ backticks/tildes +
-            # optional info string) found INSIDE this block's own content
-            # means the scanner merged two genuinely distinct blocks --
-            # CommonMark itself has no way to treat an info-stringed line as
-            # a closer for an earlier, still-open fence (see
-            # _iter_fenced_blocks' own docstring), so this is the one
-            # residual ambiguity correct, spec-compliant scanning still
-            # cannot resolve alone. Skip rather than guess which half (or
-            # neither) is the real quotation.
-            continue
         runup = (answer or "")[max(0, start - _BLOCK_LOOKBACK):start]
         if _ILLUSTRATIVE_RE.search(runup):
             continue
@@ -1228,6 +1227,40 @@ def _blocks_not_in_their_file(answer: str) -> list[tuple[str, str, int]]:
         resolved, _ = _resolve_path(target, hint_paths=names)
         if resolved is None:
             continue
+        # T33: boundary-ambiguity checks moved HERE, after a real file has
+        # been named and resolved -- only now is there a genuine "this block
+        # is quoted evidence about THIS file" claim to be ambiguous ABOUT.
+        # Reports AMBIGUOUS (counted, visible) instead of a silent `continue`
+        # -- see this function's own docstring for why "skipped" must never
+        # render identically to "examined and clean".
+        if _MD_HEADING_IN_BLOCK_RE.search(block):
+            # T30: a markdown sub-heading (##+) INSIDE captured "block
+            # content" is strong evidence this span is not a real fenced
+            # quotation at all -- still a live possibility even with
+            # _iter_fenced_blocks' correct CommonMark-compliant pairing,
+            # whenever an unclosed fence runs all the way to end of input
+            # and genuinely swallows a later heading on its way there.
+            findings.append(("AMBIGUOUS", resolved,
+                              "fenced block contains a markdown heading -- its "
+                              "boundary could not be reliably determined and its "
+                              "content was not compared against the file", 0))
+            continue
+        if _EMBEDDED_FENCE_OPEN_RE.search(block):
+            # T32: a fence-OPENING-shaped line (3+ backticks/tildes +
+            # optional info string) found INSIDE this block's own content
+            # means the scanner merged two genuinely distinct blocks --
+            # CommonMark itself has no way to treat an info-stringed line as
+            # a closer for an earlier, still-open fence (see
+            # _iter_fenced_blocks' own docstring), so this is the one
+            # residual ambiguity correct, spec-compliant scanning still
+            # cannot resolve alone. Report AMBIGUOUS rather than guessing
+            # which half (or neither) is the real quotation.
+            findings.append(("AMBIGUOUS", resolved,
+                              "fenced block merges what looks like two distinct "
+                              "fences -- its boundary could not be reliably "
+                              "determined and its content was not compared "
+                              "against the file", 0))
+            continue
         lines = _distinctive_lines(block)
         if len(lines) < 2:
             continue
@@ -1238,7 +1271,7 @@ def _blocks_not_in_their_file(answer: str) -> list[tuple[str, str, int]]:
         flat = re.sub(r"\s+", " ", body)
         absent = [ln for ln in lines if ln not in flat]
         if len(absent) == len(lines):
-            findings.append((resolved, absent[0][:70], len(lines)))
+            findings.append(("ABSENT", resolved, absent[0][:70], len(lines)))
     return findings
 
 
@@ -2930,9 +2963,17 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     blocks = _blocks_not_in_their_file(answer)
     if blocks:
         out.append(f"QUOTED BLOCKS ({len(blocks)}):")
-        for resolved, sample, n in blocks:
-            out.append(f"  BLOCK NOT IN {resolved} <-- none of the {n} quoted lines "
-                       f"appear in that file, e.g. {sample!r}")
+        for kind, resolved, sample, n in blocks:
+            if kind == "AMBIGUOUS":
+                # T33: a block whose own fence boundary could not be
+                # reliably determined -- never compared against the file at
+                # all. Visible and counted, same as an AMBIGUOUS file:line
+                # citation elsewhere in this report -- "could not be
+                # checked" must never render the same as "checked and clean".
+                out.append(f"  AMBIGUOUS   {resolved} <-- {sample}")
+            else:
+                out.append(f"  BLOCK NOT IN {resolved} <-- none of the {n} quoted lines "
+                           f"appear in that file, e.g. {sample!r}")
         out.append("")
         problems += len(blocks)
 

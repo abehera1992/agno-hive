@@ -228,8 +228,13 @@ def test_fence_mispairing_across_an_unclosed_fence_does_not_flag_markdown_headin
         "useGetVouchersQuery,\n"
         "```\n"
     )
+    # T33 (2026-10-19): this ambiguous span is no longer silently discarded --
+    # it is reported AMBIGUOUS (counted, visible), never as a confident
+    # ABSENT/BLOCK NOT IN finding (that would be the original T30/T32 false
+    # positive this test guards against).
     findings = verify._blocks_not_in_their_file(answer)
-    assert findings == []
+    assert len(findings) == 1
+    assert findings[0][0] == "AMBIGUOUS"
 
 
 def test_ordinary_prose_about_a_file_is_not_a_source_block_claim():
@@ -278,7 +283,8 @@ def test_fabricated_source_quotation_with_no_markdown_heading_is_still_flagged(
     )
     findings = verify._blocks_not_in_their_file(answer)
     assert len(findings) == 1
-    assert findings[0][0] == "models.py"
+    assert findings[0][0] == "ABSENT"
+    assert findings[0][1] == "models.py"
 
 
 def test_a_block_with_a_single_hash_python_comment_is_still_checked(tmp_path, monkeypatch):
