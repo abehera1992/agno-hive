@@ -1971,7 +1971,44 @@ def _find_anchor_symbol(answer: str, pos: int) -> str | None:
     return found[0] if found else None
 
 
-def _find_anchor_symbols(answer: str, pos: int) -> list[str]:
+def _is_eligible_anchor_token(answer: str, tok: str) -> bool:
+    """True if a backticked span `tok` is eligible to anchor a citation --
+    shared by _find_anchor_symbols' backward and (T35) forward scans so
+    both apply IDENTICAL classification rather than two copies that could
+    drift apart.
+
+    T31 (2026-10-19): _PATHLIKE_RE's own "ends in a short alnum suffix"
+    heuristic is broader than "this is a file extension" -- it also matches
+    a genuine SHORT dotted symbol claim (`Voucher.save`, `Model.id`),
+    silently excluding it from ever becoming an anchor candidate. Reuses
+    T30's own filename/decorator-reference helpers (same real extension
+    list, same narrow contextual decorator check) instead of a second,
+    conflicting filename heuristic -- _PATHLIKE_RE's definition and its
+    other two call sites (_find_nearby_quote/_find_preceding_quote's
+    quoted-content exclusion) are unmodified.
+    """
+    if not _IDENT_RE.match(tok) and (
+        _looks_like_bare_filename(tok)
+        or _is_generic_decorator_reference(answer, tok)
+    ):
+        return False          # a path/filename or generic decorator reference
+                               # is the citation's file/pattern, not its subject
+    if tok.lower() in _NOISE:
+        return False
+    return bool(_IDENT_RE.match(tok) or _DOTTED_RE.match(tok))
+
+
+# T35 (2026-10-19): how far FORWARD of a citation's END to look for its
+# anchor symbol, mirroring _find_anchor_symbols' own backward window.
+# Reuses _LABELED_LINE_FORWARD_WINDOW rather than a new constant -- it
+# already exists for the identical need (how far forward to look for a
+# citation's own referent before assuming none is there), just previously
+# only wired into the _LABELED_LINE_RE path-pairing loop, never into anchor
+# resolution.
+_ANCHOR_FORWARD_WINDOW = _LABELED_LINE_FORWARD_WINDOW
+
+
+def _find_anchor_symbols(answer: str, pos: int, cite_end: int | None = None) -> list[str]:
     """EVERY backticked identifier a citation could be about, nearest FIRST.
 
     Nearest-wins (the original single-anchor rule) is right most of the time and
@@ -1993,8 +2030,24 @@ def _find_anchor_symbols(answer: str, pos: int) -> list[str]:
     naming symbols that are all genuinely elsewhere still fails -- while removing a
     whole class of false alarms, which matters because a checker that flags correct
     answers gets ignored, taking its true positives with it.
+
+    T35 (2026-10-19): `pos` was always treated as the citation's START, and this
+    function only ever searched BACKWARD from it -- a symbol anchor sitting AFTER
+    the citation (the common "`file:line` -- `symbol`" shape) was invisible here
+    regardless of how obviously it was the citation's intended referent.
+    Reproduced directly: `models.py:10 -- \\`Voucher.save\\`` (the real definition
+    is at line 449) produced zero anchors and therefore zero finding for a
+    genuinely wrong citation -- a silent false negative, not a crash or a visible
+    warning. `cite_end`, when supplied by the caller (the citation match's own
+    `.end()`), now ALSO scans a bounded forward window using the IDENTICAL
+    eligibility check as the backward scan (_is_eligible_anchor_token) -- no new
+    or looser classification, and the forward scan is clamped to the next
+    citation's own boundary (`_citation_bounds`' `hi`) exactly like
+    _find_nearby_quote's own forward search already is, so it can never steal a
+    DIFFERENT citation's anchor. Backward results still come first (unchanged
+    priority for the common case), forward results are appended after.
     """
-    lo, _ = _citation_bounds(answer, pos)
+    lo, hi = _citation_bounds(answer, pos)
     start = max(0, pos - _LABELED_LINE_WINDOW, lo)
     window = answer[start:pos]
     heading = None
@@ -2006,34 +2059,19 @@ def _find_anchor_symbols(answer: str, pos: int) -> list[str]:
     found: list[str] = []
     for m in _BACKTICK_RE.finditer(window):
         tok = m.group(1).strip()
-        # T31 (2026-10-19): _PATHLIKE_RE's own "ends in a short alnum suffix"
-        # heuristic is broader than "this is a file extension" -- it also
-        # matches a genuine SHORT dotted symbol claim (`Voucher.save`,
-        # `Model.id`), silently excluding it from ever becoming an anchor
-        # candidate. Reproduced directly: a citation whose only nearby
-        # candidates are a bare filename (`inventoryApi.ts`) and a genuine
-        # short dotted symbol (`Voucher.save`) lost BOTH to this one check,
-        # leaving the citation with zero anchors and therefore never
-        # evaluated for a MISMATCH at all (see the CITATIONS loop's own
-        # `anchors = symbol_claims.get((path, num)) or []` -- an empty list
-        # skips the `for a in anchors` loop entirely, a silent false
-        # negative, not a crash or a visible warning). Reuses T30's own
-        # filename/decorator-reference helpers (same real extension list,
-        # same narrow contextual decorator check) instead of a second,
-        # conflicting filename heuristic -- _PATHLIKE_RE's definition and
-        # its other two call sites (_find_nearby_quote/_find_preceding_quote's
-        # quoted-content exclusion) are unmodified.
-        if not _IDENT_RE.match(tok) and (
-            _looks_like_bare_filename(tok)
-            or _is_generic_decorator_reference(answer, tok)
-        ):
-            continue          # a path/filename or generic decorator reference
-                               # is the citation's file/pattern, not its subject
-        if tok.lower() in _NOISE:
-            continue
-        if (_IDENT_RE.match(tok) or _DOTTED_RE.match(tok)) and tok not in found:
+        if _is_eligible_anchor_token(answer, tok) and tok not in found:
             found.append(tok)
     found.reverse()                          # nearest first
+
+    if cite_end is not None and cite_end < hi:
+        fwd_window = answer[cite_end:min(cite_end + _ANCHOR_FORWARD_WINDOW, hi)]
+        fwd_heading = _MD_HEADING_RE.search(fwd_window)
+        if fwd_heading is not None:
+            fwd_window = fwd_window[:fwd_heading.start()]
+        for m in _BACKTICK_RE.finditer(fwd_window):
+            tok = m.group(1).strip()
+            if _is_eligible_anchor_token(answer, tok) and tok not in found:
+                found.append(tok)
     return found
 
 
@@ -2394,7 +2432,7 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             if quoted:
                 content_claims[pair] = quoted
         if pair not in symbol_claims:
-            anchors = _find_anchor_symbols(answer, m.start())
+            anchors = _find_anchor_symbols(answer, m.start(), m.end())
             if anchors:
                 symbol_claims[pair] = anchors
 
@@ -2460,7 +2498,7 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                 if quoted:
                     content_claims[pair] = quoted
             if pair not in symbol_claims:
-                anchors = _find_anchor_symbols(answer, m.start())
+                anchors = _find_anchor_symbols(answer, m.start(), m.end())
                 if anchors:
                     symbol_claims[pair] = anchors
 
