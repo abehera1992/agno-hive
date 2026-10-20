@@ -18148,11 +18148,26 @@ def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
         _queue = _pending_entries.get(key)
         if isinstance(_queue, list) and _queue:
             if len(_queue) > 1:
-                print(f"[team] T42: FIFO fallback resolving an AMBIGUOUS "
+                # T43 (Track A): the T42 diagnostic's own count-only message could
+                # tell a future reader THAT an ambiguous pop happened, but not
+                # WHICH candidates were in contention or which one was chosen --
+                # insufficient to ever diagnose a real misassociation after the
+                # fact, only to confirm ambiguity existed. Bounded to each
+                # candidate's own `target` field only (a file/module path or
+                # short phrase, never the full objective/evidence_required
+                # prose, a tool argument, or anything else that could carry
+                # sensitive content) -- enough to tell candidates apart, nothing
+                # more exposed than this file's own existing "move-on hint"
+                # already surfaces to the model in plain text elsewhere.
+                _candidate_targets = [
+                    str((e.get("args") or {}).get("target") or "?") for e in _queue
+                ]
+                print(f"[team] T43: FIFO fallback resolving an AMBIGUOUS "
                       f"completion for {agent_name!r} -- {len(_queue)} "
-                      f"entries pending, no run_id correlation available, "
-                      f"popping the oldest without positive evidence it is "
-                      f"the correct one", flush=True)
+                      f"entries pending (targets: {_candidate_targets!r}), "
+                      f"choosing {_candidate_targets[0]!r} (oldest) without "
+                      f"positive evidence it is the correct one -- no run_id "
+                      f"correlation was available for this completion", flush=True)
             _pending_entry = _queue.pop(0)
             if _pending_entry is not None:
                 _by_run_cleanup = getattr(team, "_pending_log_entry_by_run_id", None)
