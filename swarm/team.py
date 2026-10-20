@@ -8143,6 +8143,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                     else _swept_directory_not_reported(content, team))
     _integ_note = await _integration_mechanism_missing(
         task, content, hive_mcp_url, hive_mcp_tools)
+    _svc_note = await _unconfirmed_service_inclusion(
+        task, content, hive_mcp_url, hive_mcp_tools)
     _models_note = ("" if _asks_for_one_fact(task) else
                     await _declared_models_not_reported(
                         task, content, hive_mcp_url, hive_mcp_tools,
@@ -8176,7 +8178,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         return (_stale_findings_dropped(_fab_note, content)
                 + _cmp_note + completeness + _lost_report_evidence(team)
                 + _count_note + _term_note + _scope_note + _opened_note
-                + _integ_note + _models_note + _table_note
+                + _integ_note + _svc_note + _models_note + _table_note
                 + _docs_note + _fields_note
                 + _summarize_actual_writes(*all_results))
 
@@ -11299,6 +11301,98 @@ async def _integration_mechanism_missing(task: str, content: str,
             f"{', '.join('`' + s + '`' for s in sites[:_MAX_INTEGRATION_SITES])}.**")
 
 
+# T36 Track C (2026-10-19 battery, T11): a cross-service tracing task asked "which
+# services are involved when X happens" named email-service and imagegen-service
+# alongside the correctly-traced business-service/storage-service chain. Traced to its
+# exact cause: the Researcher's own FIRST step was a bare keyword grep ("seller" OR
+# "document") across the whole repo, which surfaces ANY file mentioning either word for
+# ANY reason -- email-service/security.py and imagegen-service/security.py/main.py
+# matched on generic, unrelated content, and the model then read deeper into each one
+# ("I'll check if there are any OTHER services involved... such as the email-service...
+# imagegen-service...") and reported genuine, real functions it found there
+# (_get_seller_credentials, upload_bytes) as part of the upload chain -- without ever
+# finding or citing an actual call, import, or config reference connecting either
+# service to business-service or storage-service.
+#
+# Design note (mandatory gate, see this track's own mission text, reproduced in the
+# T36 final report): the evidence contract for a service genuinely belonging in a
+# dependency trace is a verified call-site, import, or config-mediated reference TO or
+# FROM an already-established member of the chain -- never mere keyword co-occurrence,
+# directory existence, or a function simply having a plausibly-related name. This
+# project already names its one deterministic, grep-verifiable config-mediated
+# contract by convention (see _integration_mechanism_missing immediately above):
+# `<TARGET>_SERVICE_URL`. A generic semantic-relevance classifier is explicitly OUT of
+# scope (the mission's own design gate forbids inventing one from a single
+# observation) -- this checks only for that one, already-proven, already-deployed
+# contract, repo-wide rather than scoped to a specific directory (EkamApp's real
+# service-client wrappers live in a shared `API/utils/service_clients/` directory, not
+# inside either service's own tree, so scoping the search to "the other service's own
+# directory" would have produced false positives on the genuine business-service/
+# storage-service link this check must not disturb).
+#
+# Deliberately conservative in both directions this design note requires:
+#   * FALSE POSITIVES: only ever a DISCLOSURE (never a retry, never a rewrite, never a
+#     removal) -- the answer's own content is untouched either way.
+#   * FALSE NEGATIVES: if `<SVC>_SERVICE_URL` exists ANYWHERE in the repo for a named
+#     service (even for a reason unrelated to THIS task), this stays silent on that
+#     service -- an unverified relationship is reported as uncertain, never asserted
+#     disproven; see this check's own banner wording.
+_SERVICES_INVOLVED_TASK_RE = re.compile(
+    r"\bwhich\s+services?\b|\bservices?\s+(?:are|were)\s+involved\b|"
+    r"\btrace\s+(?:this|the)\s+(?:call\s+)?chain\b",
+    re.I,
+)
+_NAMED_SERVICE_RE = re.compile(r"\b([a-z][\w]*-service)\b", re.I)
+_MAX_UNCONFIRMED_SERVICES = 4
+
+
+async def _unconfirmed_service_inclusion(task: str, content: str,
+                                          hive_mcp_url: str | None,
+                                          hive_mcp_tools=None) -> str:
+    """A cross-service tracing task named a service with no verified link to any
+    other service it also named -- see this section's own design-note comment above
+    for the full evidence contract and the live T11 incident this closes.
+
+    Needs at least 3 distinct named services to be worth checking at all: a two-service
+    answer has nothing to cross-check against itself, and would make every genuinely
+    simple, correct two-service chain fire this check for no reason.
+    """
+    if not task or not _SERVICES_INVOLVED_TASK_RE.search(task):
+        return ""
+    named = sorted({m.group(1).lower() for m in _NAMED_SERVICE_RE.finditer(content or "")})
+    if len(named) < 3:
+        return ""
+
+    unconfirmed = []
+    for svc in named:
+        const = svc.upper().replace("-", "_") + "_SERVICE_URL"
+        hits = await _repo_search_text(const, "", hive_mcp_url, hive_mcp_tools)
+        if not (hits or "").strip():
+            unconfirmed.append(svc)
+    # All-or-nothing is silent: if EVERY named service alike shows no constant, the
+    # live search most likely did not run at all this call (hive-mcp unreachable) or
+    # this project simply does not use this convention for any of them -- a different
+    # problem than scope creep, and not this check's to diagnose. Flagging only fires
+    # when the chain is genuinely split between confirmed and unconfirmed members.
+    if not unconfirmed or len(unconfirmed) == len(named):
+        return ""
+
+    print(f"[team] service-inclusion check: {unconfirmed} named with no "
+          f"<SVC>_SERVICE_URL found anywhere in the repo, alongside "
+          f"{sorted(set(named) - set(unconfirmed))} which do have one", flush=True)
+    return (
+        f"\n\n---\n**SERVICE INCLUSION NOT CONFIRMED BY A VERIFIED LINK — the answer "
+        f"names {', '.join(f'`{s}`' for s in unconfirmed[:_MAX_UNCONFIRMED_SERVICES])} "
+        f"among the services involved, but no `<SERVICE>_SERVICE_URL` constant for "
+        f"{'it' if len(unconfirmed) == 1 else 'any of them'} was found anywhere in the "
+        f"repository (search_files, this run) -- unlike "
+        f"{', '.join(f'`{s}`' for s in sorted(set(named) - set(unconfirmed)))}, which "
+        f"does have one. This may still be correct (a relationship this check cannot "
+        f"see, such as a message queue, shared database, or a convention this project "
+        f"does not use for this service) -- it is reported as unconfirmed, not as an "
+        f"error.**"
+    )
+
 
 # A service's ORM classes, from its models.py. Same shape as _mounted_router_files: the
 # ground truth is read out of the source, not inferred from what a member happened to
@@ -11784,7 +11878,7 @@ def _stale_findings_dropped(note: str, content: str) -> str:
 async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None,
                                    hive_mcp_tools, label: str,
                                    record: dict | None = None) -> list[str]:
-    """The five guards that re-derive their facts from the repo, run against `content`.
+    """The six guards that re-derive their facts from the repo, run against `content`.
 
     Shared by the parent-process rescue (repair_unguarded_draft) and the corrected-answer
     path inside _verified_answer. One implementation because these two callers must not
@@ -11806,6 +11900,7 @@ async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None
             _scoped_coverage_gap(task, content, hive_url, hive_mcp_tools,
                                  record=record),
             _integration_mechanism_missing(task, content, hive_url, hive_mcp_tools),
+            _unconfirmed_service_inclusion(task, content, hive_url, hive_mcp_tools),
             _code_question_answered_from_docs(task, content, hive_url,
                                               hive_mcp_tools),
             _fields_not_declared_on_type(task, content, hive_url,
