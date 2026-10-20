@@ -16010,7 +16010,22 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                 str((args or {}).get("member_id", "")).strip())
             if not isinstance(getattr(team, "_pending_log_entry_by_member", None), dict):
                 team._pending_log_entry_by_member = {}
-            team._pending_log_entry_by_member[_dispatch_member_id] = log[-1]
+            # T40 (F3): a FIFO QUEUE per member, not a single slot. A single slot
+            # overwritten on every dispatch meant a SECOND delegation to the same
+            # member, dispatched before the FIRST one's own result materialized,
+            # silently replaced the bridge target -- so the first delegation's own
+            # streamed text later got tagged onto the SECOND entry (not its own),
+            # and the second's own text onto nothing (or a THIRD entry), instead of
+            # each entry's own result. Live-confirmed: a repeat ask for the backend
+            # endpoints target was served "ALREADY DONE... The frontend hooks used
+            # by the vouchers module..." -- a completely different delegation's
+            # text. A member handles its own delegations one at a time internally,
+            # so completions resolve in dispatch order even though dispatch itself
+            # returns immediately (an async generator placeholder) -- FIFO (append
+            # here, pop the oldest in _finalise_member_chunks) matches that
+            # invariant exactly, so no entry is ever tagged with another
+            # delegation's text.
+            team._pending_log_entry_by_member.setdefault(_dispatch_member_id, []).append(log[-1])
         # isinstance(str) is load-bearing, not defensive (2026-08-24). delegate_task_to_member
         # returns an async_generator on the streaming path -- the sibling logger a few
         # lines up prints `delegate result: async_generator` for exactly that reason and
@@ -17938,15 +17953,23 @@ def _finalise_member_chunks(team, agent_name: str) -> None:
     team._member_results[key] = text
     # Phase P.2 (2026-10-04): tag the delegation-log entry this text actually belongs
     # to, now that it exists -- the bridge set at dispatch time (see the duplicate-
-    # delegation gate's log.append call site). Popped, not just read: a member
-    # delegated to twice must not have its SECOND result retroactively tag the FIRST
-    # entry if something here were ever re-entered, and this mirrors the "overwrite,
-    # not accumulate" semantics team._member_results itself already uses one line up.
+    # delegation gate's log.append call site).
+    #
+    # T40 (F3): pops the OLDEST still-pending entry for this member (FIFO), not a
+    # single slot -- see the dispatch-time comment for the incident this closes. A
+    # member delegated to twice must not have its SECOND result retroactively tag
+    # the FIRST entry; FIFO pop order guarantees each finalize consumes the entry
+    # whose own dispatch is oldest and still unresolved, matching completion order
+    # to dispatch order, which mirrors the "overwrite, not accumulate" semantics
+    # team._member_results itself already uses one line up -- the newest completion
+    # always wins there, and here each entry still gets its OWN, correct text.
     _pending_entries = getattr(team, "_pending_log_entry_by_member", None)
     if isinstance(_pending_entries, dict):
-        _pending_entry = _pending_entries.pop(key, None)
-        if _pending_entry is not None:
-            _pending_entry["result"] = text
+        _queue = _pending_entries.get(key)
+        if isinstance(_queue, list) and _queue:
+            _pending_entry = _queue.pop(0)
+            if _pending_entry is not None:
+                _pending_entry["result"] = text
     # Mirrored to module scope for the same reason _best_draft is: the liveness
     # heartbeat has no `team` in scope, and on an auto-kill the parent process is the
     # only thing left alive. Without this, a killed run hands back the coordinator's
