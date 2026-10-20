@@ -21766,6 +21766,22 @@ def _names_something(line: str) -> bool:
     return any(r.search(stripped) for r in _CONCRETE_ITEM_RES)
 
 
+def _list_item_identity(line: str) -> str:
+    """Collapse one list line to the identity `_count_contradicts_own_list` dedupes by.
+
+    Strips the bullet/number prefix and markdown backtick/bold emphasis, then
+    normalizes whitespace and case, so "- `foo.py`" and "- **foo.py**" collapse to the
+    same identity. Deliberately coarse: this backs a SUPPRESSION (the same item
+    restated, not a new one), so collapsing two genuinely different items into one
+    identity only costs a missed detection, never a false suppression of a real
+    discrepancy -- the raw `actual`/`concrete` counts stay untouched and still drive
+    every other branch of that check.
+    """
+    stripped = re.sub(r"^\s*(?:[-*+•]|\d{1,3}[.)])\s*", "", line.strip())
+    stripped = stripped.replace("`", "").replace("*", "")
+    return re.sub(r"\s+", " ", stripped).strip().lower()
+
+
 # A stated count paired with the TYPE of thing counted -- "8 endpoints", "21 tables",
 # "16 RTK Query hooks". Up to two words may sit between the number and the noun so
 # "16 RTK Query hooks" and "10 frontend hooks" both bind. The lookbehind is the same
@@ -21909,7 +21925,17 @@ def _count_contradicts_own_list(content: str) -> tuple[int, int, str, int] | Non
     """
     if not content:
         return None
+    # How far the text has already been consumed as part of a PREVIOUS match's list
+    # scan. The T6 merge artifact embeds a second "N files. Here is the list:" intro
+    # INSIDE the first list's own block (glued onto a bullet with no newline) -- that
+    # second intro is a real, independent _COUNT_INTRO_RE match, but it names no claim
+    # of its own; it is debris from the same repeated block the first match already
+    # walked through and (correctly) suppressed. Without this, the loop would re-score
+    # that embedded fragment as a fresh, separate disagreement.
+    scanned_until = 0
     for m in _COUNT_INTRO_RE.finditer(content):
+        if m.start() < scanned_until:
+            continue
         stated = int(m.group(1))
         # Below 2 there is no list to speak of; above 100 a hand-written enumeration is
         # not what is being described.
@@ -21931,21 +21957,43 @@ def _count_contradicts_own_list(content: str) -> tuple[int, int, str, int] | Non
             continue
         if _LOCATION_WORD_BEFORE_RE.search(content[:m.start()]):
             continue
-        actual = concrete = 0
-        for line in content[m.end():].splitlines():
+        actual = concrete = consumed = 0
+        seen_identities: set[str] = set()
+        distinct = 0
+        for line in content[m.end():].splitlines(keepends=True):
             stripped = line.strip()
             if not stripped:
+                consumed += len(line)
                 continue        # markdown lists are often blank-line separated
             if _LIST_LINE_RE.match(stripped):
                 actual += 1
                 concrete += _names_something(stripped)
+                identity = _list_item_identity(stripped)
+                if identity not in seen_identities:
+                    seen_identities.add(identity)
+                    distinct += 1
+                consumed += len(line)
             else:
                 break           # prose ends the list
+        scanned_until = max(scanned_until, m.end() + consumed)
         # Two items minimum: a single line after a count is usually a sentence that
         # happens to start with a dash, not an enumeration.
         if actual < 2:
             continue
         if actual != stated:
+            # T6 (2026-10-19 battery): the additive answer-adoption architecture can
+            # glue a repeated draft's intro sentence onto the END of the first list's
+            # last bullet with no paragraph break between them -- nothing then breaks
+            # this scan before it walks straight into a second, verbatim copy of the
+            # SAME list and counts every item twice. A correct 24-file answer measured
+            # 28 this way (24 originals + the first 4 items of the restated copy,
+            # before unbroken prose finally ended the scan). Fixing where the answer
+            # gets assembled is out of scope here -- this only fixes the counter: if
+            # every item beyond `stated` is a normalized duplicate of one already
+            # counted in this same block, the list states ONE inventory twice, not two
+            # disagreeing ones, and this is not a genuine contradiction to report.
+            if distinct == stated:
+                continue
             return stated, actual, m.group(0).strip().rstrip(":"), concrete
         # Item count agrees; the padded-filler case. Only report when dropping the
         # unqualified items breaks the agreement -- an answer whose items are all
