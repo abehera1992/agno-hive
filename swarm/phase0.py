@@ -200,6 +200,31 @@ def _slot(member: str) -> dict:
     key = (member or "unknown").strip().lower()
     return _actions.setdefault(key, {
         "tool_calls_made": 0,
+        # T38: a SEPARATE counter from tool_calls_made, reset at each
+        # delegation boundary (note_delegation_start). Added because
+        # tool_call_limit (agno's own hard cap, config.tool_call_limit /
+        # _resolve_tool_call_limit) is enforced via agno's own
+        # current_function_call_count -- a LOCAL variable inside agno's
+        # response()/arun() that starts at 0 on every invocation and is
+        # NEVER persisted on the Agent object across invocations (confirmed
+        # by reading the installed agno/models/base.py directly). A
+        # persistent Team's member Agent is invoked fresh once per
+        # delegation, so that ceiling is a PER-DELEGATION budget. But
+        # tool_calls_made is, by its own longstanding design (see its
+        # "Reset per run by start_run()" note above), a RUN-WIDE CUMULATIVE
+        # counter across every delegation to that member. record_member_result
+        # used to compare the cumulative count directly against the
+        # per-delegation limit (`calls >= tool_call_limit`) to decide
+        # terminal_reason -- correct only for a member delegated to once per
+        # run. A T37 live incident (session fd5bf842c52c) logged
+        # "tool_calls_made: 79" against "tool_call_limit: 25" for one
+        # member_result snapshot; tracing both sides of that comparison to
+        # their source showed this is almost certainly the SAME scope
+        # mismatch (likely ~3 delegations each within their own 25-call
+        # budget), not a 79-call single-invocation enforcement bypass. This
+        # counter lets record_member_result compare like with like, without
+        # changing what tool_calls_made has meant anywhere else it's read.
+        "tool_calls_this_delegation": 0,
         "write_tool_calls_reached_hook": 0,
         "write_tool_calls_executed": 0,
         "write_tool_calls_failed": 0,
@@ -208,6 +233,19 @@ def _slot(member: str) -> dict:
         "tool_choice_escalations": 0,
         "tool_choice_raw": [],
     })
+
+
+def note_delegation_start(member: str) -> None:
+    """Called once per delegation (team.py's _start_member_objective, the
+    production point a new delegate_structured_task call begins) to reset
+    THIS member's per-delegation tool-call counter to 0. Never touches
+    tool_calls_made, which stays cumulative for the whole run by design --
+    see _slot's own comment on tool_calls_this_delegation for why the two
+    counters must not be conflated."""
+    try:
+        _slot(member)["tool_calls_this_delegation"] = 0
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def note_tool_call(member: str, function_name: str, result_text: str | None) -> None:
@@ -229,6 +267,7 @@ def note_tool_call(member: str, function_name: str, result_text: str | None) -> 
     try:
         s = _slot(member)
         s["tool_calls_made"] += 1
+        s["tool_calls_this_delegation"] += 1
         if function_name not in _WRITE_TOOLS:
             return
         s["write_tool_calls_reached_hook"] += 1
@@ -505,13 +544,25 @@ class Phase0Run:
             act = action_snapshot(member)
             writes_exec = act.get("write_tool_calls_executed", 0)
             calls = act.get("tool_calls_made", 0)
+            # T38: classify against THIS delegation's own count, not the
+            # run-wide cumulative one -- tool_call_limit is a per-delegation
+            # ceiling (see _slot's tool_calls_this_delegation comment for the
+            # proof), and comparing it against the cumulative `calls` across
+            # a member delegated to more than once in this run misclassifies
+            # a perfectly-within-budget later delegation as "tool_limit"
+            # just because earlier delegations' calls are still in the sum.
+            # Falls back to `calls` itself if the field is ever absent (a
+            # caller that predates this field, or one that never imported
+            # the new default) so an unintegrated caller sees the exact
+            # pre-T38 behavior rather than a crash.
+            calls_this_delegation = act.get("tool_calls_this_delegation", calls)
             # terminal_reason uses ONLY evidence this record can actually carry.
             # liveness_stop and exception are run-level outcomes that are not known at
             # the moment a member's result lands, so they are never claimed here --
             # the run-level record and the journal carry those.
             if forced_text_only:
                 reason = "tool_choice_none"
-            elif tool_call_limit and calls >= tool_call_limit:
+            elif tool_call_limit and calls_this_delegation >= tool_call_limit:
                 reason = "tool_limit"
             elif content.strip():
                 reason = "normal_finish"
@@ -519,6 +570,7 @@ class Phase0Run:
                 reason = "unknown"
             self.member_results[-1].update({
                 "tool_calls_made": calls,
+                "tool_calls_this_delegation": calls_this_delegation,
                 "tool_call_limit": tool_call_limit,
                 "terminal_reason": reason,
                 "terminal_reason_evidence": {

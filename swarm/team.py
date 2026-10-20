@@ -6297,6 +6297,12 @@ def _start_member_objective(
         completion_criteria=completion_criteria,
     )
     _get_member_control_box(team).start(state)
+    # T38: reset this member's per-delegation tool-call counter here too --
+    # the one production point a new delegation to this member begins, same
+    # as the control-box state above. See phase0._slot's
+    # tool_calls_this_delegation comment for why a separate, delegation-
+    # scoped counter exists alongside the run-wide cumulative one.
+    phase0.note_delegation_start(member_id)
     print(f"[team] CONTROL_BOX_OBJECTIVE_STARTED: member_id={member_id!r} "
           f"delegation_key={delegation_key} objective={objective!r}", flush=True)
 
