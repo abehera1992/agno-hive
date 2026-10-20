@@ -7179,6 +7179,18 @@ _ENV_OS_CLAIM_RE = re.compile(r"\bOS\s*:?\s*([A-Za-z][\w.\- ]{2,40})", re.IGNORE
 _ENV_PY_CLAIM_RE = re.compile(r"\bPython\s*:?\s+(\d+\.\d+(?:\.\d+)?)")
 _ENV_BRANCH_CLAIM_RE = re.compile(
     r"\b(?:current |git )?branch\s*(?:is|:)\s*[`\"']?([\w./-]+)", re.IGNORECASE)
+# T9's own historical incident, the cwd-specific half (T36 Track E, 2026-10-19
+# battery): 3 of 4 prior recorded runs relabeled get_env_info's "Project root"
+# field as "Current working directory" -- a different value entirely
+# (PROJECT_ROOT is a configured constant; cwd is os.getcwd(), see hive-mcp's
+# own test_get_env_info_cwd.py for the tool-level fix). Nothing at the SWARM
+# layer checked this distinction survived delegation -- only OS/Python-version
+# had a deterministic backstop. The 2026-10-19 run got it right, but nothing
+# would have caught a relapse.
+_ENV_CWD_CLAIM_RE = re.compile(
+    r"\b(?:current\s+working\s+directory|cwd)\b\s*(?:is\s*)?:?\s*[`\"']?([\w./\\-]+)",
+    re.IGNORECASE)
+_ENV_REAL_CWD_RE = re.compile(r"\bCurrent working directory:\s*(\S+)", re.IGNORECASE)
 
 
 def _integrity_db_count_contradiction(content: str, team) -> tuple[str, str] | None:
@@ -7210,8 +7222,9 @@ def _integrity_db_count_contradiction(content: str, team) -> tuple[str, str] | N
 
 
 def _integrity_env_fact_contradiction(content: str, team) -> tuple[str, str, str] | None:
-    """(field, claimed, real) when the answer states an OS or Python-version fact
-    that contradicts get_env_info's own captured preview THIS RUN made, or None.
+    """(field, claimed, real) when the answer states an OS, Python-version, or
+    current-working-directory fact that contradicts get_env_info's own captured
+    preview THIS RUN made, or None.
 
     T9's own historical incident (see _captured_tool_evidence's docstring) is exactly
     this shape: a coordinator asserted "Ubuntu 22.04.4 LTS / Python 3.11.6" while
@@ -7219,6 +7232,13 @@ def _integrity_env_fact_contradiction(content: str, team) -> tuple[str, str, str
     existing verify_claims/count/table checks are all structurally blind to (none of
     them read OS or interpreter-version strings). This is the deterministic backstop
     for that specific, previously-uncaught shape.
+
+    The cwd check (T36 Track E, 2026-10-19) closes the other half of the same
+    historical incident, never previously backstopped here: 3 of 4 recorded T9
+    runs relabeled get_env_info's "Project root" field as "Current working
+    directory" -- a different value (PROJECT_ROOT is a configured constant,
+    cwd is os.getcwd()). The 2026-10-19 run got this right on its own; this
+    adds the backstop so a relapse would not ship silently again.
     """
     evidence = getattr(team, "_tool_evidence", None)
     if not isinstance(evidence, list):
@@ -7246,6 +7266,15 @@ def _integrity_env_fact_contradiction(content: str, team) -> tuple[str, str, str
             # this only needs to catch a genuinely different operating system.
             if claimed_os.split()[0].lower() != real_os.split()[0].lower():
                 return "operating system", claimed_os, real_os
+
+    cwd_claim = _ENV_CWD_CLAIM_RE.search(content or "")
+    if cwd_claim:
+        cwd_real = _ENV_REAL_CWD_RE.search(combined)
+        if cwd_real:
+            claimed_cwd = cwd_claim.group(1).strip().rstrip(".,")
+            real_cwd = cwd_real.group(1).strip().rstrip(".,")
+            if claimed_cwd != real_cwd:
+                return "current working directory", claimed_cwd, real_cwd
     return None
 
 
