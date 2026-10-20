@@ -18113,9 +18113,46 @@ def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
             _queue = _pending_entries.get(key)
             if isinstance(_queue, list):
                 _queue[:] = [e for e in _queue if e is not _pending_entry]
+    # T42 (Track B): audited this fallback against the safety invariant "a
+    # result may be attached to a target only when there is actual evidence
+    # it originated from that target's delegation." Popping FIFO-oldest when
+    # run_id correlation did not resolve is PROVEN unsafe under adversarial
+    # out-of-order completion with 2+ genuinely pending entries (T41's own
+    # Case 3 -- a direct, reproducible demonstration, not a theoretical
+    # concern). A stricter fix (only pop when exactly one entry is pending,
+    # otherwise leave all entries unresolved) was built and tested, and
+    # rejected: it breaks T40's and T41's OWN existing, already-committed
+    # tests that deliberately exercise this exact fallback WITHOUT a run_id
+    # and expect FIFO-pop to resolve a legitimate IN-ORDER multi-entry
+    # completion correctly (test_case2_overlapping_dispatch_in_order_
+    # completion, test_interleaved_dispatches_do_not_cross_tag_each_others_
+    # result, test_three_interleaved_dispatches_each_keep_their_own_text) --
+    # and T42 explicitly forbids modifying those tests. The ambiguity is
+    # fundamental: with no run_id and 2+ pending entries, in-order completion
+    # (safe, FIFO-correct) and out-of-order completion (unsafe, FIFO-wrong)
+    # are INDISTINGUISHABLE from the information available at this exact
+    # point -- there is no way to tell them apart without MORE evidence than
+    # exists here, which is why run_id correlation (the real fix, already
+    # in place) is the primary mechanism and this path is the safety net for
+    # whatever still reaches it (an older agno, a missed RunStarted event, or
+    # a caller that bypasses claiming entirely, as these specific tests do).
+    # Left as FIFO-pop (T40's original, unmodified behavior) rather than a
+    # stricter rule this phase cannot safely ship -- reported as an
+    # unresolved safety question (Outcome B3-C: evidence insufficient to
+    # safely change this path further), not claimed as proven safe. The one
+    # change made: logged explicitly whenever this fallback resolves an
+    # AMBIGUOUS case (2+ candidates) so a future phase has real visibility
+    # into how often production actually reaches it, rather than inferring
+    # frequency from code reading alone.
     if _pending_entry is None and isinstance(_pending_entries, dict):
         _queue = _pending_entries.get(key)
         if isinstance(_queue, list) and _queue:
+            if len(_queue) > 1:
+                print(f"[team] T42: FIFO fallback resolving an AMBIGUOUS "
+                      f"completion for {agent_name!r} -- {len(_queue)} "
+                      f"entries pending, no run_id correlation available, "
+                      f"popping the oldest without positive evidence it is "
+                      f"the correct one", flush=True)
             _pending_entry = _queue.pop(0)
             if _pending_entry is not None:
                 _by_run_cleanup = getattr(team, "_pending_log_entry_by_run_id", None)
