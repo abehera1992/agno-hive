@@ -49,8 +49,37 @@ class RolePolicy:
 
 _route_cache: dict[str, ModelRoute] = {}
 _role_policy_cache: dict[tuple[str, str], RolePolicy] = {}
+# T39: a SEPARATE, lowercase-keyed index onto the SAME RolePolicy objects,
+# used only as a lookup fallback -- _role_policy_cache's own keys keep the
+# DB's natural casing untouched, so reload()'s admin-facing diff output
+# (which derives its "team/role" display strings directly from this cache's
+# keys) is unaffected by this fix.
+#
+# Root cause this closes: team.py's budget guard hook resolves a role's
+# tool_call_limit using the role's natural DB casing ('Researcher', from
+# spec.name) and gets the real DB override correctly. phase0's own telemetry
+# call site (record_member_result) resolves the SAME role through
+# _member_key() first, which lowercases and strips separators for member-
+# identity comparison elsewhere in team.py -- 'researcher'. Before this fix,
+# the exact-string dict lookup on 'researcher' silently missed the cache
+# entry keyed by 'Researcher' and fell through to config.tool_call_limit
+# (25), while the budget guard hook's own resolution of the SAME role in the
+# SAME run correctly returned 80. Live-confirmed via ZGX journalctl recovery
+# of the T13a-T37-LIVE1 incident: a `[budget] Researcher: call 79/80` log
+# line (real enforcement, correct) alongside a `tool_call_limit: 25`
+# telemetry field (wrong) for the identical delegation. The incident's own
+# "79 vs 25" framing was therefore never a budget violation -- the model
+# legitimately used 79 of its real 80-call budget; this was a telemetry
+# case-mismatch, not an enforcement defect. team_name is left untouched --
+# every team_name observed in this codebase is already consistently
+# lowercase, and nothing in this incident implicated that axis.
+_role_policy_cache_ci: dict[tuple[str, str], RolePolicy] = {}
 _cache_loaded = False
 _load_lock = asyncio.Lock()
+
+
+def _ci_role_key(team_name: str, role_name: str) -> tuple[str, str]:
+    return (team_name, (role_name or "").strip().lower())
 
 
 def get_route(model_id: str) -> ModelRoute | None:
@@ -68,7 +97,7 @@ def get_default_model(team_name: str, role_name: str) -> str | None:
     YAML omits a role's model: field — the team YAML's own model: field, when
     present, always takes precedence over this. Thin wrapper over
     get_role_policy() for callers that only ever needed the model id."""
-    policy = _role_policy_cache.get((team_name, role_name))
+    policy = get_role_policy(team_name, role_name)
     return policy.model_id if policy else None
 
 
@@ -76,8 +105,17 @@ def get_role_policy(team_name: str, role_name: str) -> RolePolicy | None:
     """Sync, cache-only lookup of a role's full DB-backed default -- model plus
     sampling params. Used by api/server.py's _load_team() the same way
     get_default_model() already was: a team YAML's own explicit field always
-    wins; this only fills a gap the YAML left unset."""
-    return _role_policy_cache.get((team_name, role_name))
+    wins; this only fills a gap the YAML left unset.
+
+    T39: tries the exact (team_name, role_name) key first -- the common case,
+    and the one every existing caller already satisfies -- then falls back to
+    the case-insensitive index for a caller (like phase0's telemetry) that
+    normalizes role_name before calling in. See _role_policy_cache_ci's own
+    comment for the incident this closes."""
+    policy = _role_policy_cache.get((team_name, role_name))
+    if policy is not None:
+        return policy
+    return _role_policy_cache_ci.get(_ci_role_key(team_name, role_name))
 
 
 async def ensure_cache_loaded() -> None:
@@ -114,11 +152,14 @@ async def load_cache() -> None:
             active=r["active"],
         )
     _role_policy_cache.clear()
+    _role_policy_cache_ci.clear()
     for r in role_rows:
-        _role_policy_cache[(r["team_name"], r["role_name"])] = RolePolicy(
+        policy = RolePolicy(
             model_id=r["model_id"], temperature=r["temperature"],
             max_tokens=r["max_tokens"], tool_call_limit=r["tool_call_limit"],
         )
+        _role_policy_cache[(r["team_name"], r["role_name"])] = policy
+        _role_policy_cache_ci[_ci_role_key(r["team_name"], r["role_name"])] = policy
 
 
 async def reload() -> dict:
@@ -249,6 +290,7 @@ async def reset_cache_for_tests() -> None:
     global _cache_loaded
     _route_cache.clear()
     _role_policy_cache.clear()
+    _role_policy_cache_ci.clear()
     _cache_loaded = False
 
 
