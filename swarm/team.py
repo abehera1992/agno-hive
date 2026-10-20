@@ -15039,24 +15039,90 @@ def _read_tracking_active(team) -> bool:
     return isinstance(getattr(team, "_read_state", None), dict)
 
 
-def _objective_names_new_entity(objective_norm: str, prior_objective_norm: str) -> bool:
-    """True if `objective_norm` contains an identifier-shaped token (true
-    CamelCase or snake_case, >= 4 chars -- a model/class/function/field name)
-    that `prior_objective_norm` does not. Used by the duplicate-delegation
-    gate's delegate_structured_task branch (Phase T17, 2026-10-08) to tell
-    "same question, reworded" (no new identifier -- still a duplicate, e.g.
-    'list its endpoints' vs 'enumerate every endpoint it exposes') apart from
-    "genuinely different question about the same target" (introduces a real
-    symbol the prior objective never named, e.g. 'Party' vs
-    'PartyRegistration' -- not a duplicate, regardless of how similar the
-    surrounding English reads). Reuses the identical identifier-shape test
-    Phase T16 already applies to repetition detection, same reasoning: a
-    shared surface that introduces a real new symbol is not a repeat.
+# T41 (F5): a SMALL, FIXED vocabulary of subject-area categories this gate's own
+# real delegation objectives fall into -- never a general semantic-similarity
+# engine. Each category lists its own synonyms, so two phrasings of the SAME
+# subject ("backend endpoints" / "server-side API routes") map to the SAME
+# category and are correctly NOT flagged as a new entity, while two phrasings
+# of genuinely DIFFERENT subjects ("endpoints" / "frontend hooks") map to
+# DISJOINT categories and are correctly flagged.
+#
+# This is deliberately NOT the SequenceMatcher/Jaccard prose-similarity this
+# codebase's own history (see _normalize_delegation_task's docstring and the
+# comment block above _make_duplicate_delegation_gate_hook) already tried and
+# ruled out for this exact gate, for exactly the failure shape this fix must
+# avoid reintroducing: "what fields does Party have" vs "what fields does
+# PartyRegistration have" read as near-identical prose but name two different
+# targets. A continuous similarity score over raw text cannot tell those
+# apart without also conflating real synonyms; a fixed categorical lookup can,
+# because "Party"/"PartyRegistration" are project-specific ENTITY names (the
+# existing identifier-shape check below already owns that), never generic
+# SUBJECT-AREA words like "endpoint" or "hook" -- the two checks are
+# orthogonal, each scoped to a different kind of "new" the prior objective
+# never named.
+_SUBJECT_CATEGORY_KEYWORDS: dict[str, frozenset[str]] = {
+    "endpoints": frozenset({"endpoint", "endpoints", "route", "routes"}),
+    "hooks": frozenset({"hook", "hooks"}),
+    "tables": frozenset({"table", "tables", "schema", "column", "columns"}),
+    "models": frozenset({"model", "models"}),
+    "migrations": frozenset({"migration", "migrations"}),
+    "auth": frozenset({"auth", "authentication", "middleware", "login"}),
+    "config": frozenset({"config", "configuration", "settings"}),
+    "upload": frozenset({"upload", "uploads"}),
+    "import": frozenset({"import", "imports", "ingestion"}),
+    "tests": frozenset({"test", "tests", "testing"}),
+    "onboarding": frozenset({"onboarding", "verification", "seller"}),
+}
+_CATEGORY_WORD_RE = re.compile(r"[A-Za-z]+")
 
-    Order matters -- only checks for a symbol NEW to this objective, not the
-    reverse, so a narrower follow-up ("now just the email field on Party")
-    naming no new symbol at all is still correctly treated as the same
-    target+question and stays a duplicate.
+
+def _subject_categories(text: str) -> frozenset[str]:
+    """The set of fixed subject-area categories this text's own words mention,
+    case-insensitive whole-word matching only. Empty for text matching none --
+    the caller must treat an empty result on either side as "nothing to
+    compare", never as evidence of a change."""
+    words = {w.lower() for w in _CATEGORY_WORD_RE.findall(text or "")}
+    return frozenset(
+        cat for cat, keywords in _SUBJECT_CATEGORY_KEYWORDS.items()
+        if words & keywords
+    )
+
+
+def _objective_names_new_entity(objective_norm: str, prior_objective_norm: str) -> bool:
+    """True if `objective_norm` introduces something the prior objective never
+    named -- either of two independent, orthogonal signals:
+
+    1. An identifier-shaped token (true CamelCase or snake_case, >= 4 chars --
+       a model/class/function/field name), e.g. 'Party' -> 'PartyRegistration'.
+       Reuses the identical identifier-shape test Phase T16 already applies to
+       repetition detection, same reasoning: a shared surface that introduces
+       a real new symbol is not a repeat.
+
+    2. (T41/F5, 2026-10-20) A recognized subject-area CATEGORY (see
+       _subject_categories) that the prior objective's own words never
+       mention at all -- e.g. 'list the backend endpoints' -> 'list the
+       frontend hooks'. Fires ONLY when a category is detected on the CURRENT
+       side AND the prior side mentions NO category at all, or mentions only
+       disjoint ones -- never when the two sides share a category (that is a
+       rewording, e.g. 'backend endpoints' vs 'server-side API routes', both
+       the "endpoints" category) and never when EITHER side mentions no
+       category at all beyond what's already covered (ambiguous prose with no
+       recognized subject word stays conservative -- see _subject_categories'
+       own docstring).
+
+    Used by the duplicate-delegation gate's delegate_structured_task branch
+    (Phase T17, 2026-10-08 for signal 1; T41/F5 for signal 2) to tell "same
+    question, reworded" (no new identifier, no new category -- still a
+    duplicate, e.g. 'list its endpoints' vs 'enumerate every endpoint it
+    exposes') apart from "genuinely different question about the same
+    target" (not a duplicate, regardless of how similar the surrounding
+    English reads).
+
+    Order matters for BOTH signals -- only checks for something NEW to this
+    objective, not the reverse, so a narrower follow-up ("now just the email
+    field on Party", or "just the endpoints that create a voucher") naming
+    nothing new at all is still correctly treated as the same target+question
+    and stays a duplicate.
     """
     def _identifiers(text: str) -> set[str]:
         return {
@@ -15065,9 +15131,20 @@ def _objective_names_new_entity(objective_norm: str, prior_objective_norm: str) 
             and ("_" in tok or any(c.isupper() for c in tok[1:]))
         }
     new_ids = _identifiers(objective_norm)
-    if not new_ids:
-        return False
-    return bool(new_ids - _identifiers(prior_objective_norm))
+    if new_ids and (new_ids - _identifiers(prior_objective_norm)):
+        return True
+
+    # Both sides must name a recognized category -- if the PRIOR side names
+    # none at all, there is nothing established to compare against (generic
+    # prose describing the same thing in uncategorized terms must not be
+    # treated as evidence of a change), so this stays conservative (False)
+    # rather than guessing from one-sided information.
+    new_cats = _subject_categories(objective_norm)
+    prior_cats = _subject_categories(prior_objective_norm)
+    if new_cats and prior_cats and not (new_cats & prior_cats):
+        return True
+
+    return False
 
 
 def _make_duplicate_delegation_gate_hook(read_only: bool = False):
