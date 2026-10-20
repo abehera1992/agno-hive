@@ -2802,17 +2802,43 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                     if _quote_matches(quoted, _read_window(resolved, num, _LINE_TOLERANCE)):
                         out.append(f"             content verified within {_LINE_TOLERANCE} lines")
                     else:
-                        problems += 1
-                        # {resolved}:{num} as the SECOND token, matching BAD/AMBIGUOUS's
-                        # shape — swarm/team.py's retry-prompt builder extracts
-                        # line.split()[1] as "the unsupported thing" by that convention;
-                        # putting the word "quoted" there instead (an earlier version of
-                        # this line did) made every MISMATCH invisible to the retry loop.
-                        out.append(
-                            f"  MISMATCH   {resolved}:{num} <-- quoted {quoted[:60]!r} not "
-                            f"found within {_LINE_TOLERANCE} lines; citation and quoted "
-                            f"content do not point at the same place"
-                        )
+                        # T10 (2026-10-19 battery): a range-shaped citation registers
+                        # BOTH endpoints as independent `file_lines` entries (see the
+                        # _LABELED_LINE_RE loop above), each carrying the SAME quoted
+                        # content -- so "Line 132-168 defines `check_login_rate_limit`"
+                        # checks the quote once at 132 (the real declaration -- passes)
+                        # AND once at 168 (the function's closing line, which never
+                        # repeats its own name -- a false MISMATCH on an entirely
+                        # correct citation). `num` being the END of a declared range is
+                        # not, on its own, a claim that the quoted content repeats
+                        # there; the start is where a declaration actually lives.
+                        # Falls back to the range's start ONLY when `num` is that range's
+                        # END, mirroring the existing declared-symbol-range handling
+                        # below rather than inventing a second mechanism -- a symbol
+                        # found only at the end, within the range but not at either
+                        # endpoint, elsewhere outside the range, or not at all, all still
+                        # fall through to the genuine MISMATCH unchanged.
+                        _rng = _range_containing(answer, num)
+                        if (_rng and _rng[1] == num and _rng[0] != num
+                                and _quote_matches(
+                                    quoted, _read_window(resolved, _rng[0], _LINE_TOLERANCE))):
+                            out.append(
+                                f"             `{quoted[:60]}` verified within "
+                                f"{_LINE_TOLERANCE} lines of the cited range's start "
+                                f"(line {_rng[0]})"
+                            )
+                        else:
+                            problems += 1
+                            # {resolved}:{num} as the SECOND token, matching BAD/AMBIGUOUS's
+                            # shape — swarm/team.py's retry-prompt builder extracts
+                            # line.split()[1] as "the unsupported thing" by that convention;
+                            # putting the word "quoted" there instead (an earlier version of
+                            # this line did) made every MISMATCH invisible to the retry loop.
+                            out.append(
+                                f"  MISMATCH   {resolved}:{num} <-- quoted {quoted[:60]!r} not "
+                                f"found within {_LINE_TOLERANCE} lines; citation and quoted "
+                                f"content do not point at the same place"
+                            )
                 else:
                     # No quoted content -- fall back to the identifier the citation is
                     # ABOUT. Closes the gap this file's own docstring named ("NOT caught
