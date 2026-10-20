@@ -11110,8 +11110,20 @@ async def _module_hook_coverage_gap(task: str, content: str, hive_mcp_url: str |
     this measures raw count coverage only, the same deliberately crude bar
     _scoped_coverage_gap already accepts for routers.
     """
+    # T36.1 diagnostic (2026-10-20): a live T13a replay this phase showed no
+    # trace of this function's OWN log lines anywhere in the run's journal,
+    # despite the task text appearing, by inspection, to match
+    # _MODULE_HOOK_ASK_RE -- inconclusive whether the regex genuinely missed
+    # on the exact live task string, an exception was swallowed upstream of
+    # this call, or this path simply was not reached on that run's particular
+    # branch (e.g. an evidence-integrity retry's own reformatted task text).
+    # This entry print exists ONLY to disambiguate that on the next live run;
+    # it changes no behavior.
+    print(f"[team] module-hook check: called, task={task[:80]!r}", flush=True)
     m = _MODULE_HOOK_ASK_RE.search(task or "")
     if not m or not (content or "").strip():
+        print(f"[team] module-hook check: task did not match (or content empty) "
+              f"— silent", flush=True)
         return ""
     module = m.group(1).lower()
     stem = module[:-1] if module.endswith("s") and len(module) > 1 else module
