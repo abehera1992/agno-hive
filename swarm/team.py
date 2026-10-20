@@ -7328,6 +7328,20 @@ _CMP_MATCHED_BLOCK_RE = re.compile(
     r"MATCHED \(\d+\):\n((?:  .+\n?)+)")
 _CMP_MATCHED_PAIR_RE = re.compile(
     r"^  \S+\s+(\S+)\s+<->\s+(\S+)\s*$", re.MULTILINE)
+# T36 Track F (2026-10-19 battery): PARTIAL MATCHES (compare.py's own shape --
+# "{identity}   {l_method} {l_path}  <->  {r_method} {r_path}   ({diff})") was
+# never fed into `present` at all -- only full MATCHED pairs and HOOKS EXPORTED
+# were. A PARTIAL_MATCH item (same route, differing attribute -- e.g. T13b's
+# real Post/Cancel voucher endpoints, PUT vs POST) is exactly as confirmed-
+# present as a full match; compare.py's own docstring is explicit that a
+# partial match "correctly leaves left_only" (the route DOES exist on both
+# sides). Without this, a future answer that narrated a genuine PARTIAL_MATCH
+# item as a plain gap would go uncaught by this guard, even with the real
+# compare_enumerations evidence sitting right there in the same run.
+_CMP_PARTIAL_BLOCK_RE = re.compile(
+    r"PARTIAL MATCHES[^\n]*\(\d+\):\n((?:  .+\n?)+)")
+_CMP_PARTIAL_LINE_RE = re.compile(
+    r"^  (\S+)\s+(\S+)\s+(\S+)\s+<->\s+(\S+)\s+(\S+)\s+\(", re.MULTILINE)
 _CMP_HOOKS_BLOCK_RE = re.compile(
     r"HOOKS EXPORTED BY [^\n]*\((\d+)\):\n((?:  .+\n?)*)")
 _CMP_TOTALS_LINE_RE = re.compile(
@@ -7336,10 +7350,12 @@ _CMP_TOTALS_LINE_RE = re.compile(
 
 def _cmp_confirmed_present(cmp_body: str) -> set[str]:
     """Every name compare_enumerations' own output confirms exists on the
-    right (frontend) side: a MATCHED pair's own right-hand name, plus every
-    entry in a HOOKS EXPORTED block when one is printed. Both come straight
-    from compare.py's own fixed output shape (see this section's own comment
-    above) -- structural parsing, not inference."""
+    right (frontend) side -- or, for a PARTIAL_MATCH, confirms exists on
+    BOTH sides, just differing on an attribute: a MATCHED pair's own
+    right-hand name, a PARTIAL_MATCH pair's identity/left-path/right-path,
+    plus every entry in a HOOKS EXPORTED block when one is printed. All
+    come straight from compare.py's own fixed output shape (see this
+    section's own comments above) -- structural parsing, not inference."""
     present: set[str] = set()
     hooks_m = _CMP_HOOKS_BLOCK_RE.search(cmp_body or "")
     if hooks_m:
@@ -7349,6 +7365,15 @@ def _cmp_confirmed_present(cmp_body: str) -> set[str]:
         for pair in _CMP_MATCHED_PAIR_RE.finditer(matched_m.group(1)):
             present.add(pair.group(1))
             present.add(pair.group(2))
+    partial_m = _CMP_PARTIAL_BLOCK_RE.search(cmp_body or "")
+    if partial_m:
+        for pm in _CMP_PARTIAL_LINE_RE.finditer(partial_m.group(1)):
+            identity, l_method, l_path, r_method, r_path = pm.groups()
+            present.add(identity)
+            present.add(l_path)
+            present.add(r_path)
+            present.add(f"{l_method} {l_path}")
+            present.add(f"{r_method} {r_path}")
     return present
 
 
