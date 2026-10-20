@@ -17982,6 +17982,15 @@ _MEMBER_RESULT_EVENT_TYPES = {"RunCompleted"}
 # capture below accumulates and this event only finalises.
 _MEMBER_RESULT_END_EVENT_TYPES = {"RunContentCompleted"}
 
+# T41 (Track B): the FIRST event agno emits for a given member invocation --
+# confirmed real and observed in this codebase's own live journal (the comment
+# above this constant's own sibling already lists "RunStarted" among the
+# run-shaped events seen across 153 real delegations). Used to claim a run_id
+# for the oldest unclaimed pending entry, at the earliest possible point --
+# see _claim_pending_entry_for_run's own docstring for why this point is safe
+# (dispatch-order-preserving) even though completion order is not.
+_MEMBER_RESULT_START_EVENT_TYPES = {"RunStarted"}
+
 # Cap per member so a runaway generation cannot grow this without bound. Well above a
 # real member report (the largest measured relayed 29,445 chars).
 _MEMBER_CHUNK_CAP = 60_000
@@ -18009,7 +18018,58 @@ def _accumulate_member_chunk(team, agent_name: str, chunk: str) -> None:
         team._member_chunks[key] = (buf + chunk)[:_MEMBER_CHUNK_CAP]
 
 
-def _finalise_member_chunks(team, agent_name: str) -> None:
+def _claim_pending_entry_for_run(team, agent_name: str, run_id) -> None:
+    """T41 (Track B/F3-follow-up): associate a NEWLY-STARTED member invocation
+    (a 'RunStarted' event, confirmed real -- agno's own
+    utils/events.py:create_run_started_event sets run_id=from_run_response.run_id,
+    the same real, populated value used for telemetry elsewhere, not a
+    theoretical dataclass default) with the OLDEST still-UNCLAIMED pending
+    log entry for that member.
+
+    Why claiming at RunStarted (not at completion) is safe even though T40's
+    own FIFO-at-completion assumption was proven NOT safe: agno runs every
+    tool call requested in one model turn via `asyncio.gather` (confirmed by
+    reading agno/models/base.py directly -- "Create and run all function
+    calls in parallel"), and for the async-generator results
+    delegate_structured_task returns, routes each one's own events through a
+    PER-GENERATOR background task into a SHARED queue -- so completion order
+    genuinely can diverge from dispatch order (whichever generator's own
+    underlying work finishes first emits its own RunContentCompleted first).
+    But the SYNCHRONOUS portion of each dispatched coroutine -- including
+    this codebase's own log.append/_pending_log_entry_by_member.append calls
+    at dispatch time -- runs in task-scheduling order before any of them
+    yield control at their own first await (a real model call), and agno's
+    OWN RunStarted event is created and emitted at the very start of that
+    invocation, before such a model call -- so RunStarted events for several
+    concurrently-dispatched delegations to the SAME member are observed in
+    the SAME order they were dispatched, even though their LATER completion
+    is not. Claiming here, rather than at completion, is what makes the later
+    lookup (_finalise_member_chunks, by run_id) correct regardless of
+    completion order.
+
+    Silent/no-op if run_id is missing, team has no pending queue for this
+    member, or every pending entry is already claimed (an older agno, or an
+    event stream that never emits RunStarted, falls through to
+    _finalise_member_chunks' own FIFO fallback -- exactly T40's pre-T41
+    behavior, never a crash)."""
+    if run_id is None or team is None or not agent_name:
+        return
+    pending = getattr(team, "_pending_log_entry_by_member", None)
+    if not isinstance(pending, dict):
+        return
+    queue = pending.get(_member_key(agent_name))
+    if not isinstance(queue, list):
+        return
+    for entry in queue:
+        if "run_id" not in entry:
+            entry["run_id"] = run_id
+            if not isinstance(getattr(team, "_pending_log_entry_by_run_id", None), dict):
+                team._pending_log_entry_by_run_id = {}
+            team._pending_log_entry_by_run_id[run_id] = entry
+            return
+
+
+def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
     """Promote a member's buffered chunks to its finished result, and clear the buffer.
 
     Clearing matters: a member delegated to twice must not have its second answer
@@ -18033,20 +18093,36 @@ def _finalise_member_chunks(team, agent_name: str) -> None:
     # delegation gate's log.append call site).
     #
     # T40 (F3): pops the OLDEST still-pending entry for this member (FIFO), not a
-    # single slot -- see the dispatch-time comment for the incident this closes. A
-    # member delegated to twice must not have its SECOND result retroactively tag
-    # the FIRST entry; FIFO pop order guarantees each finalize consumes the entry
-    # whose own dispatch is oldest and still unresolved, matching completion order
-    # to dispatch order, which mirrors the "overwrite, not accumulate" semantics
-    # team._member_results itself already uses one line up -- the newest completion
-    # always wins there, and here each entry still gets its OWN, correct text.
+    # single slot -- see the dispatch-time comment for the incident this closes.
+    #
+    # T41 (Track B): FIFO alone assumes completion order matches dispatch order,
+    # which is NOT guaranteed by agno's own architecture (asyncio.gather runs every
+    # tool call in one turn concurrently -- see _claim_pending_entry_for_run's own
+    # docstring for the direct agno-source proof). Prefer the run_id this
+    # invocation was claimed under (set at RunStarted, itself dispatch-order-safe)
+    # -- correct regardless of completion order -- and fall back to FIFO pop only
+    # when no run_id is available (an older agno, a test double, or a RunStarted
+    # event that was missed), which reproduces T40's own exact pre-T41 behavior
+    # for that case rather than crashing or silently doing nothing.
     _pending_entries = getattr(team, "_pending_log_entry_by_member", None)
-    if isinstance(_pending_entries, dict):
+    _pending_entry = None
+    _by_run = getattr(team, "_pending_log_entry_by_run_id", None)
+    if run_id is not None and isinstance(_by_run, dict):
+        _pending_entry = _by_run.pop(run_id, None)
+        if _pending_entry is not None and isinstance(_pending_entries, dict):
+            _queue = _pending_entries.get(key)
+            if isinstance(_queue, list):
+                _queue[:] = [e for e in _queue if e is not _pending_entry]
+    if _pending_entry is None and isinstance(_pending_entries, dict):
         _queue = _pending_entries.get(key)
         if isinstance(_queue, list) and _queue:
             _pending_entry = _queue.pop(0)
             if _pending_entry is not None:
-                _pending_entry["result"] = text
+                _by_run_cleanup = getattr(team, "_pending_log_entry_by_run_id", None)
+                if isinstance(_by_run_cleanup, dict) and "run_id" in _pending_entry:
+                    _by_run_cleanup.pop(_pending_entry["run_id"], None)
+    if _pending_entry is not None:
+        _pending_entry["result"] = text
     # Mirrored to module scope for the same reason _best_draft is: the liveness
     # heartbeat has no `team` in scope, and on an auto-kill the parent process is the
     # only thing left alive. Without this, a killed run hands back the coordinator's
@@ -18197,6 +18273,14 @@ def _stream_event_to_chunk(event, team=None) -> str | dict | None:
       None — every other event type (dropped, same as the previous hard filter)
     """
     event_type = getattr(event, "event", "")
+    if event_type in _MEMBER_RESULT_START_EVENT_TYPES:
+        # T41 (Track B): claim this invocation's run_id for the oldest unclaimed
+        # pending entry, as early as possible -- see _claim_pending_entry_for_run's
+        # own docstring for why this point is dispatch-order-safe. A side effect
+        # only; this event carries no content of its own to return.
+        _claim_pending_entry_for_run(
+            team, getattr(event, "agent_name", "") or "", getattr(event, "run_id", None))
+        return None
     if event_type in _CONTENT_EVENT_TYPES:
         chunk = getattr(event, "content", None)
         if isinstance(chunk, str) and chunk:
@@ -18208,7 +18292,8 @@ def _stream_event_to_chunk(event, team=None) -> str | dict | None:
     if event_type in _MEMBER_RESULT_END_EVENT_TYPES:
         # Marker only: this event carries content=None. It says "that member is done",
         # which is when its accumulated chunks become a finished result.
-        _finalise_member_chunks(team, getattr(event, "agent_name", "") or "")
+        _finalise_member_chunks(
+            team, getattr(event, "agent_name", "") or "", getattr(event, "run_id", None))
         return None
     if event_type in _TOOL_START_EVENT_TYPES:
         tool = getattr(event, "tool", None)
