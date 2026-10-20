@@ -8154,6 +8154,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     _draft_coverage: dict[str, int] = {}
     _scope_note = await _scoped_coverage_gap(
         task, content, hive_mcp_url, hive_mcp_tools, record=_draft_coverage)
+    _hook_cov_note = await _module_hook_coverage_gap(
+        task, content, hive_mcp_url, hive_mcp_tools)
     _opened_note = ("" if _asks_for_one_fact(task)
                     else _swept_directory_not_reported(content, team))
     _integ_note = await _integration_mechanism_missing(
@@ -8192,7 +8194,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             content, _rs.get("enumerations") if isinstance(_rs, dict) else None)
         return (_stale_findings_dropped(_fab_note, content)
                 + _cmp_note + completeness + _lost_report_evidence(team)
-                + _count_note + _term_note + _scope_note + _opened_note
+                + _count_note + _term_note + _scope_note + _hook_cov_note + _opened_note
                 + _integ_note + _svc_note + _models_note + _table_note
                 + _docs_note + _fields_note
                 + _summarize_actual_writes(*all_results))
@@ -11066,6 +11068,82 @@ async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None
             f"{'…' if len(missing) > 12 else ''}.**" + _unmounted_note)
 
 
+# T36.1 Track A (T13a): a module-scoped audit asking for "frontend hooks" and the
+# answer silently covers only a fraction of the module's real RTK Query exports --
+# with or without an explicit gap claim. _integrity_gap_list_without_comparison
+# (T36 Track B) and _integrity_completeness_claim_without_comparison (Phase T17)
+# both need the answer to SAY something gap-shaped; a live replay of T13a with no
+# files named (session 7b93fe6b, 2026-10-20) produced an answer that named only 2
+# hooks and made NO gap claim at all -- "it's challenging to identify any gaps...
+# without the specific frontend hooks" -- invisible to every wording-based check by
+# construction, since there is no sentence to anchor on.
+#
+# Modeled directly on _scoped_coverage_gap immediately above (same T12-era
+# "call the tool myself instead of trusting what the run gathered" shape, extended
+# from backend routers to frontend RTK hooks): the module name comes from the TASK
+# text, not a historical count, and the expected hooks come from a LIVE,
+# unscoped repo search for this project's own naming convention
+# (`export const use<Module>...Query|Mutation`) -- never hardcoded to 5, or to
+# `inventoryApi.ts` specifically, so a module with 2 real hooks and one with 30 are
+# each measured against their own real total, and a module this convention does not
+# apply to simply finds nothing and stays silent.
+_MODULE_HOOK_ASK_RE = re.compile(
+    r"\b(?:audit|overview|describe|document|summar\w+)\b[^.]{0,40}?\bthe\s+"
+    r"([a-z][\w-]*)\s+module\b[^.]{0,160}?\b(?:frontend\s+)?hooks?\b", re.I)
+_MODULE_HOOK_MIN_EXPORTS = 2
+_MODULE_HOOK_COVERAGE_RATIO = 0.5
+
+
+async def _module_hook_coverage_gap(task: str, content: str, hive_mcp_url: str | None,
+                                    hive_mcp_tools=None) -> str:
+    """The question named a MODULE and asked for its frontend hooks; the answer
+    names far fewer real RTK Query hook exports than actually exist for that
+    module, independent of which file the run happened to read and independent of
+    whether the answer ever states a gap in words. See this section's own header
+    comment for the live T13a incident this closes and the deliberate design
+    choices (no hardcoded count, no hardcoded file).
+
+    Silent unless the module's real hook count clears _MODULE_HOOK_MIN_EXPORTS
+    (fewer than that is not a listing worth measuring) and the answer's coverage
+    ratio is genuinely low -- a legitimate alternate implementation that happens to
+    use a different but still-real subset of the module's hooks is not flagged;
+    this measures raw count coverage only, the same deliberately crude bar
+    _scoped_coverage_gap already accepts for routers.
+    """
+    m = _MODULE_HOOK_ASK_RE.search(task or "")
+    if not m or not (content or "").strip():
+        return ""
+    module = m.group(1).lower()
+    stem = module[:-1] if module.endswith("s") and len(module) > 1 else module
+    stem_cap = stem[:1].upper() + stem[1:]
+    pattern = rf"export const (use\w*{re.escape(stem_cap)}\w*(?:Query|Mutation))\b"
+    hits = await _repo_search_text(pattern, "", hive_mcp_url, hive_mcp_tools)
+    if not (hits or "").strip():
+        print(f"[team] module-hook check: no RTK hook export matching {pattern!r} "
+              f"found anywhere in the repo — nothing to compare", flush=True)
+        return ""
+    names = sorted({mm.group(1) for mm in re.finditer(pattern, hits)})
+    if len(names) < _MODULE_HOOK_MIN_EXPORTS:
+        return ""
+    named = [n for n in names if n in content]
+    if len(named) > _MODULE_HOOK_COVERAGE_RATIO * len(names):
+        print(f"[team] module-hook check: {module} module has {len(names)} real hook "
+              f"export(s) (search_files, this run), answer names {len(named)} — above "
+              f"threshold, silent", flush=True)
+        return ""
+    missing = [n for n in names if n not in named]
+    print(f"[team] module-hook check: {module} module has {len(names)} real hook "
+          f"export(s), answer names {len(named)} — {missing}", flush=True)
+    return (
+        f"\n\n---\n**THE ANSWER COVERS ONLY {len(named)} OF {len(names)} REAL FRONTEND "
+        f"HOOKS FOR THE {module.upper()} MODULE — a live search for this project's own "
+        f"RTK Query naming convention (search_files, this run) found {len(names)} real "
+        f"hook export(s): {', '.join('`' + n + '`' for n in names)}. The answer above "
+        f"names only {len(named)} of them. Any conclusion above about what the frontend "
+        f"does or does not cover -- stated as a gap or not -- is not yet verified "
+        f"against this module's full real hook surface.**"
+    )
+
 
 # Files a member opened but that never reach the answer, grouped by the DIRECTORY they
 # came from. Per-directory, not per-run: an answer that legitimately spans several
@@ -11893,7 +11971,7 @@ def _stale_findings_dropped(note: str, content: str) -> str:
 async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None,
                                    hive_mcp_tools, label: str,
                                    record: dict | None = None) -> list[str]:
-    """The six guards that re-derive their facts from the repo, run against `content`.
+    """The seven guards that re-derive their facts from the repo, run against `content`.
 
     Shared by the parent-process rescue (repair_unguarded_draft) and the corrected-answer
     path inside _verified_answer. One implementation because these two callers must not
@@ -11914,6 +11992,7 @@ async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None
             _affirmed_term_absent_from_citations(task, content, hive_url, hive_mcp_tools),
             _scoped_coverage_gap(task, content, hive_url, hive_mcp_tools,
                                  record=record),
+            _module_hook_coverage_gap(task, content, hive_url, hive_mcp_tools),
             _integration_mechanism_missing(task, content, hive_url, hive_mcp_tools),
             _unconfirmed_service_inclusion(task, content, hive_url, hive_mcp_tools),
             _code_question_answered_from_docs(task, content, hive_url,
