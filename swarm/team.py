@@ -7318,7 +7318,22 @@ _GAP_CLAIM_LINE_RE = re.compile(
     # COMPLETENESS_RE was independently widened for (Phase T17) on the
     # inverse, zero-gap phrasing of this exact sentence shape.
     r"without\s+(?:a\s+|an\s+)?[\w\- ]{0,20}counterparts?\b|"
-    r"do(?:es)?\s+not\s+have\s+(?:a\s+|an\s+)?[\w\- ]{0,20}counterparts?)\b",
+    r"with\s+no\s+[\w\- ]{0,20}counterparts?\b|"
+    # LIVE REPLAY, same day: re-running the exact T13a task against the
+    # deployed fix caught a SECOND, narrower miss in the same family --
+    # "Backend Functionality with No Frontend Counterpart" ("with NO", not
+    # "WITHOUT") and "do not have A CORRESPONDING frontend hook" (ends in
+    # "hook", not "counterpart"; preceded by "a", not "no"). Neither of the
+    # two patterns above, nor the pre-existing bare "no corresponding"
+    # keyword, matches either shape -- confirmed by replaying this exact
+    # task against the live, deployed swarm the same day this fix was
+    # written, not assumed. Widened rather than left as a known miss: the
+    # risk of a false positive from "do(es) not have a corresponding NOUN"
+    # is the same low bar the sibling "no NOUN" alternative above already
+    # accepts.
+    r"do(?:es)?\s+not\s+have\s+(?:a\s+|an\s+)?[\w\- ]{0,20}counterparts?|"
+    r"do(?:es)?\s+not\s+have\s+(?:a\s+|an\s+)?(?:corresponding\s+)?[\w\- ]{0,20}"
+    r"(?:hooks?|functions?|actions?|endpoints?|routes?|methods?))\b",
     re.IGNORECASE)
 
 # The two blocks compare_enumerations' own output always prints when there is

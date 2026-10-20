@@ -126,6 +126,37 @@ def test_silent_when_answer_has_no_gap_claim_at_all():
     assert _integrity_gap_list_without_comparison(answer, _T13A_TASK, "") is None
 
 
+# ── Live replay (2026-10-20), same day as the fix: re-running the exact T13a ───
+# ── task against the deployed guard reproduced its own root cause (page.tsx   ─
+# ── read instead of the API slice) but with SLIGHTLY different wording than   ─
+# ── the original historical answer -- "...with No Frontend Counterpart" ("with ─
+# ── no", not "without") and "do not have A CORRESPONDING frontend hook" (ends  ─
+# ── in "hook", not "counterpart"). Neither matched the first widening; this   ─
+# ── pins the live-caught miss so it cannot regress silently.
+
+_T13A_LIVE_REPLAY_ANSWER = (
+    "### Backend Functionality with No Frontend Counterpart\n\n"
+    "The following backend endpoints do not have a corresponding frontend "
+    "hook:\n\n"
+    "1. **Post voucher**\n"
+    "2. **Cancel voucher**\n"
+    "3. **Create GRN from PO**\n"
+    "4. **Create credit note**\n"
+    "5. **Create stock adjustment**\n"
+    "6. **Create stock transfer**\n\n"
+    "These endpoints are available in the backend but are not directly "
+    "accessible through the frontend hooks identified in the page.tsx file.\n"
+)
+
+
+def test_live_replay_wording_shape_is_caught():
+    result = _integrity_gap_list_without_comparison(
+        _T13A_LIVE_REPLAY_ANSWER, _T13A_TASK, "")
+    assert result is not None
+    claimed, real = result
+    assert claimed == "Post voucher"
+
+
 # ── Full _evidence_integrity_findings wiring ────────────────────────────────────
 
 @pytest.mark.asyncio
