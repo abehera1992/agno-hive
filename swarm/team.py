@@ -7279,7 +7279,17 @@ _GAP_CLAIM_LINE_RE = re.compile(
     # of adjectives/qualifiers between "no" and the thing claimed absent, the
     # exact shape live battery evidence found (Phase R follow-up 2):
     # "Called GET /vouchers a gap ('no frontend list function')".
-    r"no\s+(?:\w+\s+){0,3}(?:function|action|hook|endpoint|route|method))\b",
+    r"no\s+(?:\w+\s+){0,3}(?:function|action|hook|endpoint|route|method)|"
+    # "counterpart" phrasing (T36 Track B, 2026-10-19 battery) -- T13a's live
+    # answer headed its gap list "Backend Endpoints Without Frontend
+    # Counterparts" and introduced it "...do not have a frontend counterpart:"
+    # -- neither form contains any keyword above (no "gap"/"missing"/"not
+    # defined"/etc.), so a real, concretely-named gap list went completely
+    # invisible to this check, the same blind spot _RECONCILE_EXTRA_
+    # COMPLETENESS_RE was independently widened for (Phase T17) on the
+    # inverse, zero-gap phrasing of this exact sentence shape.
+    r"without\s+(?:a\s+|an\s+)?[\w\- ]{0,20}counterparts?\b|"
+    r"do(?:es)?\s+not\s+have\s+(?:a\s+|an\s+)?[\w\- ]{0,20}counterparts?)\b",
     re.IGNORECASE)
 
 # The two blocks compare_enumerations' own output always prints when there is
@@ -7326,6 +7336,55 @@ _GAP_LIST_LOOKAHEAD = 5
 
 def _is_blank_or_list_intro_line(line: str) -> bool:
     return not line.strip() or bool(_LIST_INTRO_LINE_RE.search(line))
+
+
+def _gap_claim_block_lines(content: str) -> list[str]:
+    """Every line a gap-claiming sentence covers: the claim line itself, plus
+    its associated enumerated list -- found via the same bounded, colon/blank-
+    intro-skipping lookahead `_integrity_named_item_falsely_gapped` already
+    used. Extracted (T36 Track B) so a second check can ask a DIFFERENT
+    question of the exact same lines without a second, independently-
+    drifting scan; `_integrity_named_item_falsely_gapped` below is rewritten
+    to consume this unchanged, so its own existing behavior and tests are the
+    regression check for this extraction.
+    """
+    lines = (content or "").splitlines()
+    n = len(lines)
+    out: list[str] = []
+    for i, line in enumerate(lines):
+        if not _GAP_CLAIM_LINE_RE.search(line):
+            continue
+        out.append(line)
+        j = i + 1
+        lookahead = 0
+        while (j < n and lookahead < _GAP_LIST_LOOKAHEAD
+               and not _LIST_ITEM_LINE_RE.match(lines[j])
+               and _is_blank_or_list_intro_line(lines[j])):
+            j += 1
+            lookahead += 1
+        while j < n and _LIST_ITEM_LINE_RE.match(lines[j]):
+            out.append(lines[j])
+            j += 1
+    return out
+
+
+def _first_named_gap_item(content: str) -> str | None:
+    """The first concretely-named list item inside a gap-claiming block (see
+    _gap_claim_block_lines), stripped of its bullet/number marker and markdown
+    emphasis -- for a disclosure that something NAMED was claimed as a gap,
+    without needing a compare_enumerations call to check it against. None
+    when no gap-claiming line has an associated list at all (a bare "it has
+    gaps" sentence names nothing concrete to flag, and this must not invent
+    one to report).
+    """
+    for line in _gap_claim_block_lines(content):
+        stripped = line.strip()
+        if not _LIST_ITEM_LINE_RE.match(stripped):
+            continue  # the claim line itself, not one of its list items
+        item = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", stripped).strip().strip("*_ ")
+        if item:
+            return item[:80]
+    return None
 
 
 def _integrity_named_item_falsely_gapped(content: str, cmp_note: str) -> tuple[str, str] | None:
@@ -7380,37 +7439,10 @@ def _integrity_named_item_falsely_gapped(content: str, cmp_note: str) -> tuple[s
     if not present:
         return None
 
-    def _check_line(line: str) -> tuple[str, str] | None:
+    for line in _gap_claim_block_lines(content):
         for name in present:
             if name and re.search(rf"(?<![\w./-]){re.escape(name)}(?![\w./-])", line):
                 return name, "compare_enumerations' own MATCHED/HOOKS EXPORTED output lists this as present"
-        return None
-
-    lines = (content or "").splitlines()
-    n = len(lines)
-    for i, line in enumerate(lines):
-        if not _GAP_CLAIM_LINE_RE.search(line):
-            continue
-        hit = _check_line(line)
-        if hit:
-            return hit
-        # Skip forward past a short, bounded run of blank/colon-intro lines
-        # to find where an introduced list actually starts.
-        j = i + 1
-        lookahead = 0
-        while (j < n and lookahead < _GAP_LIST_LOOKAHEAD
-               and not _LIST_ITEM_LINE_RE.match(lines[j])
-               and _is_blank_or_list_intro_line(lines[j])):
-            j += 1
-            lookahead += 1
-        # Whether or not a list was found, scan its contiguous run (empty
-        # range if lines[j] is not a list-item line -- no-op, matches the
-        # original silent behavior for a gap-claim line with no following list).
-        while j < n and _LIST_ITEM_LINE_RE.match(lines[j]):
-            hit = _check_line(lines[j])
-            if hit:
-                return hit
-            j += 1
     return None
 
 
@@ -7457,6 +7489,43 @@ def _integrity_completeness_claim_without_comparison(
             "no compare_enumerations call was made this run -- this task asked "
             "for a two-sided reconciliation, and nothing was ever actually "
             "compared, so completeness cannot be verified from this run's own evidence")
+
+
+def _integrity_gap_list_without_comparison(
+        content: str, task: str, cmp_note: str) -> tuple[str, str] | None:
+    """(claimed, real) when a two-sided task names SPECIFIC gaps and NO
+    compare_enumerations call happened at all this run.
+
+    Sibling of `_integrity_completeness_claim_without_comparison` immediately
+    above (Phase T17, 2026-10-08) -- which catches only the FLAT "zero gaps"/
+    "fully covered" shape of this same underlying defect. The 2026-10-19
+    battery re-run of that exact T13a task hit the OTHER shape: no
+    compare_enumerations call happened, and the final answer named SIX
+    specific gaps ("Post Voucher", "Cancel Voucher", "Create GRN from PO",
+    ...) -- two of which (Post, Cancel) have real frontend hooks the run's
+    own Researcher simply never found (it searched a page component for
+    hooks instead of the API slice that exports them). Neither existing
+    check fires here: `_integrity_named_item_falsely_gapped` needs a real
+    cmp_note to contradict the named items WITH, and
+    `_integrity_completeness_claim_without_comparison`'s lexicon only matches
+    a ZERO-gap sentence, not a concretely-enumerated nonzero one. A named,
+    nonzero gap list is exactly as unverifiable as a flat "fully covered"
+    sentence when nothing was ever actually compared -- this closes that gap
+    using the SAME gap-claim-block extraction those two already share
+    (`_gap_claim_block_lines`), not a new parser.
+    """
+    if not task or not _TWO_SIDED_TASK_RE.search(task):
+        return None
+    if _comparison_body(cmp_note):
+        return None  # a real comparison ran -- _integrity_named_item_falsely_gapped owns this case
+    item = _first_named_gap_item(content)
+    if item is None:
+        return None
+    return (item,
+            "no compare_enumerations call was made this run -- this task asked "
+            "for a two-sided reconciliation and named specific gaps, but nothing "
+            "was ever actually compared, so this list cannot be verified from "
+            "this run's own evidence")
 
 
 def _integrity_comparison_zero_claim_contradiction(content: str, cmp_note: str) -> tuple[str, str] | None:
@@ -7577,6 +7646,17 @@ async def _evidence_integrity_findings(
         claimed, real = missing_cmp
         findings.append({"category": "comparison completeness/gap",
                           "claimed": claimed, "real": real})
+    # 3e. T36 Track B (2026-10-19 battery): the nonzero-gap-list counterpart
+    # of 3d -- see _integrity_gap_list_without_comparison's own docstring for
+    # the live T13a incident this closes. Mutually exclusive with 3/3b/3c (all
+    # require a real cmp_note) and with 3d (a flat completeness claim rarely
+    # co-occurs with a named gap list in the same answer) -- ordering here is
+    # cosmetic, not load-bearing.
+    missing_cmp_named = _integrity_gap_list_without_comparison(content, task, cmp_note)
+    if missing_cmp_named:
+        claimed, real = missing_cmp_named
+        findings.append({"category": "comparison completeness/gap",
+                          "claimed": f"{claimed!r} is a gap/missing", "real": real})
 
     # 4. DB row counts -- new, narrow (see _integrity_db_count_contradiction).
     db = _integrity_db_count_contradiction(content, team)
