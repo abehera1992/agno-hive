@@ -8999,8 +8999,12 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
 
     # Under-reported exports (2026-08-28). The T13 shape: the run OPENED the file and
     # the answer named one sibling of five. See _under_reported_exports.
+    #
+    # T37: `task` passed from here on (the zero-named/hooks-asked widening) -- this is
+    # the real production path, not just the function's own standalone correctness.
     _rs_exp = getattr(team, "_read_state", None)
-    under = _under_reported_exports(content, _rs_exp if isinstance(_rs_exp, dict) else None)
+    under = _under_reported_exports(
+        content, _rs_exp if isinstance(_rs_exp, dict) else None, task=task)
     if under is not None:
         path, named, total, missing = under
         listed = ", ".join(f"`{n}`" for n in missing)
@@ -21766,7 +21770,8 @@ def _hook_family_names(text) -> set[str]:
     return {m.group(0) for m in re.finditer(r"\buse[A-Z]\w*?(?:Query|Mutation)\b", text)}
 
 
-def _under_reported_exports(content: str, read_state) -> tuple[str, int, int, list[str]] | None:
+def _under_reported_exports(content: str, read_state,
+                            task: str | None = None) -> tuple[str, int, int, list[str]] | None:
     """A file whose sibling exports the answer opened but did not report.
 
     Returns (path, named, total, missing) or None.
@@ -21790,6 +21795,19 @@ def _under_reported_exports(content: str, read_state) -> tuple[str, int, int, li
     Silent unless the answer NAMES at least one member of a family, so a response that
     never discusses exports is untouched, and unless the run actually opened the file --
     an unread file's exports are not something this answer was expected to list.
+
+    T37 (2026-10-20): "named zero" used to mean only one thing here -- "never discusses
+    this file's exports", the off-topic case this function's own reasoning above is
+    about. A live T13a replay (session b7a51d65) showed the OTHER thing "named zero" can
+    mean: the answer DOES discuss the topic ("the frontend has 2 hook definitions") but
+    never uses a real identifier for any of them -- read_state["exports"] still had all
+    5 real hooks on record (the file was read), and the task explicitly asked for
+    "frontend hooks", yet the silencing condition treated this exactly like the
+    off-topic case and said nothing. `task` (optional, backward compatible -- its
+    omission reproduces the original behavior exactly) distinguishes the two: zero named
+    is still silent when the task never asked about this family's domain at all (the
+    original, narrow, correct case), and now fires when it did -- without touching the
+    already-working "named SOME but not all" path at all.
     """
     if not content or not isinstance(read_state, dict):
         return None
@@ -21798,11 +21816,16 @@ def _under_reported_exports(content: str, read_state) -> tuple[str, int, int, li
         if len(members) < _EXPORT_FAMILY_MIN:
             continue
         named = [n for n in members if n in content]
-        # Silent unless the answer NAMES at least one sibling -- a response that never
-        # discusses this file's exports is not under-reporting them -- and silent when
-        # it names them all, which is the correct outcome.
-        if not named or len(named) == len(members):
+        if len(named) == len(members):
             continue
+        if not named:
+            # Zero named: silent unless the task itself asked about this family's
+            # domain (hooks, the only family this function currently extracts --
+            # see _hook_family_names). A task that never raised the topic has
+            # nothing to compare against, exactly as before; one that did, with
+            # the file actually read, is the T13a shape this closes.
+            if not task or not re.search(r"\bhooks?\b", task, re.IGNORECASE):
+                continue
         return path, len(named), len(members), sorted(set(members) - set(named))[:8]
     return None
 
