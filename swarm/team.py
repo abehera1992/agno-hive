@@ -12269,6 +12269,32 @@ _BATCH_ALTERNATIVE_HINTS = {
 # well-behaved run never sees it.
 _BATCH_HINT_EVERY = 8
 
+# T39: the advisory hint above is proven, live, to be sometimes ignored outright --
+# session fd5bf842c52c (T13a-T37-LIVE1) received it at calls 8, 16, 24, ..., 72 (9
+# times) while making 77 consecutive single-literal-identifier search_files calls
+# (useReactQueryCancelProvider, useReactQueryAbort, ... -- a mechanical
+# prefix+suffix combinatorial expansion, zero matches, zero regex metacharacters,
+# zero repeats), and never once adopted the regex-alternation form the hint itself
+# demonstrates. A wildcard/regex search in the SAME scope the run already had
+# access to (grep -rnE 'use[A-Za-z]*(Query|Mutation)' against the same glob_filter)
+# finds the real hooks in one call -- confirmed directly against the live
+# repository this phase. This is a deterministic escalation of the SAME existing
+# mechanism (same injection channel, same _force_text_only actuator the budget
+# guard hook already uses and that this exact incident's own journal confirms
+# genuinely stops further tool calls, not just a text nudge) for the one case the
+# advisory form already failed on: a long, uninterrupted run of literal-pattern
+# zero-match search_files calls with no sign the model ever tried a regex. 20 is
+# comfortably above the 9-endpoint legitimate enumeration _BATCH_HINT_EVERY was
+# already tuned around (two full advisory cycles, at 8 and 16, before this fires)
+# and far below the 77-call runaway it is built to stop.
+_LITERAL_SEARCH_PROBE_LIMIT = 20
+
+# A pattern with no regex metacharacter at all -- a bare identifier guess, not an
+# alternation/wildcard attempt. Deliberately narrow (word characters only) so a
+# model that DOES try `first|second|third` or `use\w*Query` is never penalized for
+# the attempt, even if that specific regex happens to miss.
+_LITERAL_PROBE_PATTERN_RE = re.compile(r"^\w+$")
+
 # Distinct lightrag_query calls one agent may make in one run before the tool starts
 # refusing. Semantic recall is cheap to ASK for and expensive to serve, which is the
 # combination that produces a runaway nothing else bounds: the read-char budget cannot
@@ -13316,6 +13342,11 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     consecutive_stub_count: dict[str, int] = {}
     # Fresh calls per (agent, tool) this run, for the one-call-per-item detector.
     batch_counts: dict[tuple[str, str], int] = {}
+    # T39: consecutive single-literal-identifier, zero-match search_files calls per
+    # (agent, tool) since the last match/regex-attempt/reset -- same keying
+    # convention as batch_counts above. See _LITERAL_SEARCH_PROBE_LIMIT's own
+    # comment for the incident this closes.
+    literal_probe_streak: dict[tuple[str, str], int] = {}
     read_chars: dict[str, int] = {}   # fresh-read chars per agent, see _MEMBER_READ_CHAR_BUDGET
     # The same count scoped to ONE delegation, reset when a member is delegated to.
     # The per-run budget above is 450,000 and never fires in time to stop a member
@@ -13507,6 +13538,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         # `return result` reads it on every path, including a cache hit that never
         # enters that branch, where a branch-local binding would be a NameError.
         batch_hint = ""
+        literal_probe_note = ""
 
         # Checked BEFORE calling the real function (unlike the identical-args
         # cache below, which only avoids a re-call once cache_key repeats
@@ -13725,6 +13757,46 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     f"before the answer is written. Gather the rest in as few calls as "
                     f"you can, then answer."
                 )
+            # T39: deterministic escalation for the one case the hint above has been
+            # measured, live, to not fix on its own -- see _LITERAL_SEARCH_PROBE_LIMIT's
+            # comment for the incident (fd5bf842c52c, 77 consecutive single-literal
+            # guesses, 9 ignored hints). Tracked here rather than in a new hook because
+            # this closure already has result/args/agent and the batch-hint's own
+            # per-(agent, tool) counting right above it.
+            literal_probe_note = ""
+            if function_name == "search_files":
+                _pattern = str((args or {}).get("pattern", "")).strip()
+                _streak_key = (norm_agent_key, function_name)
+                _is_zero_match = isinstance(result, str) and result.startswith("No matches for:")
+                if _is_zero_match and _LITERAL_PROBE_PATTERN_RE.match(_pattern):
+                    literal_probe_streak[_streak_key] = literal_probe_streak.get(_streak_key, 0) + 1
+                else:
+                    # A match (progress) or a regex/alternation attempt (compliance) --
+                    # either is exactly what this streak exists to encourage.
+                    literal_probe_streak[_streak_key] = 0
+                _streak = literal_probe_streak.get(_streak_key, 0)
+                if _streak >= _LITERAL_SEARCH_PROBE_LIMIT:
+                    literal_probe_streak[_streak_key] = 0
+                    print(f"[team] {agent_key or 'coordinator'} made {_streak} consecutive "
+                          f"single-literal-identifier search_files calls with zero matches "
+                          f"— forcing text-only instead of letting the guessing continue",
+                          flush=True)
+                    _force_text_only(agent, team=None)
+                    literal_probe_note = (
+                        f"\n\n── NOTE FROM THE RUN, not from the tool ──\n"
+                        f"That was {_streak} consecutive search_files calls in a row, each a "
+                        f"single literal identifier guess (including '{_pattern}'), each "
+                        f"finding zero matches. Guessing more individual names will not find "
+                        f"what is not there. search_files takes a REGEX: one alternation or "
+                        f"wildcard call in the SAME scope you already have — for example "
+                        f"search_files('voucher', glob) or search_files('use[A-Za-z]*(Query|"
+                        f"Mutation)', glob) — searches for ANY matching name at once, instead "
+                        f"of guessing candidates one at a time. You cannot make another tool "
+                        f"call this turn — write the answer now using what you have actually "
+                        f"found. If you were unable to confirm whether something exists, say "
+                        f"so explicitly as UNRESOLVED; do not state that nothing exists merely "
+                        f"because the names you tried yourself were not found."
+                    )
             # Second, independent source -- survives delegation, unlike session_state.
             # Path and size added 2026-08-27 so the evidence manifest below can name
             # what was actually read, not just how many reads happened.
@@ -13929,12 +14001,12 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 f"earlier report this run. Reason from it directly for the CURRENT "
                 f"task.\n\n" + result
             )
-        # The batch hint rides back attached to the real result, the same way the
-        # delegation-volume warning does -- a print alone goes to the journal, where the
-        # model cannot read it. Only for str results; a non-str would be corrupted by
-        # concatenation, and the print above still records it either way.
-        if batch_hint and isinstance(result, str):
-            return result + batch_hint
+        # The batch hint (and the T39 literal-probe note, same channel, same reason)
+        # ride back attached to the real result -- a print alone goes to the journal,
+        # where the model cannot read it. Only for str results; a non-str would be
+        # corrupted by concatenation, and the prints above still record it either way.
+        if (batch_hint or literal_probe_note) and isinstance(result, str):
+            return result + batch_hint + literal_probe_note
         # Same channel as batch_hint, for the same reason: a print reaches the journal,
         # not the model. Fires only when an English-phrase search returned nothing but
         # documentation -- the search that has failed T11 for three batteries while
