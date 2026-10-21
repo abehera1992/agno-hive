@@ -69,7 +69,24 @@ class EvidenceRecord:
     the EXACT object the tool call returned -- never truncated, previewed, or
     otherwise transformed. This is a separate, additional structure from
     team._tool_evidence (the existing capped/preview-truncated LLM-context
-    cache, which this module does not touch, replace, or read)."""
+    cache, which this module does not touch, replace, or read).
+
+    `agent_name` (T24): the RAW agent identity captured directly at the
+    tool-call boundary by whoever calls finish_tool_call -- e.g. the real
+    agno `agent` object's own `.name`, the same source team.py's
+    phase0.note_tool_call already trusts for per-member read-budget
+    tracking. Optional and defaulted to None so every pre-existing caller
+    (none of which passes it) is unaffected. Exists because
+    execution_id-based attribution (ExecutionRecord.agent_name, looked up
+    via _fidelity_agent_name in team.py) silently collapses to the root
+    Coordinator execution whenever no child Execution was ever pushed for
+    the call that produced this evidence -- true for every
+    delegate_structured_task-based delegation, since only the agno-native
+    delegate_task_to_member name creates one (see _tool_interception_hook's
+    `_is_delegation` check). This field is a second, independent identity
+    channel for the SAME evidence item, populated from data already
+    available at capture time rather than reconstructed afterward from
+    execution-stack state that may never have been pushed."""
     tool_call_id: str
     execution_id: str | None
     run_id: str
@@ -80,6 +97,7 @@ class EvidenceRecord:
     error: str | None
     started_at: float
     completed_at: float
+    agent_name: str | None = None
 
 
 class RunContext:
@@ -170,10 +188,17 @@ class RunContext:
         return rec
 
     def finish_tool_call(self, tool_call: ToolCallRecord, content: Any,
-                          success: bool, error: str | None) -> EvidenceRecord:
+                          success: bool, error: str | None,
+                          agent_name: str | None = None) -> EvidenceRecord:
         """Records the EXACT `content` handed in -- no truncation, no
         preview, no summarisation. Returns the Evidence record; also appended
-        to self.evidence."""
+        to self.evidence.
+
+        `agent_name` (T24, optional, defaults to None): see EvidenceRecord's
+        own docstring -- a direct identity passed in by the caller, who may
+        have a more reliable source (the real agent object) than this
+        execution's own ExecutionRecord.agent_name. Never required: every
+        pre-existing caller that omits it keeps the exact prior behavior."""
         tool_call.completed_at = time.monotonic()
         tool_call.status = "ok" if success else "error"
         tool_call.error = error
@@ -188,6 +213,7 @@ class RunContext:
             error=error,
             started_at=tool_call.started_at,
             completed_at=tool_call.completed_at,
+            agent_name=agent_name,
         )
         self.evidence.append(ev)
         return ev
