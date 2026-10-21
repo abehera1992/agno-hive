@@ -4658,7 +4658,15 @@ def _has_bare_absence_claim(content: str) -> bool:
 # that genuinely only asked about one specific symbol is not told to go looking for
 # something it never asked about.
 _BROAD_ANY_QUESTION_RE = re.compile(
-    r"\bif\s+any(?:where)?\b|\bif\s+at\s+all\b|\bwhere,?\s+if\s+(?:any|anywhere)\b",
+    r"\bif\s+any(?:where)?\b|\bif\s+at\s+all\b|\bwhere,?\s+if\s+(?:any|anywhere)\b"
+    # Bare "anywhere" alone, no "if" required -- added after checking this guard
+    # against T10's own AUTHORITATIVE prompt in groundedness-battery.md ("Is there
+    # a rate-limiting middleware ANYWHERE in the authentication service?"), which
+    # the narrower "if any/anywhere" phrasing above does not match at all. Low
+    # false-positive cost either way: this only ever widens an ALREADY-triggered
+    # structural_findings retry with one extra bounded search instruction, never a
+    # new retry round or a change to an answer that verify_claims found clean.
+    r"|\banywhere\b",
     re.IGNORECASE,
 )
 
