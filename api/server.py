@@ -478,12 +478,32 @@ def _liveness_kill_reason(snapshot: dict) -> str | None:
             and stagnant > config.liveness_refused_call_threshold_s
             and snapshot.get("requests_advancing")):
         unavailable = snapshot.get("unavailable_tool_calls") or {}
-        if unavailable.get("count"):
+        # T50 (2026-10-21): require the unavailable-tool call to be RECENT relative to
+        # the current no_tool window, not merely non-zero at any point this run.
+        # Live-confirmed misattribution (T4, T11): a single unavailable-tool call fired
+        # once, harmlessly, early in a run and self-recovered; minutes later, an
+        # unrelated stall began (the Coordinator repeatedly calling a VALID tool,
+        # forward_member_answer, with no new evidence) and THIS branch's old
+        # `if unavailable.get("count"):` check -- true for the rest of the run,
+        # regardless of age -- blamed the stale count for it. seconds_since_last is a
+        # same-process duration computed by swarm/team.py's own heartbeat at snapshot
+        # time (see _unavailable_tool_snapshot_with_duration); comparing it against
+        # no_tool itself (also a duration, not a timestamp) needs no clock synchronization
+        # between this process and the worker that recorded it. Missing entirely (an
+        # older snapshot, or a build that predates this field) fails safe to "not
+        # recent" rather than "recent", so the stale-attribution bug cannot resurface
+        # silently on a partial rollout.
+        _unavailable_recent = (
+            unavailable.get("seconds_since_last") is not None
+            and unavailable["seconds_since_last"] <= no_tool
+        )
+        if unavailable.get("count") and _unavailable_recent:
             return (
                 f"model kept issuing calls for {no_tool:.0f}s but none executed, and "
                 f"produced no content in that time — it kept asking for a tool it does "
                 f"not have ({unavailable.get('last_tool')!r}, "
-                f"{unavailable['count']} unavailable-tool call(s))"
+                f"{unavailable['count']} unavailable-tool call(s), most recently "
+                f"{unavailable['seconds_since_last']:.0f}s ago)"
             )
         return (
             f"model kept issuing calls for {no_tool:.0f}s but none executed, and "

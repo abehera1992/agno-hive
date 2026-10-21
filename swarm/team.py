@@ -4642,6 +4642,36 @@ def _has_bare_absence_claim(content: str) -> bool:
     return bool(_NOT_FOUND_RE.search(text)) and not _claimed_search_terms(text)
 
 
+# T50 (2026-10-21, T10 root cause): "is there any X, and if so where" is a BROADER
+# question than "does the specific library/symbol a draft happened to mention exist".
+# Root-caused live: T10 asked where rate limiting is implemented, if anywhere; the
+# draft claimed `slowapi` specifically (unsupported), verify_claims correctly flagged
+# it, and the existing structural_findings retry instruction below correctly fixed
+# THAT narrow claim -- but its own wording ("confirm it is not present... do not
+# mention it again") never reopens the broader question the flagged symbol was only
+# ONE candidate answer to. The real implementation (check_login_rate_limit,
+# authHelper.py:132) was never searched for, not because the retry lost the original
+# task (it is quoted verbatim at the top of every retry prompt -- see retry_prompt
+# below) but because this specific instruction variant never asked it to look past
+# the one symbol it was correcting. Deliberately narrow: only "if any/anywhere"-shaped
+# questions trigger the extra clause below, not every structural finding, so a task
+# that genuinely only asked about one specific symbol is not told to go looking for
+# something it never asked about.
+_BROAD_ANY_QUESTION_RE = re.compile(
+    r"\bif\s+any(?:where)?\b|\bif\s+at\s+all\b|\bwhere,?\s+if\s+(?:any|anywhere)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_broad_any_question(task: str) -> bool:
+    """True when the ORIGINAL task explicitly allows for "nothing, OR something
+    somewhere" -- the shape that makes confirming one candidate's absence
+    insufficient to answer the question. Deterministic and narrow on purpose: see
+    this constant's own comment for why a tighter, task-shape-gated trigger is
+    preferred over reopening every structural finding's retry unconditionally."""
+    return bool(_BROAD_ANY_QUESTION_RE.search(task or ""))
+
+
 def _unverified_claimed_searches(content: str, *results) -> list[str]:
     """Claimed search terms (see _claimed_search_terms) with no matching actual
     search_files()/find_files() call anywhere in `results`. Matching is loose --
@@ -6399,6 +6429,76 @@ def _make_member_control_box_hook():
             _record_member_action(team, who, function_name, args, before, after)
         return result
     return _control_box_hook
+
+
+_COORDINATOR_PROGRESS_FORCE_FLAG = "_coordinator_progress_force_applied"
+
+
+def _make_coordinator_progress_guard_hook():
+    """T50 (2026-10-21): closes the T4/T11 stuck-loop mechanism -- root-caused via
+    direct journal tracing, not assumption. Confirmed sequence in both runs: a
+    delegate_structured_task hallucination ('ERROR Function delegate_structured_task
+    not found') fires once, mid a MEMBER's delegation, and is non-fatal -- the member
+    simply continues and its result is captured normally. The real stall begins
+    SEPARATELY and LATER, once Z16's repetition-truncation completion pass
+    re-invokes the Coordinator to finish the answer: it successfully calls
+    forward_member_answer ONCE, then keeps calling it again -- same member_id, same
+    already-forwarded text, every ~3-4s -- producing zero new evidence, until the
+    external liveness watchdog's 120s no-progress threshold kills the run. The
+    watchdog's own diagnostic text named the FIRST, already-resolved, unrelated
+    hallucination as the cause (fixed separately, see api/server.py's
+    seconds_since_last check) -- the actual repeating call was forward_member_answer,
+    a tool the Coordinator legitimately holds, which is why no existing guard caught
+    it: nothing was unauthorized, and the tool call itself succeeded every time.
+
+    This reuses the SAME progress-fingerprint logic _record_member_action already
+    uses for every delegated member (same tool, same arguments, no growth in the
+    run's own evidence/claims/reads/member-results counters = no progress -- see
+    that function's own docstring for why this never makes legitimate repetition
+    illegal) -- now extended to the Coordinator's own tool calls via the
+    MemberControlState this phase registers for it at team-build time. Positioned
+    immediately after _make_member_control_box_hook() in the shared tool_hooks
+    prefix so it always reads state _record_member_action has already updated this
+    same call.
+
+    On a confirmed no-progress streak at config.liveness_repetition_threshold (the
+    SAME threshold Z16's own in-process content-repetition stop already uses --
+    deliberately not a new constant, so "how many firings is a genuine loop" stays
+    answered once, not twice), forces text-only via the SAME _force_text_only
+    actuator every other budget/stub/duplicate-delegation guard in this file already
+    uses for "stop calling tools, answer now" -- not a new mechanism, not a change to
+    the liveness watchdog's timeout or threshold, and not a block on THIS call (which
+    has already executed and returned by the time the force is applied -- a repeat
+    that already landed is still delivered to the model normally; only the NEXT call
+    is affected). One-shot per run (mirrors _REPETITION_COMPLETION_FLAG's own
+    discipline): once forced, stays forced -- a model that is still generating after
+    being told to answer now gets no further escalation from this hook, since
+    _force_text_only already blocks every further tool call on its own.
+
+    Purely additive to _control_box_hook's own observational contract: reads the
+    state that hook just wrote, never mutates it, and never alters this call's
+    result -- the only effect is on tool_choice for the NEXT, not-yet-started call."""
+    async def _coordinator_progress_guard_hook(function_name, function, args, agent=None,
+                                                team=None, run_context=None):
+        result = await function(**args)
+        if team is not None and agent is None:
+            # agent is None exactly when this call is the Coordinator's own (every
+            # delegated member's call arrives with a real `agent` object) -- the
+            # same convention phase0.note_tool_call already uses to attribute
+            # coordinator-level calls.
+            state = _get_member_control_box(team).latest_for_member(_member_id("Coordinator"))
+            if (state is not None
+                    and state.no_progress_streak >= config.liveness_repetition_threshold
+                    and not getattr(team, _COORDINATOR_PROGRESS_FORCE_FLAG, False)):
+                setattr(team, _COORDINATOR_PROGRESS_FORCE_FLAG, True)
+                print(f"[team] coordinator progress guard: {function_name!r} repeated "
+                      f"{state.no_progress_streak} time(s) with no growth in evidence/"
+                      f"claims/reads/member-results -- forcing text-only so the "
+                      f"Coordinator must synthesize now instead of replaying the same "
+                      f"call", flush=True)
+                _force_text_only(None, team=team)
+        return result
+    return _coordinator_progress_guard_hook
 
 
 def _synthesize_comparison_answer(cmp_note: str) -> str | None:
@@ -8175,6 +8275,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                         record=_draft_coverage))
     _table_note = await _table_claimed_missing_but_present(
         task, content, hive_mcp_url, hive_mcp_tools)
+    _crud_gap_note = await _crud_gap_claimed_but_written(
+        content, hive_mcp_url, hive_mcp_tools)
     # Both also registered in _run_repo_derived_guards, which covers the rescue and
     # corrected-answer paths. THIS is the one a normal answer takes -- registering only
     # there left them unreachable in ordinary operation.
@@ -8202,7 +8304,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         return (_stale_findings_dropped(_fab_note, content)
                 + _cmp_note + completeness + _lost_report_evidence(team)
                 + _count_note + _term_note + _scope_note + _hook_cov_note + _opened_note
-                + _integ_note + _svc_note + _models_note + _table_note
+                + _integ_note + _svc_note + _models_note + _table_note + _crud_gap_note
                 + _docs_note + _fields_note
                 + _summarize_actual_writes(*all_results))
 
@@ -9508,7 +9610,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         return (content + _stale_findings_dropped(_fab_note, content)
                 + _lost_report_evidence(team) + _count_note
                 + _term_note + _scope_note + _opened_note + _integ_note
-                + _models_note + _table_note + _docs_note + _fields_note
+                + _models_note + _table_note + _crud_gap_note + _docs_note + _fields_note
                 + _summarize_actual_writes(*all_results))
     if len(all_results) > 1:
         # Aggregate retry budget already spent by an earlier guard this call --
@@ -9617,6 +9719,26 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             f"Re-read the file with get_file_content and either cite where the thing "
             f"really is, or say it is not there."
         )
+        # T50 (2026-10-21): see _looks_like_broad_any_question's own comment for the
+        # T10 incident this closes. Fires only for THIS category (an absence-shaped
+        # structural finding) on THIS shape of task (explicitly "if any/anywhere") --
+        # never a second retry round, never a new team.arun() call, just one more
+        # clause inside the SAME single bounded retry this answer already gets.
+        if _looks_like_broad_any_question(task):
+            instructions.append(
+                f"the original question also asks more broadly whether this capability "
+                f"exists ANYWHERE in the relevant service, not only whether the one "
+                f"specific thing just ruled out ({named}) is present. Confirming that one "
+                f"candidate is absent does not by itself answer that broader question. "
+                f"Before answering, make ONE additional narrow search_files() call for the "
+                f"general capability itself (not the specific library/symbol just ruled "
+                f"out) within the same service directory, and state plainly in your "
+                f"answer exactly what you searched for and what you found or did not "
+                f"find. Do not imply the broader question is fully answered merely "
+                f"because the one flagged candidate was ruled out -- distinguish a "
+                f"confirmed implementation, a plausible but unverified lead, and genuine "
+                f"absence of evidence."
+            )
     # Z21 (2026-09-28): the model's own prior draft was never included here -- the
     # retry only ever saw {task}\n\nIMPORTANT: {specific citation instructions}, with
     # nothing to edit. Live-observed root cause of T3/T13a's expensive, broad repair
@@ -12141,6 +12263,109 @@ async def _table_claimed_missing_but_present(task: str, content: str,
             f"artifact of the schema qualifier the answer chose, not a fact about the "
             f"database, and any count or conclusion resting on it is unsupported.**")
 
+
+# T50 (2026-10-21, T13b root cause): T13b's own facts (9 endpoints, every table and
+# field) were all independently verified correct. Its weakness was the final
+# SYNTHESIS step: it flagged VoucherSeries/VoucherVersion/StockLedger/StockLevel as
+# "significant CRUD gaps" by mechanically applying "every table needs its own
+# create/update/delete endpoint", without checking whether those tables are written
+# to at all -- they are, as a side effect of other voucher operations (an
+# audit/ledger/version-history shape, not an unimplemented one). T13a's run of the
+# IDENTICAL audit avoided this trap. Deterministic and generic on purpose -- matches
+# any backticked PascalCase identifier (this codebase's own model-naming convention)
+# flagged near gap language, not a hardcoded list of table names, so it applies to a
+# future audit of a different module the same way.
+_CRUD_GAP_KEYWORD_RE = re.compile(
+    r"\b(?:no|lacks?|missing|without)\b[^.\n]{0,60}?\b(?:crud|create|update|delete|write)\b"
+    r"|\b(?:crud|create|update|delete|write)\b[^.\n]{0,60}?\b(?:no|lacks?|missing|without)\b"
+    r"|\bgap\b",
+    re.IGNORECASE,
+)
+_CRUD_GAP_IDENT_RE = re.compile(r"`([A-Z][A-Za-z0-9]*)`")
+_CRUD_GAP_WINDOW = 150
+_MAX_CRUD_GAP_CLAIMS = 4
+
+
+def _crud_gap_flagged_identifiers(content: str) -> list[str]:
+    """Every backticked PascalCase identifier with CRUD-gap language in the SAME
+    sentence as it -- a cheap proxy for "the answer is calling THIS one a gap".
+
+    Bounded to the sentence, not a raw character window either side: a prior,
+    unrelated gap claim about a DIFFERENT model in the preceding sentence must not
+    flag this one merely for being mentioned soon after it. Confirmed needed by a
+    direct test case: "...StockLedger is missing a dedicated write path.
+    `Voucher` itself has full CRUD coverage..." -- a raw +/-150-char window pulled
+    "missing" (StockLedger's own gap language) across the full stop into Voucher's
+    unrelated coverage sentence and flagged Voucher too. _CRUD_GAP_WINDOW still caps
+    how far the sentence-bounded search is allowed to look, for the same "nothing
+    unbounded" discipline used everywhere else in this file.
+    """
+    text = content or ""
+    flagged: list[str] = []
+    for m in _CRUD_GAP_IDENT_RE.finditer(text):
+        name = m.group(1)
+        if name in flagged:
+            continue
+        left_raw = text[max(0, m.start() - _CRUD_GAP_WINDOW):m.start()]
+        right_raw = text[m.end():min(len(text), m.end() + _CRUD_GAP_WINDOW)]
+        left_cut = left_raw.rfind(".")
+        left_window = left_raw[left_cut + 1:] if left_cut != -1 else left_raw
+        right_cut = right_raw.find(".")
+        right_window = right_raw[:right_cut] if right_cut != -1 else right_raw
+        if _CRUD_GAP_KEYWORD_RE.search(left_window + right_window):
+            flagged.append(name)
+    return flagged
+
+
+async def _crud_gap_claimed_but_written(content: str, hive_mcp_url: str | None,
+                                        hive_mcp_tools=None) -> str:
+    """The answer calls a model a CRUD gap, but a repo-wide search finds it actually
+    being CONSTRUCTED somewhere (a real write site, not merely its own class
+    declaration) -- the gap may be intentional (audit/ledger/derived data written
+    only as a side effect of other operations), not unimplemented.
+
+    Same family as _table_claimed_missing_but_present just above: grep-based,
+    deterministic, silent when nothing contradicts the claim or the search tool is
+    unavailable. DISCLOSES rather than repairs (unlike the table-qualifier guard,
+    which can safely hand back the one correct name) -- "written elsewhere" does not
+    tell this guard whether the gap is in fact intentional-by-design or a genuine
+    unimplemented path; only a reader (or a future targeted investigation) can judge
+    that from the actual call site. Bounded to _MAX_CRUD_GAP_CLAIMS names and ONE
+    search call per name -- the same bounded-cost shape _table_claimed_missing_but_present
+    already uses, not a new, larger search budget.
+    """
+    names = _crud_gap_flagged_identifiers(content)
+    if not names:
+        return ""
+    confirmed: list[tuple[str, list[str]]] = []
+    for name in names[:_MAX_CRUD_GAP_CLAIMS]:
+        hits_text = await _repo_search_text(rf"\b{name}\(", "**/*.py",
+                                            hive_mcp_url, hive_mcp_tools)
+        if not hits_text:
+            continue
+        # Exclude the model's own class declaration ("class Name(Base):") -- that is
+        # the DEFINITION, never a write site, and would otherwise contradict every
+        # single flagged model trivially (every one of them has exactly one).
+        instantiation_hits = [
+            ln for ln in hits_text.splitlines()
+            if ln.strip() and f"class {name}(" not in ln
+        ]
+        if instantiation_hits:
+            confirmed.append((name, instantiation_hits[:2]))
+    if not confirmed:
+        print(f"[team] crud-gap check: {len(names)} gap claim(s) {names}, no "
+              f"contradicting instantiation found — silent", flush=True)
+        return ""
+    print(f"[team] crud-gap check: answer calls {[n for n, _ in confirmed]} a CRUD "
+          f"gap, but each is constructed elsewhere in the codebase: "
+          f"{[h for _, hs in confirmed for h in hs]}", flush=True)
+    lines = "; ".join(f"`{n}` is constructed at {'; '.join(hs)}" for n, hs in confirmed)
+    return (f"\n\n---\n**A CRUD GAP CLAIMED HERE MAY BE INTENTIONAL, NOT MISSING — "
+            f"{lines}. If these records are written only as a side effect of other "
+            f"operations (an audit log, a ledger, a version/history table) rather "
+            f"than directly user-managed entities, the absence of a dedicated CRUD "
+            f"endpoint can be correct by design, not an implementation gap. Verify "
+            f"which applies before treating this as unimplemented.**")
 
 
 async def _fill_count_markers(content: str, hive_mcp_url: str | None,
@@ -16663,6 +16888,18 @@ def _make_tool_interception_hook(
         # a delegate_task_to_member call itself is attributed to its caller, not
         # to the member execution it is about to start.
         run_context = getattr(team, "_run_context", None)
+        # T24: the RAW agent identity for THIS call, captured directly from the
+        # real `agent` object agno hands this hook -- the SAME source
+        # phase0.note_tool_call below already trusts for per-member read-budget
+        # attribution (and the same "agent=None -> coordinator" convention it
+        # already uses). Threaded into every finish_tool_call call below as
+        # EvidenceRecord.agent_name, a second, independent identity channel that
+        # does not depend on a child Execution having been pushed for this call
+        # (see _is_delegation immediately below -- it never fires for
+        # delegate_structured_task, so no such child Execution exists for any
+        # delegation observed in production; this capture is correct regardless
+        # of that gap and does not require closing it).
+        _fid_agent_name = getattr(agent, "name", None) or "Coordinator"
         # Phase A finding A (fixed for Phase C): exact match, not a prefix check.
         # "delegate_task_to_member".startswith() also matched the PLURAL broadcast
         # tool "delegate_task_to_members" (agno's own, see team.py's
@@ -16723,7 +16960,8 @@ def _make_tool_interception_hook(
             # returned).
             if _tool_call is not None:
                 _evidence = run_context.finish_tool_call(
-                    _tool_call, content=result, success=True, error=None)
+                    _tool_call, content=result, success=True, error=None,
+                    agent_name=_fid_agent_name)
                 # Phase D: durable ToolCall completion + Evidence insert, one
                 # transaction (see execution_store.persist_tool_call_completed).
                 await execution_store.guard(execution_store.persist_tool_call_completed(
@@ -16808,7 +17046,8 @@ def _make_tool_interception_hook(
             elapsed = time.monotonic() - started
             if _tool_call is not None:
                 _evidence = run_context.finish_tool_call(
-                    _tool_call, content=None, success=False, error=str(exc))
+                    _tool_call, content=None, success=False, error=str(exc),
+                    agent_name=_fid_agent_name)
                 await execution_store.guard(execution_store.persist_tool_call_completed(
                     _tool_call_db_id, _tool_call, _evidence))
             if _delegation_execution_id is not None:
@@ -16844,7 +17083,8 @@ def _make_tool_interception_hook(
                 _cancel_error = (f"{type(_exc_now).__name__}: {_exc_now}"
                                   if _exc_now is not None else "cancelled")
                 _evidence = run_context.finish_tool_call(
-                    _tool_call, content=None, success=False, error=_cancel_error)
+                    _tool_call, content=None, success=False, error=_cancel_error,
+                    agent_name=_fid_agent_name)
                 await execution_store.guard(execution_store.persist_tool_call_completed(
                     _tool_call_db_id, _tool_call, _evidence))
             # Phase A: close the delegation's child execution here so it happens
@@ -17751,6 +17991,10 @@ def _build_team(
 
     tool_hooks = [
         interception_hook, _make_member_control_box_hook(),
+        # T50: reads the control-box state _make_member_control_box_hook() just
+        # updated, so it must sit immediately after it in this shared prefix -- see
+        # _make_coordinator_progress_guard_hook's own docstring.
+        _make_coordinator_progress_guard_hook(),
         search_before_browse_gate_hook, read_cache_hook,
         decompose_first_gate_hook,
         evidence_gate_hook, duplicate_delegation_gate_hook, delegation_log_hook,
@@ -17969,6 +18213,36 @@ def _build_team(
     # treats as "unknown" rather than "did not delegate" -- same -1-is-not-zero rule
     # _count_read_calls follows.
     team._delegation_state = delegation_log_hook.state
+    # T50 (2026-10-21): give the Coordinator its own MemberControlState, the SAME
+    # progress-fingerprint machinery delegate_structured_task already registers for
+    # every MEMBER (see _start_member_objective/_record_member_action). Without this,
+    # _get_member_control_box(team).latest_for_member("coordinator") always returned
+    # None (no delegation key for "coordinator" was ever started), so
+    # _record_member_action's own `if state is None: return` silently no-opped on
+    # EVERY Coordinator tool call, even though the shared _control_box_hook already
+    # observes them (`who = _member_id(getattr(agent, "name", None) or "Coordinator")`,
+    # resolving to "coordinator") -- the infrastructure existed and was already wired
+    # to see these calls; it just had nowhere to record them.
+    #
+    # member_id is normalized through the SAME _member_id() helper the hook's own
+    # `who` resolution uses -- a state keyed "Coordinator" (capitalized) would
+    # silently never match. Deliberately NOT routed through _start_member_objective
+    # itself: that function also calls phase0.note_delegation_start(member), which
+    # resets a per-delegation tool-call counter keyed by member name -- correct for a
+    # real delegate_structured_task call, but the Coordinator is not a delegated
+    # member, and creating a spurious "coordinator" slot in phase0's delegation
+    # telemetry is exactly the kind of incidental side effect T45/T46/T47's existing
+    # correlation/concurrency telemetry must stay untouched by (per this phase's own
+    # constraint: preserve T45/T46/T47 unless direct evidence proves a change
+    # necessary -- none does here). delegation_key="run" is a constant, not a real
+    # delegate_structured_task hash -- there is exactly one Coordinator per run, so one
+    # fixed key is enough; _record_member_action's own repeat/progress logic (same
+    # tool + same args + no growth in evidence/claims/reads/member-results = no
+    # progress) needs no per-delegation scoping to work correctly here.
+    _get_member_control_box(team).start(MemberControlState(
+        member_id=_member_id("Coordinator"), delegation_key="run",
+        objective="", evidence_required="", completion_criteria="",
+    ))
     # A model that asks for a tool its owner does not hold twice in a row is flipped to
     # text-only through the same actuator the budget and stub guards use. The models
     # themselves cannot import this module, so each carries the callback.
@@ -19866,6 +20140,25 @@ async def _run_heartbeat(
                     "stream_event_count": event_count or 0,
                     "tool_calls_made": activity["last_call_name"] is not None,
                 }
+                # T50: mutate the dict's own "unavailable_tool_calls" entry IN PLACE,
+                # after construction, rather than changing the dict-literal assignment
+                # above -- unavailable_tool_snapshot() already returns a fresh shallow
+                # copy, so this cannot leak back into the real _unavailable_tool_state.
+                # "last_at" (a raw monotonic timestamp) never crosses into the snapshot
+                # file -- it is converted to "seconds_since_last", a DURATION, HERE, in
+                # the SAME process that wrote it (tool_fix.py's _record_unavailable_tool
+                # runs inside this same worker), for the identical cross-process-clock
+                # reason stagnant_seconds/no_tool_progress_seconds are already durations
+                # rather than timestamps (see this function's own docstring). Without
+                # this, api/server.py's Tier 4 diagnosis has no way to tell "this
+                # unavailable-tool call explains the CURRENT stall" from "this happened
+                # minutes ago and something else is stalling now" -- live-confirmed cost
+                # (T4, T11): a single early, harmless, self-recovered unavailable-tool
+                # call was blamed for an unrelated later stall (the Coordinator looping
+                # on a VALID tool, forward_member_answer, with no new evidence).
+                _last_at = snapshot["unavailable_tool_calls"].pop("last_at", None)
+                if _last_at is not None:
+                    snapshot["unavailable_tool_calls"]["seconds_since_last"] = now - _last_at
                 tmp_path = f"{liveness_path}.tmp"
                 with open(tmp_path, "w") as f:
                     json.dump(snapshot, f)
@@ -21669,7 +21962,17 @@ def _evidence_fidelity_report(run_context, member_results: dict | None, final_an
     total_in_relay = 0
     total_in_answer = 0
     for ev in (run_context.evidence if run_context is not None else []):
-        agent_name = _fidelity_agent_name(run_context, ev.execution_id)
+        # T24: prefer the identity captured directly at the tool-call boundary
+        # (EvidenceRecord.agent_name -- set by _tool_interception_hook from the
+        # real agent object) over the execution-stack-derived lookup, which
+        # collapses to the root Coordinator execution whenever no child
+        # Execution was ever pushed for this call -- true for every
+        # delegate_structured_task-based delegation (see EvidenceRecord's own
+        # docstring). Falls back to the prior behavior unchanged whenever the
+        # new field is absent (every pre-T24 caller, and any future caller
+        # that still omits it).
+        agent_name = (getattr(ev, "agent_name", None)
+                      or _fidelity_agent_name(run_context, ev.execution_id))
         ev_tokens = _salient_tokens(_result_text(ev.content))
         if not ev_tokens:
             items.append({
@@ -23737,6 +24040,29 @@ async def _stream_team_run(
                 raise _BackendRunError(out["message"])
             elif isinstance(out, dict):
                 activity["last_progress_at"] = time.monotonic()
+                # T50 (2026-10-21): this function's own activity dict has no tool_hook
+                # closure (see this function's docstring), so before this fix
+                # last_call_at/last_tool_call_at were set ONCE at construction and never
+                # again -- every tool-shaped dict event updated last_progress_at only.
+                # The liveness SNAPSHOT's no_tool_progress_seconds (api/server.py's Tier
+                # 4) is derived from last_call_at, not last_progress_at, so during any
+                # call through this function (every verify-claims correction retry, and
+                # _complete_repetition_truncated_answer's own completion pass) that
+                # number climbed unboundedly from this call's own start regardless of
+                # how much real tool activity was actually happening -- live-confirmed
+                # (T4, T11): "no_tool_progress_seconds" reached exactly 120s at the
+                # moment of each liveness kill, tracking wall-clock time since THIS
+                # call began, not genuine tool silence (forward_member_answer was
+                # succeeding every ~3-4s throughout). Updating both here, on every real
+                # tool-shaped event this function sees, closes the gap at its root
+                # rather than leaving api/server.py's diagnosis to reason from a number
+                # that was never accurate for this code path.
+                activity["last_call_at"] = time.monotonic()
+                activity["last_tool_call_at"] = time.monotonic()
+                activity["last_tool_result_at"] = time.monotonic()
+                _evt_name = out.get("name") if isinstance(out.get("name"), str) else None
+                if _evt_name:
+                    activity["last_call_name"] = _evt_name
                 # Stash listing counts on the team, alongside _read_state, so the
                 # answer-time count guard can reach them. Accumulates across a run's
                 # retries exactly like _read_state does.

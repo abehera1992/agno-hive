@@ -33,6 +33,7 @@ auto-kill (config.liveness_silence_threshold_s) fires with zero answer produced.
 
 import contextvars  # noqa: E402  (this module defines helpers above its imports)
 import os  # noqa: E402
+import time  # noqa: E402
 
 # agno team internal tools — do not strip from content, let agno handle natively
 _AGNO_INTERNAL_TOOLS = {"delegate_task_to_member", "delegate_task_to_members", "get_member_information"}
@@ -679,6 +680,18 @@ def _record_unavailable_tool(owner: str, tool: str, forced: bool) -> None:
     _unavailable_tool_state["count"] = _unavailable_tool_state.get("count", 0) + 1
     _unavailable_tool_state["last_tool"] = tool
     _unavailable_tool_state["last_owner"] = owner
+    # T50 (2026-10-21): monotonic, same-process timestamp of the MOST RECENT
+    # unavailable-tool call. count/last_tool/last_owner carry no "when" --
+    # live-confirmed cost (T4, T11): a single unavailable-tool call early in a run
+    # (harmless, self-recovered) left count=1 sitting in this dict for the rest of
+    # the run, and api/server.py's liveness diagnosis later blamed THAT stale count
+    # for a completely unrelated stall (the Coordinator repeatedly calling a VALID
+    # tool, forward_member_answer, with no new evidence) that began minutes later.
+    # This timestamp lets that diagnosis require recency instead of mere existence --
+    # see swarm/team.py's _run_heartbeat, which turns this into a same-process
+    # duration (never a raw timestamp) before it crosses into api/server.py's
+    # separate process.
+    _unavailable_tool_state["last_at"] = time.monotonic()
     if forced:
         _unavailable_tool_state["forced_text_only"] = True
 
