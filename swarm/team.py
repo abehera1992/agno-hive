@@ -8,6 +8,7 @@ import sys
 import time
 from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass
+from uuid import uuid4
 
 from opentelemetry import trace
 from pydantic import BaseModel, Field
@@ -12499,6 +12500,22 @@ _STUB_ESCALATION_SERVE = 5
 _evidence_integrity_retry_active: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_evidence_integrity_retry_active", default=False)
 
+# T45 (Track C): carries a dispatch-time-generated delegation identity from the
+# duplicate-delegation gate hook (where it is set, synchronously, the moment a
+# NEW delegation is dispatched -- see _duplicate_delegation_gate_hook) across to
+# whichever Agent.arun() call turns out to be the resulting member invocation
+# (see _install_member_run_id_patch below). Per-asyncio-Task by construction
+# (contextvars.ContextVar copies, not shares, its value into each new Task a
+# scheduler creates -- confirmed via agno/models/base.py's own
+# asyncio.gather(*(self.arun_function_call(fc) for fc in ...)), where each
+# function call becomes its own Task), so two concurrently-dispatched
+# delegations to the same member never see each other's pending value. Read
+# and cleared (consume-once) by the FIRST Agent.arun() call reached while set,
+# so a member's own internal/nested arun() calls (if any) never inherit a
+# stale value belonging to the delegation that dispatched them.
+_pending_delegation_run_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_pending_delegation_run_id", default=None)
+
 # 2026-08-15: a THIRD escalation tier, keyed on the AGGREGATE total_stub_serve_count
 # (already computed for the Tier-3 liveness signal, config.liveness_aggregate_stub_threshold
 # = 15) rather than any single (agent, tool, args) key's own count. Confirmed live: a
@@ -16103,6 +16120,59 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
             # invariant exactly, so no entry is ever tagged with another
             # delegation's text.
             team._pending_log_entry_by_member.setdefault(_dispatch_member_id, []).append(log[-1])
+            # T45 (Track C): generate the member's OWN run_id HERE, at dispatch
+            # time -- before any await, before agno's own aregister_run/
+            # aread_or_create_session race window even begins -- rather than
+            # observing (T41) or guessing (T40's FIFO fallback) it later.
+            #
+            # Deliberately NOT written onto log[-1]["run_id"] directly, and
+            # NOT registered into _pending_log_entry_by_run_id yet -- doing
+            # either eagerly broke 3 protected tests
+            # (test_t41_fifo_correlation_integrity.py's own case3b/4/5),
+            # which simulate RunStarted arriving with THEIR OWN externally-
+            # chosen run_id values (not this one) to exercise T41's
+            # claim-at-RunStarted fallback in isolation. Eagerly marking the
+            # entry "already has a run_id" made _claim_pending_entry_for_run's
+            # own "if 'run_id' not in entry" check skip it, so the test's own
+            # simulated id was never claimed onto anything and completion
+            # fell through to the ambiguous FIFO fallback -- the exact
+            # regression the T42/T43/T44 chain has repeatedly flagged as
+            # unacceptable to reintroduce.
+            #
+            # Instead: register into a SEPARATE table, keyed by this
+            # delegation's own pre-generated id, pointing at the SAME entry
+            # object. _claim_pending_entry_for_run checks this table FIRST
+            # (an exact, identity-based match -- correct regardless of queue
+            # position or arrival order) before falling back to its existing
+            # oldest-unclaimed heuristic (unchanged, still exactly what the
+            # 3 protected tests exercise). The entry's own "run_id" key is
+            # still written exactly once, by _claim_pending_entry_for_run
+            # itself, at the moment a real (or simulated) RunStarted event
+            # actually arrives -- never speculatively here.
+            #
+            # The pre-generated id only becomes the REAL member run's own
+            # run_id if _install_member_run_id_patch's Agent.arun wrapper
+            # actually forwards it (see that function's own docstring).
+            # Derived from, not a copy of, the upstream agno-agi/agno fix at
+            # commit 1444c9bc3 (first released v2.6.10) -- that commit's own
+            # cancellation-propagation machinery (register_member_run/
+            # aregister_member_run) is deliberately NOT vendored here; only
+            # its "generate the child's run_id before dispatch and pass it
+            # explicitly" idea is reused, via a small wrapper instead of a
+            # vendored copy of agno's own ~800-line _get_delegate_task_function.
+            # If that patch is ever absent (failed to install, or a future
+            # agno version changes Agent.arun's own signature incompatibly,
+            # or the member is a sub-Team rather than an Agent -- this patch
+            # covers Agent.arun only, see that function's own docstring), the
+            # entry registered here is simply never matched -- T41's
+            # claim-at-RunStarted-by-oldest-unclaimed mechanism remains the
+            # active correlation path, exactly as it was before this phase.
+            # No behavior regresses either way -- this is additive.
+            _member_run_id = str(uuid4())
+            if not isinstance(getattr(team, "_pending_entry_by_expected_run_id", None), dict):
+                team._pending_entry_by_expected_run_id = {}
+            team._pending_entry_by_expected_run_id[_member_run_id] = log[-1]
+            _pending_delegation_run_id.set(_member_run_id)
         # isinstance(str) is load-bearing, not defensive (2026-08-24). delegate_task_to_member
         # returns an async_generator on the streaming path -- the sibling logger a few
         # lines up prints `delegate result: async_generator` for exactly that reason and
@@ -17991,6 +18061,111 @@ _MEMBER_RESULT_END_EVENT_TYPES = {"RunContentCompleted"}
 # (dispatch-order-preserving) even though completion order is not.
 _MEMBER_RESULT_START_EVENT_TYPES = {"RunStarted"}
 
+_member_run_id_patch_installed = False
+
+
+def _install_member_run_id_patch() -> bool:
+    """T45 (Track C): make a member's REAL run actually adopt the run_id the
+    duplicate-delegation gate hook already generated and registered at
+    dispatch time (see _pending_delegation_run_id's own docstring and the
+    registration code in _duplicate_delegation_gate_hook).
+
+    Why this exists: confirmed by direct source reading (T44), agno's own
+    adelegate_task_to_member/delegate_task_to_member closures
+    (agno/team/_default_tools.py, installed version 2.5.17) call
+    member_agent.arun()/.run() WITHOUT ever passing run_id= -- so agno's own
+    `run_id = run_id or str(uuid4())` always generates a fresh one, and this
+    codebase can only ever OBSERVE it later (T41's claim-at-RunStarted),
+    never choose it. Upstream agno-agi/agno fixed exactly this gap at commit
+    1444c9bc3 ("feat: update agent, team and workflow cancel run
+    persistance", #5996; first released v2.6.10) by generating
+    `member_run_id = str(uuid4())` before dispatch and passing
+    `run_id=member_run_id` into the member's own run() /arun() call. That
+    commit's actual purpose was cancellation propagation
+    (register_member_run/aregister_member_run, a whole new
+    agno.run.cancel registry this installed version does not have) -- its
+    "pre-generate the child's run_id, pass it explicitly" idea is reused
+    here WITHOUT vendoring that registry or any of its ~800 lines of
+    surrounding diff across delegate_task_to_member/adelegate_task_to_member/
+    delegate_task_to_members/adelegate_task_to_members. Re-implementing
+    those closures (they call two PRIVATE, non-exported nested helpers,
+    _setup_delegate_task_to_member and _process_delegate_task_to_member,
+    themselves not independently importable) was evaluated in T44 and
+    rejected as unbounded maintenance risk for a problem this much smaller
+    fix resolves on its own.
+
+    How: wraps Agent.arun (the ONLY entrypoint this codebase's own delegation
+    path actually calls -- confirmed via T44's own call-chain trace,
+    AgnoHive's Coordinator always runs async, so async_mode=True always
+    selects adelegate_task_to_member, never the sync sibling) so that if a
+    caller omits run_id AND this task's own _pending_delegation_run_id is
+    set, the wrapper supplies it -- consume-once: cleared from the
+    contextvar immediately upon use, before calling through, so a NESTED
+    arun() call triggered from inside the member's own execution (if the
+    member itself delegates further) never inherits a stale value meant for
+    THIS delegation's own run, and instead gets agno's own normal fresh
+    uuid4(). Contextvars are per-asyncio-Task by construction (confirmed via
+    agno/models/base.py's own asyncio.gather(*(self.arun_function_call(fc)
+    for fc in ...)), where each tool call becomes its own Task) -- two
+    concurrently-dispatched delegations to the same member each have their
+    OWN task-local value, never shared, never overwritten by each other.
+
+    Deliberately defensive: if Agent cannot be imported, or .arun is not the
+    attribute expected, this returns False and changes nothing -- every
+    existing correlation path (T40's FIFO, T41's claim-at-RunStarted)
+    remains the active mechanism exactly as before, since the dispatch-time
+    registration this patch would consume is harmless if never read (see the
+    dispatch-time comment in _duplicate_delegation_gate_hook). Idempotent:
+    a second call is a no-op (checks _member_run_id_patch_installed first),
+    so re-importing this module or re-building a team does not stack
+    wrappers.
+    """
+    global _member_run_id_patch_installed
+    if _member_run_id_patch_installed:
+        return True
+    try:
+        from agno.agent import Agent
+    except Exception:
+        print("[team] T45: Agent.arun patch NOT installed -- could not "
+              "import agno.agent.Agent; T41's claim-at-RunStarted mechanism "
+              "remains the active correlation path, unaffected", flush=True)
+        return False
+
+    _original_arun = getattr(Agent, "arun", None)
+    if not callable(_original_arun):
+        print("[team] T45: Agent.arun patch NOT installed -- Agent.arun is "
+              "not callable on this installed agno version; T41's claim-at-"
+              "RunStarted mechanism remains the active correlation path, "
+              "unaffected", flush=True)
+        return False
+
+    def _patched_arun(self, *args, **kwargs):
+        if kwargs.get("run_id") is None:
+            _pending = _pending_delegation_run_id.get()
+            if _pending is not None:
+                kwargs["run_id"] = _pending
+                # Consume-once, BEFORE calling through -- a nested arun() this
+                # same call triggers (e.g. the member delegating further
+                # itself) must see this cleared, not inherit it.
+                _pending_delegation_run_id.set(None)
+        return _original_arun(self, *args, **kwargs)
+
+    Agent.arun = _patched_arun
+    _member_run_id_patch_installed = True
+    print("[team] T45: Agent.arun patch installed -- member delegations now "
+          "carry a dispatch-time-generated run_id end-to-end when this "
+          "codebase's own gate hook sets one", flush=True)
+    return True
+
+
+# Installed once, at module import time -- well before any team is built or
+# any delegation dispatched. Deliberately not gated behind any config flag:
+# per _install_member_run_id_patch's own docstring, a failed install is a
+# safe no-op (prints and returns False), never a crash, and leaves every
+# existing correlation path exactly as it was.
+_install_member_run_id_patch()
+
+
 # Cap per member so a runaway generation cannot grow this without bound. Well above a
 # real member report (the largest measured relayed 29,445 chars).
 _MEMBER_CHUNK_CAP = 60_000
@@ -18051,8 +18226,32 @@ def _claim_pending_entry_for_run(team, agent_name: str, run_id) -> None:
     member, or every pending entry is already claimed (an older agno, or an
     event stream that never emits RunStarted, falls through to
     _finalise_member_chunks' own FIFO fallback -- exactly T40's pre-T41
-    behavior, never a crash)."""
+    behavior, never a crash).
+
+    T45 (Track C) addition: BEFORE falling back to oldest-unclaimed, check
+    whether this exact run_id was pre-generated and registered by this
+    codebase's own dispatch-time code (_duplicate_delegation_gate_hook, via
+    _pending_entry_by_expected_run_id) for a SPECIFIC entry. When it was --
+    i.e. _install_member_run_id_patch's Agent.arun wrapper successfully
+    forwarded this exact id into the real member run -- that match is
+    authoritative and identity-based, correct regardless of queue position,
+    dispatch order, or arrival order, closing the residual race T43/T44
+    identified in the oldest-unclaimed heuristic below. When no such
+    pre-registration exists for this id (an older agno, a sub-Team member
+    this patch does not cover, or a caller -- including this file's own
+    existing tests -- that never goes through the dispatch-time hook at
+    all), this falls through to the EXACT same oldest-unclaimed behavior as
+    before T45, unchanged."""
     if run_id is None or team is None or not agent_name:
+        return
+    expected = getattr(team, "_pending_entry_by_expected_run_id", None)
+    if isinstance(expected, dict) and run_id in expected:
+        entry = expected.pop(run_id)
+        if "run_id" not in entry:
+            entry["run_id"] = run_id
+            if not isinstance(getattr(team, "_pending_log_entry_by_run_id", None), dict):
+                team._pending_log_entry_by_run_id = {}
+            team._pending_log_entry_by_run_id[run_id] = entry
         return
     pending = getattr(team, "_pending_log_entry_by_member", None)
     if not isinstance(pending, dict):
