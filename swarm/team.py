@@ -18216,6 +18216,84 @@ def _accumulate_member_chunk(team, agent_name: str, chunk: str) -> None:
         team._member_chunks[key] = (buf + chunk)[:_MEMBER_CHUNK_CAP]
 
 
+def _check_member_concurrency_episode(team, agent_name: str) -> None:
+    """T47: passive, observational-only. Fires
+    phase0.Phase0Run.record_member_concurrency exactly once per overlap
+    EPISODE -- the moment a member's own count of GENUINELY-STARTED
+    (agno's own RunStarted actually observed -- entry["run_id"] is set by
+    THIS function's own caller, _claim_pending_entry_for_run) and
+    not-yet-finalized delegations transitions from below 2 to 2 or more.
+
+    Deliberately keyed on entry.get("run_id") being present, NOT on raw
+    membership in _pending_log_entry_by_member or
+    _pending_entry_by_expected_run_id -- a dispatch-time pre-registration
+    (T45's own expected-id table, written BEFORE any RunStarted event) does
+    not prove the member's run has actually begun executing on agno's own
+    side; only a claimed run_id does. Counting the raw registry size
+    instead would conflate "dispatched" with "genuinely running" and could
+    report concurrency that never actually overlapped in execution -- the
+    exact pitfall this phase's own mission text warned against.
+
+    Changes no correlation decision, dispatch order, or cleanup semantics
+    -- purely reads state T40/T41/T45 already maintain for their own
+    purposes. Episode state lives in
+    team._concurrency_episode_active_members (a set of member keys
+    currently in an active episode) -- bounded by the small, fixed number
+    of distinct team members, never grows unboundedly. Cleared by
+    _clear_member_concurrency_episode_if_resolved (called from
+    _finalise_member_chunks) once the count drops back below 2, so a
+    LATER, separate overlap for the same member is reported as its own
+    fresh episode rather than being silently suppressed by a stale flag.
+    """
+    if team is None or not agent_name:
+        return
+    pending = getattr(team, "_pending_log_entry_by_member", None)
+    if not isinstance(pending, dict):
+        return
+    key = _member_key(agent_name)
+    queue = pending.get(key)
+    if not isinstance(queue, list):
+        return
+    started_run_ids = [e["run_id"] for e in queue if isinstance(e, dict) and "run_id" in e]
+    if len(started_run_ids) < 2:
+        return
+    active = getattr(team, "_concurrency_episode_active_members", None)
+    if not isinstance(active, set):
+        active = set()
+        team._concurrency_episode_active_members = active
+    if key in active:
+        return  # already reported for this still-ongoing episode -- dedup
+    active.add(key)
+    episode_id = str(uuid4())
+    _phase0 = getattr(team, "_phase0", None)
+    if _phase0 is not None:
+        _phase0.record_member_concurrency(agent_name, started_run_ids, episode_id)
+
+
+def _clear_member_concurrency_episode_if_resolved(team, agent_name: str) -> None:
+    """Companion to _check_member_concurrency_episode -- called from
+    _finalise_member_chunks after an entry has been removed from this
+    member's own pending queue (via either the run_id-based path or the
+    FIFO fallback). Clears the active-episode flag once the count of
+    genuinely-started, not-yet-finalized entries for this member drops back
+    below 2, so a later, separate overlap is reported as a fresh episode
+    rather than silently suppressed by a stale flag. A no-op (and safe) if
+    no episode is currently active for this member."""
+    if team is None or not agent_name:
+        return
+    active = getattr(team, "_concurrency_episode_active_members", None)
+    if not isinstance(active, set) or not active:
+        return
+    key = _member_key(agent_name)
+    if key not in active:
+        return
+    pending = getattr(team, "_pending_log_entry_by_member", None)
+    queue = pending.get(key) if isinstance(pending, dict) else None
+    started_count = sum(1 for e in (queue or []) if isinstance(e, dict) and "run_id" in e)
+    if started_count < 2:
+        active.discard(key)
+
+
 def _claim_pending_entry_for_run(team, agent_name: str, run_id) -> None:
     """T41 (Track B/F3-follow-up): associate a NEWLY-STARTED member invocation
     (a 'RunStarted' event, confirmed real -- agno's own
@@ -18275,6 +18353,7 @@ def _claim_pending_entry_for_run(team, agent_name: str, run_id) -> None:
             if not isinstance(getattr(team, "_pending_log_entry_by_run_id", None), dict):
                 team._pending_log_entry_by_run_id = {}
             team._pending_log_entry_by_run_id[run_id] = entry
+            _check_member_concurrency_episode(team, agent_name)
         return
     pending = getattr(team, "_pending_log_entry_by_member", None)
     if not isinstance(pending, dict):
@@ -18288,6 +18367,7 @@ def _claim_pending_entry_for_run(team, agent_name: str, run_id) -> None:
             if not isinstance(getattr(team, "_pending_log_entry_by_run_id", None), dict):
                 team._pending_log_entry_by_run_id = {}
             team._pending_log_entry_by_run_id[run_id] = entry
+            _check_member_concurrency_episode(team, agent_name)
             return
 
 
@@ -18397,6 +18477,13 @@ def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
                     _by_run_cleanup.pop(_pending_entry["run_id"], None)
     if _pending_entry is not None:
         _pending_entry["result"] = text
+    # T47: covers BOTH removal paths above (run_id-based pop at line ~18352
+    # equivalent, and the FIFO-fallback pop) with one call site -- by this
+    # point whichever path resolved _pending_entry has already removed it
+    # from the member's own queue, so re-checking the now-current count is
+    # correct regardless of which branch fired (or neither, which is also
+    # safe: a no-op re-check of an unchanged count).
+    _clear_member_concurrency_episode_if_resolved(team, agent_name)
     # Mirrored to module scope for the same reason _best_draft is: the liveness
     # heartbeat has no `team` in scope, and on an auto-kill the parent process is the
     # only thing left alive. Without this, a killed run hands back the coordinator's

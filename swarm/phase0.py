@@ -374,6 +374,7 @@ class Phase0Run:
         self.delegations: list[dict] = []
         self.member_results: list[dict] = []
         self.mechverify: list[dict] = []
+        self.concurrency_events: list[dict] = []
         self._seq = 0
 
     # ── during the run: append-only, no I/O ──────────────────────────────────────
@@ -468,6 +469,36 @@ class Phase0Run:
                 "proceeded_to_reviewer": proceeded_to_reviewer,
             })
             _emit(self.mechverify[-1])
+        except Exception:  # noqa: BLE001
+            pass
+
+    def record_member_concurrency(self, member: str, outstanding_run_ids: list[str],
+                                  episode_id: str) -> None:
+        """T47: ONE event per overlap EPISODE, fired by team.py's own
+        _check_member_concurrency_episode the moment a member's count of
+        GENUINELY-STARTED (agno's own RunStarted observed -- not merely
+        dispatched/pre-registered) and not-yet-finalized delegations
+        transitions from below 2 to 2 or more. `outstanding_run_ids` are
+        the distinct, agno-confirmed run identities currently outstanding
+        for this member -- their distinctness is the actual evidence of
+        genuine overlap, not merely a registry entry count. Purely
+        observational: never read back by team.py's own correlation or
+        dispatch logic, same append-only, best-effort discipline as every
+        other record_* method here -- a telemetry defect here can cost a
+        row, never the run."""
+        try:
+            self._seq += 1
+            self.concurrency_events.append({
+                "type": "member_delegation_concurrency_observed",
+                "run_id": self.run_id,
+                "seq": self._seq,
+                "member": member,
+                "episode_id": episode_id,
+                "outstanding_run_ids": outstanding_run_ids,
+                "outstanding_count": len(outstanding_run_ids),
+                "confirmed_overlap": True,
+            })
+            _emit(self.concurrency_events[-1])
         except Exception:  # noqa: BLE001
             pass
 
