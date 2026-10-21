@@ -16168,6 +16168,14 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
             # claim-at-RunStarted-by-oldest-unclaimed mechanism remains the
             # active correlation path, exactly as it was before this phase.
             # No behavior regresses either way -- this is additive.
+            #
+            # Installed lazily, HERE, not at module import time -- see
+            # _ensure_member_run_id_patch_installed's own docstring for why
+            # (a print at import time corrupted the worker's stdout-is-pure-
+            # JSON contract; this call site runs well after main.py's own
+            # stdout->stderr redirect, the same timing every other
+            # "[team] ..." print in this file already relies on).
+            _ensure_member_run_id_patch_installed()
             _member_run_id = str(uuid4())
             if not isinstance(getattr(team, "_pending_entry_by_expected_run_id", None), dict):
                 team._pending_entry_by_expected_run_id = {}
@@ -18158,12 +18166,27 @@ def _install_member_run_id_patch() -> bool:
     return True
 
 
-# Installed once, at module import time -- well before any team is built or
-# any delegation dispatched. Deliberately not gated behind any config flag:
-# per _install_member_run_id_patch's own docstring, a failed install is a
-# safe no-op (prints and returns False), never a crash, and leaves every
-# existing correlation path exactly as it was.
-_install_member_run_id_patch()
+# Deliberately NOT called here at module import time. main.py's own
+# worker-process entrypoint (_run_worker_main) imports swarm.team at ITS OWN
+# module top level -- BEFORE it redirects sys.stdout -> sys.stderr (its own
+# docstring: "Redirects stdout -> stderr BEFORE anything... can write to
+# it -- stdout must carry ONLY the final JSON result line"). A print() at
+# import time therefore lands on the real, unredirected stdout pipe
+# api/server.py captures and json.loads()s as a single value -- confirmed
+# live: this exact ordering produced "[api] worker died (the worker produced
+# unparseable output: Expecting value: line 1 column 2 (char 1))" on the
+# very first post-deploy run, with the run's own correlation logic having
+# worked perfectly (verified in the journal) -- the corruption was purely
+# this print landing on the wrong stream, nothing to do with correlation
+# correctness. Fixed by calling this lazily instead, from inside
+# _duplicate_delegation_gate_hook on first dispatch (idempotent -- see the
+# installed-flag check at the top of this function) -- by then the worker
+# is deep inside actual run processing, well after the redirect, exactly
+# the same timing every other "[team] ..." print in this file already
+# relies on safely.
+def _ensure_member_run_id_patch_installed() -> None:
+    if not _member_run_id_patch_installed:
+        _install_member_run_id_patch()
 
 
 # Cap per member so a runaway generation cannot grow this without bound. Well above a
