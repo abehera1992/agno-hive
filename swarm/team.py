@@ -8428,6 +8428,51 @@ async def _evidence_integrity_check(
     finally:
         _evidence_integrity_retry_active.reset(_z14_token)
 
+    # T57: this retry's own _stream_team_run call can itself be cut off by
+    # the repetition-loop guard (Z16) -- confirmed live, T56's run
+    # kzpp5fqwh: the reconciliation retry hit the repetition threshold
+    # mid-restatement, and the truncated text happened to contain no
+    # remaining detectable contradiction, so it was adopted below despite
+    # never reaching a usable conclusion. Give it the SAME one bounded
+    # completion pass every other repetition-truncated generation in this
+    # file already gets -- _complete_repetition_truncated_answer, reused
+    # unmodified, with its own checkpoint-evidence prompt, nested
+    # -truncation handling, and honest-disclosure fallback -- rather than
+    # judging the truncated text purely by whether a contradiction remains
+    # in it.
+    #
+    # Deliberately reuses _REPETITION_COMPLETION_FLAG, the SAME one-shot
+    # budget _verified_answer's own upfront call already spends from, not a
+    # second, parallel completion budget -- at most one repetition
+    # -completion pass happens per run, whichever stage needs it first.
+    # `result=None`/a throwaway list are safe here: _count_read_calls
+    # treats a None result as "undeterminable" (its own documented
+    # fallback, always-adopt), and this function has no `result` object of
+    # its own to pass -- it is content-in, content-out.
+    was_truncated = getattr(team, "_repetition_truncated", False)
+    pre_completion = retried
+    retried, _ = await _complete_repetition_truncated_answer(
+        retried, task, team, [], None, liveness_path)
+    if (was_truncated and retried == pre_completion
+            and _TRUNCATED_ANSWER_NOTE not in retried
+            and not _ends_at_a_natural_stopping_point(retried)):
+        # _complete_repetition_truncated_answer's own one-shot budget had
+        # already been spent by an earlier stage in this same run -- it
+        # returned this truncated text completely unchanged, without its
+        # own usual incomplete-disclosure note, because it never got to
+        # attempt a completion at all. Add that disclosure here so this
+        # still-incomplete candidate is never mistaken for a finished one
+        # by the checks below.
+        retried = retried + _TRUNCATED_ANSWER_NOTE
+    if _TRUNCATED_ANSWER_NOTE in retried:
+        print("[team] evidence-integrity: retry remains repetition-truncated "
+              "after the one bounded completion pass -- not adopting it as "
+              "complete merely because no contradiction remains in it; "
+              "keeping the pre-retry draft instead", flush=True)
+        forced = _force_uncertainty_answer(content, findings)
+        await _persist_evidence_integrity_trace(team, findings, resolved=False, retried=True)
+        return forced
+
     # Same defensive floor _adopt_retry applies to every other retry in this
     # file -- a genuinely empty completion or one that strips to nothing (pure
     # tool-call syntax) is never a candidate for adoption, whatever the recheck
