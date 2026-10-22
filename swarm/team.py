@@ -19891,7 +19891,27 @@ def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:
     every cycle, so it still reaches three occurrences with only one extra
     cycle of delay versus flagging on the second; a phrase that legitimately
     recurs once, far away, for an unrelated reason is left alone.
+
+    T62: a segment composed ENTIRELY of whitespace, once substantial in its
+    own raw length, is the most extreme possible form of "no new semantic
+    content" there is -- confirmed live, a T3 battery rerun (session
+    299f7d507c30's own "repetition-completion" recovery pass): the model
+    collapsed into emitting progressively GROWING runs of pure tab
+    characters (single tabs, then double, then triple-tab groups) for
+    300+ seconds with NEITHER this function nor _looks_like_repetition_decay
+    ever firing. Root cause: both normalize via str.split(), which discards
+    whitespace-only tokens entirely, so a pure-whitespace segment normalizes
+    to the EMPTY string and trivially satisfies the "too short to judge"
+    early-return just below, regardless of its raw character length.
+    Checked FIRST, against the RAW segment -- not the word-normalized one
+    the existing tiers use -- since word-based normalization is exactly
+    what hides this case. Cannot misfire on legitimate content: any real
+    prose, code, or data contains non-whitespace characters, so .strip()
+    on it is never empty.
     """
+    if len(new_segment) >= _REPETITION_MIN_SEGMENT_LEN and not new_segment.strip():
+        return True
+
     normalized_new = " ".join(new_segment.split())
     if len(normalized_new) < _REPETITION_MIN_SEGMENT_LEN:
         return False
