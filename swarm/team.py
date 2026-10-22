@@ -6622,10 +6622,27 @@ def _sections_without_completeness_claim(content: str, cmp_note: str = "") -> li
         blocks.append(content[start:end].rstrip())
     out = []
     for b in blocks:
-        if not b or _reconcile_completeness_claims(b):
+        _heading = b.splitlines()[0][:60] if b else ""
+        if not b:
             continue
-        if cmp_note and _matched_item_named_as_missing(b, cmp_note):
+        if _reconcile_completeness_claims(b):
+            print(f"[team] section exclusion: {_heading!r} dropped by the blanket "
+                  f"completeness-claim lexicon", flush=True)
             continue
+        if cmp_note:
+            _matched_hit = _matched_item_named_as_missing(b, cmp_note)
+            if _matched_hit:
+                # T54 (Priority 1): narrow, distinguishing log line -- T53's own
+                # live validation could not tell this exclusion path apart from
+                # the blanket-lexicon one above from the journal alone. Kept
+                # permanent (not a temporary diagnostic): this is the ONE signal
+                # that proves the new branch fired at all, at negligible cost
+                # (one print only on the already-rare path where a section is
+                # being dropped).
+                print(f"[team] section exclusion: {_heading!r} dropped -- names "
+                      f"{_matched_hit!r} as missing, but compare_enumerations "
+                      f"proved it MATCHED/PARTIAL_MATCH", flush=True)
+                continue
         out.append(b)
     return out
 
@@ -9031,6 +9048,28 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     miscount = _miscounted_listing(content, getattr(team, "_listings", None))
     if miscount is not None:
         stated, listing = miscount
+        # T54 (Priority 2, T7 remediation): when the TASK's own wording already
+        # named which of the several defensible readings it wants, there is no
+        # adjudication left to avoid -- replace the wrong answer outright with one
+        # built directly from the tool's own output, rather than only marking the
+        # wrong number in place and leaving a possibly-incomplete file list (e.g.
+        # missing __init__.py, the live-reproduced T53 incident) as the primary
+        # answer text.
+        restated = _authoritative_listing_restatement(task, listing)
+        if restated is not None:
+            print(f"[team] answer states {stated} but list_directory({listing['path']}) "
+                  f"returned {listing['items']} items — task wording names a "
+                  f"specific reading; replacing with the authoritative restatement",
+                  flush=True)
+            return (
+                f"{restated}\n\n---\n**THE ORIGINAL ANSWER'S COUNT DID NOT MATCH THE "
+                f"DIRECTORY LISTING AND HAS BEEN REPLACED — it stated {stated}, which "
+                f"matches no reading of the list_directory call this run actually "
+                f"made for `{listing['path']}`. The restatement above is built "
+                f"directly from that tool's own output, not from the model's "
+                f"recollection.**"
+                + _tail()
+            )
         by_ext = ", ".join(f"{n} .{ext}" for ext, n in sorted(listing["by_ext"].items()))
         print(f"[team] answer states {stated} but list_directory({listing['path']}) "
               f"returned {listing['items']} items — flagging the discrepancy")
@@ -23656,6 +23695,53 @@ def _mark_miscounted_statement_inline(content: str, stated: int) -> str:
         return content
     insert_at = m.end()
     return content[:insert_at] + " **[see COUNT DISAGREES note below]**" + content[insert_at:]
+
+
+# "the exact number of .py files" -- unambiguous about WHICH of _miscounted_listing's
+# several independently-defensible readings (total/files/dirs/per-extension) a task
+# wants, when it names one explicitly. Narrower than it looks on purpose: "how many
+# files" alone (no extension) is still ambiguous (all files? just one kind?) and is
+# deliberately NOT matched here -- this fires only when the task's own wording has
+# already resolved the question _miscounted_listing's own docstring says it must not.
+_TASK_EXTENSION_COUNT_RE = re.compile(
+    r"\bnumber\s+of\s+\.?([A-Za-z0-9]{1,6})\s+files?\b", re.IGNORECASE)
+
+
+def _task_wants_extension_count(task: str) -> str | None:
+    """The file extension a task's own wording unambiguously names as the count it
+    wants (e.g. "report the EXACT number of .py files"), or None when the wording
+    does not single one out. Lower-cased to match `by_ext`'s own keys.
+    """
+    m = _TASK_EXTENSION_COUNT_RE.search(task or "")
+    return m.group(1).lower() if m else None
+
+
+def _authoritative_listing_restatement(task: str, listing: dict) -> str | None:
+    """A deterministic, fully-correct restatement of ONE listing, for the narrow
+    case where the task's own wording already resolved which of
+    _miscounted_listing's several defensible readings is wanted. Returns None
+    whenever that narrowing does not apply -- this must never guess any more than
+    _miscounted_listing itself does.
+
+    T54 (Priority 2, T7 remediation): T53 only marked the wrong stated number in
+    place, leaving the wrong number (and the model's own incomplete file list,
+    e.g. missing `__init__.py` in the live-reproduced incident) as the primary
+    answer text. This instead replaces the WHOLE answer with one built directly
+    from `listing["names"]` -- the exact per-file list list_directory itself
+    returned, never invented, never deduplicated, every real file kept -- for the
+    one case (the task names a specific extension) where there is no reading left
+    to adjudicate.
+    """
+    ext = _task_wants_extension_count(task)
+    if not ext or ext not in (listing.get("by_ext") or {}):
+        return None
+    names = sorted(n for n in (listing.get("names") or [])
+                    if n.lower().endswith(f".{ext}"))
+    if not names:
+        return None
+    body = "\n".join(f"- `{n}`" for n in names)
+    return (f"`{listing['path']}` contains {len(names)} `.{ext}` file(s), per "
+            f"list_directory's own output:\n\n{body}")
 
 
 def _miscounted_listing(content: str, listings: list | None) -> tuple[int, dict] | None:
