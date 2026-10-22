@@ -1853,13 +1853,20 @@ def _with_forwarded_evidence(content: str, team) -> str:
     for k, t in forwarded.items():
         if not (t and t.strip()):
             continue
+        # T13 fix: a key may carry a "#2"/"#3" suffix (see forward_member_answer's own
+        # write site) when a member was forwarded more than once with genuinely
+        # different content -- strip it for display only, so attribution still reads as
+        # the real member name and every pre-existing single-forward test asserting
+        # "### From {member}" (never suffixed, since those fixtures only ever have one
+        # entry per member) is unaffected.
+        label = k.split("#", 1)[0]
         mode, lines = _forwarded_gap(t, content)
         if mode == "full":
             full.append(k)
-            parts.append(f"\n\n### From {k}\n{t.strip()}")
+            parts.append(f"\n\n### From {label}\n{t.strip()}")
         elif mode == "lines":
             partial[k] = f"{len(lines)} line(s), first: {lines[0].strip()[:70]!r}"
-            parts.append(f"\n\n### From {k} (only the lines the answer above does not contain)\n"
+            parts.append(f"\n\n### From {label} (only the lines the answer above does not contain)\n"
                          + "\n".join(lines))
     if not parts:
         return content
@@ -2175,7 +2182,42 @@ def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = N
               f"{', unresolved' if result.unresolved else ''})", flush=True)
         if forwarded is None:
             return result.answer
-        forwarded[key] = result.answer
+        # T13 fix (2026-10-21): a plain `forwarded[key] = result.answer` here silently
+        # dropped every earlier forward to the SAME member once a later, DIFFERENT
+        # delegation to that member was also forwarded -- live-traced via ZGX journal
+        # (run 88ca75d6679d, the exact T13a/T13b vouchers-audit shape): forward_member_
+        # answer itself retrieved and forwarded all three sequential researcher
+        # delegations (endpoints, tables, hooks) correctly, each forward correctly
+        # reading the then-current team._member_results slot (T40/T41's own fixes to
+        # THAT dict are correct and untouched) -- but each one's `forwarded[key] =`
+        # assignment below overwrote the previous, so by the time
+        # _with_forwarded_evidence ran at final-answer time, only the LAST forward
+        # (hooks) was still reachable through this dict. The tables forward -- the
+        # middle one, already correctly retrieved and already correctly forwarded --
+        # was unrecoverable at that point, not because it was never captured, but
+        # because this single-slot-per-member map could only remember the newest one.
+        #
+        # Fix: the first forward for a member keeps the exact pre-fix shape (a bare
+        # string at `forwarded[key]`) so every existing single-forward caller and test
+        # asserting that exact shape (e.g. `t._forwarded_members == {"researcher":
+        # LIST_ANSWER}`) is untouched. Only a SUBSEQUENT, genuinely DIFFERENT forward to
+        # the same member gets a new suffixed key (`f"{key}#2"`, `#3`, ...) instead of
+        # overwriting -- _with_forwarded_evidence already iterates forwarded.items()
+        # generically, so no change is needed there to pick these up. An identical
+        # re-forward of unchanged content (the Coordinator calling this twice in a row
+        # for the same member with no new delegation in between) is deliberately NOT
+        # given a new slot, so a run with no multi-delegation forwarding behaves
+        # byte-for-byte as before, and a repeated identical forward never inflates the
+        # final answer with duplicate evidence.
+        existing_keys = [key] + [k for k in forwarded if k.startswith(f"{key}#")]
+        if not any(forwarded.get(k) == result.answer for k in existing_keys):
+            if key not in forwarded:
+                forwarded[key] = result.answer
+            else:
+                n = 2
+                while f"{key}#{n}" in forwarded:
+                    n += 1
+                forwarded[f"{key}#{n}"] = result.answer
         return (
             f"FORWARDED: {key}'s answer ({len(result.answer):,} characters) is recorded and "
             f"will appear in your final answer exactly as written. Do not retype it; add "
@@ -17924,7 +17966,11 @@ def _build_team(
     # one map rather than two that can drift.
     member_answers: dict[str, str] = {}
     # Exact member text captured by forward_member_answer at forward time; bound to
-    # team._forwarded_members below and read by _with_forwarded_evidence.
+    # team._forwarded_members below and read by _with_forwarded_evidence. Values are
+    # normally `str` (one forward per member, the pre-T13-fix shape every existing
+    # caller/test assumes); a member forwarded more than once with genuinely different
+    # content gets an additional "{member}#2"/"#3" key instead of overwriting -- see
+    # forward_member_answer's own write site for why.
     forwarded_members: dict[str, str] = {}
     # Phase F -- built from the SAME top-level `task` decompose_first_gate_hook/
     # search_before_browse_gate_hook already receive, unconditionally (unlike those two,

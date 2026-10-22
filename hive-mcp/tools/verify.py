@@ -346,6 +346,14 @@ _DECORATOR_ROUTE_RE = re.compile(
     r"@\w+\.(?:get|post|put|patch|delete|options|head)\(\s*"
     r"['\"]([^'\"]+)['\"]"
 )
+# A4 (verify-claims precision fixes): same shape as _DECORATOR_ROUTE_RE above, but
+# ALSO captures the verb (group 1), for _quote_matches' decorator-restatement check --
+# kept as its own regex rather than widening _DECORATOR_ROUTE_RE's own capture groups,
+# since that regex's existing callers rely on group(1) being the path specifically.
+_DECORATOR_VERB_PATH_RE = re.compile(
+    r"@\w+\.(get|post|put|patch|delete|options|head)\(\s*"
+    r"['\"]([^'\"]+)['\"]"
+)
 # A backtick span that IS a code declaration ("class Voucher(BaseModel)", "class
 # Voucher(Base):", "class Voucher", "def get_voucher(...)", "async def
 # get_voucher(...)") rather than a bare symbol name or a call. The old tokenizer
@@ -416,11 +424,25 @@ _PARAM_RE = re.compile(r"(?:\\$)?\\{[^}]*\\}|:[A-Za-z_][A-Za-z0-9_]*")
 
 # Words that show up in backticks constantly and mean nothing on their own. Grepping
 # them wastes a subprocess and returns thousands of hits.
+#
+# A1 (verify-claims precision fixes): common English function words -- articles,
+# demonstratives, a few pronouns -- that a model occasionally backtick-wraps for
+# EMPHASIS ("...is declared on line 129... `The` exact line is:"), never as a code
+# reference. Live-reproduced: a battery-T1-shaped answer with a bare backtick-wrapped
+# "`The`" sentence-opener was extracted as a checkable identifier (it matches
+# _IDENT_RE -- 3 letters, no dot) and checked against the one file the answer names,
+# producing "NOT IN FILE The <-- ... does not define it" on an otherwise fully correct
+# citation. Kept deliberately narrow -- only words that are virtually never a real
+# code identifier when standing alone, matching this set's own existing design (compare
+# "get"/"post"/"data"/"value" above, included for the identical reason: common enough
+# as plain English that a bare backtick around one is noise far more often than a
+# genuine symbol claim).
 _NOISE = {
     "true", "false", "null", "none", "string", "number", "boolean", "int", "str",
     "float", "bool", "dict", "list", "any", "void", "async", "await", "return",
     "const", "let", "var", "def", "class", "import", "export", "type", "interface",
     "get", "post", "put", "delete", "patch", "data", "error", "result", "value",
+    "the", "this", "that", "these", "those", "it", "its",
 }
 
 # Module/package prefixes common enough that `prefix.attribute` inside generated code
@@ -687,6 +709,58 @@ def _negation_scope(answer: str, start: int) -> str:
     for m in _CLAUSE_BREAK_RE.finditer(window):
         last_break = m.end()
     return window[last_break:] if last_break is not None else window
+
+
+# A3 (verify-claims precision fixes): how far around a negated claim to look for an
+# explicit service/directory SCOPE the claim itself names. Wide enough to span the
+# common "no X anywhere in the Y service" shape (the scope phrase typically follows
+# the negated noun, which _negation_scope's own backward-only window cannot see at
+# all), narrow enough to stay within the same sentence rather than borrowing a scope
+# named several claims away.
+_SERVICE_SCOPE_WINDOW = 150
+# "the authentication service" / "authentication-service" -- a service name as the
+# project actually spells its own directories (API/<name>-service/) is always a
+# SINGLE word immediately before "service" (authentication-service, business-service,
+# inventory-service, storage-service, ... -- every directory under API/ follows this
+# shape, never a multi-word domain phrase). Captures just that one word; a greedier
+# "up to 3 words" version of this regex was tried first and measured live to capture
+# "in the authentication" (from "...anywhere in the authentication service") as
+# group(1) -- its own quantifier had no way to tell a real name word from "in"/"the"
+# sitting right before it, so the slug built from it ("in-the-authentication-service")
+# never resolves and the scope narrowing silently never fires. Anchoring to exactly
+# one preceding word sidesteps that: it cannot swallow an article or preposition, and
+# EkamApp's own directories never need more than one word to identify regardless.
+_SERVICE_SCOPE_RE = re.compile(
+    r"\b([a-z][a-z0-9]*)[\s-]service\b", re.IGNORECASE
+)
+
+
+def _service_scope_glob(context: str) -> str | None:
+    """A ripgrep --glob restricting a search to one named service's own directory,
+    when `context` names one AND that directory genuinely exists -- else None.
+
+    Exists because the ABSENCE CLAIMS check below used to grep a negated term
+    (`middleware`) against the WHOLE project regardless of what the claim itself was
+    actually scoped to. Live-reproduced, battery T10: "There is no rate-limiting
+    `middleware` anywhere in the authentication service" is TRUE -- the authentication
+    service genuinely has none -- but `middleware` as a bare word is unavoidably
+    present in every OTHER FastAPI service's own boilerplate (`from
+    fastapi.middleware.cors import CORSMiddleware`, `uvicorn.middleware.
+    proxy_headers`), so an unscoped repo-wide grep finds a hit in some unrelated
+    service and reports the correct, carefully-scoped claim CONTRADICTED.
+
+    Deliberately conservative: only narrows the search when the claim's own text
+    names a real service directory, verified against the filesystem rather than
+    trusted from the name alone -- a claim naming no service, or naming one that does
+    not exist under API/, is searched exactly as before (whole-repo, unscoped), so a
+    genuine fabrication with no stated scope is caught exactly as it always was.
+    """
+    for m in _SERVICE_SCOPE_RE.finditer(context):
+        slug = re.sub(r"[\s-]+", "-", m.group(1).strip().lower())
+        candidate = PROJECT_ROOT / "API" / f"{slug}-service"
+        if candidate.is_dir():
+            return f"API/{slug}-service/**"
+    return None
 
 
 def _is_negated_claim(answer: str, start: int, end: int) -> bool:
@@ -1392,6 +1466,20 @@ def _dotted_idents(text: str) -> list[str]:
         tok = m.group(0)
         left = tok.split(".", 1)[0].lower()
         if left in _STDLIB_PREFIXES or left in _NOISE:
+            continue
+        # A2 (verify-claims precision fixes): T30 added _looks_like_bare_filename to
+        # exclude a bare FILENAME (`items_api.py`) from being read as an owner.attribute
+        # SYMBOL claim ("items_api" owns attribute "py") -- but only wired it into the
+        # inline-backtick extraction loop, never into this fenced-code-block path. Live-
+        # reproduced, battery T6: a raw `list_directory` dump inside a ```-fenced block
+        # (not individually backtick-wrapped filenames) reaches _dotted_idents, not the
+        # backtick loop, so every one of 24 real filenames in the listing was still split
+        # into owner="items_api"/attr="py" and grepped as a dotted claim -- "py" trivially
+        # exists elsewhere in the repo (any other .py file, any `python ...` shell command),
+        # so every filename reported SPLIT-FOUND, needlessly flagging a 100% accurate
+        # directory listing. Same exclusion, same rationale, now applied at both the two
+        # places a dotted-looking token can enter the claim list.
+        if _looks_like_bare_filename(tok):
             continue
         if tok not in out:
             out.append(tok)
@@ -2174,6 +2262,30 @@ def _quote_matches(quoted: str, window: str) -> bool:
     if unwrapped != quoted and unwrapped and unwrapped in window:
         return True
 
+    # A4 (verify-claims precision fixes): a quote shaped like a decorator CALL
+    # (`@router.post("/upload")`) that drops the real declaration's trailing kwargs
+    # (`, response_model=..., status_code=201`) and closes the paren early is a
+    # faithful, syntactically-tidy RESTATEMENT of a real decorator, not a different
+    # claim -- but it is also not a literal substring of the real line (the quote's
+    # own closing `")` never appears verbatim once the real line has more after the
+    # path argument), and it carries no "..." to trigger the ellipsis path above.
+    #
+    # Live-reproduced, battery T11, all six of six citations: every one of
+    # `@router.post("/upload")`, `@router.get("/download/{file_id}")`, etc. was
+    # independently confirmed byte-exact against the real declared decorator by
+    # direct file read, yet all six reported MISMATCH, because the model's own
+    # inline restatement omitted kwargs the real line carries. Compares only the
+    # HTTP verb and the quoted path literal -- the same two fields _DECORATOR_ROUTE_RE
+    # already extracts and verifies elsewhere for the ROUTES section -- so an
+    # genuinely WRONG verb or a genuinely invented path still fails this check and
+    # falls through to the real MISMATCH unchanged.
+    qm = _DECORATOR_VERB_PATH_RE.search(quoted)
+    if qm:
+        verb, path = qm.group(1).lower(), qm.group(2)
+        for wm in _DECORATOR_VERB_PATH_RE.finditer(window):
+            if wm.group(1).lower() == verb and wm.group(2) == path:
+                return True
+
     parts = [p.strip() for p in _ELLIPSIS_RE.split(quoted)]
     parts = [p for p in parts if p]
     if len(parts) < 2:
@@ -2299,6 +2411,12 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     # Claims that something does NOT exist. Collected rather than discarded so the
     # opposite check can run -- see the ABSENCE CLAIMS section.
     negated_idents: list[str] = []
+    # A3 (verify-claims precision fixes): the text immediately around each negated
+    # claim, captured at extraction time so the ABSENCE CLAIMS section below can look
+    # for an explicit service/directory SCOPE the claim itself names ("anywhere in the
+    # authentication service") -- see _service_scope_glob's own docstring for why this
+    # narrows the contradiction search rather than searching the whole repo.
+    negated_scope_ctx: dict[str, str] = {}
     # W1/W2 (2026-09-17): claimed base class(es) for a `class X(Y)`-shaped
     # declaration claim, keyed by the declared symbol name -- e.g. `class
     # Voucher(BaseModel)` records decl_bases["Voucher"] = ["BaseModel"]. Consumed by
@@ -2357,6 +2475,10 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                 # opposite grep, not no grep at all.
                 if tok not in negated_idents:
                     negated_idents.append(tok)
+                    negated_scope_ctx[tok] = answer[
+                        max(0, m.start() - _SERVICE_SCOPE_WINDOW):
+                        min(len(answer), m.end() + _SERVICE_SCOPE_WINDOW)
+                    ]
                 continue
             if _is_proposed_new_claim(answer, m.start()):
                 if tok not in idents and tok not in proposed_idents:
@@ -2948,7 +3070,14 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
         checked = negated_idents[:_MAX_CLAIMS] + negated_paths[:_MAX_CLAIMS]
         out.append(f"ABSENCE CLAIMS ({len(checked)} checked):")
         for tok in negated_idents[:_MAX_CLAIMS]:
-            hits = _rg(tok, fixed=True, glob_filter=glob_filter,
+            # A3: an explicit caller-supplied glob_filter always wins (never silently
+            # overridden); otherwise, if the claim's own surrounding text names a real
+            # service directory, search only there instead of the whole project -- see
+            # _service_scope_glob's own docstring for the T10 false positive this fixes.
+            scoped_glob = glob_filter or _service_scope_glob(
+                negated_scope_ctx.get(tok, "")
+            ) or ""
+            hits = _rg(tok, fixed=True, glob_filter=scoped_glob,
                        whole_word="." not in tok)
             code_hits = [h for h in hits
                          if not h.split(":", 1)[0].lower().endswith(_DOC_EXTS)]
