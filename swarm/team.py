@@ -10073,7 +10073,28 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     else:
         report, bad, unavailable = _fab_report, _fab_bad, _fab_unavailable
     if unavailable:
-        return content + _UNVERIFIED_DISCLAIMER + _summarize_actual_writes(*all_results)
+        # T60: this used to return only _summarize_actual_writes -- the bare
+        # write summary -- dropping every OTHER guard's own disclosure note
+        # (_scope_note, _integ_note, _models_note, _hook_cov_note, _cmp_note,
+        # _count_note, _table_note, _crud_gap_note, _docs_note, _fields_note,
+        # _svc_note, _opened_note, the unchecked-completeness block, and
+        # _lost_report_evidence) even though every one of them was already
+        # computed earlier in this call, completely independently of
+        # verify_claims' own availability. `unavailable=True` here means
+        # hive-mcp WAS configured and the call was attempted but failed
+        # (exception/timeout) -- per _verify_claims' own docstring, a
+        # fully-unconfigured hive_mcp_url/hive_mcp_tools (run_task_async's
+        # own "no connected MCP exposes verify_claims" log line) is a
+        # DIFFERENT, silent case that returns unavailable=False and takes
+        # the "not bad" branch below, never this one. _tail() is safe here
+        # even though it also includes
+        # _stale_findings_dropped(_fab_note, content): _fab_note is only ever
+        # set non-empty when _fab_bad is True (see its own assignment above),
+        # which cannot be true in the SAME call where verify_claims came back
+        # unavailable -- so this introduces no stale or incorrect fabrication
+        # note, only the independent disclosures that were being silently
+        # dropped.
+        return content + _UNVERIFIED_DISCLAIMER + _tail()
     if not bad:
         # _tail(), not the bare write summary: an answer that trips NO guard is exactly
         # where a false completeness claim hides best -- T13b's "there are no gaps"
