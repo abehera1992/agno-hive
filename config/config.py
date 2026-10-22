@@ -431,6 +431,37 @@ class Config:
     liveness_repetition_threshold: int = int(
         os.getenv("LIVENESS_REPETITION_THRESHOLD", "4"))
 
+    # Tier 0 (2026-10-22, T3 remediation): the snapshot file itself has stopped being
+    # written, independent of what its own last-written fields claim.
+    #
+    # Every tier above trusts a DURATION the worker computed about ITSELF (stagnant_
+    # seconds, no_tool_progress_seconds, ...) -- all of which freeze, unchanged, the
+    # instant the worker stops running at all, whether by a clean exit the parent
+    # missed, a hard crash, or the event loop itself being starved by a blocking call
+    # that never yields. A frozen snapshot reporting "stagnant_seconds: 5" looks
+    # identical, to every tier above, to a genuinely healthy run mid-tick -- there was
+    # no way, from this side, to tell "the heartbeat is still ticking and this is
+    # current" apart from "the heartbeat died and this is what it last wrote before
+    # that." A live incident already named this gap without a fix: a run sat 26
+    # minutes with zero tool calls, the heartbeat kept printing "coordinator still
+    # running" throughout, and whether the stall clock was genuinely not advancing or
+    # the snapshot had simply stopped being written could not be settled afterward --
+    # the file is unlinked on exit and was the only record.
+    #
+    # written_at (swarm/team.py's _run_heartbeat) is a wall-clock time.time(), not the
+    # monotonic clock every duration field above deliberately uses -- the one
+    # exception, because this check's entire point is comparing against THIS process's
+    # own wall clock at read time, not reasoning about a duration internal to the
+    # worker. Both processes run on the same host (a local subprocess), so no NTP-skew
+    # concern applies the way it would across machines.
+    #
+    # 120s: 4x the 30s heartbeat tick interval, generous enough that ordinary
+    # scheduling jitter or a slow single tick never trips it, while still ending a
+    # truly-frozen worker roughly 15x faster than agno_run's own 1800s client-side
+    # timeout rather than waiting for that backstop to give up.
+    liveness_snapshot_stale_threshold_s: float = float(
+        os.getenv("LIVENESS_SNAPSHOT_STALE_THRESHOLD_S", "120"))
+
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))
     session_window: int = int(os.getenv("AGNO_SESSION_WINDOW", "6"))

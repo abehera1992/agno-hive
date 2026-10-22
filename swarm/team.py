@@ -3648,6 +3648,26 @@ def _reader_facing_report(report: str) -> str:
     # must keep working; only what the READER sees changes. What actually happened is
     # worth stating plainly: the same draft was checked twice unchanged.
     if "verify_claims STOPPED" in report:
+        # No-op-retry transparency fix (2026-10-22, T51 remediation Phase 6):
+        # hive-mcp's STOPPED message now appends the original check's own specific
+        # findings after this exact marker (see verify.py's _checked_answer_reports)
+        # -- surface them instead of the generic blanket sentence below, so the
+        # reader learns WHICH claims are actually in question rather than being told
+        # only that something, unspecified, might be wrong. Falls back to the
+        # original generic sentence when the marker is absent (an older deployed
+        # verify.py, or a case where the prior report genuinely was not retained),
+        # so this never regresses to a worse message than before.
+        _marker = "The previous report's own findings, unchanged since that check:\n"
+        _idx = report.find(_marker)
+        if _idx != -1:
+            _specific = report[_idx + len(_marker):].strip()
+            if _specific:
+                return (
+                    "The same answer text was submitted for verification twice "
+                    "without changing, so the check was not repeated. The first "
+                    "check's own findings, unchanged, are what the claims above "
+                    "should be read against:\n\n" + _specific
+                )
         return ("The same answer text was submitted for verification twice without "
                 "changing, so the check was not repeated. Whatever the first check "
                 "reported still stands — treat the claims above as unverified.")
@@ -6551,6 +6571,47 @@ def _make_coordinator_progress_guard_hook():
     return _coordinator_progress_guard_hook
 
 
+_MD_HEADING_RE = re.compile(r"^#{1,6}\s+.+$", re.MULTILINE)
+
+
+def _sections_without_completeness_claim(content: str) -> list[str]:
+    """Markdown-heading-delimited blocks of `content` that assert no completeness
+    claim of their own -- see _reconcile_completeness_claims, the SAME tested
+    lexicon the comparison-reconciliation gate below already uses to decide whether
+    a block is about completeness at all, reused here rather than a second,
+    bespoke classifier.
+
+    Built for Phase 3 (T13 remediation, 2026-10-22): _synthesize_comparison_answer
+    replaces the WHOLE draft once it fires, which is correct for whatever section
+    actually made the completeness claim being reconciled, but wrong for an
+    unrelated section the SAME draft also wrote. Live-traced via ZGX journal (run
+    88ca75d6679d and its post-T51-fix re-run): a "### Database Tables" block, built
+    from a real Researcher delegation's own evidence and never discussing
+    completeness at all, was discarded along with the completeness claim it had
+    nothing to do with.
+
+    Returns [] (nothing preserved) when `content` has no markdown headings at all --
+    a single-block answer with no completeness claim already takes the early-return
+    path above this function's caller, so reaching here with no headings means the
+    whole thing WAS the claim and there is nothing separable to keep. Errs toward
+    dropping a borderline section rather than keeping one: a section that happens to
+    also match the completeness lexicon is excluded, never merged, since the one
+    invariant this whole gate exists to protect is that contradictory prose must
+    never ride back in alongside the authoritative comparison.
+    """
+    if not content:
+        return []
+    headings = list(_MD_HEADING_RE.finditer(content))
+    if not headings:
+        return []
+    blocks = []
+    for i, h in enumerate(headings):
+        start = h.start()
+        end = headings[i + 1].start() if i + 1 < len(headings) else len(content)
+        blocks.append(content[start:end].rstrip())
+    return [b for b in blocks if b and not _reconcile_completeness_claims(b)]
+
+
 def _synthesize_comparison_answer(cmp_note: str) -> str | None:
     """K4: the whole answer built as PURE STRING TEMPLATING from
     `_comparison_summary`'s counts and `_comparison_entries`' exact per-item
@@ -6828,6 +6889,20 @@ async def _reconcile_completeness_claim_with_comparison(
               f"evidence_ledger_consulted={_ledger_record is not None} "
               f"claim_id={_claim.claim_id if _claim else None} "
               f"claim_authoritative_consumed={_claim_authoritative_consumed}", flush=True)
+        # Phase 3 remediation (2026-10-22): keep any section of the ORIGINAL draft
+        # that made no completeness claim of its own -- the comparison's authority
+        # over the completeness dimension (this gate's own entire purpose) is
+        # unchanged; this only stops an unrelated, already-evidenced section (e.g. a
+        # required "Database Tables" section) from being discarded along with the
+        # completeness claim it had nothing to do with. See
+        # _sections_without_completeness_claim's own docstring for the live T13
+        # incident this closes.
+        preserved = _sections_without_completeness_claim(content)
+        if preserved:
+            print(f"[team] comparison gate: preserving {len(preserved)} unrelated "
+                  f"section(s) from the original draft alongside the deterministic "
+                  f"synthesis", flush=True)
+            synthesized = synthesized + "\n\n" + "\n\n".join(preserved)
         return synthesized, result, True
 
     if not claims:
@@ -9206,6 +9281,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         more = f" (+{len(unsourced) - 8} more)" if len(unsourced) > 8 else ""
         print(f"[team] {len(unsourced)} enumerated filename(s) appear in no tool result "
               f"this run: {named}{more} — flagging", flush=True)
+        content = _mark_unsourced_filenames_inline(content, unsourced)
         return (
             f"{content}\n\n---\n**NAMES THAT NO TOOL RETURNED — the list above includes "
             f"{len(unsourced)} filename(s) that appear in NO tool result from this run: "
@@ -20133,6 +20209,13 @@ async def _run_heartbeat(
         if liveness_path:
             try:
                 snapshot = {
+                    # Tier 0 (2026-10-22, T3 remediation): wall-clock, deliberately NOT
+                    # monotonic -- every duration field below is self-reported by this
+                    # process and freezes the instant it stops running; this is the one
+                    # field that lets the READER notice that freeze at all, by comparing
+                    # against ITS OWN wall clock later. See config.py's
+                    # liveness_snapshot_stale_threshold_s for the incident this closes.
+                    "written_at": time.time(),
                     "stagnant_seconds": stagnant_ticks * interval,
                     "max_stub_serve_count": activity.get("max_stub_serve_count", 0),
                     "total_stub_serve_count": activity.get("total_stub_serve_count", 0),
@@ -22938,6 +23021,50 @@ def _unsourced_filenames(content: str, seen: set | None) -> list[str]:
     if len(candidates) < _MIN_ENUMERATED_FILES:
         return []
     return sorted(n for n in candidates if n not in seen)[:20]
+
+
+# Phase 1 remediation (2026-10-22): historically this detection only ever produced a
+# trailing disclosure block (see the call site below) -- live-confirmed insufficient
+# by itself on T12's worst case (B9): the "External Dependencies" prose above the
+# block still read, on its own, as a settled inventory, and the fabricated names
+# (auth_utils.py, gst_engine.py, ...) were delivered as the primary answer text with
+# the correction living only in an appendix a reader could miss entirely. This marks
+# the SAME names this run already determined were unsourced, in place, at the exact
+# point the claim is made -- no new model call, no re-delegation, no claim about
+# whether the file is real, only about what THIS run observed.
+_UNSOURCED_INLINE_MARKER = " **[UNVERIFIED -- no tool call this run confirmed this file]**"
+
+
+def _mark_unsourced_filenames_inline(content: str, unsourced: list[str]) -> str:
+    """Annotate each unsourced filename's first enumerated occurrence in place.
+
+    Only the first list-line occurrence of each name is marked, so a name mentioned
+    again later in prose is not drowned in repeated warnings -- the trailing block
+    appended at the call site already names every occurrence collectively; this adds
+    the one thing that block could not: pointing at the specific claim.
+    """
+    if not unsourced:
+        return content
+    remaining = set(unsourced)
+    lines = content.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if not remaining or not _LIST_LINE_RE.match(line.rstrip("\n")):
+            continue
+        updated = line
+        for name in list(remaining):
+            # Same token shape _FILENAME_RE itself matches, so this never mangles a
+            # substring of a longer, genuinely-sourced filename.
+            m = re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w/])", updated)
+            if not m:
+                continue
+            insert_at = m.end()
+            if updated[insert_at:insert_at + 1] == "`":
+                insert_at += 1  # land outside the inline-code span, not inside it
+            updated = updated[:insert_at] + _UNSOURCED_INLINE_MARKER + updated[insert_at:]
+            remaining.discard(name)
+        if updated != line:
+            lines[i] = updated
+    return "".join(lines)
 
 
 def _recorded_listing_block(listings: list | None, available: int,

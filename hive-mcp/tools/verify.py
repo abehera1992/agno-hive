@@ -2333,6 +2333,40 @@ def _quote_matches(quoted: str, window: str) -> bool:
 # does not add (see Phase 4 report, DEDUP FINDING).
 _MAX_TRACKED_ANSWERS = 8
 _checked_answer_counts: dict[str, int] = {}
+# No-op-retry transparency (2026-10-22, T51 remediation Phase 6): the ORIGINAL
+# report's own specific findings, keyed the same way _checked_answer_counts already
+# is. Before this, a second byte-identical submission returned only the generic
+# STOPPED notice -- the first report's specific findings were simply gone the
+# moment the counter incremented, with no way for a caller, or a human reading a
+# downstream rewrite of this message, to recover WHICH claims were actually in
+# question. Bounded by the same _MAX_TRACKED_ANSWERS eviction as the counter it
+# shadows.
+_checked_answer_reports: dict[str, str] = {}
+# No-op-retry transparency (2026-10-22): what was actually staged the first time this
+# exact answer text was checked, so a SECOND call can tell a genuine same-session
+# repeat (nothing staged has changed) apart from two DIFFERENT callers whose answer
+# text happens to collide byte-for-byte while the real state underneath is not the
+# same check at all -- precisely the gap _checked_answer_counts' own comment above
+# names as unresolved ("No text-only key can distinguish that from a genuine
+# same-caller repeat"). Closing the common, cheap case (different staged files) does
+# not need a caller/session identity this module still does not have.
+_checked_answer_fingerprints: dict[str, tuple] = {}
+
+
+def _staged_fingerprint() -> tuple:
+    """Cheap, order-independent snapshot of what _staged_files() currently returns.
+
+    Not a perfect same-session proof (two unrelated stagings landing in the exact
+    same tick, same path, would still look unchanged), but closes the practical
+    case this phase actually hit: two callers whose project root differs entirely
+    (e.g. two tests, each given its own tmp_path) can never produce a matching
+    fingerprint, so a stale, unrelated report is never relayed as if it were this
+    check's own.
+    """
+    try:
+        return tuple(sorted((str(p), p.stat().st_mtime) for p in _staged_files()))
+    except Exception:
+        return ()
 
 
 def verify_claims(answer: str, glob_filter: str = "") -> str:
@@ -2353,54 +2387,84 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     ("`path`, line N -- `quoted text`"), the quoted text's actual location IS checked
     against line N — but a bare, unquoted citation still only proves the line exists.
     """
-    global _checked_answer_counts
+    global _checked_answer_counts, _checked_answer_reports, _checked_answer_fingerprints
     if not answer or not answer.strip():
         return "verify_claims: nothing to check (empty answer)."
 
     if _checked_answer_counts.get(answer, 0) >= 1:
+        # Fingerprint check (2026-10-22): a text collision alone does not prove this
+        # is the SAME check repeated -- see _staged_fingerprint's own docstring. If
+        # what's staged now does not match what was staged the first time this exact
+        # text was seen, this is a different caller/context that happens to share
+        # byte-identical answer text; fall through to a genuine fresh check instead
+        # of relaying a stale, unrelated report as if it were this one's own.
+        _same_session = _checked_answer_fingerprints.get(answer) == _staged_fingerprint()
         _checked_answer_counts.pop(answer, None)  # reset — a later distinct check isn't blocked
-        # Deliberately contains "could NOT be found", the exact phrase
-        # swarm/team.py's _verify_claims uses to classify a report as "bad"
-        # ("could NOT be found" in report). That orchestrator-level guard calls
-        # this tool up to twice — an initial check, then a recheck of a correction
-        # round — and if the correction genuinely changes nothing, its second call
-        # lands here. It must still see this as bad: the underlying claims were
-        # never actually fixed, only re-submitted, so treating a stuck repeat as
-        # "verified good" would silently drop the fabrication disclaimer the
-        # orchestrator would otherwise attach.
-        return (
-            # Third-person/declarative, not a second-person imperative -- this
-            # exact string reaches TWO audiences with no framework layer between
-            # them: the calling model (which should act on it) AND, when a model
-            # simply pastes its own tool result into its final answer, a human
-            # reader. swarm/team.py's OWN server-constructed reports get a
-            # separate reader-facing rewrite before being shown to a person (see
-            # _reader_facing_report there) -- but THIS string is returned directly
-            # by the tool, with no such rewrite step downstream, so it must be
-            # safe standing alone in either voice. Live battery evidence (Phase P,
-            # T1/T7 reruns): a model that called this tool twice on its own
-            # unchanged draft pasted the old imperative text ("Either (a)... or
-            # (b)...") verbatim into its delivered answer -- confusing and wrong
-            # in a reader's voice, the same failure shape _reader_facing_report
-            # was built to fix for the other call path.
-            #
-            # "STOPPED" and "could NOT be found" are BOTH load-bearing and must
-            # stay verbatim: swarm/team.py's _verify_claims classifies a report as
-            # bad via the literal check `"could NOT be found" in report" (see
-            # test_stopped_message_still_classifies_as_bad_for_the_orchestrator).
-            "verify_claims STOPPED: this exact answer text was already checked "
-            "once, and its claims could NOT be found in the project. Checking "
-            "the same, unchanged text again will not surface anything new. The "
-            "caller should revise the answer using the previous report's "
-            "findings, or state plainly that no grounded answer was found, "
-            "rather than resubmitting the same draft."
-        )
+        # No-op-retry transparency fix (2026-10-22): recover the ORIGINAL report's
+        # own specific findings rather than leaving the reader with only the generic
+        # notice below. Popped (not peeked), matching the counter's own reset above --
+        # a later genuinely-distinct check of this same text starts clean on both.
+        _prior_report = _checked_answer_reports.pop(answer, None)
+        _checked_answer_fingerprints.pop(answer, None)
+        if _same_session:
+            # Deliberately contains "could NOT be found", the exact phrase
+            # swarm/team.py's _verify_claims uses to classify a report as "bad"
+            # ("could NOT be found" in report). That orchestrator-level guard calls
+            # this tool up to twice — an initial check, then a recheck of a correction
+            # round — and if the correction genuinely changes nothing, its second call
+            # lands here. It must still see this as bad: the underlying claims were
+            # never actually fixed, only re-submitted, so treating a stuck repeat as
+            # "verified good" would silently drop the fabrication disclaimer the
+            # orchestrator would otherwise attach.
+            return (
+                # Third-person/declarative, not a second-person imperative -- this
+                # exact string reaches TWO audiences with no framework layer between
+                # them: the calling model (which should act on it) AND, when a model
+                # simply pastes its own tool result into its final answer, a human
+                # reader. swarm/team.py's OWN server-constructed reports get a
+                # separate reader-facing rewrite before being shown to a person (see
+                # _reader_facing_report there) -- but THIS string is returned directly
+                # by the tool, with no such rewrite step downstream, so it must be
+                # safe standing alone in either voice. Live battery evidence (Phase P,
+                # T1/T7 reruns): a model that called this tool twice on its own
+                # unchanged draft pasted the old imperative text ("Either (a)... or
+                # (b)...") verbatim into its delivered answer -- confusing and wrong
+                # in a reader's voice, the same failure shape _reader_facing_report
+                # was built to fix for the other call path.
+                #
+                # "STOPPED" and "could NOT be found" are BOTH load-bearing and must
+                # stay verbatim: swarm/team.py's _verify_claims classifies a report as
+                # bad via the literal check `"could NOT be found" in report" (see
+                # test_stopped_message_still_classifies_as_bad_for_the_orchestrator).
+                "verify_claims STOPPED: this exact answer text was already checked "
+                "once, and its claims could NOT be found in the project. Checking "
+                "the same, unchanged text again will not surface anything new. The "
+                "caller should revise the answer using the previous report's "
+                "findings, or state plainly that no grounded answer was found, "
+                "rather than resubmitting the same draft."
+                # Appended, never substituted for the required verbatim text above --
+                # "STOPPED" and "could NOT be found" still classify this as bad exactly
+                # as before. This is the ONE thing a caller/reader could not previously
+                # recover from this message alone: which specific claims the first,
+                # already-discarded check actually found wrong.
+                + (f"\n\nThe previous report's own findings, unchanged since that check:\n"
+                   f"{_prior_report}" if _prior_report else "")
+            )
+        # else: what's staged has changed since the text collision was recorded --
+        # not a genuine repeat. Fall through and check this submission fresh.
 
     _checked_answer_counts[answer] = 1
     if len(_checked_answer_counts) > _MAX_TRACKED_ANSWERS:
         # Oldest entry evicted by insertion order -- bounds memory under
         # concurrent load without needing a caller identity to key on.
         _checked_answer_counts.pop(next(iter(_checked_answer_counts)), None)
+    # Captured once per call, here rather than at the function's own final return --
+    # nothing in this read-only tool writes to *.hive_proposed, so what's staged
+    # cannot change between here and the return below; recorded at the point the
+    # answer is first marked seen, alongside it, for locality.
+    _checked_answer_fingerprints[answer] = _staged_fingerprint()
+    if len(_checked_answer_fingerprints) > _MAX_TRACKED_ANSWERS:
+        _checked_answer_fingerprints.pop(next(iter(_checked_answer_fingerprints)), None)
 
     # ── collect candidate claims ──────────────────────────────────────────────
     idents: list[str] = []
@@ -3201,4 +3265,11 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
         out.append("VERDICT: every checked claim exists in the project. NOTE: this "
                    "proves existence only. It does NOT confirm the symbol does what the "
                    "answer says it does.")
-    return "\n".join(out)
+    _report = "\n".join(out)
+    # No-op-retry transparency fix (2026-10-22): save THIS check's own report so a
+    # later byte-identical resubmission (the STOPPED branch above) can recover it
+    # instead of leaving the reader with only a generic "treat as unverified" notice.
+    _checked_answer_reports[answer] = _report
+    if len(_checked_answer_reports) > _MAX_TRACKED_ANSWERS:
+        _checked_answer_reports.pop(next(iter(_checked_answer_reports)), None)
+    return _report

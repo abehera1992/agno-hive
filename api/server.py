@@ -391,7 +391,31 @@ def _liveness_kill_reason(snapshot: dict) -> str | None:
     model that rotates its non-convergence across several different files instead
     of hammering one, which can keep every individual Tier-2 count just under
     threshold; see swarm/team.py's _make_read_cache_tool_hook docstring for the
-    live incident)."""
+    live incident).
+
+    Tier 0 (2026-10-22, T3 remediation) runs first and is independent of every tier
+    below: it does not ask what the worker last reported about itself, only whether
+    it is still reporting anything at all. Every tier below trusts a duration the
+    worker computed about its OWN state, and every one of those durations freezes,
+    unchanged, the instant the worker stops running -- whether it exited cleanly in
+    a way the parent missed, crashed outright, or the event loop was starved by a
+    blocking call that never yields back to the heartbeat's own asyncio.sleep loop.
+    A frozen snapshot and a genuinely healthy one mid-tick are indistinguishable to
+    Tiers 1-5 alike; this is the check that tells them apart, by comparing the
+    snapshot's own written_at against THIS process's wall clock rather than trusting
+    anything the (possibly-dead) worker last computed about its own internal state."""
+    written_at = snapshot.get("written_at")
+    if written_at is not None:
+        stale_for = time.time() - written_at
+        if stale_for > config.liveness_snapshot_stale_threshold_s:
+            return (
+                f"heartbeat snapshot has not been written in {stale_for:.0f}s "
+                f"(threshold {config.liveness_snapshot_stale_threshold_s:.0f}s) -- the "
+                f"worker has stopped reporting entirely, so its own last-reported "
+                f"state (stagnant_seconds={snapshot.get('stagnant_seconds', 0):.0f}, "
+                f"liveness_state={snapshot.get('liveness_state')!r}) is stale and not "
+                f"trustworthy"
+            )
     stagnant = snapshot.get("stagnant_seconds", 0)
     if stagnant > config.liveness_silence_threshold_s:
         base = f"no tool call or new stream content for over {config.liveness_silence_threshold_s:.0f}s"
