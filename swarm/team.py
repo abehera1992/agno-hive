@@ -6133,29 +6133,96 @@ def _task_evidence_obligations(team, task: "str | None") -> "list[EvidenceObliga
     return None
 
 
-def _evaluate_requirement_coverage(team, obligations: "list[EvidenceObligation]") -> dict:
-    """{target: "satisfied"|"missing"|"unknown"} (Objective B; "unknown"
-    added T65). Tries structured declaration IDENTITY first -- an exact
-    (case-insensitive) match against a RETAINED file_read EvidenceRecord's
-    own `excerpt`, which IS the real declared name _extract_declarations
-    found (e.g. "PricingPlan", not a paraphrase) -- so "PricingPlan"/
-    "pricing_plan"/"Pricing Plan" in the obligation's own normalized form
-    still matches the one real declaration without a growing synonym list
-    (Section 6: exact identity where the system already knows the
-    declaration, UNKNOWN/substring-fallback otherwise, never a semantic-
-    similarity engine). Falls back to the original substring-over-path-and-
-    excerpt check (bounded fallback, explicitly still permitted) only when
-    no exact declaration match exists.
+_CODE_IDENTIFIER_RE = re.compile(
+    r"\b(?:[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+|[a-z][a-z0-9]*_[a-z0-9_]+)\b")
 
-    An obligation with `resolved=False` (T65) is never checked against the
-    ledger at all -- its `target` is a natural-language conceptual phrase
-    (see _resolve_trace_target), not a literal identifier, so a substring
-    check against it would reproduce the exact false-negative this phase
-    fixes. Reported "unknown" unconditionally: not "satisfied" (nothing was
-    actually verified) and not "missing" (nothing disprovable was checked
-    either) -- disclosed explicitly, never silently guessed either way, and
-    never blocks completion since the caller's own missing-check only reacts
-    to the literal string "missing".
+
+def _relationship_support_claim(team) -> "Claim | None":
+    """T66: deterministic, content-agnostic signal for "a real relationship
+    was demonstrated", as distinct from "two unrelated facts both happen to
+    exist in the ledger" -- the exact gap T65.1 confirmed (its own B vs. D/E
+    cases: unrelated evidence and independently-found symbols both reached
+    COMPLETE identically to an excerpt that actually showed one entity
+    calling into another).
+
+    The ONLY signal used: does a SINGLE, untruncated, retained file_read
+    EvidenceRecord's own excerpt -- one real tool call's own real output,
+    never assembled from separate observations -- contain two or more
+    DISTINCT code-identifier-shaped tokens (_CODE_IDENTIFIER_RE: PascalCase
+    with an internal case transition, or snake_case with an underscore).
+    This is structural, not semantic: it does not match on "api"/"route"/
+    "model"/"seller"/"verification" or any task-specific vocabulary (the
+    forbidden broad-keyword-heuristic shape), and plain English prose
+    ("calls", "status", "the") never matches _CODE_IDENTIFIER_RE's own
+    shape requirement. It also cannot fire from two independently-read
+    files, each naming only one identifier (T65.1's Case D) -- co-occurrence
+    must be WITHIN one real observation, which is the one place this
+    architecture can currently distinguish "assembled from separate facts"
+    from "actually observed together". any_truncated_for_path is reused
+    (GAP A, pre-existing on _EvidenceLedger) so a cut-off search/read can
+    never manufacture this signal from content that was never fully seen.
+
+    Builds a real, inspectable Claim via the existing _make_claim/
+    _validate_claim_evidence pipeline -- never a bespoke boolean -- so the
+    resulting authoritative=True/False and evidence_ids are the same
+    auditable record every other claim type in this file already produces,
+    and a stale/invalidated evidence_id is caught by the SAME
+    _validate_claim_evidence check every other claim already uses, not a
+    second, independently-maintained rule.
+
+    Deliberately NOT a general relationship verifier: it only answers
+    "did ONE real observation show more than one real identifier", nothing
+    about WHICH identifiers correspond to WHICH obligation, and nothing
+    about call-graph correctness. Returns None (no claim) when no
+    qualifying record exists -- never fabricates one.
+    """
+    ledger = getattr(team, "_evidence_ledger", None)
+    if ledger is None:
+        return None
+    for r in ledger.list():
+        if (isinstance(r, EvidenceRecord) and r.relevance_status == "retained"
+                and r.evidence_type == "file_read" and r.excerpt
+                and not ledger.any_truncated_for_path(r.source_path)):
+            tokens = set(_CODE_IDENTIFIER_RE.findall(r.excerpt))
+            if len(tokens) >= 2:
+                return _create_factual_claim(
+                    team,
+                    statement=(f"single observation at {r.source_path!r} "
+                               f"names {len(tokens)} distinct identifiers "
+                               f"together: {sorted(tokens)!r}"),
+                    evidence_ids=[r.evidence_id],
+                    provenance="deterministic:single_observation_multi_entity")
+    return None
+
+
+def _evaluate_requirement_coverage(team, obligations: "list[EvidenceObligation]") -> dict:
+    """{target: "satisfied"|"missing"|"unknown"|"supported"} (Objective B;
+    "unknown" added T65, "supported" added T66). Tries structured
+    declaration IDENTITY first -- an exact (case-insensitive) match against a
+    RETAINED file_read EvidenceRecord's own `excerpt`, which IS the real
+    declared name _extract_declarations found (e.g. "PricingPlan", not a
+    paraphrase) -- so "PricingPlan"/"pricing_plan"/"Pricing Plan" in the
+    obligation's own normalized form still matches the one real declaration
+    without a growing synonym list (Section 6: exact identity where the
+    system already knows the declaration, UNKNOWN/substring-fallback
+    otherwise, never a semantic-similarity engine). Falls back to the
+    original substring-over-path-and-excerpt check (bounded fallback,
+    explicitly still permitted) only when no exact declaration match exists.
+
+    An obligation with `resolved=False` (T65) is never checked via the
+    literal-substring path at all -- its `target` is a natural-language
+    conceptual phrase (see _resolve_trace_target), not a literal identifier,
+    so a substring check against it would reproduce the exact false-negative
+    T65 fixed. Instead (T66), _relationship_support_claim is consulted ONCE
+    per call (memoized in a local, never cached across calls -- the ledger
+    can grow between completion-decision calls, so a stale True must never
+    survive to a later, different evaluation): if it returns a validated
+    Claim, every unresolved target in THIS obligation set is "supported"
+    (a real relationship was demonstrated, per that function's own narrow
+    signal); otherwise every unresolved target remains "unknown" -- not
+    "satisfied" (nothing was verified) and not "missing" (T65.1: missing
+    evidence is not proof of nonexistence) -- disclosed explicitly.
+    `_completion_decision` is the caller that decides which of these block.
     """
     ledger = getattr(team, "_evidence_ledger", None)
     declared_exact: set[str] = set()
@@ -6168,11 +6235,19 @@ def _evaluate_requirement_coverage(team, obligations: "list[EvidenceObligation]"
                 haystacks.append(f"{r.source_path or ''} {r.excerpt or ''}".lower())
             elif isinstance(r, ComparisonEvidence):
                 haystacks.append(r.source.lower())
+    relationship_claim = None
+    relationship_checked = False
     coverage = {}
     for ob in obligations:
         t = ob.target
         if not ob.resolved:
-            coverage[t] = "unknown"
+            if not relationship_checked:
+                relationship_claim = _relationship_support_claim(team)
+                relationship_checked = True
+            if relationship_claim is not None and _validate_claim(team, relationship_claim):
+                coverage[t] = "supported"
+            else:
+                coverage[t] = "unknown"
         elif ledger is None:
             coverage[t] = "missing"
         elif t and t in declared_exact:
@@ -6215,6 +6290,23 @@ def _completion_decision(team, task: "str | None" = None) -> tuple[str, str]:
        mechanically decompose -- UNKNOWN must never be guessed as
        SUFFICIENT, but also must never itself become a blocking condition:
        only a CONFIRMED-MISSING obligation blocks completion.
+
+    3. T66 (fixing the T65.1-confirmed gap): a RESOLVED obligation reported
+       "unknown" cannot occur (coverage only ever reports "satisfied"/
+       "missing" for those) -- but an UNRESOLVED obligation (a conceptual
+       "from X to Y" target, T65) reported "unknown" means "no relationship
+       was demonstrated", which DOES block, same as a confirmed-missing
+       resolved obligation -- unless _evaluate_requirement_coverage instead
+       reported "supported" (a validated _relationship_support_claim
+       exists). This is narrower than making every UNKNOWN blocking
+       (rule 2's own UNKNOWN-never-blocks principle is UNCHANGED for a
+       task this cannot mechanically decompose at all, i.e.
+       obligations=None -- that path never reaches this rule, see below).
+       It only closes the specific, confirmed gap: a non-empty ledger of
+       ANY content was previously sufficient for COMPLETE even when the
+       obligations it was supposed to satisfy were never actually
+       resolved (T65.1's B/C/D cases, all indistinguishable from a
+       genuinely satisfied E before this phase).
     """
     member_chars = getattr(team, "_member_result_chars", 0)
     if not member_chars:
@@ -6254,6 +6346,22 @@ def _completion_decision(team, task: "str | None" = None) -> tuple[str, str]:
             return ("INSUFFICIENT_EVIDENCE",
                     f"required coverage missing for: {', '.join(missing)} "
                     f"(obligations derived from {source})")
+        # T66: an unresolved (conceptual) obligation reported "unknown" has
+        # no demonstrated relationship -- distinct from "missing" (T65.1:
+        # missing evidence is never proof of nonexistence), but still fails
+        # closed, per this function's own rule 3. Only obligations still
+        # present in `coverage` with status "unknown" reach here (a
+        # "supported" status, or a resolved obligation's "satisfied", does
+        # not).
+        unresolved_unsupported = [ob.target for ob in obligations
+                                   if not ob.resolved and coverage.get(ob.target) == "unknown"]
+        if unresolved_unsupported:
+            source = obligations[0].source
+            return ("INSUFFICIENT_EVIDENCE",
+                    f"required relationship not demonstrated for: "
+                    f"{', '.join(unresolved_unsupported)} (obligations "
+                    f"derived from {source}; evidence may exist but no "
+                    f"single observation establishes the relationship)")
     else:
         # T64: UNKNOWN (this task's shape could not be mechanically
         # decomposed into obligations) was previously indistinguishable, in
