@@ -715,6 +715,7 @@ async def _run_worker_subprocess(
                                 repairs = await repair_unguarded_draft(
                                     payload.get("task") or "", draft,
                                     payload.get("mcp_url"), payload.get("mcp_urls"),
+                                    member_results=(snapshot or {}).get("member_results"),
                                 )
                             except Exception as exc:  # noqa: BLE001
                                 print(f"[api] draft repair failed "
@@ -722,12 +723,13 @@ async def _run_worker_subprocess(
                                       f"returning the draft unchecked")
                                 repairs = ""
                             # The members' own findings, which used to die with the
-                            # worker. The four parent-side repair guards can only
-                            # re-derive facts from the repo; they cannot recover what
-                            # THIS run gathered. T11 (2026-09-08) is the case: killed
-                            # at 513s, 2,228 characters handed back, every guard
-                            # correctly silent because none applied to that question
-                            # shape, and the Researcher's work simply gone.
+                            # worker. The repair guards above can only re-derive facts
+                            # from the repo or (T53) approximate from this same
+                            # recovered data; they cannot recover everything THIS run
+                            # gathered. T11 (2026-09-08) is the case: killed at 513s,
+                            # 2,228 characters handed back, every guard correctly
+                            # silent because none applied to that question shape, and
+                            # the Researcher's work simply gone.
                             _found = render_member_findings(
                                 (snapshot or {}).get("member_results"))
                             if _found:
@@ -817,6 +819,7 @@ async def _run_worker_subprocess(
             repairs = await repair_unguarded_draft(
                 payload.get("task") or "", draft,
                 payload.get("mcp_url"), payload.get("mcp_urls"),
+                member_results=_crash_members,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[api] draft repair failed ({type(exc).__name__}: {exc}) — "

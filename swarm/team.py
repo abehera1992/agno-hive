@@ -6574,7 +6574,7 @@ def _make_coordinator_progress_guard_hook():
 _MD_HEADING_RE = re.compile(r"^#{1,6}\s+.+$", re.MULTILINE)
 
 
-def _sections_without_completeness_claim(content: str) -> list[str]:
+def _sections_without_completeness_claim(content: str, cmp_note: str = "") -> list[str]:
     """Markdown-heading-delimited blocks of `content` that assert no completeness
     claim of their own -- see _reconcile_completeness_claims, the SAME tested
     lexicon the comparison-reconciliation gate below already uses to decide whether
@@ -6590,14 +6590,25 @@ def _sections_without_completeness_claim(content: str) -> list[str]:
     completeness at all, was discarded along with the completeness claim it had
     nothing to do with.
 
+    `cmp_note` (T53, Priority 1, T2 remediation, 2026-10-23; default "" preserves
+    the exact pre-T53 behavior for any other caller) closes a blind spot THIS
+    function itself introduced: a section can dodge the blanket completeness
+    lexicon entirely while still naming a specific, genuinely MATCHED or
+    PARTIAL_MATCH item as missing -- live-reproduced via direct harness, the exact
+    T2 shape ("GET /gst/rate-changes ... has no corresponding frontend hook" for
+    an endpoint the comparison proves is matched). Such a section is excluded too,
+    via _matched_item_named_as_missing, even though it never trips
+    _reconcile_completeness_claims on its own.
+
     Returns [] (nothing preserved) when `content` has no markdown headings at all --
     a single-block answer with no completeness claim already takes the early-return
     path above this function's caller, so reaching here with no headings means the
     whole thing WAS the claim and there is nothing separable to keep. Errs toward
     dropping a borderline section rather than keeping one: a section that happens to
-    also match the completeness lexicon is excluded, never merged, since the one
-    invariant this whole gate exists to protect is that contradictory prose must
-    never ride back in alongside the authoritative comparison.
+    also match the completeness lexicon, OR names a matched/partial-match identity
+    as missing, is excluded, never merged, since the one invariant this whole gate
+    exists to protect is that contradictory prose must never ride back in alongside
+    the authoritative comparison.
     """
     if not content:
         return []
@@ -6609,7 +6620,14 @@ def _sections_without_completeness_claim(content: str) -> list[str]:
         start = h.start()
         end = headings[i + 1].start() if i + 1 < len(headings) else len(content)
         blocks.append(content[start:end].rstrip())
-    return [b for b in blocks if b and not _reconcile_completeness_claims(b)]
+    out = []
+    for b in blocks:
+        if not b or _reconcile_completeness_claims(b):
+            continue
+        if cmp_note and _matched_item_named_as_missing(b, cmp_note):
+            continue
+        out.append(b)
+    return out
 
 
 def _synthesize_comparison_answer(cmp_note: str) -> str | None:
@@ -6692,6 +6710,60 @@ def _reconstruction_category_conflict(content: str, cmp_note: str) -> str | None
                      f"and a LEFT_ONLY item ({hit_left!r}) together -- a partial "
                      f"match must not be reported as missing")
     return None
+
+
+# T53 (Priority 1, T2 remediation): generic absence framings a model uses to claim
+# something is missing -- no project-specific vocabulary, same spirit as this
+# file's own _AFFIRMS_RE for the mirror-image (existence) claim.
+_MISSING_FRAMING_RE = re.compile(
+    r"\b(?:missing|does\s+not\s+have|do\s+not\s+have|no\s+corresponding|"
+    r"not\s+exposed|lacks?|without\s+a\b|without\s+an\b|has\s+no\b|have\s+no\b|"
+    r"not\s+implemented|not\s+available)\b", re.IGNORECASE)
+
+
+def _matched_item_named_as_missing(section: str, cmp_note: str) -> list[str]:
+    """Identities compare_enumerations PROVED match (or partially match) that
+    `section`'s own prose ALSO names inside an absence-framing sentence --
+    exact substring co-occurrence, no NLP/fuzzy matching, generic to any
+    two-sided comparison. Sibling of _reconstruction_category_conflict above
+    (PARTIAL_MATCH confused with LEFT_ONLY); this is the shape T2 actually
+    hit, live-reproduced via direct harness (2026-10-23): a genuinely MATCHED
+    endpoint (`GET /gst/rate-changes`) named as having "no corresponding
+    frontend hook" in the SAME section a real LEFT_ONLY gap was also,
+    correctly, named in -- the completeness-claim lexicon this gate otherwise
+    relies on does not recognize a specific-named-item claim like this one at
+    all (it only matches blanket assertions: "all X have Y", "no gaps"), so
+    `claims` comes back empty and nothing before this check ever looked at
+    the section's own text against the comparison's own MATCHED/PARTIAL_MATCH
+    identities.
+
+    Returns the matched identities found (for logging), or [] when the
+    section makes no absence claim at all, or makes one that names nothing
+    the comparison proved exists.
+    """
+    if not section or not _MISSING_FRAMING_RE.search(section):
+        return []
+    entries = _comparison_entries(cmp_note)
+    if not entries:
+        return []
+    hits: list[str] = []
+    for category in ("matched", "partial_match"):
+        for line in entries.get(category) or []:
+            if "  <->" not in line:
+                continue
+            left, right = line.split("  <->", 1)
+            left = left.strip()
+            if category == "partial_match":
+                # Same leading-normalized-path-token strip as
+                # _reconstruction_category_conflict's own _identity() helper.
+                parts = left.split("   ", 1)
+                left = parts[1].strip() if len(parts) > 1 else left
+            right = right.strip()
+            if left and left in section:
+                hits.append(left)
+            elif right and right in section:
+                hits.append(right)
+    return hits
 
 
 async def _persist_completeness_claim(team, statement: str, status: str) -> None:
@@ -6897,7 +6969,7 @@ async def _reconcile_completeness_claim_with_comparison(
         # completeness claim it had nothing to do with. See
         # _sections_without_completeness_claim's own docstring for the live T13
         # incident this closes.
-        preserved = _sections_without_completeness_claim(content)
+        preserved = _sections_without_completeness_claim(content, cmp_note)
         if preserved:
             print(f"[team] comparison gate: preserving {len(preserved)} unrelated "
                   f"section(s) from the original draft alongside the deterministic "
@@ -8962,6 +9034,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         by_ext = ", ".join(f"{n} .{ext}" for ext, n in sorted(listing["by_ext"].items()))
         print(f"[team] answer states {stated} but list_directory({listing['path']}) "
               f"returned {listing['items']} items — flagging the discrepancy")
+        content = _mark_miscounted_statement_inline(content, stated)
         return (
             f"{content}\n\n---\n**COUNT DISAGREES WITH THE DIRECTORY LISTING — the "
             f"answer above states {stated}, but the list_directory call this run "
@@ -11859,7 +11932,8 @@ _DRAFT_REPAIR_TIMEOUT_S = 90.0
 
 
 async def repair_unguarded_draft(task: str, content: str, mcp_url: str | None = None,
-                                 mcp_urls: list[str] | None = None) -> str:
+                                 mcp_urls: list[str] | None = None,
+                                 member_results: dict | None = None) -> str:
     """Run the repair guards against a draft whose worker was killed before verifying it.
 
     A liveness auto-kill SIGKILLs the worker process and api/server.py hands back the
@@ -11880,24 +11954,78 @@ async def repair_unguarded_draft(task: str, content: str, mcp_url: str | None = 
     counts against count_matches, routers against include_router, integration against
     search_files, models against models.py.
 
+    `member_results` (T53, 2026-10-23; default None preserves every pre-existing call
+    exactly) is the ONE exception to "nothing but the answer text": not a fresh repo
+    query, but the SAME recovered snapshot data render_member_findings already renders
+    alongside this function's own output (see api/server.py's call site). Closes a gap
+    T52's own Tier-0 liveness fix newly widened: that fix correctly kills more silently-
+    frozen runs than before, routing more answers through THIS rescue path -- and
+    _unsourced_filenames (T52, Phase 1) needs team._seen_files, which dies with the
+    worker exactly like the three guards excluded above, so a killed run's fabricated
+    names went undisclosed even after T52 shipped. Live-confirmed gap, not theoretical:
+    run fdff93e5547a's own recovered T12 draft named database.py/gst_engine.py/
+    gst_resolver.py/file_parsers.py/utility_ai_client.py with no inline mark at all.
+    Building the real team._seen_files is impossible (the worker is gone), but each
+    member's own recovered report text is exactly what _seen_files was built FROM while
+    the worker was alive -- _filenames_in() over that same text is the identical
+    extraction, just read from the snapshot instead of from live tool events. A
+    deliberately conservative approximation (may under-flag if a member's own prose
+    never restates a filename it saw; never over-flags, since nothing is added to
+    `content` itself) rather than no check at all. Appended as a trailing disclosure,
+    not an inline mark -- this function returns only a suffix, never mutated content,
+    so the inline-marking behavior normal runs get is approximated, not replicated,
+    pending a broader contract change this phase did not make.
+
     Never raises and never returns anything but a suffix. The draft is the only thing
     this path has left; a guard that fails, hangs, or finds hive-mcp unreachable must
     cost the caller nothing more than the notes it would have added.
     """
     if not (content or "").strip():
         return ""
+    # T53: collected before the hive-mcp connectivity check below -- unlike every
+    # other guard in this function, this one needs no repo query at all, only the
+    # recovered member_results already in hand, so a run with no reachable hive-mcp
+    # URL must not also lose this specific disclosure for an unrelated reason.
+    fired: list[str] = []
+    try:
+        if isinstance(member_results, dict) and member_results:
+            approx_seen: set[str] = set()
+            for _text in member_results.values():
+                approx_seen |= _filenames_in(_text)
+            unsourced = _unsourced_filenames(content, approx_seen)
+            if unsourced:
+                named = ", ".join(f"`{n}`" for n in unsourced[:8])
+                more = f" (+{len(unsourced) - 8} more)" if len(unsourced) > 8 else ""
+                print(f"[team] draft repair: {len(unsourced)} enumerated filename(s) "
+                      f"appear in no recovered member report: {named}{more} — "
+                      f"flagging", flush=True)
+                fired.append(
+                    f"\n\n---\n**NAMES THAT NO RECOVERED REPORT MENTIONS — this run "
+                    f"was stopped before it finished, so this check is approximate "
+                    f"(built from the members' own recovered text, not the full "
+                    f"tool-call record): {len(unsourced)} filename(s) the answer "
+                    f"lists -- {named}{more} -- appear in none of the members' own "
+                    f"recovered reports. They may still exist, but nothing recovered "
+                    f"from this run is evidence for them; treat the enumeration as "
+                    f"unverified.**"
+                )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[team] draft repair: unsourced-filename check failed "
+              f"({type(exc).__name__}: {exc}) — returning the draft unchecked "
+              f"on this axis", flush=True)
     effective_mcp_url = mcp_url or config.mcp_url
     all_urls = [u for u in (mcp_urls or []) + [effective_mcp_url] if u]
     hive_url = _pick_hive_mcp_url(all_urls, effective_mcp_url)
     if not hive_url:
         print("[team] draft repair: no hive-mcp url in the run's MCP set — "
-              "returning the draft unchecked", flush=True)
-        return ""
+              "returning the draft unchecked beyond the member-results-only check "
+              "above", flush=True)
+        return "".join(fired)
 
     # Same order _verified_answer appends them in, so a rescued answer reads like a
     # normal one. Ordering matters more than it looks: these banners are what a reader
     # scans for, and two answer shapes for the same question shape is its own defect.
-    fired = await _run_repo_derived_guards(task, content, hive_url, None, "draft repair")
+    fired += await _run_repo_derived_guards(task, content, hive_url, None, "draft repair")
     if fired:
         print(f"[team] draft repair: {len(fired)} guard(s) fired on the "
               f"{len(content):,}-char draft of a killed run", flush=True)
@@ -23502,6 +23630,32 @@ def _listing_named_in(sentence: str, by_path: dict) -> dict | None:
         elif score == best_score and score > 0:
             tied = True
     return None if (best_score == 0 or tied) else best
+
+
+def _mark_miscounted_statement_inline(content: str, stated: int) -> str:
+    """Annotate the first occurrence of the mismatched stated count in place,
+    pointing to the trailing COUNT DISAGREES disclosure rather than leaving the
+    correction reachable only from an appendix a reader could miss. Mirrors
+    _mark_unsourced_filenames_inline's own design (T52, Phase 1) for the
+    identical reason: a disclosure appended after the claim does not, by
+    itself, stop the wrong claim from reading as settled fact above it.
+
+    T53 (Priority 2, T7 remediation): live-reproduced, run fdff93e5547a --
+    the Coordinator's own completion restates the SAME directory listing
+    twice within one continuous generation, the first restatement correct
+    (matches the real 6-entry listing, includes __init__.py), the second
+    independently wrong (states 5, omits __init__.py) -- with no Z16
+    repetition-loop event anywhere in the journal, because the two
+    restatements are not textually identical and so never trip that
+    detector at all. Marks only the mismatched number itself, never rewrites
+    or removes anything -- _miscounted_listing's own docstring explains why
+    picking a "correct" reading is deliberately not this mechanism's job.
+    """
+    m = _STATED_COUNT_RE.search(content or "")
+    if not m:
+        return content
+    insert_at = m.end()
+    return content[:insert_at] + " **[see COUNT DISAGREES note below]**" + content[insert_at:]
 
 
 def _miscounted_listing(content: str, listings: list | None) -> tuple[int, dict] | None:
