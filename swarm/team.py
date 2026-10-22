@@ -6007,10 +6007,26 @@ class EvidenceObligation:
     index for a TASK_TEXT-derived one (the older, narrower fallback). `source`
     records which path produced it, so a caller/report can tell a coordinator-
     stated requirement from a mechanically-guessed one.
+
+    `resolved` (T65, 2026-10-22): True (the default, and the only value
+    every pre-existing call site ever produces) means `target` is a literal
+    identifier or path, safe to check against evidence as a substring/exact
+    match, exactly as this type has always worked. False means `target` is
+    an unresolved, natural-language conceptual phrase (e.g. "the api
+    route"), produced only by _resolve_trace_target's own narrow carve-out
+    inside the _NAMED_TRACE_RE branch -- see that function's docstring for
+    the confirmed false-negative this exists to prevent (T64's own report).
+    _evaluate_requirement_coverage must report "unknown" for an
+    unresolved obligation and never check it against the ledger: checking a
+    conceptual phrase as a literal substring is the exact defect being
+    fixed, and asserting it "satisfied" with no check at all would be
+    worse, not better (Part B's own explicit rule: never silently
+    satisfied).
     """
     obligation_id: str
     target: str
     source: str          # "control_box" | "task_text"
+    resolved: bool = True
 
 
 def _control_box_evidence_obligations(team) -> "list[EvidenceObligation] | None":
@@ -6050,6 +6066,44 @@ def _control_box_evidence_obligations(team) -> "list[EvidenceObligation] | None"
     return deduped if len(deduped) >= 2 else None
 
 
+def _resolve_trace_target(span: str) -> "tuple[str, bool]":
+    """(target, resolved) for one _NAMED_TRACE_RE-captured endpoint span.
+
+    T65, fixing the false negative T64 confirmed live: _NAMED_TRACE_RE's own
+    "from X to Y" pattern has no shape constraint on X/Y -- it captures
+    whatever prose sits between "from"/"to" and the sentence end, with no
+    way to tell a literal identifier ("parties_api.py") from a generic
+    architectural description ("the API route"). The latter will never
+    appear as a literal substring in any real evidence path or excerpt, so
+    treating it as a checkable target always reports "missing" regardless
+    of investigation quality -- exactly the established T3 task's own
+    failure mode (docs/runbooks/groundedness-battery.md).
+
+    Deterministic, no model call, three tiers in order:
+    1. Path-shaped (contains a path separator, or ends in a short dotted
+       extension) -- the task named a literal file. Kept as-is, resolved.
+    2. Contains an _EVIDENCE_ENTITY_RE-shaped embedded entity (e.g. "the
+       Party model" -> "Party") -- the surrounding phrase is prose, but it
+       names a real, checkable identifier. The embedded entity becomes the
+       target, resolved -- this is the SAME extraction the entity-list
+       branch below and the control-box path already trust, just applied to
+       a sub-span rather than the whole task.
+    3. Neither -- a generic conceptual phrase with nothing literal to check
+       (e.g. "the API route", "database model"). Returned unresolved: the
+       caller must never check this against evidence as a substring, and
+       _evaluate_requirement_coverage reports it "unknown", never
+       "missing" and never "satisfied" (Part B's own rule -- unresolved
+       targets are disclosed, not guessed either way).
+    """
+    s = span.strip()
+    if "/" in s or "\\" in s or re.search(r"\.[A-Za-z0-9]{1,5}$", s):
+        return _normalize_delegation_target(s), True
+    m = _EVIDENCE_ENTITY_RE.search(s)
+    if m:
+        return _normalize_delegation_target(m.group(1)), True
+    return _normalize_delegation_target(s), False
+
+
 def _task_evidence_obligations(team, task: "str | None") -> "list[EvidenceObligation] | None":
     """Structured evidence obligations, or None (UNKNOWN, never guessed as
     zero/satisfied). Tries the Control-Box-derived source FIRST (richer,
@@ -6065,12 +6119,12 @@ def _task_evidence_obligations(team, task: "str | None") -> "list[EvidenceObliga
         return None
     m = _NAMED_TRACE_RE.search(task)
     if m:
-        return [EvidenceObligation(obligation_id="task_text:0",
-                                    target=_normalize_delegation_target(m.group(1)),
-                                    source="task_text"),
-                EvidenceObligation(obligation_id="task_text:1",
-                                    target=_normalize_delegation_target(m.group(2)),
-                                    source="task_text")]
+        t0, r0 = _resolve_trace_target(m.group(1))
+        t1, r1 = _resolve_trace_target(m.group(2))
+        return [EvidenceObligation(obligation_id="task_text:0", target=t0,
+                                    source="task_text", resolved=r0),
+                EvidenceObligation(obligation_id="task_text:1", target=t1,
+                                    source="task_text", resolved=r1)]
     entities = [_normalize_delegation_target(e.group(1))
                 for e in _EVIDENCE_ENTITY_RE.finditer(task)]
     if len(entities) >= 2:
@@ -6080,34 +6134,48 @@ def _task_evidence_obligations(team, task: "str | None") -> "list[EvidenceObliga
 
 
 def _evaluate_requirement_coverage(team, obligations: "list[EvidenceObligation]") -> dict:
-    """{target: "satisfied"|"missing"} (Objective B). Tries structured
-    declaration IDENTITY first -- an exact (case-insensitive) match against a
-    RETAINED file_read EvidenceRecord's own `excerpt`, which IS the real
-    declared name _extract_declarations found (e.g. "PricingPlan", not a
-    paraphrase) -- so "PricingPlan"/"pricing_plan"/"Pricing Plan" in the
-    obligation's own normalized form still matches the one real declaration
-    without a growing synonym list (Section 6: exact identity where the
-    system already knows the declaration, UNKNOWN/substring-fallback
-    otherwise, never a semantic-similarity engine). Falls back to the
-    original substring-over-path-and-excerpt check (bounded fallback,
-    explicitly still permitted) only when no exact declaration match exists.
+    """{target: "satisfied"|"missing"|"unknown"} (Objective B; "unknown"
+    added T65). Tries structured declaration IDENTITY first -- an exact
+    (case-insensitive) match against a RETAINED file_read EvidenceRecord's
+    own `excerpt`, which IS the real declared name _extract_declarations
+    found (e.g. "PricingPlan", not a paraphrase) -- so "PricingPlan"/
+    "pricing_plan"/"Pricing Plan" in the obligation's own normalized form
+    still matches the one real declaration without a growing synonym list
+    (Section 6: exact identity where the system already knows the
+    declaration, UNKNOWN/substring-fallback otherwise, never a semantic-
+    similarity engine). Falls back to the original substring-over-path-and-
+    excerpt check (bounded fallback, explicitly still permitted) only when
+    no exact declaration match exists.
+
+    An obligation with `resolved=False` (T65) is never checked against the
+    ledger at all -- its `target` is a natural-language conceptual phrase
+    (see _resolve_trace_target), not a literal identifier, so a substring
+    check against it would reproduce the exact false-negative this phase
+    fixes. Reported "unknown" unconditionally: not "satisfied" (nothing was
+    actually verified) and not "missing" (nothing disprovable was checked
+    either) -- disclosed explicitly, never silently guessed either way, and
+    never blocks completion since the caller's own missing-check only reacts
+    to the literal string "missing".
     """
     ledger = getattr(team, "_evidence_ledger", None)
-    if ledger is None:
-        return {o.target: "missing" for o in obligations}
     declared_exact: set[str] = set()
     haystacks = []
-    for r in ledger.list():
-        if isinstance(r, EvidenceRecord) and r.relevance_status == "retained":
-            if r.evidence_type == "file_read" and r.excerpt:
-                declared_exact.add(_normalize_delegation_target(r.excerpt))
-            haystacks.append(f"{r.source_path or ''} {r.excerpt or ''}".lower())
-        elif isinstance(r, ComparisonEvidence):
-            haystacks.append(r.source.lower())
+    if ledger is not None:
+        for r in ledger.list():
+            if isinstance(r, EvidenceRecord) and r.relevance_status == "retained":
+                if r.evidence_type == "file_read" and r.excerpt:
+                    declared_exact.add(_normalize_delegation_target(r.excerpt))
+                haystacks.append(f"{r.source_path or ''} {r.excerpt or ''}".lower())
+            elif isinstance(r, ComparisonEvidence):
+                haystacks.append(r.source.lower())
     coverage = {}
     for ob in obligations:
         t = ob.target
-        if t and t in declared_exact:
+        if not ob.resolved:
+            coverage[t] = "unknown"
+        elif ledger is None:
+            coverage[t] = "missing"
+        elif t and t in declared_exact:
             coverage[t] = "satisfied"
         elif t and any(t in h for h in haystacks):
             coverage[t] = "satisfied"
