@@ -6169,12 +6169,34 @@ def _completion_decision(team, task: "str | None" = None) -> tuple[str, str]:
     obligations = _task_evidence_obligations(team, task)
     if obligations:
         coverage = _evaluate_requirement_coverage(team, obligations)
+        # T64: this verdict was computed but never logged anywhere -- the
+        # only place this ever surfaced was the `reason` string of an
+        # INSUFFICIENT_EVIDENCE return, so a SATISFIED run left zero trace
+        # of what was checked or why it passed, making it impossible to
+        # later evaluate this signal's precision/false-positive rate across
+        # real runs. Purely additive: does not change this function's
+        # return value, computed from values already in hand, and bounded
+        # (targets/sources/statuses only -- no raw evidence payloads).
+        print(f"[team] REQUIREMENT_COVERAGE: source={obligations[0].source!r} "
+              f"targets={[o.target for o in obligations]!r} "
+              f"coverage={coverage!r}", flush=True)
         missing = [t for t, s in coverage.items() if s == "missing"]
         if missing:
             source = obligations[0].source
             return ("INSUFFICIENT_EVIDENCE",
                     f"required coverage missing for: {', '.join(missing)} "
                     f"(obligations derived from {source})")
+    else:
+        # T64: UNKNOWN (this task's shape could not be mechanically
+        # decomposed into obligations) was previously indistinguishable, in
+        # the journal, from "the check ran and found nothing wrong" --
+        # both produced silence. Logging it explicitly means a reader can
+        # tell "this run's coverage was never evaluated" apart from "it was
+        # evaluated and passed", which matters for judging how often this
+        # signal actually applies across real tasks.
+        print(f"[team] REQUIREMENT_COVERAGE: UNKNOWN -- task shape not "
+              f"mechanically decomposable into obligations (never treated "
+              f"as satisfied or missing)", flush=True)
     if ledger_empty:
         return "COMPLETE", "no ledger-tracked evidence, but real tool activity occurred this run"
     return "COMPLETE", "evidence ledger holds at least one observation"
@@ -6432,8 +6454,18 @@ def _start_member_objective(
     # tool_calls_this_delegation comment for why a separate, delegation-
     # scoped counter exists alongside the run-wide cumulative one.
     phase0.note_delegation_start(member_id)
+    # T64: evidence_required/completion_criteria were already validated,
+    # already-held arguments at this exact point (see this function's own
+    # first paragraph) but were never themselves logged -- only `objective`
+    # was. Without them, a later reader of this journal line cannot tell
+    # what this delegation was actually supposed to establish, only what it
+    # was asked to go do; both are needed to judge, after the fact, whether
+    # a given tool call advanced THIS delegation's own stated requirement.
+    # Purely additive: no new computation, no control-flow change.
     print(f"[team] CONTROL_BOX_OBJECTIVE_STARTED: member_id={member_id!r} "
-          f"delegation_key={delegation_key} objective={objective!r}", flush=True)
+          f"delegation_key={delegation_key} objective={objective!r} "
+          f"evidence_required={evidence_required!r} "
+          f"completion_criteria={completion_criteria!r}", flush=True)
 
 
 def _record_member_action(
