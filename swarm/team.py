@@ -7836,6 +7836,67 @@ def _integrity_named_item_falsely_gapped(content: str, cmp_note: str) -> tuple[s
     return None
 
 
+def _strip_falsely_gapped_list_items(
+        content: str, cmp_note: str) -> tuple[str, list[str]] | None:
+    """Deterministic, zero-LLM-call correction counterpart of
+    _integrity_named_item_falsely_gapped, which only DETECTS the shape. Removes
+    ONLY the specific bulleted/numbered list line(s) that name something
+    compare_enumerations' own MATCHED/PARTIAL_MATCH/HOOKS EXPORTED output (the
+    SAME tool call this run already made) confirms exists -- never the gap-
+    declaring line itself (sibling bullets may name genuinely missing items),
+    never an unrelated section, never anything compare_enumerations did not
+    itself confirm present. Returns None when nothing in any gap-claiming list
+    names a confirmed-present item, so the caller falls through unchanged.
+
+    T55 (Priority A): _evidence_integrity_check is the final choke point
+    before an answer ships, run AFTER _verified_answer's own retry chain and
+    therefore after _reconcile_completeness_claim_with_comparison's own
+    one-shot gate has already fired or not. A matched item named as missing
+    at THIS stage -- in the original draft, or in this function's own one
+    reconciliation retry -- previously had nowhere to go but
+    _force_uncertainty_answer's disclosure-only banner, confirmed live in
+    T54's run kbxxxr147. Uses the exact same scan shape as
+    _gap_claim_block_lines (same regexes, same bounded lookahead) so this is
+    not a second, independently-drifting extraction -- only the SELECTION
+    (which lines to drop) is new.
+    """
+    body = _comparison_body(cmp_note)
+    if not body:
+        return None
+    present = _cmp_confirmed_present(body)
+    if not present:
+        return None
+
+    lines = (content or "").splitlines()
+    n = len(lines)
+    drop: set[int] = set()
+    removed: list[str] = []
+    for i, line in enumerate(lines):
+        if not _GAP_CLAIM_LINE_RE.search(line):
+            continue
+        j = i + 1
+        lookahead = 0
+        while (j < n and lookahead < _GAP_LIST_LOOKAHEAD
+               and not _LIST_ITEM_LINE_RE.match(lines[j])
+               and _is_blank_or_list_intro_line(lines[j])):
+            j += 1
+            lookahead += 1
+        while j < n and _LIST_ITEM_LINE_RE.match(lines[j]):
+            if j not in drop:
+                for name in present:
+                    if name and re.search(
+                            rf"(?<![\w./-]){re.escape(name)}(?![\w./-])", lines[j]):
+                        drop.add(j)
+                        removed.append(name)
+                        break
+            j += 1
+
+    if not drop:
+        return None
+    kept = [line for idx, line in enumerate(lines) if idx not in drop]
+    return "\n".join(kept), removed
+
+
 def _integrity_completeness_claim_without_comparison(
         content: str, task: str, cmp_note: str) -> tuple[str, str] | None:
     """(claimed, real) when a two-sided reconciliation task's answer makes a
@@ -8171,6 +8232,26 @@ async def _evidence_integrity_check(
     if not findings:
         return content
 
+    # T55 (Priority A): try the deterministic, zero-LLM-call correction before
+    # spending a whole regeneration round on a shape that does not need one.
+    # `content` reaching this function is already verify_claims-clean (checked
+    # by _verified_answer before this function was ever called), and removing
+    # lines from already-clean text cannot introduce a new fabrication, so no
+    # extra verify_claims call is needed here. Adopts only on FULL resolution
+    # (every finding cleared) -- a partial strip, or no match at all, falls
+    # through to the existing retry logic completely unchanged.
+    stripped = _strip_falsely_gapped_list_items(content, cmp_note)
+    if stripped is not None:
+        stripped_content, stripped_names = stripped
+        stripped_findings = await _evidence_integrity_findings(
+            stripped_content, task, team, hive_mcp_url, hive_mcp_tools, cmp_note)
+        if not stripped_findings:
+            print(f"[team] evidence-integrity: deterministic correction removed "
+                  f"falsely-gapped item(s) {stripped_names!r} from the gap list -- "
+                  f"no retry needed, adopting", flush=True)
+            await _persist_evidence_integrity_trace(team, findings, resolved=True, retried=False)
+            return stripped_content
+
     print(f"[team] evidence-integrity: {len(findings)} contradiction(s) found in the "
           f"final answer — {[f['category'] for f in findings]}", flush=True)
 
@@ -8244,6 +8325,38 @@ async def _evidence_integrity_check(
     recheck = await _evidence_integrity_findings(
         retried, task, team, hive_mcp_url, hive_mcp_tools, recheck_cmp_note)
     if recheck:
+        # T55 (Priority A): the retry's own regenerated draft can carry the exact
+        # same falsely-gapped shape the first pass had (confirmed live, T54's run
+        # kbxxxr147: "useGetEmailCredentialsQuery" named as a gap after the
+        # retry, despite compare_enumerations' own MATCHED output). Try the same
+        # deterministic correction on THIS draft before giving up with
+        # disclosure-only. Unlike the pre-retry attempt above, `retried` is NOT
+        # pre-verified (see the Phase AC comment just below), so a successful
+        # strip is itself re-checked with verify_claims before being adopted --
+        # the same bar the "resolved" branch further below already holds a
+        # clean candidate to. Adopts only on FULL resolution; otherwise falls
+        # through to the existing disposition completely unchanged.
+        restripped = _strip_falsely_gapped_list_items(retried, recheck_cmp_note)
+        if restripped is not None:
+            restripped_content, restripped_names = restripped
+            restripped_findings = await _evidence_integrity_findings(
+                restripped_content, task, team, hive_mcp_url, hive_mcp_tools,
+                recheck_cmp_note)
+            if not restripped_findings:
+                _rs_fab_report, _rs_fab_bad, _ = await _verify_claims(
+                    restripped_content, hive_mcp_url, hive_mcp_tools)
+                if not _rs_fab_bad:
+                    print(f"[team] evidence-integrity: retry still contradicted "
+                          f"{[f['category'] for f in recheck]}, but the deterministic "
+                          f"correction removed falsely-gapped item(s) "
+                          f"{restripped_names!r} and fully resolved it -- adopting "
+                          f"without disclosure", flush=True)
+                    await _persist_evidence_integrity_trace(
+                        team, recheck, resolved=True, retried=True)
+                    return restripped_content
+                # fabrication present even after the strip -- fall through to the
+                # existing disposition below, which already merges verify_claims
+                # findings into the same disclosure banner.
         # Phase AC (2026-09-17): _force_uncertainty_answer's own docstring is exact
         # about what this branch used to do -- "the reader gets the full original
         # text... Everything else below is the original answer, unmodified" -- but
