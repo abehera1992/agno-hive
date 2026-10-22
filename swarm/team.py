@@ -4433,7 +4433,8 @@ def _member_reads_delta(team, reads_before: int) -> int:
     return max(reads_after - reads_before, 0)
 
 
-def _adopt_retry(label: str, content: str, result, retried: str, retry, member_reads: int = 0):
+def _adopt_retry(label: str, content: str, result, retried: str, retry, team=None,
+                  member_reads: int = 0):
     """Adopt a guard's retry only when it is at least as grounded as the current draft.
 
     Returns the (content, result) pair to carry forward. Falsy `retried` (an empty
@@ -4449,7 +4450,34 @@ def _adopt_retry(label: str, content: str, result, retried: str, retry, member_r
     real list_directory, and the retry was DISCARDED as "LESS evidence" -- the
     coordinator's environment-probing counted as reads and the member's actual directory
     listing counted as nothing. Callers that pass nothing keep the old behaviour exactly.
+
+    `team` (T59): a retry that was itself cut short by _stream_team_run's own repetition
+    (Z16) or semantic-stall (T58) guard is never grounds for adoption, however many reads
+    it made. Confirmed architectural gap: T57/T58 added this exact check at exactly ONE of
+    this helper's then-12 call sites (_complete_repetition_truncated_answer's own, which
+    computes it separately and does not rely on this parameter), leaving the other 11 --
+    _reconcile_completeness_claim_with_comparison, _reask_after_syntax_loss, eight guards
+    inside _verified_answer, and _grounded_retry_from_evidence -- free to adopt a
+    truncated candidate as a normal, complete retry, since _more_grounded only compares
+    read counts and never looks at truncation state. Moving the check into this one
+    shared helper closes it for every caller at once, rather than requiring each site to
+    remember it separately -- the same inconsistency that caused the gap in the first
+    place. Defaults to None so a caller with no team object in scope keeps the prior
+    behaviour exactly (there are none left in this file after T59, but the default stays
+    non-breaking); every real caller now passes its own `team`.
     """
+    if team is not None:
+        truncated = (getattr(team, "_repetition_truncated", False)
+                     or getattr(team, "_semantic_stall_truncated", False))
+        if truncated:
+            setattr(team, "_repetition_truncated", False)
+            setattr(team, "_semantic_stall_truncated", False)
+            print(
+                f"[team] {label}: retry was cut short by the repetition/semantic-stall "
+                f"guard before adoption was even considered -- rejecting it outright, "
+                f"keeping the original draft"
+            )
+            return content, result
     if not retried:
         return content, result
     # Emptiness has to be judged AFTER stripping, not before (2026-08-24). A retry
@@ -7082,7 +7110,7 @@ async def _reconcile_completeness_claim_with_comparison(
         return content, result, False
 
     adopted, adopted_result = _adopt_retry(
-        "comparison-reconciliation", content, result, retried, retry,
+        "comparison-reconciliation", content, result, retried, retry, team=team,
         member_reads=_member_reads_delta(team, reads_before))
     if adopted is not retried:
         return content, result, False
@@ -7164,7 +7192,7 @@ async def _reask_after_syntax_loss(content: str, task: str, team, all_results,
         return content, result
 
     adopted, adopted_result = _adopt_retry(
-        "syntax-loss-reask", content, result, retried, retry,
+        "syntax-loss-reask", content, result, retried, retry, team=team,
         member_reads=_member_reads_delta(team, reads_before))
     if adopted is not retried:
         return content, result
@@ -7343,7 +7371,7 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
         return content + _TRUNCATED_ANSWER_NOTE, result
 
     adopted, adopted_result = _adopt_retry(
-        "repetition-completion", content, result, completed, retry,
+        "repetition-completion", content, result, completed, retry, team=team,
         member_reads=_member_reads_delta(team, reads_before))
     if adopted is not completed:
         if _ends_at_a_natural_stopping_point(content):
@@ -8949,7 +8977,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                         + _tail()
                     )
                 content, result = _adopt_retry(
-                    "unfinished-intent", content, result, retried, retry
+                    "unfinished-intent", content, result, retried, retry, team=team
                 )
         except Exception as exc:
             print(f"[team] unfinished-intent retry failed: {exc}")
@@ -9004,7 +9032,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                         + _tail()
                     )
                 content, result = _adopt_retry(
-                    "write-claim", content, result, retried, retry
+                    "write-claim", content, result, retried, retry, team=team
                 )
         except Exception as exc:
             print(f"[team] write-claim retry failed: {exc}")
@@ -9076,7 +9104,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                         + _tail()
                     )
                 content, result = _adopt_retry(
-                    "search-claim", content, result, retried, retry
+                    "search-claim", content, result, retried, retry, team=team
                 )
         except Exception as exc:
             print(f"[team] search-claim retry failed: {exc}")
@@ -9135,7 +9163,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 liveness_path=liveness_path,
             )
             all_results.append(retry)
-            content, result = _adopt_retry("no-evidence", content, result, retried, retry)
+            content, result = _adopt_retry(
+                "no-evidence", content, result, retried, retry, team=team)
         except Exception as exc:
             print(f"[team] evidence retry failed: {exc}")
 
@@ -9200,7 +9229,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 liveness_path=liveness_path,
             )
             all_results.append(retry)
-            content, result = _adopt_retry("db-evidence", content, result, retried, retry)
+            content, result = _adopt_retry(
+                "db-evidence", content, result, retried, retry, team=team)
         except Exception as exc:
             print(f"[team] db-evidence retry failed: {exc}")
 
@@ -9271,7 +9301,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 )
                 all_results.append(retry)
                 content, result = _adopt_retry(
-                    "narrated-tool", content, result, retried, retry,
+                    "narrated-tool", content, result, retried, retry, team=team,
                     member_reads=_member_reads_delta(team, reads_before),
                 )
             except Exception as exc:
@@ -9325,7 +9355,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                 team, f"{task}\n\n{correction}", liveness_path=liveness_path,
             )
             all_results.append(retry)
-            content, result = _adopt_retry("enumeration", content, result, retried, retry)
+            content, result = _adopt_retry(
+                "enumeration", content, result, retried, retry, team=team)
         except Exception as exc:
             print(f"[team] enumeration-evidence retry failed: {exc}")
 
@@ -10348,7 +10379,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # bare `if not corrected` above was the whole gate here, and a 234-character
     # apology is not falsy.
     adopted, _ = _adopt_retry(
-        "citation-correction", content, result, corrected, retry,
+        "citation-correction", content, result, corrected, retry, team=team,
         member_reads=_member_reads_delta(team, _reads_before_retry),
     )
     if adopted is not corrected:
@@ -22928,7 +22959,7 @@ async def _grounded_retry_from_evidence(
         return content, result, False
 
     adopted, adopted_result = _adopt_retry(
-        label, content, result, retried, retry,
+        label, content, result, retried, retry, team=team,
         member_reads=_member_reads_delta(team, reads_before))
     if adopted is not retried:
         return content, result, False
