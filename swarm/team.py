@@ -7195,8 +7195,10 @@ _TRUNCATED_ANSWER_NOTE = (
 
 async def _complete_repetition_truncated_answer(content: str, task: str, team, all_results,
                                                  result, liveness_path: str | None):
-    """One bounded completion pass when Z16's repetition guard cut a generation off
-    before it reached a conclusion.
+    """One bounded completion pass when a generation was cut off before it reached
+    a conclusion -- Z16's textual repetition guard, or (T58) _stream_team_run's
+    semantic-stall guard; see truncation_reason below for how the two are told
+    apart in this function's own diagnostics without being merged into one.
 
     Z31 (2026-09-29) live-confirmed the exact failure this closes: T13b's Coordinator
     correctly delegated all three research targets, correctly received and synthesized
@@ -7233,20 +7235,34 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
 
     One-shot per call via team._repetition_completion_attempted, same discipline
     _SYNTAX_REASK_FLAG already uses -- a completion attempt that itself gets cut short
-    by repetition must never recurse into a second completion attempt. The triggering
-    team._repetition_truncated flag is cleared immediately on entry, whether or not a
-    completion actually runs, so it can never be read twice.
+    by repetition (or, T58, by a semantic stall) must never recurse into a second
+    completion attempt. Both triggering flags are cleared immediately on entry,
+    whether or not a completion actually runs, so neither can ever be read twice.
+    Shared one-shot budget across both reasons -- not a second, parallel one for the
+    new trigger -- per this phase's own "do not introduce unlimited retries" rule.
 
-    Deliberately reads ONLY the flag _stream_team_run's copy of the Z16 logic never
-    sets (see run_task_async's own comment where team._repetition_truncated is set) --
+    Deliberately reads ONLY the flags _stream_team_run's copy of the Z16 logic (and,
+    T58, its semantic-stall logic) sets (see run_task_async's own comment where
+    team._repetition_truncated is set) --
     a retry-path truncation inside an EXISTING guard's own _stream_team_run call is
     left to that guard's own _adopt_retry comparison, unchanged, rather than folded in
     here. Z16's truncation behavior itself, and _stream_team_run's copy of it, are
     both completely unmodified by this function.
     """
-    if not getattr(team, "_repetition_truncated", False):
+    # T58: a semantic-stall stop (_stream_team_run's OWN new signal -- see
+    # its "T58" comment) is a DIFFERENT reason than Z16's textual
+    # repetition, but needs the identical bounded-completion treatment:
+    # the generation stopped before reaching a conclusion either way.
+    # Checked as an alternative trigger, not merged into one flag, so the
+    # two reasons stay distinguishable in the diagnostics below -- this
+    # function's own "preserve interruption provenance" obligation.
+    was_repetition = getattr(team, "_repetition_truncated", False)
+    was_semantic_stall = getattr(team, "_semantic_stall_truncated", False)
+    if not was_repetition and not was_semantic_stall:
         return content, result
     setattr(team, "_repetition_truncated", False)
+    setattr(team, "_semantic_stall_truncated", False)
+    truncation_reason = "repetition" if was_repetition else "semantic stall"
     if getattr(team, _REPETITION_COMPLETION_FLAG, False):
         return content, result
     setattr(team, _REPETITION_COMPLETION_FLAG, True)
@@ -7278,8 +7294,8 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
         f"\n── Your answer so far (incomplete) ──\n{content}\n── end of what you have so far ──"
     )
     reads_before = _run_read_count(team)
-    print(f"[team] repetition-truncated answer ({len(content):,} chars) — attempting "
-          f"one bounded completion", flush=True)
+    print(f"[team] {truncation_reason}-truncated answer ({len(content):,} chars) — "
+          f"attempting one bounded completion", flush=True)
     try:
         completed, retry = await _stream_team_run(
             team, prompt, log_label="repetition-completion", liveness_path=liveness_path)
@@ -7297,9 +7313,15 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
     # now sets team._repetition_truncated (see _stream_team_run's own updated
     # comment) exactly like the original, outer one did -- read and cleared here,
     # once, so a still-incomplete completion is never adopted as if it were whole.
-    nested_truncation = getattr(team, "_repetition_truncated", False)
+    # T58: the completion attempt's own _stream_team_run call can equally
+    # trip the NEW semantic-stall signal, not just Z16's repetition one --
+    # same treatment, either way: a still-incomplete completion must never
+    # be adopted as if it were whole.
+    nested_truncation = (getattr(team, "_repetition_truncated", False)
+                         or getattr(team, "_semantic_stall_truncated", False))
     if nested_truncation:
         setattr(team, "_repetition_truncated", False)
+        setattr(team, "_semantic_stall_truncated", False)
     if not completed or completed.strip() == "(no response)":
         # The literal fallback _stream_team_run/run_task_async's own Z16 copy both
         # use when a generation yields zero content -- truthy as a string, so the
@@ -7312,12 +7334,12 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
             # when `content` already reached its own conclusion before the repeat
             # began -- there was nothing left to add. Disclosing it as incomplete
             # here would mislabel an already-finished answer.
-            print("[team] repetition-truncation completion returned nothing, but "
-                  "the pre-repeat draft already reads as complete — not disclosing "
-                  "it as incomplete", flush=True)
+            print(f"[team] {truncation_reason}-truncation completion returned "
+                  f"nothing, but the pre-repeat draft already reads as complete "
+                  f"— not disclosing it as incomplete", flush=True)
             return content, result
-        print("[team] repetition-truncation completion returned nothing — keeping "
-              "the truncated draft", flush=True)
+        print(f"[team] {truncation_reason}-truncation completion returned "
+              f"nothing — keeping the truncated draft", flush=True)
         return content + _TRUNCATED_ANSWER_NOTE, result
 
     adopted, adopted_result = _adopt_retry(
@@ -7328,13 +7350,13 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
             # T28: same reasoning as the "nothing returned" branch above -- a
             # completion attempt that adds nothing MORE GROUNDED is expected, not a
             # failure, when the original draft already concluded on its own.
-            print("[team] repetition-truncation completion was not more grounded, "
-                  "but the pre-repeat draft already reads as complete — not "
-                  "disclosing it as incomplete", flush=True)
+            print(f"[team] {truncation_reason}-truncation completion was not more "
+                  f"grounded, but the pre-repeat draft already reads as complete "
+                  f"— not disclosing it as incomplete", flush=True)
             return content, result
-        print("[team] repetition-truncation completion was not more grounded than "
-              "the truncated draft — keeping the draft, disclosed as incomplete",
-              flush=True)
+        print(f"[team] {truncation_reason}-truncation completion was not more "
+              f"grounded than the truncated draft — keeping the draft, disclosed "
+              f"as incomplete", flush=True)
         return content + _TRUNCATED_ANSWER_NOTE, result
     # PHASE N / TRACK A (2026-10-03): the prompt above tells the model it is
     # CONTINUING `content`, not replacing it ("pick up from where it left off...
@@ -7358,12 +7380,14 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
     # one-shot, per _REPETITION_COMPLETION_FLAG above).
     combined = f"{content.rstrip()}\n\n{completed.strip()}" if content.strip() else completed
     if nested_truncation:
-        print("[team] repetition-truncation completion was itself cut short by a "
-              "second repetition loop — adopting it but disclosing it as still "
-              "incomplete rather than shipping it silently", flush=True)
+        print(f"[team] {truncation_reason}-truncation completion was itself cut "
+              f"short by a second stall/repetition — adopting it but disclosing "
+              f"it as still incomplete rather than shipping it silently",
+              flush=True)
         return combined + _TRUNCATED_ANSWER_NOTE, adopted_result
-    print(f"[team] repetition-truncation completion adopted ({len(completed):,} chars) "
-          f"— preserving {len(content):,} pre-repeat chars alongside it", flush=True)
+    print(f"[team] {truncation_reason}-truncation completion adopted "
+          f"({len(completed):,} chars) — preserving {len(content):,} pre-repeat "
+          f"chars alongside it", flush=True)
     return combined, adopted_result
 
 
@@ -8449,7 +8473,13 @@ async def _evidence_integrity_check(
     # treats a None result as "undeterminable" (its own documented
     # fallback, always-adopt), and this function has no `result` object of
     # its own to pass -- it is content-in, content-out.
-    was_truncated = getattr(team, "_repetition_truncated", False)
+    # T58: the retry's own _stream_team_run call can equally trip the new
+    # semantic-stall signal (same shape as a repetition stop, different
+    # cause) -- checked as an alternative trigger here too, for the same
+    # reason _complete_repetition_truncated_answer's own entry check now
+    # does.
+    was_truncated = (getattr(team, "_repetition_truncated", False)
+                     or getattr(team, "_semantic_stall_truncated", False))
     pre_completion = retried
     retried, _ = await _complete_repetition_truncated_answer(
         retried, task, team, [], None, liveness_path)
@@ -19450,6 +19480,22 @@ class _BackendRunError(RuntimeError):
     already worked for any other exception type before this one did."""
 
 
+# T58: discovery/search tools whose JOB is pattern-based exploration, and
+# whose own result preview is therefore the right signal for "did the last
+# attempt actually find something new" -- never get_file_content/
+# get_files_batch, which retrieve a KNOWN, already-decided target and are
+# not prone to the "keep trying a different pattern" failure mode this
+# closes. See _stream_team_run's own "T58" comment (where this is
+# consumed) for the live incident (T57 run kpj33b99v) this is grounded in.
+_EXPLORATORY_TOOLS = frozenset({"search_files", "count_matches", "find_files"})
+# Same threshold-choice philosophy as config.liveness_repetition_threshold's
+# own comment ("max observed benign streak 3, so 4 leaves one firing of
+# margin") -- not independently re-derived, reused for consistency. The
+# live incident ran the identical-preview pattern SIX times before the
+# retry's own time/token budget ended it; 4 stops two firings earlier.
+_SEMANTIC_STALL_THRESHOLD = 4
+
+
 def _stream_event_to_chunk(event, team=None) -> str | dict | None:
     """Classify one raw agno team.arun(stream=True) event into what run_task_stream
     yields downstream (and, since 2026-08-10, what run_task_async logs for content
@@ -24618,6 +24664,30 @@ async def _stream_team_run(
     # a repeat streak that never reaches the threshold), in which this function's
     # behavior is byte-for-byte unchanged from before this phase.
     repetition_stopped = False
+    # T58: a DISTINCT stall signal from Z16's repetition_stopped above --
+    # confirmed live, T57's run kpj33b99v: six consecutive search_files
+    # calls against the same file, each with a DIFFERENT regex pattern
+    # (narrated each time as "let me try a different approach/pattern"),
+    # all returning the exact same 200-char result preview
+    # ("...businessApi.ts:196:   useGetEmailCredentialsQuery,"). T16's own
+    # detector never saw this: it only scans narrated TEXT content, and
+    # the narration bridging these calls is different wording every time
+    # -- the actual non-progress lives entirely in the TOOL-CALL stream,
+    # which _looks_like_repetition_loop never looks at. Deliberately the
+    # narrowest possible deterministic signal: an EXPLORATORY tool
+    # (_EXPLORATORY_TOOLS -- discovery tools only, never get_file_content/
+    # get_files_batch, which retrieve a KNOWN target and are not prone to
+    # this failure mode) whose result preview is byte-identical to the
+    # immediately preceding exploratory call's preview, regardless of
+    # whether the ARGS (typically the search pattern) differ -- "tried a
+    # new pattern, got the same answer" is unambiguous non-progress; it
+    # does not require parsing or comparing the args at all. Any genuinely
+    # different preview resets the counter to 0 (fresh evidence), so
+    # legitimate exploration that actually finds something new every time
+    # is never penalized.
+    last_exploratory_preview: str | None = None
+    semantic_stall_count = 0
+    semantic_stall_stopped = False
     unrecognized_event_counts: dict[str, int] = {}
     try:
         async for event in team.arun(prompt, stream=True, yield_run_output=True):
@@ -24773,6 +24843,52 @@ async def _stream_team_run(
                 # retries exactly like _read_state does.
                 if _consume_stream_event(team, out):
                     print(f"[{log_label}] {_stream_event_log_line(out)}", flush=True)
+                # T58: see this function's own "T58" comment above
+                # last_exploratory_preview's declaration for the live
+                # incident and reasoning. Checked only on the "end" event
+                # (the one carrying result_preview) for an exploratory
+                # tool; a "start" event has no result yet and is ignored
+                # here exactly as before.
+                if (out.get("__tool_event__") == "end"
+                        and _evt_name in _EXPLORATORY_TOOLS):
+                    _preview = out.get("result_preview")
+                    if _preview is not None and _preview == last_exploratory_preview:
+                        semantic_stall_count += 1
+                        print(
+                            f"[{log_label}] semantic stall suspected -- "
+                            f"{_evt_name!r} returned the SAME result preview "
+                            f"as its own immediately preceding exploratory "
+                            f"call ({semantic_stall_count}/"
+                            f"{_SEMANTIC_STALL_THRESHOLD}), despite the "
+                            f"model narrating a different approach/pattern: "
+                            f"{_preview[:150]!r}",
+                            flush=True,
+                        )
+                        if semantic_stall_count >= _SEMANTIC_STALL_THRESHOLD:
+                            print(
+                                f"[{log_label}] semantic stall threshold "
+                                f"reached ({semantic_stall_count} >= "
+                                f"{_SEMANTIC_STALL_THRESHOLD}) -- stopping "
+                                f"this generation in-process and keeping "
+                                f"the {last_good_len} chars generated "
+                                f"before the stall began; no new evidence "
+                                f"was obtained across "
+                                f"{_SEMANTIC_STALL_THRESHOLD} consecutive "
+                                f"exploratory calls despite varying "
+                                f"arguments each time",
+                                flush=True,
+                            )
+                            semantic_stall_stopped = True
+                            last_logged_at = time.monotonic()
+                            last_logged_len = len(full_content)
+                            break
+                    else:
+                        # Genuinely new evidence (or the first exploratory
+                        # call this run) -- reset. Legitimate exploration
+                        # that finds something different every time is
+                        # never penalized.
+                        semantic_stall_count = 0
+                        last_exploratory_preview = _preview
                 last_segment_start = len(full_content)
                 segment_agent_names = set()
             else:
@@ -24819,6 +24935,20 @@ async def _stream_team_run(
         # already sets closes that blind spot for every caller of this function, not
         # just the one that exposed it.
         setattr(team, "_repetition_truncated", True)
+    if semantic_stall_stopped:
+        # T58: same truncation shape as Z16's repetition_stopped branch
+        # above, for the SAME reason -- an in-process stall stop never
+        # reaches natural stream exhaustion, so both candidates are built
+        # from our own accumulated chunks and must be cut back to the last
+        # confirmed-good boundary. Sets a DISTINCT flag
+        # (_semantic_stall_truncated, not _repetition_truncated) so a
+        # caller that cares WHY a generation was interrupted (see
+        # _complete_repetition_truncated_answer's own updated entry
+        # check) can tell the two reasons apart, per this phase's own
+        # "preserve interruption provenance" requirement.
+        accumulated = accumulated[:last_good_len].strip() or "(no response)"
+        final_segment = accumulated
+        setattr(team, "_semantic_stall_truncated", True)
     final_segment, accumulated = _isolate_contaminated_fallback(
         final_segment, accumulated, segment_agent_names, run_agent_names, team)
     content = _with_forwarded_evidence(_first_surviving_answer(
