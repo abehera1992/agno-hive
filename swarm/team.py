@@ -7713,6 +7713,105 @@ def _cmp_confirmed_present(cmp_body: str) -> set[str]:
     return present
 
 
+# ── T56: route-identity reconciliation ──────────────────────────────────────
+#
+# T55 live incident (run kern293ls): a backend route correctly reported
+# MATCHED by compare_enumerations still shipped in the final answer's gap
+# list, because the answer named it by its EFFECTIVE, mount-prefixed path
+# ("GET /business/status") while _cmp_confirmed_present only holds the bare
+# strings compare_enumerations itself printed ("/status", the LEFT side's
+# bare @router decorator path) -- an exact-bounded-substring check can never
+# recognize these as the same route, since "/business/status" is not a
+# substring match for "/status" at all (the "/business" prefix breaks it).
+#
+# compare_enumerations (hive-mcp/tools/compare.py) already solved exactly
+# this problem for its OWN join: _path_identity_match treats one normalized
+# path as the same route as another when it is a path-boundary SUFFIX of it.
+# Reimplemented here unchanged (not a new interpretation) because
+# swarm/team.py and hive-mcp are separate services with no Python import
+# boundary between them.
+#
+# Deliberately checked ONLY against a confirmed pair's RIGHT-hand (frontend)
+# recorded path, never the bare LEFT decorator path: _path_identity_match's
+# own suffix rule is happy to call "/status" and "/other/status" the same
+# identity (both end in the path segment "/status"), which is exactly the
+# false-positive the mission's own negative controls name. The bare LEFT
+# path is short and generic enough that this risk is real; the RIGHT path
+# is the frontend's own literal URL string, read directly from source by
+# compare_enumerations with zero inference about any backend mount prefix,
+# and is specific enough that an unrelated route essentially never
+# collides with it. This is narrower than a fully general mount-prefix
+# resolver on purpose -- a model describing a PARTIAL_MATCH route by its
+# LEFT-side method+path is not covered by this widening; see
+# _strip_falsely_gapped_list_items' own T56 docstring note and the T56
+# report for this documented limitation.
+_ROUTE_PARAM_RE = re.compile(r"\$\{[^}]*\}|\{[^}]*\}")
+
+
+def _norm_route_path(p: str) -> str:
+    """compare_enumerations' own _norm_path, reimplemented unchanged."""
+    return _ROUTE_PARAM_RE.sub("{}", p.split("?", 1)[0]).rstrip("/")
+
+
+def _route_identity_match(a: str, b: str) -> bool:
+    """compare_enumerations' own _path_identity_match, reimplemented
+    unchanged: same route identity when one normalized path is a
+    path-boundary suffix of the other."""
+    na, nb = _norm_route_path(a), _norm_route_path(b)
+    if na == nb:
+        return True
+    short, long_ = (na, nb) if len(na) <= len(nb) else (nb, na)
+    return short.startswith("/") and long_.endswith(short)
+
+
+_CMP_MATCHED_PAIR_METHOD_RE = re.compile(
+    r"^  (\S+)\s+(\S+)\s+<->\s+(\S+)\s*$", re.MULTILINE)
+# A claimed "METHOD /path" token inside a gap-claiming list line -- the
+# shape a model's own prose uses to name a specific route, e.g.
+# "GET /business/status" or "**POST /business/register**".
+_ROUTE_CLAIM_RE = re.compile(
+    r"\b(GET|POST|PUT|PATCH|DELETE)\s+(/[^\s`*)\]]+)", re.IGNORECASE)
+
+
+def _cmp_confirmed_mounted_routes(cmp_body: str) -> list[tuple[str, str]]:
+    """Every (method, right_path) pair compare_enumerations' own MATCHED or
+    PARTIAL MATCHES block confirms -- right_path is the frontend's own
+    literal URL string each time, never the bare backend decorator path.
+    See this section's own header comment for why only this side is used.
+    """
+    out: list[tuple[str, str]] = []
+    matched_m = _CMP_MATCHED_BLOCK_RE.search(cmp_body or "")
+    if matched_m:
+        for pm in _CMP_MATCHED_PAIR_METHOD_RE.finditer(matched_m.group(1)):
+            method, _l_path, r_path = pm.groups()
+            out.append((method.upper(), r_path))
+    partial_m = _CMP_PARTIAL_BLOCK_RE.search(cmp_body or "")
+    if partial_m:
+        for pm in _CMP_PARTIAL_LINE_RE.finditer(partial_m.group(1)):
+            _identity, _l_method, _l_path, r_method, r_path = pm.groups()
+            out.append((r_method.upper(), r_path))
+    return out
+
+
+def _mounted_route_falsely_gapped(
+        line: str, mounted_routes: list[tuple[str, str]]) -> tuple[str, str] | None:
+    """(method, path) this line claims as missing that is actually the SAME
+    route, by compare_enumerations' own path-boundary-suffix identity, as a
+    confirmed pair's right-hand (frontend, source-observed) path --
+    method-constrained, so a claim naming the right path but a DIFFERENT
+    method (e.g. "POST /business/status" against a confirmed GET) is
+    correctly left alone, and a claim whose path does not share a genuine
+    boundary suffix with any confirmed right-hand path (e.g.
+    "/other/status", "/business/status-history") is correctly left alone.
+    """
+    for claim_method, claim_path in _ROUTE_CLAIM_RE.findall(line):
+        cm = claim_method.upper()
+        for r_method, r_path in mounted_routes:
+            if cm == r_method and _route_identity_match(claim_path, r_path):
+                return cm, claim_path
+    return None
+
+
 _LIST_ITEM_LINE_RE = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+")
 # A "this introduces a list" line -- typically a bolded sub-header ending in a
 # colon ("**Backend endpoints with no frontend counterpart:**") -- commonly
@@ -7826,13 +7925,25 @@ def _integrity_named_item_falsely_gapped(content: str, cmp_note: str) -> tuple[s
     if not body:
         return None
     present = _cmp_confirmed_present(body)
-    if not present:
+    mounted_routes = _cmp_confirmed_mounted_routes(body)
+    if not present and not mounted_routes:
         return None
 
     for line in _gap_claim_block_lines(content):
         for name in present:
             if name and re.search(rf"(?<![\w./-]){re.escape(name)}(?![\w./-])", line):
                 return name, "compare_enumerations' own MATCHED/HOOKS EXPORTED output lists this as present"
+        # T56: the model's own claim may use the route's EFFECTIVE, mount
+        # -prefixed path rather than compare_enumerations' bare decorator
+        # path -- see this section's own header comment above
+        # _cmp_confirmed_mounted_routes for why this check is additive,
+        # method-constrained, and confined to the right-hand recorded path.
+        route_hit = _mounted_route_falsely_gapped(line, mounted_routes)
+        if route_hit:
+            method, path = route_hit
+            return (f"{method} {path}",
+                    "compare_enumerations' own MATCHED/PARTIAL MATCHES output "
+                    "confirms this route under its mount-prefixed path")
     return None
 
 
@@ -7864,9 +7975,19 @@ def _strip_falsely_gapped_list_items(
     if not body:
         return None
     present = _cmp_confirmed_present(body)
-    if not present:
+    mounted_routes = _cmp_confirmed_mounted_routes(body)
+    if not present and not mounted_routes:
         return None
 
+    # T56: a model may describe a MATCHED/PARTIAL_MATCH route by its
+    # effective, mount-prefixed path rather than compare_enumerations' bare
+    # decorator path (the T55 live incident: "GET /business/status" against
+    # a confirmed "GET /status <-> .../business/status"). Checked with the
+    # SAME _mounted_route_falsely_gapped helper _integrity_named_item_
+    # falsely_gapped now also uses -- one shared matching contract, not two
+    # independently-drifting ones. See _cmp_confirmed_mounted_routes' own
+    # header comment for why this is confined to the right-hand recorded
+    # path and is method-constrained.
     lines = (content or "").splitlines()
     n = len(lines)
     drop: set[int] = set()
@@ -7889,6 +8010,11 @@ def _strip_falsely_gapped_list_items(
                         drop.add(j)
                         removed.append(name)
                         break
+                else:
+                    route_hit = _mounted_route_falsely_gapped(lines[j], mounted_routes)
+                    if route_hit:
+                        drop.add(j)
+                        removed.append(f"{route_hit[0]} {route_hit[1]}")
             j += 1
 
     if not drop:
