@@ -4721,7 +4721,7 @@ def _claimed_search_terms(content: str) -> list[str]:
     return terms
 
 
-_FENCED_CODE_RE = re.compile(r"```[\s\S]*?```")
+_FENCE_MARKER_RE = re.compile(r"```")
 _INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
 
 
@@ -4734,11 +4734,31 @@ def _code_span_ranges(text: str) -> list[tuple[int, int]]:
     `HTTPException(status_code=404, detail="Seller not found")`, and the bare-absence
     guard below treated that quoted string literal as an assertion of absence.
 
-    Fenced blocks are collected first; inline spans are only added when they fall
-    outside an already-covered fenced range, since a fenced block's own content may
-    contain backticks that are not a second, narrower span.
+    Fenced blocks are found by pairing ``` markers sequentially (1st+2nd, 3rd+4th,
+    ...), matching a non-greedy ```...``` match's own first-to-next pairing. T3 F2
+    hardening (2026-10-23): an ODD, unpaired trailing marker -- a fence a truncated
+    or cut-off stream never closed -- is treated as opening an unterminated block
+    that extends to the end of the text, rather than being silently dropped from
+    `ranges` entirely. Confirmed live by the read-only review that found this gap:
+    the original regex-based `_FENCED_CODE_RE.finditer` requires both an opening AND
+    a closing marker to match at all, so an unclosed fence produced NO range, and a
+    quoted "Seller not found" inside it re-triggered the exact pre-patch false
+    positive this guard exists to prevent.
+
+    Inline spans are only added when they fall outside an already-covered fenced
+    range, since a fenced block's own content may contain backticks that are not a
+    second, narrower span.
     """
-    ranges = [m.span() for m in _FENCED_CODE_RE.finditer(text)]
+    markers = [m.start() for m in _FENCE_MARKER_RE.finditer(text)]
+    ranges: list[tuple[int, int]] = []
+    i = 0
+    while i < len(markers):
+        if i + 1 < len(markers):
+            ranges.append((markers[i], markers[i + 1] + 3))
+            i += 2
+        else:
+            ranges.append((markers[i], len(text)))
+            i += 1
     for m in _INLINE_CODE_RE.finditer(text):
         s, e = m.span()
         if not any(a <= s < b for a, b in ranges):
