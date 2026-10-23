@@ -4721,6 +4721,35 @@ def _claimed_search_terms(content: str) -> list[str]:
     return terms
 
 
+_FENCED_CODE_RE = re.compile(r"```[\s\S]*?```")
+_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+
+
+def _code_span_ranges(text: str) -> list[tuple[int, int]]:
+    """Start/end offsets of every fenced code block and inline code span in `text`.
+
+    Used so a _NOT_FOUND_RE match sitting inside a quoted source-code excerpt is not
+    mistaken for the model's own prose claim that something is missing -- T3 root
+    cause, 2026-10-23: the model faithfully quoted a real line it had actually read,
+    `HTTPException(status_code=404, detail="Seller not found")`, and the bare-absence
+    guard below treated that quoted string literal as an assertion of absence.
+
+    Fenced blocks are collected first; inline spans are only added when they fall
+    outside an already-covered fenced range, since a fenced block's own content may
+    contain backticks that are not a second, narrower span.
+    """
+    ranges = [m.span() for m in _FENCED_CODE_RE.finditer(text)]
+    for m in _INLINE_CODE_RE.finditer(text):
+        s, e = m.span()
+        if not any(a <= s < b for a, b in ranges):
+            ranges.append((s, e))
+    return ranges
+
+
+def _in_code_span(pos: int, ranges: list[tuple[int, int]]) -> bool:
+    return any(a <= pos < b for a, b in ranges)
+
+
 def _has_bare_absence_claim(content: str) -> bool:
     """True when the answer asserts something was NOT FOUND but names no specific
     term for _claimed_search_terms to extract -- e.g. a terse "Not found." with no
@@ -4728,9 +4757,33 @@ def _has_bare_absence_claim(content: str) -> bool:
     _unverified_claimed_searches entirely (an empty claimed-terms list has nothing
     to compare against the trace), even when the underlying trace shows the model
     reading/globbing an entirely wrong, hallucinated directory and never running a
-    real content search for anything."""
+    real content search for anything.
+
+    2026-10-23 (T3 root cause): a _NOT_FOUND_RE match sitting inside a fenced code
+    block or inline code span is a quoted source-code excerpt, not the model's own
+    assertion that something is missing -- confirmed live, the model had correctly
+    quoted a real `detail="Seller not found"` HTTPException line it had actually
+    read, this guard fired on it anyway, discarded an otherwise fully correct and
+    already-verified draft, and the forced retry that followed fabricated an entire
+    fictional `/seller-verification` subsystem. Only a match OUTSIDE any code span
+    counts toward this guard now; each match is judged on its own position, so a
+    genuine plain-prose bare absence claim sitting elsewhere in the same answer as
+    unrelated code is still caught exactly as before.
+    """
     text = content or ""
-    return bool(_NOT_FOUND_RE.search(text)) and not _claimed_search_terms(text)
+    matches = list(_NOT_FOUND_RE.finditer(text))
+    if not matches:
+        return False
+    ranges = _code_span_ranges(text)
+    prose_matches = [m for m in matches if not _in_code_span(m.start(), ranges)]
+    if not prose_matches:
+        return False
+    for m in prose_matches:
+        window = text[m.end():m.end() + _CLAIMED_ABSENCE_WINDOW]
+        window = re.split(r"[.\n]", window, maxsplit=1)[0]
+        if not _CLAIMED_ABSENCE_TOKEN_RE.search(window):
+            return True
+    return False
 
 
 # T50 (2026-10-21, T10 root cause): "is there any X, and if so where" is a BROADER
@@ -9538,9 +9591,35 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
                         f"absent.**"
                         + _tail()
                     )
-                content, result = _adopt_retry(
-                    "search-claim", content, result, retried, retry, team=team
-                )
+                # T3 root cause (2026-10-23): this guard's OWN retry can itself be an
+                # ungrounded fabrication -- in the live incident it invented
+                # /seller-verification, seller_verification_api.py and a
+                # SellerVerificationService/Seller model from nothing, introducing
+                # brand-new symbols with no tool call behind them at all. The
+                # structural checks inside _adopt_retry (non-empty, not
+                # stall-truncated, not the canned budget-exhausted sentence) cannot
+                # see that -- none of them look at whether the content is TRUE, only
+                # whether it is well-formed. _answer_supported_by_evidence is the
+                # existing, deterministic, no-LLM-call mechanism built for exactly
+                # this comparison (every salient token in the candidate must be one a
+                # tool actually returned this run -- see its own docstring). Checked
+                # here, scoped to this one call site, rather than inside the shared
+                # _adopt_retry helper itself: _adopt_retry has ~12 other call sites
+                # for unrelated guards, and this fabrication shape is specific to a
+                # retry that invents new claims rather than merely re-reading
+                # evidence already gathered. Bound to `retried` itself, never a
+                # verdict computed for the draft it would replace -- conservative by
+                # construction, so an unavailable/inconclusive check also keeps the
+                # original rather than adopting an unverifiable retry.
+                if not _answer_supported_by_evidence(retried, team):
+                    print(
+                        "[team] search-claim: retry not supported by evidence "
+                        "captured this run -- keeping the original draft"
+                    )
+                else:
+                    content, result = _adopt_retry(
+                        "search-claim", content, result, retried, retry, team=team
+                    )
         except Exception as exc:
             print(f"[team] search-claim retry failed: {exc}")
 
