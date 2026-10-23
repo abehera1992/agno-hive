@@ -5996,6 +5996,15 @@ def _claimed_action_without_lineage(team, content: str) -> bool:
 # engine.
 _NAMED_TRACE_RE = re.compile(r"\bfrom\s+(.+?)\s+to\s+(?:the\s+)?(.+?)[.?!]", re.I)
 
+# T66.1: same embedded-entity shape _EVIDENCE_ENTITY_RE already trusts, but
+# WITHOUT requiring a leading "the " -- _NAMED_TRACE_RE's own group 2 never
+# has one (its enclosing `(?:the\s+)?` already consumed it), so
+# _resolve_trace_target's tier 2 needs its own copy of this pattern, not
+# _EVIDENCE_ENTITY_RE itself, to actually resolve a span like "Party model".
+_EMBEDDED_ENTITY_IN_SPAN_RE = re.compile(
+    r"\b([A-Z][A-Za-z0-9]{2,})(?:\s+and\s+[A-Z][A-Za-z0-9]{2,})?\s+"
+    r"(?:model|class|enum|table|schema)\b")
+
 
 @dataclass(frozen=True)
 class EvidenceObligation:
@@ -6082,12 +6091,18 @@ def _resolve_trace_target(span: str) -> "tuple[str, bool]":
     Deterministic, no model call, three tiers in order:
     1. Path-shaped (contains a path separator, or ends in a short dotted
        extension) -- the task named a literal file. Kept as-is, resolved.
-    2. Contains an _EVIDENCE_ENTITY_RE-shaped embedded entity (e.g. "the
-       Party model" -> "Party") -- the surrounding phrase is prose, but it
-       names a real, checkable identifier. The embedded entity becomes the
-       target, resolved -- this is the SAME extraction the entity-list
-       branch below and the control-box path already trust, just applied to
-       a sub-span rather than the whole task.
+    2. Contains an embedded entity (e.g. "the Party model" -> "Party", or
+       "Party model" -> "Party") -- the surrounding phrase is prose, but it
+       names a real, checkable identifier. T66.1 fix: uses
+       _EMBEDDED_ENTITY_IN_SPAN_RE, NOT _EVIDENCE_ENTITY_RE directly --
+       _EVIDENCE_ENTITY_RE requires a literal leading "the ", which
+       _NAMED_TRACE_RE's own second capture group never has (its enclosing
+       non-capturing "the " group already consumed it before group 2 starts), so this
+       tier previously never fired for a _NAMED_TRACE_RE second endpoint in
+       practice -- confirmed and documented as an open limitation in T66's
+       own report, fixed here because T66.1 depends on identifying a
+       concrete anchor "when identifiable" (Part B) to scope relationship
+       support to the right entity rather than any entity.
     3. Neither -- a generic conceptual phrase with nothing literal to check
        (e.g. "the API route", "database model"). Returned unresolved: the
        caller must never check this against evidence as a substring, and
@@ -6098,7 +6113,7 @@ def _resolve_trace_target(span: str) -> "tuple[str, bool]":
     s = span.strip()
     if "/" in s or "\\" in s or re.search(r"\.[A-Za-z0-9]{1,5}$", s):
         return _normalize_delegation_target(s), True
-    m = _EVIDENCE_ENTITY_RE.search(s)
+    m = _EMBEDDED_ENTITY_IN_SPAN_RE.search(s)
     if m:
         return _normalize_delegation_target(m.group(1)), True
     return _normalize_delegation_target(s), False
@@ -6136,62 +6151,98 @@ def _task_evidence_obligations(team, task: "str | None") -> "list[EvidenceObliga
 _CODE_IDENTIFIER_RE = re.compile(
     r"\b(?:[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+|[a-z][a-z0-9]*_[a-z0-9_]+)\b")
 
+# T66.1: identifier CO-OCCURRENCE (any 2+ _CODE_IDENTIFIER_RE tokens in one
+# excerpt, T66's own signal) is confirmed too weak -- a comment naming two
+# sibling classes, an import statement, or two unrelated declarations all
+# satisfy it with no real connection between them. Replaced with two
+# narrower, still-deterministic structural patterns that must BOTH be
+# present, on DIFFERENT identifiers, for a connection to be recognized:
+#
+# _DEFINITION_RE: a real function or class HEADER -- "def foo(" or
+# "class Foo" -- never produced by a comment, an import, or a bare mention.
+_DEFINITION_RE = re.compile(
+    r"\bdef\s+([a-z_][a-z0-9_]{2,})\s*\(|\bclass\s+([A-Z][A-Za-z0-9]{2,})\b")
+# _REFERENCE_RE: a genuine invocation of a DIFFERENT identifier -- either a
+# dotted method/attribute call ("VerificationCheck.update(") or an
+# assignment whose right-hand side is a call ("x = VerificationCheck(").
+# Neither shape is produced by an import list, a comment, or a bare class/
+# function declaration header (a base-class declaration "class Foo(Base):"
+# has no leading dot before the "(", so it cannot be mistaken for a dotted
+# call; it also is not an assignment).
+_REFERENCE_RE = re.compile(
+    r"\b([A-Z][A-Za-z0-9]{2,}|[a-z_][a-z0-9_]{2,})\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\s*\("
+    r"|\b\w+\s*=\s*([A-Z][A-Za-z0-9]{2,}|[a-z_][a-z0-9_]{2,})\s*\(")
 
-def _relationship_support_claim(team) -> "Claim | None":
-    """T66: deterministic, content-agnostic signal for "a real relationship
-    was demonstrated", as distinct from "two unrelated facts both happen to
-    exist in the ledger" -- the exact gap T65.1 confirmed (its own B vs. D/E
-    cases: unrelated evidence and independently-found symbols both reached
-    COMPLETE identically to an excerpt that actually showed one entity
-    calling into another).
 
-    The ONLY signal used: does a SINGLE, untruncated, retained file_read
-    EvidenceRecord's own excerpt -- one real tool call's own real output,
-    never assembled from separate observations -- contain two or more
-    DISTINCT code-identifier-shaped tokens (_CODE_IDENTIFIER_RE: PascalCase
-    with an internal case transition, or snake_case with an underscore).
-    This is structural, not semantic: it does not match on "api"/"route"/
-    "model"/"seller"/"verification" or any task-specific vocabulary (the
-    forbidden broad-keyword-heuristic shape), and plain English prose
-    ("calls", "status", "the") never matches _CODE_IDENTIFIER_RE's own
-    shape requirement. It also cannot fire from two independently-read
-    files, each naming only one identifier (T65.1's Case D) -- co-occurrence
-    must be WITHIN one real observation, which is the one place this
-    architecture can currently distinguish "assembled from separate facts"
-    from "actually observed together". any_truncated_for_path is reused
-    (GAP A, pre-existing on _EvidenceLedger) so a cut-off search/read can
-    never manufacture this signal from content that was never fully seen.
+def _relationship_support_claim(team, obligations: "list[EvidenceObligation]") -> "Claim | None":
+    """T66.1: deterministic signal for "a real relationship was
+    demonstrated", replacing T66's own confirmed-too-weak co-occurrence
+    check (T66's report acknowledged this: "a pathological excerpt naming
+    two unrelated-but-identifier-shaped tokens together... would also
+    pass"). Two corrections, matching T66.1's own two named gaps:
 
-    Builds a real, inspectable Claim via the existing _make_claim/
-    _validate_claim_evidence pipeline -- never a bespoke boolean -- so the
-    resulting authoritative=True/False and evidence_ids are the same
-    auditable record every other claim type in this file already produces,
-    and a stale/invalidated evidence_id is caught by the SAME
-    _validate_claim_evidence check every other claim already uses, not a
-    second, independently-maintained rule.
+    A. A connection must be STRUCTURAL, not mere co-occurrence: a single
+    observation must contain BOTH a real definition header (_DEFINITION_RE
+    -- "def foo(" or "class Foo") AND a genuine call/assignment reference
+    to a DIFFERENT identifier (_REFERENCE_RE -- a dotted call or an
+    assignment-from-a-call). A comment naming two sibling classes, an
+    import statement, or two bare declarations with no call between them
+    each satisfy AT MOST one of these two patterns, never both with
+    differing identifiers -- confirmed in this phase's own boundary tests.
 
-    Deliberately NOT a general relationship verifier: it only answers
-    "did ONE real observation show more than one real identifier", nothing
-    about WHICH identifiers correspond to WHICH obligation, and nothing
-    about call-graph correctness. Returns None (no claim) when no
-    qualifying record exists -- never fabricates one.
+    B. Scoped to the obligation, when a concrete anchor is identifiable
+    (Part B): if ANY obligation in `obligations` is resolved (a real,
+    named entity or path -- never a conceptual phrase), the REFERENCE side
+    of the connection must normalize to one of those anchors. A connection
+    to some OTHER, unrelated identifier (T66.1's "wrong relationship" case)
+    is correctly rejected even though it is structurally a real call --
+    this is the one place a concrete anchor lets this function tell "the
+    right relationship" from "a different, real relationship" without any
+    keyword/relevance heuristic, reusing the exact same
+    _normalize_delegation_target identity-matching _evaluate_requirement_
+    coverage's own declared_exact path already trusts. When NO obligation
+    resolves to a concrete anchor (a purely conceptual task, e.g. the
+    established T3 phrasing), this scoping cannot engage -- documented as
+    an open limitation, not silently ignored: the structural check (A)
+    alone is this function's floor for that case, same honesty T66's own
+    report already gave for its own, now-replaced signal.
+
+    any_truncated_for_path (GAP A, pre-existing) is reused unchanged so a
+    cut-off read/search can never manufacture this signal. Builds a real,
+    inspectable Claim via the existing _make_claim/_validate_claim_evidence
+    pipeline, never a bespoke boolean -- unchanged from T66's own
+    discipline, only the trigger condition changed.
     """
     ledger = getattr(team, "_evidence_ledger", None)
     if ledger is None:
         return None
+    anchors = {ob.target for ob in obligations if ob.resolved and ob.target}
     for r in ledger.list():
-        if (isinstance(r, EvidenceRecord) and r.relevance_status == "retained"
+        if not (isinstance(r, EvidenceRecord) and r.relevance_status == "retained"
                 and r.evidence_type == "file_read" and r.excerpt
                 and not ledger.any_truncated_for_path(r.source_path)):
-            tokens = set(_CODE_IDENTIFIER_RE.findall(r.excerpt))
-            if len(tokens) >= 2:
-                return _create_factual_claim(
-                    team,
-                    statement=(f"single observation at {r.source_path!r} "
-                               f"names {len(tokens)} distinct identifiers "
-                               f"together: {sorted(tokens)!r}"),
-                    evidence_ids=[r.evidence_id],
-                    provenance="deterministic:single_observation_multi_entity")
+            continue
+        text = r.excerpt
+        defines = {g for pair in _DEFINITION_RE.findall(text) for g in pair if g}
+        if not defines:
+            continue
+        refs = {g for pair in _REFERENCE_RE.findall(text) for g in pair if g}
+        if not refs:
+            continue
+        connecting_refs = {ref for ref in refs if any(ref != d for d in defines)}
+        if not connecting_refs:
+            continue
+        if anchors:
+            normalized_refs = {_normalize_delegation_target(x) for x in connecting_refs}
+            if not (anchors & normalized_refs):
+                continue
+        return _create_factual_claim(
+            team,
+            statement=(f"single observation at {r.source_path!r} defines "
+                       f"{sorted(defines)!r} and references {sorted(connecting_refs)!r} "
+                       f"via a real call/assignment"),
+            evidence_ids=[r.evidence_id],
+            provenance="deterministic:definition_plus_reference")
     return None
 
 
@@ -6242,7 +6293,7 @@ def _evaluate_requirement_coverage(team, obligations: "list[EvidenceObligation]"
         t = ob.target
         if not ob.resolved:
             if not relationship_checked:
-                relationship_claim = _relationship_support_claim(team)
+                relationship_claim = _relationship_support_claim(team, obligations)
                 relationship_checked = True
             if relationship_claim is not None and _validate_claim(team, relationship_claim):
                 coverage[t] = "supported"
