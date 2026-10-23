@@ -6232,33 +6232,59 @@ def _relationship_support_claim(team, obligations: "list[EvidenceObligation]") -
         connecting_refs = {ref for ref in refs if any(ref != d for d in defines)}
         if not connecting_refs:
             continue
+        scope_verified = bool(anchors)
         if anchors:
             normalized_refs = {_normalize_delegation_target(x) for x in connecting_refs}
             if not (anchors & normalized_refs):
                 continue
+        # T66.2: `provenance` records whether this connection was checked
+        # against a concrete anchor (scope_verified=True) or accepted on
+        # the structural floor alone, with no anchor available to check
+        # against (scope_verified=False) -- Section 4's own required
+        # separation of "is this the right scope" from "is this a real
+        # connection". A purely conceptual task (neither endpoint resolves
+        # to a concrete entity -- the established T3 phrasing's own shape)
+        # has nothing to anchor against, so this function cannot verify
+        # scope for it at all; investigated and confirmed exhaustively
+        # (T66.2's own report) that no deterministic, keyword-free signal
+        # can distinguish that case from a genuine connection in an
+        # unrelated part of the repository without either reintroducing
+        # T64's original false negative (by making the floor itself
+        # blocking) or using a forbidden relevance/keyword/model mechanism.
+        # Surfacing the distinction, rather than collapsing it, is the
+        # smallest sound change available: _evaluate_requirement_coverage
+        # reports a different, still non-blocking coverage value for this
+        # case so the uncertainty is visible in the run's own journal
+        # instead of silently indistinguishable from a scope-verified claim.
+        provenance = ("deterministic:definition_plus_reference_anchored" if scope_verified
+                      else "deterministic:definition_plus_reference_unanchored")
         return _create_factual_claim(
             team,
             statement=(f"single observation at {r.source_path!r} defines "
                        f"{sorted(defines)!r} and references {sorted(connecting_refs)!r} "
-                       f"via a real call/assignment"),
+                       f"via a real call/assignment"
+                       + ("" if scope_verified else
+                          " -- NO CONCRETE ANCHOR AVAILABLE to verify this "
+                          "observation belongs to the task's own scope")),
             evidence_ids=[r.evidence_id],
-            provenance="deterministic:definition_plus_reference")
+            provenance=provenance)
     return None
 
 
 def _evaluate_requirement_coverage(team, obligations: "list[EvidenceObligation]") -> dict:
-    """{target: "satisfied"|"missing"|"unknown"|"supported"} (Objective B;
-    "unknown" added T65, "supported" added T66). Tries structured
-    declaration IDENTITY first -- an exact (case-insensitive) match against a
-    RETAINED file_read EvidenceRecord's own `excerpt`, which IS the real
-    declared name _extract_declarations found (e.g. "PricingPlan", not a
-    paraphrase) -- so "PricingPlan"/"pricing_plan"/"Pricing Plan" in the
-    obligation's own normalized form still matches the one real declaration
-    without a growing synonym list (Section 6: exact identity where the
-    system already knows the declaration, UNKNOWN/substring-fallback
-    otherwise, never a semantic-similarity engine). Falls back to the
-    original substring-over-path-and-excerpt check (bounded fallback,
-    explicitly still permitted) only when no exact declaration match exists.
+    """{target: "satisfied"|"missing"|"unknown"|"supported"|"supported_unscoped"}
+    (Objective B; "unknown" added T65, "supported" added T66,
+    "supported_unscoped" added T66.2). Tries structured declaration IDENTITY
+    first -- an exact (case-insensitive) match against a RETAINED file_read
+    EvidenceRecord's own `excerpt`, which IS the real declared name
+    _extract_declarations found (e.g. "PricingPlan", not a paraphrase) -- so
+    "PricingPlan"/"pricing_plan"/"Pricing Plan" in the obligation's own
+    normalized form still matches the one real declaration without a
+    growing synonym list (Section 6: exact identity where the system
+    already knows the declaration, UNKNOWN/substring-fallback otherwise,
+    never a semantic-similarity engine). Falls back to the original
+    substring-over-path-and-excerpt check (bounded fallback, explicitly
+    still permitted) only when no exact declaration match exists.
 
     An obligation with `resolved=False` (T65) is never checked via the
     literal-substring path at all -- its `target` is a natural-language
@@ -6268,9 +6294,18 @@ def _evaluate_requirement_coverage(team, obligations: "list[EvidenceObligation]"
     per call (memoized in a local, never cached across calls -- the ledger
     can grow between completion-decision calls, so a stale True must never
     survive to a later, different evaluation): if it returns a validated
-    Claim, every unresolved target in THIS obligation set is "supported"
-    (a real relationship was demonstrated, per that function's own narrow
-    signal); otherwise every unresolved target remains "unknown" -- not
+    Claim, every unresolved target in THIS obligation set is "supported" or
+    "supported_unscoped" (T66.2: the distinction is read from the Claim's
+    own `provenance` string -- "_anchored" vs "_unanchored" -- rather than
+    re-deriving it, so there is exactly one place this decision is made).
+    "supported_unscoped" means a real relationship was demonstrated, but no
+    concrete anchor existed in this obligation set to verify it belongs to
+    the task's own scope (T66.2's own investigated, documented limitation --
+    this is NEVER blocking, same as "supported", because making it blocking
+    would also block the genuinely correct, equally-unanchored case T64
+    exists to allow; the distinction exists so the uncertainty is visible in
+    the journal rather than silently indistinguishable from a scope-verified
+    claim). Otherwise every unresolved target remains "unknown" -- not
     "satisfied" (nothing was verified) and not "missing" (T65.1: missing
     evidence is not proof of nonexistence) -- disclosed explicitly.
     `_completion_decision` is the caller that decides which of these block.
@@ -6296,7 +6331,9 @@ def _evaluate_requirement_coverage(team, obligations: "list[EvidenceObligation]"
                 relationship_claim = _relationship_support_claim(team, obligations)
                 relationship_checked = True
             if relationship_claim is not None and _validate_claim(team, relationship_claim):
-                coverage[t] = "supported"
+                coverage[t] = ("supported_unscoped"
+                               if relationship_claim.provenance.endswith("_unanchored")
+                               else "supported")
             else:
                 coverage[t] = "unknown"
         elif ledger is None:
@@ -6413,6 +6450,26 @@ def _completion_decision(team, task: "str | None" = None) -> tuple[str, str]:
                     f"{', '.join(unresolved_unsupported)} (obligations "
                     f"derived from {source}; evidence may exist but no "
                     f"single observation establishes the relationship)")
+        # T66.2: COMPLETE is still permitted here (never blocking -- see
+        # _evaluate_requirement_coverage's own docstring for why), but when
+        # the ONLY thing standing between this run and INSUFFICIENT_EVIDENCE
+        # was an unscoped relationship claim, the success reason says so
+        # explicitly instead of the generic fallthrough text below, so a
+        # human reviewing this run's own disclosure -- not just the journal
+        # -- knows this specific COMPLETE rests on a claim this architecture
+        # could not verify belongs to the task's own scope.
+        unscoped = [ob.target for ob in obligations
+                    if not ob.resolved and coverage.get(ob.target) == "supported_unscoped"]
+        if unscoped:
+            source = obligations[0].source
+            return ("COMPLETE",
+                    f"relationship demonstrated for: {', '.join(unscoped)}, but "
+                    f"no concrete anchor was available to verify it belongs to "
+                    f"this task's own scope (obligations derived from {source}); "
+                    f"not blocked, per this architecture's own documented "
+                    f"inability to distinguish this from a genuinely correct, "
+                    f"equally unanchored answer without a forbidden relevance "
+                    f"mechanism")
     else:
         # T64: UNKNOWN (this task's shape could not be mechanically
         # decomposed into obligations) was previously indistinguishable, in
