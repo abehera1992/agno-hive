@@ -12631,6 +12631,187 @@ async def _repo_search_text(pattern: str, glob_filter: str, hive_mcp_url: str | 
     return box["text"]
 
 
+# ── Mandatory LightRAG-first pre-fetch (2026-10-23) ─────────────────────────
+#
+# teams/engineering.yaml's own "SEARCH BEFORE YOU BROWSE, ALWAYS, NO EXCEPTIONS"
+# instruction already told the Researcher to call lightrag_query before any
+# exploratory search -- and the 2026-10-23 T7-T13b battery (6 full live runs,
+# ~17:09-18:46 EDT on ZGX) proves, via direct journal correlation (every
+# "lightrag" line in that window classified: all 18 were member-surface tool
+# LISTINGS, zero were tool_hook/stream-event INVOCATIONS), that it never once
+# did. The same lesson _computed_comparison's own docstring already recorded
+# for a different tool -- "the gate worked mechanically... and the model
+# re-read both files and ran 60 search_files calls instead... stop asking...
+# do it here and show the result" -- applies here: a prompt instruction is
+# not an execution guarantee. This enforces the attempt deterministically, in
+# Python, at delegate_structured_task's own established interception point
+# (_build_canonical_researcher_task's docstring: "Every delegation funnels
+# through this ONE function regardless of which member or task generated
+# it, making it the correct interception point" -- written for
+# inherited_context, equally true here) instead of relying on the model to
+# remember an instruction it has already been shown to ignore.
+_LIGHTRAG_PREFETCH_CACHE_ATTR = "_lightrag_prefetch_cache"
+# Generic repo-retrieval gate: any member whose OWN capability surface
+# (team.members[i].tools -- "the canonical, already-logged capability
+# source", per _build_structured_delegation_tool's own docstring) includes at
+# least one of these is doing repository/code-understanding retrieval for
+# THIS delegation. Never a hardcoded member-name check, so this applies to any
+# current or future team/role roster unchanged, and correctly skips a
+# delegation whose member has none of them (e.g. an Executor-only
+# environment/shell/DB task).
+_LIGHTRAG_REPO_RETRIEVAL_TOOLS = frozenset({
+    "get_file_content", "search_files", "search_files_batch", "find_files",
+    "list_directory", "list_directory_tree", "get_files_batch",
+})
+
+
+def _lightrag_result_is_usable(text: str) -> bool:
+    """Whether a lightrag_query response contains anything worth handing to a
+    delegation -- per the REAL response shape in lightrag_mcp/server.py's own
+    lightrag_query (confirmed by reading it directly): "[no results]" is its
+    own literal no-match sentinel (returned when BOTH the project and global
+    namespaces come back empty), "Query failed: {exc}" wraps any exception,
+    and "Invalid mode ..." covers a bad mode argument (never reachable from
+    this module's own caller, which always passes a valid literal; kept as a
+    defensive floor in case that ever changes). Anything else is the
+    wrapper's own real "-- Project (...) --" / "-- Global memory --" joined
+    text.
+
+    Deliberately generous beyond those three exact shapes, per this project's
+    own Section 5 requirement: a conservative evaluator must not suppress the
+    EXISTING search/read fallback merely because the text is nonempty -- and
+    this result is never adopted as the sole source of truth regardless (the
+    caller always continues normal retrieval too) -- so a borderline case is
+    let through as disclosed, unverified evidence rather than discarded.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t == "[no results]":
+        return False
+    if t.startswith("Query failed:"):
+        return False
+    if t.startswith("Invalid mode "):
+        return False
+    return True
+
+
+async def _repo_lightrag_query(query: str, project_id: str,
+                               lightrag_url: str | None,
+                               mode: str = "hybrid") -> "tuple[str, str]":
+    """(outcome, text) from one fresh, bounded MCP session call to
+    lightrag_query -- the same "open a session, call_tool, extract text"
+    shape _repo_search_text already uses for search_files (same module),
+    minus its live-session-reuse branch: delegate_structured_task's own
+    closure has no access to this run's already-open hive-mcp/project-MCP
+    sessions (those are built later, in run_task_async's own mcp_by_url --
+    see _pick_hive_mcp), but config.lightrag_mcp_url is always known
+    statically (_resolve_mcp_urls, api/server.py, appends it to every run
+    unconditionally), so a fresh session here needs no new plumbing through
+    the delegation pipeline.
+
+    outcome is one of "no_url" | "timeout" | "error" | "empty" | "usable" --
+    a stable, explicit field, never parsed back out of a natural-language
+    message (Section 7's own requirement). Never raises.
+
+    _MCP_TIMEOUT (180s, its own comment: "lightrag_query synthesis
+    ~90-120s") is reused unchanged rather than the shorter
+    _BESPOKE_MCP_SESSION_TIMEOUT (90s) other _repo_* helpers use for faster
+    tools -- this call must be genuinely awaited, not abandoned early.
+    """
+    if not lightrag_url:
+        return "no_url", ""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    box: dict = {"text": ""}
+
+    async def _ask() -> None:
+        async with streamablehttp_client(lightrag_url) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                res = await session.call_tool(
+                    "lightrag_query",
+                    {"query": query, "project_id": project_id, "mode": mode})
+                if _mcp_error_text(res):
+                    return
+                box["text"] = _extract_mcp_text(res)
+
+    try:
+        await asyncio.wait_for(_ask(), timeout=_MCP_TIMEOUT)
+    except asyncio.TimeoutError:
+        return "timeout", ""
+    except Exception as exc:  # noqa: BLE001
+        print(f"[team] lightrag-prefetch: session failed "
+              f"({type(exc).__name__}: {exc or '<no message>'})", flush=True)
+        return "error", ""
+
+    text = box["text"]
+    if not _lightrag_result_is_usable(text):
+        return "empty", text
+    return "usable", text
+
+
+async def _lightrag_prefetch_for_delegation(
+        team, member_id: str,
+        target: str, objective: str, evidence_required: str) -> "str | None":
+    """The mandatory, deterministic LightRAG-first attempt for ONE
+    delegation, or None when either this delegation is not a
+    repository/code-understanding retrieval task (gated on
+    _LIGHTRAG_REPO_RETRIEVAL_TOOLS, above) or the attempt produced nothing
+    usable (Section 6: the existing search/read workflow always continues
+    regardless either way -- this function's return value is additive
+    evidence only, never a gate on normal retrieval).
+
+    Cached on the run-scoped `team` object, keyed by a hash of
+    (target, objective, evidence_required) computed HERE -- deliberately NOT
+    the caller's own canonical_hash, which is a hash of the FULL canonical
+    task text that this function's own result is about to become part of
+    (delegate_structured_task builds canonical_task only AFTER this call
+    returns); reusing that hash would be circular. A reworded-duplicate
+    delegation to the same target/objective (confirmed live during this
+    project's own T13a battery run: "ALREADY DONE -- 'researcher' was
+    already asked about ... earlier this run, worded differently") still
+    hits this cache, since completion_criteria -- the one field that can
+    differ on a reworded repeat -- is deliberately excluded from this key.
+    """
+    if team is None:
+        return None
+    available = _member_capability_tools(team, member_id)
+    if not available or not (available & _LIGHTRAG_REPO_RETRIEVAL_TOOLS):
+        return None
+
+    cache_key = hashlib.sha256(
+        f"{target}\x00{objective}\x00{evidence_required}"
+        .encode("utf-8", errors="replace")).hexdigest()[:16]
+    cache = getattr(team, _LIGHTRAG_PREFETCH_CACHE_ATTR, None)
+    if cache is None:
+        cache = {}
+        setattr(team, _LIGHTRAG_PREFETCH_CACHE_ATTR, cache)
+    if cache_key in cache:
+        print(f"[team] LIGHTRAG_PREFETCH: prefetch_key={cache_key} "
+              f"outcome='cached' (duplicate delegation, reusing prior result)",
+              flush=True)
+        return cache[cache_key]
+
+    project_id = getattr(team, "_project_id", None) or "default"
+    query = f"{target} -- {objective} {evidence_required}".strip()
+    start = time.monotonic()
+    outcome, text = await _repo_lightrag_query(query, project_id, config.lightrag_mcp_url)
+    duration = time.monotonic() - start
+    usable = outcome == "usable"
+    # Structured, explicit-field log line (Section 7). fallback_continues is
+    # always True and logged anyway -- a reader should never have to infer
+    # "did normal search still run" from its absence elsewhere.
+    print(f"[team] LIGHTRAG_PREFETCH: prefetch_key={cache_key} "
+          f"member_id={member_id!r} outcome={outcome!r} usable={usable} "
+          f"duration_s={duration:.1f} chars={len(text)} "
+          f"fallback_continues=True", flush=True)
+    result = text if usable else None
+    cache[cache_key] = result
+    return result
+
+
 # "...and how it integrates with the business service" -- the subject service comes from
 # _SCOPED_ASK_RE, this captures the OTHER one.
 _INTEGRATES_WITH_RE = re.compile(
@@ -18579,6 +18760,7 @@ def _inherited_context_is_relevant(
 def _build_canonical_researcher_task(
     target: str, objective: str, evidence_required: str, completion_criteria: str,
     inherited_context: str | None = None,
+    lightrag_context: str | None = None,
 ) -> str:
     """Pure, deterministic text construction -- Phase S Test B requires
     canonical_task(x) == canonical_task(x) for identical inputs. No model call, no
@@ -18654,12 +18836,37 @@ def _build_canonical_researcher_task(
             f"investigate your own target fresh -- do not force an unrelated answer "
             f"to reuse it.\n\n"
         )
+    # LightRAG-first prefetch (2026-10-23): a deterministic pre-fetch already ran
+    # for this delegation BEFORE this task text was built (see
+    # _lightrag_prefetch_for_delegation, called from delegate_structured_task just
+    # above its own call to this function) -- this block only renders what it
+    # returned, with provenance preserved exactly as INHERITED CONTEXT's own block
+    # above does, and the SAME explicit "not independently confirmed" framing: a
+    # semantic-search result can describe a file's role correctly without quoting
+    # its literal content (see teams/parallel-review.yaml's own documented
+    # incident), so it is disclosed as a lead, never promoted to a citation.
+    _lightrag_block = ""
+    if lightrag_context and lightrag_context.strip():
+        _lr_text = lightrag_context.strip()
+        if len(_lr_text) > _INHERITED_CONTEXT_CAP:
+            _lr_text = _lr_text[:_INHERITED_CONTEXT_CAP] + "\n... (truncated)"
+        _lightrag_block = (
+            f"LIGHTRAG SEMANTIC SEARCH (ran automatically before this task was "
+            f"dispatched to you -- NOT independently confirmed, and NOT a "
+            f"substitute for reading the actual file):\n{_lr_text}\n\n"
+            f"This may name real files/symbols worth reading directly, or may "
+            f"only describe a file's role without quoting its literal content. "
+            f"Use it to target your own search/read faster if it helps; do not "
+            f"cite it in place of a real file you have read, and do not skip "
+            f"your own investigation merely because this block is nonempty.\n\n"
+        )
     return (
         f"TARGET:\n{target}\n\n"
         f"OBJECTIVE:\n{objective}\n\n"
         f"EVIDENCE REQUIRED:\n{evidence_required}\n\n"
         f"COMPLETION CRITERIA:\n{completion_criteria}\n\n"
         f"{_inherited_block}"
+        f"{_lightrag_block}"
         f"SCOPE PRECEDENCE:\n"
         f"The objective and completion criteria above define WHEN this task is "
         f"complete. They do NOT define WHAT content is in scope -- your own "
@@ -18845,11 +19052,26 @@ def _build_structured_delegation_tool(original_function, team=None):
         print(f"[team] T27 inherited-context relevance: included={_relevant} "
               f"member_id={member_id!r} session_summary_present={bool(_session_summary)}",
               flush=True)
+        # LightRAG-first prefetch (2026-10-23): mandatory, deterministic attempt
+        # for this ONE delegation, awaited before canonical_task is built so a
+        # usable result is already part of what the member receives -- not a
+        # prompt instruction for the member to call it themselves (see
+        # _lightrag_prefetch_for_delegation's own docstring for why that already
+        # failed live, across this project's entire 2026-10-23 T7-T13b battery).
+        # is_broadcast dispatches to every real member internally (no single
+        # member_id to gate on here); skipped for that shape rather than guessed
+        # against an arbitrary one of them.
+        _lightrag_context = (
+            await _lightrag_prefetch_for_delegation(
+                team, member_id, target, objective, evidence_required)
+            if not is_broadcast else None
+        )
         canonical_task = _build_canonical_researcher_task(
             target=target, objective=objective,
             evidence_required=evidence_required,
             completion_criteria=completion_criteria,
             inherited_context=_session_summary if _relevant else None,
+            lightrag_context=_lightrag_context,
         )
         canonical_hash = hashlib.sha256(
             canonical_task.encode("utf-8", errors="replace")).hexdigest()[:16]
@@ -21021,6 +21243,13 @@ async def run_task_stream(
         # attaching inherited context to a delegation -- see
         # _inherited_context_is_relevant's own docstring.
         team._task = task or ""
+        # LightRAG-first prefetch (2026-10-23): same late-binding slot convention
+        # as team._session_summary/_task above -- read by
+        # _lightrag_prefetch_for_delegation at delegation time, via
+        # delegate_structured_task's own closure. project_id is this run's own
+        # parameter, never guessed (see _lightrag_namespace_instruction's own
+        # docstring for why a guessed value is a real, recurring failure mode).
+        team._project_id = project_id
         # Phase A (durable execution/evidence backbone, runtime identity only --
         # no persistence here, see swarm/execution_context.py). run_task_stream
         # does not use Phase0 (no phase0.start_run() call exists on this path
@@ -26105,6 +26334,10 @@ async def run_task_async(
         team._session_summary = session_summary or ""
         # Phase T27: see the matching line + comment in run_task_stream above.
         team._task = task or ""
+        # LightRAG-first prefetch (2026-10-23): same late-binding slot convention
+        # as team._session_summary/_task above -- see the matching line + comment
+        # in run_task_stream.
+        team._project_id = project_id
         # Same late-binding slot as the two above: the hooks read it at call time,
         # which is always after construction. None when telemetry is off, and every
         # read site is guarded on that.
