@@ -10,6 +10,7 @@ from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass
 from uuid import uuid4
 
+import httpx
 from opentelemetry import trace
 from pydantic import BaseModel, Field
 from agno.run.team import TeamRunOutput
@@ -6174,7 +6175,114 @@ _REFERENCE_RE = re.compile(
     r"|\b\w+\s*=\s*([A-Z][A-Za-z0-9]{2,}|[a-z_][a-z0-9_]{2,})\s*\(")
 
 
-def _relationship_support_claim(team, obligations: "list[EvidenceObligation]") -> "Claim | None":
+_RELEVANCE_ASSESSMENT_TIMEOUT_S = 15.0
+_RELEVANCE_EXCERPT_CHARS = 500
+# Empirically validated against the real, deployed llama3.1-8b (not assumed
+# correct from the model's name or size). An earlier wording ("does this
+# observation concern the same subsystem... the task is asking about") made
+# the model judge whether ONE observation, by itself, COMPLETES the entire
+# "from X to Y" trace -- its own reasoning, inspected directly, said a
+# genuinely on-topic seller-verification excerpt was "irrelevant" because it
+# didn't ALSO show the API route. This wording explicitly separates "is this
+# the right domain/service" (the question this assessor exists to answer)
+# from "does this one observation alone finish the task" (the deterministic
+# structural check's job, already done before this is ever called) --
+# confirmed stable 5/5 on both the real positive control and the real
+# scenario 7b negative control, and correct on a keyword-overlap trap (task
+# vocabulary appearing in an unrelated comment) and a generic/ambiguous case.
+_RELEVANCE_SYSTEM_PROMPT = (
+    "You are a relevance classifier used inside a larger verification "
+    "system. A SEPARATE, deterministic check already confirmed this code "
+    "observation contains a real function/class definition and a real "
+    "call or reference to another identifier. Your ONLY job: does this "
+    "observation belong to the SAME SERVICE, MODULE, OR BUSINESS DOMAIN "
+    "the TASK is about? Compare the SUBJECT MATTER, not code structure or "
+    "style. A single relevant observation is enough even if it does not "
+    "show the task's entire description (for example, a function updating "
+    "a seller-verification record IS relevant to a seller-verification "
+    "task, even without also showing the API route). But an observation "
+    "from a DIFFERENT business domain or service (for example, shipping "
+    "labels, billing, inventory) is IRRELEVANT to a seller-verification "
+    "task, even if its code has a similar shape (a function definition "
+    "and a call). Judge the DOMAIN/TOPIC the code is about, not merely "
+    "whether it looks like real code. Respond with EXACTLY one word: "
+    "\"relevant\", \"irrelevant\", or \"abstain\". Do not explain. Do not "
+    "say anything else."
+)
+
+
+async def _assess_relevance(task: str, source_path: "str | None", excerpt: str) -> str:
+    """FINAL phase: the one narrow, bounded model call this architecture
+    permits for scope relevance (never for the deterministic structural
+    relationship check itself, which is untouched). Returns exactly
+    "relevant", "irrelevant", or "abstain" -- "abstain" for EVERY failure
+    mode (timeout, connection error, non-2xx response, malformed JSON, or
+    any text that doesn't cleanly parse to one of the other two words).
+    Never raises, never retries, never defaults to "relevant": per this
+    phase's own explicit failure policy, a provider outage or an
+    unexpected response must leave relevance exactly as unverified as no
+    model call at all would have left it.
+
+    Reuses the EXISTING, already-deployed vllm_extract endpoint
+    (config.vllm_extract_base_url/vllm_extract_model -- LiteLLM proxy ->
+    llama3.1-8b, the SAME fast model LightRAG's own extraction role
+    already uses for short, narrow extraction prompts, confirmed by
+    reading lightrag_mcp/rag.py's own _extract_llm) rather than
+    introducing a new provider, credential, or external service. One
+    bounded HTTP call, no retry, no streaming, max_tokens=8 (the whole
+    point is a single word).
+
+    Receives ONLY the three things this phase's own constraints permit:
+    the task's own original text (unmodified), one EvidenceRecord's own
+    source_path, and its own excerpt (capped at
+    _RELEVANCE_EXCERPT_CHARS -- this is a relevance check, not a full-text
+    review, and the excerpt is already capped by _EVIDENCE_EXCERPT_CHARS
+    at the ledger level). No conversation history, no other evidence, no
+    prior assessment -- never swayed by anything but the one comparison
+    it exists to make.
+    """
+    body = {
+        "model": config.vllm_extract_model,
+        "messages": [
+            {"role": "system", "content": _RELEVANCE_SYSTEM_PROMPT},
+            {"role": "user", "content": (
+                f"TASK: {task}\n\n"
+                f"OBSERVATION PATH: {source_path or '(unknown)'}\n"
+                f"OBSERVATION EXCERPT:\n{excerpt[:_RELEVANCE_EXCERPT_CHARS]}\n\n"
+                f"Your answer (one word only):")},
+        ],
+        "max_tokens": 8,
+        "temperature": 0,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_RELEVANCE_ASSESSMENT_TIMEOUT_S) as client:
+            resp = await client.post(
+                f"{config.vllm_extract_base_url.rstrip('/')}/chat/completions",
+                json=body, headers={"Authorization": "Bearer EMPTY"})
+        resp.raise_for_status()
+        text = resp.json()["choices"][0]["message"]["content"]
+    except Exception as exc:
+        print(f"[team] RELEVANCE_ASSESSMENT: provider failure ({exc.__class__.__name__}) "
+              f"-- treated as abstain", flush=True)
+        return "abstain"
+    normalized = re.sub(r"[^a-z]", "", (text or "").strip().lower())
+    if normalized.startswith("irrelevant"):
+        verdict = "irrelevant"
+    elif normalized.startswith("relevant"):
+        verdict = "relevant"
+    elif normalized.startswith("abstain"):
+        verdict = "abstain"
+    else:
+        verdict = "abstain"
+        print(f"[team] RELEVANCE_ASSESSMENT: malformed response {text!r} -- "
+              f"treated as abstain", flush=True)
+    print(f"[team] RELEVANCE_ASSESSMENT: source_path={source_path!r} "
+          f"model={config.vllm_extract_model!r} verdict={verdict!r}", flush=True)
+    return verdict
+
+
+async def _relationship_support_claim(
+        team, obligations: "list[EvidenceObligation]", task: "str | None") -> "Claim | None":
     """T66.1: deterministic signal for "a real relationship was
     demonstrated", replacing T66's own confirmed-too-weak co-occurrence
     check (T66's report acknowledged this: "a pathological excerpt naming
@@ -6212,6 +6320,27 @@ def _relationship_support_claim(team, obligations: "list[EvidenceObligation]") -
     inspectable Claim via the existing _make_claim/_validate_claim_evidence
     pipeline, never a bespoke boolean -- unchanged from T66's own
     discipline, only the trigger condition changed.
+
+    FINAL phase addendum: when NO obligation resolves to a concrete
+    anchor, this used to accept the structural connection on its own
+    (T66.2's "supported_unscoped", a disclosed-but-unverified floor).
+    T66.2's own report proved that floor cannot be made correct
+    deterministically -- a genuinely correct, equally unanchored answer
+    and an unrelated-service false positive are structurally identical.
+    This phase closes that gap with the one mechanism its own mission
+    permits: a single, bounded call to _assess_relevance, scoped to
+    exactly this task and this one observation. "relevant" is accepted as
+    GENUINE support (provenance explicitly says "model_assessed", never
+    disguised as an anchor match). "irrelevant" rejects this specific
+    observation and the loop continues to the next one. "abstain" or any
+    provider failure also continues the loop WITHOUT accepting this
+    observation -- relevance stays unverified, never defaulting to
+    accepted. If no observation anywhere in the ledger is ever confirmed
+    "relevant", this function returns None, same as finding nothing at
+    all -- the caller's existing "unknown" (blocking) path is reused
+    unchanged; "supported_unscoped" is retired as a distinct value this
+    phase, since every case it used to cover is now resolved one way or
+    the other by this tiebreaker.
     """
     ledger = getattr(team, "_evidence_ledger", None)
     if ledger is None:
@@ -6232,59 +6361,56 @@ def _relationship_support_claim(team, obligations: "list[EvidenceObligation]") -
         connecting_refs = {ref for ref in refs if any(ref != d for d in defines)}
         if not connecting_refs:
             continue
-        scope_verified = bool(anchors)
         if anchors:
             normalized_refs = {_normalize_delegation_target(x) for x in connecting_refs}
             if not (anchors & normalized_refs):
                 continue
-        # T66.2: `provenance` records whether this connection was checked
-        # against a concrete anchor (scope_verified=True) or accepted on
-        # the structural floor alone, with no anchor available to check
-        # against (scope_verified=False) -- Section 4's own required
-        # separation of "is this the right scope" from "is this a real
-        # connection". A purely conceptual task (neither endpoint resolves
-        # to a concrete entity -- the established T3 phrasing's own shape)
-        # has nothing to anchor against, so this function cannot verify
-        # scope for it at all; investigated and confirmed exhaustively
-        # (T66.2's own report) that no deterministic, keyword-free signal
-        # can distinguish that case from a genuine connection in an
-        # unrelated part of the repository without either reintroducing
-        # T64's original false negative (by making the floor itself
-        # blocking) or using a forbidden relevance/keyword/model mechanism.
-        # Surfacing the distinction, rather than collapsing it, is the
-        # smallest sound change available: _evaluate_requirement_coverage
-        # reports a different, still non-blocking coverage value for this
-        # case so the uncertainty is visible in the run's own journal
-        # instead of silently indistinguishable from a scope-verified claim.
-        provenance = ("deterministic:definition_plus_reference_anchored" if scope_verified
-                      else "deterministic:definition_plus_reference_unanchored")
+            return _create_factual_claim(
+                team,
+                statement=(f"single observation at {r.source_path!r} defines "
+                           f"{sorted(defines)!r} and references "
+                           f"{sorted(connecting_refs)!r} via a real call/assignment, "
+                           f"matching a concrete task anchor"),
+                evidence_ids=[r.evidence_id],
+                provenance="deterministic:definition_plus_reference_anchored")
+        # No anchor to check against -- the one remaining case this phase
+        # exists to resolve. Ask the bounded relevance assessor about THIS
+        # specific observation only.
+        if not task:
+            continue
+        verdict = await _assess_relevance(task, r.source_path, text)
+        if verdict != "relevant":
+            # "irrelevant" or "abstain" (incl. provider failure) -- this
+            # observation does not count as support. Keep scanning; a
+            # DIFFERENT observation elsewhere in the ledger might still be
+            # genuinely relevant.
+            continue
         return _create_factual_claim(
             team,
             statement=(f"single observation at {r.source_path!r} defines "
                        f"{sorted(defines)!r} and references {sorted(connecting_refs)!r} "
-                       f"via a real call/assignment"
-                       + ("" if scope_verified else
-                          " -- NO CONCRETE ANCHOR AVAILABLE to verify this "
-                          "observation belongs to the task's own scope")),
+                       f"via a real call/assignment; no concrete anchor existed, so "
+                       f"scope was assessed by {config.vllm_extract_model!r} and "
+                       f"returned 'relevant'"),
             evidence_ids=[r.evidence_id],
-            provenance=provenance)
+            provenance=f"model_assessed:{config.vllm_extract_model}:relevant")
     return None
 
 
-def _evaluate_requirement_coverage(team, obligations: "list[EvidenceObligation]") -> dict:
-    """{target: "satisfied"|"missing"|"unknown"|"supported"|"supported_unscoped"}
-    (Objective B; "unknown" added T65, "supported" added T66,
-    "supported_unscoped" added T66.2). Tries structured declaration IDENTITY
-    first -- an exact (case-insensitive) match against a RETAINED file_read
-    EvidenceRecord's own `excerpt`, which IS the real declared name
-    _extract_declarations found (e.g. "PricingPlan", not a paraphrase) -- so
-    "PricingPlan"/"pricing_plan"/"Pricing Plan" in the obligation's own
-    normalized form still matches the one real declaration without a
-    growing synonym list (Section 6: exact identity where the system
-    already knows the declaration, UNKNOWN/substring-fallback otherwise,
-    never a semantic-similarity engine). Falls back to the original
-    substring-over-path-and-excerpt check (bounded fallback, explicitly
-    still permitted) only when no exact declaration match exists.
+async def _evaluate_requirement_coverage(
+        team, obligations: "list[EvidenceObligation]", task: "str | None" = None) -> dict:
+    """{target: "satisfied"|"missing"|"unknown"|"supported"} (Objective B;
+    "unknown" added T65, "supported" added T66). Tries structured
+    declaration IDENTITY first -- an exact (case-insensitive) match against
+    a RETAINED file_read EvidenceRecord's own `excerpt`, which IS the real
+    declared name _extract_declarations found (e.g. "PricingPlan", not a
+    paraphrase) -- so "PricingPlan"/"pricing_plan"/"Pricing Plan" in the
+    obligation's own normalized form still matches the one real declaration
+    without a growing synonym list (Section 6: exact identity where the
+    system already knows the declaration, UNKNOWN/substring-fallback
+    otherwise, never a semantic-similarity engine). Falls back to the
+    original substring-over-path-and-excerpt check (bounded fallback,
+    explicitly still permitted) only when no exact declaration match exists.
 
     An obligation with `resolved=False` (T65) is never checked via the
     literal-substring path at all -- its `target` is a natural-language
@@ -6294,20 +6420,22 @@ def _evaluate_requirement_coverage(team, obligations: "list[EvidenceObligation]"
     per call (memoized in a local, never cached across calls -- the ledger
     can grow between completion-decision calls, so a stale True must never
     survive to a later, different evaluation): if it returns a validated
-    Claim, every unresolved target in THIS obligation set is "supported" or
-    "supported_unscoped" (T66.2: the distinction is read from the Claim's
-    own `provenance` string -- "_anchored" vs "_unanchored" -- rather than
-    re-deriving it, so there is exactly one place this decision is made).
-    "supported_unscoped" means a real relationship was demonstrated, but no
-    concrete anchor existed in this obligation set to verify it belongs to
-    the task's own scope (T66.2's own investigated, documented limitation --
-    this is NEVER blocking, same as "supported", because making it blocking
-    would also block the genuinely correct, equally-unanchored case T64
-    exists to allow; the distinction exists so the uncertainty is visible in
-    the journal rather than silently indistinguishable from a scope-verified
-    claim). Otherwise every unresolved target remains "unknown" -- not
-    "satisfied" (nothing was verified) and not "missing" (T65.1: missing
-    evidence is not proof of nonexistence) -- disclosed explicitly.
+    Claim, every unresolved target in THIS obligation set is "supported"
+    -- either a concrete-anchor match (T66.1) or a model-assessed
+    "relevant" verdict on an otherwise-unanchored observation (FINAL
+    phase; see _relationship_support_claim and _assess_relevance). T66.2's
+    "supported_unscoped" is retired as of this phase: every case it used
+    to cover (a real connection with no anchor to check against) is now
+    either confirmed "supported" (the assessor said "relevant") or falls
+    through to "unknown" (irrelevant/abstain/provider failure) -- there is
+    no remaining case where an unverified connection is accepted.
+    Otherwise every unresolved target remains "unknown" -- not "satisfied"
+    (nothing was verified) and not "missing" (T65.1: missing evidence is
+    not proof of nonexistence) -- disclosed explicitly, and now also
+    BLOCKING for this reason (see _completion_decision's own rule 3,
+    unchanged in meaning: "unknown" has always blocked an unresolved
+    obligation; what changed is how rarely a genuine relationship now
+    reaches "supported" without a real, verified reason).
     `_completion_decision` is the caller that decides which of these block.
     """
     ledger = getattr(team, "_evidence_ledger", None)
@@ -6328,12 +6456,10 @@ def _evaluate_requirement_coverage(team, obligations: "list[EvidenceObligation]"
         t = ob.target
         if not ob.resolved:
             if not relationship_checked:
-                relationship_claim = _relationship_support_claim(team, obligations)
+                relationship_claim = await _relationship_support_claim(team, obligations, task)
                 relationship_checked = True
             if relationship_claim is not None and _validate_claim(team, relationship_claim):
-                coverage[t] = ("supported_unscoped"
-                               if relationship_claim.provenance.endswith("_unanchored")
-                               else "supported")
+                coverage[t] = "supported"
             else:
                 coverage[t] = "unknown"
         elif ledger is None:
@@ -6347,9 +6473,14 @@ def _evaluate_requirement_coverage(team, obligations: "list[EvidenceObligation]"
     return coverage
 
 
-def _completion_decision(team, task: "str | None" = None) -> tuple[str, str]:
+async def _completion_decision(team, task: "str | None" = None) -> tuple[str, str]:
     """(status, reason) -- status is "COMPLETE" or "INSUFFICIENT_EVIDENCE"
-    (INV-11). Layered checks, all deliberately conservative:
+    (INV-11). Made async in the FINAL phase solely because
+    _evaluate_requirement_coverage may now await one bounded model call
+    (_assess_relevance) -- its own single caller, _completion_control_check,
+    was already async, so this required no change to any other call site
+    (grep-confirmed: exactly one caller before this phase, still exactly
+    one after). Layered checks, all deliberately conservative:
 
     1. The original, near-zero-false-positive signal, CORRECTED live on this
        phase's own battery: a member produced real output, the ledger
@@ -6416,7 +6547,7 @@ def _completion_decision(team, task: "str | None" = None) -> tuple[str, str]:
         # coverage (below), which is the only other blocking check.
     obligations = _task_evidence_obligations(team, task)
     if obligations:
-        coverage = _evaluate_requirement_coverage(team, obligations)
+        coverage = await _evaluate_requirement_coverage(team, obligations, task)
         # T64: this verdict was computed but never logged anywhere -- the
         # only place this ever surfaced was the `reason` string of an
         # INSUFFICIENT_EVIDENCE return, so a SATISFIED run left zero trace
@@ -6450,26 +6581,14 @@ def _completion_decision(team, task: "str | None" = None) -> tuple[str, str]:
                     f"{', '.join(unresolved_unsupported)} (obligations "
                     f"derived from {source}; evidence may exist but no "
                     f"single observation establishes the relationship)")
-        # T66.2: COMPLETE is still permitted here (never blocking -- see
-        # _evaluate_requirement_coverage's own docstring for why), but when
-        # the ONLY thing standing between this run and INSUFFICIENT_EVIDENCE
-        # was an unscoped relationship claim, the success reason says so
-        # explicitly instead of the generic fallthrough text below, so a
-        # human reviewing this run's own disclosure -- not just the journal
-        # -- knows this specific COMPLETE rests on a claim this architecture
-        # could not verify belongs to the task's own scope.
-        unscoped = [ob.target for ob in obligations
-                    if not ob.resolved and coverage.get(ob.target) == "supported_unscoped"]
-        if unscoped:
-            source = obligations[0].source
-            return ("COMPLETE",
-                    f"relationship demonstrated for: {', '.join(unscoped)}, but "
-                    f"no concrete anchor was available to verify it belongs to "
-                    f"this task's own scope (obligations derived from {source}); "
-                    f"not blocked, per this architecture's own documented "
-                    f"inability to distinguish this from a genuinely correct, "
-                    f"equally unanchored answer without a forbidden relevance "
-                    f"mechanism")
+        # T66.2's "supported_unscoped" disclosure branch is retired as of
+        # the FINAL phase: that coverage value no longer exists --
+        # _evaluate_requirement_coverage now resolves every unresolved
+        # target to either "supported" (concrete anchor OR a model-
+        # assessed "relevant" verdict) or "unknown" (blocked by rule 3
+        # above). There is no remaining case where an unverified
+        # connection reaches COMPLETE silently or with a disclosure --
+        # it is blocked outright, per this phase's own hard requirement.
     else:
         # T64: UNKNOWN (this task's shape could not be mechanically
         # decomposed into obligations) was previously indistinguishable, in
@@ -6504,7 +6623,7 @@ async def _completion_control_check(content: str, team, task: "str | None" = Non
     folds in as a third independent signal, same disclosure.
     """
     try:
-        status, reason = _completion_decision(team, task)
+        status, reason = await _completion_decision(team, task)
         unresolved_cites = _unresolved_ledger_citations(team, content)
         unresolved_claims = _fabricated_execution_claims(team, content)
         claimed_action_ungrounded = _claimed_action_without_lineage(team, content)
