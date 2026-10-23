@@ -1900,6 +1900,63 @@ def _citation_bounds(answer: str, pos: int) -> tuple[int, int]:
     return lo, hi
 
 
+# T10 (2026-10-23): a citation can be VERIFIED (the symbol genuinely appears
+# within tolerance of the cited line) while the CLAIM about it is still wrong --
+# "used explicitly in the login endpoint at auth_service_api.py:68" cited the
+# line that imports `check_login_rate_limit`, not the line that calls it (the
+# real call site was 513). The anchor check below only ever asks "is this symbol
+# near this line", which an import line always answers yes to (it names the
+# symbol by definition) regardless of whether the answer's own prose claims a
+# DECLARATION/import or a USE/invocation. Generic by construction: a plain
+# shape match on the cited line's own text (no project vocabulary) and on the
+# claim verb in the answer's own prose (no project vocabulary there either).
+_IMPORT_LINE_RE = re.compile(
+    r"^\s*(?:from\s+\S+\s+import\b"           # Python: from x import y
+    r"|import\s+(?:\{[^}]*\}|\S+)\s+from\b"   # JS/TS:  import { y } from "x"
+    r"|(?:const|let|var)\s+.+=\s*require\()",  # CJS:    const y = require("x")
+    re.MULTILINE,
+)
+
+# "used", "uses", "calls", "called", "invokes", "invoked" -- a deliberately
+# small, generic set of verbs an answer uses to claim invocation rather than
+# mere declaration/import. Matching more broadly (e.g. "references", "imports")
+# would blur the exact distinction this check exists to draw; these specific
+# verbs are the ones that, paired with an import-shaped cited line, are
+# demonstrably wrong rather than merely imprecise.
+_USE_CLAIM_VERB_RE = re.compile(r"\b(?:use[sd]?|call(?:s|ed)?|invoke[sd]?)\b", re.IGNORECASE)
+
+_USE_CLAIM_WINDOW = 80
+
+
+def _cited_line_is_import_not_use(answer: str, path: str, num: int, line_text: str | None) -> bool:
+    """True when the answer's own prose, near this exact citation, claims
+    invocation ("used"/"called"/"invoked") but the cited line itself is a plain
+    import/require statement -- never a declaration/import claim, which an
+    import line correctly supports.
+
+    Re-finds this citation's own position in `answer` rather than threading a
+    position through the shared extraction loop (file_lines/content_claims/
+    symbol_claims are keyed by (path, num) alone) -- bounded, local to this one
+    check, and touches no code any other verdict relies on.
+    """
+    if not line_text or not _IMPORT_LINE_RE.match(line_text):
+        return False
+    needle = f"{path}:{num}"
+    pos = answer.find(needle)
+    if pos < 0:
+        # Try the labeled-prose form ("Line: N" near a backticked path) --
+        # approximate is fine here since this only narrows an existing TRUE
+        # anchor match to a stricter verdict, never invents a new citation.
+        for m in _LABELED_LINE_RE.finditer(answer):
+            if str(num) in (m.group(1), m.group(2)):
+                pos = m.start()
+                break
+    if pos < 0:
+        return False
+    window = answer[max(0, pos - _USE_CLAIM_WINDOW):pos]
+    return bool(_USE_CLAIM_VERB_RE.search(window))
+
+
 _PRECEDING_QUOTE_WINDOW = 60
 
 # Only connector text may sit between a quote and the citation it belongs to. Anything
@@ -3054,7 +3111,21 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                                 for h in _symbol_line_numbers(resolved, a))),
                         None,
                     )
-                    if anchored_by:
+                    if anchored_by and _cited_line_is_import_not_use(answer, path, num, line):
+                        # T10: the symbol IS genuinely within tolerance of this
+                        # line (anchored_by proves that), but the line itself is
+                        # an import/require statement, not an invocation -- and
+                        # the answer's own nearby prose claims invocation. A
+                        # DISTINCT verdict from both "verified" and MISMATCH: the
+                        # citation is not fabricated (the symbol is real, the
+                        # line exists), the claim about WHAT is at that line is.
+                        problems += 1
+                        out.append(
+                            f"  IMPORT, NOT USE {resolved}:{num} <-- `{anchored_by}` is "
+                            f"imported here, not called; the answer's own nearby wording "
+                            f"claims invocation, which this line does not show"
+                        )
+                    elif anchored_by:
                         out.append(f"             `{anchored_by}` verified within "
                                    f"{_LINE_TOLERANCE} lines")
                     else:

@@ -6243,9 +6243,18 @@ _DEFINITION_RE = re.compile(
 # function declaration header (a base-class declaration "class Foo(Base):"
 # has no leading dot before the "(", so it cannot be mistaken for a dotted
 # call; it also is not an assignment).
+#
+# T67 (2026-10-23): the assignment alternative's "=\s*" required the call to
+# sit IMMEDIATELY after the "=", with only whitespace between -- so
+# "catalog = await fetch_catalog(...)" (confirmed live against this project's
+# own inventory-service: an ordinary cross-service call) never matched at
+# all, the "await " keyword silently defeating it. `await` is a bare Python
+# language keyword, not project vocabulary, so allowing one optional
+# "await " here closes a real, generic gap in an async-first codebase rather
+# than adding anything repository-specific.
 _REFERENCE_RE = re.compile(
     r"\b([A-Z][A-Za-z0-9]{2,}|[a-z_][a-z0-9_]{2,})\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\s*\("
-    r"|\b\w+\s*=\s*([A-Z][A-Za-z0-9]{2,}|[a-z_][a-z0-9_]{2,})\s*\(")
+    r"|\b\w+\s*=\s*(?:await\s+)?([A-Z][A-Za-z0-9]{2,}|[a-z_][a-z0-9_]{2,})\s*\(")
 
 
 _RELEVANCE_ASSESSMENT_TIMEOUT_S = 15.0
@@ -6467,6 +6476,55 @@ async def _relationship_support_claim(
                        f"returned 'relevant'"),
             evidence_ids=[r.evidence_id],
             provenance=f"model_assessed:{config.vllm_extract_model}:relevant")
+
+    # T67 (2026-10-23, T11/T12 root cause): the loop above can only ever find a
+    # relationship when BOTH halves -- the definition and the referencing call --
+    # sit in the SAME observation's own excerpt. A cross-service relationship
+    # (T11's upload-entry-point calling a storage client defined in a different
+    # file; T12's inventory-service calling out to business-service through a
+    # client module) is, by its very nature, two DIFFERENT files, so it can never
+    # satisfy that loop even when both halves were genuinely, separately read
+    # this run. Only engaged when `anchors` is non-empty -- reusing the exact
+    # same strict bar the single-observation anchored branch above already
+    # trusts -- and deliberately NOT extended to the unanchored model-assessed
+    # branch, which _assess_relevance was built and tuned to judge a single
+    # excerpt's relevance to the task, not whether two SEPARATE files' own
+    # identifiers are the same real connection versus an unrelated name
+    # collision; cross-file matching without a concrete anchor is exactly the
+    # coincidental-co-occurrence risk this function's own T66/T66.1/T66.2
+    # history already fought to exclude, and this phase does not reopen it.
+    if anchors:
+        define_sources: dict[str, EvidenceRecord] = {}
+        reference_sources: dict[str, EvidenceRecord] = {}
+        for r in ledger.list():
+            if not (isinstance(r, EvidenceRecord) and r.relevance_status == "retained"
+                    and r.evidence_type == "file_read" and r.excerpt
+                    and not ledger.any_truncated_for_path(r.source_path)):
+                continue
+            text = r.excerpt
+            for pair in _DEFINITION_RE.findall(text):
+                for g in pair:
+                    if g:
+                        define_sources.setdefault(_normalize_delegation_target(g), r)
+            for pair in _REFERENCE_RE.findall(text):
+                for g in pair:
+                    if g:
+                        reference_sources.setdefault(_normalize_delegation_target(g), r)
+        for anchor in anchors:
+            ref_rec = reference_sources.get(anchor)
+            def_rec = define_sources.get(anchor)
+            # Same-file pairs are already the single-observation loop's case
+            # above; only a genuine cross-file pair is new ground here.
+            if ref_rec is None or def_rec is None or ref_rec.source_path == def_rec.source_path:
+                continue
+            return _create_factual_claim(
+                team,
+                statement=(f"`{anchor}` is called in {ref_rec.source_path!r} (a real "
+                           f"call/assignment) and defined in {def_rec.source_path!r} -- "
+                           f"two separately retained observations, matching a concrete "
+                           f"task anchor"),
+                evidence_ids=[ref_rec.evidence_id, def_rec.evidence_id],
+                provenance="deterministic:definition_plus_reference_anchored_cross_file")
     return None
 
 
@@ -12675,6 +12733,103 @@ async def _integration_mechanism_missing(task: str, content: str,
             f"above names neither that nor any of the code that uses it. The real call "
             f"sites (from search_files): "
             f"{', '.join('`' + s + '`' for s in sites[:_MAX_INTEGRATION_SITES])}.**")
+
+
+_INTEGRATION_CORRECTION_FLAG = "_integration_correction_attempted"
+
+
+async def _attempt_integration_correction(
+        content: str, task: str, team, hive_mcp_url: str | None, hive_mcp_tools,
+        liveness_path: str | None = None, synthesis_run: bool = False) -> str:
+    """T12 (2026-10-23): a conceptual integration request ("how does X integrate
+    with the Y service") whose answer never named the real mechanism
+    (_integration_mechanism_missing) used to ONLY be disclosed after the fact,
+    at whichever _run_repo_derived_guards call site happened to see the final
+    text -- the gap this guard finds was never fed back into a chance to fix
+    it. _integration_mechanism_missing already does the hard part
+    deterministically (derives the convention-based `<SERVICE>_SERVICE_URL`
+    constant and finds its real call sites via a live repo search); this
+    function's only job is to spend ONE bounded retry handing that already-
+    discovered evidence back to the model, the same shape every other
+    targeted retry in this file already uses (build a prompt naming the
+    specific gap, _stream_team_run once, recheck, adopt or disclose) --
+    deliberately not a second verifier: the recheck IS
+    _integration_mechanism_missing, called again against the retry's own
+    text, not a new detector.
+
+    Placed at the SAME choke point as _evidence_integrity_check (Phase R),
+    immediately after it: by that point `content` has already been through
+    citation/fabrication verification (Phase H) and comparison-contradiction
+    reconciliation (Phase R), so this spends its one retry on the most-
+    corrected candidate rather than a draft about to be replaced anyway.
+    Runs before Phase I (_attempt_evidence_grounded_reconstruction), which is
+    unaffected: that gate gets entered strictly via _VERIFICATION_FAILED_PREFIX,
+    which this function never produces.
+
+    One-shot per run (own flag, not _EVIDENCE_INTEGRITY_FLAG -- a run can
+    legitimately need both an evidence-integrity reconciliation AND an
+    integration correction; they check for different things).
+    """
+    if synthesis_run or not content or getattr(team, _INTEGRATION_CORRECTION_FLAG, False):
+        return content
+    setattr(team, _INTEGRATION_CORRECTION_FLAG, True)
+
+    finding = await _integration_mechanism_missing(task, content, hive_mcp_url, hive_mcp_tools)
+    if not finding:
+        return content
+
+    print("[team] integration-correction: gap found, one targeted reconciliation "
+          "attempt", flush=True)
+    prompt = (
+        f"{task}\n\nYou already produced an answer to this task below. It did not "
+        f"describe the actual integration mechanism this run's own repository "
+        f"search just found: {finding.strip().strip('*')} Answer the original "
+        f"question again, incorporating the real call sites named above. Do not "
+        f"discard or rewrite content that was not about this integration.\n\n"
+        f"── Your previous answer ──\n{content}\n── end of your previous answer ──"
+    )
+    try:
+        retried, _retry_result = await _stream_team_run(
+            team, prompt, log_label="integration-correction", liveness_path=liveness_path)
+    except Exception as exc:
+        print(f"[team] integration-correction retry failed: {exc}", flush=True)
+        return content + finding
+
+    was_truncated = (getattr(team, "_repetition_truncated", False)
+                     or getattr(team, "_semantic_stall_truncated", False))
+    retried, _ = await _complete_repetition_truncated_answer(
+        retried, task, team, [], None, liveness_path)
+    if was_truncated and _TRUNCATED_ANSWER_NOTE not in retried \
+            and not _ends_at_a_natural_stopping_point(retried):
+        retried = retried + _TRUNCATED_ANSWER_NOTE
+
+    if not retried or not _strip_leaked_tool_tags(retried).strip() \
+            or retried.strip() == _BUDGET_EXHAUSTED_ANSWER \
+            or _TRUNCATED_ANSWER_NOTE in retried:
+        print("[team] integration-correction retry produced nothing usable", flush=True)
+        return content + finding
+
+    recheck = await _integration_mechanism_missing(task, retried, hive_mcp_url, hive_mcp_tools)
+    if recheck:
+        print("[team] integration-correction: retry still does not name the real "
+              "integration -- keeping original content with disclosure", flush=True)
+        return content + finding
+
+    # Phase Y's own safety net (_evidence_integrity_check), reused unchanged: a
+    # candidate that resolved THIS specific gap may have fabricated something
+    # else while rewriting. Never adopt without this check.
+    _retried_fab_report, _retried_fab_bad, _ = await _verify_claims(
+        retried, hive_mcp_url, hive_mcp_tools)
+    if _retried_fab_bad:
+        print(f"[team] integration-correction: retry now names the real "
+              f"integration but failed verify_claims — "
+              f"{_verdict_digest(_retried_fab_report)} — keeping original "
+              f"content with disclosure instead of adopting", flush=True)
+        return content + finding
+
+    print("[team] integration-correction: retry now names the real integration "
+          "and passes verify_claims -- adopting", flush=True)
+    return retried
 
 
 # T36 Track C (2026-10-19 battery, T11): a cross-service tracing task asked "which
@@ -24335,7 +24490,40 @@ def _names_something(line: str) -> bool:
     return any(r.search(stripped) for r in _CONCRETE_ITEM_RES)
 
 
-def _list_item_identity(line: str) -> str:
+# T7 (2026-10-23): the T6 merge artifact (see _count_contradicts_own_list's own
+# comment on `scanned_until`) can glue the NEXT repeated block's own intro sentence
+# directly onto the boundary bullet with no line break at all -- "- `plan_limits_
+# api.py`The directory ... contains 6 `.py` files:" is one real item, `plan_limits_
+# api.py`, with a second list's intro appended to the same physical line. The
+# embedded "number ... colon" shape itself (mirroring _COUNT_INTRO_RE, anchored to
+# the end of this single already-isolated line rather than a following newline,
+# which strip() has already removed by the time a caller reaches this far) starts
+# mid-sentence ("...contains 6 `.py` files:"), not at the glue point itself -- it
+# only CONFIRMS a count-intro sentence is present somewhere on this line, it does
+# not locate where it begins. Used only as that confirmation, never as the
+# truncation point itself (see _list_item_identity below).
+#
+# T7.1 (2026-10-23): the number is now CAPTURED, not just matched. A read-only
+# review executed two live counter-examples against the T7-only version of this
+# regex and confirmed it is not sufficient on its own: "`retry` is attempted up to
+# 3 times:" and "`retry` is logged but not attempted 3 times:" -- two items that
+# say opposite things -- both matched and both truncated to the bare token
+# `retry`, colliding into one identity; and a single, legitimate, non-duplicated
+# item ("`finding_a` affects 2 downstream services:") was truncated for no reason
+# at all, losing real content it should have kept. Matching the shape was never
+# enough evidence that THIS number is the glue artifact rather than an unrelated
+# number the item legitimately mentions -- only comparing it against the actual
+# declared count the surrounding list is being validated against is.
+_EMBEDDED_COUNT_INTRO_RE = re.compile(r"(?<![\w.:/-])(\d{1,3})\b[^:,\n]{0,120}:\s*$")
+
+# The bullet's own content in the live incident is one backtick-quoted token
+# (a filename); truncating identity to just that leading token -- rather than to
+# wherever the embedded match above happens to start -- correctly drops the glued
+# sentence regardless of where within it the number falls.
+_LEADING_QUOTED_TOKEN_RE = re.compile(r"^`([^`]+)`")
+
+
+def _list_item_identity(line: str, stated: int | None = None) -> str:
     """Collapse one list line to the identity `_count_contradicts_own_list` dedupes by.
 
     Strips the bullet/number prefix and markdown backtick/bold emphasis, then
@@ -24345,8 +24533,25 @@ def _list_item_identity(line: str) -> str:
     identity only costs a missed detection, never a false suppression of a real
     discrepancy -- the raw `actual`/`concrete` counts stay untouched and still drive
     every other branch of that check.
+
+    T7.1 (2026-10-23): when this line leads with a backtick-quoted token AND also
+    contains a glued-on count-intro sentence (_EMBEDDED_COUNT_INTRO_RE, used only to
+    confirm one is present, never to locate it) WHOSE OWN NUMBER EQUALS `stated` --
+    the same declared count the caller is validating this whole list against, not
+    merely some digit followed by a colon -- the identity is the quoted token alone;
+    the glued remainder belongs to the NEXT item's own scan, not this one's, and
+    keeping it here is exactly what corrupted the boundary bullet's identity in the
+    live incident. `stated=None` (no declared count in scope) is conservative by
+    construction: normalization never truncates when it has nothing to confirm the
+    match against, same as when the embedded number simply disagrees with `stated`.
     """
     stripped = re.sub(r"^\s*(?:[-*+•]|\d{1,3}[.)])\s*", "", line.strip())
+    if stated is not None:
+        embedded = _EMBEDDED_COUNT_INTRO_RE.search(stripped)
+        if embedded is not None and int(embedded.group(1)) == stated:
+            leading = _LEADING_QUOTED_TOKEN_RE.match(stripped)
+            if leading is not None:
+                stripped = leading.group(1)
     stripped = stripped.replace("`", "").replace("*", "")
     return re.sub(r"\s+", " ", stripped).strip().lower()
 
@@ -24537,7 +24742,7 @@ def _count_contradicts_own_list(content: str) -> tuple[int, int, str, int] | Non
             if _LIST_LINE_RE.match(stripped):
                 actual += 1
                 concrete += _names_something(stripped)
-                identity = _list_item_identity(stripped)
+                identity = _list_item_identity(stripped, stated)
                 if identity not in seen_identities:
                     seen_identities.add(identity)
                     distinct += 1
@@ -26304,6 +26509,16 @@ async def run_task_async(
                     # _evidence_integrity_check's own docstring for why this sits
                     # outside that chain rather than as one more guard inside it.
                     content = await _evidence_integrity_check(
+                        content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
+                        liveness_path=liveness_path, synthesis_run=synthesis_run)
+                    # T12 (2026-10-23): same choke-point placement, immediately after
+                    # Phase R above -- spends content's one remaining targeted retry
+                    # (a separate, own-flagged budget; see
+                    # _attempt_integration_correction's own docstring) on a conceptual
+                    # integration gap _integration_mechanism_missing already finds
+                    # deterministically, instead of only ever disclosing it after the
+                    # fact at a later _run_repo_derived_guards call site.
+                    content = await _attempt_integration_correction(
                         content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
                         liveness_path=liveness_path, synthesis_run=synthesis_run)
                 except Exception as exc:
