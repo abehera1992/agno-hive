@@ -12718,9 +12718,32 @@ async def _repo_lightrag_query(query: str, project_id: str,
     ~90-120s") is reused unchanged rather than the shorter
     _BESPOKE_MCP_SESSION_TIMEOUT (90s) other _repo_* helpers use for faster
     tools -- this call must be genuinely awaited, not abandoned early.
+
+    Recovery fix (2026-10-23, post-hardening): the timeout is enforced with
+    anyio.fail_after, not asyncio.wait_for. streamablehttp_client (mcp/client/
+    streamable_http.py) is built on anyio.create_task_group() internally --
+    confirmed by reading that file directly. asyncio.wait_for cancels the
+    wrapped coroutine using asyncio's own task-cancellation primitive, which
+    does not participate in anyio's cancel-scope bookkeeping; when this
+    call's genuinely-long-running timeout actually fires (not a hypothetical
+    -- lightrag_query routinely takes 170s+), that mismatch produced
+    "RuntimeError: Attempted to exit cancel scope in a different task than
+    it was entered in" on the client side, and -- confirmed directly from
+    lightrag.service's own journal for the SAME incident window --
+    corrupted that service's shared StreamableHTTPSessionManager task group,
+    which then failed EVERY subsequent request (regardless of task shape)
+    with "RuntimeError: Task group is not initialized" until the service was
+    restarted. anyio.fail_after raises its cancellation through the same
+    cancel-scope hierarchy streamablehttp_client's own task group belongs
+    to, so the exit happens in the owning task, and the underlying
+    connection is given the chance to close in the normal way rather than
+    being yanked out from under the server mid-request. Every existing
+    outcome classification, log line, and fallback behavior below is
+    unchanged -- only the cancellation mechanism moved.
     """
     if not lightrag_url:
         return "no_url", ""
+    import anyio
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
@@ -12738,8 +12761,9 @@ async def _repo_lightrag_query(query: str, project_id: str,
                 box["text"] = _extract_mcp_text(res)
 
     try:
-        await asyncio.wait_for(_ask(), timeout=_MCP_TIMEOUT)
-    except asyncio.TimeoutError:
+        with anyio.fail_after(_MCP_TIMEOUT):
+            await _ask()
+    except TimeoutError:
         return "timeout", ""
     except Exception as exc:  # noqa: BLE001
         print(f"[team] lightrag-prefetch: session failed "
