@@ -13513,6 +13513,43 @@ async def _integration_mechanism_missing(task: str, content: str,
 
 _INTEGRATION_CORRECTION_FLAG = "_integration_correction_attempted"
 
+# T12.1 (2026-10-24): matches exactly _integration_mechanism_missing's own banner
+# (the f-string at the end of that function, verbatim) -- the literal opening
+# phrase is this function's own, never shown to a model as text to echo, and the
+# banner contains exactly one `**...**` span (its call sites are single-backtick-
+# quoted, not bold), so the non-greedy close lands on the banner's own closing
+# `**` and never reads into unrelated later content. re.sub with the default
+# count=0 strips every occurrence, not just the first, in case more than one
+# exit path appended one.
+_INTEGRATION_BANNER_RE = re.compile(
+    r"\n\n---\n\*\*THE INTEGRATION WAS ASKED FOR AND NOT DESCRIBED.*?\*\*",
+    re.DOTALL)
+
+
+def _strip_integration_banner(content: str) -> str:
+    """Remove any already-appended _integration_mechanism_missing disclosure
+    before re-running that same predicate against `content`.
+
+    Root cause (T12.1, confirmed live against run_id d44c11b88888): the banner
+    quotes the convention-based <SERVICE>_SERVICE_URL constant in backticks as
+    part of explaining that the answer does NOT describe the integration --
+    but _integration_mechanism_missing's own evidence check (named = sorted(e
+    for e in evidence if e in content)) is a bare substring test, so a SECOND
+    call against content that already carries this banner (appended earlier by
+    _verified_answer's _tail(), see that function's own docstring) finds the
+    constant trivially present and concludes, wrongly, that the integration
+    WAS described. The disclosure's own text was self-satisfying the check
+    that produced it.
+
+    Transient: used only to compute what `_attempt_integration_correction`
+    checks, never to change what `content` itself holds or what the run
+    ultimately returns. The disclosure stays exactly where it was for every
+    other purpose, including the recheck against `retried` (a model's freshly
+    generated retry text, not this already-appended banner) and every other
+    call site of _integration_mechanism_missing, none of which this strips.
+    """
+    return _INTEGRATION_BANNER_RE.sub("", content or "")
+
 
 async def _attempt_integration_correction(
         content: str, task: str, team, hive_mcp_url: str | None, hive_mcp_tools,
@@ -13550,7 +13587,11 @@ async def _attempt_integration_correction(
         return content
     setattr(team, _INTEGRATION_CORRECTION_FLAG, True)
 
-    finding = await _integration_mechanism_missing(task, content, hive_mcp_url, hive_mcp_tools)
+    # T12.1: checked against a banner-stripped view of content, not content
+    # itself -- see _strip_integration_banner's own docstring for why. content
+    # (banner included) is untouched; only this one predicate's input changes.
+    finding = await _integration_mechanism_missing(
+        task, _strip_integration_banner(content), hive_mcp_url, hive_mcp_tools)
     if not finding:
         return content
 
