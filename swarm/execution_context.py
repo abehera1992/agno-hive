@@ -217,3 +217,84 @@ class RunContext:
         )
         self.evidence.append(ev)
         return ev
+
+
+@dataclass(frozen=True)
+class ExecutionProfile:
+    """Phase B (2026-10-24) -- a named, typed bundle of execution budgets for
+    one run, resolved once at run start and never re-derived mid-run.
+
+    Centrally defined here, next to RunContext, rather than scattered as
+    literals across team.py/api/server.py/EkamApp's caller -- the same
+    "one authoritative source" principle RunContext already applies to
+    identity, now applied to time/tool budgets. A profile only RESOLVES
+    values; it does not enforce anything itself -- see each field's own
+    consumer for where it is actually read (team._execution_deadline is
+    consumed by _repo_lightrag_query's own deadline parameter and, where
+    wired, by tool_call_limit resolution; the client_timeout_hint_s field
+    is consumed by the CALLER (api/server.py's request handling and
+    EkamApp's agno_run wrapper), not by anything inside this process,
+    since this process has no way to enforce how long ITS OWN caller
+    waits.
+
+    server_deadline_s=None means "unbounded" -- the standard profile's
+    value, deliberately preserving today's existing, unchanged behavior
+    for every caller that does not opt into a named profile.
+    """
+    name: str
+    client_timeout_hint_s: float | None
+    server_deadline_s: float | None
+    tool_call_limit_bonus: int = 0
+    lightrag_prefetch_budget_s: float | None = None
+    completion_reserve_s: float | None = None
+
+
+# Three profiles, per the mission's own minimum set. Values are an initial
+# operating point to validate, not a guarantee (explicit per the mission's
+# own wording for the exhaustive profile) -- each is env-overridable so a
+# live measurement can retune without a code change.
+import os as _os  # local alias -- this module otherwise has no os dependency
+
+_EXECUTION_PROFILES: dict[str, ExecutionProfile] = {
+    "standard": ExecutionProfile(
+        name="standard", client_timeout_hint_s=None, server_deadline_s=None,
+    ),
+    "extended": ExecutionProfile(
+        name="extended",
+        client_timeout_hint_s=float(_os.getenv("EXEC_PROFILE_EXTENDED_CLIENT_TIMEOUT_S", "2700")),
+        server_deadline_s=float(_os.getenv("EXEC_PROFILE_EXTENDED_DEADLINE_S", "2400")),
+        tool_call_limit_bonus=int(_os.getenv("EXEC_PROFILE_EXTENDED_TOOL_BONUS", "15")),
+        lightrag_prefetch_budget_s=60.0,
+        completion_reserve_s=180.0,
+    ),
+    "exhaustive": ExecutionProfile(
+        name="exhaustive",
+        # Mission's own explicit initial value -- "3600 seconds... configurable
+        # rather than hard-coded... an initial operating value to validate".
+        client_timeout_hint_s=float(_os.getenv("EXEC_PROFILE_EXHAUSTIVE_CLIENT_TIMEOUT_S", "3600")),
+        server_deadline_s=float(_os.getenv("EXEC_PROFILE_EXHAUSTIVE_DEADLINE_S", "3300")),
+        tool_call_limit_bonus=int(_os.getenv("EXEC_PROFILE_EXHAUSTIVE_TOOL_BONUS", "40")),
+        lightrag_prefetch_budget_s=90.0,
+        # Reserve kept well under (deadline - client_timeout margin): the
+        # server must finish synthesizing and return BEFORE the client's own
+        # ceiling, not merely before its own deadline.
+        completion_reserve_s=300.0,
+    ),
+}
+
+
+def resolve_profile(name: str | None) -> ExecutionProfile:
+    """Resolve a profile name to its ExecutionProfile, defaulting to
+    "standard" for None, an empty string, or any name this process does not
+    recognize -- never raises, since an unrecognized profile name from an
+    older/mismatched caller must fail safe to today's existing unbounded
+    behavior, not crash the run.
+    """
+    if not name:
+        return _EXECUTION_PROFILES["standard"]
+    profile = _EXECUTION_PROFILES.get(name.strip().lower())
+    if profile is None:
+        print(f"[execution_context] unrecognized execution_profile {name!r} -- "
+              f"falling back to 'standard'", flush=True)
+        return _EXECUTION_PROFILES["standard"]
+    return profile

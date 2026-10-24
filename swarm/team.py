@@ -12696,17 +12696,22 @@ def _lightrag_result_is_usable(text: str) -> bool:
     return True
 
 
+_LIGHTRAG_CONTEXT_TIMEOUT = float(os.getenv("LIGHTRAG_CONTEXT_TIMEOUT_S", "30"))
+
+
 async def _repo_lightrag_query(query: str, project_id: str,
                                lightrag_url: str | None,
-                               mode: str = "hybrid") -> "tuple[str, str]":
+                               mode: str = "hybrid",
+                               use_context_only: bool = True,
+                               deadline: "float | None" = None) -> "tuple[str, str]":
     """(outcome, text) from one fresh, bounded MCP session call to
-    lightrag_query -- the same "open a session, call_tool, extract text"
-    shape _repo_search_text already uses for search_files (same module),
-    minus its live-session-reuse branch: delegate_structured_task's own
-    closure has no access to this run's already-open hive-mcp/project-MCP
-    sessions (those are built later, in run_task_async's own mcp_by_url --
-    see _pick_hive_mcp), but config.lightrag_mcp_url is always known
-    statically (_resolve_mcp_urls, api/server.py, appends it to every run
+    LightRAG -- the same "open a session, call_tool, extract text" shape
+    _repo_search_text already uses for search_files (same module), minus
+    its live-session-reuse branch: delegate_structured_task's own closure
+    has no access to this run's already-open hive-mcp/project-MCP sessions
+    (those are built later, in run_task_async's own mcp_by_url -- see
+    _pick_hive_mcp), but config.lightrag_mcp_url is always known statically
+    (_resolve_mcp_urls, api/server.py, appends it to every run
     unconditionally), so a fresh session here needs no new plumbing through
     the delegation pipeline.
 
@@ -12714,10 +12719,30 @@ async def _repo_lightrag_query(query: str, project_id: str,
     a stable, explicit field, never parsed back out of a natural-language
     message (Section 7's own requirement). Never raises.
 
-    _MCP_TIMEOUT (180s, its own comment: "lightrag_query synthesis
-    ~90-120s") is reused unchanged rather than the shorter
-    _BESPOKE_MCP_SESSION_TIMEOUT (90s) other _repo_* helpers use for faster
-    tools -- this call must be genuinely awaited, not abandoned early.
+    Performance phase (2026-10-24): use_context_only=True (the new default)
+    calls lightrag_mcp's lightrag_query_context tool instead of
+    lightrag_query -- skips LightRAG's own LLM synthesis stage entirely.
+    Measured live against the deployed LightRAG 1.5.4 and the real "ekam"
+    index, across a symbol lookup, a relationship query, and a broad
+    discovery query: 0.8-8.3s versus 100-180s for the synthesis path this
+    function previously always used. _LIGHTRAG_CONTEXT_TIMEOUT (30s,
+    env-overridable) replaces _MCP_TIMEOUT (180s) as this call's own
+    timeout accordingly -- still generous headroom over the measured
+    range, not a tight cut. The old synthesis path remains reachable via
+    use_context_only=False for a caller that specifically wants a composed
+    answer rather than a raw evidence lead; _MCP_TIMEOUT (180s, "lightrag_
+    query synthesis ~90-120s") still applies to that path unchanged.
+
+    `deadline` (monotonic time.monotonic() end-time, optional): when the
+    caller has its own remaining-budget constraint (an execution profile's
+    overall deadline -- see _lightrag_prefetch_for_delegation's own
+    caller), this call's own timeout is further bounded to whatever time
+    remains until that deadline, never the other way around -- a tight
+    remaining budget can only shorten this call's wait, never lengthen it
+    past its own timeout. A deadline already in the past skips the call
+    entirely ("no_url"-shaped early return is reused for this -- there is
+    no separate "no_budget" outcome, since the caller-visible effect is
+    identical: no attempt was made).
 
     Recovery fix (2026-10-23, post-hardening): the timeout is enforced with
     anyio.fail_after, not asyncio.wait_for. streamablehttp_client (mcp/client/
@@ -12743,25 +12768,34 @@ async def _repo_lightrag_query(query: str, project_id: str,
     """
     if not lightrag_url:
         return "no_url", ""
+    tool_timeout = _LIGHTRAG_CONTEXT_TIMEOUT if use_context_only else _MCP_TIMEOUT
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print("[team] lightrag-prefetch: skipped -- execution deadline "
+                  "already passed", flush=True)
+            return "no_url", ""
+        tool_timeout = min(tool_timeout, remaining)
     import anyio
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
     box: dict = {"text": ""}
+    tool_name = "lightrag_query_context" if use_context_only else "lightrag_query"
 
     async def _ask() -> None:
         async with streamablehttp_client(lightrag_url) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 res = await session.call_tool(
-                    "lightrag_query",
+                    tool_name,
                     {"query": query, "project_id": project_id, "mode": mode})
                 if _mcp_error_text(res):
                     return
                 box["text"] = _extract_mcp_text(res)
 
     try:
-        with anyio.fail_after(_MCP_TIMEOUT):
+        with anyio.fail_after(tool_timeout):
             await _ask()
     except TimeoutError:
         return "timeout", ""
@@ -12872,8 +12906,17 @@ async def _lightrag_prefetch_for_delegation(
 
     project_id = getattr(team, "_project_id", None) or "default"
     query = f"{target} -- {objective} {evidence_required}".strip()
+    # Execution-profile deadline (2026-10-24): team._execution_deadline is a
+    # monotonic end-time set once at run start (see run_task_async/
+    # run_task_stream's own ExecutionProfile resolution) -- None for the
+    # standard profile (unbounded, today's unchanged default). When set,
+    # _repo_lightrag_query further bounds its own timeout to whatever time
+    # remains, so a prefetch can never, by itself, consume more of an
+    # exhaustive task's budget than is actually left.
+    deadline = getattr(team, "_execution_deadline", None)
     start = time.monotonic()
-    outcome, text = await _repo_lightrag_query(query, project_id, config.lightrag_mcp_url)
+    outcome, text = await _repo_lightrag_query(
+        query, project_id, config.lightrag_mcp_url, deadline=deadline)
     duration = time.monotonic() - start
     usable = outcome == "usable"
     # Structured, explicit-field log line (Section 7). fallback_continues is
@@ -14545,10 +14588,27 @@ def is_fresh_read_budget_exceeded(read_chars: dict[str, int], agent_key: str) ->
 
 
 # How many calls of an agent's budget to leave unspent when forcing it to answer.
-# 1, not 0: the guard fires AFTER the call that reaches (limit - reserve) returns, so
-# with 1 the agent still holds one unused call at the moment tool_choice flips. That
-# margin is what guarantees agno never has to refuse anything -- the whole point.
-_TOOL_BUDGET_RESERVE = 1
+#
+# Raised 1 -> 4 (2026-10-24, Workstream B). The old comment here claimed reserve=1
+# "guarantees agno never has to refuse anything" -- confirmed FALSE by reading the
+# actual installed agno source (agno/models/base.py, Model.run_function_calls):
+# it takes function_calls: List[FunctionCall] -- every tool call the model requested
+# in ONE turn -- and iterates the whole list, incrementing its own call counter and
+# checking function_call_limit PER ITEM, all within that one call, before this
+# repo's hook ever gets a chance to flip tool_choice for a FUTURE turn. A turn that
+# requests several calls at once (this project's own docs document 3-4-file batches
+# as a normal pattern) can therefore straddle the limit boundary entirely within one
+# already-dispatched list: the guard fires on whichever call crosses (limit-reserve),
+# but any further calls already present in that SAME list still land in agno's
+# per-item loop and get silently refused before the model is ever told to stop --
+# with reserve=1 there is only one call of headroom, i.e. none, against a batch of
+# 2+. This is consistent with (not a confirmed root cause of) the live T11 run, which
+# stalled issuing tool calls with no content produced -- the forcing message never
+# got a chance to land. 4 gives real headroom against an ordinary multi-file batch
+# without materially shrinking any role's usable budget. This does not make
+# exhaustion impossible for an unbounded batch size -- see _tools_refused_for_limit's
+# reactive disclosure path for the case this proactive guard still cannot catch.
+_TOOL_BUDGET_RESERVE = 4
 
 
 # Members the harness deliberately flipped into text-only mode this run. Module scope,
@@ -18744,6 +18804,13 @@ _STRUCTURED_DELEGATION_REQUIRED_FIELDS = (
 # text. A second, independent cap rather than trusting the first one never
 # grows -- cheap insurance against bloating every delegation in a long chain.
 _INHERITED_CONTEXT_CAP = 2000
+# Context-only LightRAG retrieval (2026-10-24 performance phase) returns raw
+# entity/relationship/chunk data, not composed prose -- measured 70,000-
+# 97,000 chars on real queries against the "ekam" index, an order of
+# magnitude larger than the synthesized-prose shape _INHERITED_CONTEXT_CAP
+# was sized for. A separate, larger cap keeps several real entity/relation
+# descriptions intact instead of truncating to a fragment of the first one.
+_LIGHTRAG_CONTEXT_BLOCK_CAP = 6000
 
 # Phase T27: live testing of T26 found the inherited-context block attached
 # unconditionally (whenever team._session_summary was non-empty) bled into an
@@ -18924,17 +18991,21 @@ def _build_canonical_researcher_task(
     _lightrag_block = ""
     if lightrag_context and lightrag_context.strip():
         _lr_text = lightrag_context.strip()
-        if len(_lr_text) > _INHERITED_CONTEXT_CAP:
-            _lr_text = _lr_text[:_INHERITED_CONTEXT_CAP] + "\n... (truncated)"
+        if len(_lr_text) > _LIGHTRAG_CONTEXT_BLOCK_CAP:
+            _lr_text = _lr_text[:_LIGHTRAG_CONTEXT_BLOCK_CAP] + "\n... (truncated)"
         _lightrag_block = (
-            f"LIGHTRAG SEMANTIC SEARCH (ran automatically before this task was "
-            f"dispatched to you -- NOT independently confirmed, and NOT a "
-            f"substitute for reading the actual file):\n{_lr_text}\n\n"
+            f"LIGHTRAG RETRIEVAL (ran automatically before this task was "
+            f"dispatched to you -- raw retrieved entity/relationship data, NOT "
+            f"independently confirmed, and NOT a substitute for reading the "
+            f"actual file. Not filtered for relevance the way a composed answer "
+            f"would be -- retrieval returns its closest matches regardless of "
+            f"true topical fit):\n{_lr_text}\n\n"
             f"This may name real files/symbols worth reading directly, or may "
-            f"only describe a file's role without quoting its literal content. "
-            f"Use it to target your own search/read faster if it helps; do not "
-            f"cite it in place of a real file you have read, and do not skip "
-            f"your own investigation merely because this block is nonempty.\n\n"
+            f"only describe a file's role without quoting its literal content, "
+            f"or may be off-topic for this specific objective. Use it to target "
+            f"your own search/read faster if it helps; do not cite it in place "
+            f"of a real file you have read, and do not skip your own "
+            f"investigation merely because this block is nonempty.\n\n"
         )
     return (
         f"TARGET:\n{target}\n\n"
@@ -21067,8 +21138,20 @@ async def run_task_stream(
     mode: str = "coordinate",
     read_only: bool = False,
     team_name: str | None = None,
+    execution_profile: str | None = None,
 ):
     """Same setup as run_task_async but yields text chunks as the coordinator generates them.
+
+    `execution_profile` (Workstream B, 2026-10-24): one of "standard"
+    (default, unbounded -- today's exact prior behavior), "extended", or
+    "exhaustive" -- see swarm/execution_context.resolve_profile. Resolved
+    once, here, into team._execution_deadline (a monotonic end-time, or
+    None for standard) and team._execution_profile_name, using the same
+    late-binding slot convention team._project_id already uses below.
+    Never re-resolved mid-run, and never reset by a delegation or retry --
+    one authoritative deadline for the whole run, consumed wherever a
+    remaining-budget check is wired (currently: _repo_lightrag_query's own
+    `deadline` parameter, via _lightrag_prefetch_for_delegation).
 
     `team_name` (default None) is forwarded to _build_team -- see run_task_async's own
     docstring for the 2026-08-15 gate-scope extension this supports.
@@ -21327,6 +21410,16 @@ async def run_task_stream(
         # parameter, never guessed (see _lightrag_namespace_instruction's own
         # docstring for why a guessed value is a real, recurring failure mode).
         team._project_id = project_id
+        # Workstream B (2026-10-24): resolved ONCE, here, at run start -- never
+        # re-resolved per delegation/retry. team._execution_deadline is None
+        # for the standard profile (unbounded, unchanged default behavior).
+        _exec_profile = execution_context.resolve_profile(execution_profile)
+        team._execution_profile_name = _exec_profile.name
+        team._execution_deadline = (
+            time.monotonic() + _exec_profile.server_deadline_s
+            if _exec_profile.server_deadline_s is not None else None)
+        print(f"[team] execution_profile={_exec_profile.name!r} "
+              f"server_deadline_s={_exec_profile.server_deadline_s!r}", flush=True)
         # Phase A (durable execution/evidence backbone, runtime identity only --
         # no persistence here, see swarm/execution_context.py). run_task_stream
         # does not use Phase0 (no phase0.start_run() call exists on this path
@@ -26091,8 +26184,14 @@ async def run_task_async(
     team_name: str | None = None,
     synthesis_run: bool = False,
     solo: bool = False,
+    execution_profile: str | None = None,
 ) -> tuple[str, dict, dict | None]:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer.
+
+    `execution_profile` (Workstream B, 2026-10-24) -- see run_task_stream's
+    own docstring for the full explanation; same resolution, same
+    team._execution_deadline/team._execution_profile_name slots, same
+    "standard" (unbounded) default for every caller that omits it.
 
     `team_name` (default None) is forwarded to _build_team -- see its own docstring
     and _GATE_ENABLED_TEAMS for the 2026-08-15 gate-scope extension. None preserves
@@ -26415,6 +26514,15 @@ async def run_task_async(
         # as team._session_summary/_task above -- see the matching line + comment
         # in run_task_stream.
         team._project_id = project_id
+        # Workstream B (2026-10-24): see the matching line + comment in
+        # run_task_stream above -- same resolution, same slots.
+        _exec_profile = execution_context.resolve_profile(execution_profile)
+        team._execution_profile_name = _exec_profile.name
+        team._execution_deadline = (
+            time.monotonic() + _exec_profile.server_deadline_s
+            if _exec_profile.server_deadline_s is not None else None)
+        print(f"[team] execution_profile={_exec_profile.name!r} "
+              f"server_deadline_s={_exec_profile.server_deadline_s!r}", flush=True)
         # Same late-binding slot as the two above: the hooks read it at call time,
         # which is always after construction. None when telemetry is off, and every
         # read site is guarded on that.

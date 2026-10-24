@@ -1057,6 +1057,7 @@ async def run(request: RunRequest, http_request: Request):
         "team_name": gate_team_name,
         "synthesis_run": request.synthesis_run,
         "solo": request.solo,
+        "execution_profile": request.execution_profile,
     }
     result, tokens, clarification = await _run_worker_subprocess(http_request, worker_payload)
 
@@ -1393,6 +1394,7 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
                 "mode": stream_mode,
                 "read_only": request.read_only,
                 "team_name": gate_team_name,
+                "execution_profile": request.execution_profile,
             })
 
             async for chunk in stream_source:

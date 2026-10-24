@@ -180,6 +180,7 @@ async def _run_worker() -> dict:
             team_name=payload.get("team_name"),
             synthesis_run=payload.get("synthesis_run", False),
             solo=payload.get("solo", False),
+            execution_profile=payload.get("execution_profile"),
         )
         return {"content": content, "tokens": tokens, "clarification": clarification}
     except Exception as exc:
@@ -279,6 +280,7 @@ async def _run_stream_worker(real_stdout) -> None:
             mode=payload.get("mode", "coordinate"),
             read_only=payload.get("read_only", False),
             team_name=payload.get("team_name"),
+            execution_profile=payload.get("execution_profile"),
         ):
             print(json.dumps({"ok": True, "v": _json_safe_stream_chunk(chunk)}),
                   file=real_stdout, flush=True)

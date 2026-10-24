@@ -67,6 +67,15 @@ class RunRequest(BaseModel):
     # changes, so a paired run isolates the synthesis step.
     solo: bool = False
 
+    # Workstream B (2026-10-24): "standard" (default, None here maps to it --
+    # see swarm/execution_context.resolve_profile), "extended", or
+    # "exhaustive". None/omitted preserves today's exact unbounded behavior
+    # for every existing caller. Never silently escalated by this process --
+    # the caller (e.g. EkamApp's agno_run wrapper) decides, explicitly, per
+    # the mission's own "never silently classifying everything as
+    # exhaustive" constraint.
+    execution_profile: str | None = None
+
 class SessionMeta(BaseModel):
     session_id: str
     turn: int         # message pairs completed (message_count // 2)

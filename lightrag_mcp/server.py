@@ -191,22 +191,34 @@ async def lightrag_insert_global(text: str) -> str:
         return f"Global insert failed: {exc}"
 
 
-@mcp.tool()
-async def lightrag_query(query: str, project_id: str, mode: str = "hybrid") -> str:
-    """Query LightRAG — searches both project-specific and global memory.
+async def _run_namespaced_query(query: str, project_id: str, mode: str,
+                                 only_need_context: bool) -> str:
+    """Shared execution for lightrag_query and lightrag_query_context --
+    same namespace fan-out, same failure/empty handling (see the inline
+    comments below for why that handling exists), only the QueryParam's own
+    only_need_context flag differs. Kept as one function rather than two
+    near-duplicates so the empty/error-conflation fix only ever needs
+    maintaining in one place.
 
-    Results from the project namespace and global shared namespace are merged,
-    giving agents cross-project context alongside project-specific knowledge.
+    only_need_context=True skips LightRAG's own LLM synthesis stage
+    entirely (confirmed directly against the deployed LightRAG 1.5.4:
+    QueryParam.only_need_context, lightrag/base.py) -- measured live,
+    2026-10-24, same "ekam" index: hybrid mode went from ~100-180s
+    (synthesis) to 7.5s (context only); local mode from a similar order to
+    0.8s. The returned text is the raw retrieved entity/relationship/chunk
+    context (still real, grounded data -- not a guess), not a completed
+    answer.
 
-    Modes:
-      local  — entity-centric: finds specific files, symbols, exact syntax.
-      global — relationship-centric: finds cross-module themes and patterns.
-      hybrid — runs both and merges results (default, recommended).
-
-    Args:
-        query:      The question or search query.
-        project_id: Project namespace to query within.
-        mode:       Retrieval mode — local | global | hybrid.
+    Note (confirmed live the same day): a context-only query essentially
+    never returns the literal "[no results]" sentinel, even for a
+    deliberately nonsensical query -- retrieval returns its closest
+    top-k matches regardless of true relevance, unlike the synthesis path,
+    which can affirmatively conclude "nothing relevant" and say so. The
+    "[no results]" check below therefore still applies (harmlessly) to the
+    synthesis path and is a no-op in practice for the context-only path;
+    callers evaluating context-only results must not assume a nonempty
+    response is necessarily ON-TOPIC -- that judgment stays downstream,
+    exactly like every other retrieval-only lead in this architecture.
     """
     if mode not in ("local", "global", "hybrid", "naive", "mix"):
         return f"Invalid mode '{mode}'. Use: local, global, hybrid."
@@ -215,7 +227,8 @@ async def lightrag_query(query: str, project_id: str, mode: str = "hybrid") -> s
             _get_ready_rag(project_id),
             _get_ready_rag(_GLOBAL),
         )
-        param = QueryParam(mode=mode, user_prompt=_GROUNDING_GUARD)
+        param = QueryParam(mode=mode, user_prompt=_GROUNDING_GUARD,
+                           only_need_context=only_need_context)
 
         # Query both namespaces in parallel
         project_result, global_result = await asyncio.gather(
@@ -267,6 +280,58 @@ async def lightrag_query(query: str, project_id: str, mode: str = "hybrid") -> s
         return "[no results]"
     except Exception as exc:
         return f"Query failed: {exc}"
+
+
+@mcp.tool()
+async def lightrag_query(query: str, project_id: str, mode: str = "hybrid") -> str:
+    """Query LightRAG — searches both project-specific and global memory.
+
+    Results from the project namespace and global shared namespace are merged,
+    giving agents cross-project context alongside project-specific knowledge.
+
+    Modes:
+      local  — entity-centric: finds specific files, symbols, exact syntax.
+      global — relationship-centric: finds cross-module themes and patterns.
+      hybrid — runs both and merges results (default, recommended).
+
+    Args:
+        query:      The question or search query.
+        project_id: Project namespace to query within.
+        mode:       Retrieval mode — local | global | hybrid.
+
+    Runs full synthesis (an LLM composes a prose answer from the retrieved
+    context) -- slower (~100-180s observed) but produces a directly
+    readable answer. For a fast, raw-evidence lead instead of a composed
+    answer, use lightrag_query_context.
+    """
+    return await _run_namespaced_query(query, project_id, mode, only_need_context=False)
+
+
+@mcp.tool()
+async def lightrag_query_context(query: str, project_id: str, mode: str = "hybrid") -> str:
+    """Query LightRAG for raw retrieval context, skipping LLM synthesis.
+
+    Same namespace fan-out and modes as lightrag_query, but returns the
+    retrieved entity/relationship/chunk context directly instead of having
+    an LLM compose a prose answer from it -- measured 2026-10-24 against
+    the deployed "ekam" index: ~0.8-8.3s versus ~100-180s for the
+    synthesis path, across a symbol lookup, a relationship query, and a
+    broad discovery query. Intended for callers that want a fast lead to
+    verify themselves (e.g. a prefetch step before ordinary file search),
+    not a final answer.
+
+    The result is real retrieved data, not a guess -- but is NOT filtered
+    for topical relevance the way a synthesized answer can be (retrieval
+    returns its closest matches regardless of true relevance). Callers
+    must treat this as an unverified lead requiring their own confirmation,
+    exactly like a synthesized lightrag_query result.
+
+    Args:
+        query:      The question or search query.
+        project_id: Project namespace to query within.
+        mode:       Retrieval mode — local | global | hybrid.
+    """
+    return await _run_namespaced_query(query, project_id, mode, only_need_context=True)
 
 
 if __name__ == "__main__":
