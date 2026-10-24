@@ -12747,13 +12747,45 @@ async def _repo_lightrag_query(query: str, project_id: str,
         return "error", ""
 
     text = box["text"]
+    # lightrag_mcp/server.py's own fix (2026-10-23 hardening phase): a
+    # namespace/backend failure now returns a "Query failed:"-prefixed
+    # string distinct from the genuine "[no results]" empty sentinel (see
+    # that file's own lightrag_query for the full distinction). Check that
+    # prefix HERE, before _lightrag_result_is_usable -- which still
+    # correctly treats both as "not usable" for the gating decision (an
+    # unusable result is unusable either way) -- so this call's own
+    # `outcome` field reports the real cause instead of conflating a tool-
+    # level failure with a genuinely empty retrieval.
+    if text.startswith("Query failed:") or text.startswith("Invalid mode "):
+        return "error", text
     if not _lightrag_result_is_usable(text):
         return "empty", text
     return "usable", text
 
 
+def _any_member_eligible_for_lightrag(team) -> bool:
+    """Whether at least one actual resolved team.members[i] has a
+    repo-retrieval tool (team.members[i].tools -- the SAME canonical
+    capability source _member_capability_tools already uses for one named
+    member, never a hardcoded team/role name). The broadcast-eligibility
+    check (2026-10-23 hardening phase): a broadcast delegation has no single
+    recipient to gate on, since delegate_task_to_members resolves and
+    dispatches to every real member internally, so eligibility is "any
+    resolved member qualifies", not "the one member named in the call" --
+    there is no member_id to check at all on this path.
+    """
+    if team is None:
+        return False
+    for member in getattr(team, "members", None) or []:
+        names = {getattr(t, "name", type(t).__name__)
+                 for t in (getattr(member, "tools", []) or [])}
+        if names & _LIGHTRAG_REPO_RETRIEVAL_TOOLS:
+            return True
+    return False
+
+
 async def _lightrag_prefetch_for_delegation(
-        team, member_id: str,
+        team, member_id: "str | None",
         target: str, objective: str, evidence_required: str) -> "str | None":
     """The mandatory, deterministic LightRAG-first attempt for ONE
     delegation, or None when either this delegation is not a
@@ -12762,6 +12794,17 @@ async def _lightrag_prefetch_for_delegation(
     usable (Section 6: the existing search/read workflow always continues
     regardless either way -- this function's return value is additive
     evidence only, never a gate on normal retrieval).
+
+    `member_id=None` (2026-10-23 hardening phase) signals a broadcast
+    delegation -- teams/parallel-review.yaml's own members are already
+    instructed to use lightrag_query, confirming broadcast work genuinely
+    does repository retrieval, so excluding it entirely (the original
+    2026-10-23 behavior) was a real coverage gap, not an intentional
+    boundary. Eligibility is then "_any_member_eligible_for_lightrag", not
+    one member's capability set -- exactly one shared query either way,
+    never one per recipient, since delegate_structured_task calls this
+    function exactly once per delegate_structured_task invocation
+    regardless of how many real members a broadcast resolves to.
 
     Cached on the run-scoped `team` object, keyed by a hash of
     (target, objective, evidence_required) computed HERE -- deliberately NOT
@@ -12774,12 +12817,21 @@ async def _lightrag_prefetch_for_delegation(
     already asked about ... earlier this run, worded differently") still
     hits this cache, since completion_criteria -- the one field that can
     differ on a reworded repeat -- is deliberately excluded from this key.
+    The key does not depend on member_id, so a broadcast and a
+    (hypothetical) non-broadcast call sharing the same target/objective/
+    evidence_required within the same run correctly reuse one result --
+    consistent with "no duplicate query... when one shared query is
+    sufficient."
     """
     if team is None:
         return None
-    available = _member_capability_tools(team, member_id)
-    if not available or not (available & _LIGHTRAG_REPO_RETRIEVAL_TOOLS):
-        return None
+    if member_id is None:
+        if not _any_member_eligible_for_lightrag(team):
+            return None
+    else:
+        available = _member_capability_tools(team, member_id)
+        if not available or not (available & _LIGHTRAG_REPO_RETRIEVAL_TOOLS):
+            return None
 
     cache_key = hashlib.sha256(
         f"{target}\x00{objective}\x00{evidence_required}"
@@ -19058,14 +19110,15 @@ def _build_structured_delegation_tool(original_function, team=None):
         # prompt instruction for the member to call it themselves (see
         # _lightrag_prefetch_for_delegation's own docstring for why that already
         # failed live, across this project's entire 2026-10-23 T7-T13b battery).
-        # is_broadcast dispatches to every real member internally (no single
-        # member_id to gate on here); skipped for that shape rather than guessed
-        # against an arbitrary one of them.
-        _lightrag_context = (
-            await _lightrag_prefetch_for_delegation(
-                team, member_id, target, objective, evidence_required)
-            if not is_broadcast else None
-        )
+        # Broadcast hardening (same day, follow-up phase): is_broadcast dispatches
+        # to every real member internally, so member_id=None signals
+        # _lightrag_prefetch_for_delegation to check ANY resolved member's
+        # eligibility instead of one named member's -- one shared query either
+        # way (teams/parallel-review.yaml, the only broadcast-mode team, already
+        # instructs its members to use lightrag_query, confirming this is a real
+        # coverage gap, not a boundary).
+        _lightrag_context = await _lightrag_prefetch_for_delegation(
+            team, None if is_broadcast else member_id, target, objective, evidence_required)
         canonical_task = _build_canonical_researcher_task(
             target=target, objective=objective,
             evidence_required=evidence_required,

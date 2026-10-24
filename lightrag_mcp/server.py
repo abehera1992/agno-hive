@@ -224,13 +224,47 @@ async def lightrag_query(query: str, project_id: str, mode: str = "hybrid") -> s
             return_exceptions=True,
         )
 
+        # Namespace failures used to be silently indistinguishable from a
+        # genuine empty match: return_exceptions=True turns a raised error into
+        # an Exception OBJECT, the string-only checks below never matched it,
+        # and both branches fell through to the same "[no results]" sentinel a
+        # real empty query also returns -- a caller had no way to tell "nothing
+        # is indexed for this" from "the backend could not be reached".
+        # Collecting failures separately (bounded, type name + truncated
+        # message only -- never a raw credential/token, which a vector-store or
+        # embedding connection error does not carry) preserves every existing
+        # response shape unchanged for the two common cases (clean success,
+        # clean empty) and only adds information for the two that were
+        # previously conflated.
         parts = []
-        if isinstance(project_result, str) and project_result.strip() and project_result != "[no results]":
+        failures = []
+        if isinstance(project_result, Exception):
+            failures.append(f"project namespace ({project_id}): "
+                             f"{type(project_result).__name__}: {str(project_result)[:200]}")
+        elif isinstance(project_result, str) and project_result.strip() and project_result != "[no results]":
             parts.append(f"── Project ({project_id}) ──\n{project_result}")
-        if isinstance(global_result, str) and global_result.strip() and global_result != "[no results]":
+        if isinstance(global_result, Exception):
+            failures.append(f"global memory: "
+                             f"{type(global_result).__name__}: {str(global_result)[:200]}")
+        elif isinstance(global_result, str) and global_result.strip() and global_result != "[no results]":
             parts.append(f"── Global memory ──\n{global_result}")
 
-        return "\n\n".join(parts) if parts else "[no results]"
+        if parts:
+            result = "\n\n".join(parts)
+            if failures:
+                result += (
+                    f"\n\n── Note: {len(failures)} namespace(s) failed and are "
+                    f"NOT reflected above -- treat this result as incomplete: "
+                    f"{'; '.join(failures)} ──")
+            return result
+        if failures:
+            # No usable evidence from either namespace, and at least one of
+            # them failed outright rather than genuinely finding nothing --
+            # report it the same way the outer except below already does, so
+            # every existing caller checking for the "Query failed:" prefix
+            # classifies this correctly as a failure, not an empty result.
+            return f"Query failed: {'; '.join(failures)}"
+        return "[no results]"
     except Exception as exc:
         return f"Query failed: {exc}"
 
