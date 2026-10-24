@@ -3035,7 +3035,20 @@ def _candidate_has_route_shape(entry: dict) -> bool:
     enumerable-line count -- is nonzero), so this fallback is a real-world
     no-op there and only matters for a caller/test that constructs a
     synthetic entry without it.
+
+    T13a target selection (2026-10-24): entry["route_shape"], when present,
+    is preferred over re-deriving from `lines` here -- see the ledger
+    population site, which greps these exact same two regexes directly
+    against the file's full raw text instead of this filtered proxy.
+    Confirmed directly: EkamApp's vouchers/page.tsx imports both of its
+    hooks on one line, which _enumerable_lines' hook alternative (anchored
+    to end-of-line) cannot match, so `lines` held only an unrelated export
+    line and this function, correct by its own rule but wrong in fact,
+    rejected the one real frontend file the run had read.
     """
+    _rs = entry.get("route_shape")
+    if _rs is not None:
+        return bool(_rs)
     lines = entry.get("lines") or []
     if not lines:
         return True
@@ -16392,11 +16405,33 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 if found and _enum_path:
                     ledger = read_state.setdefault("enumerations", {})
                     if _enum_path in ledger or len(ledger) < _LEDGER_MAX_PATHS:
+                        # T13a target selection (2026-10-24): grepped against the
+                        # file's own FULL raw text (_enum_src), not the filtered
+                        # `_enum_lines` -- _enumerable_lines' hook-name alternative
+                        # only matches a name isolated at end-of-line (an
+                        # export-list/import-list-style line) and misses the far
+                        # more common single-line
+                        # `import { useGetVouchersQuery, useCreateVoucherMutation }
+                        # from '...'` shape, or inline usage like
+                        # `= useGetVouchersQuery({...})` -- both real,
+                        # grep-verifiable evidence that compare_enumerations'
+                        # OWN extractor (which greps the real file, not this
+                        # proxy) would also find. See _candidate_has_route_shape's
+                        # own updated docstring for the live incident this closes
+                        # (EkamApp's vouchers/page.tsx, confirmed directly).
+                        _path_l = _enum_path.lower()
+                        if _path_l.endswith(".py"):
+                            _route_shape = bool(_ROUTE_SHAPE_PY_RE.search(_enum_src))
+                        elif _path_l.endswith((".ts", ".tsx", ".js", ".jsx")):
+                            _route_shape = bool(_ROUTE_SHAPE_TS_RE.search(_enum_src))
+                        else:
+                            _route_shape = None
                         ledger[_enum_path] = {
                             "path": _enum_path,
                             "tool": function_name,
                             "lines": _enum_lines,
                             "count": found,
+                            "route_shape": _route_shape,
                         }
                 if found > read_state.get("max_enumerable", 0):
                     read_state["max_enumerable"] = found
