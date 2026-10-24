@@ -3289,8 +3289,19 @@ async def _computed_comparison(task: str, enumerations: dict | None,
 
 
 async def _verify_claims(content: str, hive_mcp_url: str | None,
-                         hive_mcp_tools=None) -> tuple[str, bool, bool]:
+                         hive_mcp_tools=None,
+                         liveness_path: "str | None" = None) -> tuple[str, bool, bool]:
     """Run hive-mcp's verify_claims over a draft answer.
+
+    `liveness_path` (default None, 2026-10-24, T13a.D): when provided, touches
+    this run's liveness snapshot (see _touch_liveness_snapshot's own docstring
+    for the heartbeat-coverage gap this closes) right before returning, win or
+    lose -- this call is a plain `await`, with no streaming heartbeat task of
+    its own, so without this it can run for its full budget while the
+    snapshot the external watchdog reads goes stale. Optional and defaulting
+    to None so every existing caller of this function keeps working
+    unchanged; only callers that have a liveness_path worth protecting
+    (currently _enforce_verification_invariant) need pass it.
 
     `hive_mcp_tools` is the live agno MCPTools instance for hive-mcp, when the caller
     has one. Optional and defaulting to None so every existing caller and test keeps
@@ -3431,6 +3442,8 @@ async def _verify_claims(content: str, hive_mcp_url: str | None,
             print(f"[team] verify_claims ok via {label} (attempt {n}) in "
                   f"{time.monotonic() - started:.1f}s "
                   f"({len(report)} chars, {report.strip().splitlines()[0][:48]!r})")
+            _touch_liveness_snapshot(
+                liveness_path, f"verify_claims completed via {label} ({len(report)} chars)")
             return report, "could NOT be found" in report, False
         except Exception as exc:
             last_exc = exc
@@ -3442,6 +3455,7 @@ async def _verify_claims(content: str, hive_mcp_url: str | None,
 
     print(f"[team] verify_claims unavailable after {len(attempts)} attempt(s) "
           f"({hive_mcp_url}): {type(last_exc).__name__}: {last_exc or '<no message>'}")
+    _touch_liveness_snapshot(liveness_path, "verify_claims unavailable after all attempts")
     return "", False, True
 
 
@@ -11813,6 +11827,15 @@ async def _repair_verification_failure(
 
     print(f"[team] repair ({finding.guard}): attempting one bounded correction — "
           f"{_verdict_digest(finding.report)}", flush=True)
+    # T13a.D (2026-10-24): _stream_team_run below starts its OWN fresh
+    # heartbeat task for this repair attempt, but that task's first write is
+    # always at least one full interval (30s) away -- see
+    # _touch_liveness_snapshot's own docstring for the live incident
+    # (run eb0b395636d7) this bridges. Touching here, at the exact moment the
+    # repair begins, closes the second half of the gap (the first half, the
+    # verify_claims checks just before this point, is closed inside
+    # _verify_claims itself).
+    _touch_liveness_snapshot(liveness_path, f"repair ({finding.guard}) starting")
     try:
         corrected, _retry = await _stream_team_run(
             team, _repair_prompt(task, finding), log_label=f"repair-{finding.guard}",
@@ -11864,7 +11887,7 @@ async def _enforce_verification_invariant(
         return content
 
     fab_report, fab_bad, fab_unavailable = await _verify_claims(
-        content, hive_mcp_url, hive_mcp_tools)
+        content, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path)
     if fab_bad and not fab_unavailable:
         missing = _not_found_claims(fab_report)
         if missing:
@@ -11872,7 +11895,8 @@ async def _enforce_verification_invariant(
                                       claims=missing)
 
             async def _recheck(text: str):
-                return await _verify_claims(text, hive_mcp_url, hive_mcp_tools)
+                return await _verify_claims(
+                    text, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path)
 
             return await _repair_verification_failure(
                 content, task, team, hive_mcp_url, hive_mcp_tools, liveness_path,
@@ -21919,6 +21943,76 @@ def _classify_liveness_state(now: float, activity: dict, recent_s: float) -> str
     if event_at is not None and (now - event_at) < recent_s:
         return "PARSER_WAIT"
     return "WORKFLOW_STALLED"
+
+
+def _touch_liveness_snapshot(liveness_path: "str | None", note: str) -> None:
+    """Refresh the liveness snapshot's written_at without waiting for
+    _run_heartbeat's own sleep-gated tick (T13a.D, 2026-10-24).
+
+    Root cause this closes, confirmed by reading both sides directly:
+    api/server.py's _liveness_kill_reason Tier 0 check reads ONLY
+    snapshot["written_at"] (a deliberately wall-clock time.time() value,
+    compared against the READER's own wall clock -- see that function's own
+    docstring). _run_heartbeat (above) is the only writer, and its loop is
+    `while True: await asyncio.sleep(interval); ...write...` -- the first
+    write after a task starts or restarts is always at least one full
+    `interval` (30s) away, never immediate. A plain `await`ed call with no
+    heartbeat task running at all (e.g. _verify_claims, invoked directly
+    rather than through _stream_team_run) writes nothing for its entire
+    duration; a freshly-started heartbeat task (e.g. _stream_team_run's own,
+    for a one-shot repair attempt) cannot write its OWN first snapshot until
+    that same 30s has elapsed. Live-confirmed incident (run eb0b395636d7,
+    2026-10-24): the last real heartbeat tick wrote at 09:21:59; three
+    sequential _verify_claims calls (~83s, no heartbeat task) followed by
+    the repair's own newly-started heartbeat (which needed ~30s more before
+    its first write) pushed the gap to 122s -- past the 120s threshold --
+    while the repair was demonstrably still streaming new content
+    (confirmed: "[repair-verify_claims] content: +206 chars" at 09:23:55,
+    6 seconds before the watchdog killed the worker at 09:24:01).
+
+    Deliberately touches ONLY written_at (plus this purely informational
+    `note`, for a human reading the file mid-run -- not consulted by any
+    kill-decision tier) rather than rebuilding a full snapshot from scratch:
+    this call site has no `activity` dict and none of _run_heartbeat's own
+    local state (stagnant_ticks, liveness_state, the running draft, member
+    results, ...) -- synthesizing placeholder values for those fields would
+    make the run look better than _run_heartbeat's own next real tick will
+    honestly report, which is a correctness regression disguised as a fix.
+    Reads the existing file first (if any) and preserves every other field
+    unchanged; a missing or unreadable prior file is tolerated exactly like
+    _read_liveness_snapshot's own documented posture (api/server.py) -- no
+    first real heartbeat tick is guaranteed to have landed yet when this is
+    first called, and that is not an error here either.
+
+    This writes ONLY a freshness signal -- it does not and cannot mark
+    verification or repair as complete; _liveness_kill_reason's other tiers
+    and every verification/repair return path are completely unchanged.
+    Reuses the exact atomic write _run_heartbeat already uses (temp file +
+    os.replace) so a concurrent read from the parent can never see a torn
+    write, and writes to THIS run's own liveness_path only -- the same
+    per-run file identity _run_heartbeat already relies on -- so it cannot
+    make a different run or worker appear healthy.
+
+    No-op when liveness_path is falsy, the same guard _run_heartbeat's own
+    write uses. A write failure is logged, never raised -- this is a
+    liveness convenience, never allowed to take down the call it annotates.
+    """
+    if not liveness_path:
+        return
+    try:
+        try:
+            with open(liveness_path) as f:
+                snapshot = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            snapshot = {}
+        snapshot["written_at"] = time.time()
+        snapshot["progress_note"] = note
+        tmp_path = f"{liveness_path}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp_path, liveness_path)
+    except OSError as exc:
+        print(f"[team] liveness touch warning: {exc}", flush=True)
 
 
 async def _run_heartbeat(
