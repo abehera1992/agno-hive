@@ -555,6 +555,27 @@ _MCP_TOOL_NAMES = {
     "agno_run", "agno_list_teams", "get_context_section", "list_recent_files",
     "search_knowledge_graph", "get_graph_report",
     "lightrag_query",
+    # T12+T13a (2026-10-24): three more tools registered via main.py's own
+    # _tool(...) decorator (confirmed directly: `_tool(compare_enumerations)`,
+    # `_tool(project_map)`, `_tool(verify_project)`, hive-mcp/main.py:182,189,204)
+    # but never added here -- the exact same gap this set's own comment above
+    # already describes for search_files_batch, just three more instances of
+    # it, found by diffing every _tool(...) registration against this set
+    # rather than waiting for each one to cause its own live incident.
+    # compare_enumerations is the CONFIRMED, live-demonstrated cause of a T13a
+    # fabrication (2026-10-24): the deterministic comparison guard's own
+    # disclosure text names the tool in backticks ("`compare_enumerations
+    # (left, right)` computes the difference deterministically"), and
+    # verify_claims -- lacking this entry -- grepped it against EkamApp's
+    # repo, found nothing (it is an AgnoHive-internal tool, not an EkamApp
+    # symbol), and flagged "NOT FOUND compare_enumerations <-- does not exist
+    # in the project". project_map and verify_project are not implicated in
+    # that incident -- no live report has named either -- but are added
+    # pre-emptively since they have the identical structural exposure (a
+    # real, _tool()-registered hive-mcp name that would misfire the same way
+    # the instant a model backticks it), closing the audited gap completely
+    # rather than one symptom at a time.
+    "compare_enumerations", "project_map", "verify_project",
 }
 
 # A backtick immediately preceded by a negation cue, or immediately followed by an
