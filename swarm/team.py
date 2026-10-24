@@ -3641,6 +3641,19 @@ def _verdict_digest(report: str, limit: int = 4) -> str:
             + ("…" if len(flagged) > limit else ""))
 
 
+def _flagged_lines_set(report: str) -> set[str]:
+    """The exact flagged-line set of a verify_claims report, whitespace-normalized
+    for stable set comparison. Same prefix set and line-selection idiom
+    _verdict_digest already uses, exposed separately so a caller can tell
+    "this flagged line was already present before my retry" from "my retry
+    introduced this" -- which a bare before/after `has_problems` boolean cannot
+    distinguish (see _attempt_integration_correction's own use of this).
+    """
+    return {re.sub(r"\s+", " ", ln.strip())
+            for ln in (report or "").splitlines()
+            if ln.strip().startswith(_VERDICT_FLAG_PREFIXES)}
+
+
 def _reader_facing_report(report: str) -> str:
     """Strip the model-directed imperative from a verify_claims report before it is
     shown to a human.
@@ -13571,11 +13584,48 @@ async def _attempt_integration_correction(
     _retried_fab_report, _retried_fab_bad, _ = await _verify_claims(
         retried, hive_mcp_url, hive_mcp_tools)
     if _retried_fab_bad:
+        # T12 accuracy (2026-10-24): `content` reaching this function is not
+        # always verify_claims-clean -- when Phase H's own one retry already
+        # failed to resolve a citation defect, content arrives here already
+        # wrapped in _flagged_draft_note's disclosure (see that function's
+        # own docstring). Rejecting `retried` outright on ANY verify_claims
+        # flag, with no regard for what `content` already carried in, throws
+        # away a correction that named the real integration mechanism
+        # correctly for the sole reason that an UNRELATED, PRE-EXISTING
+        # citation defect elsewhere in the text (one this retry was never
+        # asked to fix, and was explicitly told not to rewrite) survived the
+        # rewrite unchanged. Confirmed directly against a live run
+        # (run_id d44c11b88888, 2026-10-24): the SAME two findings --
+        # MISMATCH categories_api.py:63/635, BAD parties_api.py:1004 -- were
+        # already flagged in the first verify_claims draft check, before
+        # either _evidence_integrity_check or this function ever ran, and
+        # have nothing to do with BUSINESS_SERVICE_URL or either call site
+        # this retry adds.
+        #
+        # So: reject only when the retry introduces something NEW -- a
+        # flagged line that was not already in content's own pre-retry
+        # report. Never widen this into "ignore any flag that looks old";
+        # compare the actual flagged-line sets, not a count or a guess.
+        # When nothing new was introduced, adopt the correction but
+        # re-attach the SAME disclosure _flagged_draft_note already uses
+        # elsewhere for "known bad, no further retry budget" -- the
+        # citation guarantee (a failed citation must never be silently
+        # dropped) is preserved either way.
+        _pre_report, _pre_bad, _ = await _verify_claims(
+            content, hive_mcp_url, hive_mcp_tools)
+        _new_flagged = _flagged_lines_set(_retried_fab_report) - _flagged_lines_set(_pre_report)
+        if _new_flagged:
+            print(f"[team] integration-correction: retry now names the real "
+                  f"integration but introduced new verify_claims problem(s) not "
+                  f"already present in content — {sorted(_new_flagged)[:2]} — "
+                  f"keeping original content with disclosure instead of adopting",
+                  flush=True)
+            return content + finding
         print(f"[team] integration-correction: retry now names the real "
-              f"integration but failed verify_claims — "
-              f"{_verdict_digest(_retried_fab_report)} — keeping original "
-              f"content with disclosure instead of adopting", flush=True)
-        return content + finding
+              f"integration; the only verify_claims problem(s) are ones content "
+              f"already carried in unchanged ({_verdict_digest(_retried_fab_report)}) "
+              f"— adopting, with that disclosure re-attached", flush=True)
+        return retried + _flagged_draft_note(_retried_fab_report)
 
     print("[team] integration-correction: retry now names the real integration "
           "and passes verify_claims -- adopting", flush=True)
