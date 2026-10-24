@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass
 from uuid import uuid4
@@ -7806,6 +7807,59 @@ _TRUNCATED_ANSWER_NOTE = (
     "complete it did not produce a more grounded result than what is shown above. "
     "What is above may stop mid-thought or omit the final conclusion.**"
 )
+# T13a/T13b.II (2026-10-24): a DIFFERENT reason than _TRUNCATED_ANSWER_NOTE above --
+# that note means the completion lost on evidence/grounding (_adopt_retry). This one
+# means the completion WON on grounding but did not carry the required explicit
+# continuation marker (_extract_explicit_recovery_continuation), so it cannot be
+# safely identified as a continuation rather than a restatement/replacement -- kept
+# as a distinct message so a reader (and any later guard) can tell these two
+# rejection reasons apart rather than conflating them.
+#
+# Superseded the PRIOR version of this same distinction (_candidate_largely_new_
+# relative_to, built on _looks_like_repetition_loop): that function was designed to
+# detect GENERATION-LOOP repetition (the same text streaming out over and over), not
+# to prove continuation vs. restatement of a FINISHED candidate against a finished
+# draft -- using its boolean result for this decision was itself the defect this
+# replacement closes. _looks_like_repetition_loop is unchanged and still used for
+# its original purpose; only its reuse for THIS decision is removed.
+_RECOVERY_CONTINUATION_MARKER = "<<<AGNOHIVE_CONTINUATION_V1>>>"
+_RECOVERY_CONTINUATION_REJECTED_NOTE = (
+    "\n\n[Completion note: the recovery output could not be safely "
+    "identified as a continuation. The original answer has been preserved; "
+    "the answer may be incomplete.]"
+)
+
+
+def _extract_explicit_recovery_continuation(candidate: str) -> str | None:
+    """Return only text explicitly marked as new continuation.
+
+    This is a format/provenance gate, not a semantic contradiction detector:
+    it proves the model EXPLICITLY PRESENTED this text as a continuation (per
+    the marker instruction in _complete_repetition_truncated_answer's own
+    prompt), not that the text is actually consistent with what it continues.
+    Missing, duplicated, or malformed markers fail closed (return None),
+    which the caller treats as "preserve the original, do not adopt this
+    candidate" -- never as license to guess.
+    """
+    if not isinstance(candidate, str):
+        return None
+
+    marker = _RECOVERY_CONTINUATION_MARKER
+    if candidate.count(marker) != 1:
+        return None
+
+    before, after = candidate.split(marker, 1)
+
+    # The marker must be the first non-whitespace content. This prevents
+    # accepting a candidate that first emits an unmarked full answer.
+    if before.strip():
+        return None
+
+    continuation = after.strip()
+    if not continuation:
+        return None
+
+    return continuation
 
 
 async def _complete_repetition_truncated_answer(content: str, task: str, team, all_results,
@@ -7898,13 +7952,19 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
     prompt = (
         f"{task}\n\nYou already produced an answer to this task below, but generation "
         f"was cut off before it was finished -- it stops mid-answer and never reaches "
-        f"a conclusion. Continue and FINISH this exact answer: pick up from where it "
-        f"left off and complete it, ending with the actual conclusion the task asked "
-        f"for. Do NOT start over, do NOT re-research or re-delegate, and do NOT repeat "
-        f"any part of what is already written below -- use only what you already "
-        f"found (the findings below, and your own draft further down). If what you "
-        f"already found does not already contain everything needed to finish it, say "
-        f"plainly what is missing rather than guessing.\n"
+        f"a conclusion. Continue from the exact point where it stopped and finish it, "
+        f"ending with the actual conclusion the task asked for.\n\n"
+        f"Output format (required): your entire response must begin with this exact "
+        f"marker, written once, as the very first non-whitespace characters, with "
+        f"nothing before it:\n{_RECOVERY_CONTINUATION_MARKER}\n"
+        f"After the marker, write ONLY the new continuation -- do NOT restate the "
+        f"existing answer, do NOT reissue the complete answer from the start, and do "
+        f"NOT replace, retract, or revise any earlier conclusion in what you write "
+        f"after the marker. If finishing this task would actually require revising a "
+        f"conclusion already written below, do not write a contradictory replacement "
+        f"answer -- instead, write a short explanation after the marker saying what "
+        f"would need to change and why, so a human can decide, rather than silently "
+        f"overwriting it.\n"
         + _checkpoint_block(team) +
         f"\n── Your answer so far (incomplete) ──\n{content}\n── end of what you have so far ──"
     )
@@ -7974,26 +8034,49 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
               f"as incomplete", flush=True)
         return content + _TRUNCATED_ANSWER_NOTE, result
     # PHASE N / TRACK A (2026-10-03): the prompt above tells the model it is
-    # CONTINUING `content`, not replacing it ("pick up from where it left off...
-    # do NOT repeat any part of what is already written below") -- but until now,
-    # once `completed` cleared the grounding bar, it alone became the WHOLE
-    # returned answer, discarding `content` outright. Live-confirmed cost (T12):
-    # the original draft's own pre-repeat 8,784 chars (produced before the
-    # repeating segment began, and already kept internally by Z16 specifically so
-    # they would NOT be thrown away) were silently discarded this way -- the final
-    # answer named 0 of 16 routers and 0 of 31 models despite the member having
-    # found all of them, because whatever the original draft had already written
-    # about them never survived this return. Concatenating, rather than
-    # replacing, is the fix: `content` is real, already-produced text (Z16 only
-    # ever keeps the CONFIRMED-non-repeat prefix, never the repeating tail
-    # itself), so it is never correct to throw it away just because `completed`
-    # passed its own grounding check. The model was asked not to restate
-    # `content`, so the common case is a clean continuation; on the rarer case
-    # where it restates anyway (T12, T13a), the result carries some repeated
-    # text -- strictly preferable to the silent, total loss this replaces, and
-    # bounded to at most one such duplication per call (this function is
-    # one-shot, per _REPETITION_COMPLETION_FLAG above).
-    combined = f"{content.rstrip()}\n\n{completed.strip()}" if content.strip() else completed
+    # CONTINUING `content`, not replacing it -- but until now, once `completed`
+    # cleared the grounding bar, it alone became the WHOLE returned answer,
+    # discarding `content` outright. Live-confirmed cost (T12): the original
+    # draft's own pre-repeat 8,784 chars (produced before the repeating segment
+    # began, and already kept internally by Z16 specifically so they would NOT
+    # be thrown away) were silently discarded this way -- the final answer
+    # named 0 of 16 routers and 0 of 31 models despite the member having found
+    # all of them. Concatenating, rather than replacing, is the fix.
+    #
+    # T13a/T13b.II (2026-10-24): concatenation is now gated on an EXPLICIT
+    # continuation marker (_extract_explicit_recovery_continuation), not on a
+    # textual-overlap guess. The prior gate here (_candidate_largely_new_
+    # relative_to, built on _looks_like_repetition_loop) was itself the
+    # defect: that function detects GENERATION-LOOP repetition (the same text
+    # streaming out over and over), which is a different question from "did
+    # this finished candidate explicitly present itself as a continuation of
+    # this finished draft." Using its boolean result to decide continuation
+    # vs. restatement could misjudge either way. The marker the prompt above
+    # now requires is a format/provenance proof, not a semantic one -- see
+    # _extract_explicit_recovery_continuation's own docstring for exactly what
+    # it does and does not prove; that residual gap (a marked continuation can
+    # still contradict an earlier conclusion) is disclosed, not hidden, in
+    # this task's own completion report.
+    continuation = _extract_explicit_recovery_continuation(completed)
+    if continuation is None:
+        # No reliable, explicitly-marked continuation -- never interpreted as
+        # a replacement answer and never concatenated with `content`. The
+        # original draft (if any) remains the authoritative retained answer.
+        if _ends_at_a_natural_stopping_point(content):
+            print(f"[team] {truncation_reason}-truncation completion lacked the "
+                  f"required continuation marker, but the pre-repeat draft "
+                  f"already reads as complete — not disclosing it as incomplete",
+                  flush=True)
+            return content, result
+        print(f"[team] {truncation_reason}-truncation completion lacked the "
+              f"required continuation marker -- it cannot be safely identified "
+              f"as a continuation, so it is not appended or adopted — keeping "
+              f"the draft, disclosed as incomplete", flush=True)
+        # content.rstrip() on empty/falsy `content` is "", so this is still a
+        # real, non-empty disclosure even with no original draft to preserve --
+        # never an empty answer merely because the marker is missing.
+        return content.rstrip() + _RECOVERY_CONTINUATION_REJECTED_NOTE, result
+    combined = f"{content.rstrip()}\n\n{continuation}" if content.strip() else continuation
     if nested_truncation:
         print(f"[team] {truncation_reason}-truncation completion was itself cut "
               f"short by a second stall/repetition — adopting it but disclosing "
@@ -8001,8 +8084,8 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
               flush=True)
         return combined + _TRUNCATED_ANSWER_NOTE, adopted_result
     print(f"[team] {truncation_reason}-truncation completion adopted "
-          f"({len(completed):,} chars) — preserving {len(content):,} pre-repeat "
-          f"chars alongside it", flush=True)
+          f"({len(continuation):,} chars of marked continuation) — preserving "
+          f"{len(content):,} pre-repeat chars alongside it", flush=True)
     return combined, adopted_result
 
 
@@ -11747,27 +11830,326 @@ def _not_found_claims(report: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(claims))
 
 
-def _repair_prompt(task: str, finding: "_RepairFinding") -> str:
+# T13b.II (2026-10-24): the exact, fixed template _affirmed_term_absent_from_
+# citations builds its own return string from (read directly from that
+# function: f"...ASKED ABOUT A {term.upper()}, AND NOTHING CITED IS ONE...").
+# Deterministic, not a guess -- matches only this known, unchanging prefix.
+_TERM_CITATION_CLAIM_RE = re.compile(r"ASKED ABOUT A ([A-Z0-9_-]+), AND NOTHING CITED IS ONE")
+
+
+def _finding_claim_texts(finding: "_RepairFinding") -> tuple[str, ...]:
+    """The exact claim text(s) this finding flagged, for the paragraph
+    -preservation gate in _repair_verification_failure below.
+
+    T13b.II (2026-10-24): _RepairFinding.claims is NOT populated uniformly
+    across guard types -- confirmed by reading both construction sites in
+    _enforce_verification_invariant. For the verify_claims guard, `claims` IS
+    already the exact flagged identifier text (built from _not_found_claims,
+    which this function reuses as-is). For the term-citation guard
+    (_affirmed_term_absent_from_citations), `claims` is never populated at
+    all (that finding is built as `_RepairFinding(guard="term-citation",
+    report=term_note)`, claims defaulting to `()`) -- the flagged term is
+    real and present, but only inside the free-text `report`, not as a
+    structured field.
+
+    Rather than inventing a field that does not exist, or changing
+    _affirmed_term_absent_from_citations' return signature (it has 4 call
+    sites; broadening it is a bigger, riskier change than this task's own
+    scope), this recovers the term from `report`'s own fixed, deterministic
+    template via _TERM_CITATION_CLAIM_RE. If the report does not match that
+    known shape -- a future guard reusing this dataclass differently, or the
+    template changing -- this returns () and the paragraph-preservation gate
+    fails closed exactly as it does for any other missing-claim case. No
+    fabricated fallback either way.
+    """
+    if finding.claims:
+        return finding.claims
+    m = _TERM_CITATION_CLAIM_RE.search(finding.report or "")
+    if m:
+        return (m.group(1),)
+    return ()
+
+
+def _normalize_answer_unit(text: str) -> str:
+    """Normalize whitespace and Unicode for exact structural comparison."""
+    text = unicodedata.normalize("NFKC", text or "")
+    return " ".join(text.split()).casefold()
+
+
+def _answer_paragraphs(text: str) -> list[str]:
+    """Split an answer into non-empty paragraph units."""
+    return [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n", text or "")
+        if paragraph.strip()
+    ]
+
+
+def _preserves_unaffected_paragraphs(
+    original: str, candidate: str, flagged_claims: tuple[str, ...]) -> bool:
+    """Fail closed if the repair drops, reorders, duplicates, or supplements
+    original paragraphs unrelated to the flagged claim(s), OR if a claim's
+    own repair scope is ambiguous.
+
+    T13b.V (2026-10-24): replaces the T13b.IV multiset/Counter-budget version
+    with a positional SEQUENCE-ALIGNMENT check -- the two are not equivalent,
+    and T13b.IV's own "total leftover count <= number of repairable slots"
+    rule is deliberately removed as an independent acceptance path. That
+    budget could be satisfied by an unrelated paragraph occupying a
+    repairable slot it has no connection to, as long as the TOTAL count
+    happened to fit -- order and per-slot assignment were never checked, only
+    an aggregate count. This version walks `candidate_paragraphs` strictly
+    left to right against the ORIGINAL's own paragraph order, so a candidate
+    paragraph can only ever be accounted for in one of two ways: (a) it is
+    the next required unaffected paragraph, in order, with matching
+    normalized text, or (b) it falls inside the specific gap bounded by the
+    repairable slot(s) that sit between two unaffected anchors (or before the
+    first / after the last) in the ORIGINAL -- never any other gap, and never
+    more paragraphs than that gap has slots for.
+
+    Algorithm:
+      1. Resolve every flagged claim to exactly one original paragraph (via
+         `_normalize_answer_unit`, reused unchanged) -- zero or multiple
+         matches is ambiguous and fails closed, exactly as T13b.III/IV.
+      2. Partition the ORIGINAL paragraph indices into unaffected "anchors"
+         (in their original order) and "gaps" of repairable slot indices:
+         gap[0] is before the first anchor, gap[k] is between anchor k-1 and
+         anchor k, and the trailing gap is after the last anchor.
+      3. Walk the candidate left to right, one gap/anchor at a time. For a
+         gap with N slots immediately followed by an anchor, search for the
+         anchor's own exact normalized text within a window of at most N
+         candidate paragraphs ahead of the current position -- the ONLY
+         deterministic, non-semantic way to tell how many of this gap's N
+         slots the candidate actually filled (0..N), since content meaning is
+         never consulted. If the anchor's text is not found within that
+         bounded window, the candidate cannot be unambiguously aligned and
+         this returns False. Everything strictly before the found anchor,
+         within the window, is checked 1:1 against this gap's own slots, in
+         order; anything beyond the window is never implicitly absorbed by
+         this gap, so a gap can never swallow more candidate paragraphs than
+         it has slots for.
+      4. The trailing gap (after the last anchor) absorbs whatever remains,
+         still capped at its own slot count -- any leftover beyond that cap
+         is unaccounted for and rejected.
+      5. After the walk, every candidate paragraph must have been consumed
+         by exactly one anchor match or one gap slot; a candidate paragraph
+         that is leftover is unaccounted for and rejected.
+      6. At least one repairable slot must have actually changed (its
+         position held different text, or was left empty/removed) --
+         otherwise this is a no-op, rejected exactly as T13b.III/IV already
+         required.
+
+    Documented trade-off, stated rather than hidden: when a gap contains MORE
+    THAN ONE repairable slot (two adjacent flagged paragraphs with no
+    unaffected paragraph between them), this assigns the candidate's
+    gap-filler paragraphs to those slots by POSITION ONLY, left to right --
+    never by content similarity, which would be the fabricated semantic
+    matching this task explicitly rules out. A multi-slot gap whose filler
+    count is less than its slot count is read as "the later slot(s) in this
+    gap were removed," not "which specific slot changed" -- a deterministic,
+    stated convention, not a guess about meaning.
+
+    This remains deliberately conservative and is not semantic claim
+    equivalence -- it cannot tell whether a changed paragraph still means the
+    same thing in different words, only whether the original's own sequence
+    and multiplicity survived verbatim outside the uniquely-identified
+    repairable slots.
+    """
+    original_paragraphs = _answer_paragraphs(original)
+    candidate_paragraphs = _answer_paragraphs(candidate)
+
+    if not original_paragraphs or not candidate.strip():
+        return False
+
+    normalized_claims = tuple(
+        normalized
+        for claim in flagged_claims
+        if (normalized := _normalize_answer_unit(claim))
+    )
+    if not normalized_claims:
+        # No exact claim text to attribute a change to -- fail closed, same
+        # principle _not_found_claims' own extraction discipline uses
+        # elsewhere in this file: an undeterminable comparison must not
+        # default to trust.
+        return False
+
+    normalized_original = tuple(
+        _normalize_answer_unit(paragraph) for paragraph in original_paragraphs
+    )
+    normalized_candidate = tuple(
+        _normalize_answer_unit(paragraph) for paragraph in candidate_paragraphs
+    )
+
+    # A flagged claim may authorize changing exactly one paragraph. If it
+    # occurs in zero or more than one original paragraph, its repair scope
+    # is ambiguous -- fail closed rather than permitting a broad rewrite or
+    # guessing which occurrence was meant. Unchanged from T13b.III/IV.
+    repairable_indices: set[int] = set()
+    for claim in normalized_claims:
+        matching_indices = [
+            index for index, paragraph in enumerate(normalized_original)
+            if claim in paragraph
+        ]
+        if len(matching_indices) != 1:
+            return False
+        repairable_indices.add(matching_indices[0])
+
+    unaffected_indices = [
+        index for index in range(len(original_paragraphs))
+        if index not in repairable_indices
+    ]
+
+    # gaps[g] holds the repairable slot indices (in original order) that sit
+    # strictly between unaffected anchor g-1 and anchor g; gaps[0] is before
+    # the first anchor; the final element is the trailing gap after the last
+    # anchor. len(gaps) == len(unaffected_indices) + 1 always.
+    gaps: list[list[int]] = [[] for _ in range(len(unaffected_indices) + 1)]
+    anchor_cursor = 0
+    for index in range(len(original_paragraphs)):
+        if index in repairable_indices:
+            gaps[anchor_cursor].append(index)
+        else:
+            anchor_cursor += 1
+
+    cand_pos = 0
+    changed_any = False
+    for gap_index, slot_indices in enumerate(gaps):
+        max_take = len(slot_indices)
+        has_anchor = gap_index < len(unaffected_indices)
+
+        if has_anchor:
+            anchor_index = unaffected_indices[gap_index]
+            anchor_text = normalized_original[anchor_index]
+            window_end = min(cand_pos + max_take, len(normalized_candidate) - 1)
+            found_at = None
+            for probe in range(cand_pos, window_end + 1):
+                if normalized_candidate[probe] == anchor_text:
+                    found_at = probe
+                    break
+            if found_at is None:
+                # The anchor cannot be located within the only window this
+                # gap's own slot count permits -- the candidate cannot be
+                # unambiguously aligned (missing anchor, reordered anchor, a
+                # slot absorbing more than its share, or an unaccounted
+                # extra paragraph). Reject rather than search further.
+                return False
+            take = found_at - cand_pos
+        else:
+            # Trailing gap: no anchor follows, so it absorbs whatever
+            # remains, still capped at its own slot count.
+            take = min(max_take, len(normalized_candidate) - cand_pos)
+
+        for offset in range(take):
+            slot_index = slot_indices[offset]
+            if normalized_candidate[cand_pos + offset] != normalized_original[slot_index]:
+                changed_any = True
+        if take < max_take:
+            # Slot(s) beyond what the candidate supplied in this gap were
+            # removed entirely -- a valid repair outcome, and a change.
+            changed_any = True
+        cand_pos += take
+
+        if has_anchor:
+            cand_pos += 1  # consume the anchor paragraph itself
+
+    # Every candidate paragraph must have been consumed by an anchor match
+    # or a gap's own slots -- anything left over is unaccounted for.
+    if cand_pos != len(normalized_candidate):
+        return False
+
+    # At least one repairable slot must have actually changed; a candidate
+    # that reproduces every slot's own original text, in place, is a no-op.
+    return changed_any
+
+
+def _repair_prompt(task: str, finding: "_RepairFinding", content: str = "",
+                    team=None) -> str:
     """The retry prompt, built from the verifier's OWN concrete findings -- never a
     generic "fix the answer" (Phase H's own explicit requirement). Naming the exact
     flagged identifiers mirrors this file's existing citation-correction retry
     wording (_verified_answer's own missing_symbols instruction) rather than
-    inventing a new phrasing."""
+    inventing a new phrasing.
+
+    T13b.I (2026-10-24): `content` and `team` added as trailing, defaulted
+    params -- appended after the original two, not inserted between them, and
+    both optional -- specifically so tests/test_phase_h_guard_coupled_repair.py's
+    existing 2-positional-arg calls (`_repair_prompt(task, finding)`) keep
+    their original calling shape and behavior unmodified; this fix does not
+    touch tests per its own constraints. `content`, when given (the real call
+    site in _repair_verification_failure below always gives it), carries the
+    EXISTING answer, and the prompt asks for a targeted edit of it rather
+    than "answer the original question again" with nothing to anchor to.
+
+    Root cause this closes, confirmed by reading the prior version of this
+    function: it took only `task` and `finding` -- the model was never shown
+    its own already-produced answer at all, so "answer again" was its only
+    option, not a choice it made. Live incident (T13a.F, run kmzmug0sa): the
+    already-correct, already-adopted 4-gap conclusion (adopted at 12:30:45)
+    was discarded by 3 fresh re-delegations the repair triggered
+    (12:32:26/46/13:13), producing a new, wrong, contradictory answer -- not
+    because the correct conclusion was unconfirmed, but because the repair
+    prompt gave the model no way to tell it was revising rather than
+    starting over.
+
+    Mirrors _complete_repetition_truncated_answer's own prompt shape (task +
+    explicit "do not start over" + the existing text quoted below it) -- the
+    same instruction-pattern this file already uses successfully for a
+    different reason (finishing a truncated answer without re-researching).
+    Here it is reused for correcting a flagged claim without re-answering
+    from scratch. This is a prompt-only change: it does not alter what
+    counts as a passing recheck (_repair_verification_failure's own
+    recheck(corrected) call, unchanged) or which findings are repair
+    -eligible (_not_found_claims/_enforce_verification_invariant, unchanged)
+    -- it only changes what the model sees while attempting the correction.
+    """
     if finding.claims:
         named = ", ".join(finding.claims[:8])
-        return (
+        header = (
             f"{task}\n\nIMPORTANT: verification ({finding.guard}) checked your "
-            f"previous answer against the repository and could not find these exact "
-            f"claims: {named}. Do not repeat any of them. Answer the original "
-            f"question again -- if something you previously claimed turns out not "
-            f"to exist, say so plainly instead of restating it, and only state "
-            f"something as fact once you have re-checked it with a tool this run."
+            f"previous answer against the repository and could not find these "
+            f"exact claims: {named}. Do not repeat any of them."
+        )
+        if not content:
+            return (
+                f"{header} Answer the original question again -- if something "
+                f"you previously claimed turns out not to exist, say so plainly "
+                f"instead of restating it, and only state something as fact "
+                f"once you have re-checked it with a tool this run."
+            )
+        return (
+            f"{header} Do NOT start over, do NOT re-research or re-delegate, "
+            f"and do NOT regenerate the whole answer from scratch. Make the "
+            f"smallest edit to your existing answer below that fixes this: "
+            f"remove or correct only the flagged claim(s) -- if something you "
+            f"previously claimed turns out not to exist, say so plainly in its "
+            f"place -- and leave every other conclusion in your existing "
+            f"answer exactly as it already stands, since those were not "
+            f"flagged and remain correct. Only change text connected to the "
+            f"flagged claim(s) above.\n"
+            + _checkpoint_block(team) +
+            f"\n── Your existing answer (keep everything below except the "
+            f"flagged claim(s)) ──\n{content}\n── end of existing answer ──"
+        )
+    header = (
+        f"{task}\n\nIMPORTANT: verification ({finding.guard}) flagged your "
+        f"previous answer as unconfirmed:\n{finding.report.strip()}"
+    )
+    if not content:
+        return (
+            f"{header}\n\nAnswer the original question again, addressing "
+            f"exactly this finding -- if the claim does not hold up, say so "
+            f"plainly instead of restating it."
         )
     return (
-        f"{task}\n\nIMPORTANT: verification ({finding.guard}) flagged your previous "
-        f"answer as unconfirmed:\n{finding.report.strip()}\n\nAnswer the original "
-        f"question again, addressing exactly this finding -- if the claim does not "
-        f"hold up, say so plainly instead of restating it."
+        f"{header}\n\nDo NOT start over, do NOT re-research or re-delegate, "
+        f"and do NOT regenerate the whole answer from scratch. Make the "
+        f"smallest edit to your existing answer below that addresses exactly "
+        f"this finding -- if the claim does not hold up, say so plainly in "
+        f"its place -- and leave every other, unaffected conclusion in your "
+        f"existing answer exactly as it already stands.\n"
+        + _checkpoint_block(team) +
+        f"\n── Your existing answer (keep everything below except what this "
+        f"finding flagged) ──\n{content}\n── end of existing answer ──"
     )
 
 
@@ -11838,8 +12220,8 @@ async def _repair_verification_failure(
     _touch_liveness_snapshot(liveness_path, f"repair ({finding.guard}) starting")
     try:
         corrected, _retry = await _stream_team_run(
-            team, _repair_prompt(task, finding), log_label=f"repair-{finding.guard}",
-            liveness_path=liveness_path)
+            team, _repair_prompt(task, finding, content=content, team=team),
+            log_label=f"repair-{finding.guard}", liveness_path=liveness_path)
     except Exception as exc:  # noqa: BLE001
         print(f"[team] repair ({finding.guard}) failed: {exc}", flush=True)
         return _verification_failed_answer(content, finding)
@@ -11857,6 +12239,43 @@ async def _repair_verification_failure(
         # (still flagged) -- either way, do not ship it as the answer.
         return _verification_failed_answer(content, finding,
                                             repaired_report=report2 if still_bad else None)
+
+    # T13b.II (2026-10-24): the narrow recheck above only confirms the SPECIFIC
+    # flagged claim is resolved -- it says nothing about whether `corrected`
+    # otherwise preserved `content`'s own unrelated, already-correct
+    # conclusions, or discarded/contradicted them by regenerating the whole
+    # answer instead of making the scoped edit _repair_prompt now explicitly
+    # asks for. Confirmed gap (prior review of this exact function): no
+    # existing check here compares `corrected` against `content` for that at
+    # all. _adopt_retry/_more_grounded are deliberately NOT used for this --
+    # they require an original `result` object for `content` to compare read
+    # counts against, which this function never receives (its signature has
+    # none), so wiring them in would silently always "adopt"
+    # (_count_read_calls(None) returns -1, "undeterminable", and
+    # _more_grounded treats that as pass) -- a no-op dressed up as a
+    # safeguard, not real protection.
+    #
+    # Superseded the PRIOR version of this same check (_candidate_largely_new_
+    # relative_to, built on _looks_like_repetition_loop -- designed for
+    # GENERATION-LOOP repetition detection, not for proving a repair
+    # preserved unrelated prose). Replaced with a structural, paragraph-level
+    # preservation gate: every ORIGINAL paragraph not containing one of the
+    # finding's own flagged claims must survive verbatim (normalized) in
+    # `corrected`. This is conservative and purely structural -- it is not
+    # semantic claim-entailment proof, and it intentionally may reject a
+    # legitimate repair that restructures unrelated prose, or that changes a
+    # paragraph covering multiple claims where only one was flagged. That is
+    # the accepted, documented trade-off: preferring a disclosed, preserved
+    # original over silently losing an unrelated conclusion.
+    flagged_claims = _finding_claim_texts(finding)
+    if not _preserves_unaffected_paragraphs(content, corrected, flagged_claims):
+        print(f"[team] repair ({finding.guard}): recheck passed but the "
+              f"correction does not verifiably preserve every unrelated "
+              f"paragraph of the existing answer (flagged claims recovered: "
+              f"{flagged_claims!r}) -- not safely distinguishable from one "
+              f"that discarded unaffected conclusions — keeping the "
+              f"original, disclosed as unverified", flush=True)
+        return _verification_failed_answer(content, finding, repaired_report=report2)
 
     print(f"[team] repair ({finding.guard}): recheck passed — releasing repaired "
           f"answer", flush=True)
