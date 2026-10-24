@@ -771,11 +771,91 @@ class _UnavailableToolMixin:
         return calls
 
 
-class OllamaToolFix(_UnavailableToolMixin, _ForcedTextDirectiveMixin, _ToolCallRecoveryMixin, Ollama):
+class _BatchToolBudgetMixin:
+    """Stop a model turn's ENTIRE batch of tool calls from silently
+    outrunning its own tool_call_limit (2026-10-24, Workstream B follow-up).
+
+    Root cause, confirmed by reading the installed agno source directly
+    (agno/models/base.py, Model.run_function_calls / arun_function_calls):
+    both take function_calls: List[FunctionCall] -- every call the model
+    requested in ONE turn -- and iterate the whole list in a plain for-loop,
+    refusing (via create_tool_call_limit_error_result, silently -- no hook
+    fires for a refused call) only the calls that individually push
+    current_function_call_count past function_call_limit. This repo's own
+    tool_hooks-based budget guard (swarm/team.py's _make_tool_budget_guard_hook)
+    wraps the INDIVIDUAL function each surviving call reaches -- it cannot
+    act until agno has already decided, for THIS call, to run it, which is
+    too late to stop other calls already present in the SAME list from also
+    running past the point the guard would want to intervene. Raising the
+    guard's own reserve margin only shrinks the window; it cannot close it
+    for an arbitrarily large batch.
+
+    This mixin closes the gap at its real source: before delegating to
+    agno's own implementation, it checks whether THIS WHOLE BATCH would
+    cross function_call_limit at all (current_function_call_count +
+    len(function_calls) > function_call_limit) -- not whether any
+    individual call would -- and if so, sets self.tool_choice = "none" AND
+    self._tool_choice = "none" (same two attributes _force_text_only
+    already sets, see swarm/team.py, so VLLMToolFix._sanitize_forced_text
+    still recognizes the forcing as deliberate) BEFORE any call in the
+    batch runs. This cannot prevent agno's own per-call refusal of calls
+    that individually exceed the limit -- that refusal is correct, existing
+    behavior (an honest, typed "the tool budget is spent" result via
+    create_tool_call_limit_error_result, never silent) -- it only guarantees
+    the model is told to stop asking BEFORE it can make the mistake again,
+    regardless of how many calls landed in one turn.
+
+    Delegates everything else to super() unchanged via `yield from` /
+    `async for ... yield` -- generator methods (confirmed via
+    inspect.isgeneratorfunction/isasyncgenfunction on the installed agno
+    package), not plain coroutines, so a bare `return super().method(...)`
+    would not work. No installed agno file is modified; this only
+    intercepts calls made THROUGH this process's own model subclass.
+    """
+
+    def _note_batch_overrun(self, function_calls, current_function_call_count,
+                             function_call_limit) -> None:
+        if function_call_limit is None:
+            return
+        if current_function_call_count + len(function_calls) <= function_call_limit:
+            return
+        self.tool_choice = "none"
+        self._tool_choice = "none"
+        print(f"[tool_fix] batch of {len(function_calls)} tool call(s) at count "
+              f"{current_function_call_count}/{function_call_limit} would cross "
+              f"the limit -- forcing tool_choice=none before any of them run "
+              f"(agno's own per-call refusal still applies to whichever calls "
+              f"individually exceed the limit)", flush=True)
+
+    def run_function_calls(self, function_calls, function_call_results,
+                            additional_input=None, current_function_call_count=0,
+                            function_call_limit=None, **kwargs):
+        self._note_batch_overrun(function_calls, current_function_call_count,
+                                  function_call_limit)
+        yield from super().run_function_calls(
+            function_calls, function_call_results, additional_input=additional_input,
+            current_function_call_count=current_function_call_count,
+            function_call_limit=function_call_limit, **kwargs)
+
+    async def arun_function_calls(self, function_calls, function_call_results,
+                                   additional_input=None, current_function_call_count=0,
+                                   function_call_limit=None, **kwargs):
+        self._note_batch_overrun(function_calls, current_function_call_count,
+                                  function_call_limit)
+        async for event in super().arun_function_calls(
+                function_calls, function_call_results, additional_input=additional_input,
+                current_function_call_count=current_function_call_count,
+                function_call_limit=function_call_limit, **kwargs):
+            yield event
+
+
+class OllamaToolFix(_UnavailableToolMixin, _ForcedTextDirectiveMixin,
+                     _ToolCallRecoveryMixin, _BatchToolBudgetMixin, Ollama):
     pass
 
 
-class VLLMToolFix(_UnavailableToolMixin, _ForcedTextDirectiveMixin, _ToolCallRecoveryMixin, OpenAILike):
+class VLLMToolFix(_UnavailableToolMixin, _ForcedTextDirectiveMixin,
+                   _ToolCallRecoveryMixin, _BatchToolBudgetMixin, OpenAILike):
     """Same recovery as OllamaToolFix, for the vLLM/OpenAILike path — see this
     module's own docstring for the live incident (2026-08-15) that motivated
     porting it here rather than leaving OllamaToolFix as Ollama-only."""

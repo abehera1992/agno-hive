@@ -3508,7 +3508,7 @@ _CORRECT_LINE_RE = re.compile(
     r"it actually appears at line\(s\) ([\d, ]+)"
 )
 
-def _resolve_tool_call_limit(team_name: str | None, role_name: str) -> int:
+def _resolve_tool_call_limit(team_name: str | None, role_name: str, bonus: int = 0) -> int:
     """This (team, role)'s real tool-call budget, DB override first.
 
     Added 2026-08-21. `swarm/team.py`'s Team(...) construction passed
@@ -3525,13 +3525,20 @@ def _resolve_tool_call_limit(team_name: str | None, role_name: str) -> int:
         (see RolePolicy's own docstring).
     `team_name` is also `str | None`: the request.agents path builds a team with no
     name at all, so that is checked before the lookup rather than passed through.
+
+    `bonus` (default 0, 2026-10-24, Workstream B follow-up): added to whatever
+    the DB-override-or-config lookup resolves, so ExecutionProfile.
+    tool_call_limit_bonus (extended=15, exhaustive=40) genuinely raises the
+    real, agno-enforced ceiling for a bounded-time run that needs more room
+    to explore, rather than existing only as an unread dataclass field. Every
+    existing caller that omits it gets byte-identical behavior.
     """
     if not team_name:
-        return config.tool_call_limit
+        return config.tool_call_limit + bonus
     policy = model_routing.get_role_policy(team_name, role_name)
     if policy is None or policy.tool_call_limit is None:
-        return config.tool_call_limit
-    return policy.tool_call_limit
+        return config.tool_call_limit + bonus
+    return policy.tool_call_limit + bonus
 
 
 _MAX_HANDED_OVER_LOCATIONS = 4
@@ -14689,6 +14696,7 @@ def _force_text_only(agent, team=None) -> None:
 
 def _make_tool_budget_guard_hook(
     team_name: str | None, activity: dict | None = None, role: str | None = None,
+    tool_call_limit_bonus: int = 0,
 ):
     """Force an answer just BEFORE tool_call_limit is reached, rather than trying to
     react to the refusal after it (2026-08-21).
@@ -14742,7 +14750,7 @@ def _make_tool_budget_guard_hook(
         who = role or getattr(agent, "name", None) or "Coordinator"
         counts[who] = counts.get(who, 0) + 1
         count = counts[who]
-        limit = _resolve_tool_call_limit(team_name, who)
+        limit = _resolve_tool_call_limit(team_name, who, bonus=tool_call_limit_bonus)
 
         # Low-noise permanent diagnostic (2026-08-21): the first call per role, then
         # every 10th. Added after this guard demonstrably did NOT fire on a live run
@@ -14793,6 +14801,72 @@ def _make_tool_budget_guard_hook(
         )
 
     return _tool_budget_guard_hook
+
+
+def _make_deadline_guard_hook():
+    """Time-based analog of _make_tool_budget_guard_hook, above: forces an
+    agent (or the coordinator) to text-only once this RUN's execution-profile
+    deadline is within its own completion_reserve_s of expiring -- the actual
+    enforcement point for ExecutionProfile.completion_reserve_s (2026-10-24,
+    Workstream B follow-up). Defining the field on ExecutionProfile and
+    setting team._execution_deadline/_execution_reserve_s does not, by
+    itself, stop exploration early enough to leave room for synthesis; this
+    hook is what does.
+
+    ONE SHARED instance, added once to the shared `tool_hooks` list (not
+    per-role, unlike the tool-budget guard, which needs a distinct counter
+    per role) -- the deadline itself is one value for the whole run, so one
+    hook checking it is correct and sufficient; `fired: set[str]` still
+    tracks per-identity ("who") so every role that makes a tool call after
+    the reserve window is reached gets its own forcing message exactly once,
+    not just the first role to do so after the window opens. Without that,
+    a run with the coordinator AND an active member both still working would
+    force only whichever one happened to make the next call, leaving the
+    other to keep spending budget unaware anything changed.
+
+    No-op (team._execution_deadline is None) for the standard profile --
+    exactly the same unbounded default behavior as before this hook existed.
+    Reads team._execution_deadline/_execution_reserve_s fresh on every call
+    rather than capturing them at hook-construction time, since those
+    attributes are set on `team` AFTER the hooks list is built (see
+    run_task_async/run_task_stream's own construction order) -- capturing at
+    construction time would always see the pre-assignment default (unset).
+    """
+    fired: set[str] = set()
+
+    async def _deadline_guard_hook(function_name, function, args, agent=None,
+                                    team=None, run_context=None):
+        result = await function(**args)
+        if team is None:
+            return result
+        deadline = getattr(team, "_execution_deadline", None)
+        reserve = getattr(team, "_execution_reserve_s", None)
+        if deadline is None or reserve is None:
+            return result
+        who = getattr(agent, "name", None) or "Coordinator"
+        if who in fired:
+            return result
+        remaining = deadline - time.monotonic()
+        if remaining > reserve:
+            return result
+        fired.add(who)
+        _force_text_only(agent, team)
+        print(f"[team] {who}: execution deadline reserve reached "
+              f"({remaining:.0f}s remaining, reserve={reserve:.0f}s) -- "
+              f"forcing text-only before the deadline itself expires",
+              flush=True)
+        return (
+            f"{result}\n\n---\nEXECUTION DEADLINE APPROACHING: only "
+            f"{remaining:.0f}s remain before this run's deadline, inside the "
+            f"{reserve:.0f}s reserved for writing the final answer. Do NOT "
+            f"attempt another tool call -- there is no time left to use its "
+            f"result.\n\nWRITE THE ANSWER ITSELF NOW, from what has already "
+            f"been gathered. A PARTIAL answer is the expected outcome here "
+            f"and is worth far more than a complete-sounding one. End with a "
+            f"short list of what you could not determine."
+        )
+
+    return _deadline_guard_hook
 
 
 def _bump_consecutive_stub_and_maybe_force_text_only(
@@ -19574,6 +19648,7 @@ def _build_team(
     task: str | None = None,
     team_name: str | None = None,
     project_id: str | None = None,
+    tool_call_limit_bonus: int = 0,
 ) -> Team:
     """Build a coordinator Team from agent specs (or the default Coder+Reviewer), sharing the
     already-connected `mcp_list`. Factored out of run_task_async / run_task_stream so the same
@@ -19593,7 +19668,14 @@ def _build_team(
     `project_id` (default None) is forwarded to each spec-based member agent's own
     construction (see make_agent_from_spec's own docstring) -- unlike `task`/`instructions`,
     the shared `instructions` list passed to Team(...) only reaches the coordinator, never
-    member agents, so this has to be threaded separately."""
+    member agents, so this has to be threaded separately.
+    `tool_call_limit_bonus` (default 0, 2026-10-24) -- added to every role's resolved
+    tool_call_limit (coordinator AND members) via _resolve_tool_call_limit's own
+    `bonus` parameter; the caller (run_task_async/run_task_stream) must resolve this
+    from the execution profile BEFORE calling _build_team, since agno's own
+    tool_call_limit is fixed at agent-construction time and cannot be changed
+    afterward -- see those two callers' own comments for why the profile is
+    therefore resolved earlier than team._execution_deadline's own assignment."""
     # One cache per run, shared by the coordinator AND every member agent (not just
     # the coordinator) -- see _make_read_cache_tool_hook's docstring for why both of
     # those are load-bearing, not incidental. The interception hook (Phase 9a) is
@@ -19726,6 +19808,14 @@ def _build_team(
         # a per-role instance appended to the per-role tail would sit INNER
         # to read_cache_tool_hook and get silently skipped on a cache hit.
         _make_required_tool_clearing_hook(_required_tool_states),
+        # Workstream B follow-up (2026-10-24): one shared instance, same
+        # convention as _make_required_tool_clearing_hook just above, for the
+        # same reason -- the deadline/reserve it checks is one run-wide value,
+        # not something that needs a separate counter per role the way the
+        # tool-budget guard does. See _make_deadline_guard_hook's own
+        # docstring for why "who" tracking still makes every role get its own
+        # forcing message once the reserve window opens, not just the first.
+        _make_deadline_guard_hook(),
     ]
 
     def _hooks_for(role: str) -> list:
@@ -19762,7 +19852,8 @@ def _build_team(
             "required": _policy_required, "fired_for": set(),
         })
         return tool_hooks + [
-            _make_tool_budget_guard_hook(team_name, activity, role=role),
+            _make_tool_budget_guard_hook(team_name, activity, role=role,
+                                          tool_call_limit_bonus=tool_call_limit_bonus),
         ]
 
     if agent_specs:
@@ -19924,7 +20015,8 @@ def _build_team(
         # The Coordinator's OWN budget, DB override honoured (2026-08-21) -- this was
         # config.tool_call_limit unconditionally, which is why engineering's
         # Coordinator=60 row never took effect. See _resolve_tool_call_limit.
-        tool_call_limit=_resolve_tool_call_limit(team_name, "Coordinator"),
+        tool_call_limit=_resolve_tool_call_limit(
+            team_name, "Coordinator", bonus=tool_call_limit_bonus),
         tool_hooks=_hooks_for("Coordinator"),
     )
     # Expose the delegation hook's closure-local counter on the team object so
@@ -21384,10 +21476,18 @@ async def run_task_stream(
         # actually gained a name.
         await _sync_tool_registry(mcp_list, skill_catalog)
         _hive_for_targets = _pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)
+        # Workstream B follow-up (2026-10-24): resolved HERE, before _build_team,
+        # not after it returns -- agno's own tool_call_limit is fixed at
+        # agent-construction time (confirmed by reading agno/models/base.py: it
+        # is read once into the Agent/Team object, never re-read per call), so
+        # the bonus can only take effect if it reaches _build_team itself. See
+        # the matching, later-executed resolve_profile call below, which reuses
+        # THIS same object rather than resolving twice.
+        _exec_profile = execution_context.resolve_profile(execution_profile)
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
             read_only=read_only, skill_catalog=skill_catalog, task=task, team_name=team_name,
-            project_id=project_id,
+            project_id=project_id, tool_call_limit_bonus=_exec_profile.tool_call_limit_bonus,
         )
         # What earlier turns of this session already established, for the chain-
         # degradation check at answer time. See _chain_contradictions.
@@ -21410,16 +21510,28 @@ async def run_task_stream(
         # parameter, never guessed (see _lightrag_namespace_instruction's own
         # docstring for why a guessed value is a real, recurring failure mode).
         team._project_id = project_id
-        # Workstream B (2026-10-24): resolved ONCE, here, at run start -- never
-        # re-resolved per delegation/retry. team._execution_deadline is None
-        # for the standard profile (unbounded, unchanged default behavior).
-        _exec_profile = execution_context.resolve_profile(execution_profile)
+        # Workstream B (2026-10-24): _exec_profile was already resolved ABOVE,
+        # before _build_team (see that call's own comment) -- reused here, not
+        # re-resolved, so the bonus baked into the agents' real tool_call_limit
+        # and the deadline/reserve below always describe the SAME profile.
+        # Never re-resolved per delegation/retry. team._execution_deadline is
+        # None for the standard profile (unbounded, unchanged default
+        # behavior).
         team._execution_profile_name = _exec_profile.name
+        team._tool_call_limit_bonus = _exec_profile.tool_call_limit_bonus
         team._execution_deadline = (
             time.monotonic() + _exec_profile.server_deadline_s
             if _exec_profile.server_deadline_s is not None else None)
+        # Read by _make_deadline_guard_hook (shared tool_hooks list, below) --
+        # None whenever the deadline itself is None (standard profile), so the
+        # guard is a true no-op rather than firing on a bogus comparison.
+        team._execution_reserve_s = (
+            _exec_profile.completion_reserve_s
+            if team._execution_deadline is not None else None)
         print(f"[team] execution_profile={_exec_profile.name!r} "
-              f"server_deadline_s={_exec_profile.server_deadline_s!r}", flush=True)
+              f"server_deadline_s={_exec_profile.server_deadline_s!r} "
+              f"completion_reserve_s={team._execution_reserve_s!r} "
+              f"tool_call_limit_bonus={_exec_profile.tool_call_limit_bonus!r}", flush=True)
         # Phase A (durable execution/evidence backbone, runtime identity only --
         # no persistence here, see swarm/execution_context.py). run_task_stream
         # does not use Phase0 (no phase0.start_run() call exists on this path
@@ -22433,8 +22545,14 @@ def _record_stream_artifacts(team, out: dict) -> None:
                 thin_report=_THIN_REPORT_MARKER in content,
                 # Both read from state the runtime already maintains for its own
                 # purposes -- no new tracker, and nothing here is written back.
+                # bonus included (2026-10-24) so this telemetry reports the REAL
+                # effective limit this run's agents were constructed with, not
+                # the pre-bonus one -- team._tool_call_limit_bonus is 0 for the
+                # standard profile, so this is unchanged for every run that
+                # doesn't opt into extended/exhaustive.
                 tool_call_limit=_resolve_tool_call_limit(
-                    getattr(team, "_team_name", None) or getattr(team, "name", None), _who),
+                    getattr(team, "_team_name", None) or getattr(team, "name", None), _who,
+                    bonus=getattr(team, "_tool_call_limit_bonus", 0)),
                 forced_text_only=_was_forced_text_only(_who),
             )
 
@@ -26497,10 +26615,16 @@ async def run_task_async(
                                         kind=_preflight_kind_seen),
                 "bottom_anchored": bool(config.bottom_anchor_evidence),
             })
+        # Workstream B follow-up (2026-10-24): see the matching comment in
+        # run_task_stream above -- resolved before _build_team, not after,
+        # for the same reason (agno's tool_call_limit is fixed at
+        # agent-construction time).
+        _exec_profile = execution_context.resolve_profile(execution_profile)
         team = _build_team(
             _specs, effective_coordinator, _ctools, mode, mcp_list, instructions,
             read_only=read_only, skill_catalog=skill_catalog, activity=activity, task=task,
             team_name=team_name, project_id=project_id,
+            tool_call_limit_bonus=_exec_profile.tool_call_limit_bonus,
         )
         # See the matching line in run_task_stream: the digest of what earlier turns
         # established, read back by _chain_contradictions at answer time.
@@ -26514,15 +26638,21 @@ async def run_task_async(
         # as team._session_summary/_task above -- see the matching line + comment
         # in run_task_stream.
         team._project_id = project_id
-        # Workstream B (2026-10-24): see the matching line + comment in
-        # run_task_stream above -- same resolution, same slots.
-        _exec_profile = execution_context.resolve_profile(execution_profile)
+        # Workstream B (2026-10-24): _exec_profile already resolved above,
+        # before _build_team -- reused here, not re-resolved. Same slots as
+        # run_task_stream.
         team._execution_profile_name = _exec_profile.name
+        team._tool_call_limit_bonus = _exec_profile.tool_call_limit_bonus
         team._execution_deadline = (
             time.monotonic() + _exec_profile.server_deadline_s
             if _exec_profile.server_deadline_s is not None else None)
+        team._execution_reserve_s = (
+            _exec_profile.completion_reserve_s
+            if team._execution_deadline is not None else None)
         print(f"[team] execution_profile={_exec_profile.name!r} "
-              f"server_deadline_s={_exec_profile.server_deadline_s!r}", flush=True)
+              f"server_deadline_s={_exec_profile.server_deadline_s!r} "
+              f"completion_reserve_s={team._execution_reserve_s!r} "
+              f"tool_call_limit_bonus={_exec_profile.tool_call_limit_bonus!r}", flush=True)
         # Same late-binding slot as the two above: the hooks read it at call time,
         # which is always after construction. None when telemetry is off, and every
         # read site is guarded on that.

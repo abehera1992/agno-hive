@@ -219,21 +219,68 @@ async def _run_namespaced_query(query: str, project_id: str, mode: str,
     callers evaluating context-only results must not assume a nonempty
     response is necessarily ON-TOPIC -- that judgment stays downstream,
     exactly like every other retrieval-only lead in this architecture.
+
+    Relevance safeguard (2026-10-24, Workstream 2): for only_need_context=True,
+    uses aquery_llm (the structured API aquery() itself wraps internally, at
+    no extra retrieval cost -- confirmed by reading LightRAG.aquery's own
+    source) instead of aquery, to read status/metadata/data alongside the
+    same content string aquery() would have returned. Inspected directly
+    against the real "ekam" index (both a real query and a deliberately
+    nonsensical one): LightRAG 1.5.4 exposes NO per-result relevance/
+    similarity score anywhere in this structured response -- entities carry
+    name/type/description/file_path, relationships carry a graph edge
+    "weight" (extraction confidence, not query relevance), and status was
+    "success" with a similarly-shaped entity/relation/chunk count for BOTH
+    the real and the nonsense query. The one real, query-specific signal
+    found is metadata["keywords"]["high_level"]: populated for the real
+    query, empty for the nonsense one. This is not reliable enough to gate
+    on (a legitimate but low-level-only query could also produce an empty
+    high_level list), so it is surfaced as a disclosed, conservative label
+    rather than used to suppress the result -- exactly the "report the
+    limitation" instruction this phase's mission gives for an API that
+    cannot reliably distinguish true no-match from weak match. A genuine
+    status == "failure" (an actual LightRAG-internal failure, not merely an
+    exception at the MCP layer -- those are already caught by the try/except
+    around this whole function) IS a reliable signal and is treated as an
+    error, not empty, same as the existing failure/empty distinction below.
+    A result where data.entities/relationships/chunks are ALL empty despite
+    status=="success" is treated as genuinely empty.
     """
     if mode not in ("local", "global", "hybrid", "naive", "mix"):
         return f"Invalid mode '{mode}'. Use: local, global, hybrid."
+
+    async def _query_one(rag):
+        if not only_need_context:
+            return await rag.aquery(query, param=QueryParam(
+                mode=mode, user_prompt=_GROUNDING_GUARD, only_need_context=False))
+        result = await rag.aquery_llm(query, param=QueryParam(
+            mode=mode, user_prompt=_GROUNDING_GUARD, only_need_context=True))
+        content = (result.get("llm_response") or {}).get("content") or ""
+        if result.get("status") == "failure":
+            raise RuntimeError(result.get("message") or "LightRAG query failed internally")
+        data = result.get("data") or {}
+        if not any(data.get(k) for k in ("entities", "relationships", "chunks")):
+            return "[no results]"
+        high_level = ((result.get("metadata") or {}).get("keywords") or {}).get("high_level")
+        if not high_level and content.strip():
+            content += (
+                "\n\n── Note: this query's high-level theme could not be "
+                "determined (empty keyword extraction) -- LightRAG exposes no "
+                "per-result relevance score, so this is a conservative signal, "
+                "not a confirmed no-match; treat this evidence as lower "
+                "confidence than usual and verify independently ──")
+        return content
+
     try:
         project_rag, global_rag = await asyncio.gather(
             _get_ready_rag(project_id),
             _get_ready_rag(_GLOBAL),
         )
-        param = QueryParam(mode=mode, user_prompt=_GROUNDING_GUARD,
-                           only_need_context=only_need_context)
 
         # Query both namespaces in parallel
         project_result, global_result = await asyncio.gather(
-            project_rag.aquery(query, param=param),
-            global_rag.aquery(query, param=param),
+            _query_one(project_rag),
+            _query_one(global_rag),
             return_exceptions=True,
         )
 
