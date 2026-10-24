@@ -14750,7 +14750,32 @@ def _make_tool_budget_guard_hook(
         who = role or getattr(agent, "name", None) or "Coordinator"
         counts[who] = counts.get(who, 0) + 1
         count = counts[who]
-        limit = _resolve_tool_call_limit(team_name, who, bonus=tool_call_limit_bonus)
+        # Bug found + fixed during bounded live validation (2026-10-24): a
+        # member agent's REAL, agno-enforced tool_call_limit comes from
+        # spec.tool_call_limit (swarm/agents.py's make_agent_from_spec,
+        # itself set by api/server.py's _load_team() from the DB-backed
+        # per-role policy) -- a COMPLETELY SEPARATE path from
+        # _resolve_tool_call_limit, which _load_team() has no knowledge of
+        # execution_profile to apply a bonus through. Only the Coordinator's
+        # real limit is actually constructed via _resolve_tool_call_limit
+        # (see its own tool_call_limit= kwarg a few hundred lines below) --
+        # for every member, recomputing the threshold via
+        # _resolve_tool_call_limit(..., bonus=...) here produced a NUMBER
+        # agno was never actually enforcing: live-observed, Researcher's
+        # real agent.tool_call_limit was 80 (unaffected by the bonus) while
+        # this line computed 120, which would have let agno silently refuse
+        # calls 81-116 before this guard ever reacted. Reading the agent's
+        # own real attribute when one exists closes this for every role
+        # whose real limit is set any other way, present or future, not
+        # just the specific DB-policy path that exposed it; the Coordinator
+        # (agent=None here) still has no such object to read, so it keeps
+        # using the same function its own construction uses -- the one case
+        # where the two paths are, by construction, the same number.
+        limit = (
+            getattr(agent, "tool_call_limit", None) if agent is not None else None
+        )
+        if limit is None:
+            limit = _resolve_tool_call_limit(team_name, who, bonus=tool_call_limit_bonus)
 
         # Low-noise permanent diagnostic (2026-08-21): the first call per role, then
         # every 10th. Added after this guard demonstrably did NOT fire on a live run
@@ -19857,6 +19882,31 @@ def _build_team(
         ]
 
     if agent_specs:
+        if tool_call_limit_bonus:
+            # Bug found + fixed during bounded live validation (2026-10-24):
+            # a member's REAL, agno-enforced tool_call_limit is
+            # spec.tool_call_limit (read directly by make_agent_from_spec,
+            # below) -- a path api/server.py's _load_team() populates with
+            # zero knowledge of execution_profile, since profile resolution
+            # happens later, inside run_task_async/run_task_stream. Without
+            # this, the bonus reached the budget-guard hook's OWN threshold
+            # (see _make_tool_budget_guard_hook, which now reads the agent's
+            # real limit directly to avoid exactly this kind of drift) but
+            # never the real ceiling agno enforces -- an exhaustive run's
+            # members would have been silently capped at their ordinary
+            # budget regardless of the profile. Mutating the spec in place,
+            # here, before construction, is what makes the bonus genuinely
+            # affect the real limit for every member, not just the
+            # Coordinator (whose real limit is already resolved through
+            # _resolve_tool_call_limit a few hundred lines below). Only runs
+            # when the bonus is nonzero, so the standard profile's spec
+            # objects are never touched -- byte-identical behavior for every
+            # caller that doesn't opt into extended/exhaustive.
+            for spec in agent_specs:
+                base = spec.tool_call_limit
+                if base is None:
+                    base = config.tool_call_limit
+                spec.tool_call_limit = base + tool_call_limit_bonus
         members = [
             make_agent_from_spec(
                 spec, *mcp_list, skill_catalog=skill_catalog,
