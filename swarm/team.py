@@ -13551,6 +13551,51 @@ def _strip_integration_banner(content: str) -> str:
     return _INTEGRATION_BANNER_RE.sub("", content or "")
 
 
+# T12.3 (2026-10-24): the banner's own const/sites, re-extracted from its
+# fixed, stable text shape -- not a new search, not invented evidence, the
+# exact same values _integration_mechanism_missing's search already
+# established. Needed because `const`/`sites` are local to that function;
+# re-deriving them via a second search here would risk drifting from what
+# the banner itself says, and changing _integration_mechanism_missing's own
+# return contract would touch its other three call sites (9520, 13588 at the
+# time of writing, 14302), none of which share this prompt-quality concern.
+_INTEGRATION_EVIDENCE_RE = re.compile(
+    r"through `([^`]+)`.*?call sites \(from search_files\): (.+?)\.\*\*",
+    re.DOTALL)
+
+
+def _integration_evidence_sentence(finding: str) -> str:
+    """A plain, model-directed sentence for the retry prompt, built from the
+    banner's own const/sites -- not the reader-facing disclosure text itself.
+
+    T12.2 (read-only investigation, 2026-10-24) found that feeding the model
+    `finding.strip().strip('*')` -- the reader-facing banner, built for a
+    human reading a finished report ("...the answer above names neither that
+    nor...") -- reused the same "one text, two audiences" shape this
+    codebase's own _reader_facing_report was built to fix for a DIFFERENT
+    guard (see that function's own docstring). This is a hypothesis-driven
+    improvement, not a confirmed fix: live run 2dcec24b6890 confirmed the
+    retry fired correctly (T12.1) and received this evidence, but still
+    produced a generic answer, and whether this phrasing resolves that is
+    untested.
+
+    Falls back to the old stripped-banner text if the banner's fixed shape
+    ever stops matching (e.g. a future wording change to
+    _integration_mechanism_missing) -- a missed improvement, not a lost
+    retry step.
+    """
+    m = _INTEGRATION_EVIDENCE_RE.search(finding or "")
+    if not m:
+        return finding.strip().strip('*')
+    const = m.group(1)
+    sites = re.findall(r"`([^`]+)`", m.group(2))
+    if not sites:
+        return finding.strip().strip('*')
+    return (f"The repository evidence identifies {const} as the integration "
+            f"mechanism, used at: {', '.join(sites)}. Incorporate these "
+            f"specific facts into the relevant integration section.")
+
+
 async def _attempt_integration_correction(
         content: str, task: str, team, hive_mcp_url: str | None, hive_mcp_tools,
         liveness_path: str | None = None, synthesis_run: bool = False) -> str:
@@ -13597,11 +13642,13 @@ async def _attempt_integration_correction(
 
     print("[team] integration-correction: gap found, one targeted reconciliation "
           "attempt", flush=True)
+    # T12.3: a plain, model-directed sentence built from the same const/sites
+    # the search above found -- not the reader-facing disclosure banner
+    # itself. See _integration_evidence_sentence's own docstring.
     prompt = (
         f"{task}\n\nYou already produced an answer to this task below. It did not "
         f"describe the actual integration mechanism this run's own repository "
-        f"search just found: {finding.strip().strip('*')} Answer the original "
-        f"question again, incorporating the real call sites named above. Do not "
+        f"search just found. {_integration_evidence_sentence(finding)} Do not "
         f"discard or rewrite content that was not about this integration.\n\n"
         f"── Your previous answer ──\n{content}\n── end of your previous answer ──"
     )
