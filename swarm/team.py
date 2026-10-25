@@ -13596,6 +13596,44 @@ def _integration_evidence_sentence(finding: str) -> str:
             f"specific facts into the relevant integration section.")
 
 
+# T12.5 (2026-10-24): the exact, fixed marker _with_forwarded_evidence
+# (line ~1882) always opens with -- reused verbatim, not approximated. If
+# that string's wording ever changes, this simply stops matching and
+# _without_forwarded_members_section degrades to a no-op (the full previous
+# answer is shown again, the pre-T12.5 behavior), never a wrong split.
+_FORWARDED_MEMBERS_MARKER = (
+    "\n\n---\n**FORWARDED FROM THE MEMBERS — their own text, unedited, appended "
+    "because the answer above did not carry all of it.**")
+
+
+def _without_forwarded_members_section(content: str) -> str:
+    """`content` with its mechanically-appended FORWARDED FROM THE MEMBERS
+    section (if present) cut off -- for display in the integration-correction
+    retry prompt only. Never mutates or replaces `content` itself; every
+    other use of `content` in this function (the finding check above, the
+    final `return content` / `return content + finding` fallbacks) is
+    unaffected.
+
+    T12.4 (read-only investigation, 2026-10-24) found that section is always
+    re-attached verbatim by _with_forwarded_evidence to whatever the retry's
+    own text contains -- it is never lost regardless of whether the model
+    reproduces it. Showing it to the model anyway, alongside "do not
+    discard... content not about this integration", gives the model both the
+    opportunity and an apparent instruction to manually retype a long,
+    enumerable block that, live, twice coincided with the repetition
+    detector firing while the retry was retyping it rather than revising the
+    integration section the retry exists to fix. This does not touch
+    _with_forwarded_evidence, the repetition detector, or the completion
+    pass, and does not by itself fix the repetition problem -- it only
+    removes one unnecessary trigger from what the model is shown. Returns
+    `content` unchanged if the marker is absent.
+    """
+    idx = (content or "").find(_FORWARDED_MEMBERS_MARKER)
+    if idx == -1:
+        return content
+    return content[:idx]
+
+
 async def _attempt_integration_correction(
         content: str, task: str, team, hive_mcp_url: str | None, hive_mcp_tools,
         liveness_path: str | None = None, synthesis_run: bool = False) -> str:
@@ -13645,12 +13683,17 @@ async def _attempt_integration_correction(
     # T12.3: a plain, model-directed sentence built from the same const/sites
     # the search above found -- not the reader-facing disclosure banner
     # itself. See _integration_evidence_sentence's own docstring.
+    # T12.5: the displayed previous answer excludes its own FORWARDED FROM
+    # THE MEMBERS section, if present -- see
+    # _without_forwarded_members_section's own docstring. `content` itself
+    # is untouched; only this one embedded display changes.
     prompt = (
         f"{task}\n\nYou already produced an answer to this task below. It did not "
         f"describe the actual integration mechanism this run's own repository "
         f"search just found. {_integration_evidence_sentence(finding)} Do not "
         f"discard or rewrite content that was not about this integration.\n\n"
-        f"── Your previous answer ──\n{content}\n── end of your previous answer ──"
+        f"── Your previous answer ──\n{_without_forwarded_members_section(content)}\n"
+        f"── end of your previous answer ──"
     )
     try:
         retried, _retry_result = await _stream_team_run(
