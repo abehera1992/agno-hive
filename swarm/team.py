@@ -9454,8 +9454,13 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # answer that reaches it behaves exactly as before. What changes is only that an
     # answer caught by an earlier guard now carries the fabrication finding too,
     # instead of silently losing it.
+    # T12.8: liveness_path threaded through -- this is a plain _verify_claims
+    # grep with no _stream_team_run/heartbeat task of its own; without this,
+    # a slow or retried MCP round trip here goes completely unreported to the
+    # liveness snapshot. See _touch_liveness_snapshot's own docstring and
+    # the T12.7 investigation this closes.
     _fab_report, _fab_bad, _fab_unavailable = await _verify_claims(
-        content, hive_mcp_url, hive_mcp_tools)
+        content, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path)
     # Phase Z (2026-09-17): identity of the exact text this verdict describes.
     # The reuse site near this function's bottom ("Re-using the verdict computed
     # up front, NOT re-running it") assumed content never changes between here and
@@ -10790,8 +10795,9 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         print("[team] verify (post-adoption): content changed since the up-front "
               "check (an earlier guard adopted a retry) — re-verifying the text "
               "that will actually ship", flush=True)
+        # T12.8: same liveness_path threading as the up-front check above.
         report, bad, unavailable = await _verify_claims(
-            content, hive_mcp_url, hive_mcp_tools)
+            content, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path)
     else:
         report, bad, unavailable = _fab_report, _fab_bad, _fab_unavailable
     if unavailable:
@@ -11170,8 +11176,11 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         if citations_unread else ""
     )
 
+    # T12.8: same liveness_path threading as the other two internal
+    # _verify_claims calls above -- this is the citation-correction retry's
+    # own recheck, a second plain grep call with no heartbeat task of its own.
     report2, still_bad, still_unavailable = await _verify_claims(
-        corrected, hive_mcp_url, hive_mcp_tools)
+        corrected, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path)
     # The verdict this run acted on, next to the length of the text it judged. Without
     # both, a later "why did this ship unflagged?" has nothing to work from -- which is
     # exactly where T11 left us: a clean re-check on text that fails the same check now.
