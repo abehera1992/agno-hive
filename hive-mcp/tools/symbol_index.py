@@ -192,6 +192,113 @@ def class_bases(rel_path: str, class_name: str) -> list[str] | None:
     return classes[class_name].get("bases", [])
 
 
+def _unindexable_reason(rel_path: str) -> str:
+    """Why `index_file(rel_path)` returned None -- re-derives the same checks
+    `index_file` itself already applies, cheaply, ONLY on the not-indexable
+    path (never on a successful index), so `structural_index`'s "false" case
+    always carries a specific reason instead of a bare, unexplained no.
+    """
+    path = PROJECT_ROOT / rel_path
+    try:
+        stat = path.stat()
+    except OSError:
+        return "file not found"
+    if stat.st_size > 4_000_000:
+        return "file too large (>4MB)"
+    suffix = path.suffix.lower()
+    if suffix not in (".py", ".ts", ".tsx", ".js", ".jsx"):
+        return f"unsupported extension ({suffix or '(none)'})"
+    if suffix == ".py":
+        try:
+            src = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return "file not readable"
+        try:
+            ast.parse(src.lstrip("﻿"))
+        except (SyntaxError, ValueError) as exc:
+            return f"python parse error: {exc}"
+    return "indexed to an empty result"
+
+
+def structural_index(path: str) -> str:
+    """
+    Structural (definition-level) index of one file: the classes, functions,
+    fields, exports, and routes it actually DECLARES -- not what text it
+    merely contains.
+
+    Python: a real AST parse (ast.parse/ast.walk), the same one `declares`
+    already uses -- a reference like `Voucher.__tablename__` elsewhere in the
+    repo is an attribute-access expression, never visited as a class-body
+    field declaration, so it cannot be mistaken for one.
+    TypeScript/JavaScript: line-anchored export detection (`export const/
+    function/class/interface/type/enum NAME`, a destructured multi-line
+    export block's own hook-per-line shape, and brace re-exports). A symbol
+    that is only IMPORTED or CALLED elsewhere in the file -- e.g. a React
+    hook invoked inside a component body -- is never counted; only a line
+    that actually starts with `export` is.
+
+    Use this to answer "does file X actually DEFINE or EXPORT symbol/
+    category Y" -- never answer that from get_file_content's raw text plus
+    your own pattern match, which cannot distinguish a definition from a
+    call site or a mention inside a comment or string.
+
+    When this reports `indexable: false`, that is NOT evidence the category
+    is absent -- it means this file could not be structurally parsed at all
+    (unsupported language, a parse error, not found, or too large); fall
+    back to reading the file and reasoning conservatively, and disclose the
+    result as unverified structural evidence, not as a confirmed absence.
+
+    Returns a fixed-shape text report, parseable by section header:
+
+        STRUCTURAL INDEX: <path>
+        indexable: true
+        language: py|ts
+        CLASSES (N):
+          <name> (line L) bases=[...] fields=[field1, field2, ...]
+        FUNCTIONS (N):
+          <name> (line L)
+        EXPORTS (N):            -- ts/js files only, in place of CLASSES/FUNCTIONS
+          <name> (line L)
+        ROUTES (N):
+          <METHOD> <path> (line L)
+
+    or, when not indexable:
+
+        STRUCTURAL INDEX: <path>
+        indexable: false
+        reason: <specific reason -- never a bare "false" with nothing else>
+    """
+    idx = index_file(path)
+    if idx is None:
+        return (f"STRUCTURAL INDEX: {path}\n"
+                f"indexable: false\n"
+                f"reason: {_unindexable_reason(path)}\n")
+
+    lines = [f"STRUCTURAL INDEX: {path}", "indexable: true",
+             f"language: {idx.get('lang', '')}"]
+    if idx.get("lang") == "py":
+        classes = idx.get("classes", {})
+        lines.append(f"CLASSES ({len(classes)}):")
+        for cname, meta in sorted(classes.items(), key=lambda kv: kv[1]["line"]):
+            fields = ", ".join(sorted(meta.get("fields", {}).keys()))
+            bases = ", ".join(meta.get("bases", []))
+            lines.append(f"  {cname} (line {meta['line']}) bases=[{bases}] fields=[{fields}]")
+        functions = idx.get("functions", {})
+        lines.append(f"FUNCTIONS ({len(functions)}):")
+        for fname, fline in sorted(functions.items(), key=lambda kv: kv[1]):
+            lines.append(f"  {fname} (line {fline})")
+    else:
+        exports = idx.get("exports", {})
+        lines.append(f"EXPORTS ({len(exports)}):")
+        for ename, eline in sorted(exports.items(), key=lambda kv: kv[1]):
+            lines.append(f"  {ename} (line {eline})")
+    routes = idx.get("routes", {})
+    lines.append(f"ROUTES ({len(routes)}):")
+    for route, rline in sorted(routes.items(), key=lambda kv: kv[1]):
+        lines.append(f"  {route} (line {rline})")
+    return "\n".join(lines) + "\n"
+
+
 def field_of(rel_path: str, class_name: str, field: str) -> tuple[bool | None, str]:
     """Is `field` declared on `class_name` in `rel_path`?
 

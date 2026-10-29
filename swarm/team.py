@@ -12716,6 +12716,50 @@ async def _repo_file_text(rel_path: str, hive_mcp_url: str | None,
     return box["text"]
 
 
+async def _repo_structural_index(rel_path: str, hive_mcp_url: str | None,
+                                 hive_mcp_tools=None) -> str:
+    """One file's STRUCTURAL (definition-level) index from hive-mcp's
+    structural_index tool (T69.7), or "" when the call itself fails (network/
+    timeout) -- NOT the same as the tool's own "indexable: false", which is a
+    real, successful answer with its own `reason:` line. Same session
+    handling as _repo_file_text/_repo_find_files -- live session first, fresh
+    connection only as a fallback.
+    """
+    if not (hive_mcp_url or hive_mcp_tools):
+        return ""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    box: dict = {"text": ""}
+
+    async def _ask(session) -> None:
+        res = await session.call_tool("structural_index", {"path": rel_path})
+        if _mcp_error_text(res):
+            return
+        box["text"] = _extract_mcp_text(res)
+
+    if hive_mcp_tools is not None:
+        try:
+            await asyncio.wait_for(_ask(await hive_mcp_tools.get_session_for_run()),
+                                   timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] coverage gate: live session failed "
+                  f"({type(exc).__name__}: {exc or '<no message>'})")
+
+    if not box["text"] and hive_mcp_url:
+        try:
+            async def _fresh() -> None:
+                async with streamablehttp_client(hive_mcp_url) as (read, write, _):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        await _ask(session)
+            await asyncio.wait_for(_fresh(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] coverage gate: structural_index failed "
+                  f"({type(exc).__name__}: {exc or '<no message>'})")
+    return box["text"]
+
+
 # app.include_router(items_api.router) -- the module whose router is actually MOUNTED.
 _INCLUDE_ROUTER_RE = re.compile(r"include_router\(\s*(?:[\w.]+\.)?([A-Za-z_]\w*)\s*\.router")
 
@@ -14072,25 +14116,29 @@ _CATEGORY_CONTENT_SHAPE: dict[str, dict[str, re.Pattern]] = {
 }
 
 
-def _content_matches_category(category: str, content: str, file_path: str) -> bool:
-    """Whether `content` (read from `file_path`) contains a real code-shape
-    signal for `category` -- never a path or prose keyword match. An
+def _content_matches_category_heuristic(category: str, content: str, file_path: str) -> bool:
+    """TIER 5 (weakest) -- HEURISTIC evidence only. Whether `content` (read
+    from `file_path`) contains a real code-SHAPE signal for `category` via a
+    plain regex over raw text -- never a path or prose keyword match. An
     unrecognized category or an extension with no registered pattern for
     that category returns False rather than guessing either way.
 
-    Import/require statements are stripped before matching (TS/JS only, via
-    _TS_IMPORT_STMT_RE -- the SAME detector _extract_import_specs already
-    uses). Without this, a file that merely CONSUMES a hook -- `import {
-    useGetVouchersQuery } from '@/lib/.../inventoryApi'` -- would match the
-    "hooks" shape just as readily as the file that actually DEFINES it,
-    because the identifier text is literally present either way. Caught by
-    this phase's own scratch check: vouchers/page.tsx (a consumer) must NOT
-    register as hooks-covered on its own, or the gate would never feel a
-    need to traverse to inventoryApi.ts (the real definer) at all -- which
-    is the exact discovery gap T69 found. Python's import statements are
-    stripped too, for the same reason and by the same reasoning, even though
-    no current Python category pattern happens to collide with an import
-    clause's own text.
+    T69.7: this is now the FALLBACK tier, used by _content_matches_category
+    ONLY when hive-mcp's structural_index tool reports a file as not
+    indexable at all (unsupported language, parse error, not found, too
+    large) -- never the primary evidence source. Even with the existing
+    import-statement stripping below, this tier CANNOT distinguish a
+    definition from a call site that is not an import: `const {data} =
+    useGetVouchersQuery(...)` inside a component body matches the exact same
+    `use[A-Z]\\w*(?:Query|Mutation)` shape as a real `export const
+    useGetVouchersQuery = ...` definition, and is not an import statement, so
+    stripping imports alone does not fix it. Confirmed live (T69 battery,
+    2026-10-29): this tier alone let vouchers/page.tsx (a hook CONSUMER)
+    register as "hooks"-covered on its own, so the completeness gate never
+    traversed to inventoryApi.ts (the real definer) -- the exact discovery
+    gap T69.6/T69.7 exist to close. _content_matches_category below now
+    tries the structural (AST/export-anchored) tier FIRST and only reaches
+    this function when that tier was unable to see the file at all.
     """
     ext = os.path.splitext(file_path or "")[1].lower()
     if ext in (".tsx", ".js", ".jsx"):
@@ -14104,6 +14152,90 @@ def _content_matches_category(category: str, content: str, file_path: str) -> bo
     elif ext == ".py":
         text = _PY_IMPORT_STMT_RE.sub("", text)
     return bool(pattern.search(text))
+
+
+# Parses hive-mcp's structural_index tool output (see that function's own
+# docstring for the fixed text shape) -- a section header line, then its
+# indented body lines, repeated for CLASSES/FUNCTIONS/EXPORTS/ROUTES.
+_STRUCTURAL_INDEXABLE_RE = re.compile(r"^indexable:\s*(true|false)", re.MULTILINE)
+_STRUCTURAL_SECTION_RE = re.compile(
+    r"^([A-Z]+) \(\d+\):\n((?:  .*\n?)*)", re.MULTILINE)
+
+
+def _structural_category_evidence(category: str, structural_text: str) -> "bool | None":
+    """Whether hive-mcp's structural_index output for one file shows
+    `category` actually DEFINED or EXPORTED there -- TIERS 1/2 (definition,
+    export/registration) of the T69.6 evidence model, never tier 4 (usage).
+
+    Returns True/False when the file WAS structurally indexable (a confident,
+    AST-or-export-anchored answer); returns None when it was NOT indexable at
+    all -- the caller MUST treat None as "no structural evidence either way",
+    falling back to _content_matches_category_heuristic (tier 5), never as
+    False (which would wrongly assert the category is confirmed absent from
+    an unparseable file).
+
+    "hooks" is checked only against the EXPORTS section (TS/JS files have no
+    CLASSES/FUNCTIONS section at all, so this naturally returns False for a
+    .py file without special-casing the extension). "endpoints" is checked
+    against the ROUTES section, present for both languages. "tables" is
+    checked against the CLASSES section's own `fields=[...]` text, which
+    only ever lists field names the AST walk found as actual class-body
+    assignment targets -- a bare reference like `Voucher.__tablename__`
+    elsewhere in the file is an attribute-access expression, never visited
+    by the AST walk as a field declaration, so it cannot appear here.
+    An unrecognized category returns False, same as the heuristic tier.
+    """
+    if not _STRUCTURAL_INDEXABLE_RE.search(structural_text or ""):
+        return None
+    if _STRUCTURAL_INDEXABLE_RE.search(structural_text).group(1) != "true":
+        return None
+    sections = {m.group(1): m.group(2)
+                for m in _STRUCTURAL_SECTION_RE.finditer(structural_text)}
+    if category == "hooks":
+        return bool(_REACT_HOOK_IDENTIFIER_RE.search(sections.get("EXPORTS", "")))
+    if category == "endpoints":
+        return bool(sections.get("ROUTES", "").strip())
+    if category == "tables":
+        return "__tablename__" in sections.get("CLASSES", "")
+    return False
+
+
+async def _content_matches_category(
+        category: str, content: str, file_path: str,
+        hive_mcp_url: str | None, hive_mcp_tools,
+        structural_text: "str | None" = None) -> bool:
+    """Whether `file_path` (whose already-fetched text is `content`) counts
+    as evidence that `category` is DEFINED/EXPORTED there -- tries the
+    structural (AST/export-anchored) tier first via hive-mcp's
+    structural_index tool, falling back to the plain regex heuristic
+    (_content_matches_category_heuristic) ONLY when structural evidence is
+    unavailable (None) for this file. Structural evidence, when available,
+    is authoritative and the heuristic tier is not additionally consulted --
+    a file that genuinely defines nothing of this category structurally does
+    not get a second, weaker chance to look like it does via raw text.
+
+    `structural_text` lets a caller that already fetched the structural
+    index for this file (e.g. once per file, before checking it against
+    several categories) pass it in directly instead of this function
+    re-fetching it -- avoiding a redundant network round-trip per category.
+    Passing None (the default) makes this function fetch it itself.
+
+    Returns False, never raises, if a category has no registered evidence
+    shape at all (same contract the heuristic tier already had).
+    """
+    if structural_text is None:
+        try:
+            structural_text = await _repo_structural_index(
+                file_path, hive_mcp_url, hive_mcp_tools)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] coverage gate: structural_index call failed for "
+                  f"{file_path!r} ({type(exc).__name__}: {exc}) -- falling "
+                  f"back to heuristic evidence", flush=True)
+            structural_text = ""
+    structural = _structural_category_evidence(category, structural_text)
+    if structural is not None:
+        return structural
+    return _content_matches_category_heuristic(category, content, file_path)
 
 
 async def _traverse_missing_category_dependencies(
@@ -14183,8 +14315,22 @@ async def _traverse_missing_category_dependencies(
             continue
         if not content:
             continue
+        # Fetched ONCE per file, not once per still-missing category --
+        # _content_matches_category accepts it pre-fetched precisely to
+        # avoid a redundant structural_index round-trip for every category
+        # checked against the same file (T69.7).
+        try:
+            structural_text = await _repo_structural_index(
+                src_path, hive_mcp_url, hive_mcp_tools)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] coverage gate: structural_index call failed for "
+                  f"{src_path!r} ({type(exc).__name__}: {exc}) -- falling "
+                  f"back to heuristic evidence for this file", flush=True)
+            structural_text = ""
         for cat in list(still_missing):
-            if _content_matches_category(cat, content, src_path):
+            if await _content_matches_category(
+                    cat, content, src_path, hive_mcp_url, hive_mcp_tools,
+                    structural_text=structural_text):
                 covered.add(cat)
                 still_missing.discard(cat)
 
@@ -14257,8 +14403,23 @@ async def _traverse_missing_category_dependencies(
             continue
         visited.add(norm_resolved)
         budget -= 1
-        matched_cat = next((c for c in still_missing
-                           if _content_matches_category(c, fetched, resolved_path)), None)
+        # Fetched once, checked against each still-missing category --
+        # same single-fetch-per-file discipline as the pass-1 loop above.
+        try:
+            resolved_structural_text = await _repo_structural_index(
+                resolved_path, hive_mcp_url, hive_mcp_tools)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] coverage gate: structural_index call failed for "
+                  f"{resolved_path!r} ({type(exc).__name__}: {exc}) -- "
+                  f"falling back to heuristic evidence for this file", flush=True)
+            resolved_structural_text = ""
+        matched_cat = None
+        for c in still_missing:
+            if await _content_matches_category(
+                    c, fetched, resolved_path, hive_mcp_url, hive_mcp_tools,
+                    structural_text=resolved_structural_text):
+                matched_cat = c
+                break
         if not matched_cat:
             attempted.append({"from": src_path, "spec": spec,
                               "resolved_path": resolved_path,

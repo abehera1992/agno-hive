@@ -44,6 +44,7 @@ from tools.bash import (
     bash_job_status, bash_job_kill,
 )
 from tools.verify import verify_claims
+from tools.symbol_index import structural_index
 from tools.skills import list_skills, load_skill
 from tools.shell import run_shell, run_docker, get_env_info, check_port, list_processes
 from tools.git import git_status, git_log, git_diff, git_log_file, git_blame
@@ -188,6 +189,7 @@ _tool(search_files_batch)
 _tool(count_matches)
 _tool(compare_enumerations)
 _tool(verify_claims)
+_tool(structural_index)
 _tool(list_skills)
 _tool(load_skill)
 _tool(list_directory)
