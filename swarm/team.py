@@ -13643,6 +13643,849 @@ def _without_forwarded_members_section(content: str) -> str:
     return content[:idx]
 
 
+# ── T69.1 (2026-10-29): bounded cross-directory dependency traversal + a
+# general comparison-completeness gate ──────────────────────────────────────
+#
+# T68/T69's audit of the T13a vouchers-hooks failure (run f0e67ec6b668,
+# 2026-10-25) found TWO distinct gaps, neither fixed by the objective-dedup
+# correction above:
+#   1. Discovery: the frontend-hooks delegation was scoped to the vouchers
+#      PAGE directory (journal 09:10:04), which structurally cannot contain
+#      the API-slice file (inventoryApi.ts) that actually defines the hooks
+#      a comparison needs -- it lives in a different directory entirely.
+#   2. Completeness: even once the comparison delegation can run, nothing
+#      checked whether BOTH sides of "endpoints vs hooks" had actually been
+#      searched before an absence claim was allowed to ship.
+#
+# Both are closed here with ONE mechanism, placed at the SAME post-generation
+# choke point _attempt_integration_correction already uses (immediately after
+# it, in _verified_answer's own guard chain) rather than inside the hot-path
+# read-cache tool hook: that hook intercepts EVERY tool call for EVERY member
+# and is deliberately a pure in-memory operation with no network calls (see
+# its own docstring) -- the precedent for spending a network round-trip on
+# deterministic extra evidence, in this file, is already the integration-gap
+# guards above (_integration_mechanism_missing calls _repo_search_text; this
+# does the analogous thing with _repo_find_files/_repo_file_text).
+#
+# Generalizes beyond vouchers/T13a: nothing below names a vouchers path, an
+# endpoint count, or a hook name. The category table (_SUBJECT_CATEGORY_
+# KEYWORDS, already shared with the dedup fix above) decides which task
+# shapes qualify, and _COMPARISON_TASK_RE (already shared with comparison-
+# discipline's own skill-injection trigger) decides which tasks are asking a
+# gap-analysis question at all -- this reuses both rather than adding a
+# third, vouchers-specific detector.
+
+# Lightweight, regex-based import extraction -- consistent with this module's
+# existing shallow-parse style (_ROUTE_SHAPE_PY_RE/_ROUTE_SHAPE_TS_RE), not a
+# real parser, and honest about covering only the two languages this
+# repository actually uses (FastAPI/Python backends, TypeScript/Next.js
+# frontends). A dynamic/computed import (an f-string module path, `require
+# (someVariable)`) is not a literal string either regex can capture, and is
+# correctly left unresolved by the caller rather than guessed.
+_PY_IMPORT_STMT_RE = re.compile(
+    r"^\s*from\s+[\w.]+\s+import\s+[^\n]*|^\s*import\s+[\w.]+(?:\s*,\s*[\w.]+)*",
+    re.MULTILINE)
+_TS_IMPORT_STMT_RE = re.compile(
+    r"""^\s*import\b[^;\n]*?from\s*['"][^'"]+['"]"""
+    r"""|^\s*export\s+[*{][^;\n]*?from\s*['"][^'"]+['"]"""
+    r"""|\brequire\(\s*['"][^'"]+['"]\s*\)""",
+    re.MULTILINE)
+# Module/dotted-path extraction from an already-matched statement, not a
+# second independent search over the whole file -- deliberately scoped to
+# ONE statement at a time so the module path and its own named-import
+# clause are never mismatched across two different import lines.
+_IMPORT_PY_MODULE_RE = re.compile(r"^\s*from\s+([\w.]+)\s+import|^\s*import\s+([\w.]+)")
+_IMPORT_TS_MODULE_RE = re.compile(r"""['"]([^'"]+)['"]""")
+# A React/Next.js hook identifier (useXxx) inside a named-import clause is
+# "hooks"-category evidence even when neither the module path nor the
+# identifier itself contains the literal word "hook" -- confirmed necessary
+# against the T13a acceptance shape: `import { useGetVouchersQuery } from
+# '@/lib/api/services/inventory/inventoryApi'` names neither "inventoryApi"
+# nor "useGetVouchersQuery" as a literal "hook" word, so _subject_categories'
+# own whole-word keyword match (by design, see its docstring) would never
+# tag this import as "hooks"-relevant without this one addition. A genuine
+# language/framework naming convention, not a vouchers-specific pattern --
+# applies to any React hook import in any task. Requires the Query/Mutation
+# suffix (the RTK Query generated-hook shape), NOT a bare `useXxx` -- the
+# first version of this pattern matched `useState`/`useEffect` too, which
+# would have mis-flagged nearly every React component's own plain React
+# import as "hooks"-relevant (caught by this phase's own scratch check
+# against a synthetic `import { useState } from 'react'` line). Identical
+# to _CATEGORY_CONTENT_SHAPE["hooks"][".ts"] below by design -- defined once
+# and reused in both places so the two checks cannot drift apart.
+_REACT_HOOK_IDENTIFIER_RE = re.compile(r"\buse[A-Z]\w*(?:Query|Mutation)\b")
+
+_DEPENDENCY_TRAVERSAL_SOURCE_EXTS = (".py", ".ts", ".tsx", ".js", ".jsx")
+_DEPENDENCY_TRAVERSAL_MAX_FILES = 6
+_DEPENDENCY_TRAVERSAL_EXCERPT_CHARS = 6000
+
+
+def _extract_import_specs(content: str, file_path: str) -> "list[tuple[str, str]]":
+    """(module_spec, full_statement_text) pairs for every import in `content`,
+    in file order, de-duplicated by module_spec. [] for an unsupported
+    extension or empty content.
+
+    The full statement text is kept alongside the bare module path because
+    the path alone often carries NO category signal at all -- a named-import
+    clause like `{ useGetVouchersQuery }` or `{ Voucher, VoucherSeries }`
+    does, and _category_relevance_hint (below) looks at both. See the module
+    comment above for the two languages this covers and why a dynamic import
+    is deliberately left out rather than guessed.
+    """
+    ext = os.path.splitext(file_path or "")[1].lower()
+    pairs: list[tuple[str, str]] = []
+    if ext == ".py":
+        for m in _PY_IMPORT_STMT_RE.finditer(content or ""):
+            stmt = m.group(0)
+            mod_m = _IMPORT_PY_MODULE_RE.search(stmt)
+            mod = mod_m and (mod_m.group(1) or mod_m.group(2))
+            if mod:
+                pairs.append((mod, stmt))
+    elif ext in (".ts", ".tsx", ".js", ".jsx"):
+        for m in _TS_IMPORT_STMT_RE.finditer(content or ""):
+            stmt = m.group(0)
+            mod_m = _IMPORT_TS_MODULE_RE.search(stmt)
+            if mod_m:
+                pairs.append((mod_m.group(1), stmt))
+    else:
+        return []
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for spec, stmt in pairs:
+        if spec and spec not in seen:
+            seen.add(spec)
+            out.append((spec, stmt))
+    return out
+
+
+def _filename_stem_without_extensions(name: str) -> str:
+    """`name` with every trailing extension suffix stripped, repeatedly --
+    handles a compound extension ('vouchers.module.scss' -> 'vouchers'), not
+    just the last one ('inventoryApi.ts' -> 'inventoryApi', one pass is
+    enough there). A name with no extension at all ('VoucherForm',
+    'business_admin_api') is returned unchanged. Used only where a
+    filename-shaped IDENTIFIER is wanted (category-relevance scoring); never
+    used to build a find_files search target, where the real, full filename
+    (extension included) is what must be searched for.
+    """
+    stem = name
+    while True:
+        new_stem, ext = os.path.splitext(stem)
+        if not ext or not new_stem:
+            break
+        stem = new_stem
+    return stem
+
+
+def _category_relevance_hint(spec: str, statement_text: str) -> "frozenset[str]":
+    """Subject categories (see _subject_categories) that `spec`/`statement_text`
+    give evidence of, including the one convention-based signal
+    _subject_categories' own literal whole-word matching cannot see on its
+    own: a React hook identifier (useXxx) inside the statement's named-import
+    clause. Used ONLY to decide whether an import is worth resolving, never
+    to decide coverage (_category_covered_by_reads stays path-only, applied
+    to a file AFTER it is actually fetched).
+
+    T69.4: the last PATH segment is now derived path-aware -- split on '/'
+    only when `spec` contains one (a path-shaped TS/JS/alias specifier,
+    where a dot inside the last segment is part of the filename, e.g.
+    'vouchers.module.scss'), falling back to the whole spec when it doesn't
+    (a bare Python module, 'business_admin_api', which has no '/' at all).
+    The previous `re.split(r"[./]", spec)[-1]` split on EVERY dot
+    unconditionally, which reduced 'vouchers.module.scss' to the bare
+    extension 'scss' and lost the meaningful filename stem entirely. A
+    multi-part extension is then stripped via _filename_stem_without_
+    extensions so it cannot itself become the category hint.
+    """
+    last_segment = spec.rsplit("/", 1)[-1] if spec and "/" in spec else (spec or "")
+    stem = _filename_stem_without_extensions(last_segment)
+    cats = _subject_categories(spec) | _subject_categories(stem)
+    if _REACT_HOOK_IDENTIFIER_RE.search(statement_text or ""):
+        cats |= frozenset({"hooks"})
+    return cats
+
+
+def _nearby_scope_glob(norm_from: str) -> "str | None":
+    """A generic "nearby directory" glob prefix for `norm_from` -- two levels
+    up from the importing file itself (its own directory's parent), e.g.
+    'API/inventory-service/router/vouchers_api.py' -> 'API/inventory-service'.
+    None when `norm_from` has too few segments to go up two levels.
+
+    Deliberately not a service-name/convention-specific rule (never looks for
+    '-service', 'src', 'app', or any other literal directory-naming
+    convention) -- just "nearby", generic across any repository layout. Used
+    ONLY to scope the FALLBACK filename search (stage 2 below) ahead of a
+    repository-wide one; a scoped miss still falls through to the
+    unscoped search, so this never makes a resolvable import unresolvable,
+    only tries the more-likely location first.
+    """
+    parts = [p for p in norm_from.split("/") if p]
+    if len(parts) <= 2:
+        return None
+    return "/".join(parts[:-2])
+
+
+async def _resolve_import_spec(spec: str, from_path: str,
+                               hive_mcp_url: str | None,
+                               hive_mcp_tools) -> "tuple[str | None, str]":
+    """Best-effort resolution of one import specifier, named inside
+    `from_path`, to a real repository path -- (resolved_path_or_None, reason).
+
+    Reuses hive-mcp's EXISTING find_files tool (via _repo_find_files) for
+    every strategy below -- no new index, no new tool, no hardcoded path-
+    alias table for any one project's convention. Three stages, in order,
+    each only reached if the previous one found nothing:
+
+    1. EXACT resolution against `from_path`'s own directory (T69.3 --
+       previously absent entirely, every spec was resolved by the stage-3
+       fallback regardless):
+       - A relative import ('./x', '../x') is joined against from_path's
+         directory and checked for each candidate extension, THEN for
+         '<joined>/index<ext>' (barrel/index-file resolution: an import of
+         a DIRECTORY whose real file is '<dir>/index.ts' and would never
+         match a bare '<dir>.ts' filename search).
+       - A bare, dot-free Python specifier ('models', 'config' -- this
+         project's own actual style, confirmed against
+         API/inventory-service/router/vouchers_api.py:29,31: `from config
+         import settings` / `from models import (...)`) is tried as a
+         same-directory sibling '<from_dir>/<spec>.py', then one directory
+         up '<parent>/<spec>.py', BEFORE being considered for exclusion as
+         an external package at all -- previously this bare-token shape was
+         excluded as "external" unconditionally, which misclassified every
+         local Python import of this exact shape and made the "tables"
+         category (reached via a bare `from models import`) unreachable by
+         traversal for this repository's own backend code.
+       A stage-1 hit is unambiguous by construction (one exact candidate
+       path, confirmed to exist) -- no scoring, no tie possible.
+    2. Only once stage 1 finds nothing AND the specifier still looks local
+       (not matched by the bare-external-package shape below) -- an ordinary
+       external package (a bare lowercase token, no dot, no path separator,
+       not relative/alias-prefixed, found nowhere locally -- 'react',
+       'fastapi', 'os') is left UNRESOLVED as external, without spending
+       any further network round-trip on it.
+    3. A scoped-then-repository-wide filename search on the specifier's LAST
+       path/dot segment (an alias like '@/lib/...', or anything stage 1/2
+       didn't resolve or exclude) -- tries _nearby_scope_glob(from_path)
+       first ("scope candidates appropriately", not blindly repository-wide),
+       falling back to a full '**' search only if the scoped one finds
+       nothing. This remains a filename-shape heuristic, not a true module
+       resolver (a wrong same-named file elsewhere is still possible), and
+       is the one stage that can produce an AMBIGUOUS outcome: when 2+
+       candidates tie for the best path-segment score, this now returns
+       (None, "ambiguous: ...") rather than silently picking the first --
+       an ambiguous match must never be counted as verified coverage.
+    """
+    spec = (spec or "").strip()
+    if not spec or "${" in spec or spec in (".", ".."):
+        return None, "dynamic or empty import specifier, cannot resolve statically"
+
+    norm_from = (from_path or "").replace("\\", "/")
+    from_dir = os.path.dirname(norm_from)
+    from_ext = os.path.splitext(norm_from)[1].lower()
+    is_python = from_ext == ".py"
+    # TS/JS freely import across .ts/.tsx/.js/.jsx regardless of the
+    # IMPORTING file's own extension (a .tsx page importing a .ts API slice
+    # is normal, not an edge case) -- restricting candidate_exts to the
+    # importer's own extension only (the pre-T69.3 behavior) silently relied
+    # on this function's final wildcard ('.*') fallback to paper over every
+    # cross-extension case, which also means it never tried the barrel/
+    # index fallback at the right extension. Python is the one language
+    # here where the target extension IS fixed (.py), so it stays narrow.
+    candidate_exts = ((".py",) if is_python else
+                      tuple(e for e in _DEPENDENCY_TRAVERSAL_SOURCE_EXTS if e != ".py"))
+
+    # TS/JS specifiers use '/' as the only real path separator -- a dot in
+    # the LAST segment is part of the filename itself (e.g.
+    # './vouchers.module.scss', whose own extension is '.scss', not a
+    # fourth path segment named 'scss'). Python specifiers genuinely use '.'
+    # as their package separator ('from a.b import c'), so only Python
+    # splits on dots. T69.3: the prior single regex (splitting on both
+    # unconditionally) silently truncated any TS/JS specifier with an
+    # embedded dot down to its bare extension as "tail".
+    if is_python:
+        segments = [p for p in re.split(r"[./]", spec) if p and p not in (".", "..")]
+    else:
+        segments = [p for p in spec.split("/") if p and p not in (".", "..")]
+    if not segments:
+        return None, f"import {spec!r} has no resolvable path segment"
+    tail = segments[-1]
+    # The literal extension already written in the specifier, if any (e.g.
+    # './vouchers.module.scss' -> '.scss') -- tried AS-IS before any
+    # guessed extension, since guessing would otherwise never produce the
+    # right suffix for a non-code asset import (CSS/SCSS modules, JSON).
+    spec_ext = os.path.splitext(spec)[1].lower() if not is_python else ""
+
+    # ---- Stage 1: exact, unambiguous resolution against from_path's own
+    # directory -- relative imports, and bare same-package Python modules.
+    exact_candidates: list[str] = []
+    if spec.startswith("."):
+        joined = os.path.normpath(f"{from_dir}/{spec}").replace("\\", "/").lstrip("/")
+        if spec_ext:
+            exact_candidates.append(joined)
+        exact_candidates += [f"{joined}{e}" for e in candidate_exts]
+        exact_candidates += [f"{joined}/index{e}" for e in candidate_exts]
+    elif is_python and "." not in spec and re.match(r"^[A-Za-z_]\w*$", spec):
+        if from_dir:
+            exact_candidates.append(f"{from_dir}/{spec}.py")
+            parent = os.path.dirname(from_dir)
+            if parent and parent != from_dir:
+                exact_candidates.append(f"{parent}/{spec}.py")
+
+    for cand in exact_candidates:
+        hit = await _repo_find_files(cand, hive_mcp_url, hive_mcp_tools)
+        norm_cand = cand.lstrip("/")
+        for h in (hit or []):
+            if h.replace("\\", "/").lstrip("/") == norm_cand:
+                return h, "resolved exactly against the importing file's own directory"
+
+    # ---- Stage 2: external-package exclusion -- only AFTER stage 1 found
+    # nothing locally, so a same-package bare import ('models', 'config')
+    # gets a real chance to resolve before being written off as external.
+    if (not spec.startswith((".", "/", "@")) and "." not in spec
+            and re.match(r"^[a-z][a-z0-9_-]*$", spec)):
+        return None, (f"{spec!r} did not resolve against the importing file's own "
+                      f"directory; treated as an external package import, not "
+                      f"traversed further")
+
+    # ---- Stage 3: scoped, then repository-wide, filename search -- aliases
+    # ('@/lib/...') and anything else stage 1 could not resolve exactly.
+    scope = _nearby_scope_glob(norm_from)
+    search_prefixes = ([scope] if scope else []) + ["**"]
+    found = None
+
+    if spec_ext:
+        # `tail` already carries its own real extension (e.g.
+        # 'vouchers.module.scss', 'inventoryApi.ts' -- segments were split
+        # on '/' only for a non-Python spec, so `tail` is the full,
+        # unmodified last path segment). Appending a guessed extension on
+        # top of an already-complete filename ('vouchers.module.scss.ts')
+        # can never match a real file, so the extension-guessing/barrel/
+        # wildcard loop below is skipped entirely for this case (T69.4) --
+        # replaced by exactly two attempts, in order:
+        #
+        # 1. If a real, concrete scope directory exists (never the "**"
+        #    wildcard tier, which names no actual directory to be exact
+        #    about), try the literal path WITHIN it and accept it ONLY if
+        #    the returned path string equals that exact candidate (T69.4.1).
+        #    _repo_find_files wraps hive-mcp's find_files, which applies its
+        #    OWN fallback-prefix search when the literal pattern finds
+        #    nothing (confirmed directly from hive-mcp/tools/context.py:
+        #    710-762: _GLOB_FALLBACK_PREFIXES, env-configured, plus an
+        #    always-appended "**" as its own final attempt) -- so a non-
+        #    empty result here is NOT proof the literal candidate itself
+        #    exists; it may be hive-mcp's own fallback surfacing a DIFFERENT
+        #    file whose path merely ENDS WITH the same "{scope}/{tail}"
+        #    suffix (e.g. the same basename nested under an unrelated
+        #    deeper root). Stage 1 already guards against exactly this for
+        #    relative/sibling candidates; this is the equivalent guard for
+        #    the scoped-alias case, which had none until this fix -- without
+        #    it, an unverified fallback hit could have been silently adopted
+        #    as if it were the exact alias target.
+        # 2. If there is no scope, or the scope attempt did not verify,
+        #    fall through to a repository-wide literal search and let the
+        #    SAME scoring/ambiguity logic below (shared with the non-
+        #    spec_ext path) decide -- a single real hit is accepted as
+        #    heuristic discovery (the existing "scoped filename search"
+        #    wording, never claimed as "exact"), and 2+ tied hits are
+        #    reported as ambiguous, never silently picked. There is no
+        #    analogous "exact" guarantee possible at this tier, because
+        #    "**" names no single real directory to compare a returned path
+        #    against -- so this case is deliberately NOT given a one-line
+        #    confident return the way the scope case is.
+        if scope:
+            exact_cand = f"{scope}/{tail}".lstrip("/")
+            raw = await _repo_find_files(f"{scope}/{tail}", hive_mcp_url, hive_mcp_tools)
+            exact_hit = next((h for h in (raw or [])
+                              if h.replace("\\", "/").lstrip("/") == exact_cand), None)
+            if exact_hit:
+                return exact_hit, "resolved exactly via alias/scoped literal-path lookup"
+        found = await _repo_find_files(f"**/{tail}", hive_mcp_url, hive_mcp_tools)
+    else:
+        for prefix in search_prefixes:
+            for ext in candidate_exts:
+                found = await _repo_find_files(f"{prefix}/{tail}{ext}", hive_mcp_url, hive_mcp_tools)
+                if found:
+                    break
+            if not found:
+                # Barrel/index resolution (T69.3) -- an aliased or otherwise
+                # unresolved DIRECTORY import ('@/lib/api/services/auth',
+                # backed by 'auth/index.ts') never matches a bare
+                # '{tail}{ext}' glob at all; try '{tail}/index{ext}' before
+                # falling through further. Confirmed against this
+                # repository's own real barrel files (Client/.../lib/api/
+                # services/auth/index.ts, .../rbac/index.ts, .../store/
+                # index.ts, components/guards/index.ts).
+                for ext in candidate_exts:
+                    found = await _repo_find_files(
+                        f"{prefix}/{tail}/index{ext}", hive_mcp_url, hive_mcp_tools)
+                    if found:
+                        break
+            if not found:
+                found = await _repo_find_files(f"{prefix}/{tail}.*", hive_mcp_url, hive_mcp_tools)
+            if not found:
+                # Wildcard barrel fallback -- covers a barrel file whose
+                # extension isn't in `candidate_exts` for this importer's
+                # language (defensive; candidate_exts is already TS/JS-wide
+                # or Python-only above, so this is a last-resort catch, not
+                # the primary path).
+                found = await _repo_find_files(f"{prefix}/{tail}/index.*", hive_mcp_url, hive_mcp_tools)
+            if found:
+                break
+
+    if not found:
+        return None, f"no file found matching {tail!r} (from import {spec!r})"
+
+    if len(found) == 1:
+        return found[0], "resolved via scoped filename search (single candidate)"
+
+    def _score(path: str) -> int:
+        norm = path.replace("\\", "/").lower()
+        return sum(1 for seg in segments if seg.lower() in norm)
+    ranked = sorted(found, key=_score, reverse=True)
+    top_score = _score(ranked[0])
+    tied = [p for p in ranked if _score(p) == top_score]
+    if len(tied) > 1:
+        return None, (f"ambiguous: {len(tied)} candidates tied for the best match on "
+                      f"import {spec!r} ({', '.join(tied[:5])}) -- not resolved, not "
+                      f"counted as verified coverage")
+    return ranked[0], (f"resolved via scoped filename search "
+                       f"({len(found)} candidates, one clear best path-segment match)")
+
+
+# Content-shape signals per subject category -- CONNECTS to the ALREADY-
+# PROVEN _ROUTE_SHAPE_PY_RE/_ROUTE_SHAPE_TS_RE pair (hive-mcp's own
+# compare.py extractor shapes, mirrored read-only above) instead of
+# inventing a parallel detector for "endpoints"/"hooks". A file's PATH
+# almost never contains the literal category word -- vouchers_api.py names
+# no "endpoint", inventoryApi.ts names no "hook" -- so _subject_categories
+# (designed for prose/objective text, literal whole-word matching) is the
+# wrong tool for judging what a FILE'S CONTENT covers; these patterns judge
+# the content directly. "tables" has no existing shared detector, so one is
+# added here, in the same spirit (a real ORM declaration shape, not a
+# keyword match) -- not reused because nothing to reuse exists yet.
+_TABLE_SHAPE_PY_RE = re.compile(
+    r"__tablename__\s*=|\bclass\s+\w+\s*\([^)]*\bBase\b[^)]*\)\s*:")
+_CATEGORY_CONTENT_SHAPE: dict[str, dict[str, re.Pattern]] = {
+    "endpoints": {".py": _ROUTE_SHAPE_PY_RE, ".ts": re.compile(r"\bendpoint\s*[:=]")},
+    "hooks": {".ts": _REACT_HOOK_IDENTIFIER_RE},
+    "tables": {".py": _TABLE_SHAPE_PY_RE},
+}
+
+
+def _content_matches_category(category: str, content: str, file_path: str) -> bool:
+    """Whether `content` (read from `file_path`) contains a real code-shape
+    signal for `category` -- never a path or prose keyword match. An
+    unrecognized category or an extension with no registered pattern for
+    that category returns False rather than guessing either way.
+
+    Import/require statements are stripped before matching (TS/JS only, via
+    _TS_IMPORT_STMT_RE -- the SAME detector _extract_import_specs already
+    uses). Without this, a file that merely CONSUMES a hook -- `import {
+    useGetVouchersQuery } from '@/lib/.../inventoryApi'` -- would match the
+    "hooks" shape just as readily as the file that actually DEFINES it,
+    because the identifier text is literally present either way. Caught by
+    this phase's own scratch check: vouchers/page.tsx (a consumer) must NOT
+    register as hooks-covered on its own, or the gate would never feel a
+    need to traverse to inventoryApi.ts (the real definer) at all -- which
+    is the exact discovery gap T69 found. Python's import statements are
+    stripped too, for the same reason and by the same reasoning, even though
+    no current Python category pattern happens to collide with an import
+    clause's own text.
+    """
+    ext = os.path.splitext(file_path or "")[1].lower()
+    if ext in (".tsx", ".js", ".jsx"):
+        ext = ".ts"
+    pattern = _CATEGORY_CONTENT_SHAPE.get(category, {}).get(ext)
+    if not pattern:
+        return False
+    text = content or ""
+    if ext == ".ts":
+        text = _TS_IMPORT_STMT_RE.sub("", text)
+    elif ext == ".py":
+        text = _PY_IMPORT_STMT_RE.sub("", text)
+    return bool(pattern.search(text))
+
+
+async def _traverse_missing_category_dependencies(
+        task_cats: "frozenset[str]", read_paths: list[str],
+        hive_mcp_url: str | None, hive_mcp_tools) -> "tuple[frozenset, list[dict], list[dict]]":
+    """Two passes over `read_paths` (from team._read_state["reads"] -- the
+    existing, real read log, no new state store):
+
+    Pass 1 (free, no budget cost): for each already-read file, checks
+    whether its OWN content already covers one of `task_cats` (a category a
+    read file's content demonstrably carries, even if nothing asked it to
+    follow an import for that category), and collects every import whose
+    _category_relevance_hint overlaps `task_cats` as a scored candidate --
+    nothing is resolved or fetched yet.
+
+    Pass 2: candidates are sorted by relevance score, HIGHEST first (T69.3 --
+    previously processed in raw read/import-statement order, which let an
+    earlier-read file's weakly-relevant or ultimately-uncategorized imports
+    exhaust the budget before a later file's real candidate was ever
+    reached), then resolved+fetched one at a time against the shared budget.
+    Bounded to _DEPENDENCY_TRAVERSAL_MAX_FILES real FOLLOWED-import fetches
+    total across every candidate in this one call (re-reading the already-
+    read files themselves in pass 1 does not count against this budget --
+    that is bounded by `read_paths`' own length, which this run already paid
+    for), and never re-fetches a path already in `read_paths` or already
+    resolved earlier in this same call (the `visited` set) -- no cycles, no
+    repeated reads.
+
+    Returns (covered_cats, resolved, attempted):
+      - `covered_cats`: every category in `task_cats` for which EITHER an
+        already-read file's content OR a newly-resolved dependency's content
+        matched that category's real shape (_content_matches_category) --
+        the actual, evidence-grounded coverage set, not a guess.
+      - `resolved`: dicts for followed imports that were fetched AND whose
+        content matched a still-missing category, each {"from", "spec",
+        "resolved_path", "reason", "content_excerpt", "matched_category"}.
+      - `attempted`: the FULL evidence trail -- every specifier considered,
+        resolved or not, each {"from", "spec", "resolved_path", "status",
+        "reason"}, status in {"resolved", "resolved_uncategorized",
+        "unresolved", "ambiguous", "already_read", "skipped"} -- "ambiguous"
+        (T69.3) means 2+ candidates tied for the best match and NONE was
+        picked; it is never counted toward `covered_cats`, same as
+        "unresolved" -- for the completeness gate to disclose precisely what
+        was tried, not just what succeeded.
+
+    Never raises: a resolution or fetch failure is recorded and the loop
+    continues -- the same "degrade quietly, record why" contract
+    _fetch_skill_text already uses for an unreachable hive-mcp.
+    """
+    covered: set[str] = set()
+    resolved: list[dict] = []
+    attempted: list[dict] = []
+    visited: set[str] = {p.replace("\\", "/") for p in read_paths if p}
+    budget = _DEPENDENCY_TRAVERSAL_MAX_FILES
+    still_missing = set(task_cats)
+
+    # ---- Pass 1: direct content coverage (free, no budget cost) PLUS
+    # candidate collection for pass 2. T69.3: candidates are no longer
+    # resolved in raw read/import order -- a strongly-relevant import found
+    # in an EARLIER-read file could otherwise consume the whole budget on
+    # weakly-relevant or ultimately-uncategorized fetches before a later
+    # file's real candidate (e.g. the one import that actually leads to the
+    # defining file for a missing category) is ever reached. Collecting
+    # every candidate FIRST, then sorting by relevance strength before
+    # spending any budget, fixes that ordering gap without changing the
+    # budget or visited-set semantics themselves.
+    candidates: list[tuple[int, str, str, str]] = []  # (score, src_path, spec, stmt)
+    for src_path in read_paths:
+        ext = os.path.splitext(src_path or "")[1].lower()
+        if ext not in _DEPENDENCY_TRAVERSAL_SOURCE_EXTS:
+            continue
+        try:
+            content = await _repo_file_text(src_path, hive_mcp_url, hive_mcp_tools)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] dependency traversal: could not re-read {src_path!r} "
+                  f"({type(exc).__name__}: {exc})", flush=True)
+            continue
+        if not content:
+            continue
+        for cat in list(still_missing):
+            if _content_matches_category(cat, content, src_path):
+                covered.add(cat)
+                still_missing.discard(cat)
+
+        for spec, stmt in _extract_import_specs(content, src_path):
+            hint = _category_relevance_hint(spec, stmt)
+            overlap = hint & task_cats
+            if not overlap:
+                # No category signal at all -- never a candidate, regardless
+                # of ordering. This is the bound against "expanding every
+                # dependency indiscriminately": react/lucide-react/
+                # sqlalchemy-helper imports are never even scored.
+                continue
+            # Score: more overlapping categories, and an identifier-level
+            # signal (_REACT_HOOK_IDENTIFIER_RE, folded into the hint for the
+            # module path's own tail too) outranks a plain keyword hit on
+            # the bare module path -- a stronger, more specific signal is
+            # tried before a weaker, more generic one.
+            score = len(overlap) * 10 + (5 if _REACT_HOOK_IDENTIFIER_RE.search(stmt or "") else 0)
+            candidates.append((score, src_path, spec, stmt))
+
+    # ---- Pass 2: highest-relevance candidates first (stable sort --
+    # ties keep their original read/file order), budget applied here only.
+    candidates.sort(key=lambda c: c[0], reverse=True)
+
+    for _score_val, src_path, spec, stmt in candidates:
+        if not still_missing:
+            break
+        if budget <= 0:
+            attempted.append({"from": src_path, "spec": spec, "resolved_path": None,
+                              "status": "skipped",
+                              "reason": "traversal file budget exhausted"})
+            continue
+        if not (_category_relevance_hint(spec, stmt) & still_missing):
+            # Relevant to the task overall (it passed pass 1's filter) but
+            # not to what's STILL missing by the time its turn came up
+            # (an earlier, higher-scored candidate already covered that
+            # category) -- correctly skipped without spending a find_files
+            # round-trip on a category that no longer needs one.
+            continue
+        try:
+            resolved_path, reason = await _resolve_import_spec(
+                spec, src_path, hive_mcp_url, hive_mcp_tools)
+        except Exception as exc:  # noqa: BLE001
+            attempted.append({"from": src_path, "spec": spec, "resolved_path": None,
+                              "status": "unresolved",
+                              "reason": f"resolution failed: {type(exc).__name__}: {exc}"})
+            continue
+        if not resolved_path:
+            # T69.3: _resolve_import_spec's own reason distinguishes a
+            # genuine ambiguous tie from any other unresolved cause --
+            # tagged with its own status so the completeness gate's
+            # evidence trail can tell them apart, but EITHER WAY this is
+            # not coverage: an ambiguous match is never silently counted
+            # as a verified dependency.
+            status = "ambiguous" if (reason or "").startswith("ambiguous:") else "unresolved"
+            attempted.append({"from": src_path, "spec": spec, "resolved_path": None,
+                              "status": status, "reason": reason})
+            continue
+        norm_resolved = resolved_path.replace("\\", "/")
+        if norm_resolved in visited:
+            attempted.append({"from": src_path, "spec": spec,
+                              "resolved_path": resolved_path, "status": "already_read",
+                              "reason": "already covered this run"})
+            continue
+        fetched = await _repo_file_text(resolved_path, hive_mcp_url, hive_mcp_tools)
+        if not fetched:
+            attempted.append({"from": src_path, "spec": spec,
+                              "resolved_path": resolved_path, "status": "unresolved",
+                              "reason": "resolved a path but could not read it"})
+            continue
+        visited.add(norm_resolved)
+        budget -= 1
+        matched_cat = next((c for c in still_missing
+                           if _content_matches_category(c, fetched, resolved_path)), None)
+        if not matched_cat:
+            attempted.append({"from": src_path, "spec": spec,
+                              "resolved_path": resolved_path,
+                              "status": "resolved_uncategorized",
+                              "reason": "fetched successfully but content did not "
+                                       "match any still-missing category's shape"})
+            continue
+        covered.add(matched_cat)
+        still_missing.discard(matched_cat)
+        excerpt = (fetched if len(fetched) <= _DEPENDENCY_TRAVERSAL_EXCERPT_CHARS
+                  else fetched[:_DEPENDENCY_TRAVERSAL_EXCERPT_CHARS] + "\n... (truncated)")
+        entry = {"from": src_path, "spec": spec, "resolved_path": resolved_path,
+                "status": "resolved", "reason": reason, "content_excerpt": excerpt,
+                "matched_category": matched_cat}
+        resolved.append(entry)
+        attempted.append(entry)
+    return frozenset(covered), resolved, attempted
+
+
+_COVERAGE_CORRECTION_FLAG = "_coverage_correction_attempted"
+
+
+async def _comparison_coverage_gap(
+        task: str, content: str, team,
+        hive_mcp_url: str | None, hive_mcp_tools) -> "dict | None":
+    """A comparison/gap-analysis task spanning 2+ subject categories (e.g.
+    "endpoints" vs "hooks") whose answer concludes an absence, checked
+    against whether BOTH sides were actually searched this run before that
+    conclusion is allowed to stand unqualified.
+
+    Reuses _COMPARISON_TASK_RE (the SAME detector that already selects the
+    comparison-discipline skill injection) and team._read_state["reads"]
+    (the existing, real read log) -- no new task-shape detector, no new
+    state store. Silent (returns None) in every case where there is nothing
+    to guard: the task isn't a qualifying multi-category comparison, the
+    answer makes no gap-shaped conclusion at all (checked with the SAME
+    regex against the answer's own text -- a model that already disclosed
+    UNRESOLVED needs no further gate action), or every named category
+    already has real, content-grounded coverage.
+
+    When a gap is found, attempts ONE bounded dependency-traversal pass
+    (_traverse_missing_category_dependencies) over files already read this
+    run BEFORE concluding the gap is real -- a category that traversal
+    successfully resolves is removed from the returned `missing_cats`, and
+    its content is handed back as genuine new evidence for
+    _attempt_coverage_correction to feed to a retry, not merely disclosed as
+    missing.
+
+    Returns None, or {"missing_cats": frozenset, "resolved": [...],
+    "attempted": [...]} for _attempt_coverage_correction to act on.
+    """
+    task_cats = _subject_categories(task or "")
+    if len(task_cats) < 2 or not _COMPARISON_TASK_RE.search(task or ""):
+        return None
+    if not _COMPARISON_TASK_RE.search(content or ""):
+        # The answer itself never asserted a gap-shaped conclusion (e.g. it
+        # already disclosed UNRESOLVED, or simply enumerated both sides
+        # without concluding an absence) -- nothing for this gate to guard.
+        return None
+
+    read_state = getattr(team, "_read_state", None) or {}
+    read_paths = [str(r.get("path") or "") for r in (read_state.get("reads") or [])
+                  if r.get("path")]
+    if not read_paths:
+        return None
+
+    covered_cats, resolved, attempted = await _traverse_missing_category_dependencies(
+        task_cats, read_paths, hive_mcp_url, hive_mcp_tools)
+    still_missing = task_cats - covered_cats
+
+    print(f"[team] coverage gate: task spans categories {sorted(task_cats)}; "
+          f"content-grounded coverage found for {sorted(covered_cats)} "
+          f"({len(resolved)} via followed dependencies), leaving "
+          f"{sorted(still_missing)} still uncovered", flush=True)
+
+    if not resolved and not still_missing:
+        return None
+    return {"missing_cats": still_missing, "resolved": resolved, "attempted": attempted}
+
+
+_COVERAGE_GAP_BANNER_RE = re.compile(
+    r"\n\n---\n\*\*THIS COMPARISON MAY BE INCOMPLETE.*?\*\*", re.DOTALL)
+
+
+def _mandatory_coverage_disclosure(missing_cats: "frozenset[str]", task_cats) -> str:
+    """The fixed disclosure text for `missing_cats`, or "" if empty.
+
+    Factored out so EVERY exit path of _attempt_coverage_correction can
+    attach it unconditionally (T69.3) -- previously only the all-
+    unresolved early-return path attached this text inline, so a MIXED
+    outcome (traversal resolves evidence for one missing category but
+    leaves another still uncovered, including one _CATEGORY_CONTENT_SHAPE
+    has no detector for at all) could reach the retry path and adopt
+    `retried` with no mechanical guarantee the still-missing side was named
+    anywhere in the final text -- the model's own retry prose was the only
+    thing that could have said so, which is exactly the "prose instruction
+    is not a guarantee" failure class this codebase has already found and
+    fixed elsewhere (see _make_duplicate_delegation_gate_hook's docstring).
+    """
+    if not missing_cats:
+        return ""
+    return (
+        f"\n\n---\n**THIS COMPARISON MAY BE INCOMPLETE — the task asked to "
+        f"compare {sorted(task_cats)}, but {sorted(missing_cats)} had no file "
+        f"read shaped like it this run, and automatic dependency traversal from "
+        f"the files that WERE read could not resolve one either (unsupported "
+        f"category, ambiguous candidate, or budget/depth limit — see this run's "
+        f"own log for which). A matching code shape proves that category exists "
+        f"somewhere in what was searched; it does not prove every instance of it "
+        f"was found. Any \"no counterpart\"/absence conclusion above should be "
+        f"treated as UNRESOLVED for {sorted(missing_cats)}, not confirmed absent.**")
+
+
+async def _attempt_coverage_correction(
+        content: str, task: str, team, hive_mcp_url: str | None, hive_mcp_tools,
+        liveness_path: str | None = None, synthesis_run: bool = False) -> str:
+    """One bounded retry (same choke point and shape as
+    _attempt_integration_correction, run immediately after it) for a
+    comparison task whose conclusion outran its own coverage.
+
+    When traversal (_comparison_coverage_gap) found real content for a
+    missing side, the retry is handed that content directly and asked to
+    reconcile its conclusion against it -- this can either CLOSE the gap (the
+    newly-found evidence shows a real counterpart the first draft missed) or
+    CONFIRM it (the new evidence is read and the absence still holds, now on
+    a demonstrably complete basis). When traversal found nothing for a
+    missing side, there is no new evidence to retry with -- the function
+    appends an honest disclosure instead of spending a retry on a model that
+    has no more to go on than it already had.
+
+    T69.3: the disclosure for whatever remains in `missing_cats` (per
+    _mandatory_coverage_disclosure, above) is now attached on EVERY exit
+    path where it is non-empty -- the retry-failed paths, the verify_claims-
+    rejected path, AND the clean-adoption path -- not only the all-
+    unresolved early return. A category traversal resolved is never
+    re-disclosed as missing; only genuinely still-missing categories are
+    named, computed once from `gap["missing_cats"]` and reused at every
+    return, never re-derived from (and therefore never dependent on) the
+    retry's own prose.
+
+    One-shot per run (own flag), same as _attempt_integration_correction, and
+    deliberately independent of _INTEGRATION_CORRECTION_FLAG -- a run can
+    legitimately need both.
+    """
+    if synthesis_run or not content or getattr(team, _COVERAGE_CORRECTION_FLAG, False):
+        return content
+    setattr(team, _COVERAGE_CORRECTION_FLAG, True)
+
+    gap = await _comparison_coverage_gap(
+        task, _COVERAGE_GAP_BANNER_RE.sub("", content or ""), team,
+        hive_mcp_url, hive_mcp_tools)
+    if not gap:
+        return content
+
+    missing_cats = gap["missing_cats"]
+    resolved = gap["resolved"]
+    task_cats = _subject_categories(task)
+    disclosure = _mandatory_coverage_disclosure(missing_cats, task_cats)
+
+    if not resolved:
+        # Traversal could not find anything for the missing side either --
+        # disclose precisely, do not retry blind.
+        print("[team] coverage-correction: no new evidence found by traversal -- "
+              "disclosing the gap rather than retrying blind", flush=True)
+        return content + disclosure
+
+    print(f"[team] coverage-correction: traversal found {len(resolved)} dependency "
+          f"file(s); {sorted(missing_cats) or '(now fully covered)'} still "
+          f"uncovered -- one targeted reconciliation attempt", flush=True)
+    evidence_blocks = "\n\n".join(
+        f"`{e['resolved_path']}` (reached via `{e['spec']}`, imported from "
+        f"`{e['from']}`):\n```\n{e['content_excerpt']}\n```"
+        for e in resolved)
+    prompt = (
+        f"{task}\n\nYou already produced an answer to this task below. Before "
+        f"concluding any gap/absence, this run's own automatic dependency "
+        f"traversal just found and read the following file(s), reached by "
+        f"following imports from files you already read, which your answer "
+        f"did not examine:\n\n{evidence_blocks}\n\nReconcile your conclusion "
+        f"against this evidence -- it may close the gap you reported, or the "
+        f"gap may still hold once this is accounted for. Do not discard or "
+        f"rewrite content unrelated to this comparison.\n\n"
+        f"── Your previous answer ──\n{_without_forwarded_members_section(content)}\n"
+        f"── end of your previous answer ──"
+    )
+    try:
+        retried, _retry_result = await _stream_team_run(
+            team, prompt, log_label="coverage-correction", liveness_path=liveness_path)
+    except Exception as exc:
+        print(f"[team] coverage-correction retry failed: {exc}", flush=True)
+        return content + disclosure
+
+    was_truncated = (getattr(team, "_repetition_truncated", False)
+                     or getattr(team, "_semantic_stall_truncated", False))
+    retried, _ = await _complete_repetition_truncated_answer(
+        retried, task, team, [], None, liveness_path)
+    if was_truncated and _TRUNCATED_ANSWER_NOTE not in retried \
+            and not _ends_at_a_natural_stopping_point(retried):
+        retried = retried + _TRUNCATED_ANSWER_NOTE
+
+    if not retried or not _strip_leaked_tool_tags(retried).strip() \
+            or retried.strip() == _BUDGET_EXHAUSTED_ANSWER \
+            or _TRUNCATED_ANSWER_NOTE in retried:
+        print("[team] coverage-correction retry produced nothing usable", flush=True)
+        return content + disclosure
+
+    _retried_fab_report, _retried_fab_bad, _ = await _verify_claims(
+        retried, hive_mcp_url, hive_mcp_tools)
+    if _retried_fab_bad:
+        _pre_report, _pre_bad, _ = await _verify_claims(content, hive_mcp_url, hive_mcp_tools)
+        _new_flagged = _flagged_lines_set(_retried_fab_report) - _flagged_lines_set(_pre_report)
+        if _new_flagged:
+            print(f"[team] coverage-correction: retry introduced new verify_claims "
+                  f"problem(s) not already present in content — "
+                  f"{sorted(_new_flagged)[:2]} — keeping original content", flush=True)
+            return content + disclosure
+        print(f"[team] coverage-correction: retry's only verify_claims problem(s) are "
+              f"ones content already carried in unchanged "
+              f"({_verdict_digest(_retried_fab_report)}) — adopting, disclosure(s) "
+              f"re-attached", flush=True)
+        return retried + _flagged_draft_note(_retried_fab_report) + disclosure
+
+    print("[team] coverage-correction: retry reconciled against the new evidence "
+          "and passes verify_claims -- adopting", flush=True)
+    return retried + disclosure
+
+
 async def _attempt_integration_correction(
         content: str, task: str, team, hive_mcp_url: str | None, hive_mcp_tools,
         liveness_path: str | None = None, synthesis_run: bool = False) -> str:
@@ -17772,17 +18615,28 @@ def _objective_names_new_entity(objective_norm: str, prior_objective_norm: str) 
        repetition detection, same reasoning: a shared surface that introduces
        a real new symbol is not a repeat.
 
-    2. (T41/F5, 2026-10-20) A recognized subject-area CATEGORY (see
-       _subject_categories) that the prior objective's own words never
-       mention at all -- e.g. 'list the backend endpoints' -> 'list the
-       frontend hooks'. Fires ONLY when a category is detected on the CURRENT
-       side AND the prior side mentions NO category at all, or mentions only
-       disjoint ones -- never when the two sides share a category (that is a
-       rewording, e.g. 'backend endpoints' vs 'server-side API routes', both
-       the "endpoints" category) and never when EITHER side mentions no
-       category at all beyond what's already covered (ambiguous prose with no
-       recognized subject word stays conservative -- see _subject_categories'
-       own docstring).
+    2. (T41/F5, 2026-10-20; widened T69.1, 2026-10-29) A recognized subject-
+       area CATEGORY (see _subject_categories) that the prior objective's own
+       words never mention at all -- e.g. 'list the backend endpoints' ->
+       'list the frontend hooks', OR 'list the backend endpoints' -> 'compare
+       the backend endpoints to the frontend hooks'. Fires whenever the
+       CURRENT side names at least one category absent from the prior side
+       (new_cats - prior_cats is non-empty), even when the two sides ALSO
+       share a category -- a comparison objective that restates the prior
+       subject while adding a genuinely new one must not be swallowed by the
+       shared half. Confirmed live during the T13a battery (run
+       f0e67ec6b668, 2026-10-25): "list all API endpoints" then "identify
+       backend functionality with no frontend counterpart by comparing the
+       backend endpoints with the frontend hooks" shares "endpoints" with the
+       prior objective but also introduces "hooks" -- the disjointness-only
+       version of this check (`not (new_cats & prior_cats)`) treated the
+       shared half as proof of no new information and blocked the one
+       delegation that would have performed the actual comparison. Still
+       never fires on pure rewording (e.g. 'backend endpoints' vs
+       'server-side API routes', both the "endpoints" category and nothing
+       else, so new_cats - prior_cats is empty) and still conservative
+       (False) when EITHER side mentions no category at all (see
+       _subject_categories' own docstring).
 
     Used by the duplicate-delegation gate's delegate_structured_task branch
     (Phase T17, 2026-10-08 for signal 1; T41/F5 for signal 2) to tell "same
@@ -17815,7 +18669,7 @@ def _objective_names_new_entity(objective_norm: str, prior_objective_norm: str) 
     # rather than guessing from one-sided information.
     new_cats = _subject_categories(objective_norm)
     prior_cats = _subject_categories(prior_objective_norm)
-    if new_cats and prior_cats and not (new_cats & prior_cats):
+    if new_cats and prior_cats and (new_cats - prior_cats):
         return True
 
     return False
@@ -27855,6 +28709,16 @@ async def run_task_async(
                     # deterministically, instead of only ever disclosing it after the
                     # fact at a later _run_repo_derived_guards call site.
                     content = await _attempt_integration_correction(
+                        content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
+                        liveness_path=liveness_path, synthesis_run=synthesis_run)
+                    # T69.1 (2026-10-29): same choke-point placement, immediately
+                    # after the integration-gap retry above -- a DIFFERENT gap
+                    # shape (a multi-category comparison/gap-analysis conclusion
+                    # that outran its own search coverage, e.g. T13a's vouchers-
+                    # hooks failure) gets its own one-shot retry budget, backed by
+                    # bounded dependency traversal rather than a plain disclosure.
+                    # See _comparison_coverage_gap's own docstring.
+                    content = await _attempt_coverage_correction(
                         content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
                         liveness_path=liveness_path, synthesis_run=synthesis_run)
                 except Exception as exc:
