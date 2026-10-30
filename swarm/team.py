@@ -3011,6 +3011,39 @@ _ROUTE_SHAPE_PY_RE = re.compile(r"@\w[\w.]*\.(?:get|post|put|patch|delete)\(", r
 _ROUTE_SHAPE_TS_RE = re.compile(
     r"\bendpoint\s*[:=]|\buse[A-Z]\w*(?:Query|Mutation)\b")
 
+# Phase 0.2 (T13a preservation-scope fix, 2026-10-30): the SAME hook-name shape
+# hive-mcp/tools/compare.py's own _TS_HOOK_RE uses to populate its "HOOKS
+# EXPORTED BY {right_path}" block in cmp_note -- mirrored here, read-only,
+# purely to EXTRACT the specific name rather than merely detect the shape
+# (_ROUTE_SHAPE_TS_RE above only answers "does this text contain a hook-shaped
+# construct at all", never which one). Never re-implementing or widening the
+# comparison engine's own join: this only reads cmp_note's already-rendered
+# text, generically, for whatever right-side file a comparison ran against --
+# no project- or domain-specific name anywhere in this pattern.
+_COMPARISON_HOOK_NAME_RE = re.compile(r"\buse[A-Z]\w*(?:Query|Mutation)\b")
+
+# Generic HTTP-method + path shape, for recognising a route-identity CLAIM in
+# free-form prose (never hardcoded to any one project's routes) -- compared
+# against the union of every "{METHOD} {path}" identity string already
+# present across compare_enumerations' own matched/partial_match/left_only/
+# right_only/ambiguous categories (see _unsupported_comparison_identifiers).
+_PROSE_ROUTE_IDENTITY_RE = re.compile(
+    r"\b(GET|POST|PUT|PATCH|DELETE)\s+(/[\w{}./-]*)", re.IGNORECASE)
+
+# A dedicated sentence splitter for _unsupported_comparison_identifiers --
+# _MEMBER_SENTENCE_SPLIT_RE (above) requires the NEXT sentence to start with
+# an uppercase letter, which is correct for member narration but wrong here:
+# a hook name starts lowercase ("useUpdateVoucherMutation"), so a fabricated
+# hook sitting right after a sentence about REAL hooks would never be split
+# off -- found live during this phase's own scratch validation (a merged
+# real+fake sentence was dropped as one unit, losing the real hooks it also
+# named). Splits before an uppercase letter OR before a hook/route-shaped
+# token specifically, so this one failure mode is covered without changing
+# the shared regex every other caller of _MEMBER_SENTENCE_SPLIT_RE relies on.
+_COMPARISON_SENTENCE_SPLIT_RE = re.compile(
+    r"(?<=[.!?])\s*(?=[A-Z]|use[A-Z]\w*(?:Query|Mutation)\b|"
+    r"(?:GET|POST|PUT|PATCH|DELETE)\s+/)")
+
 
 def _candidate_has_route_shape(entry: dict) -> bool:
     """Whether an enumerations[] entry's OWN already-captured lines (the SAME
@@ -7236,6 +7269,87 @@ def _make_coordinator_progress_guard_hook():
 _MD_HEADING_RE = re.compile(r"^#{1,6}\s+.+$", re.MULTILINE)
 
 
+def _unsupported_comparison_identifiers(section: str, cmp_note: str) -> tuple[str | None, list[str]]:
+    """`section` with every SENTENCE dropped that names a hook or route
+    identifier belonging to the comparison's own compared-file shapes --
+    TS `use...Query`/`use...Mutation` hooks, or a generic `METHOD /path`
+    route -- that compare_enumerations' own exhaustive enumeration of THIS
+    comparison's two files never recorded on EITHER side, in ANY of its five
+    categories. Returns (None, flagged) when nothing survives (drop the whole
+    section, same outcome as this function's siblings below), or
+    (trimmed_section, flagged) otherwise; `flagged` is only for the caller's
+    own log line, never for inventing a "does not exist" replacement claim --
+    an unsupported sentence is removed, nothing is asserted in its place.
+
+    Phase 0.2 (T13a remediation, 2026-10-30): the companion to
+    _matched_item_named_as_missing below -- that one catches a MATCHED/
+    PARTIAL_MATCH identity wrongly reported as missing; this one catches the
+    mirror-image defect live-traced in the Phase 0.1 audit (run 79af6ad3ed64):
+    a preserved section asserting a hook/route identity that never appeared
+    on EITHER side of the comparison at all -- not matched, not partial,
+    not left-only, not right-only, not ambiguous. Neither check overlaps the
+    other's job.
+
+    Deliberately narrow and shape-restricted, never a blanket identifier
+    filter: a sentence containing no hook- or route-shaped token at all (a
+    database-table name, a service name, an unrelated function name) is never
+    inspected by this function and is returned completely untouched -- this
+    only ever looks at text using the SAME two shapes compare_enumerations
+    itself already recognises for its own two operand files, which is what
+    keeps this scoped to the comparison's own subject rather than a global
+    fabrication detector. Returns (section, []) unchanged, as a no-op, when
+    `cmp_note` does not parse into real categories (_comparison_entries
+    returns None) -- a comparison that never ran must never activate this.
+
+    Known limitation, disclosed rather than worked around with a heuristic:
+    compare_enumerations' own rendered categories identify Python-side routes
+    by `METHOD path` only, never by backend handler FUNCTION name (e.g.
+    `list_vouchers`) -- so a fabricated bare function name not phrased as a
+    route (as opposed to a fabricated hook, or a fabricated route string) is
+    outside what this data can safely validate. Extending compare_enumerations
+    itself to also expose real handler names (mirroring its existing "HOOKS
+    EXPORTED BY" block for the left/Python side) would close this, but that is
+    a comparison-engine change, explicitly out of scope for this phase.
+    """
+    entries = _comparison_entries(cmp_note)
+    if entries is None:
+        return section, []
+    known_hooks = set(_COMPARISON_HOOK_NAME_RE.findall(cmp_note))
+    known_routes: set[str] = set()
+    for cat in ("matched", "partial_match", "left_only", "right_only", "ambiguous"):
+        for line in entries.get(cat) or []:
+            for method, path in _PROSE_ROUTE_IDENTITY_RE.findall(line):
+                known_routes.add(f"{method.upper()} {path}")
+
+    lines = section.splitlines()
+    heading = lines[0] if lines else ""
+    body = "\n".join(lines[1:])
+    if not body.strip():
+        return section, []
+
+    flagged: list[str] = []
+    kept_sentences: list[str] = []
+    for sentence in _COMPARISON_SENTENCE_SPLIT_RE.split(body):
+        if not sentence.strip():
+            continue
+        unsupported = [h for h in _COMPARISON_HOOK_NAME_RE.findall(sentence)
+                       if h not in known_hooks]
+        unsupported += [f"{m.upper()} {p}"
+                        for m, p in _PROSE_ROUTE_IDENTITY_RE.findall(sentence)
+                        if f"{m.upper()} {p}" not in known_routes]
+        if unsupported:
+            flagged.extend(unsupported)
+            continue
+        kept_sentences.append(sentence)
+
+    if not flagged:
+        return section, []
+    kept_body = " ".join(kept_sentences).strip()
+    if not kept_body:
+        return None, flagged
+    return f"{heading}\n{kept_body}", flagged
+
+
 def _sections_without_completeness_claim(content: str, cmp_note: str = "") -> list[str]:
     """Markdown-heading-delimited blocks of `content` that assert no completeness
     claim of their own -- see _reconcile_completeness_claims, the SAME tested
@@ -7305,6 +7419,19 @@ def _sections_without_completeness_claim(content: str, cmp_note: str = "") -> li
                       f"{_matched_hit!r} as missing, but compare_enumerations "
                       f"proved it MATCHED/PARTIAL_MATCH", flush=True)
                 continue
+            trimmed, _unsupported_hits = _unsupported_comparison_identifiers(b, cmp_note)
+            if _unsupported_hits:
+                # Phase 0.2: distinguishing log line, same convention as T54's
+                # own print above -- the one signal that proves THIS branch
+                # (as opposed to the matched-item-as-missing branch) fired.
+                print(f"[team] section exclusion: {_heading!r} -- "
+                      f"{'dropped entirely' if trimmed is None else 'sentence(s) stripped'} "
+                      f"-- names {_unsupported_hits!r}, none of which "
+                      f"compare_enumerations recorded on either side of this "
+                      f"comparison", flush=True)
+            if trimmed is None:
+                continue
+            b = trimmed
         out.append(b)
     return out
 
