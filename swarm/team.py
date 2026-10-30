@@ -5074,18 +5074,38 @@ def _ends_at_a_natural_stopping_point(content: str) -> bool:
     question, "did the model stop mid-action," from the opposite direction
     this needs.
 
+    T69.10 (2026-10-29): judged against `content` with any mechanically
+    -appended FORWARDED FROM THE MEMBERS section (_with_forwarded_evidence)
+    removed first, via _without_forwarded_members_section (T12.5, reused
+    unmodified -- an exact match against the fixed marker string
+    _with_forwarded_evidence always writes, never a punctuation/search
+    heuristic over the append boundary). Every caller of this function
+    receives its candidate AFTER _stream_team_run has already run that
+    append, so without this, a coordinator draft cut off mid-token was
+    judged "complete" whenever the forwarded block appended after it
+    happened to end in ordinary punctuation -- confirmed live, T69.9's
+    read-only audit of run 6e7e2b0da015 (coordinator's own synthesis
+    stopped mid-word at "...useGetVouchers"; the forwarded researcher
+    block appended after it ends in a normal sentence, so this check
+    reported "ends naturally" for a candidate that never reached its own
+    conclusion). _without_forwarded_members_section is a no-op (returns
+    `content` unchanged) whenever nothing was forwarded, so this is
+    byte-for-byte unchanged behavior on every run that never calls
+    forward_member_answer.
+
     Deliberately narrow and purely textual, matching this file's existing
     convention for every other repetition-adjacent heuristic
     (_looks_like_repetition_loop, _looks_like_repetition_decay,
     _ends_with_unfinished_intent) -- no new model call, no broadening of an
     existing threshold or retry budget.
     """
-    tail = (content or "").rstrip()
+    own = _without_forwarded_members_section(content) or ""
+    tail = own.rstrip()
     if not tail or tail.endswith("..."):
         return False
     if not _NATURAL_STOP_RE.search(tail):
         return False
-    return not _ends_with_unfinished_intent(content)
+    return not _ends_with_unfinished_intent(own)
 
 
 _SYNTAX_REASK_FLAG = "_syntax_loss_reask_done"
