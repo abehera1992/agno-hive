@@ -8517,8 +8517,32 @@ def _integrity_branch_contradiction(content: str, team) -> tuple[str, str] | Non
 # A sentence calling something absent/gapped/uncovered -- the vocabulary the
 # named-item check below looks for BEFORE checking whether the same line also
 # names something compare_enumerations' own output confirms exists.
+#
+# Phase 0.3 (T13a evidence-integrity false-retry fix, 2026-10-30): the bare
+# polarity words (gap/missing/absent/uncovered) flip meaning under a directly
+# preceding negation -- "these are NOT missing" asserts the OPPOSITE of a gap
+# claim, but the un-guarded word match could not tell the two apart. Confirmed
+# live and reproduced directly against this exact regex: K4's own
+# deterministic, authoritative template text (_synthesize_comparison_answer)
+# contains "...differing on a named attribute -- these are NOT missing:" and
+# "...coverage for these is UNRESOLVED, neither missing nor complete:" --
+# both correct, both negated, both tripped this line-level match anyway,
+# which is what let _evidence_integrity_check (swarm/team.py's own later,
+# separate evidence-integrity guard) flag an already-correct, already
+# verify_claims-clean K4 answer as contradicting a "comparison completeness/
+# gap" finding that was never actually made, triggering an unconstrained
+# regeneration that then fabricated fresh, unrelated identifiers. The four
+# OTHER alternatives below ("no corresponding", "not defined/found/...",
+# "without a counterpart", etc.) are themselves already negated constructions
+# -- the negation IS the gap signal there, so they are deliberately left
+# untouched; only the bare positive-polarity nouns needed this guard. Scoped
+# to a negation DIRECTLY preceding the word (one space, no intervening
+# words) -- the exact, confirmed shape of both incidents, not a broader
+# "somewhere earlier in the sentence" check that could blind this to a real
+# gap claim sharing a line with an unrelated negated clause.
 _GAP_CLAIM_LINE_RE = re.compile(
-    r"\b(?:gap|missing|absent|uncovered|no corresponding|"
+    r"\b(?:(?<!not\s)(?<!n't\s)(?<!never\s)(?<!neither\s)"
+    r"(?:gap|missing|absent|uncovered)|no corresponding|"
     r"not (?:defined|found|present|covered|implemented|exist(?:s|ing)?)|"
     # "no frontend list function", "no corresponding action" -- up to 3 words
     # of adjectives/qualifiers between "no" and the thing claimed absent, the
