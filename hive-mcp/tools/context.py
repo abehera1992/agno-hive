@@ -22,12 +22,33 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import TypedDict
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import config
 from config import PROJECT_ROOT
 
 from .exclusions import EXCLUDE_DIRS, is_excluded, rg_args
+
+# Phase 0.18: structured find_files result (ToolResult.structured_content),
+# alongside the existing human-readable text (ToolResult.content) -- see
+# find_files' own docstring for why. FastMCP generates this tool's
+# outputSchema from the return-type annotation below and validates every
+# ToolResult.structured_content against it, so the annotation and the dict
+# _find_files_result actually builds must stay in exact agreement.
+from fastmcp.tools.tool import ToolResult
+
+
+class FileMatchResult(TypedDict):
+    path: str
+
+
+class FindFilesResult(TypedDict):
+    status: str                    # "found" | "no_matches" | "error"
+    query: str
+    matches: "list[FileMatchResult]"
+    suggestions: "list[str]"
+    error: "str | None"
 
 # Exclusions live in one place and apply to search, read, write, scan and index alike.
 # Project-specific entries come from EXCLUDE_DIRS / EXCLUDE_GLOBS in the project env.
@@ -707,7 +728,33 @@ def _rg_glob(rg: str, glob_pattern: str, max_results: int) -> list[str]:
     return sorted([l for l in result.stdout.splitlines() if l.strip()][:max_results])
 
 
-def find_files(glob_pattern: str, max_results: int = 200) -> str:
+def _find_files_result(status: str, query: str, matches: "list[str]",
+                       suggestions: "list[str]", error: "str | None") -> FindFilesResult:
+    """Build the structured half of find_files' ToolResult. Every path in
+    `matches` is already repository-relative by construction (ripgrep's own
+    --files output under cwd=PROJECT_ROOT, or pathlib's relative_to(
+    PROJECT_ROOT)) -- never derived from `query`, `suggestions`, or any
+    prose. Re-validated here anyway, defense in depth: a match that is
+    absolute, escapes the root via '..', or does not actually exist on disk
+    is dropped rather than ever reaching a caller as "found" evidence."""
+    safe_matches: list[FileMatchResult] = []
+    for m in matches:
+        p = (m or "").strip()
+        if not p or p.startswith("/") or p.startswith("\\") or ".." in Path(p).parts:
+            continue
+        if not (PROJECT_ROOT / p.rstrip("/")).exists():
+            continue
+        safe_matches.append({"path": p})
+    return {
+        "status": status,
+        "query": query,
+        "matches": safe_matches,
+        "suggestions": list(suggestions or []),
+        "error": error,
+    }
+
+
+def find_files(glob_pattern: str, max_results: int = 200) -> FindFilesResult:
     """
     Find files by glob pattern. Returns paths relative to project root.
     Uses ripgrep when available (fast, respects .gitignore); falls back to pathlib.
@@ -724,6 +771,21 @@ def find_files(glob_pattern: str, max_results: int = 200) -> str:
         find_files('src/lib/api/services/**') → frontend service files (auto-prefixed)
         find_files('**/Dockerfile*')        → all Dockerfiles
         find_files('**/.env*')              → env files
+
+    Phase 0.18: returns a structured result (status/query/matches/
+    suggestions/error) alongside the SAME human-readable text this tool
+    always returned, via FastMCP's ToolResult(content=..., structured_
+    content=...) -- the text a model-facing caller sees is byte-for-byte
+    unchanged; a programmatic caller (AgnoHive's _repo_find_files) should
+    read the structured result instead of parsing this prose. This closes
+    a confirmed live defect (Phase 0.17): a scoped lookup's own "No matches
+    for: X — ... Did you mean: Y?" guidance text, when parsed as if it were
+    a result listing, let the echoed query path AND the suggested
+    alternative both become false "found" candidates. Neither `query` nor
+    `suggestions` below is ever a match; a genuine zero-result search
+    returns `matches: []` with status "no_matches", not an error, and a
+    genuine operational failure returns status "error" with `error` set,
+    distinguishable from an honest no-match.
     """
     import shutil
     rg = shutil.which("rg")
@@ -736,8 +798,15 @@ def find_files(glob_pattern: str, max_results: int = 200) -> str:
                     if matches:
                         break
             if not matches:
-                return f"No matches for: {glob_pattern}{_did_you_mean_glob(glob_pattern)}"
-            return f"{len(matches)} result(s) for '{glob_pattern}':\n" + "\n".join(matches)
+                hint, suggestions = _did_you_mean_glob_detailed(glob_pattern)
+                return ToolResult(
+                    content=f"No matches for: {glob_pattern}{hint}",
+                    structured_content=_find_files_result(
+                        "no_matches", glob_pattern, [], suggestions, None))
+            return ToolResult(
+                content=f"{len(matches)} result(s) for '{glob_pattern}':\n" + "\n".join(matches),
+                structured_content=_find_files_result(
+                    "found", glob_pattern, matches, [], None))
         except Exception:
             pass  # fall through to pathlib
 
@@ -755,11 +824,17 @@ def find_files(glob_pattern: str, max_results: int = 200) -> str:
             if matches:
                 break
     except Exception as e:
-        return f"find_files failed: {e}"
+        return ToolResult(
+            content=f"find_files failed: {e}",
+            structured_content=_find_files_result("error", glob_pattern, [], [], str(e)))
 
     if not matches:
-        return f"No matches for: {glob_pattern}"
-    return f"{len(matches)} result(s) for '{glob_pattern}':\n" + "\n".join(matches)
+        return ToolResult(
+            content=f"No matches for: {glob_pattern}",
+            structured_content=_find_files_result("no_matches", glob_pattern, [], [], None))
+    return ToolResult(
+        content=f"{len(matches)} result(s) for '{glob_pattern}':\n" + "\n".join(matches),
+        structured_content=_find_files_result("found", glob_pattern, matches, [], None))
 
 
 def _zero_glob_note(glob_filter: str) -> str:
@@ -1154,6 +1229,73 @@ def _glob_hint_bases(first_segment: str):
     return found
 
 
+def _did_you_mean_glob_detailed(glob_pattern: str) -> "tuple[str, list[str]]":
+    """(prose_suffix, suggestion_names) -- the same near-miss logic
+    _did_you_mean_glob already implements, refactored to ALSO return the raw
+    suggestion names as a real list, not just embedded inside a prose
+    sentence. Added Phase 0.18: find_files' own structured_content needs
+    genuine suggestion names it can put in a `suggestions` field, separate
+    from `matches` -- re-parsing this function's own prose with a regex
+    would reintroduce exactly the "derive filesystem facts from arbitrary
+    text" pattern this phase exists to eliminate, even for text this
+    codebase generates itself. _did_you_mean_glob below is now a thin
+    wrapper over this function (single source of truth for the walk logic;
+    its own prose-only return value and behavior are unchanged for its
+    existing caller).
+
+    Returns ("", []) when there is nothing useful to say.
+    """
+    def _walk(cursor, segments: list[str], walked: list[str]) -> "tuple[str, list[str]]":
+        for part in segments:
+            if any(ch in part for ch in "*?["):
+                return "", []                      # reached the wildcard with everything real
+            candidate = cursor / part
+            if candidate.exists():
+                cursor = candidate
+                walked = walked + [part]
+                continue
+            if not cursor.is_dir():
+                return "", []
+            siblings = [p.name for p in cursor.iterdir()
+                        if not p.name.startswith(".") and p.name not in _IGNORE_DIRS]
+            close = _prefix_filtered_matches(part, siblings)
+            if not close:
+                return "", []
+            shown = "/".join(walked) or "."
+            return (f" — the path prefix does not exist: no '{part}' in {shown}/. "
+                    f"Did you mean: {', '.join(close)}? "
+                    f"A glob that matches nothing because its DIRECTORY is wrong is not "
+                    f"evidence that the thing you are looking for is absent.", close)
+        return "", []
+
+    try:
+        raw = (glob_pattern or "").strip().strip("/")
+        if not raw or "/" not in raw:
+            return "", []
+        segments = raw.split("/")
+
+        hint, sugg = _walk(PROJECT_ROOT, segments, [])
+        if hint:
+            return hint, sugg
+
+        first = segments[0]
+        if any(ch in first for ch in "*?["):
+            return "", []
+        for base in _glob_hint_bases(first):
+            hint, sugg = _walk(base, segments[1:],
+                               list(base.relative_to(PROJECT_ROOT).parts))
+            if hint:
+                return hint, sugg
+
+        if not (PROJECT_ROOT / first).exists():
+            return (f" — the path prefix does not exist: no '{first}' in ./. "
+                    f"A glob that matches nothing because its DIRECTORY is wrong is not "
+                    f"evidence that the thing you are looking for is absent.", [])
+        return "", []
+    except Exception:
+        return "", []
+
+
 def _did_you_mean_glob(glob_pattern: str) -> str:
     """Near-miss suggestion for a glob whose LITERAL directory prefix does not exist.
 
@@ -1174,99 +1316,13 @@ def _did_you_mean_glob(glob_pattern: str) -> str:
     Only the leading LITERAL segments are checked -- everything up to the first segment
     containing a wildcard. A pattern like `**/*.py` has no literal prefix and is
     correctly left alone.
+
+    Phase 0.18: now a thin wrapper over _did_you_mean_glob_detailed, which has
+    the real (unchanged) walk logic and also returns the suggestion names as
+    a structured list for find_files' own structured_content. This function's
+    own signature and return value are unchanged for its existing caller.
     """
-    import difflib
-
-    def _walk(cursor, segments: list[str], walked: list[str]) -> str:
-        for part in segments:
-            if any(ch in part for ch in "*?["):
-                return ""                      # reached the wildcard with everything real
-            candidate = cursor / part
-            if candidate.exists():
-                cursor = candidate
-                walked = walked + [part]
-                continue
-            if not cursor.is_dir():
-                return ""
-            # Files included, not just directories (fixed 2026-08-23, same day, from a
-            # live miss). A glob segment followed by ** must BE a directory, so it is
-            # tempting to only offer directories -- but the useful answer is often that
-            # the thing is a FILE. Live: find_files('API/business-service/models/**/*.py')
-            # matched nothing and stayed silent because the real `models.py` is a flat
-            # file and was filtered out of the candidates. "Did you mean: models.py?"
-            # is exactly the correction needed, and withholding it left the agent to
-            # keep guessing.
-            siblings = [p.name for p in cursor.iterdir()
-                        if not p.name.startswith(".") and p.name not in _IGNORE_DIRS]
-            close = _prefix_filtered_matches(part, siblings)
-            if not close:
-                # Still "" here, NOT the bare locating message: the caller's next move
-                # is to re-resolve this segment under the fallback prefixes, and that
-                # is where 'inventory-service/models/**' finds API/inventory-service and
-                # produces the good "Did you mean: models.py?" hint. Returning a message
-                # from here short-circuits that -- caught live while making this change,
-                # having turned a correct hint into a useless one. The bare locating
-                # message is emitted once, at the end, only after every resolution has
-                # failed.
-                return ""
-            shown = "/".join(walked) or "."
-            return (f" — the path prefix does not exist: no '{part}' in {shown}/. "
-                    f"Did you mean: {', '.join(close)}? "
-                    f"A glob that matches nothing because its DIRECTORY is wrong is not "
-                    f"evidence that the thing you are looking for is absent.")
-        return ""
-
-    try:
-        raw = (glob_pattern or "").strip().strip("/")
-        if not raw or "/" not in raw:
-            return ""
-        segments = raw.split("/")
-
-        hint = _walk(PROJECT_ROOT, segments, [])
-        if hint:
-            return hint
-
-        # Resolve the base the way find_files itself does (2026-08-24). find_files
-        # retries a failed pattern under each of _GLOB_FALLBACK_PREFIXES, "**"
-        # included, so 'inventory-service/router/**/*' resolves happily without the
-        # real 'API/' prefix. This helper walked LITERALLY from PROJECT_ROOT, so the
-        # same prefix-less pattern died on segment one -- no 'inventory-service' at
-        # the root, no top-level sibling close enough to suggest -- and returned "".
-        #
-        # That asymmetry is the trap, not the missing prefix: prefix-less patterns
-        # work often enough that an agent never learns its paths are malformed, and
-        # then a genuinely wrong one comes back as a bare dead end with no correction.
-        #
-        # Live cost (T12, 2026-08-24): a Researcher searched
-        # 'inventory-service/models/**/*.py', got "No matches", and reported that the
-        # inventory service HAS NO MODELS and that its data models are all defined in
-        # business-service. API/inventory-service/models.py is 32,437 bytes and
-        # defines 33 SQLAlchemy classes -- Item, ItemCategory, StockLevel, Voucher,
-        # Party and the rest. Handed the fully-qualified pattern, this function
-        # already produced exactly the right correction ("Did you mean: models.py?");
-        # it simply never got the chance.
-        first = segments[0]
-        if any(ch in first for ch in "*?["):
-            return ""
-        for base in _glob_hint_bases(first):
-            hint = _walk(base, segments[1:],
-                         list(base.relative_to(PROJECT_ROOT).parts))
-            if hint:
-                return hint
-
-        # Nothing resolved and nothing worth suggesting -- say where the trail died
-        # anyway. "No matches" alone reads as "the thing is absent"; naming the segment
-        # that does not exist says the PATH was wrong, which is a different and far more
-        # actionable statement. This is the half that was always correct in T4's
-        # "no 'backend' in ./. Did you mean: krakend?" -- worth keeping now that the
-        # bad guess beside it is gone.
-        if not (PROJECT_ROOT / first).exists():
-            return (f" — the path prefix does not exist: no '{first}' in ./. "
-                    f"A glob that matches nothing because its DIRECTORY is wrong is not "
-                    f"evidence that the thing you are looking for is absent.")
-        return ""
-    except Exception:
-        return ""
+    return _did_you_mean_glob_detailed(glob_pattern)[0]
 
 
 def _did_you_mean(relative_path: str) -> str:
