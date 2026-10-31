@@ -2110,7 +2110,10 @@ def _make_required_tool_clearing_hook(required_tool_states: dict):
     return _required_tool_clearing_hook
 
 
-def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = None):
+def _make_forward_member_answer(
+        member_answers: dict, forwarded: dict | None = None,
+        delegation_generation: dict | None = None,
+        member_result_generation: dict | None = None):
     """Build the coordinator's forward tool over the live member-results map.
 
     `forwarded` (default None = no recording, the pre-2026-09-21 behaviour) receives the
@@ -2118,6 +2121,17 @@ def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = N
     a short receipt instead of the text, and _with_forwarded_evidence puts the recorded
     text into the final answer -- the runtime carries it, so a coordinator that retypes,
     paraphrases or forgets it cannot lose it.
+
+    `delegation_generation`/`member_result_generation` (Phase 0.23, both default None =
+    no staleness check, the exact pre-existing behaviour for any caller that does not
+    pass them): the live _make_read_cache_tool_hook counter and its member_answers-write-
+    time snapshot (see member_result_generation's own module-level comment at its
+    definition for the live incident this closes). When both are supplied, a member_id
+    whose CURRENT delegation generation is newer than the generation its stored answer
+    was captured at means that newer delegation has not finished yet -- the stored text
+    is a real answer, just not to the question just asked. Treated exactly like "nothing
+    stored yet" (the existing NO RESULT message, unchanged), never surfaced as a
+    confident FORWARDED success for the wrong delegation.
 
     Why forwarding rather than another guard: LangChain's multi-agent benchmark found a
     supervisor architecture underperforming for exactly the reason measured here -- the
@@ -2169,6 +2183,33 @@ def _make_forward_member_answer(member_answers: dict, forwarded: dict | None = N
         # execution boundary every tool call already passes through, for
         # whichever tool policy ever names next, not just this one.
         key = _member_key(str(member_id or "").strip())
+        # Phase 0.23: a NEWER delegation to this member is still in flight if its
+        # own delegation_generation counter is ahead of the generation the
+        # CURRENTLY stored answer was captured at -- the stored text is real,
+        # just not an answer to whatever was most recently asked. Checked
+        # BEFORE the "nothing stored" branch below: a stale answer from an
+        # earlier delegation is truthy, so it would otherwise sail past that
+        # check and be forwarded as if it answered the current question.
+        if delegation_generation is not None and member_result_generation is not None:
+            _current_gen = delegation_generation.get(key, 0)
+            _captured_gen = member_result_generation.get(key, 0)
+            if _current_gen > _captured_gen:
+                print(f"[team] forward_member_answer: {key!r}'s stored answer is from "
+                      f"an EARLIER delegation (generation {_captured_gen} of "
+                      f"{_current_gen}) -- the current delegation has not finished "
+                      f"yet, refusing to forward stale content as if it were new",
+                      flush=True)
+                return (
+                    f"NOT YET: the most recent delegate_task_to_member call for "
+                    f"{member_id!r} has not finished -- {member_id!r}'s stored answer "
+                    f"is still the one from the PREVIOUS delegation, not an answer to "
+                    f"what you most recently asked. Forwarding it now would attach the "
+                    f"wrong evidence to your answer. Do not delegate to {member_id!r} "
+                    f"again (one is already running) -- wait and call "
+                    f"forward_member_answer for {member_id!r} again shortly, or, if "
+                    f"you cannot wait any longer, write your answer now stating plainly "
+                    f"that this part is still unresolved rather than guessing at it."
+                )
         text = (member_answers or {}).get(key)
         if not text:
             have = sorted(k for k, v in (member_answers or {}).items() if v)
@@ -18821,6 +18862,10 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # uses for its own closure-local counter.
     _read_cache_tool_hook.state = read_state
     _read_cache_tool_hook.evidence_ledger = evidence_ledger
+    # Phase 0.23: exposed the same way -- see member_result_generation's own
+    # module-level comment (where member_answers is defined) for why
+    # forward_member_answer needs read access to this live counter.
+    _read_cache_tool_hook.delegation_generation = delegation_generation
     return _read_cache_tool_hook
 
 
@@ -22541,6 +22586,26 @@ def _build_team(
     # this exact object and team._member_results is bound to it below, so both sides read
     # one map rather than two that can drift.
     member_answers: dict[str, str] = {}
+    # Phase 0.23 (2026-10-31): which delegation_generation (see
+    # _make_read_cache_tool_hook's own dict, exposed below as
+    # team._delegation_generation) each member_answers[key] actually
+    # corresponds to, recorded at the SAME moment _capture_member_result
+    # writes member_answers[key] -- see each of that logic's two write
+    # sites for where. Lets forward_member_answer tell "this member's
+    # CURRENT delegation already finished and wrote a fresh answer" apart
+    # from "this member's result slot still holds an EARLIER delegation's
+    # leftover, because the current one is still running" -- confirmed
+    # live (the T13a run on 49b1f83): the Coordinator called
+    # forward_member_answer('researcher') four times in a row for the
+    # hooks delegation and got the SAME stale tables answer every time
+    # (member_answers['researcher'] genuinely had not been overwritten
+    # yet -- the hooks delegation's own Researcher run was still actively
+    # generating, 20+ tool calls in), with nothing in forward_member_
+    # answer's own "FORWARDED" response telling the Coordinator this was
+    # not the NEW result it had just asked for. The Coordinator eventually
+    # gave up and fabricated plausible-sounding hook names instead of
+    # waiting or disclosing uncertainty.
+    member_result_generation: dict[str, int] = {}
     # Exact member text captured by forward_member_answer at forward time; bound to
     # team._forwarded_members below and read by _with_forwarded_evidence. Values are
     # normally `str` (one forward per member, the pre-T13-fix shape every existing
@@ -22762,7 +22827,9 @@ def _build_team(
     if FORWARD_MEMBER_ANSWER_TOOL in set(
             team_config.get_extra_tools(team_name or "", "Coordinator")):
         coordinator_tools_list.append(
-            _make_forward_member_answer(member_answers, forwarded_members))
+            _make_forward_member_answer(
+                member_answers, forwarded_members,
+                read_cache_hook.delegation_generation, member_result_generation))
         # Copied, never mutated in place: `instructions` belongs to the caller and is
         # reused across runs in the same process, so appending to it directly would make
         # the block accumulate once per run.
@@ -22928,6 +22995,12 @@ def _build_team(
     team._member_results = member_answers
     team._forwarded_members = forwarded_members
     team._required_tool_states = _required_tool_states
+    # Phase 0.23: exposed for the two team._member_results write sites to record
+    # which delegation generation produced each answer, and for
+    # forward_member_answer's own staleness check -- see member_result_
+    # generation's own module-level comment for the live incident this closes.
+    team._delegation_generation = read_cache_hook.delegation_generation
+    team._member_result_generation = member_result_generation
     # Phase O.1 fix (2026-10-04, live NameError on first smoke test): _finalise_
     # member_chunks is a module-level function, not a closure inside _build_team
     # -- it never had `team_name` in scope. Attached here, same pattern as every
@@ -23329,6 +23402,14 @@ def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
     if not isinstance(getattr(team, "_member_results", None), dict):
         team._member_results = {}
     team._member_results[key] = text
+    # Phase 0.23: record which delegation generation this text was captured
+    # at, at the SAME moment it is written -- see member_result_generation's
+    # own module-level comment for why forward_member_answer needs this.
+    _dg = getattr(team, "_delegation_generation", None)
+    if isinstance(_dg, dict):
+        if not isinstance(getattr(team, "_member_result_generation", None), dict):
+            team._member_result_generation = {}
+        team._member_result_generation[key] = _dg.get(key, 0)
     # Phase P.2 (2026-10-04): tag the delegation-log entry this text actually belongs
     # to, now that it exists -- the bridge set at dispatch time (see the duplicate-
     # delegation gate's log.append call site).
@@ -25482,7 +25563,15 @@ def _record_stream_artifacts(team, out: dict) -> None:
         # bucket, the same normalisation the delegation gate matches on.
         if not isinstance(getattr(team, "_member_results", None), dict):
             team._member_results = {}
-        team._member_results[_member_key(out.get("agent_name", ""))] = out["content"]
+        _mk = _member_key(out.get("agent_name", ""))
+        team._member_results[_mk] = out["content"]
+        # Phase 0.23: same generation-stamping as _finalise_member_chunks' own
+        # write site -- see member_result_generation's own module-level comment.
+        _dg = getattr(team, "_delegation_generation", None)
+        if isinstance(_dg, dict):
+            if not isinstance(getattr(team, "_member_result_generation", None), dict):
+                team._member_result_generation = {}
+            team._member_result_generation[_mk] = _dg.get(_mk, 0)
         # Running total of what has landed in the COORDINATOR's context. Every member
         # result is appended there verbatim, so this is the quantity that actually
         # grows toward the model's context limit -- see _delegation_budget_exhausted.
