@@ -15991,6 +15991,19 @@ _BATCH_HINT_EVERY = 8
 # and far below the 77-call runaway it is built to stop.
 _LITERAL_SEARCH_PROBE_LIMIT = 20
 
+# Phase 0.5 (T13a search-first discovery gap, 2026-10-30): the exact path:line:
+# shape BOTH search_files and search_files_batch render their own matching lines
+# in (confirmed directly against hive-mcp/tools/context.py: search_files's rg
+# branch reformats to f"{path}:{line}: {content}", its Python fallback renders
+# f"{rel}:{i}: {line.rstrip()}", and search_files_batch is search_files run in
+# parallel per glob under "=== glob: ... ===" headers that this pattern simply
+# does not match -- so it extracts real matched-file paths from either tool's
+# output without caring which one produced it). Used only to name a SINGLE
+# candidate path for a follow-up read -- never to decide anything about route
+# shape, completeness, or comparison eligibility, all of which stay exactly
+# where they already lived (_candidate_has_route_shape, _computed_comparison).
+_SEARCH_RESULT_PATH_RE = re.compile(r"^([\w./-]+):\d+: ", re.MULTILINE)
+
 # A pattern with no regex metacharacter at all -- a bare identifier guess, not an
 # alternation/wildcard attempt. Deliberately narrow (word characters only) so a
 # model that DOES try `first|second|third` or `use\w*Query` is never penalized for
@@ -17366,6 +17379,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         # enters that branch, where a branch-local binding would be a NameError.
         batch_hint = ""
         literal_probe_note = ""
+        search_candidate_note = ""
 
         # Checked BEFORE calling the real function (unlike the identical-args
         # cache below, which only avoids a re-call once cache_key repeats
@@ -17591,6 +17605,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             # this closure already has result/args/agent and the batch-hint's own
             # per-(agent, tool) counting right above it.
             literal_probe_note = ""
+            search_candidate_note = ""
             if function_name == "search_files":
                 _pattern = str((args or {}).get("pattern", "")).strip()
                 _streak_key = (norm_agent_key, function_name)
@@ -17767,6 +17782,37 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     "missed": (isinstance(result, str)
                                and result.lstrip().startswith("No matches for:")),
                 })
+                # Phase 0.5: search_files/search_files_batch can only ever return
+                # matching LINES (rg --max-count 1 per file, confirmed directly
+                # against hive-mcp/tools/context.py) -- never a file's full
+                # content, so a search result can never be promoted into a
+                # complete enumeration operand (Case B from this phase's own
+                # evidence contract is structurally unreachable for these two
+                # tools; this is a confirmed limitation, not an oversight). The
+                # ONLY safe thing a search result can do here is name a SINGLE
+                # candidate path for a follow-up read -- recorded nowhere, fed
+                # into no decision, just surfaced back to the model exactly the
+                # way the pre-existing batch_hint/literal_probe_note channel
+                # already surfaces other advisory text on this same tool result.
+                # Never fires for a multi-file sweep (several distinct paths),
+                # which is exactly the shape this phase's scope forbids treating
+                # as complete evidence for every file it mentions.
+                if isinstance(result, str):
+                    _search_paths = sorted(set(_SEARCH_RESULT_PATH_RE.findall(result)))
+                    if len(_search_paths) == 1:
+                        _cand_path = _search_paths[0]
+                        if (_cand_path.lower().endswith((".py", ".ts", ".tsx", ".js", ".jsx"))
+                                and _cand_path not in (read_state.get("enumerations") or {})):
+                            search_candidate_note = (
+                                f"\n\nNOTE FROM THE RUN, not from the tool: this "
+                                f"search's only match is in {_cand_path!r} -- these "
+                                f"are matching line(s) only, not that file's full "
+                                f"content. If {_cand_path!r} is one side of a "
+                                f"comparison or enumeration this task needs, call "
+                                f"get_file_content({_cand_path!r}) before relying on "
+                                f"it as a complete list -- a search result is never "
+                                f"a substitute for reading the file."
+                            )
             # find_files misses too (2026-08-27). Only search_files was recorded, and
             # the disproof that mattered most came from find_files: leg 3 ran
             # find_files('API/inventory-service/clients/*.py'), got "No matches", and
@@ -17850,12 +17896,13 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 f"earlier report this run. Reason from it directly for the CURRENT "
                 f"task.\n\n" + result
             )
-        # The batch hint (and the T39 literal-probe note, same channel, same reason)
-        # ride back attached to the real result -- a print alone goes to the journal,
-        # where the model cannot read it. Only for str results; a non-str would be
+        # The batch hint (and the T39 literal-probe note, and the Phase 0.5
+        # search-candidate note, same channel, same reason) ride back attached
+        # to the real result -- a print alone goes to the journal, where the
+        # model cannot read it. Only for str results; a non-str would be
         # corrupted by concatenation, and the prints above still record it either way.
-        if (batch_hint or literal_probe_note) and isinstance(result, str):
-            return result + batch_hint + literal_probe_note
+        if (batch_hint or literal_probe_note or search_candidate_note) and isinstance(result, str):
+            return result + batch_hint + literal_probe_note + search_candidate_note
         # Same channel as batch_hint, for the same reason: a print reaches the journal,
         # not the model. Fires only when an English-phrase search returned nothing but
         # documentation -- the search that has failed T11 for three batteries while
