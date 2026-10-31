@@ -11903,6 +11903,59 @@ def _balanced_path(token: str) -> str:
     return token
 
 
+def _structured_find_files_matches(structured: dict) -> "list[str] | None":
+    """Phase 0.18: paths from hive-mcp's find_files own structured_content
+    (status/query/matches/suggestions/error -- see hive-mcp/tools/context.py's
+    find_files and _find_files_result), validated defensively -- never trusts
+    shape alone. Returns:
+      - a list (possibly empty) of real candidate paths for status "found"/
+        "no_matches",
+      - None for status "error" OR any malformed/unrecognized shape (missing
+        "status", a status outside the three known values, a non-list
+        "matches", or a match entry with no usable "path") -- the SAME
+        "lookup failed, not an empty result" signal this function's own
+        caller (_repo_find_files) already uses, so a malformed structured
+        result can never be silently read as "confirmed zero matches."
+
+    Never extracts a candidate from `query`, `suggestions`, or `error` --
+    only from `matches[].path`, and only when that whole shape validates.
+    `_balanced_path` is intentionally NOT applied here: a structured path
+    came from a real filesystem listing server-side, not from token-matching
+    arbitrary prose, so there is nothing for it to balance/repair.
+
+    Path safety is defense-in-depth here, not the primary check -- hive-mcp's
+    own _find_files_result already validates containment and real existence
+    server-side (it has the actual filesystem; this process does not). This
+    function additionally rejects any path that is absolute or carries a
+    '..' traversal segment, purely from the string's own shape, so a future
+    server-side regression cannot silently hand this process an escaping
+    path as if it were a normal match.
+    """
+    if not isinstance(structured, dict):
+        return None
+    status = structured.get("status")
+    if status not in ("found", "no_matches", "error"):
+        return None
+    if status == "error":
+        return None
+    raw_matches = structured.get("matches")
+    if not isinstance(raw_matches, list):
+        return None
+    out: list[str] = []
+    for entry in raw_matches:
+        if not isinstance(entry, dict):
+            continue
+        p = entry.get("path")
+        if not (isinstance(p, str) and p.strip()):
+            continue
+        p = p.strip()
+        norm = p.replace("\\", "/")
+        if norm.startswith("/") or ":" in norm.split("/", 1)[0] or ".." in norm.split("/"):
+            continue
+        out.append(p)
+    return out
+
+
 async def _repo_find_files(glob_pattern: str, hive_mcp_url: str | None,
                            hive_mcp_tools=None) -> list[str] | None:
     """Paths matching `glob_pattern`, from hive-mcp's find_files.
@@ -11911,13 +11964,24 @@ async def _repo_find_files(glob_pattern: str, hive_mcp_url: str | None,
     _repo_match_count, whose session handling this mirrors exactly (live session first,
     fresh connection only as a fallback; opening a new streamablehttp_client while the
     run's own connections are open is the step confirmed to hang on 2026-08-20).
+
+    Phase 0.18: prefers hive-mcp's structured find_files result
+    (CallToolResult.structuredContent) as the authoritative source, falling
+    back to the original prose-token extraction ONLY when structured content
+    is absent entirely (an older hive-mcp deployment, or a tool that never
+    adopted the structured contract) -- never when it is PRESENT but empty/
+    error, which is itself a real, trustworthy answer. Confirmed live
+    (Phase 0.17): the prose-parsing path previously in sole use here
+    manufactured two false "found" candidates out of a genuine "no matches,
+    did you mean X" guidance message -- the echoed query path and the
+    suggested alternative -- which this phase exists to stop relying on.
     """
     if not (hive_mcp_url or hive_mcp_tools):
         return None
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
-    box: dict = {"paths": None}
+    box: dict = {"paths": None, "source": None}
 
     async def _ask(session) -> None:
         res = await session.call_tool("find_files", {"glob_pattern": glob_pattern})
@@ -11925,6 +11989,22 @@ async def _repo_find_files(glob_pattern: str, hive_mcp_url: str | None,
         if err:
             print(f"[team] scope guard: find_files rejected ({glob_pattern!r}): {err}")
             return
+        structured = getattr(res, "structuredContent", None)
+        if structured is not None:
+            paths = _structured_find_files_matches(structured)
+            if paths is not None:
+                box["paths"] = paths
+                box["source"] = f"structured ({structured.get('status')!r})"
+                return
+            print(f"[team] scope guard: find_files structuredContent present but "
+                  f"malformed/error for {glob_pattern!r} -- treating as an "
+                  f"unresolved lookup, not a confirmed no-match: {structured!r}")
+            box["source"] = "structured (malformed/error -> unresolved)"
+            return
+        # No structuredContent at all -- fall back to the original prose-token
+        # extraction, explicitly logged as such so the two paths stay
+        # distinguishable during validation.
+        box["source"] = "text-fallback (no structuredContent)"
         text = _extract_mcp_text(res)
         found = _PATH_TOKEN_RE.findall(text)
         box["paths"] = [p for p in
@@ -11949,6 +12029,10 @@ async def _repo_find_files(glob_pattern: str, hive_mcp_url: str | None,
         except Exception as exc:  # noqa: BLE001
             print(f"[team] scope guard: find_files failed "
                   f"({type(exc).__name__}: {exc or '<no message>'})")
+    if box["source"]:
+        print(f"[team] scope guard: find_files({glob_pattern!r}) resolved via "
+              f"{box['source']} -> {len(box['paths']) if box['paths'] is not None else 'None'} "
+              f"candidate(s)", flush=True)
     return box["paths"]
 
 
