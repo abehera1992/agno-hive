@@ -14669,6 +14669,38 @@ def _structural_category_evidence(category: str, structural_text: str) -> "bool 
     return False
 
 
+def _matched_symbols_for_category(category: str, structural_text: str) -> "list[str]":
+    """Phase 0.16: the ACTUAL exported symbol names (not just the bool
+    _structural_category_evidence returns) that make `structural_text`
+    count as "hooks" evidence for one already-resolved dependency file --
+    so a caller building a reconciliation-retry prompt (_attempt_coverage_
+    correction) can name the real hook list explicitly, instead of only
+    handing over a content excerpt and hoping the model re-derives the
+    same list unaided. Directly addresses the comparison-operand problem
+    (Phase 0.14/0.15: compare_enumerations was run against a page/component
+    that imports hooks, not the API slice that defines them, producing a
+    misleadingly lopsided left=9/right=0/matched=0 result) without
+    touching compare_enumerations itself, which is a separate, separately-
+    deployed hive-mcp tool outside this phase's deployment scope.
+
+    Deliberately scoped to "hooks" only -- the one category this phase's
+    own T13a failure concretely needs (RTK Query generated hook names in a
+    TS/JS EXPORTS section). Returns [] for every other category or an
+    unindexable file, never raises, and never guesses: an empty list means
+    "no explicit symbol list available here", the caller's existing
+    content-excerpt fallback still applies unchanged.
+    """
+    if category != "hooks":
+        return []
+    if not _STRUCTURAL_INDEXABLE_RE.search(structural_text or ""):
+        return []
+    if _STRUCTURAL_INDEXABLE_RE.search(structural_text).group(1) != "true":
+        return []
+    sections = {m.group(1): m.group(2)
+                for m in _STRUCTURAL_SECTION_RE.finditer(structural_text)}
+    return sorted(set(_REACT_HOOK_IDENTIFIER_RE.findall(sections.get("EXPORTS", ""))))
+
+
 async def _content_matches_category(
         category: str, content: str, file_path: str,
         hive_mcp_url: str | None, hive_mcp_tools,
@@ -14941,9 +14973,10 @@ async def _traverse_missing_category_dependencies(
         covered.add(matched_cat)
         still_missing.discard(matched_cat)
         excerpt = _excerpt_around_match(fetched, matched_cat, resolved_path)
+        matched_symbols = _matched_symbols_for_category(matched_cat, resolved_structural_text)
         entry = {"from": src_path, "spec": spec, "resolved_path": resolved_path,
                 "status": "resolved", "reason": reason, "content_excerpt": excerpt,
-                "matched_category": matched_cat}
+                "matched_category": matched_cat, "matched_symbols": matched_symbols}
         resolved.append(entry)
         attempted.append(entry)
     return frozenset(covered), resolved, attempted
@@ -14953,22 +14986,26 @@ _COVERAGE_CORRECTION_FLAG = "_coverage_correction_attempted"
 
 
 async def _comparison_coverage_gap(
-        task: str, content: str, team,
+        task: str, team,
         hive_mcp_url: str | None, hive_mcp_tools) -> "dict | None":
     """A comparison/gap-analysis task spanning 2+ subject categories (e.g.
-    "endpoints" vs "hooks") whose answer concludes an absence, checked
-    against whether BOTH sides were actually searched this run before that
-    conclusion is allowed to stand unqualified.
+    "endpoints" vs "hooks"), checked against whether BOTH sides were
+    actually searched this run before ANY conclusion about them -- absence,
+    presence, or silence -- is allowed to stand unqualified.
 
-    Reuses _COMPARISON_TASK_RE (the SAME detector that already selects the
-    comparison-discipline skill injection) and team._read_state["reads"]
-    (the existing, real read log) -- no new task-shape detector, no new
-    state store. Silent (returns None) in every case where there is nothing
-    to guard: the task isn't a qualifying multi-category comparison, the
-    answer makes no gap-shaped conclusion at all (checked with the SAME
-    regex against the answer's own text -- a model that already disclosed
-    UNRESOLVED needs no further gate action), or every named category
-    already has real, content-grounded coverage.
+    Phase 0.16: activation depends ONLY on the ORIGINAL task's own request
+    (team._original_task, or `task` as a fallback) and on real, already-read
+    source content -- never on whether the GENERATED ANSWER happens to use
+    a particular gap-shaped phrase. Reuses _COMPARISON_TASK_RE (the SAME
+    detector that already selects the comparison-discipline skill
+    injection) against the task, and team._read_state["reads"] (the
+    existing, real read log) -- no new task-shape detector, no new state
+    store. Silent (returns None) in every case where there is nothing to
+    guard: the task isn't a qualifying multi-category comparison, nothing
+    has been read yet, or every named category already has real,
+    content-grounded coverage (confirmed by _traverse_missing_category_
+    dependencies' own Pass 1, which costs nothing beyond re-checking
+    already-read files' content).
 
     When a gap is found, attempts ONE bounded dependency-traversal pass
     (_traverse_missing_category_dependencies) over files already read this
@@ -14981,38 +15018,32 @@ async def _comparison_coverage_gap(
     Returns None, or {"missing_cats": frozenset, "resolved": [...],
     "attempted": [...]} for _attempt_coverage_correction to act on.
     """
-    task_cats = _subject_categories(task or "")
-    if len(task_cats) < 2 or not _COMPARISON_TASK_RE.search(task or ""):
+    # Phase 0.16: both the qualifying-task check AND the category budget are
+    # now computed from the ORIGINAL task text (team._original_task, snapshot
+    # BEFORE run_task_async's own preflight-grounding mutation -- see that
+    # snapshot's own comment), never from a preflight-inflated `task` and
+    # never from the GENERATED ANSWER's wording. `task` itself (the
+    # parameter) is kept only as a fallback for a caller that never ran
+    # through that snapshot point (e.g. a future/alternate entry path),
+    # which reproduces this function's exact pre-Phase-0.16 behavior for
+    # that caller rather than silently doing nothing.
+    #
+    # Confirmed live (Phase 0.14, run 5ce43069c276): computing categories
+    # from the preflight-extended `task` gave 6 categories (['config',
+    # 'endpoints','hooks','import','migrations','tables']) instead of the 3
+    # the question actually asks about, diluting the shared traversal
+    # budget. Phase 0.15 worked around this by intersecting with the
+    # DELIVERED ANSWER's own categories -- removed here, since Phase 0.15's
+    # live run (5ce73639...) showed that same answer-dependence silently
+    # skipping this whole gate: _COMPARISON_TASK_RE never matched the
+    # generated wording ("do not have a direct frontend counterpart"), so
+    # the gate never even reached that intersection step. Reading the clean
+    # original task instead fixes the preflight-inflation problem at its
+    # actual source, with zero dependence on anything generated.
+    original_task = getattr(team, "_original_task", None) or task or ""
+    task_cats = _subject_categories(original_task)
+    if len(task_cats) < 2 or not _COMPARISON_TASK_RE.search(original_task):
         return None
-    if not _COMPARISON_TASK_RE.search(content or ""):
-        # The answer itself never asserted a gap-shaped conclusion (e.g. it
-        # already disclosed UNRESOLVED, or simply enumerated both sides
-        # without concluding an absence) -- nothing for this gate to guard.
-        return None
-
-    # T69.8 (Phase 0.15): restrict the categories the bounded traversal below
-    # spends _DEPENDENCY_TRAVERSAL_MAX_FILES on to ones the DELIVERED ANSWER
-    # actually discusses, not every category-shaped word anywhere in `task`.
-    # `task` can carry preflight-grounding facts appended ahead of the real
-    # question (project_map's own printed paths/filenames for an unrelated
-    # file it also found can literally contain words like "migrations" or
-    # "config"), which inflates _subject_categories(task) well past what the
-    # question is actually asking to compare. Confirmed live (Phase 0.14, run
-    # 5ce43069c276): task_cats computed as 6 categories (['config',
-    # 'endpoints','hooks','import','migrations','tables']) from the
-    # preflight-extended task string, while the delivered content's own
-    # _subject_categories is exactly the 3 the question is actually about
-    # (['endpoints','hooks','tables']) -- diluting the shared traversal
-    # budget across 3 extra categories the answer never substantively
-    # discusses, at the expense of the one ('hooks') whose real dependency
-    # (inventoryApi.ts) actually needed that budget to be followed.
-    # Intersecting with the content's own categories only ever NARROWS
-    # task_cats (never adds one), and falls back to the unnarrowed set if the
-    # intersection is empty (a genuinely contentless/degenerate draft), so
-    # this cannot make a category that previously got traversed become
-    # un-traversed.
-    content_cats = _subject_categories(content or "")
-    traversal_cats = (task_cats & content_cats) or task_cats
 
     read_state = getattr(team, "_read_state", None) or {}
     read_paths = [str(r.get("path") or "") for r in (read_state.get("reads") or [])
@@ -15020,24 +15051,29 @@ async def _comparison_coverage_gap(
     if not read_paths:
         return None
 
+    # Phase 0.16: activation is no longer gated on whether the GENERATED
+    # ANSWER happens to phrase a gap-shaped conclusion
+    # (_COMPARISON_TASK_RE.search(content), the entire Phase 0.14/0.15 gate,
+    # removed) -- the traversal itself is already fully source-grounded:
+    # Pass 1 checks only the REAL content of files already read this run,
+    # Pass 2 only follows REAL imports carrying a REAL category-relevance
+    # hint, bounded by the existing file budget. Running it unconditionally
+    # for every qualifying comparison task is safe and cheap when nothing is
+    # actually missing (Pass 1 alone resolves every category, Pass 2 never
+    # spends a single file on it -- confirmed by the early return below).
     covered_cats, resolved, attempted = await _traverse_missing_category_dependencies(
-        traversal_cats, read_paths, hive_mcp_url, hive_mcp_tools)
-    still_missing = traversal_cats - covered_cats
+        task_cats, read_paths, hive_mcp_url, hive_mcp_tools)
+    still_missing = task_cats - covered_cats
 
-    print(f"[team] coverage gate: task spans categories {sorted(task_cats)} "
-          f"(traversal scoped to {sorted(traversal_cats)} the answer actually "
-          f"discusses); content-grounded coverage found for {sorted(covered_cats)} "
+    print(f"[team] coverage gate: original task spans categories {sorted(task_cats)}; "
+          f"content-grounded coverage found for {sorted(covered_cats)} "
           f"({len(resolved)} via followed dependencies), leaving "
           f"{sorted(still_missing)} still uncovered", flush=True)
 
     if not resolved and not still_missing:
         return None
     return {"missing_cats": still_missing, "resolved": resolved, "attempted": attempted,
-            "task_cats": traversal_cats}
-
-
-_COVERAGE_GAP_BANNER_RE = re.compile(
-    r"\n\n---\n\*\*THIS COMPARISON MAY BE INCOMPLETE.*?\*\*", re.DOTALL)
+            "task_cats": task_cats}
 
 
 def _mandatory_coverage_disclosure(missing_cats: "frozenset[str]", task_cats) -> str:
@@ -15104,20 +15140,18 @@ async def _attempt_coverage_correction(
         return content
     setattr(team, _COVERAGE_CORRECTION_FLAG, True)
 
-    gap = await _comparison_coverage_gap(
-        task, _COVERAGE_GAP_BANNER_RE.sub("", content or ""), team,
-        hive_mcp_url, hive_mcp_tools)
+    gap = await _comparison_coverage_gap(task, team, hive_mcp_url, hive_mcp_tools)
     if not gap:
         return content
 
     missing_cats = gap["missing_cats"]
     resolved = gap["resolved"]
-    # T69.8: use the SAME (answer-narrowed) category set the gap itself
-    # traversed against, not a fresh _subject_categories(task) recompute --
-    # the latter would be the wider, preflight-inflated set and make the
-    # disclosure name categories the traversal never actually tried to
-    # cover, inconsistent with `missing_cats` (always a subset of the
-    # narrowed set by construction).
+    # Phase 0.16: use the SAME (original-task-derived) category set the gap
+    # itself traversed against, not a fresh _subject_categories(task)
+    # recompute -- the latter would read the (possibly preflight-inflated)
+    # `task` parameter and make the disclosure name categories the
+    # traversal never actually tried to cover, inconsistent with
+    # `missing_cats` (always a subset of the gap's own set by construction).
     task_cats = gap["task_cats"]
     disclosure = _mandatory_coverage_disclosure(missing_cats, task_cats)
 
@@ -15131,19 +15165,40 @@ async def _attempt_coverage_correction(
     print(f"[team] coverage-correction: traversal found {len(resolved)} dependency "
           f"file(s); {sorted(missing_cats) or '(now fully covered)'} still "
           f"uncovered -- one targeted reconciliation attempt", flush=True)
+    # Phase 0.16: name the explicit symbol list for any resolved dependency
+    # that has one (currently "hooks" only -- _matched_symbols_for_category's
+    # own scope), not just a raw content excerpt. Confirmed live (Phase
+    # 0.14/0.15): a page/component importing an API slice is NOT the
+    # authoritative symbol inventory -- compare_enumerations run against
+    # that page produced a misleading left=9/right=0/matched=0 result
+    # neither phase's retry corrected, because nothing told the model
+    # explicitly which file/symbols were actually authoritative. This does
+    # not touch compare_enumerations itself (a separate, separately-
+    # deployed hive-mcp tool outside this phase's scope) -- it gives the
+    # model the real list directly so a correct answer does not depend on
+    # the model re-invoking that tool against the right operand on its own.
     evidence_blocks = "\n\n".join(
         f"`{e['resolved_path']}` (reached via `{e['spec']}`, imported from "
-        f"`{e['from']}`):\n```\n{e['content_excerpt']}\n```"
+        f"`{e['from']}`)"
+        + (f" -- this file's own real exported {e['matched_category']}: "
+           f"{', '.join(e['matched_symbols'])}"
+           if e.get("matched_symbols") else "")
+        + f":\n```\n{e['content_excerpt']}\n```"
         for e in resolved)
     prompt = (
         f"{task}\n\nYou already produced an answer to this task below. Before "
         f"concluding any gap/absence, this run's own automatic dependency "
         f"traversal just found and read the following file(s), reached by "
         f"following imports from files you already read, which your answer "
-        f"did not examine:\n\n{evidence_blocks}\n\nReconcile your conclusion "
-        f"against this evidence -- it may close the gap you reported, or the "
-        f"gap may still hold once this is accounted for. Do not discard or "
-        f"rewrite content unrelated to this comparison.\n\n"
+        f"did not examine:\n\n{evidence_blocks}\n\nIf you previously compared "
+        f"against a page or component file (rather than the file(s) named "
+        f"above), that comparison's operand was very likely wrong -- a page "
+        f"that merely IMPORTS a hook is not the authoritative source for "
+        f"which hooks exist; the file(s) above, and any explicit symbol list "
+        f"given for them, are. Reconcile your conclusion against this "
+        f"evidence -- it may close the gap you reported, or the gap may "
+        f"still hold once this is accounted for. Do not discard or rewrite "
+        f"content unrelated to this comparison.\n\n"
         f"── Your previous answer ──\n{_without_forwarded_members_section(content)}\n"
         f"── end of your previous answer ──"
     )
@@ -29257,6 +29312,13 @@ async def run_task_async(
                         # exact mechanism for the /stream endpoint -- this brings /run onto the
                         # same one, permanently, not just for this investigation.
                         unrecognized_event_counts: dict[str, int] = {}
+                        # Phase 0.16: snapshot BEFORE any preflight-facts mutation below --
+                        # _comparison_coverage_gap (_attempt_coverage_correction's own guard)
+                        # reads this instead of the (possibly preflight-extended) `task` when
+                        # computing which subject categories the TASK itself actually asked
+                        # about. Unconditional (even when the gate below never fires, or never
+                        # finds anything), so it is always the clean baseline, never stale.
+                        setattr(team, "_original_task", task)
                         if team_config.get_gate_enabled(team_name, PREFLIGHT_GROUNDING_GATE, False):
                             try:
                                 _facts = await asyncio.wait_for(
