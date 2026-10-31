@@ -7619,6 +7619,62 @@ def _sections_without_completeness_claim(content: str, cmp_note: str = "") -> li
     return out
 
 
+def _reapply_comparison_synthesis_after_retry(candidate: str, cmp_note: str) -> str:
+    """Phase 0.22: re-applies the SAME deterministic comparison synthesis
+    _reconcile_completeness_claim_with_comparison already uses, to a
+    candidate produced by a LATER retry/regeneration that has no
+    guarantee of carrying it forward.
+
+    Confirmed live (the T13a run immediately after Phase 0.21 shipped):
+    _reconcile_completeness_claim_with_comparison correctly fired
+    (DETERMINISTIC_COMPARISON_GATE_FIRED, match=3 partial_match=2
+    left_only=4 right_only=43 ambiguous=0) and replaced the draft with the
+    deterministic synthesis plus its own preserved sections. A LATER guard
+    in this same choke-point sequence (_evidence_integrity_check) found an
+    unrelated-seeming contradiction in that already-correct content, ran
+    its OWN one-shot retry (a full _stream_team_run regeneration), and
+    adopted the regenerated text once it stopped contradicting THAT
+    specific finding and passed verify_claims -- with nothing checking
+    whether the regenerated prose still mentioned the comparison at all.
+    It did not: the delivered answer replaced the exact MATCH/
+    PARTIAL_MATCH/LEFT_ONLY/RIGHT_ONLY breakdown with "the backend has
+    more endpoints than frontend hooks" -- true in spirit, unsupported by
+    nothing, and a regression from evidence this run had already
+    established deterministically.
+
+    Deliberately narrow: only acts when `cmp_note` is itself eligible --
+    parses into real categories (_comparison_entries) AND existence is
+    genuinely contradicted or uncertain (left_only/right_only/ambiguous
+    nonzero), the EXACT SAME gate _reconcile_completeness_claim_with_
+    comparison already uses -- so an ordinary task with no actionable
+    comparison, or a comparison that is genuinely clean (nothing missing),
+    is completely unaffected; this never forces a comparison onto content
+    that was never eligible for one. Zero new model calls: _synthesize_
+    comparison_answer is pure string templating, and _sections_without_
+    completeness_claim is a pure regex scan over `candidate` -- the exact
+    same cost profile the original synthesis already has, which is why
+    this is safe to run on every retry-adoption path in this function
+    rather than only the one incident traced it to.
+
+    Returns `candidate` completely unchanged when cmp_note is not
+    eligible, or when _synthesize_comparison_answer itself returns None
+    (cmp_note failed to parse) -- never guesses, never fabricates a
+    comparison from a candidate that never had one."""
+    summary = _comparison_summary(cmp_note)
+    if not summary or not (summary["left_only"] or summary["right_only"]
+                            or summary["ambiguous"]):
+        return candidate
+    synthesized = _synthesize_comparison_answer(cmp_note)
+    if synthesized is None:
+        return candidate
+    preserved = _sections_without_completeness_claim(candidate, cmp_note)
+    result = synthesized + ("\n\n" + "\n\n".join(preserved) if preserved else "")
+    print(f"[team] comparison preservation: re-applied the deterministic "
+          f"comparison synthesis to a retry's own regenerated text -- "
+          f"preserving {len(preserved)} unrelated section(s)", flush=True)
+    return result
+
+
 def _synthesize_comparison_answer(cmp_note: str) -> str | None:
     """K4: the whole answer built as PURE STRING TEMPLATING from
     `_comparison_summary`'s counts and `_comparison_entries`' exact per-item
@@ -9643,7 +9699,7 @@ async def _evidence_integrity_check(
                   f"falsely-gapped item(s) {stripped_names!r} from the gap list -- "
                   f"no retry needed, adopting", flush=True)
             await _persist_evidence_integrity_trace(team, findings, resolved=True, retried=False)
-            return stripped_content
+            return _reapply_comparison_synthesis_after_retry(stripped_content, cmp_note)
 
     print(f"[team] evidence-integrity: {len(findings)} contradiction(s) found in the "
           f"final answer — {[f['category'] for f in findings]}", flush=True)
@@ -9800,7 +9856,8 @@ async def _evidence_integrity_check(
                           f"without disclosure", flush=True)
                     await _persist_evidence_integrity_trace(
                         team, recheck, resolved=True, retried=True)
-                    return restripped_content
+                    return _reapply_comparison_synthesis_after_retry(
+                        restripped_content, recheck_cmp_note)
                 # fabrication present even after the strip -- fall through to the
                 # existing disposition below, which already merges verify_claims
                 # findings into the same disclosure banner.
@@ -9879,7 +9936,12 @@ async def _evidence_integrity_check(
     print("[team] evidence-integrity: retry resolved every contradiction — adopting",
           flush=True)
     await _persist_evidence_integrity_trace(team, findings, resolved=True, retried=True)
-    return retried
+    # Phase 0.22: THE confirmed incident this function exists to close -- see
+    # _reapply_comparison_synthesis_after_retry's own docstring. `retried` is a
+    # full regeneration with no guarantee it still carries an authoritative
+    # comparison this run already established; recheck_cmp_note (already
+    # computed above, no new tool call) is what re-applies it if eligible.
+    return _reapply_comparison_synthesis_after_retry(retried, recheck_cmp_note)
 
 
 async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | None,
