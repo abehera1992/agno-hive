@@ -8308,6 +8308,57 @@ def _extract_explicit_recovery_continuation(candidate: str) -> str | None:
     return continuation
 
 
+# Phase 0.19 (2026-10-31): structural backstop for the exact failure Phase 0.18's
+# live T13a run confirmed -- the completion prompt below already tells the model
+# "do NOT restate the existing answer... do NOT reissue the complete answer from
+# the start", but that is prose, and _stream_team_run's own `team.arun(...)` call
+# gives the Coordinator its full, unrestricted tool surface, delegate_task_to_member(s)
+# included. Live log for that run: the completion pass's own Coordinator opened
+# with "Let's start by breaking this down into a checklist and then investigate
+# each part", then delegated to Researcher, which called search_files('voucher',
+# '**/*') -- a full investigation restart, not a continuation, despite the prompt's
+# explicit instruction not to. This matches MINIMAL_COORDINATOR_GATE's own forensics
+# (16 hours, 31 delegate_task_to_member calls, zero other coordinator tool use):
+# this coordinator's bias toward delegating is strong enough that prose alone does
+# not reliably override it. _extract_explicit_recovery_continuation already makes
+# the WORST case safe (an unmarked restart is correctly rejected, never adopted) --
+# this closes the gap one layer earlier, so a well-behaved completion attempt is
+# the common case instead of the rare one.
+#
+# Reuses _DELEGATION_TOOL_NAMES (defined later in this module; resolved at call
+# time, not at this function's definition time, same as every other forward
+# reference in this file) and the exact intercept-and-redirect hook shape
+# _make_decompose_first_gate_hook already uses elsewhere in production -- not a
+# new mechanism, one more use of an existing, already-validated one. Installed as
+# the FIRST entry of team.tool_hooks (confirmed by reading agno's own
+# tools/function.py: hooks run outermost-first in list order, so position 0 sees
+# every delegation call before any other hook and can refuse it outright) for the
+# duration of exactly this one _stream_team_run call, restored unconditionally in
+# a `finally` immediately after -- never leaked into the original investigation
+# (which has already finished by the time this function runs) or into any later
+# call on this same team object.
+_NO_DELEGATION_DURING_COMPLETION_MESSAGE = (
+    "BLOCKED: delegation is disabled for this completion pass. All research for "
+    "this task is already finished and is not being redone. Do not delegate and "
+    "do not request further investigation -- continue writing the remaining "
+    "answer text directly, in prose, from the exact point where it was cut off."
+)
+
+
+def _make_no_delegation_hook():
+    """One-call tool_hook: redirects any delegate_task_to_member(s)/
+    delegate_structured_task call instead of letting it run. See the Phase 0.19
+    comment above _complete_repetition_truncated_answer for why this exists and
+    why interception (not removing the tool from the model's schema) is the
+    right shape here -- the same shape _make_decompose_first_gate_hook already
+    uses for a different trigger condition."""
+    async def _no_delegation_hook(function_name, function, args, **_kwargs):
+        if function_name not in _DELEGATION_TOOL_NAMES:
+            return await function(**args)
+        return _NO_DELEGATION_DURING_COMPLETION_MESSAGE
+    return _no_delegation_hook
+
+
 async def _complete_repetition_truncated_answer(content: str, task: str, team, all_results,
                                                  result, liveness_path: str | None):
     """One bounded completion pass when a generation was cut off before it reached
@@ -8423,6 +8474,12 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
     reads_before = _run_read_count(team)
     print(f"[team] {truncation_reason}-truncated answer ({len(content):,} chars) — "
           f"attempting one bounded completion", flush=True)
+    # Phase 0.19: install the no-delegation hook for exactly this one call. A plain
+    # list (never None -- Team's own dataclass default) is snapshotted and restored
+    # unconditionally below, so a call that raises, is cancelled, or times out can
+    # never leave this team object with the completion-only hook still installed.
+    _original_tool_hooks = list(getattr(team, "tool_hooks", None) or [])
+    team.tool_hooks = [_make_no_delegation_hook()] + _original_tool_hooks
     try:
         completed, retry = await _stream_team_run(
             team, prompt, log_label="repetition-completion", liveness_path=liveness_path)
@@ -8431,6 +8488,8 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
         print(f"[team] repetition-truncation completion failed: {exc} — keeping the "
               f"truncated draft", flush=True)
         return content + _truncation_note_for_reason(truncation_reason), result
+    finally:
+        team.tool_hooks = _original_tool_hooks
     # T12-FOLLOWUP: the _stream_team_run call just above can ITSELF trip its own
     # copy of the Z16 repetition-stop logic -- live-confirmed on T4 and T13a, where
     # the completion pass restated content it had already written (the exact
