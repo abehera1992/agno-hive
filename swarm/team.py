@@ -15210,7 +15210,7 @@ def _task_subject_terms(task: str) -> list[str]:
 
 
 async def _blind_category_search(
-        category: str, task: str, read_paths: list[str],
+        category: str, task: str, read_paths: list[str],  # noqa: ARG001 -- see Phase 0.21 note below
         hive_mcp_url: str | None, hive_mcp_tools) -> "dict | None":
     """Phase 0.20: a deterministic, repo-wide fallback for the one shape
     _traverse_missing_category_dependencies' own import-following traversal
@@ -15233,8 +15233,34 @@ async def _blind_category_search(
 
     This closes exactly that one gap, not general unbounded exploration: it
     runs ONLY when `category` has a registered content-shape extension
-    (_CATEGORY_CONTENT_SHAPE) AND read_paths contains NONE of it -- i.e. only
-    when this category's own kind of file was never even touched this run.
+    (_CATEGORY_CONTENT_SHAPE) AND the category still appears in the caller's
+    own `still_missing` set -- which already means Pass 1 checked every
+    already-read file's REAL CONTENT against this category's actual shape
+    (_content_matches_category) and found none, and Pass 2 found no import
+    to follow either. This function's only caller (_comparison_coverage_gap)
+    never reaches it for a category Pass 1/2 already covered, so it does not
+    need, and must not re-derive, its own coverage test.
+
+    Phase 0.21 (2026-10-31) REMOVED an earlier, CRUDER gate here that
+    additionally required read_paths to contain NO file of this category's
+    own extension at all -- confirmed live-reproducible as a false-negative
+    bug, not merely theoretical: an entirely UNRELATED .ts file already read
+    this run (one with no hook-shaped export of its own, so Pass 1 correctly
+    left "hooks" in still_missing) silently suppressed this function from
+    ever running, purely because SOME .ts file happened to be in read_paths
+    -- extension presence and category relevance are not the same fact, and
+    conflating them reintroduces exactly the "nothing explored vs. nothing
+    relevant explored" confusion this function exists to resolve. The
+    caller's still_missing is the one gate this function needs; an extra,
+    weaker one layered on top can only ever suppress it incorrectly, never
+    correctly (still_missing already implies it).
+
+    `read_paths` is kept in the signature for call-site stability (and
+    because it is genuinely part of this function's conceptual contract --
+    "what was already read" -- even though no current code path reads it)
+    rather than touching the one existing call site for a parameter removal
+    unrelated to this phase's actual fix.
+
     Reuses _repo_search_text (a CONTENT search, not a path glob -- see the
     inline comment at its call site below for why a glob on the subject term
     alone cannot find inventoryApi.ts, the real authoritative file for this
@@ -15253,16 +15279,6 @@ async def _blind_category_search(
     _resolve_import_spec, or compare_enumerations."""
     shape_exts = set(_CATEGORY_CONTENT_SHAPE.get(category, {}))
     if not shape_exts:
-        return None
-
-    def _norm_ext(p: str) -> str:
-        ext = os.path.splitext(p or "")[1].lower()
-        return ".ts" if ext in (".tsx", ".js", ".jsx") else ext
-
-    if any(_norm_ext(p) in shape_exts for p in read_paths):
-        # The right KIND of file was read this run -- pass 1/2 above already
-        # had a fair chance at this category; this is not the zero-candidate
-        # gap this function exists for.
         return None
 
     terms = _task_subject_terms(task)[:2]
@@ -15332,9 +15348,10 @@ async def _blind_category_search(
                 excerpt = _excerpt_around_match(fetched, category, resolved_path)
                 matched_symbols = _matched_symbols_for_category(category, structural_text)
                 print(f"[team] blind category search: found {resolved_path!r} for "
-                      f"category {category!r} via subject term {term!r} -- zero "
-                      f"read_paths had this category's own extension this run, "
-                      f"repo-wide search recovered it", flush=True)
+                      f"category {category!r} via subject term {term!r} -- the "
+                      f"existing traversal's own content check found no coverage "
+                      f"from anything already read this run, repo-wide search "
+                      f"recovered it", flush=True)
                 return {"from": f"(blind repo-wide search on {term!r})",
                         "spec": resolved_path, "resolved_path": resolved_path,
                         "status": "resolved",

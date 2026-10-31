@@ -1580,6 +1580,114 @@ def _decl_site(rel_path: str, symbol: str) -> tuple[bool, int | None, str]:
     return False, None, ""
 
 
+# Bound on how many distinct ripgrep-hit files _repo_wide_field_declaration
+# will run the real (AST-based) declares() check against -- a small, fixed
+# ceiling, matching this file's existing "bounded, not a scan" discipline
+# (e.g. _declared_bases_mismatch's own repo-wide grep). Confirmed against
+# the real repo (2026-10-31): a generic column name like "created_at" has
+# 20+ distinct declaring files, so this exists to keep that case cheap, not
+# to cap a realistic single-digit candidate count.
+_REPO_WIDE_FIELD_CANDIDATE_CAP = 12
+
+
+def _repo_wide_field_declaration(
+        tok: str, exclude_paths: "list[str]",
+        glob_filter: str = "") -> "tuple[str, str | None, int | None]":
+    """Phase 0.21: whether `tok` (a bare, non-dotted field/symbol name) has a
+    REAL, structurally-confirmed declaration somewhere in the repo the
+    answer never named by path -- the repo-wide counterpart to
+    _structural_verdict's own asserted-paths-scoped check, same shape and
+    same motivation as _declared_bases_mismatch's own repo-wide grep (see
+    that function's docstring: "the real Phase V fabrication run never
+    cited `models.py` by path anywhere near its 'Database Tables' section,
+    so a check scoped to asserted_paths ... would never fire on the one
+    case this exists to catch").
+
+    Confirmed live (Phase 0.20/0.21, T13a): a final answer's own "Database
+    Tables" section described vouchers.created_at/seaweedfs_fid/irn/
+    ewb_number without ever writing "models.py" as a literal path string
+    anywhere in its own text (unlike the backend-endpoints section, which
+    DID cite vouchers_api.py by path) -- so asserted_paths held exactly one
+    file, cited for an unrelated section, and _structural_verdict's
+    single-candidate branch asserted NOT IN FILE for every one of them.
+    Direct repo check (2026-10-31): seaweedfs_fid/irn/ewb_number each have
+    exactly ONE real structural declaration site (API/inventory-service/
+    models.py), and a repo-wide grep finds nothing else that genuinely
+    DECLARES them (a router file referencing `voucher.irn` is not a
+    declaration site, and declares() -- AST-based, not text-based --
+    correctly rejects it as a candidate).
+
+    Grep (_rg, the SAME primitive _declared_bases_mismatch already uses for
+    this exact "scoped check would miss it" problem) finds CANDIDATE files;
+    each candidate is then independently re-verified via the REAL,
+    structural declares() -- a text hit alone is never treated as evidence,
+    exactly preserving this module's existing "structural check, not a
+    bare grep" discipline for every claim this file settles. A candidate
+    already in `exclude_paths` (the file(s) the answer DID name, already
+    checked and already came back False) is skipped -- this function only
+    ever looks for OTHER files, never re-asks the one(s) already answered.
+
+    Returns a 3-way tagged result -- ("found", path, line) | ("ambiguous",
+    None, None) | ("absent", None, None) -- deliberately NOT collapsed to
+    `tuple | None`, because "zero other files declare this" and "2+ files
+    declare this, ambiguously" are DIFFERENT facts the caller must not treat
+    alike: the mission this phase exists to satisfy is explicit that
+    "unvisited or ambiguous model files cannot establish absence." An
+    earlier draft of this function returned a bare None for both, and the
+    caller then always fell through to NOT IN FILE either way -- correct for
+    "absent" (seaweedfs_fid/irn/ewb_number's own shape, confirmed exactly
+    one real declaring file) but WRONG for "ambiguous" (created_at's own
+    shape: real, genuinely declared in 20+ distinct files, so asserting NOT
+    IN FILE off this function's own finding would have been a new false
+    negative this fix itself introduced). "found" fires only when EXACTLY
+    one distinct file structurally declares `tok`. Bounded to
+    _REPO_WIDE_FIELD_CANDIDATE_CAP distinct ripgrep-hit files -- never an
+    unbounded repo scan.
+    """
+    from .symbol_index import declares
+
+    # Confirmed live (2026-10-31): an UNSCOPED _rg call (no glob_filter) for a
+    # common bare word like "created_at" took >20s on the real repo and hit
+    # _rg's own subprocess timeout, silently returning [] -- not a correctness
+    # bug (the caller already treats [] as "no evidence found", same as a
+    # genuine zero-hit search), but a real latency cost on every check this
+    # fires for. Scoping to the same code-file extensions this function's own
+    # post-filter already requires (never a NEW restriction, just applying it
+    # BEFORE the subprocess call instead of after) cut the same real search to
+    # ~13.6s on this repo -- comfortably inside _rg's own existing timeout, and
+    # it stays rg_args()'s pre-existing node_modules/.git/dist/build exclusions
+    # unchanged, same as every other _rg caller in this file.
+    _code_glob = glob_filter or "*.{py,ts,tsx,js,jsx}"
+    hits = _rg(rf"\b{re.escape(tok)}\b", fixed=False, whole_word=True, glob_filter=_code_glob)
+    excluded = set(exclude_paths)
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for h in hits:
+        path = h.split(":", 1)[0]
+        if path in seen or path in excluded:
+            continue
+        seen.add(path)
+        if not path.lower().endswith((".py", ".ts", ".tsx", ".js", ".jsx")):
+            continue
+        candidates.append(path)
+        if len(candidates) >= _REPO_WIDE_FIELD_CANDIDATE_CAP:
+            break
+
+    found: list[tuple[str, int]] = []
+    for path in candidates:
+        try:
+            ok, line, _kind = declares(path, tok)
+        except (OSError, ValueError, SyntaxError):
+            continue
+        if ok and line:
+            found.append((path, line))
+            if len(found) > 1:
+                return ("ambiguous", None, None)  # 2+ real distinct declaring files
+    if len(found) == 1:
+        return ("found", found[0][0], found[0][1])
+    return ("absent", None, None)
+
+
 def _structural_verdict(tok: str, asserted_paths: list[str]) -> str | None:
     """Verdict line for `tok` checked against the files the answer named, or None.
 
@@ -1643,8 +1751,30 @@ def _structural_verdict(tok: str, asserted_paths: list[str]) -> str | None:
         if _appears_in_file(indexable[0], tok):
             return (f"  REFERENCED {tok:35s} <-- used in {indexable[0]} but declared "
                     f"elsewhere; not a claim this check can settle")
+        # Phase 0.21: before asserting NOT IN FILE off the one path the answer
+        # happened to cite (for this symbol's purposes, possibly for an
+        # entirely unrelated reason -- see _repo_wide_field_declaration's own
+        # docstring for the exact T13a incident this closes), check whether a
+        # REAL, structural declaration exists elsewhere in the repo that the
+        # answer simply never named by path. This never weakens the asserted-
+        # paths check above -- it only ever prevents a false NOT IN FILE for a
+        # field that genuinely exists, on an unambiguous single real owner.
+        _status, _real_path, _real_line = _repo_wide_field_declaration(tok, indexable)
+        if _status == "found":
+            return (f"  DECLARED   {tok:36s} <-- {_real_path}:{_real_line} (a real "
+                    f"declaration the answer's own cited path(s) never named)")
+        if _status == "ambiguous":
+            # 2+ distinct files genuinely declare this -- real, but not
+            # attributable to one owner from a bare identifier alone. NOT
+            # IN FILE would be a false negative (the field is not absent,
+            # it is merely ambiguous), so this returns None -- the SAME
+            # "nothing this check can settle" signal the caller already
+            # treats as "fall back to the weaker, caller-level grep", which
+            # reports existence honestly without picking an owner.
+            return None
         return (f"  NOT IN FILE {tok:35s} <-- {indexable[0]} does not define it; "
-                f"the answer names no other file that does")
+                f"the answer names no other file that does, and no other single "
+                f"file in the repo structurally declares it either")
     return None
 
 
