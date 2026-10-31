@@ -15171,6 +15171,182 @@ async def _traverse_missing_category_dependencies(
     return frozenset(covered), resolved, attempted
 
 
+# Phase 0.20 (2026-10-31): generic, project-agnostic stopwords for extracting a
+# task's own SUBJECT word(s) (e.g. "vouchers") separately from its CATEGORY
+# words (_SUBJECT_CATEGORY_KEYWORDS' own "endpoints"/"hooks"/"tables" etc.) --
+# used only by _blind_category_search below. Deliberately narrow: fixed
+# English instruction/connective words any task sentence is likely to use,
+# never project- or feature-specific.
+_TASK_GENERIC_WORDS = frozenset({
+    "audit", "list", "its", "and", "the", "of", "for", "with", "all", "every",
+    "any", "identify", "anything", "present", "compare", "what", "which",
+    "module", "modules", "backend", "frontend", "counterpart", "has", "have",
+    "from", "that", "this", "database", "code", "files", "file", "shows",
+})
+
+
+def _task_subject_terms(task: str) -> list[str]:
+    """Phase 0.20: the task's own subject noun(s) -- e.g. "vouchers" for
+    "Audit the vouchers module..." -- kept separate from _subject_categories'
+    CATEGORY vocabulary (endpoints/hooks/tables/...), which this excludes
+    alongside the small, closed-class _TASK_GENERIC_WORDS stopword set.
+    Never project- or feature-specific: both exclusion lists are fixed
+    English words, so whatever word remains is whatever THIS task happens to
+    be about -- for any task, not only a vouchers audit.
+
+    Order-preserving, deduplicated, length >= 4 only. Used solely to build a
+    repo-wide find_files glob for _blind_category_search -- never to decide
+    coverage, correctness, or anything else by itself."""
+    category_words = {w for kws in _SUBJECT_CATEGORY_KEYWORDS.values() for w in kws}
+    seen: set[str] = set()
+    out: list[str] = []
+    for w in _CATEGORY_WORD_RE.findall(task or ""):
+        lw = w.lower()
+        if len(lw) < 4 or lw in category_words or lw in _TASK_GENERIC_WORDS or lw in seen:
+            continue
+        seen.add(lw)
+        out.append(lw)
+    return out
+
+
+async def _blind_category_search(
+        category: str, task: str, read_paths: list[str],
+        hive_mcp_url: str | None, hive_mcp_tools) -> "dict | None":
+    """Phase 0.20: a deterministic, repo-wide fallback for the one shape
+    _traverse_missing_category_dependencies' own import-following traversal
+    cannot reach by construction -- `category` has ZERO candidate files to
+    traverse FROM, because none of `read_paths` is even the right KIND of
+    file for it.
+
+    Confirmed live (the T13a run immediately after Phase 0.19 shipped): for
+    the "list frontend hooks" delegation, every search_files call that run
+    used glob_filter='API/inventory-service/**/*' -- the backend directory
+    only -- so the Researcher never read, or even searched for, a single
+    file under Client/. Pass 1 of _traverse_missing_category_dependencies has
+    nothing to check (no file of a frontend extension is in read_paths); pass
+    2 has nothing to follow (no import statement from a frontend file exists
+    in read_paths at all, since none were read). Both correctly report
+    nothing found -- there is genuinely nothing to traverse from -- but
+    "nothing to traverse from" and "the target doesn't exist" are different
+    facts, and the existing traversal cannot distinguish them because it
+    never looks outside read_paths by design.
+
+    This closes exactly that one gap, not general unbounded exploration: it
+    runs ONLY when `category` has a registered content-shape extension
+    (_CATEGORY_CONTENT_SHAPE) AND read_paths contains NONE of it -- i.e. only
+    when this category's own kind of file was never even touched this run.
+    Reuses _repo_search_text (a CONTENT search, not a path glob -- see the
+    inline comment at its call site below for why a glob on the subject term
+    alone cannot find inventoryApi.ts, the real authoritative file for this
+    category in the T13a case) with a repo-wide glob_filter and the task's
+    own subject word(s) as the search pattern -- never the T13a vouchers/
+    hook names specifically, see _task_subject_terms -- and, on a real
+    (non-ambiguous) match, the SAME _content_matches_category /
+    _matched_symbols_for_category / _excerpt_around_match pipeline pass 2 of
+    the traversal above already uses, so a hit from this path is evidence-
+    grounded exactly like a followed import is, never a guess. Returns None
+    (never fabricates) on no match, an ambiguous multi-match, or a fetched
+    file that does not actually match the category's content shape.
+
+    Bounded: at most 2 subject terms, at most 2 extensions each -- a small,
+    fixed ceiling, not a search loop. Never touches read_paths,
+    _resolve_import_spec, or compare_enumerations."""
+    shape_exts = set(_CATEGORY_CONTENT_SHAPE.get(category, {}))
+    if not shape_exts:
+        return None
+
+    def _norm_ext(p: str) -> str:
+        ext = os.path.splitext(p or "")[1].lower()
+        return ".ts" if ext in (".tsx", ".js", ".jsx") else ext
+
+    if any(_norm_ext(p) in shape_exts for p in read_paths):
+        # The right KIND of file was read this run -- pass 1/2 above already
+        # had a fair chance at this category; this is not the zero-candidate
+        # gap this function exists for.
+        return None
+
+    terms = _task_subject_terms(task)[:2]
+    if not terms:
+        return None
+
+    # ".ts" is the one extension every registered frontend category actually
+    # uses (hooks); ".py" covers the registered backend categories (endpoints/
+    # tables). Trying only the ones actually registered for THIS category
+    # keeps the ceiling small and fixed regardless of which category it is.
+    candidate_exts = [e for e in (".ts", ".py") if e in shape_exts] or list(shape_exts)[:1]
+
+    for term in terms:
+        for ext in candidate_exts:
+            # CONTENT search (search_files), not a PATH glob (find_files) --
+            # confirmed necessary live: the real authoritative file for the
+            # "hooks" category in the T13a case is inventoryApi.ts, named
+            # for the whole inventory SERVICE, not for "voucher" at all; the
+            # subject term appears only inside its content (hook names like
+            # useGetVouchersQuery), never in its path. A find_files glob on
+            # the subject term would correctly find nothing for exactly this
+            # shape -- confirmed directly against the real repo before this
+            # function's search primitive was switched.
+            #
+            # _SEARCH_RESULT_PATH_RE (Phase 0.5, already used elsewhere in
+            # this file for the identical "turn a search_files hit into one
+            # candidate path" purpose) is reused rather than a new extractor
+            # -- its anchored `^path:digits: ` shape does not match
+            # search_files' own "No matches for: X" negative-result prose
+            # (no `:digits:` follows "No"), so this does not reproduce the
+            # Phase 0.17 false-candidate-from-negative-prose defect.
+            try:
+                raw = await _repo_search_text(
+                    term, f"**/*{ext}", hive_mcp_url, hive_mcp_tools)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[team] blind category search: search_files failed for "
+                      f"term {term!r} ext {ext!r}: {type(exc).__name__}: {exc}",
+                      flush=True)
+                continue
+            matches = sorted({m.replace("\\", "/")
+                              for m in _SEARCH_RESULT_PATH_RE.findall(raw or "")
+                              if os.path.splitext(m)[1].lower() == ext
+                              or (ext == ".ts" and os.path.splitext(m)[1].lower()
+                                  in (".tsx", ".js", ".jsx"))})
+            if not matches or len(matches) > 5:
+                # None, or too many distinct files to be a confident guess --
+                # never silently pick one out of a crowd; the existing
+                # disclosure mechanism correctly reports this as still
+                # uncovered rather than this function guessing.
+                continue
+            for resolved_path in matches:
+                fetched = await _repo_file_text(resolved_path, hive_mcp_url, hive_mcp_tools)
+                if not fetched:
+                    continue
+                try:
+                    structural_text = await _repo_structural_index(
+                        resolved_path, hive_mcp_url, hive_mcp_tools)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[team] blind category search: structural_index failed "
+                          f"for {resolved_path!r}: {type(exc).__name__}: {exc}",
+                          flush=True)
+                    structural_text = ""
+                if not await _content_matches_category(
+                        category, fetched, resolved_path, hive_mcp_url, hive_mcp_tools,
+                        structural_text=structural_text):
+                    continue
+                excerpt = _excerpt_around_match(fetched, category, resolved_path)
+                matched_symbols = _matched_symbols_for_category(category, structural_text)
+                print(f"[team] blind category search: found {resolved_path!r} for "
+                      f"category {category!r} via subject term {term!r} -- zero "
+                      f"read_paths had this category's own extension this run, "
+                      f"repo-wide search recovered it", flush=True)
+                return {"from": f"(blind repo-wide search on {term!r})",
+                        "spec": resolved_path, "resolved_path": resolved_path,
+                        "status": "resolved",
+                        "reason": f"found via repo-wide search on subject term "
+                                  f"{term!r} -- no file of this category's own "
+                                  f"extension was read this run to traverse an "
+                                  f"import from",
+                        "content_excerpt": excerpt, "matched_category": category,
+                        "matched_symbols": matched_symbols}
+    return None
+
+
 _COVERAGE_CORRECTION_FLAG = "_coverage_correction_attempted"
 
 
@@ -15252,11 +15428,32 @@ async def _comparison_coverage_gap(
     # spends a single file on it -- confirmed by the early return below).
     covered_cats, resolved, attempted = await _traverse_missing_category_dependencies(
         task_cats, read_paths, hive_mcp_url, hive_mcp_tools)
-    still_missing = task_cats - covered_cats
+    still_missing = set(task_cats - covered_cats)
+    _n_via_traversal = len(resolved)
+
+    # Phase 0.20: one bounded, deterministic repo-wide fallback per category
+    # the traversal above had literally nothing to traverse FROM (see
+    # _blind_category_search's own docstring for the exact gap this closes --
+    # confirmed live on the T13a run immediately after Phase 0.19 shipped).
+    # Only reached for a category still in still_missing after the real
+    # import-following attempt above, so this never substitutes for or
+    # races that mechanism -- it only covers the gap the traversal cannot
+    # reach by its own construction (no candidate file to start from at all).
+    for _cat in sorted(still_missing):
+        _blind_hit = await _blind_category_search(
+            _cat, original_task, read_paths, hive_mcp_url, hive_mcp_tools)
+        if _blind_hit is not None:
+            still_missing.discard(_cat)
+            resolved.append(_blind_hit)
+            attempted.append(_blind_hit)
+
+    covered_cats = task_cats - frozenset(still_missing)
+    still_missing = frozenset(still_missing)
 
     print(f"[team] coverage gate: original task spans categories {sorted(task_cats)}; "
           f"content-grounded coverage found for {sorted(covered_cats)} "
-          f"({len(resolved)} via followed dependencies), leaving "
+          f"({_n_via_traversal} via followed dependencies, "
+          f"{len(resolved) - _n_via_traversal} via blind repo-wide search), leaving "
           f"{sorted(still_missing)} still uncovered", flush=True)
 
     if not resolved and not still_missing:
