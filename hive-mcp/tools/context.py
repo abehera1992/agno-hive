@@ -36,7 +36,16 @@ from .exclusions import EXCLUDE_DIRS, is_excluded, rg_args
 # outputSchema from the return-type annotation below and validates every
 # ToolResult.structured_content against it, so the annotation and the dict
 # _find_files_result actually builds must stay in exact agreement.
-from fastmcp.tools.tool import ToolResult
+#
+# fastmcp.tools.base, not fastmcp.tools.tool -- confirmed the hard way: this
+# repo's local dev environment has fastmcp 3.2.4 (where .tools.tool happens
+# to also re-export ToolResult), but hive-mcp's own requirements.txt pins
+# only `fastmcp>=3.2.0`, unbounded above -- the actual Docker image built by
+# CI installed fastmcp 4.1.4, which removed the `tools.tool` module entirely
+# and crash-looped the container on import. `tools.base` is the one import
+# path confirmed, by directly inspecting both installed versions, to carry
+# ToolResult in each.
+from fastmcp.tools.base import ToolResult
 
 
 class FileMatchResult(TypedDict):
