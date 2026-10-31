@@ -78,6 +78,23 @@ _BESPOKE_MCP_SESSION_TIMEOUT = 90
 # Pause between verify_claims' two attempts -- long enough to let a briefly-saturated
 # hive-mcp drain, short enough to be irrelevant next to the timeouts themselves.
 _VERIFY_RETRY_PAUSE_S = 2
+# Phase 0.11 (2026-10-31): bounds the gap between CONSECUTIVE events yielded by
+# _stream_team_run's own agno stream (content, tool-call, or otherwise -- any
+# event at all), never overall elapsed runtime. A healthy, continuously-
+# progressing run has no cap at all: the live T13a run that validated Phase
+# 0.9's instrumentation took 1,690.6s end to end and is unaffected, because it
+# kept yielding events throughout -- the longest single gap observed in any
+# journal reviewed across every prior phase (a single model-dispatch round
+# trip, or hive-mcp's LightRAG prefetch) was well under 60s. Set to 2x
+# _BESPOKE_MCP_SESSION_TIMEOUT (one external round trip's own budget, doubled
+# since a delegated member's own call can itself retry once -- live-session
+# then fresh-connection -- before answering) and deliberately below the
+# EXTERNAL worker watchdog's own liveness_silence_threshold_s (300s,
+# config.py) so THIS boundary fires first, in-process, with content already
+# preserved and attributable to this exact function -- Phase 0.10 found the
+# external SIGKILL path did not visibly act during the one real incident
+# (run 5fb015ec8eae) that motivates this.
+_STREAM_INACTIVITY_TIMEOUT_S = 180
 
 # 2026-08-19 (live 7-test groundedness battery, tasks hive-test1-groundedness and
 # hive-test6-gstpropagation): _BESPOKE_MCP_SESSION_TIMEOUT above only protects
@@ -28216,8 +28233,37 @@ async def _stream_team_run(
     semantic_stall_count = 0
     semantic_stall_stopped = False
     unrecognized_event_counts: dict[str, int] = {}
+    # Phase 0.11: drive the agno async generator manually (not `async for`) so
+    # each individual __anext__() can be bounded by _STREAM_INACTIVITY_TIMEOUT_S
+    # -- see that constant's own comment for what this bounds (inter-event gap,
+    # never overall runtime) and why. `_agen` is a real Python async generator
+    # (confirmed directly: agno 2.5.17's agno.team._run._arun_stream is an
+    # asyncgenfunction) -- closed explicitly in the finally block below so its
+    # own internal cleanup (MCP tool disconnection) runs even when this
+    # function stops consuming it early, rather than abandoning it.
+    inactivity_timeout_stopped = False
+    _agen = team.arun(prompt, stream=True, yield_run_output=True)
     try:
-        async for event in team.arun(prompt, stream=True, yield_run_output=True):
+        while True:
+            try:
+                event = await asyncio.wait_for(
+                    _agen.__anext__(), timeout=_STREAM_INACTIVITY_TIMEOUT_S)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                print(
+                    f"[{log_label}] stream inactivity timeout -- no event of "
+                    f"any kind (content, tool call, or otherwise) arrived "
+                    f"within {_STREAM_INACTIVITY_TIMEOUT_S}s "
+                    f"(stream_event_count={activity['stream_event_count']}) "
+                    f"-- stopping this generation in-process and keeping the "
+                    f"{len(''.join(full_content)):,} chars generated so far, "
+                    f"rather than blocking indefinitely on the external "
+                    f"liveness watchdog",
+                    flush=True,
+                )
+                inactivity_timeout_stopped = True
+                break
             if not getattr(event, "event", None):
                 final_run_output = event
                 continue
@@ -28421,6 +28467,30 @@ async def _stream_team_run(
             else:
                 _log_unclassified_stream_event(log_label, event, unrecognized_event_counts)
     finally:
+        # Phase 0.11: close the underlying agno generator explicitly -- on
+        # EVERY exit path (normal exhaustion, the inactivity timeout above,
+        # or any exception/cancellation), not only the ones this function
+        # happens to break out of cleanly. `aclose()` on an already-exhausted
+        # generator is a documented no-op; on one still suspended mid-await
+        # (the inactivity-timeout case) it injects GeneratorExit so agno's own
+        # cleanup (MCP tool disconnection, confirmed present in
+        # agno.team._run._arun_stream's own imports) gets a chance to run,
+        # rather than abandoning the generator to the garbage collector.
+        # Wrapped in its own try/except, never asyncio.CancelledError, so a
+        # cleanup failure can never mask the real result or escape this
+        # function in place of whatever actually happened in the loop above.
+        try:
+            await _agen.aclose()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[{log_label}] stream cleanup warning: closing the "
+                f"underlying agno generator raised "
+                f"{type(exc).__name__}: {str(exc)[:160]} -- continuing with "
+                f"whatever content was already accumulated",
+                flush=True,
+            )
         heartbeat_task.cancel()
         with suppress(asyncio.CancelledError):
             await heartbeat_task
@@ -28475,6 +28545,23 @@ async def _stream_team_run(
         # "preserve interruption provenance" requirement.
         accumulated = accumulated[:last_good_len].strip() or "(no response)"
         final_segment = accumulated
+        setattr(team, "_semantic_stall_truncated", True)
+    if inactivity_timeout_stopped:
+        # Phase 0.11: no trim needed here, unlike the two branches above --
+        # by definition nothing new was yielded between the last successfully
+        # processed event and the timeout, so `accumulated`/`final_segment`
+        # (already built from exactly what was received) need no cutback.
+        # Reuses team._semantic_stall_truncated rather than a new flag: it is
+        # the existing, already-wired signal _adopt_retry (see its own
+        # "truncated" check) and _complete_repetition_truncated_answer (its
+        # own entry check) use to mean "this stream was cut short, do not
+        # treat it as a clean, complete answer" -- exactly what an inactivity
+        # timeout is, without requiring any change to either of those
+        # functions. The distinct root cause stays diagnosable from the
+        # "stream inactivity timeout" log line printed where it was detected,
+        # above.
+        if not accumulated.strip():
+            accumulated = "(no response)"
         setattr(team, "_semantic_stall_truncated", True)
     final_segment, accumulated = _isolate_contaminated_fallback(
         final_segment, accumulated, segment_agent_names, run_agent_names, team)
