@@ -30244,6 +30244,38 @@ async def run_task_async(
                           f"items={_fid['items']}", flush=True)
                 except Exception as exc:
                     print(f"[team] evidence-fidelity diagnostic failed: {exc}", flush=True)
+                # Phase 0.24 (2026-10-31): final required-section coverage check --
+                # a LAST, idempotent re-application of the SAME _with_forwarded_
+                # evidence mechanism _stream_team_run's own wrap-up already uses,
+                # confirmed live-necessary (the T13a run on 4f7957d): compare_
+                # enumerations fired correctly and replaced an unsupported
+                # completeness claim with the deterministic, CORRECT comparison
+                # (DETERMINISTIC_COMPARISON_GATE_FIRED, match=3 partial_match=2
+                # left_only=4 right_only=43 ambiguous=0) -- but that replacement is
+                # a WHOLESALE content swap (_reconcile_completeness_claim_with_
+                # comparison's own `return synthesized + preserved, result, True`),
+                # and whatever _with_forwarded_evidence had ALREADY appended earlier
+                # in the SAME run (the Database Tables and individual frontend hook
+                # names, both genuinely forwarded this run -- confirmed via the
+                # live journal's own "forwarding researcher's answer" lines) does
+                # not survive a later wholesale replacement unless something
+                # re-checks for it afterward. Nothing did, until now.
+                #
+                # _with_forwarded_evidence is already idempotent and additive-only
+                # (confirmed directly: calling it twice on already-complete content
+                # changes nothing; calling it on content a LATER guard replaced
+                # wholesale correctly re-detects and re-appends exactly what that
+                # replacement dropped) -- this is the SAME mechanism, one more call,
+                # not a new one. Placed BEFORE the completion-control check below so
+                # that check sees the fully-restored content, not a still-incomplete
+                # one it would otherwise have to disclose as such. Never touches the
+                # comparison itself, never invents a missing section, never recovers
+                # anything that was not ALREADY forwarded by a real member this run.
+                try:
+                    content = _with_forwarded_evidence(content, team)
+                except Exception as exc:
+                    print(f"[team] final forwarded-evidence coverage check failed: {exc}",
+                          flush=True)
                 # C.5 (2026-10-03): the completion-control choke point (INV-11) --
                 # placed last, deliberately after every recovery mechanism above
                 # has already had its chance, same "last word" reasoning Phase I's
