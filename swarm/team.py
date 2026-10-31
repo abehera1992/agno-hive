@@ -3094,6 +3094,67 @@ def _candidate_has_route_shape(entry: dict) -> bool:
     return True
 
 
+async def _resolve_comparison_operand_path(path: str, session) -> tuple[str, str]:
+    """(canonical_path, "") on success, or ("", reason) -- never guesses, never
+    falls back to `path` itself on failure.
+
+    Phase 0.7 (T13a canonical-path fix, 2026-10-31): closes the confirmed Phase
+    0.6 gap -- the enumeration ledger records a tool call's INPUT argument
+    (args.get("relative_path")), never get_file_content's own internal
+    basename-correction, so a bare filename that get_file_content silently
+    resolved (its own "# NOTE: ... reading that instead" fallback,
+    hive-mcp/tools/context.py's get_file_content/_find_by_basename) survives
+    into _computed_comparison unresolved, and compare_enumerations -- which
+    requires a real repo-relative path by its own documented contract, with
+    no such fallback -- rejects it outright ("not a file: <basename>").
+
+    Deliberately does NOT parse get_file_content's own prose NOTE (explicit
+    phase constraint) and does NOT reimplement _find_by_basename's filesystem
+    walk here -- swarm/team.py has no direct filesystem access to the target
+    project at all, only the same MCP session compare_enumerations itself
+    uses. Instead this calls the REAL, already-deployed find_files tool over
+    that session with the SAME '**/{basename}' glob shape _find_by_basename
+    already uses, and the require-exactly-one-match discipline already proven
+    safe by get_file_content's own live, working auto-correction behaviour --
+    not a new resolution strategy, the SAME one, from the caller that actually
+    needs a confirmed path rather than a forgiving one.
+
+    An already-qualified path (contains '/') is returned unchanged -- no
+    basename search at all, preserving the working Python-side behaviour
+    exactly (Phase 0.6 confirmed this side already worked). A bare path
+    containing '..' is rejected outright (fail closed on an unsafe/invalid
+    qualified path, never reinterpreted as a basename to search for).
+    """
+    if ".." in path:
+        return "", f"rejected unsafe path containing '..': {path!r}"
+    if "/" in path:
+        return path, ""
+    basename = path
+    try:
+        res = await session.call_tool("find_files", {"glob_pattern": f"**/{basename}"})
+        text = "\n".join(getattr(c, "text", "") for c in (res.content or [])).strip()
+    except Exception as exc:
+        return "", f"basename resolution failed for {basename!r}: {type(exc).__name__}: {str(exc)[:80]}"
+    if not text or text.startswith("No matches for:"):
+        return "", f"no file named {basename!r} found in the project"
+    # find_files' own fixed format (hive-mcp/tools/context.py): first line is
+    # "{N} result(s) for '{glob}':", every subsequent non-blank line one real,
+    # already-repo-relative, already-existing path -- never guessed, never
+    # ranked by this function; exactly one such line is required.
+    matches = [ln.strip() for ln in text.splitlines()[1:] if ln.strip()]
+    if len(matches) != 1:
+        return "", (f"basename {basename!r} is ambiguous -- {len(matches)} file(s) match "
+                     f"this project: {matches!r}; refusing to guess which one is intended")
+    canonical = matches[0]
+    if ".." in canonical or canonical.startswith("/"):
+        # Defense-in-depth only -- find_files' own PROJECT_ROOT-scoped glob and
+        # .gitignore filtering already make this unreachable in practice; a
+        # tool result that still looked like an escape would be a bug in that
+        # tool, not something this caller should ever trust silently.
+        return "", f"find_files returned a path outside the project root: {canonical!r}"
+    return canonical, ""
+
+
 async def _computed_comparison(task: str, enumerations: dict | None,
                                hive_mcp_url: str | None, hive_mcp_tools=None,
                                content: str = "", team=None) -> str:
@@ -3264,6 +3325,28 @@ async def _computed_comparison(task: str, enumerations: dict | None,
     if not left or not right or left == right:
         return _skip(f"could not resolve two distinct sides (left={left!r}, right={right!r}; "
                      f"{len(enumerations)} enumeration(s) recorded)")
+    # Phase 0.7: canonicalize BEFORE the genuine compare_enumerations call below
+    # -- left/right at this point may still be the bare filename an
+    # enumeration ledger entry recorded (Phase 0.6's confirmed root cause: the
+    # ledger keys on a tool call's INPUT arg, never get_file_content's own
+    # internal basename correction). A separate, short-lived session is used
+    # here deliberately, rather than restructuring the existing
+    # start_tool_call/finish_tool_call-bracketed block below, which stays
+    # byte-for-byte unchanged and must only ever see an already-canonical pair.
+    try:
+        _resolve_session = await hive_mcp_tools.get_session_for_run()
+    except Exception as exc:
+        return _skip(f"could not open hive-mcp session for operand path "
+                     f"resolution: {type(exc).__name__}: {str(exc)[:80]}")
+    left, _left_err = await _resolve_comparison_operand_path(left, _resolve_session)
+    if not left:
+        return _skip(f"left operand could not be canonicalized: {_left_err}")
+    right, _right_err = await _resolve_comparison_operand_path(right, _resolve_session)
+    if not right:
+        return _skip(f"right operand could not be canonicalized: {_right_err}")
+    if left == right:
+        return _skip(f"left and right resolved to the same canonical path "
+                     f"({left!r}) -- refusing to compare a file to itself")
     # Phase E: this is a genuine tool call (compare_enumerations, over hive-mcp)
     # but reaches it via a bespoke `session.call_tool` -- the SAME pattern
     # _verify_claims uses for its own one-shot session -- rather than through
