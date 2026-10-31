@@ -14232,6 +14232,42 @@ _DEPENDENCY_TRAVERSAL_SOURCE_EXTS = (".py", ".ts", ".tsx", ".js", ".jsx")
 _DEPENDENCY_TRAVERSAL_MAX_FILES = 6
 _DEPENDENCY_TRAVERSAL_EXCERPT_CHARS = 6000
 
+# Phase 0.17: hive-mcp's REAL get_file_content tool -- the one _repo_file_text
+# (this traversal's own source of file content) actually calls in production
+# -- does not return raw source text. Confirmed directly in its own source
+# (hive-mcp/tools/context.py:281: `f"{lineno:>6}\t{text}"`) and its own
+# docstring ("Output uses cat -n style line numbers"): every line is prefixed
+# with a right-aligned line number and a literal tab. _PY_IMPORT_STMT_RE/
+# _TS_IMPORT_STMT_RE below are anchored on `^\s*import`/`^\s*from` (MULTILINE)
+# -- `\s*` matches the numbering's own leading SPACES but not the DIGITS that
+# follow, so neither regex has ever matched a real import line fetched this
+# way. Confirmed live (Phase 0.16, run 4238e60ed372): _extract_import_specs
+# produced zero candidates from page.tsx's own re-fetched content despite the
+# file genuinely containing the import compare_enumerations' own diagnostic
+# text had already shown is there.
+#
+# Matches ONLY the exact transport shape (optional leading spaces, one or
+# more digits, then exactly one literal tab, at a line's own start) -- a real
+# import/code line starts with a keyword or identifier character, never a
+# bare digit run followed by a tab, so this is a safe no-op on already-raw
+# source text (every existing/raw-text caller is unaffected).
+_TRANSPORT_LINE_NUMBER_RE = re.compile(r"^[ ]*\d+\t", re.MULTILINE)
+
+
+def _strip_transport_line_numbers(content: str) -> str:
+    """Strip hive-mcp's cat -n style line-number transport prefix (see
+    _TRANSPORT_LINE_NUMBER_RE's own comment) from `content`, for PARSING
+    purposes only. Never mutates the caller's own original string (returns a
+    new one) and is used solely as an internal normalization inside
+    _extract_import_specs -- never applied to citation-facing text, and
+    never changes any real source file's own line numbering, since nothing
+    outside this parsing step ever sees the result. A no-op (returns
+    `content` unchanged in substance) when `content` is already raw/
+    unnumbered text, which is exactly what makes this safe to apply
+    unconditionally rather than needing to first detect which shape the
+    input is in."""
+    return _TRANSPORT_LINE_NUMBER_RE.sub("", content or "")
+
 
 def _extract_import_specs(content: str, file_path: str) -> "list[tuple[str, str]]":
     """(module_spec, full_statement_text) pairs for every import in `content`,
@@ -14244,18 +14280,28 @@ def _extract_import_specs(content: str, file_path: str) -> "list[tuple[str, str]
     does, and _category_relevance_hint (below) looks at both. See the module
     comment above for the two languages this covers and why a dynamic import
     is deliberately left out rather than guessed.
+
+    Phase 0.17: `content` is normalized via _strip_transport_line_numbers
+    before either regex runs, so this works identically whether `content` is
+    raw source text (every pre-existing caller) or hive-mcp's real
+    cat -n-numbered get_file_content response (what _repo_file_text actually
+    receives in production -- see _TRANSPORT_LINE_NUMBER_RE's own comment).
+    Only this function's own local, parsing-only copy is normalized; the
+    caller's original `content` string is never touched, so no citation or
+    real source line number anywhere else is affected.
     """
     ext = os.path.splitext(file_path or "")[1].lower()
+    normalized = _strip_transport_line_numbers(content or "")
     pairs: list[tuple[str, str]] = []
     if ext == ".py":
-        for m in _PY_IMPORT_STMT_RE.finditer(content or ""):
+        for m in _PY_IMPORT_STMT_RE.finditer(normalized):
             stmt = m.group(0)
             mod_m = _IMPORT_PY_MODULE_RE.search(stmt)
             mod = mod_m and (mod_m.group(1) or mod_m.group(2))
             if mod:
                 pairs.append((mod, stmt))
     elif ext in (".ts", ".tsx", ".js", ".jsx"):
-        for m in _TS_IMPORT_STMT_RE.finditer(content or ""):
+        for m in _TS_IMPORT_STMT_RE.finditer(normalized):
             stmt = m.group(0)
             mod_m = _IMPORT_TS_MODULE_RE.search(stmt)
             if mod_m:
