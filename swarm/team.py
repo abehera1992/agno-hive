@@ -2736,7 +2736,8 @@ def _lead_sentence(content: str) -> str:
 
 
 async def _repo_match_count(pattern: str, hive_mcp_url: str | None,
-                            hive_mcp_tools=None, glob_filter: str = "**/*") -> int | None:
+                            hive_mcp_tools=None, glob_filter: str = "**/*",
+                            op_label: str = "") -> int | None:
     """Exact count of `pattern` in the project, from hive-mcp's count_matches.
 
     Returns None when the count could not be obtained. None is NOT zero, and every
@@ -2746,6 +2747,10 @@ async def _repo_match_count(pattern: str, hive_mcp_url: str | None,
     Same live-session-then-fresh-connection shape as _fill_count_markers, and for the
     same reason: opening a new streamablehttp_client while the run's own connections to
     that server are still open is the step confirmed to hang on 2026-08-20.
+
+    `op_label` (default "", Phase 0.9, 2026-10-31): opt-in, additive operation-start
+    telemetry tag -- see _verify_claims' own docstring for the same parameter. Every
+    pre-existing caller that omits it sees unchanged output.
     """
     if not (hive_mcp_url or hive_mcp_tools):
         return None
@@ -2766,14 +2771,23 @@ async def _repo_match_count(pattern: str, hive_mcp_url: str | None,
             box["n"] = int(m.group(1))
 
     if hive_mcp_tools is not None:
+        if op_label:
+            print(f"[guard-op] {op_label} count_matches START via live-session "
+                  f"timeout_s={_BESPOKE_MCP_SESSION_TIMEOUT} pattern={pattern!r}",
+                  flush=True)
         try:
             await asyncio.wait_for(_ask(await hive_mcp_tools.get_session_for_run()),
                                    timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
         except Exception as exc:
             print(f"[team] premise guard: live session failed "
-                  f"({type(exc).__name__}: {exc or '<no message>'})")
+                  + (f"[{op_label}] " if op_label else "")
+                  + f"({type(exc).__name__}: {exc or '<no message>'})")
 
     if box["n"] is None and hive_mcp_url:
+        if op_label:
+            print(f"[guard-op] {op_label} count_matches START via fresh-connection "
+                  f"timeout_s={_BESPOKE_MCP_SESSION_TIMEOUT} pattern={pattern!r}",
+                  flush=True)
         try:
             async def _fresh() -> None:
                 async with streamablehttp_client(hive_mcp_url) as (read, write, _):
@@ -2783,8 +2797,57 @@ async def _repo_match_count(pattern: str, hive_mcp_url: str | None,
             await asyncio.wait_for(_fresh(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
         except Exception as exc:
             print(f"[team] premise guard: hive-mcp unreachable ({hive_mcp_url}): "
-                  f"{type(exc).__name__}: {exc or '<no message>'}")
+                  + (f"[{op_label}] " if op_label else "")
+                  + f"{type(exc).__name__}: {exc or '<no message>'}")
+    if op_label:
+        print(f"[guard-op] {op_label} count_matches EXIT result={box['n']!r}", flush=True)
     return box["n"]
+
+
+async def _timed_guard_call(name: str, run_id: str, before_content: str, coro) -> str:
+    """Phase 0.9 (observability only, 2026-10-31): entry/exit/duration/outcome
+    telemetry around one post-_verified_answer guard call.
+
+    Why: Phase 0.8's live T13a run showed the deterministic comparison and the
+    verify-retry regeneration both complete, then went completely silent for
+    17+ minutes somewhere in the six guards that run after _verified_answer
+    (_hoist_denied_premise through _attempt_evidence_grounded_reconstruction) --
+    with no way to tell, from the journal alone, which guard (if any) was still
+    running versus already done, because none of them logs on entry and several
+    make their own MCP/model calls with no heartbeat of their own. This wraps
+    each guard's own call expression so the next run can answer that from the
+    journal directly.
+
+    Pure passthrough: returns exactly what `coro` resolves to, and re-raises
+    exactly what it raises -- including asyncio.CancelledError, which is caught
+    only to log it and is ALWAYS re-raised immediately, never swallowed. Nothing
+    here reads `before_content`/the result to make a DECISION; the comparison is
+    only used to label the outcome line "completed" (the guard changed the text)
+    vs. "skipped" (it returned the same text unchanged) for a human reading the
+    log -- it never feeds back into control flow. `coro` is already a bound
+    awaitable (the guard's own call expression, e.g. `_hoist_denied_premise(...)`)
+    passed in by the caller, not a callable this function invokes differently --
+    so this changes nothing about how, when, or with what arguments the guard
+    actually runs.
+    """
+    started = time.monotonic()
+    print(f"[guard-trace] {name} run={run_id} ENTER", flush=True)
+    try:
+        result = await coro
+    except asyncio.CancelledError:
+        print(f"[guard-trace] {name} run={run_id} CANCELLED after "
+              f"{time.monotonic() - started:.1f}s", flush=True)
+        raise
+    except Exception as exc:
+        print(f"[guard-trace] {name} run={run_id} EXCEPTION after "
+              f"{time.monotonic() - started:.1f}s -- "
+              f"{type(exc).__name__}: {str(exc)[:160]}", flush=True)
+        raise
+    outcome = "completed" if result != before_content else "skipped"
+    print(f"[guard-trace] {name} run={run_id} EXIT after "
+          f"{time.monotonic() - started:.1f}s outcome={outcome} "
+          f"out_chars={len(result or ''):,}", flush=True)
+    return result
 
 
 async def _hoist_denied_premise(content: str, hive_mcp_url: str | None = None,
@@ -2823,7 +2886,8 @@ async def _hoist_denied_premise(content: str, hive_mcp_url: str | None = None,
 
     absent = []
     for sym in candidates[:_PREMISE_MAX_LOOKUPS]:
-        n = await _repo_match_count(sym, hive_mcp_url, hive_mcp_tools)
+        n = await _repo_match_count(sym, hive_mcp_url, hive_mcp_tools,
+                                    op_label="hoist_denied_premise")
         if n == 0:
             absent.append(sym)
         elif n is None:
@@ -3420,7 +3484,8 @@ async def _computed_comparison(task: str, enumerations: dict | None,
 
 async def _verify_claims(content: str, hive_mcp_url: str | None,
                          hive_mcp_tools=None,
-                         liveness_path: "str | None" = None) -> tuple[str, bool, bool]:
+                         liveness_path: "str | None" = None,
+                         op_label: str = "") -> tuple[str, bool, bool]:
     """Run hive-mcp's verify_claims over a draft answer.
 
     `liveness_path` (default None, 2026-10-24, T13a.D): when provided, touches
@@ -3436,6 +3501,17 @@ async def _verify_claims(content: str, hive_mcp_url: str | None,
     `hive_mcp_tools` is the live agno MCPTools instance for hive-mcp, when the caller
     has one. Optional and defaulting to None so every existing caller and test keeps
     working unchanged; when present it is TRIED FIRST (see the attempt list below).
+
+    `op_label` (default "", Phase 0.9, 2026-10-31): when non-empty, prints one extra
+    START line before the attempts loop and tags this call's existing per-attempt
+    success/failure/unavailable lines with the caller's own label, so a run with
+    several _verify_claims call sites in flight (the six post-_verified_answer guards
+    each call this directly) can be told apart in the journal. Opt-in and purely
+    additive -- every pre-existing caller that does not pass it sees byte-identical
+    output to before. See Phase 0.8's own finding: this call already has a bounded
+    asyncio.wait_for timeout per attempt, but nothing printed when an attempt STARTED,
+    only on success/failure -- indistinguishable in the journal from "still running"
+    until it finishes one way or the other.
 
     Returns (report, has_problems, unavailable). `unavailable=True` means the check
     was ATTEMPTED and failed (exception or timeout) -- distinct from "not attempted"
@@ -3528,6 +3604,10 @@ async def _verify_claims(content: str, hive_mcp_url: str | None,
             attempts.append(("fresh-connection-retry", _call_on_fresh_connection,
                              _BESPOKE_MCP_SESSION_TIMEOUT // 2))
 
+    if op_label:
+        print(f"[guard-op] {op_label} verify_claims START "
+              f"attempts={[(l, b) for l, _, b in attempts]} "
+              f"content_chars={len(content):,}", flush=True)
     last_exc = None
     for n, (label, call, budget) in enumerate(attempts, start=1):
         started = time.monotonic()
@@ -3571,7 +3651,8 @@ async def _verify_claims(content: str, hive_mcp_url: str | None,
             # invisible because a 0.1s "ok" and a real 5s "ok" logged identically.
             print(f"[team] verify_claims ok via {label} (attempt {n}) in "
                   f"{time.monotonic() - started:.1f}s "
-                  f"({len(report)} chars, {report.strip().splitlines()[0][:48]!r})")
+                  f"({len(report)} chars, {report.strip().splitlines()[0][:48]!r})"
+                  + (f" [{op_label}]" if op_label else ""))
             _touch_liveness_snapshot(
                 liveness_path, f"verify_claims completed via {label} ({len(report)} chars)")
             return report, "could NOT be found" in report, False
@@ -3579,12 +3660,14 @@ async def _verify_claims(content: str, hive_mcp_url: str | None,
             last_exc = exc
             print(f"[team] verify_claims attempt {n}/{len(attempts)} ({label}) failed "
                   f"after {time.monotonic() - started:.1f}s (budget {budget}s) "
-                  f"({hive_mcp_url}): {type(exc).__name__}: {exc or '<no message>'}")
+                  + (f"[{op_label}] " if op_label else "")
+                  + f"({hive_mcp_url}): {type(exc).__name__}: {exc or '<no message>'}")
             if n < len(attempts):
                 await asyncio.sleep(_VERIFY_RETRY_PAUSE_S)
 
     print(f"[team] verify_claims unavailable after {len(attempts)} attempt(s) "
-          f"({hive_mcp_url}): {type(last_exc).__name__}: {last_exc or '<no message>'}")
+          + (f"[{op_label}] " if op_label else "")
+          + f"({hive_mcp_url}): {type(last_exc).__name__}: {last_exc or '<no message>'}")
     _touch_liveness_snapshot(liveness_path, "verify_claims unavailable after all attempts")
     return "", False, True
 
@@ -9523,7 +9606,8 @@ async def _evidence_integrity_check(
                 recheck_cmp_note)
             if not restripped_findings:
                 _rs_fab_report, _rs_fab_bad, _ = await _verify_claims(
-                    restripped_content, hive_mcp_url, hive_mcp_tools)
+                    restripped_content, hive_mcp_url, hive_mcp_tools,
+                    op_label="evidence_integrity_check:restripped-recheck")
                 if not _rs_fab_bad:
                     print(f"[team] evidence-integrity: retry still contradicted "
                           f"{[f['category'] for f in recheck]}, but the deterministic "
@@ -9552,7 +9636,8 @@ async def _evidence_integrity_check(
         # reused rather than duplicated: merge verify_claims' own findings into the
         # SAME disclosure instead of adding a second banner or a second retry.
         _retried_fab_report, _retried_fab_bad, _ = await _verify_claims(
-            retried, hive_mcp_url, hive_mcp_tools)
+            retried, hive_mcp_url, hive_mcp_tools,
+            op_label="evidence_integrity_check:retry-contradiction-recheck")
         if _retried_fab_bad:
             print(f"[team] evidence-integrity: retry still contradicts "
                   f"{[f['category'] for f in recheck]} AND failed verify_claims — "
@@ -9584,7 +9669,8 @@ async def _evidence_integrity_check(
     # other path to a shipped answer crosses. One additional, bounded call -- not a
     # second verifier, the existing one -- closes that gap.
     _retried_fab_report, _retried_fab_bad, _retried_fab_unavailable = await _verify_claims(
-        retried, hive_mcp_url, hive_mcp_tools)
+        retried, hive_mcp_url, hive_mcp_tools,
+        op_label="evidence_integrity_check:reconciliation-recheck")
     if _retried_fab_bad:
         print(f"[team] evidence-integrity: reconciliation candidate resolved the "
               f"comparison contradiction but failed verify_claims — "
@@ -12595,7 +12681,8 @@ async def _enforce_verification_invariant(
         return content
 
     fab_report, fab_bad, fab_unavailable = await _verify_claims(
-        content, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path)
+        content, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path,
+        op_label="enforce_verification_invariant:initial")
     if fab_bad and not fab_unavailable:
         missing = _not_found_claims(fab_report)
         if missing:
@@ -12604,7 +12691,8 @@ async def _enforce_verification_invariant(
 
             async def _recheck(text: str):
                 return await _verify_claims(
-                    text, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path)
+                    text, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path,
+                    op_label="enforce_verification_invariant:repair-recheck")
 
             return await _repair_verification_failure(
                 content, task, team, hive_mcp_url, hive_mcp_tools, liveness_path,
@@ -12787,7 +12875,8 @@ async def _attempt_evidence_grounded_reconstruction(
               f"right_only={summary['right_only']} ambiguous={summary['ambiguous']}",
               flush=True)
         report_s, still_bad_s, unavailable_s = await _verify_claims(
-            synthesized, hive_mcp_url, hive_mcp_tools)
+            synthesized, hive_mcp_url, hive_mcp_tools,
+            op_label="attempt_evidence_grounded_reconstruction:synthesis-recheck")
         print(f"[team] deterministic reconstruction synthesis recheck: "
               f"still_bad={still_bad_s} unavailable={unavailable_s} | "
               f"{_verdict_digest(report_s)}", flush=True)
@@ -12819,7 +12908,8 @@ async def _attempt_evidence_grounded_reconstruction(
         return content
 
     report2, still_bad, unavailable2 = await _verify_claims(
-        reconstructed, hive_mcp_url, hive_mcp_tools)
+        reconstructed, hive_mcp_url, hive_mcp_tools,
+        op_label="attempt_evidence_grounded_reconstruction:final-recheck")
     # K7: narrow, deterministic defense-in-depth -- see
     # _reconstruction_category_conflict's own docstring. A no-op whenever
     # cmp_note isn't synthesis-eligible (e.g. every existing pre-Phase-L test
@@ -14881,9 +14971,12 @@ async def _attempt_coverage_correction(
         return content + disclosure
 
     _retried_fab_report, _retried_fab_bad, _ = await _verify_claims(
-        retried, hive_mcp_url, hive_mcp_tools)
+        retried, hive_mcp_url, hive_mcp_tools,
+        op_label="attempt_coverage_correction:retry-recheck")
     if _retried_fab_bad:
-        _pre_report, _pre_bad, _ = await _verify_claims(content, hive_mcp_url, hive_mcp_tools)
+        _pre_report, _pre_bad, _ = await _verify_claims(
+            content, hive_mcp_url, hive_mcp_tools,
+            op_label="attempt_coverage_correction:original-recheck")
         _new_flagged = _flagged_lines_set(_retried_fab_report) - _flagged_lines_set(_pre_report)
         if _new_flagged:
             print(f"[team] coverage-correction: retry introduced new verify_claims "
@@ -14993,7 +15086,8 @@ async def _attempt_integration_correction(
     # candidate that resolved THIS specific gap may have fabricated something
     # else while rewriting. Never adopt without this check.
     _retried_fab_report, _retried_fab_bad, _ = await _verify_claims(
-        retried, hive_mcp_url, hive_mcp_tools)
+        retried, hive_mcp_url, hive_mcp_tools,
+        op_label="attempt_integration_correction:retry-recheck")
     if _retried_fab_bad:
         # T12 accuracy (2026-10-24): `content` reaching this function is not
         # always verify_claims-clean -- when Phase H's own one retry already
@@ -15023,7 +15117,8 @@ async def _attempt_integration_correction(
         # citation guarantee (a failed citation must never be silently
         # dropped) is preserved either way.
         _pre_report, _pre_bad, _ = await _verify_claims(
-            content, hive_mcp_url, hive_mcp_tools)
+            content, hive_mcp_url, hive_mcp_tools,
+            op_label="attempt_integration_correction:original-recheck")
         _new_flagged = _flagged_lines_set(_retried_fab_report) - _flagged_lines_set(_pre_report)
         if _new_flagged:
             print(f"[team] integration-correction: retry now names the real "
@@ -29122,6 +29217,10 @@ async def run_task_async(
                 # Tier-4 guard: grep the draft's claims; one correction round if any are
                 # unsupported. Instruction-level verification was tried first and the
                 # model ignored it, so this is enforced outside the model.
+                # Phase 0.9 (2026-10-31): the run's own short id, for the guard-chain
+                # entry/exit telemetry below -- "unknown" only when _phase0 tracking
+                # is off for this run (e.g. a non-read_only call), never a hard failure.
+                _run_id_for_trace = getattr(_phase0, "run_id", None) or "unknown"
                 try:
                     _hive_url, _hive_tools = _pick_hive_mcp(mcp_by_url, "verify_claims")
                     if _hive_url is None:
@@ -29142,8 +29241,9 @@ async def run_task_async(
                     # at its 20+ return sites. The _verification_block rollout showed
                     # what per-return-site wiring costs: four early returns were missed
                     # and shipped unguarded. One choke point covers every path.
-                    content = await _hoist_denied_premise(
-                        content, _hive_url, hive_mcp_tools=_hive_tools)
+                    content = await _timed_guard_call(
+                        "_hoist_denied_premise", _run_id_for_trace, content,
+                        _hoist_denied_premise(content, _hive_url, hive_mcp_tools=_hive_tools))
                     # Phase H (2026-09-23): same choke-point reasoning as
                     # _hoist_denied_premise directly above -- re-verify the FINAL
                     # text and repair-or-fail rather than let a still-invalid
@@ -29151,18 +29251,22 @@ async def run_task_async(
                     # 20+ internal guards produced it. See that section's own
                     # docstring (defined near _affirmed_term_absent_from_citations)
                     # for the T13b/T12/T10 root causes this closes.
-                    content = await _enforce_verification_invariant(
-                        content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
-                        liveness_path=liveness_path)
+                    content = await _timed_guard_call(
+                        "_enforce_verification_invariant", _run_id_for_trace, content,
+                        _enforce_verification_invariant(
+                            content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
+                            liveness_path=liveness_path))
                     # Phase R (2026-09-14): the same "one choke point" placement,
                     # applied to _verified_answer's own FINAL output -- catches a
                     # contradiction against structured evidence that survived every
                     # guard inside _verified_answer's own chain untouched. See
                     # _evidence_integrity_check's own docstring for why this sits
                     # outside that chain rather than as one more guard inside it.
-                    content = await _evidence_integrity_check(
-                        content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
-                        liveness_path=liveness_path, synthesis_run=synthesis_run)
+                    content = await _timed_guard_call(
+                        "_evidence_integrity_check", _run_id_for_trace, content,
+                        _evidence_integrity_check(
+                            content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
+                            liveness_path=liveness_path, synthesis_run=synthesis_run))
                     # T12 (2026-10-23): same choke-point placement, immediately after
                     # Phase R above -- spends content's one remaining targeted retry
                     # (a separate, own-flagged budget; see
@@ -29170,9 +29274,11 @@ async def run_task_async(
                     # integration gap _integration_mechanism_missing already finds
                     # deterministically, instead of only ever disclosing it after the
                     # fact at a later _run_repo_derived_guards call site.
-                    content = await _attempt_integration_correction(
-                        content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
-                        liveness_path=liveness_path, synthesis_run=synthesis_run)
+                    content = await _timed_guard_call(
+                        "_attempt_integration_correction", _run_id_for_trace, content,
+                        _attempt_integration_correction(
+                            content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
+                            liveness_path=liveness_path, synthesis_run=synthesis_run))
                     # T69.1 (2026-10-29): same choke-point placement, immediately
                     # after the integration-gap retry above -- a DIFFERENT gap
                     # shape (a multi-category comparison/gap-analysis conclusion
@@ -29180,9 +29286,11 @@ async def run_task_async(
                     # hooks failure) gets its own one-shot retry budget, backed by
                     # bounded dependency traversal rather than a plain disclosure.
                     # See _comparison_coverage_gap's own docstring.
-                    content = await _attempt_coverage_correction(
-                        content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
-                        liveness_path=liveness_path, synthesis_run=synthesis_run)
+                    content = await _timed_guard_call(
+                        "_attempt_coverage_correction", _run_id_for_trace, content,
+                        _attempt_coverage_correction(
+                            content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
+                            liveness_path=liveness_path, synthesis_run=synthesis_run))
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
                 # Phase I (2026-09-23): the LAST word, deliberately after Phase R above --
@@ -29195,9 +29303,12 @@ async def run_task_async(
                 # same reason every guard at this choke point is: a diagnostic or
                 # recovery attempt failing must never cost the run its answer.
                 try:
-                    content = await _attempt_evidence_grounded_reconstruction(
-                        content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
-                        liveness_path=liveness_path)
+                    content = await _timed_guard_call(
+                        "_attempt_evidence_grounded_reconstruction", _run_id_for_trace,
+                        content,
+                        _attempt_evidence_grounded_reconstruction(
+                            content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
+                            liveness_path=liveness_path))
                 except Exception as exc:
                     print(f"[team] evidence-grounded reconstruction warning: {exc}")
                 # Phase V forensic instrumentation: log-only, never mutates `content`,
