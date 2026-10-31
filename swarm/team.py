@@ -15611,6 +15611,108 @@ def _mandatory_coverage_disclosure(missing_cats: "frozenset[str]", task_cats) ->
         f"treated as UNRESOLVED for {sorted(missing_cats)}, not confirmed absent.**")
 
 
+def _section_for_category(content: str, category: str) -> str | None:
+    """The first markdown-heading-delimited block of `content` (heading
+    through the line before the next heading, or end of content) whose
+    HEADING text matches `category`'s own _SUBJECT_CATEGORY_KEYWORDS --
+    reusing the exact keyword vocabulary _subject_categories already uses
+    for task-category detection, so "category" means the same thing on
+    both sides of this comparison. None if `category` is unrecognized, has
+    no keywords, or no heading in `content` matches.
+
+    Phase 0.25 (T13a vouchers-hooks under-delegation remediation): the
+    section-identification half of a category-scoped salvage -- see
+    _attempt_coverage_correction's own retry-rejection branch for why a
+    whole-answer accept/reject decision is too coarse when a retry fixes
+    one category's evidence gap while leaving a different, unrelated one
+    still wrong.
+    """
+    keywords = _SUBJECT_CATEGORY_KEYWORDS.get(category)
+    if not keywords or not content:
+        return None
+    headings = list(_MD_HEADING_RE.finditer(content))
+    for i, m in enumerate(headings):
+        heading_words = {w.lower() for w in _CATEGORY_WORD_RE.findall(m.group())}
+        if heading_words & keywords:
+            start = m.start()
+            end = headings[i + 1].start() if i + 1 < len(headings) else len(content)
+            return content[start:end].rstrip()
+    return None
+
+
+def _flagged_symbol_names(flagged_lines: set[str]) -> set[str]:
+    """The bare symbol/entity name named on each verify_claims flagged line
+    (e.g. 'NOT IN FILE voucher_types <-- ...' -> 'voucher_types'), stripping
+    whichever _VERDICT_FLAG_PREFIXES prefix the line starts with. Used to
+    check whether a specific candidate section actually contains the
+    fabricated name a retry introduced, rather than assuming any new
+    verify_claims problem anywhere taints every section equally."""
+    names = set()
+    for line in flagged_lines:
+        for prefix in _VERDICT_FLAG_PREFIXES:
+            if line.startswith(prefix):
+                rest = line[len(prefix):].strip()
+                token = rest.split("<--", 1)[0].strip().split()
+                if token:
+                    names.add(token[0])
+                break
+    return names
+
+
+def _salvage_resolved_category_section(
+        content: str, retried: str, resolved: list[dict], new_flagged: set[str]) -> str | None:
+    """When a coverage-correction retry is otherwise rejected for
+    introducing a verify_claims problem it did not have before, this is the
+    narrow exception: if ONE of the categories the retry was actually given
+    real evidence for (`resolved`, from _comparison_coverage_gap -- never a
+    guess) has its own section in `retried` that does not itself contain any
+    of the newly-flagged fabricated names, that one section is real,
+    evidence-backed improvement, independent of whatever else in the same
+    retry is still wrong. Replaces only that section of `content` with the
+    corresponding section of `retried`; every other section of `content`
+    (including categories the retry never got evidence for, and anything
+    already correct) is untouched.
+
+    Returns the merged text if at least one category was safely salvaged,
+    else None -- the caller's existing whole-retry-rejection fallback is
+    unchanged for every other case, including when no section split is
+    identifiable at all (prose without markdown headings) or when the only
+    categories with real evidence are themselves the ones still naming a
+    newly-flagged symbol.
+
+    Phase 0.25: confirmed live-necessary on the vouchers T13a run
+    (a7ec54e1c780) -- the coverage-correction retry correctly reconciled
+    "hooks" against the real inventoryApi.ts evidence _comparison_
+    coverage_gap found (all 5 real hook names present), but also
+    re-fabricated a "tables" entry (voucher_types) the retry was never given
+    any evidence for, and the existing all-or-nothing check discarded the
+    whole retry -- including the correct hooks fix -- keeping the original,
+    still-fabricated content instead. Never invents anything: every section
+    adopted here already passed its own verify_claims recheck as part of
+    `retried`'s overall check, and is gated on citing the SAME real evidence
+    `gap["resolved"]` independently confirmed."""
+    flagged_names = _flagged_symbol_names(new_flagged)
+    merged = content
+    any_merged = False
+    for entry in resolved:
+        category = entry.get("matched_category")
+        if not category:
+            continue
+        retried_section = _section_for_category(retried, category)
+        if not retried_section:
+            continue
+        if flagged_names & {w for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", retried_section)}:
+            # The retry's own section for this category still names one of
+            # the newly-flagged fabricated symbols -- not a clean fix,
+            # never salvage it.
+            continue
+        content_section = _section_for_category(content, category)
+        if content_section and content_section != retried_section:
+            merged = merged.replace(content_section, retried_section, 1)
+            any_merged = True
+    return merged if any_merged else None
+
+
 async def _attempt_coverage_correction(
         content: str, task: str, team, hive_mcp_url: str | None, hive_mcp_tools,
         liveness_path: str | None = None, synthesis_run: bool = False) -> str:
@@ -15740,6 +15842,21 @@ async def _attempt_coverage_correction(
             op_label="attempt_coverage_correction:original-recheck")
         _new_flagged = _flagged_lines_set(_retried_fab_report) - _flagged_lines_set(_pre_report)
         if _new_flagged:
+            # Phase 0.25: before discarding the retry wholesale, check whether
+            # the specific category it was actually handed real evidence for
+            # (`resolved`) can be salvaged in isolation -- see
+            # _salvage_resolved_category_section's own docstring for the
+            # confirmed live incident this closes. A retry that fixes one
+            # evidence-backed category while re-fabricating a DIFFERENT one
+            # it was never given evidence for should not lose the fix it
+            # actually earned.
+            _salvaged = _salvage_resolved_category_section(content, retried, resolved, _new_flagged)
+            if _salvaged is not None:
+                print(f"[team] coverage-correction: retry introduced new verify_claims "
+                      f"problem(s) {sorted(_new_flagged)[:2]} but a resolved category's "
+                      f"own section is clean -- salvaging that section only, "
+                      f"keeping the rest of the original content", flush=True)
+                return _salvaged + disclosure
             print(f"[team] coverage-correction: retry introduced new verify_claims "
                   f"problem(s) not already present in content — "
                   f"{sorted(_new_flagged)[:2]} — keeping original content", flush=True)
