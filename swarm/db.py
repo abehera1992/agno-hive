@@ -231,7 +231,16 @@ runs = Table(
     Column("run_type", Text, nullable=True),
     Column("team_name", Text, nullable=True),
     Column("task_preview", Text, nullable=True),
-    Column("status", Text, nullable=False, default="running"),  # 'running' | 'ok' | 'failed'
+    # Phase 0.13: 'ok_truncated' added -- the RUN's own terminal outcome
+    # (persist_run_completed, run_task_async's outermost finally), set when
+    # the actually-delivered final answer still carries a recognized
+    # incomplete-answer disclosure note (team.py's _final_content_is_
+    # incomplete), never merely because SOME intermediate retry inside the
+    # run timed out or got truncated and was then successfully recovered
+    # from -- that case is indistinguishable from a normal 'ok' here, by
+    # design. Plain Text column, no CHECK constraint, so this addition
+    # needed no migration.
+    Column("status", Text, nullable=False, default="running"),  # 'running' | 'ok' | 'ok_truncated' | 'failed'
     Column("started_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("completed_at", DateTime(timezone=True), nullable=True),
     Column("error_message", Text, nullable=True),

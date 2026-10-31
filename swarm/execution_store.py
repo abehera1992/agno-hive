@@ -1123,7 +1123,14 @@ async def check_storage_integrity() -> dict:
 
             impossible = 0
             for table, terminal in (
-                (db.runs, ("ok", "failed")),
+                # Phase 0.13: "ok_truncated" added here only -- db.runs is the
+                # only table persist_run_completed ever writes it to (the
+                # run-level terminal outcome). db.executions never receives
+                # this value (per-retry/root rows stay plain "ok"/"failed",
+                # since they describe one intermediate attempt, not the
+                # overall delivered answer -- see team.py's run_task_async
+                # finally block), so it is deliberately left unchanged.
+                (db.runs, ("ok", "ok_truncated", "failed")),
                 (db.executions, ("ok", "failed")),
                 (db.tool_calls, ("ok", "error")),
             ):

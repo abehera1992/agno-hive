@@ -8157,12 +8157,83 @@ async def _reask_after_syntax_loss(content: str, task: str, team, all_results,
 
 
 _REPETITION_COMPLETION_FLAG = "_repetition_completion_attempted"
+# Phase 0.13: shared substring every incomplete-answer disclosure note below
+# contains, regardless of which cause produced it -- every existing
+# `_TRUNCATED_ANSWER_NOTE in X` / `not in X` containment check in this file
+# is rewritten against THIS marker instead of the (now cause-specific)
+# literal note text, so "is there already an incomplete-answer disclosure
+# present" keeps working unchanged across all three causes.
+_INCOMPLETE_ANSWER_MARKER = "**INCOMPLETE ANSWER —"
 _TRUNCATED_ANSWER_NOTE = (
     "\n\n---\n**INCOMPLETE ANSWER — this generation was cut off in-process by the "
     "repetition-loop guard before it reached a conclusion, and one attempt to "
     "complete it did not produce a more grounded result than what is shown above. "
     "What is above may stop mid-thought or omit the final conclusion.**"
 )
+# Phase 0.13 (fixes the defect Phase 0.12 confirmed by direct source reading):
+# _TRUNCATED_ANSWER_NOTE above names "the repetition-loop guard" unconditionally,
+# even when the real cause was T58's semantic-stall guard or Phase 0.11's stream
+# inactivity timeout -- neither of which is a repetition loop. These two siblings
+# share _INCOMPLETE_ANSWER_MARKER so every existing containment check still finds
+# them; only the literal wording differs. Deliberately does NOT imply an overall
+# task-duration limit was reached (Phase 0.11's own bound is an inter-event gap,
+# not a total-runtime cap) and does NOT imply the model/service itself failed --
+# this is a deliberate in-process stop, not a crash.
+_SEMANTIC_STALL_TRUNCATED_NOTE = (
+    "\n\n---\n**INCOMPLETE ANSWER — this generation was cut off in-process because "
+    "an exploratory search kept returning the same result on repeated attempts "
+    "despite the model trying a different approach each time, and one attempt to "
+    "complete it did not produce a more grounded result than what is shown above. "
+    "What is above may stop mid-thought or omit the final conclusion.**"
+)
+_INACTIVITY_TIMEOUT_TRUNCATED_NOTE = (
+    "\n\n---\n**INCOMPLETE ANSWER — this generation stopped after an extended "
+    "period with no event of any kind, and one attempt to complete it did not "
+    "produce a more grounded result than what is shown above. What is above may "
+    "stop mid-thought or omit the final conclusion.**"
+)
+
+
+def _truncation_note_for_reason(reason: str | None) -> str:
+    """The cause-specific incomplete-answer disclosure for `reason` -- the
+    same three-way string _complete_repetition_truncated_answer (and its own
+    callers' fallback-disclosure branches) compute: "repetition" /
+    "semantic stall" / "inactivity timeout". Any other value, including None
+    (a defensive/legacy caller that never captured a reason), falls back to
+    _TRUNCATED_ANSWER_NOTE's own repetition-loop wording -- the exact
+    behavior every call site had before this phase, so an uninspected caller
+    is never worse off than before."""
+    if reason == "semantic stall":
+        return _SEMANTIC_STALL_TRUNCATED_NOTE
+    if reason == "inactivity timeout":
+        return _INACTIVITY_TIMEOUT_TRUNCATED_NOTE
+    return _TRUNCATED_ANSWER_NOTE
+
+
+def _current_truncation_reason(team) -> str | None:
+    """Read-only snapshot of WHY team._repetition_truncated/
+    _semantic_stall_truncated is currently set, for a caller that needs to
+    know the cause BEFORE handing control to _complete_repetition_truncated_
+    answer -- that function clears both flags (and the stall-cause label
+    below) on its own entry, so a caller reading them only AFTER that call
+    returns would always see them already cleared. Never mutates team;
+    purely observational, safe to call any number of times.
+
+    team._stall_truncation_kind (set alongside team._semantic_stall_truncated
+    by _stream_team_run's own T58 and Phase 0.11 branches) is what
+    distinguishes "semantic stall" from "inactivity timeout" -- both set the
+    SAME boolean flag, so the boolean alone cannot tell them apart. Not a new
+    detection mechanism: a pure provenance label attached to an existing,
+    unmodified stop decision."""
+    if getattr(team, "_repetition_truncated", False):
+        return "repetition"
+    if getattr(team, "_semantic_stall_truncated", False):
+        return ("inactivity timeout"
+                if getattr(team, "_stall_truncation_kind", None) == "inactivity_timeout"
+                else "semantic stall")
+    return None
+
+
 # T13a/T13b.II (2026-10-24): a DIFFERENT reason than _TRUNCATED_ANSWER_NOTE above --
 # that note means the completion lost on evidence/grounding (_adopt_retry). This one
 # means the completion WON on grounding but did not carry the required explicit
@@ -8184,6 +8255,25 @@ _RECOVERY_CONTINUATION_REJECTED_NOTE = (
     "identified as a continuation. The original answer has been preserved; "
     "the answer may be incomplete.]"
 )
+
+
+def _final_content_is_incomplete(content: "str | None") -> bool:
+    """Phase 0.13: the ONE signal run_task_async's run-level terminal status
+    trusts for "was the answer actually delivered incomplete" -- whether the
+    FINAL content still carries a known incomplete-answer disclosure note,
+    never a historical truncation flag. team._repetition_truncated/
+    _semantic_stall_truncated are intermediate-attempt signals that get set
+    and cleared repeatedly across a run's own retries/recovery passes (see
+    _adopt_retry and _complete_repetition_truncated_answer); by the time this
+    run's content is final, an intermediate timeout that was successfully
+    recovered from has already had its flag cleared and left no note in the
+    text -- correctly NOT incomplete. Only a disclosure note that actually
+    survived into the delivered answer means the delivered answer itself is
+    incomplete."""
+    if not content:
+        return False
+    return (_INCOMPLETE_ANSWER_MARKER in content
+            or _RECOVERY_CONTINUATION_REJECTED_NOTE in content)
 
 
 def _extract_explicit_recovery_continuation(candidate: str) -> str | None:
@@ -8285,9 +8375,15 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
     was_semantic_stall = getattr(team, "_semantic_stall_truncated", False)
     if not was_repetition and not was_semantic_stall:
         return content, result
+    # Phase 0.13: snapshot the full 3-way reason (including the provenance
+    # label distinguishing T58's semantic stall from Phase 0.11's inactivity
+    # timeout, which share the _semantic_stall_truncated boolean) BEFORE
+    # clearing it below -- _current_truncation_reason is read-only, so this
+    # does not change when or whether the flags get cleared.
+    truncation_reason = _current_truncation_reason(team) or "repetition"
     setattr(team, "_repetition_truncated", False)
     setattr(team, "_semantic_stall_truncated", False)
-    truncation_reason = "repetition" if was_repetition else "semantic stall"
+    setattr(team, "_stall_truncation_kind", None)
     if getattr(team, _REPETITION_COMPLETION_FLAG, False):
         return content, result
     setattr(team, _REPETITION_COMPLETION_FLAG, True)
@@ -8334,7 +8430,7 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
     except Exception as exc:  # noqa: BLE001
         print(f"[team] repetition-truncation completion failed: {exc} — keeping the "
               f"truncated draft", flush=True)
-        return content + _TRUNCATED_ANSWER_NOTE, result
+        return content + _truncation_note_for_reason(truncation_reason), result
     # T12-FOLLOWUP: the _stream_team_run call just above can ITSELF trip its own
     # copy of the Z16 repetition-stop logic -- live-confirmed on T4 and T13a, where
     # the completion pass restated content it had already written (the exact
@@ -8348,11 +8444,21 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
     # trip the NEW semantic-stall signal, not just Z16's repetition one --
     # same treatment, either way: a still-incomplete completion must never
     # be adopted as if it were whole.
-    nested_truncation = (getattr(team, "_repetition_truncated", False)
-                         or getattr(team, "_semantic_stall_truncated", False))
+    # Phase 0.13: snapshot the nested reason too, same read-before-clear
+    # discipline as the outer truncation_reason above -- this inner stop can
+    # be a DIFFERENT cause than the outer one (e.g. outer was an inactivity
+    # timeout, but the completion attempt's own retry hits Z16 repetition).
+    nested_reason = _current_truncation_reason(team)
+    nested_truncation = nested_reason is not None
     if nested_truncation:
         setattr(team, "_repetition_truncated", False)
         setattr(team, "_semantic_stall_truncated", False)
+        setattr(team, "_stall_truncation_kind", None)
+    # Whichever reason is actually most relevant to "why is this still
+    # incomplete" below: the completion attempt's OWN truncation if it had
+    # one, otherwise the original (outer) truncation this whole function
+    # exists to recover from.
+    effective_reason = nested_reason or truncation_reason
     if not completed or completed.strip() == "(no response)":
         # The literal fallback _stream_team_run/run_task_async's own Z16 copy both
         # use when a generation yields zero content -- truthy as a string, so the
@@ -8371,7 +8477,7 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
             return content, result
         print(f"[team] {truncation_reason}-truncation completion returned "
               f"nothing — keeping the truncated draft", flush=True)
-        return content + _TRUNCATED_ANSWER_NOTE, result
+        return content + _truncation_note_for_reason(effective_reason), result
 
     adopted, adopted_result = _adopt_retry(
         "repetition-completion", content, result, completed, retry, team=team,
@@ -8388,7 +8494,7 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
         print(f"[team] {truncation_reason}-truncation completion was not more "
               f"grounded than the truncated draft — keeping the draft, disclosed "
               f"as incomplete", flush=True)
-        return content + _TRUNCATED_ANSWER_NOTE, result
+        return content + _truncation_note_for_reason(effective_reason), result
     # PHASE N / TRACK A (2026-10-03): the prompt above tells the model it is
     # CONTINUING `content`, not replacing it -- but until now, once `completed`
     # cleared the grounding bar, it alone became the WHOLE returned answer,
@@ -8435,10 +8541,10 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
     combined = f"{content.rstrip()}\n\n{continuation}" if content.strip() else continuation
     if nested_truncation:
         print(f"[team] {truncation_reason}-truncation completion was itself cut "
-              f"short by a second stall/repetition — adopting it but disclosing "
-              f"it as still incomplete rather than shipping it silently",
-              flush=True)
-        return combined + _TRUNCATED_ANSWER_NOTE, adopted_result
+              f"short by a second stall/repetition ({nested_reason}) — adopting "
+              f"it but disclosing it as still incomplete rather than shipping it "
+              f"silently", flush=True)
+        return combined + _truncation_note_for_reason(nested_reason), adopted_result
     print(f"[team] {truncation_reason}-truncation completion adopted "
           f"({len(continuation):,} chars of marked continuation) — preserving "
           f"{len(content):,} pre-repeat chars alongside it", flush=True)
@@ -9556,13 +9662,15 @@ async def _evidence_integrity_check(
     # cause) -- checked as an alternative trigger here too, for the same
     # reason _complete_repetition_truncated_answer's own entry check now
     # does.
-    was_truncated = (getattr(team, "_repetition_truncated", False)
-                     or getattr(team, "_semantic_stall_truncated", False))
+    # Phase 0.13: snapshot the reason BEFORE the call below clears it, same
+    # discipline as _complete_repetition_truncated_answer's own entry check.
+    _fallback_reason = _current_truncation_reason(team)
+    was_truncated = _fallback_reason is not None
     pre_completion = retried
     retried, _ = await _complete_repetition_truncated_answer(
         retried, task, team, [], None, liveness_path)
     if (was_truncated and retried == pre_completion
-            and _TRUNCATED_ANSWER_NOTE not in retried
+            and _INCOMPLETE_ANSWER_MARKER not in retried
             and not _ends_at_a_natural_stopping_point(retried)):
         # _complete_repetition_truncated_answer's own one-shot budget had
         # already been spent by an earlier stage in this same run -- it
@@ -9571,8 +9679,8 @@ async def _evidence_integrity_check(
         # attempt a completion at all. Add that disclosure here so this
         # still-incomplete candidate is never mistaken for a finished one
         # by the checks below.
-        retried = retried + _TRUNCATED_ANSWER_NOTE
-    if _TRUNCATED_ANSWER_NOTE in retried:
+        retried = retried + _truncation_note_for_reason(_fallback_reason)
+    if _INCOMPLETE_ANSWER_MARKER in retried:
         print("[team] evidence-integrity: retry remains repetition-truncated "
               "after the one bounded completion pass -- not adopting it as "
               "complete merely because no contradiction remains in it; "
@@ -14973,17 +15081,19 @@ async def _attempt_coverage_correction(
         print(f"[team] coverage-correction retry failed: {exc}", flush=True)
         return content + disclosure
 
-    was_truncated = (getattr(team, "_repetition_truncated", False)
-                     or getattr(team, "_semantic_stall_truncated", False))
+    # Phase 0.13: snapshot the reason BEFORE the call below clears it, same
+    # discipline as the evidence-integrity guard's own fallback above.
+    _fallback_reason = _current_truncation_reason(team)
+    was_truncated = _fallback_reason is not None
     retried, _ = await _complete_repetition_truncated_answer(
         retried, task, team, [], None, liveness_path)
-    if was_truncated and _TRUNCATED_ANSWER_NOTE not in retried \
+    if was_truncated and _INCOMPLETE_ANSWER_MARKER not in retried \
             and not _ends_at_a_natural_stopping_point(retried):
-        retried = retried + _TRUNCATED_ANSWER_NOTE
+        retried = retried + _truncation_note_for_reason(_fallback_reason)
 
     if not retried or not _strip_leaked_tool_tags(retried).strip() \
             or retried.strip() == _BUDGET_EXHAUSTED_ANSWER \
-            or _TRUNCATED_ANSWER_NOTE in retried:
+            or _INCOMPLETE_ANSWER_MARKER in retried:
         print("[team] coverage-correction retry produced nothing usable", flush=True)
         return content + disclosure
 
@@ -15079,17 +15189,19 @@ async def _attempt_integration_correction(
         print(f"[team] integration-correction retry failed: {exc}", flush=True)
         return content + finding
 
-    was_truncated = (getattr(team, "_repetition_truncated", False)
-                     or getattr(team, "_semantic_stall_truncated", False))
+    # Phase 0.13: snapshot the reason BEFORE the call below clears it, same
+    # discipline as the evidence-integrity guard's own fallback above.
+    _fallback_reason = _current_truncation_reason(team)
+    was_truncated = _fallback_reason is not None
     retried, _ = await _complete_repetition_truncated_answer(
         retried, task, team, [], None, liveness_path)
-    if was_truncated and _TRUNCATED_ANSWER_NOTE not in retried \
+    if was_truncated and _INCOMPLETE_ANSWER_MARKER not in retried \
             and not _ends_at_a_natural_stopping_point(retried):
-        retried = retried + _TRUNCATED_ANSWER_NOTE
+        retried = retried + _truncation_note_for_reason(_fallback_reason)
 
     if not retried or not _strip_leaked_tool_tags(retried).strip() \
             or retried.strip() == _BUDGET_EXHAUSTED_ANSWER \
-            or _TRUNCATED_ANSWER_NOTE in retried:
+            or _INCOMPLETE_ANSWER_MARKER in retried:
         print("[team] integration-correction retry produced nothing usable", flush=True)
         return content + finding
 
@@ -28498,6 +28610,17 @@ async def _stream_team_run(
         # completion and any exception raised out of the loop above, so identity/
         # status stay available either way without a new try/except around the
         # whole function.
+        #
+        # Phase 0.13: deliberately NOT given the new "ok_truncated" terminal
+        # status -- this row describes whether THIS ONE retry attempt itself
+        # raised, not whether the overall answer the run eventually delivers
+        # is complete. An inactivity timeout or Z16/T58 stop both exit via
+        # `break`, never a raise, so this stays "ok" for exactly the same
+        # reason it did before this phase: the retry function returned
+        # normally. Whether its content was adopted, recovered from, or
+        # discarded is decided by the CALLER, after this row is already
+        # closed -- only run_task_async's own outermost finally (the run's
+        # true terminal outcome) inspects the final delivered content.
         if _run_ctx is not None and _retry_execution_id is not None:
             _run_ctx.finish_execution(
                 _retry_execution_id,
@@ -28546,6 +28669,11 @@ async def _stream_team_run(
         accumulated = accumulated[:last_good_len].strip() or "(no response)"
         final_segment = accumulated
         setattr(team, "_semantic_stall_truncated", True)
+        # Phase 0.13: provenance label only, alongside the existing flag above --
+        # not a new detection mechanism or threshold. Lets a disclosure-wording
+        # caller (_current_truncation_reason) tell this cause apart from the
+        # DIFFERENT one below that sets the identical boolean.
+        setattr(team, "_stall_truncation_kind", "semantic_stall")
     if inactivity_timeout_stopped:
         # Phase 0.11: no trim needed here, unlike the two branches above --
         # by definition nothing new was yielded between the last successfully
@@ -28563,6 +28691,9 @@ async def _stream_team_run(
         if not accumulated.strip():
             accumulated = "(no response)"
         setattr(team, "_semantic_stall_truncated", True)
+        # Phase 0.13: same provenance label as the semantic-stall branch above,
+        # distinct value -- see that branch's own comment.
+        setattr(team, "_stall_truncation_kind", "inactivity_timeout")
     final_segment, accumulated = _isolate_contaminated_fallback(
         final_segment, accumulated, segment_agent_names, run_agent_names, team)
     content = _with_forwarded_evidence(_first_surviving_answer(
@@ -29196,6 +29327,12 @@ async def run_task_async(
                             # so the run's own completion is persisted separately,
                             # once, at run_task_async's true end (see the outer
                             # finally below).
+                            #
+                            # Phase 0.13: for the same reason, this row never gets
+                            # the new "ok_truncated" terminal status either -- it
+                            # tracks only whether the FIRST PASS itself raised,
+                            # which is unaffected by what any later retry/recovery
+                            # does to the answer the run ultimately delivers.
                             await execution_store.guard(execution_store.persist_execution_completed(
                                 _run_ctx.executions[_run_ctx.root_execution_id]))
                 accumulated = "".join(full_content) or "(no response)"
@@ -29487,7 +29624,24 @@ async def run_task_async(
                 _run_ctx = getattr(team, "_run_context", None)
                 if _run_ctx is not None:
                     _exc = sys.exc_info()[1]
-                    _final_status = "failed" if _exc is not None else "ok"
+                    # Phase 0.13: the run's TERMINAL DELIVERED outcome, not
+                    # "did any intermediate retry ever time out" -- locals()
+                    # is used (rather than referencing `content` directly)
+                    # because an exception raised before `content` was ever
+                    # first assigned (e.g. inside the stream-consumption
+                    # block above) would make a direct reference raise
+                    # NameError from inside this finally. A successfully
+                    # recovered intermediate timeout/truncation leaves no
+                    # disclosure note in the final content, so it is
+                    # correctly "ok" here, exactly as before this phase --
+                    # only a disclosure note that actually survived into
+                    # what was delivered distinguishes "ok_truncated".
+                    _final_status = (
+                        "failed" if _exc is not None
+                        else "ok_truncated" if _final_content_is_incomplete(
+                            locals().get("content"))
+                        else "ok"
+                    )
                     await execution_store.guard(execution_store.persist_run_completed(
                         _run_ctx, status=_final_status,
                         error=str(_exc) if _exc is not None else None,
