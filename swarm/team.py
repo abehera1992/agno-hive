@@ -14707,6 +14707,48 @@ async def _content_matches_category(
     return _content_matches_category_heuristic(category, content, file_path)
 
 
+def _excerpt_around_match(content: str, category: str, file_path: str,
+                          window_chars: int = _DEPENDENCY_TRAVERSAL_EXCERPT_CHARS) -> str:
+    """Phase 0.15: an excerpt of `content` CENTERED on the first real
+    occurrence of `category`'s own content-shape pattern
+    (_CATEGORY_CONTENT_SHAPE), instead of _traverse_missing_category_
+    dependencies' previous plain head-truncation (`content[:window_chars]`).
+
+    Confirmed directly against the real inventoryApi.ts (Phase 0.14's own
+    missed dependency): it is a single ~1,700-line API slice exporting 49
+    unrelated RTK Query hooks across many feature areas, with the actual
+    hook-export block (where the voucher-specific names this phase's own
+    traversal exists to surface actually live) positioned well past any
+    reasonable head-truncation window -- a head-truncated excerpt handed to
+    the reconciliation retry in _attempt_coverage_correction would correctly
+    be MARKED as covering "hooks" (matching happens against the FULL fetched
+    content, not the excerpt), yet show the retry model none of the actual
+    hook names it needs to reconcile its answer against. This function does
+    not change what counts as covered -- only what text a caller sees.
+
+    Falls back to the previous plain head-truncation when no pattern is
+    registered for this category/extension, or no match is found (should
+    not happen for a category this function is only ever called with AFTER
+    _content_matches_category already confirmed a match, but this never
+    raises either way -- a window-selection miss must never crash a
+    traversal that already succeeded on the real coverage question)."""
+    if len(content) <= window_chars:
+        return content
+    ext = os.path.splitext(file_path or "")[1].lower()
+    if ext in (".tsx", ".js", ".jsx"):
+        ext = ".ts"
+    pattern = _CATEGORY_CONTENT_SHAPE.get(category, {}).get(ext)
+    match = pattern.search(content) if pattern else None
+    if not match:
+        return content[:window_chars] + "\n... (truncated)"
+    half = window_chars // 2
+    start = max(0, match.start() - half)
+    end = min(len(content), start + window_chars)
+    prefix = "... (truncated)\n" if start > 0 else ""
+    suffix = "\n... (truncated)" if end < len(content) else ""
+    return prefix + content[start:end] + suffix
+
+
 async def _traverse_missing_category_dependencies(
         task_cats: "frozenset[str]", read_paths: list[str],
         hive_mcp_url: str | None, hive_mcp_tools) -> "tuple[frozenset, list[dict], list[dict]]":
@@ -14898,8 +14940,7 @@ async def _traverse_missing_category_dependencies(
             continue
         covered.add(matched_cat)
         still_missing.discard(matched_cat)
-        excerpt = (fetched if len(fetched) <= _DEPENDENCY_TRAVERSAL_EXCERPT_CHARS
-                  else fetched[:_DEPENDENCY_TRAVERSAL_EXCERPT_CHARS] + "\n... (truncated)")
+        excerpt = _excerpt_around_match(fetched, matched_cat, resolved_path)
         entry = {"from": src_path, "spec": spec, "resolved_path": resolved_path,
                 "status": "resolved", "reason": reason, "content_excerpt": excerpt,
                 "matched_category": matched_cat}
@@ -14949,6 +14990,30 @@ async def _comparison_coverage_gap(
         # without concluding an absence) -- nothing for this gate to guard.
         return None
 
+    # T69.8 (Phase 0.15): restrict the categories the bounded traversal below
+    # spends _DEPENDENCY_TRAVERSAL_MAX_FILES on to ones the DELIVERED ANSWER
+    # actually discusses, not every category-shaped word anywhere in `task`.
+    # `task` can carry preflight-grounding facts appended ahead of the real
+    # question (project_map's own printed paths/filenames for an unrelated
+    # file it also found can literally contain words like "migrations" or
+    # "config"), which inflates _subject_categories(task) well past what the
+    # question is actually asking to compare. Confirmed live (Phase 0.14, run
+    # 5ce43069c276): task_cats computed as 6 categories (['config',
+    # 'endpoints','hooks','import','migrations','tables']) from the
+    # preflight-extended task string, while the delivered content's own
+    # _subject_categories is exactly the 3 the question is actually about
+    # (['endpoints','hooks','tables']) -- diluting the shared traversal
+    # budget across 3 extra categories the answer never substantively
+    # discusses, at the expense of the one ('hooks') whose real dependency
+    # (inventoryApi.ts) actually needed that budget to be followed.
+    # Intersecting with the content's own categories only ever NARROWS
+    # task_cats (never adds one), and falls back to the unnarrowed set if the
+    # intersection is empty (a genuinely contentless/degenerate draft), so
+    # this cannot make a category that previously got traversed become
+    # un-traversed.
+    content_cats = _subject_categories(content or "")
+    traversal_cats = (task_cats & content_cats) or task_cats
+
     read_state = getattr(team, "_read_state", None) or {}
     read_paths = [str(r.get("path") or "") for r in (read_state.get("reads") or [])
                   if r.get("path")]
@@ -14956,17 +15021,19 @@ async def _comparison_coverage_gap(
         return None
 
     covered_cats, resolved, attempted = await _traverse_missing_category_dependencies(
-        task_cats, read_paths, hive_mcp_url, hive_mcp_tools)
-    still_missing = task_cats - covered_cats
+        traversal_cats, read_paths, hive_mcp_url, hive_mcp_tools)
+    still_missing = traversal_cats - covered_cats
 
-    print(f"[team] coverage gate: task spans categories {sorted(task_cats)}; "
-          f"content-grounded coverage found for {sorted(covered_cats)} "
+    print(f"[team] coverage gate: task spans categories {sorted(task_cats)} "
+          f"(traversal scoped to {sorted(traversal_cats)} the answer actually "
+          f"discusses); content-grounded coverage found for {sorted(covered_cats)} "
           f"({len(resolved)} via followed dependencies), leaving "
           f"{sorted(still_missing)} still uncovered", flush=True)
 
     if not resolved and not still_missing:
         return None
-    return {"missing_cats": still_missing, "resolved": resolved, "attempted": attempted}
+    return {"missing_cats": still_missing, "resolved": resolved, "attempted": attempted,
+            "task_cats": traversal_cats}
 
 
 _COVERAGE_GAP_BANNER_RE = re.compile(
@@ -15045,7 +15112,13 @@ async def _attempt_coverage_correction(
 
     missing_cats = gap["missing_cats"]
     resolved = gap["resolved"]
-    task_cats = _subject_categories(task)
+    # T69.8: use the SAME (answer-narrowed) category set the gap itself
+    # traversed against, not a fresh _subject_categories(task) recompute --
+    # the latter would be the wider, preflight-inflated set and make the
+    # disclosure name categories the traversal never actually tried to
+    # cover, inconsistent with `missing_cats` (always a subset of the
+    # narrowed set by construction).
+    task_cats = gap["task_cats"]
     disclosure = _mandatory_coverage_disclosure(missing_cats, task_cats)
 
     if not resolved:
