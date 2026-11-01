@@ -14,6 +14,7 @@ from uuid import uuid4
 import httpx
 from opentelemetry import trace
 from pydantic import BaseModel, Field
+from agno.exceptions import StopAgentRun
 from agno.run.team import TeamRunOutput
 from agno.team import Team
 from agno.tools import tool as agno_tool
@@ -8441,6 +8442,34 @@ _NO_DELEGATION_DURING_COMPLETION_MESSAGE = (
     "answer text directly, in prose, from the exact point where it was cut off."
 )
 
+# Phase 0.30 (bounded completion): live incident ko60hqhpl / session
+# 18481d07-259a-48ce-83be-9ea74611f9b1 showed the model, refused once, simply
+# retrying the same blocked delegation call instead of switching to prose --
+# vLLM's own backend log showed 5 sequential tool-call attempts (incrementing
+# placeholder IDs) across the full 120s window, none of them visible here
+# because the refusal above returns a string instead of ever executing
+# anything, so the model just kept retrying against a wall until the API's
+# liveness auto-terminate finally killed the whole run. A small, explicit
+# per-invocation cap on how many refusals one completion call tolerates,
+# closed with agno's own StopAgentRun (agno.exceptions -- "Exception raised
+# when an agent should stop executing entirely"; caught inside agno's own
+# run loop and never re-raised to this function's caller, it marks the tool
+# result stop_after_tool_call=True so the run ends cleanly after this one
+# tool result instead of taking another model turn -- confirmed by reading
+# agno/models/base.py's arun_function_call/arun_function_calls directly, not
+# assumed), ends a looping completion pass in low single-digit seconds
+# instead of waiting the full 120s for the external liveness kill.
+#
+# No new fallback logic is needed anywhere else for this: _complete_
+# repetition_truncated_answer's own post-call handling already treats an
+# empty/near-empty `completed` result, or one with no explicit continuation
+# marker, as "nothing usable came back" and falls back to the original,
+# pre-completion draft disclosed as incomplete (see its "not completed"
+# and "continuation is None" branches) -- exactly the shape a stopped-early
+# completion produces, since the model was only issuing refused tool calls,
+# never prose, before the cap trips.
+_MAX_REFUSED_DELEGATIONS_PER_COMPLETION = 2
+
 
 def _make_no_delegation_hook():
     """One-call tool_hook: redirects any delegate_task_to_member(s)/
@@ -8448,10 +8477,39 @@ def _make_no_delegation_hook():
     comment above _complete_repetition_truncated_answer for why this exists and
     why interception (not removing the tool from the model's schema) is the
     right shape here -- the same shape _make_decompose_first_gate_hook already
-    uses for a different trigger condition."""
+    uses for a different trigger condition.
+
+    Phase 0.30: bounds how many times the model may retry a refused delegation
+    within this one call before the hook gives up and stops the run via
+    StopAgentRun, rather than refusing indefinitely (see the comment on
+    _MAX_REFUSED_DELEGATIONS_PER_COMPLETION above). `refused_count` is a plain
+    closure variable scoped to this one hook instance -- installed for exactly
+    one _stream_team_run call and discarded immediately after (the caller's
+    own try/finally restores team.tool_hooks unconditionally) -- so nothing
+    here needs to be reset between calls or attached to `team`."""
+    refused_count = 0
+
     async def _no_delegation_hook(function_name, function, args, **_kwargs):
+        nonlocal refused_count
         if function_name not in _DELEGATION_TOOL_NAMES:
             return await function(**args)
+        refused_count += 1
+        # Never logs `args` -- the delegated sub-task text is prompt content,
+        # not diagnostic metadata. function_name + a count is enough to
+        # correlate this with the completion run in the journal.
+        print(f"[team] completion-pass delegation refused ({function_name}, "
+              f"attempt {refused_count}/{_MAX_REFUSED_DELEGATIONS_PER_COMPLETION})",
+              flush=True)
+        if refused_count >= _MAX_REFUSED_DELEGATIONS_PER_COMPLETION:
+            print(f"[team] completion pass stopped: {refused_count} refused "
+                  f"delegation attempt(s) in this call -- model is retrying a "
+                  f"blocked action instead of writing prose, ending the pass "
+                  f"now instead of waiting for the external liveness kill",
+                  flush=True)
+            raise StopAgentRun(
+                "completion pass stopped after repeated refused delegation attempts",
+                agent_message=_NO_DELEGATION_DURING_COMPLETION_MESSAGE,
+            )
         return _NO_DELEGATION_DURING_COMPLETION_MESSAGE
     return _no_delegation_hook
 
