@@ -13826,12 +13826,26 @@ _REQUESTS_WORKFLOW_RELATED_RE = re.compile(
 _TABLES_LANDMARK_RE = re.compile(
     r"\bdatabase\s+tables?\b|\btables?\s+(?:used|owned|declared)\b", re.I)
 _TABLES_WINDOW_CHARS = 1500
-# A backticked identifier on a bullet/numbered line -- the one shape both
-# observed runs used for a table-list item, whether the value is a snake_case
-# table name (T13a: `` `voucher_series` ``) or a PascalCase model class name
-# (T13b: `` `Voucher` ``). Resolved against the real table/class map below
-# rather than assumed from casing.
-_TABLE_BULLET_RE = re.compile(r"`([A-Za-z][A-Za-z0-9_]*)`")
+# A backticked OR bold-markdown identifier on a bullet/numbered line -- a table-
+# list item has used both shapes across live runs: backtick-wrapped bare names
+# (T13a 1st observation: `` `voucher_series` ``), backtick-wrapped class names
+# (T13b: `` `Voucher` ``), and bold-wrapped, schema-prefixed names (T13a 2nd
+# observation: `**inventory.voucher_series**`). An optional lowercase
+# "schema." prefix is stripped either way. Two full groups (not one shared
+# across alternatives) because backtick and `**` must pair with themselves,
+# never cross -- `` `foo** `` must not match. Resolved against the real
+# table/class map below rather than assumed from casing or presence of a
+# schema prefix; a bold span that is not a real table/class name (ordinary
+# emphasis elsewhere in the answer) is filtered out there, not here.
+_TABLE_BULLET_RE = re.compile(
+    r"`(?:[a-z][\w]*\.)?([A-Za-z][A-Za-z0-9_]*)`"
+    r"|\*\*(?:[a-z][\w]*\.)?([A-Za-z][A-Za-z0-9_]*)\*\*")
+
+
+def _table_bullet_name(m: "re.Match") -> str:
+    """The captured identifier from a `_TABLE_BULLET_RE` match, whichever
+    alternative (backtick or bold) fired."""
+    return m.group(1) or m.group(2)
 _CLASS_DEF_RE = re.compile(r"^class\s+(\w+)\([^)]*\):", re.MULTILINE)
 _TABLENAME_ASSIGN_RE = re.compile(r"__tablename__\s*=\s*[\"'](\w+)[\"']")
 _FK_TARGET_RE = re.compile(r"ForeignKey\(\s*[\"']([\w.]+)[\"']")
@@ -14004,7 +14018,7 @@ async def _module_table_ownership_scope(task: str, content: str,
 
     asserted: list[str] = []
     for bm in _TABLE_BULLET_RE.finditer(window):
-        name = bm.group(1)
+        name = _table_bullet_name(bm)
         if name in tmap and tmap[name] not in asserted and name not in asserted:
             asserted.append(name)
     if not asserted:
