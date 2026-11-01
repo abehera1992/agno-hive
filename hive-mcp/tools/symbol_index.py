@@ -58,6 +58,13 @@ def _py_index(src: str) -> dict:
         return {}
     classes: dict[str, dict] = {}
     functions: dict[str, int] = {}
+    # Phase 0.28 (Track C1): the END line of each function's own declaration,
+    # from the same AST node Python already parsed (`end_lineno`, standard since
+    # 3.8) -- not a second parse, not a new parser. Lets a citation-content check
+    # validate a multiline signature against its own real span instead of a fixed
+    # +/-N-line guess that can land short of a long parameter list's closing
+    # paren. See verify.py's `declaration_span` caller for the incident this closes.
+    function_ends: dict[str, int] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
             fields: dict[str, int] = {}
@@ -77,7 +84,22 @@ def _py_index(src: str) -> dict:
                                             if isinstance(b, ast.Name)]}
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             functions.setdefault(node.name, node.lineno)
-    return {"classes": classes, "functions": functions, "lang": "py"}
+            # `node.end_lineno` is the end of the whole FUNCTION BODY, not the
+            # signature -- wrong for this use (Track C1 needs where the
+            # PARAMETER LIST closes, not where the last statement inside the
+            # function ends). The signature's own real end is one line before
+            # the first body statement (the docstring, if present, counts --
+            # it is body[0] too), or the def's own line for a one-liner where
+            # the body starts on the same line as `def`.
+            if node.body:
+                first_body_line = node.body[0].lineno
+                sig_end = (first_body_line - 1 if first_body_line > node.lineno
+                          else node.lineno)
+            else:
+                sig_end = node.lineno
+            function_ends.setdefault(node.name, max(sig_end, node.lineno))
+    return {"classes": classes, "functions": functions,
+            "function_ends": function_ends, "lang": "py"}
 
 
 def _ts_index(src: str) -> dict:
@@ -171,6 +193,34 @@ def declares(rel_path: str, symbol: str) -> tuple[bool | None, int | None, str]:
         if symbol in route:
             return True, line, "route"
     return False, None, ""
+
+
+def declaration_span(rel_path: str, symbol: str) -> tuple[int, int] | None:
+    """(start_line, end_line) of a Python FUNCTION's declaration, 1-indexed
+    inclusive, from the same AST index `declares` already builds -- or None
+    when the file isn't indexable, isn't Python, or does not declare `symbol`
+    as a function (class/field/export/route claims are single-line and do not
+    need a span here).
+
+    Phase 0.28 (Track C1): lets a citation-content check validate an
+    ellipsis-quoted multiline signature against the declaration's own real
+    extent, rather than a fixed +/-N-line window that can land short of a
+    long parameter list's closing paren. T10, 2026-10-31 fresh battery:
+    `authHelper.py:132`'s real signature is `async def check_login_rate_limit(`
+    through `) -> None:` at line 138 (7 lines, 5 typed/defaulted parameters) --
+    the fixed 5-line tolerance window used elsewhere in this pipeline reaches
+    only to line 136, so the quote's closing `)` was never in the window
+    checked, and a citation independently confirmed byte-exact was reported
+    MISMATCH.
+    """
+    idx = index_file(rel_path)
+    if idx is None or idx.get("lang") != "py":
+        return None
+    functions = idx.get("functions", {})
+    ends = idx.get("function_ends", {})
+    if symbol in functions and symbol in ends:
+        return functions[symbol], ends[symbol]
+    return None
 
 
 def class_bases(rel_path: str, class_name: str) -> list[str] | None:

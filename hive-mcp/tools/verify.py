@@ -67,6 +67,44 @@ from .exclusions import rg_args, is_excluded, EXCLUDE_DIRS
 _BACKTICK_RE = re.compile(r"`([^`\n]{2,120})`")
 # path/to/file.ext:123  — the citation form the instructions ask for.
 _FILE_LINE_RE = re.compile(r"([A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,6}):(\d{1,6})")
+
+# Phase 0.28 (Track C2): a dotted-quad IPv4 address followed by a port literal
+# matches _FILE_LINE_RE's own shape exactly -- the last octet satisfies
+# `\.[A-Za-z0-9]{1,6}` as a plausible "extension" and the port satisfies
+# `\d{1,6}` as a plausible "line number". Live, battery T12:
+# `os.getenv("AGNO_API_URL", "http://100.96.86.82:9001")` inside a fenced code
+# block produced two fabricated citations, `//100.96.86.82:9001` and
+# `//100.96.86.82:11434`, both correctly reported BAD (no such file) because
+# neither was ever a citation to begin with.
+#
+# Deliberately narrow, not an extension allowlist: rejects a match only when the
+# "extension" group is PURELY NUMERIC, or the whole path segment is itself a
+# dotted-quad shape. No real extension in this repo's own citation contract
+# (.py/.ts/.tsx/.json/.yaml/.md/.env/.cfg/.sql/.sh/.toml/...) is ever all-digits,
+# and no real repo-relative path is four dot-separated 1-3-digit groups, so
+# neither condition can reject a genuine file citation.
+_IPV4_DOTTED_QUAD_RE = re.compile(r"^/{0,2}(?:\d{1,3}\.){3}\d{1,3}$")
+
+
+def _looks_like_network_address(path: str, ext: str) -> bool:
+    """True when a `_FILE_LINE_RE` match is a network address:port, not a
+    source-file citation -- see _IPV4_DOTTED_QUAD_RE's own comment above."""
+    if ext.isdigit():
+        return True
+    return bool(_IPV4_DOTTED_QUAD_RE.match(path))
+
+
+def _file_line_matches(answer: str):
+    """`_FILE_LINE_RE.finditer(answer)`, excluding network-address:port matches
+    (Track C2) -- the single point every consumer of `_FILE_LINE_RE` goes
+    through, so a dotted-IP:port literal cannot register as a citation NOR
+    bound a real citation's quote-search window (see `_citation_bounds`)."""
+    for m in _FILE_LINE_RE.finditer(answer or ""):
+        path = m.group(1)
+        ext = path.rsplit(".", 1)[-1]
+        if _looks_like_network_address(path, ext):
+            continue
+        yield m
 # Labeled-prose line citations: "**Line:** 389", "line 389", "Line: 389". Measured
 # 2026-08-03: a real answer wrote "**File:** `models.py`, **Line:** 389" instead of
 # the compact "models.py:389" form -- _FILE_LINE_RE never matches that shape at all,
@@ -2042,8 +2080,8 @@ def _citation_bounds(answer: str, pos: int) -> tuple[int, int]:
     true positives with it.
     """
     lo, hi = 0, len(answer)
-    for rx in (_FILE_LINE_RE, _LABELED_LINE_RE):
-        for m in rx.finditer(answer):
+    for matches in (_file_line_matches(answer), _LABELED_LINE_RE.finditer(answer)):
+        for m in matches:
             if m.end() <= pos:
                 lo = max(lo, m.end())        # nearest citation ending before this one
             elif m.start() > pos:
@@ -2402,7 +2440,31 @@ def _read_window(rel_path: str, center_line: int, span: int) -> str:
     return "\n".join(lines[lo:hi])
 
 
+def _read_exact_span(rel_path: str, start_line: int, end_line: int) -> str:
+    """Real file text from `start_line` to `end_line` inclusive (1-indexed) --
+    the declaration-aware counterpart to `_read_window`'s +/-N-line guess,
+    used only once the structural index (`symbol_index.declaration_span`) has
+    already confirmed the exact extent of a specific function's own
+    declaration (Phase 0.28, Track C1). Bounded by construction: the span
+    comes from one AST-parsed node, never a guessed or searched range, so this
+    can never pull in a neighboring, unrelated declaration as evidence.
+    """
+    p = PROJECT_ROOT / rel_path
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return ""
+    lo = max(0, start_line - 1)
+    hi = min(len(lines), end_line)
+    return "\n".join(lines[lo:hi])
+
+
 _ELLIPSIS_RE = re.compile(r"\.\.\.|…")
+
+# "async def check_login_rate_limit(..." / "def foo(..." / "class Bar(..." -- the
+# symbol an ellipsis-quoted signature is ABOUT, so its real declaration span can be
+# looked up structurally rather than guessed from a fixed line window (Track C1).
+_DECL_OPENER_RE = re.compile(r"\b(?:async\s+def|def|class)\s+(\w+)")
 
 
 # "(lines 235-263)", "lines 235–263", "lines 235 to 263" -- a SPAN, not a point. The end
@@ -2816,7 +2878,7 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     # word order does not reliably say which is the subject. See _find_anchor_symbols
     # and the CITATIONS loop, which resolves it by asking the file.
     symbol_claims: dict[tuple[str, int], list[str]] = {}
-    for m in _FILE_LINE_RE.finditer(answer):
+    for m in _file_line_matches(answer):
         path, num = m.group(1), int(m.group(2))
         pair = (path, num)
         if pair not in file_lines:
@@ -3213,7 +3275,35 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                         # endpoint, elsewhere outside the range, or not at all, all still
                         # fall through to the genuine MISMATCH unchanged.
                         _rng = _range_containing(answer, num)
-                        if (_rng and _rng[1] == num and _rng[0] != num
+                        # Phase 0.28 (Track C1): an ellipsis-quoted signature can run
+                        # past the fixed _LINE_TOLERANCE window -- resolve the
+                        # declaration's own real span from the structural index
+                        # (symbol_index, the same AST already used elsewhere in this
+                        # pipeline) and retry against exactly that extent, never a
+                        # neighboring or guessed range. Only attempted when the quote
+                        # actually carries an ellipsis and names a def/class opener;
+                        # an ordinary short citation never reaches this branch at all,
+                        # since _quote_matches already matched it above.
+                        _span_verified = False
+                        if _ELLIPSIS_RE.search(quoted):
+                            _decl_m = _DECL_OPENER_RE.search(quoted)
+                            if _decl_m:
+                                from .symbol_index import declaration_span
+                                _span = declaration_span(resolved, _decl_m.group(1))
+                                if (_span and _span[0] <= num <= _span[1]
+                                        and _quote_matches(
+                                            quoted,
+                                            _read_exact_span(resolved, *_span))):
+                                    out.append(
+                                        f"             `{quoted[:60]}` verified "
+                                        f"against the full declaration "
+                                        f"(lines {_span[0]}-{_span[1]}, structural "
+                                        f"index)"
+                                    )
+                                    _span_verified = True
+                        if _span_verified:
+                            pass
+                        elif (_rng and _rng[1] == num and _rng[0] != num
                                 and _quote_matches(
                                     quoted, _read_window(resolved, _rng[0], _LINE_TOLERANCE))):
                             out.append(

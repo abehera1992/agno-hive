@@ -10189,6 +10189,12 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
         task, content, hive_mcp_url, hive_mcp_tools, record=_draft_coverage)
     _hook_cov_note = await _module_hook_coverage_gap(
         task, content, hive_mcp_url, hive_mcp_tools)
+    # Phase 0.28 (Track B). Also registered in _run_repo_derived_guards (rescue /
+    # corrected-answer paths) -- THIS call is the one a normal, never-retried
+    # answer actually takes, same reason _docs_note/_fields_note are called
+    # twice (see the comment on them below).
+    _table_scope_note = await _module_table_ownership_scope(
+        task, content, hive_mcp_url, hive_mcp_tools)
     _opened_note = ("" if _asks_for_one_fact(task)
                     else _swept_directory_not_reported(content, team))
     _integ_note = await _integration_mechanism_missing(
@@ -10229,7 +10235,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
             content, _rs.get("enumerations") if isinstance(_rs, dict) else None)
         return (_stale_findings_dropped(_fab_note, content)
                 + _cmp_note + completeness + _lost_report_evidence(team)
-                + _count_note + _term_note + _scope_note + _hook_cov_note + _opened_note
+                + _count_note + _term_note + _scope_note + _hook_cov_note
+                + _table_scope_note + _opened_note
                 + _integ_note + _svc_note + _models_note + _table_note + _crud_gap_note
                 + _docs_note + _fields_note
                 + _summarize_actual_writes(*all_results))
@@ -12263,6 +12270,84 @@ _AFFIRMS_RE = re.compile(
 _EXISTENCE_VERBS = (r"implemented|defined|present|available|located|configured|handled"
                     r"|provided|registered|applied|in\s+place|set\s+up")
 
+# Phase 0.28 (Track A): a reporting-clause affirmation -- "These findings indicate
+# that there is indeed a middleware...", "The evidence confirms that a middleware
+# component exists.", "The repository contains middleware..." -- none of which the
+# two shapes above recognize, because both require the TERM to come BEFORE the
+# existence marker ("TERM is/are implemented") or the marker to be the literal
+# opening of the content ("Yes"/"There is"). All three new shapes put the marker
+# BEFORE the term, or use an existence verb (exists/contains/has/includes) neither
+# shape checks for at all.
+#
+# T10, 2026-10-31 fresh battery: the Researcher's own concluding sentence was
+# "These findings indicate that there is indeed a rate-limiting middleware or
+# mechanism in place" -- at character offset ~1383 in the delivered content, well
+# past any narration preamble. Confirmed empirically (Phase 0.27) that neither
+# existing shape recognizes this sentence even in total isolation, with no preamble
+# at all -- a genuine recognition gap, not merely the old 400-char window being
+# too narrow.
+#
+# Deliberately scanned over a WIDER span than the two shapes above
+# (_REPORTING_SCAN_CHARS, not _HEAD_CHARS): this family requires an explicit
+# existence marker AND the term AND no disqualifying hedge/negation/question word in
+# a tight local window, which is a much narrower trigger than the old bare
+# "yes"/"there is" opening anchor -- the "a 'yes' buried in later prose is usually
+# about something else" risk that justifies capping the first two shapes at the
+# answer's opening does not apply the same way here, because this family cannot
+# fire on a bare "yes" alone, or on hedged/negated/question phrasing (see
+# _DISQUALIFIER_RE below).
+_REPORTING_SCAN_CHARS = 4000
+
+# "there is/are ... TERM" -- an existence marker directly BEFORE the term, the
+# mirror image of the term-before-verb fallback below. The reporting-clause prefix
+# ("X indicates/shows/confirms that ...") is not required for this shape to match --
+# only common in practice -- so a bare "There is middleware." also counts.
+_THERE_IS_TERM_RE_TMPL = (
+    r"there\s+(?:is|are)\s+(?!no\b|not\b|none\b|nothing\b)[^.\n]{{0,60}}?\b{term}\b")
+# "TERM ... exists" -- a different existence verb than the is/are+adjective shape
+# the original fallback covers ("exists"/"exist", never "is/are present").
+_TERM_EXISTS_RE_TMPL = r"\b{term}\b[^.\n]{{0,40}}?\bexists?\b"
+# "contains/has/includes/comprises ... TERM" -- an ordinary possession/containment
+# verb asserting the term is present, with no is/are or exists at all.
+_CONTAINS_TERM_RE_TMPL = (
+    r"\b(?:contains?|has|have|includes?|comprises?)\b[^.\n]{{0,40}}?\b{term}\b")
+
+# Disqualifies a candidate match from the three shapes above regardless of which one
+# found it: a hedge, a question, or a negation anywhere in the window around the
+# match means the sentence is not a confident affirmation, no matter how
+# "existence"-shaped its words are.
+#   "This MAY indicate middleware" / "the question asks WHETHER middleware exists" /
+#   "IF there is a scheduler" / "does NOT establish that middleware exists" /
+#   "insufficient to establish middleware" / "middleware-like behavior MAY exist"
+# The window spans from _DISQUALIFIER_WINDOW chars before the match through the
+# match's own end (not just before it), because a hedge like "may" in
+# "behavior may exist" sits INSIDE the matched span, between the term and the verb.
+_DISQUALIFIER_RE = re.compile(
+    r"\b(?:if|whether|may|might|could|possibly|perhaps|unsure|unclear|unknown|"
+    r"not|n't|never|no|fails?\s+to|unable\s+to|insufficient|ask\w*|question\w*)\b",
+    re.I)
+_DISQUALIFIER_WINDOW = 80
+
+
+def _reports_existence(content: str, term: str) -> bool:
+    """Phase 0.28 (Track A): does `content` affirm, in a reporting-clause or
+    reordered-existence shape, that `term` exists -- the recognition gap
+    _affirms_existence's own two original shapes do not cover. See the
+    constants above for the exact shapes and the disqualifier list.
+    """
+    scan = (content or "").strip()[:_REPORTING_SCAN_CHARS]
+    if not scan or not term:
+        return False
+    escaped = re.escape(term)
+    for tmpl in (_THERE_IS_TERM_RE_TMPL, _TERM_EXISTS_RE_TMPL, _CONTAINS_TERM_RE_TMPL):
+        pattern = tmpl.format(term=escaped)
+        for m in re.finditer(pattern, scan, re.I):
+            win_lo = max(0, m.start() - _DISQUALIFIER_WINDOW)
+            window = scan[win_lo:m.end()]
+            if not _DISQUALIFIER_RE.search(window):
+                return True
+    return False
+
 
 def _affirms_existence(content: str, term: str) -> bool:
     """Does the answer's opening assert that `term` exists?
@@ -12291,10 +12376,17 @@ def _affirms_existence(content: str, term: str) -> bool:
         return True
     if not term:
         return False
-    return bool(re.search(
+    if re.search(
         rf"\b{re.escape(term)}\b[^.\n]{{0,40}}?\b(?:is|are)\s+"
         rf"(?!not\b|no\b|never\b|nowhere\b|absent\b|missing\b)"
-        rf"(?:{_EXISTENCE_VERBS})\b", head, re.I))
+        rf"(?:{_EXISTENCE_VERBS})\b", head, re.I):
+        return True
+    # Phase 0.28 (Track A): reporting-clause / reordered-existence shapes -- see
+    # _reports_existence's own docstring. Checked last and separately from the two
+    # shapes above: it scans a wider span and has its own disqualifier logic, kept
+    # as a distinct function rather than folded in here so each shape's own
+    # calibration stays independently readable and testable.
+    return _reports_existence(content, term)
 _CITED_FILE_RE = re.compile(r"`?([A-Za-z0-9_./-]+\.(?:py|ts|tsx))`?")
 _MAX_TERM_FILE_CHECKS = 4
 
@@ -13707,6 +13799,262 @@ _MODULE_HOOK_ASK_RE = re.compile(
     r"([a-z][\w-]*)\s+module\b[^.]{0,160}?\b(?:frontend\s+)?hooks?\b", re.I)
 _MODULE_HOOK_MIN_EXPORTS = 2
 _MODULE_HOOK_COVERAGE_RATIO = 0.5
+
+# Phase 0.28 (Track B): the same "audit/overview/... the X module" shape as
+# _MODULE_HOOK_ASK_RE above, widened to "database tables" instead of "hooks" --
+# a CONCEPTUAL module question, no file named. Deliberately does not require
+# "database" (T13a's own task said just "its database tables"; other phrasing
+# in this battery has said plain "tables") -- "database " stays optional.
+_MODULE_TABLE_ASK_RE = re.compile(
+    r"\b(?:audit|overview|describe|document|summar\w+)\b[^.]{0,40}?\bthe\s+"
+    r"([a-z][\w-]*)\s+module\b[^.]{0,200}?\b(?:database\s+)?tables?\b", re.I)
+# The task's OWN requested relationship type. When it explicitly asks for a
+# BROADER relationship (foreign-key-related, or workflow-wide), a table reachable
+# only by that relationship is exactly what was asked for and must not be flagged
+# -- the guard below only enforces direct-ownership scope for the plain "list its
+# database tables" shape neither of these match.
+_REQUESTS_FK_RELATED_RE = re.compile(r"\bforeign[\s-]?key\b", re.I)
+_REQUESTS_WORKFLOW_RELATED_RE = re.compile(
+    r"\bworkflow\b|\bused\s+(?:across|throughout|anywhere\s+in)\b|\brelated\s+to\b",
+    re.I)
+# A landmark phrase that precedes a module's own table list in every observed
+# shape of this answer (both the no-heading forwarded-narration shape and the
+# clean "#### Database Tables" heading shape) -- used to bound the window
+# scanned for table-name bullets, so a hook name ("useGetVouchersQuery",
+# matches the same bare-identifier shape) from a LATER section is never read as
+# a table claim.
+_TABLES_LANDMARK_RE = re.compile(
+    r"\bdatabase\s+tables?\b|\btables?\s+(?:used|owned|declared)\b", re.I)
+_TABLES_WINDOW_CHARS = 1500
+# A backticked identifier on a bullet/numbered line -- the one shape both
+# observed runs used for a table-list item, whether the value is a snake_case
+# table name (T13a: `` `voucher_series` ``) or a PascalCase model class name
+# (T13b: `` `Voucher` ``). Resolved against the real table/class map below
+# rather than assumed from casing.
+_TABLE_BULLET_RE = re.compile(r"`([A-Za-z][A-Za-z0-9_]*)`")
+_CLASS_DEF_RE = re.compile(r"^class\s+(\w+)\([^)]*\):", re.MULTILINE)
+_TABLENAME_ASSIGN_RE = re.compile(r"__tablename__\s*=\s*[\"'](\w+)[\"']")
+_FK_TARGET_RE = re.compile(r"ForeignKey\(\s*[\"']([\w.]+)[\"']")
+# Bounded per-class scan when a models.py has no following class to stop at
+# (the last class in the file) -- generous enough for any real model class in
+# this codebase, never a full-file scan.
+_CLASS_BLOCK_FALLBACK_CHARS = 2000
+
+
+def _table_class_map(models_src: str) -> dict[str, str]:
+    """table_name -> class_name, AND class_name -> class_name (self-mapped), from
+    a models.py's own `class X(...): ... __tablename__ = "y"` declarations.
+
+    A bounded regex scan per class (to its own next `class` boundary, or
+    _CLASS_BLOCK_FALLBACK_CHARS for the last one), not a full AST -- consistent
+    with every other guard in this file reading hive-mcp-fetched text, rather
+    than cross-importing hive-mcp's own AST-based symbol_index into the swarm
+    process for one guard.
+    """
+    out: dict[str, str] = {}
+    defs = list(_CLASS_DEF_RE.finditer(models_src))
+    for i, m in enumerate(defs):
+        end = (defs[i + 1].start() if i + 1 < len(defs)
+               else min(len(models_src), m.end() + _CLASS_BLOCK_FALLBACK_CHARS))
+        block = models_src[m.end():end]
+        tm = _TABLENAME_ASSIGN_RE.search(block)
+        if tm:
+            out.setdefault(tm.group(1), m.group(1))
+        out.setdefault(m.group(1), m.group(1))
+    return out
+
+
+def _fk_targets_of_class(models_src: str, class_name: str) -> set[str]:
+    """Table names `class_name`'s own columns declare a ForeignKey to, e.g.
+    `ForeignKey("inventory.parties.party_id")` -> {"parties"} (the middle,
+    table segment of schema.table.column -- not the trailing column name).
+    """
+    defs = list(_CLASS_DEF_RE.finditer(models_src))
+    out: set[str] = set()
+    for i, m in enumerate(defs):
+        if m.group(1) != class_name:
+            continue
+        end = (defs[i + 1].start() if i + 1 < len(defs)
+               else min(len(models_src), m.end() + _CLASS_BLOCK_FALLBACK_CHARS))
+        block = models_src[m.end():end]
+        for fm in _FK_TARGET_RE.finditer(block):
+            parts = fm.group(1).split(".")
+            out.add(parts[-2] if len(parts) >= 2 else parts[-1])
+    return out
+
+
+async def _module_table_ownership_scope(task: str, content: str,
+                                        hive_mcp_url: str | None,
+                                        hive_mcp_tools=None) -> str:
+    """A conceptual "the X module['s] ... database tables" question (no file
+    named) answered with tables that are real, but reachable from the module's
+    own tables only via a foreign key -- confusing graph reachability with file
+    ownership.
+
+    T13a, 2026-10-31 fresh battery: asked for "the vouchers module['s] ...
+    database tables" with no file named. The Researcher found the right
+    endpoint file for ENDPOINTS (`vouchers_api.py`, via search), then
+    separately widened its own criterion for TABLES to "anything reachable
+    from Voucher by a foreign key, a JSONB reference, or a workflow side
+    effect" -- a real, independently-confirmed
+    `Voucher.party_id -> ForeignKey("inventory.parties.party_id")`, but a
+    different claim than "this table belongs to the vouchers module."
+
+    Resolving the module's own endpoint file by a live search (no hardcoded
+    module OR table names, the same pattern _module_hook_coverage_gap already
+    uses for hooks) is NOT, on its own, enough to classify ownership: checked
+    directly against the real `vouchers_api.py`, that file's own code
+    genuinely imports, references, and in several cases constructs/writes
+    Party, Item, Godown, StockLedger, StockLevel, ItemCategory,
+    GSTComplianceTask, AND GSTOverrideAudit, alongside
+    Voucher/VoucherSeries/VoucherVersion -- so "does the owning file reference
+    this class anywhere" does not separate the module's own 3 tables from the
+    other 9 the SAME file legitimately touches for cross-table validation and
+    side effects. The signal that DOES separate them cleanly, confirmed
+    against every real table this service declares: whether the table's OWN
+    name shares the module's naming stem -- "voucher_series"/"vouchers"/
+    "voucher_versions" all start with "voucher"; none of the other 11 real
+    tables T13a named do. This still resolves the module's own endpoint file
+    (to confirm the module genuinely exists and to name real evidence in the
+    disclosure), but classifies ownership by naming convention against the
+    module's own stem, with a foreign-key relationship named when one is
+    found for a table outside that set -- never counted as ownership on its
+    own.
+
+    Silent, not a correction, when: the task does not ask this exact shape; the
+    task already names a specific file (the existing, already-correct pattern
+    applies, and re-running this check on it would be redundant); the module's
+    own endpoint file cannot be resolved to exactly one candidate (ambiguous or
+    not found -- preserved as ambiguity, never resolved by guessing the
+    broadest file); the task itself explicitly asks for a broader relationship
+    (foreign-key-related or workflow-related tables), in which case indirect
+    tables are exactly what was asked for; or every table the answer names is
+    already direct.
+    """
+    m = _MODULE_TABLE_ASK_RE.search(task or "")
+    if not m or not (content or "").strip():
+        return ""
+    if re.search(r"\.(?:py|ts|tsx)\b", task or ""):
+        print("[team] table-scope check: task already names a specific file — "
+              "the existing named-file pattern applies, silent", flush=True)
+        return ""
+    module = m.group(1).lower()
+    if (_REQUESTS_FK_RELATED_RE.search(task or "")
+            or _REQUESTS_WORKFLOW_RELATED_RE.search(task or "")):
+        print(f"[team] table-scope check: task for {module!r} explicitly requests "
+              f"a broader relationship — indirect tables are in scope, silent",
+              flush=True)
+        return ""
+
+    stem = module[:-1] if module.endswith("s") and len(module) > 1 else module
+    candidates = await _repo_find_files(f"**/*{stem}*api*.py", hive_mcp_url,
+                                        hive_mcp_tools)
+    candidates = [c for c in (candidates or []) if "test" not in c.lower()]
+    if not candidates or len(candidates) != 1:
+        print(f"[team] table-scope check: {module!r} module's own endpoint file "
+              f"{'unresolved' if not candidates else f'ambiguous ({len(candidates)} candidates)'}"
+              f" — preserved as ambiguity, no guess", flush=True)
+        return ""
+    owner_path = candidates[0]
+    svc_m = re.match(r"^(API/[^/]+)/", owner_path)
+    if not svc_m:
+        return ""
+    owner_src = await _repo_file_text(owner_path, hive_mcp_url, hive_mcp_tools)
+    models_src = await _repo_file_text(f"{svc_m.group(1)}/models.py", hive_mcp_url,
+                                       hive_mcp_tools)
+    if not owner_src or not models_src:
+        print(f"[team] table-scope check: could not read {owner_path!r} and/or "
+              f"{svc_m.group(1)}/models.py — cannot classify, silent", flush=True)
+        return ""
+    # get_file_content returns `cat -n` numbered output (leading "  N\t" on
+    # every line), which defeats _CLASS_DEF_RE/_TABLENAME_ASSIGN_RE/
+    # _FK_TARGET_RE's own line-start anchoring below -- strip it for this
+    # guard's own regex scan only (owner_src's whole-word class-name check
+    # just above is unaffected by numbering either way).
+    models_src = re.sub(r"(?m)^\s*\d+\t", "", models_src)
+
+    tmap = _table_class_map(models_src)
+    if not tmap:
+        print(f"[team] table-scope check: no `class X(...): __tablename__ = "
+              f"...` declarations found in {svc_m.group(1)}/models.py — cannot "
+              f"classify, silent", flush=True)
+        return ""
+
+    landmark = _TABLES_LANDMARK_RE.search(content)
+    if not landmark:
+        return ""
+    window = content[landmark.start():landmark.start() + _TABLES_WINDOW_CHARS]
+    hooks_cut = re.search(r"\bhooks?\b", window, re.I)
+    if hooks_cut:
+        window = window[:hooks_cut.start()]
+
+    asserted: list[str] = []
+    for bm in _TABLE_BULLET_RE.finditer(window):
+        name = bm.group(1)
+        if name in tmap and tmap[name] not in asserted and name not in asserted:
+            asserted.append(name)
+    if not asserted:
+        return ""
+
+    # Empirically re-derived against the REAL vouchers_api.py (not assumed):
+    # that file's own code genuinely imports, references, and in several cases
+    # constructs/writes Party, Item, Godown, StockLedger, StockLevel,
+    # ItemCategory, GSTComplianceTask, AND GSTOverrideAudit, alongside
+    # Voucher/VoucherSeries/VoucherVersion -- so "does the owning file
+    # reference this class anywhere" (imports, whole-word mentions, even
+    # `ClassName(` construction) does NOT separate the module's own 3 tables
+    # from the other 9 real tables that SAME file legitimately touches for
+    # cross-table validation and side effects (a posted voucher writes a
+    # StockLedger row; that does not make stock_ledger a vouchers-module
+    # table). The signal that DOES separate them cleanly: whether the table's
+    # OWN name shares the module's naming stem -- "voucher_series"/
+    # "vouchers"/"voucher_versions" all start with "voucher"; none of the
+    # other 11 real tables this run named do. A naming-convention check, not
+    # a structural/FK-graph one -- the same convention
+    # _module_hook_coverage_gap already relies on for RTK hook naming
+    # ("use<Module>...Query|Mutation"), applied here to table names instead.
+    direct = {name for name in asserted
+              if name.startswith(stem) or tmap[name].lower().startswith(stem.lower())}
+    if not direct:
+        print(f"[team] table-scope check: none of the asserted tables share "
+              f"the {stem!r} naming stem — cannot confirm the module's own "
+              f"tables from naming convention alone, silent", flush=True)
+        return ""
+
+    indirect: list[tuple[str, str]] = []
+    for name in asserted:
+        if name in direct:
+            continue
+        fk_from = None
+        for dname in direct:
+            dcls = tmap[dname]
+            if name in _fk_targets_of_class(models_src, dcls):
+                fk_from = dcls
+                break
+        reason = (f"foreign-key-referenced from `{fk_from}`" if fk_from
+                  else f"no naming or foreign-key relationship to the "
+                       f"{module} module's own tables")
+        indirect.append((name, reason))
+
+    if not indirect:
+        print(f"[team] table-scope check: all {len(asserted)} asserted table(s) "
+              f"share the {module} module's own naming stem — silent", flush=True)
+        return ""
+
+    print(f"[team] table-scope check: {module!r} module (own endpoint file "
+          f"{owner_path}) — {sorted(direct)} share the module's naming stem; "
+          f"answer also lists {indirect} as if equally owned", flush=True)
+    lines = "; ".join(f"`{n}` ({r})" for n, r in indirect)
+    return (
+        f"\n\n---\n**TABLE OWNERSHIP SCOPE CHECK — the {module} module's own "
+        f"tables (by naming convention, confirmed against "
+        f"`{svc_m.group(1)}/models.py`) are: {', '.join(sorted(direct))}. The "
+        f"following table(s) named above are NOT part of that set, even though "
+        f"they are real tables genuinely referenced by `{owner_path}` and may "
+        f"be genuinely related: {lines}. They are listed together above as if "
+        f"all equally belong to the {module} module; the distinction above is "
+        f"the actual ownership scope.**"
+    )
 
 
 async def _module_hook_coverage_gap(task: str, content: str, hive_mcp_url: str | None,
@@ -16714,6 +17062,7 @@ async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None
             _scoped_coverage_gap(task, content, hive_url, hive_mcp_tools,
                                  record=record),
             _module_hook_coverage_gap(task, content, hive_url, hive_mcp_tools),
+            _module_table_ownership_scope(task, content, hive_url, hive_mcp_tools),
             _integration_mechanism_missing(task, content, hive_url, hive_mcp_tools),
             _unconfirmed_service_inclusion(task, content, hive_url, hive_mcp_tools),
             _code_question_answered_from_docs(task, content, hive_url,
