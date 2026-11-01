@@ -9205,6 +9205,25 @@ def _gap_claim_block_lines(content: str) -> list[str]:
     n = len(lines)
     out: list[str] = []
     for i, line in enumerate(lines):
+        # Phase 0.26 (T13a vouchers run 23a78383f0ef): a markdown HEADING
+        # (e.g. "#### Backend-Frontend Gap Analysis") is a section TITLE,
+        # not a claim about any specific item -- it only names the section's
+        # topic. Letting a bare heading-level keyword match anchor this
+        # lookahead let it walk PAST an unrelated sub-header ("**Backend API
+        # Endpoints (9 total):**", itself not gap-matching, skipped as a
+        # mere colon "intro" line) straight into that sub-header's own full
+        # restatement list -- flagging "GET /vouchers" (a real, MATCHED
+        # endpoint, confirmed present by compare_enumerations) as if the
+        # answer had named it a gap, when the answer's own actual gap list
+        # (under a later, genuinely gap-worded sub-header) was correct and
+        # never touched. Every sentence-level gap claim this function's own
+        # docstring cites as historical evidence (Z2/T36) already matches
+        # _GAP_CLAIM_LINE_RE on its own BODY TEXT, not merely because some
+        # earlier heading also matched -- so excluding headings from
+        # triggering this lookahead changes nothing for any of them; each
+        # still finds its own list via its own non-heading match.
+        if _MD_HEADING_RE.match(line):
+            continue
         if not _GAP_CLAIM_LINE_RE.search(line):
             continue
         out.append(line)
@@ -9357,6 +9376,12 @@ def _strip_falsely_gapped_list_items(
     drop: set[int] = set()
     removed: list[str] = []
     for i, line in enumerate(lines):
+        # Phase 0.26: same heading exclusion as _gap_claim_block_lines'
+        # own scan above -- kept in sync deliberately, per this function's
+        # own docstring ("exact same scan shape ... not a second,
+        # independently-drifting extraction").
+        if _MD_HEADING_RE.match(line):
+            continue
         if not _GAP_CLAIM_LINE_RE.search(line):
             continue
         j = i + 1
@@ -9717,8 +9742,21 @@ async def _evidence_integrity_check(
         if isinstance(getattr(team, "_read_state", None), dict) else None,
         hive_mcp_url, hive_mcp_tools, content, team=team)
 
+    # Phase 0.26: findings are checked against the Coordinator's own actual
+    # answer only -- never the verbatim "FORWARDED FROM THE MEMBERS" section
+    # _with_forwarded_evidence already appends to `content` by this point.
+    # That section is a member's own raw, unedited exploration narration
+    # (see _without_forwarded_members_section's own docstring); it can
+    # legitimately contain now-superseded dead-ends ("no direct matches ...
+    # in the hooks directory" while searching the wrong folder, corrected
+    # later in the SAME narration once the real file was found) that read as
+    # a contradiction of compare_enumerations' own totals when scanned on
+    # their own, despite never being part of what the Coordinator actually
+    # concluded. `content`/`retried` themselves are never altered -- only
+    # what this ONE check inspects.
     findings = await _evidence_integrity_findings(
-        content, task, team, hive_mcp_url, hive_mcp_tools, cmp_note)
+        _without_forwarded_members_section(content), task, team, hive_mcp_url,
+        hive_mcp_tools, cmp_note)
     if not findings:
         return content
 
@@ -9865,8 +9903,12 @@ async def _evidence_integrity_check(
         (getattr(team, "_read_state", None) or {}).get("enumerations")
         if isinstance(getattr(team, "_read_state", None), dict) else None,
         hive_mcp_url, hive_mcp_tools, retried, team=team)
+    # Phase 0.26: same forwarded-section exclusion as the initial findings
+    # check above -- `retried` itself is passed through unaltered to every
+    # other use below (adoption, disclosure, persistence).
     recheck = await _evidence_integrity_findings(
-        retried, task, team, hive_mcp_url, hive_mcp_tools, recheck_cmp_note)
+        _without_forwarded_members_section(retried), task, team, hive_mcp_url,
+        hive_mcp_tools, recheck_cmp_note)
     if recheck:
         # T55 (Priority A): the retry's own regenerated draft can carry the exact
         # same falsely-gapped shape the first pass had (confirmed live, T54's run
