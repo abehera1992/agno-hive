@@ -16726,6 +16726,16 @@ async def repair_unguarded_draft(task: str, content: str, mcp_url: str | None = 
     so the inline-marking behavior normal runs get is approximated, not replicated,
     pending a broader contract change this phase did not make.
 
+    `_missing_requested_categories(task, content)` (Phase 0.30, 2026-11-01) is a
+    second exception to "needs a repo query" -- a pure text check over the same
+    `task`/`content` this function already has, same tier as the unsourced-
+    filename check above. Closes the gap Phase 0.29's own completeness fix left
+    open: that fix lives inside `_complete_repetition_truncated_answer`, which
+    runs in the WORKER -- so a killed worker never reaches it, and a rescued
+    draft missing a requested category (T13b, run ko60hqhpl: the completion
+    that would have added Tables went silent and was liveness-killed) shipped
+    with no completeness disclosure at all.
+
     Never raises and never returns anything but a suffix. The draft is the only thing
     this path has left; a guard that fails, hangs, or finds hive-mcp unreachable must
     cost the caller nothing more than the notes it would have added.
@@ -16761,6 +16771,44 @@ async def repair_unguarded_draft(task: str, content: str, mcp_url: str | None = 
                 )
     except Exception as exc:  # noqa: BLE001
         print(f"[team] draft repair: unsourced-filename check failed "
+              f"({type(exc).__name__}: {exc}) — returning the draft unchecked "
+              f"on this axis", flush=True)
+    # Phase 0.30: Phase 0.29's missing-requested-category detection
+    # (_missing_requested_categories) lives entirely inside
+    # _complete_repetition_truncated_answer, a WORKER-side function -- when the
+    # worker is killed (the exact case this whole function exists for), that
+    # path never runs, so a rescued draft missing a requested category reaches
+    # the caller with no completeness disclosure at all. Live-confirmed gap,
+    # not theoretical: T13b, 2026-11-01, run ko60hqhpl -- the bounded-
+    # completion attempt that would have added the Tables section went silent
+    # and was liveness-killed before producing anything; the rescued draft
+    # (Hooks complete, Endpoints partial, no Tables at all) reached the caller
+    # with nothing noting the omission.
+    #
+    # Needs no repo query (same tier as the T53 check above), so this runs even
+    # when no hive-mcp URL is reachable below. Reuses _missing_requested_
+    # categories exactly as Phase 0.29 built it -- no second category-detection
+    # mechanism.
+    try:
+        missing_cats = _missing_requested_categories(task, content)
+        if missing_cats:
+            plural = len(missing_cats) != 1
+            print(f"[team] draft repair: {len(missing_cats)} requested "
+                  f"categor{'ies' if plural else 'y'} missing from the killed "
+                  f"run's draft: {', '.join(missing_cats)} — flagging",
+                  flush=True)
+            fired.append(
+                f"\n\n---\n**UNRESOLVED — MISSING REQUESTED "
+                f"CATEGOR{'IES' if plural else 'Y'}: this run was stopped "
+                f"before it finished, and the draft above has no section at "
+                f"all for {', '.join(missing_cats)}, which the task "
+                f"explicitly asked for. Treat the answer as incomplete, not "
+                f"as evidence that {'these' if plural else 'this'} "
+                f"categor{'ies' if plural else 'y'} "
+                f"{'do' if plural else 'does'} not exist.**"
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[team] draft repair: missing-category check failed "
               f"({type(exc).__name__}: {exc}) — returning the draft unchecked "
               f"on this axis", flush=True)
     effective_mcp_url = mcp_url or config.mcp_url
