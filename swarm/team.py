@@ -8456,6 +8456,54 @@ def _make_no_delegation_hook():
     return _no_delegation_hook
 
 
+def _missing_requested_categories(task: str, content: str) -> list[str]:
+    """Which of `task`'s own requested categories have NO section at all yet in
+    `content`, sorted for a stable, testable order.
+
+    Phase 0.29 (Z31 follow-up): T13b, 2026-11-01 -- the SAME repetition-truncation
+    `_complete_repetition_truncated_answer` already recovers from, but this time
+    the cut happened mid-way through the ENDPOINTS section, one category BEFORE
+    the tables section the original Z31 incident lost would even have begun. The
+    completion that function already produces says "continue... ending with the
+    actual conclusion", and the model read that as "finish the sentence you were
+    on" -- it completed the endpoints list and stopped, never writing tables at
+    all, even though the real tables findings were sitting right there in
+    `_checkpoint_block`'s own re-injection (team._member_results already held
+    them, status=COMPLETE). The existing UNRESOLVED guard caught the omission
+    correctly after the fact; this closes the gap at its source instead of only
+    disclosing it.
+
+    Reuses the SAME category vocabulary `_section_for_category`/
+    `_subject_categories` already use elsewhere (Phase 0.25's salvage, Phase
+    0.28's table-scope guard) -- no new category system. "models" is folded into
+    "tables" when both match: this codebase's own T13b-shaped tasks name
+    `models.py` as WHERE to find the tables, which trips the "models" keyword
+    from the filename alone, not a second, separate deliverable (the same false
+    split the T1-T13 battery report already documented as harmless there; left
+    uncorrected as a disclosure, but NOT treated as two required sections here,
+    where it would wrongly double the reminder below).
+    """
+    requested = set(_subject_categories(task))
+    if "models" in requested and "tables" in requested:
+        requested.discard("models")
+    return sorted(cat for cat in requested if _section_for_category(content, cat) is None)
+
+
+def _missing_categories_continuation_note(missing_cats: list[str]) -> str:
+    """The reminder clause appended to a truncation-completion prompt when
+    `missing_cats` is non-empty -- "" (no change to the prompt) otherwise."""
+    if not missing_cats:
+        return ""
+    return (
+        f"\n\nYour draft so far has NO section at all for: "
+        f"{', '.join(missing_cats)}. This is not a wording gap -- continuing must "
+        f"include writing {'a' if len(missing_cats) == 1 else 'one'} full section "
+        f"for each of those, using the findings already gathered this run (see "
+        f"below), before the answer can be considered finished. Finishing only the "
+        f"section you were mid-sentence in is NOT the conclusion the task asked for."
+    )
+
+
 async def _complete_repetition_truncated_answer(content: str, task: str, team, all_results,
                                                  result, liveness_path: str | None):
     """One bounded completion pass when a generation was cut off before it reached
@@ -8549,11 +8597,15 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
     # real model classes team._member_results already held. Adding the SAME
     # checkpoint every other path already gets closes that one gap, not a new
     # mechanism.
+    _missing_cats = _missing_requested_categories(task, content)
+    _missing_cats_note = _missing_categories_continuation_note(_missing_cats)
+
     prompt = (
         f"{task}\n\nYou already produced an answer to this task below, but generation "
         f"was cut off before it was finished -- it stops mid-answer and never reaches "
         f"a conclusion. Continue from the exact point where it stopped and finish it, "
-        f"ending with the actual conclusion the task asked for.\n\n"
+        f"ending with the actual conclusion the task asked for."
+        f"{_missing_cats_note}\n\n"
         f"Output format (required): your entire response must begin with this exact "
         f"marker, written once, as the very first non-whitespace characters, with "
         f"nothing before it:\n{_RECOVERY_CONTINUATION_MARKER}\n"
