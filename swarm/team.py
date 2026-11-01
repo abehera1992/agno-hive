@@ -16741,7 +16741,8 @@ _DRAFT_REPAIR_TIMEOUT_S = 90.0
 
 async def repair_unguarded_draft(task: str, content: str, mcp_url: str | None = None,
                                  mcp_urls: list[str] | None = None,
-                                 member_results: dict | None = None) -> str:
+                                 member_results: dict | None = None,
+                                 enumerations: dict | None = None) -> str:
     """Run the repair guards against a draft whose worker was killed before verifying it.
 
     A liveness auto-kill SIGKILLs the worker process and api/server.py hands back the
@@ -16793,6 +16794,28 @@ async def repair_unguarded_draft(task: str, content: str, mcp_url: str | None = 
     draft missing a requested category (T13b, run ko60hqhpl: the completion
     that would have added Tables went silent and was liveness-killed) shipped
     with no completeness disclosure at all.
+
+    `enumerations` (Phase 0.31, Track A; default None preserves every pre-existing
+    call exactly) is a THIRD exception, same tier as the two above: a snapshot copy
+    of team._read_state["enumerations"] (api/server.py's own liveness/crash
+    snapshot, same channel as `member_results`), fed straight into
+    `_unchecked_completeness_block` -- pure text/dict formatting, no repo query, no
+    hive-mcp connection, so it runs even when no hive-mcp URL is reachable below.
+    Closes the half of the "deterministic comparison must survive recovery"
+    requirement that is actually safe to close here: a completeness claim ("all N
+    endpoints have a hook") shown against the evidence it rests on.
+
+    The OTHER half -- `_computed_comparison`'s own compare_enumerations diff --
+    is deliberately NOT recomputed here. That function requires a live
+    `hive_mcp_tools` object with a working `.get_session_for_run()` (it opens a
+    SECOND, separate session purely for the comparison call itself), not a bare
+    URL; every guard actually callable from this function was chosen specifically
+    because it needs nothing but a URL (see this function's own docstring above).
+    Standing up an equivalent tools object here, purely to recover one footnote,
+    would be new session-lifecycle machinery in a path whose whole design promise
+    is "costs the caller nothing more than the notes it would have added" -- out
+    of proportion to what a liveness-killed run's footnote is worth. Reported as a
+    known limitation, not silently attempted.
 
     Never raises and never returns anything but a suffix. The draft is the only thing
     this path has left; a guard that fails, hangs, or finds hive-mcp unreachable must
@@ -16867,6 +16890,23 @@ async def repair_unguarded_draft(task: str, content: str, mcp_url: str | None = 
             )
     except Exception as exc:  # noqa: BLE001
         print(f"[team] draft repair: missing-category check failed "
+              f"({type(exc).__name__}: {exc}) — returning the draft unchecked "
+              f"on this axis", flush=True)
+    # Phase 0.31 (Track A): pure text/dict formatting over the recovered
+    # enumerations ledger, same tier as the two checks above -- no repo query, no
+    # hive-mcp connection, so this runs even when no hive-mcp URL is reachable
+    # below. See this function's own docstring for why the OTHER half
+    # (_computed_comparison's compare_enumerations diff) is not attempted here.
+    try:
+        if isinstance(enumerations, dict) and enumerations:
+            completeness_note = _unchecked_completeness_block(content, enumerations)
+            if completeness_note:
+                print(f"[team] draft repair: completeness claim found against "
+                      f"{len(enumerations)} recovered enumeration(s) — flagging",
+                      flush=True)
+                fired.append(completeness_note)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[team] draft repair: completeness-block check failed "
               f"({type(exc).__name__}: {exc}) — returning the draft unchecked "
               f"on this axis", flush=True)
     effective_mcp_url = mcp_url or config.mcp_url
@@ -17226,7 +17266,7 @@ def _stale_findings_dropped(note: str, content: str) -> str:
 async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None,
                                    hive_mcp_tools, label: str,
                                    record: dict | None = None) -> list[str]:
-    """The seven guards that re-derive their facts from the repo, run against `content`.
+    """The guards that re-derive their facts from the repo, run against `content`.
 
     Shared by the parent-process rescue (repair_unguarded_draft) and the corrected-answer
     path inside _verified_answer. One implementation because these two callers must not
@@ -17255,6 +17295,12 @@ async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None
                                               hive_mcp_tools),
             _fields_not_declared_on_type(task, content, hive_url,
                                          hive_mcp_tools),
+            # Phase 0.31 (Track A): these two were in _verified_answer's own _tail()
+            # all along but never wired into this shared set, so a liveness-killed or
+            # crashed run's rescued draft skipped them even though both need nothing
+            # the dead worker held -- same repo-derived shape as every guard above.
+            _table_claimed_missing_but_present(task, content, hive_url, hive_mcp_tools),
+            _crud_gap_claimed_but_written(content, hive_url, hive_mcp_tools),
             # _nothing() rather than a bare "": gather takes awaitables only, and the
             # models guard is the one _verified_answer suppresses for a single-fact ask.
             _nothing() if _asks_for_one_fact(task) else
@@ -25374,6 +25420,54 @@ def _record_member_result(key: str, text: str) -> None:
         _best_member_results[key] = text[:_LIVENESS_MEMBER_MAX_CHARS]
 
 
+# Phase 0.31 (Track A): same lifetime and reason as _best_draft/_best_member_results
+# above -- team._read_state["enumerations"] (the ledger _computed_comparison and
+# _unchecked_completeness_block both read) dies with the worker on a liveness
+# SIGKILL exactly like the draft and member text already captured here, so a
+# recovered answer's completeness claim ("all N endpoints have a frontend hook")
+# reached the caller with neither the claim nor the evidence it rests on checked --
+# repair_unguarded_draft had no enumerations to show. Captured by snapshot copy, not
+# by reference: team itself is gone by the time anything reads this.
+_best_enumerations: dict = {}
+# Each enumeration entry's "lines" list is already bounded for display by
+# _ENUMERATION_RENDER_CAP wherever it is RENDERED; capped again here, independently,
+# because this copy is written to disk every heartbeat tick and must stay small on
+# its own rather than trust a renderer downstream to bound it first.
+_LIVENESS_ENUMERATION_LINES_MAX = _ENUMERATION_RENDER_CAP
+
+
+def _record_enumerations(team=None) -> None:
+    """Snapshot of team._read_state["enumerations"], for the liveness snapshot.
+
+    Longest-wins by total item count across all entries, the same crude "more data
+    beats less data" rule _best_draft uses by length -- not a semantic merge, since
+    a verify-retry's own team object could in principle hold a smaller ledger than
+    the main pass already recorded, and the main pass's larger ledger must not be
+    overwritten by it.
+    """
+    global _best_enumerations
+    rs = getattr(team, "_read_state", None)
+    enumerations = rs.get("enumerations") if isinstance(rs, dict) else None
+    if not isinstance(enumerations, dict):
+        return
+    # Total items across all entries, not entry (file) count -- two ledgers can
+    # hold the same number of files while one has read far more out of each, and
+    # entry-count alone would let that larger one lose to a same-key-count,
+    # thinner ledger from e.g. a retry's own smaller team object.
+    _total = lambda d: sum(e.get("count", 0) for e in d.values())
+    if _total(enumerations) < _total(_best_enumerations):
+        return
+    _best_enumerations = {
+        path: {**entry, "lines": (entry.get("lines") or [])[:_LIVENESS_ENUMERATION_LINES_MAX]}
+        for path, entry in enumerations.items()
+    }
+
+
+def best_enumerations() -> dict:
+    """Enumerations ledger captured so far this run, for the liveness snapshot."""
+    return dict(_best_enumerations)
+
+
 def best_member_results() -> dict[str, str]:
     """Members' findings so far, for the liveness snapshot."""
     return dict(_best_member_results)
@@ -25734,6 +25828,12 @@ async def _run_heartbeat(
                     # find", which on a killed run is usually the larger and more
                     # useful half.
                     "member_results": best_member_results(),
+                    # Phase 0.31 (Track A): survives a SIGKILL on the same atomic
+                    # channel as "draft"/"member_results" above, for the same reason --
+                    # repair_unguarded_draft needs it to show a recovered answer's
+                    # completeness claim against the evidence it rests on, which
+                    # otherwise died with the worker along with every other guard.
+                    "enumerations": best_enumerations(),
                     # Whether this run has produced ANYTHING yet. The parent needs to
                     # tell a run that stalled after working -- which has a draft worth
                     # salvaging -- from one that never got a single turn, which has
@@ -29792,6 +29892,7 @@ async def _stream_team_run(
                 if now - last_logged_at >= 10:
                     joined = "".join(full_content)
                     _record_draft(joined, team=team, run_agent_names=run_agent_names)
+                    _record_enumerations(team)
                     new_segment = joined[last_logged_len:]
                     preview = new_segment[-300:]
                     loop_detected = _looks_like_repetition_loop(new_segment, joined[:last_logged_len])
@@ -30605,6 +30706,7 @@ async def run_task_async(
                                 if now - last_logged_at >= 10:
                                     joined = "".join(full_content)
                                     _record_draft(joined, team=team, run_agent_names=run_agent_names)
+                                    _record_enumerations(team)
                                     new_segment = joined[last_logged_len:]
                                     preview = new_segment[-300:]
                                     loop_detected = _looks_like_repetition_loop(new_segment, joined[:last_logged_len])

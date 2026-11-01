@@ -716,6 +716,7 @@ async def _run_worker_subprocess(
                                     payload.get("task") or "", draft,
                                     payload.get("mcp_url"), payload.get("mcp_urls"),
                                     member_results=(snapshot or {}).get("member_results"),
+                                    enumerations=(snapshot or {}).get("enumerations"),
                                 )
                             except Exception as exc:  # noqa: BLE001
                                 print(f"[api] draft repair failed "
@@ -785,8 +786,9 @@ async def _run_worker_subprocess(
             _snap = _read_liveness_snapshot(liveness_path) or {}
             _crash_draft = (_snap.get("draft") or "").strip()
             _crash_members = _snap.get("member_results")
+            _crash_enumerations = _snap.get("enumerations")
         except Exception:  # noqa: BLE001
-            _crash_draft, _crash_members = "", None
+            _crash_draft, _crash_members, _crash_enumerations = "", None, None
         try:
             liveness_path.unlink(missing_ok=True)
         except OSError:
@@ -820,6 +822,7 @@ async def _run_worker_subprocess(
                 payload.get("task") or "", draft,
                 payload.get("mcp_url"), payload.get("mcp_urls"),
                 member_results=_crash_members,
+                enumerations=_crash_enumerations,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[api] draft repair failed ({type(exc).__name__}: {exc}) — "
