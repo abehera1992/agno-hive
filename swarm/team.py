@@ -13980,10 +13980,24 @@ async def _module_table_ownership_scope(task: str, content: str,
               f"classify, silent", flush=True)
         return ""
 
-    landmark = _TABLES_LANDMARK_RE.search(content)
-    if not landmark:
+    # Live, 2026-11-01 re-validation: the FIRST textual "database tables" match
+    # is often the model's own restated task narration near the top of the
+    # answer ("I'll help you list all endpoints, database tables, and frontend
+    # hooks for the vouchers module...") -- not the real labeled section. That
+    # landmark's own window then hits the word "hooks" almost immediately
+    # (the SAME sentence says "and frontend hooks"), collapsing the window to
+    # nothing before it ever reaches the real list. Scan every landmark match
+    # and use the first one that is actually followed, within a short
+    # distance, by a real backticked-identifier bullet -- a prose mention with
+    # no list after it is not a real "tables" section.
+    window = ""
+    for cand in _TABLES_LANDMARK_RE.finditer(content):
+        probe = content[cand.start():cand.start() + 300]
+        if _TABLE_BULLET_RE.search(probe):
+            window = content[cand.start():cand.start() + _TABLES_WINDOW_CHARS]
+            break
+    if not window:
         return ""
-    window = content[landmark.start():landmark.start() + _TABLES_WINDOW_CHARS]
     hooks_cut = re.search(r"\bhooks?\b", window, re.I)
     if hooks_cut:
         window = window[:hooks_cut.start()]
