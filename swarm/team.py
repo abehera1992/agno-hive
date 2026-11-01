@@ -24944,6 +24944,10 @@ async def run_task_stream(
     # swarm/tool_fix.py's module state, exactly as Phase W's Workload C -> D -> E
     # cascade demonstrated. Same run-start lifecycle boundary as the reset above.
     reset_peak_token_state()
+    # Phase 0.31A (2026-11-01): same reason and same run-start boundary as the
+    # reset above -- see _reset_liveness_snapshot_state's own docstring for the
+    # confirmed gap this closes.
+    _reset_liveness_snapshot_state()
 
     from swarm.sessions import get_context as get_session_context
 
@@ -25395,9 +25399,14 @@ _LIVENESS_DRAFT_MAX_CHARS = 120_000
 # purpose: a verify-retry builds its OWN activity dict and runs its OWN heartbeat
 # against the SAME liveness file, so a per-dict draft would let a stalling retry
 # overwrite the main pass's good content with its empty content -- which is exactly
-# the T13 shape this whole mechanism exists to survive. Keyed on nothing and never
-# reset because each run is its own subprocess (same reasoning as tool_fix's token
-# peak), so "this run" and "this process" are the same scope.
+# the T13 shape this whole mechanism exists to survive. Keyed on nothing, because
+# for /run and /stream each top-level request IS its own fresh subprocess (same
+# reasoning as tool_fix's token peak) -- but /plan calls run_task_async directly
+# IN-PROCESS (see reset_peak_token_state's own call sites' comment), so without an
+# explicit reset this global survives across /plan requests exactly the way
+# tool_fix's peak-token state did before Phase Y added its reset. Phase 0.31A
+# (2026-11-01) adds the matching reset -- _reset_liveness_snapshot_state(), called
+# at the same two run-start call sites reset_peak_token_state() already is.
 #
 # Longest-wins is a deliberately crude ranking. It is not "best answer" in any
 # semantic sense; it is "the most content anyone managed to produce", which is the
@@ -25466,6 +25475,31 @@ def _record_enumerations(team=None) -> None:
 def best_enumerations() -> dict:
     """Enumerations ledger captured so far this run, for the liveness snapshot."""
     return dict(_best_enumerations)
+
+
+def _reset_liveness_snapshot_state() -> None:
+    """Clear _best_draft/_best_member_results/_best_enumerations at run start.
+
+    Phase 0.31A (2026-11-01): confirmed gap, not theoretical -- for /run and
+    /stream, each top-level request IS its own fresh subprocess, so these
+    globals start empty naturally and this reset is a no-op. /plan calls
+    run_task_async directly IN-PROCESS (no subprocess isolation) with no
+    liveness_path at all, so nothing ever reads these back for /plan today --
+    but _record_draft/_record_member_result/_record_enumerations are called
+    unconditionally during streaming regardless of liveness_path, so a /plan
+    run still WRITES into them, and a later caller that DOES set a
+    liveness_path (in this same long-running process, if one is ever added)
+    would see a prior /plan request's leftover "best" draft/enumerations
+    outrank its own real, current content under the longest-wins rule --
+    exactly the failure reset_peak_token_state() was already added to close
+    for swarm/tool_fix.py's own module state (see its call sites' comment).
+    Called at the same two run-start call sites that reset_peak_token_state()
+    already is, for the identical reason.
+    """
+    global _best_draft, _best_member_results, _best_enumerations
+    _best_draft = ""
+    _best_member_results = {}
+    _best_enumerations = {}
 
 
 def best_member_results() -> dict[str, str]:
@@ -30245,6 +30279,10 @@ async def run_task_async(
     # swarm/tool_fix.py's module state, exactly as Phase W's Workload C -> D -> E
     # cascade demonstrated. Same run-start lifecycle boundary as the reset above.
     reset_peak_token_state()
+    # Phase 0.31A (2026-11-01): same reason and same run-start boundary as the
+    # reset above -- see _reset_liveness_snapshot_state's own docstring for the
+    # confirmed gap this closes.
+    _reset_liveness_snapshot_state()
 
     from swarm.sessions import get_context as get_session_context
 

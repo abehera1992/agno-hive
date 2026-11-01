@@ -661,6 +661,17 @@ async def _run_worker_subprocess(
         "task": (payload.get("task") or "")[:120],
     }
     liveness_path = Path(tempfile.gettempdir()) / f"agnohive-liveness-{proc.pid}.json"
+    # Phase 0.31A (2026-11-01): the OS can and does reuse PIDs. If an EARLIER
+    # run that used this same pid crashed before its own `finally:` block's
+    # unlink ran (see below), a leftover snapshot at this exact path would
+    # otherwise be readable by THIS run's poll loop before its own first
+    # heartbeat tick writes anything -- a stale, wrong-run draft/write_at,
+    # old enough to immediately read as kill-worthy under
+    # _liveness_kill_reason's own staleness check. Unlinking any pre-existing
+    # file at this path before this run's worker ever gets a chance to write
+    # to it closes that race with the same idiom the `finally:` block already
+    # uses for its own cleanup, not new lifecycle machinery.
+    liveness_path.unlink(missing_ok=True)
     worker_payload = {**payload, "liveness_path": str(liveness_path)}
     proc.stdin.write(json.dumps(worker_payload).encode())
     proc.stdin.write_eof()
