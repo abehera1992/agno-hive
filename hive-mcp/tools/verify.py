@@ -1049,6 +1049,75 @@ _RUNTIME_CREATE_CONTEXT_RE = re.compile(
 # line. Past any of these the text belongs to a DIFFERENT item and says nothing about
 # this symbol.
 _ITEM_BOUNDARY_RE = re.compile(r"\n[ \t]*(?:[-*+]|\d+[.)])[ \t]|\n[ \t]*\n|\n[ \t]*#{1,6}[ \t]|\n[ \t]*\|")
+# The list-marker alternative of _ITEM_BOUNDARY_RE above, isolated -- Phase 0.36
+# (P0, T4) needs to ask specifically "is this a list item" (not "is this ANY
+# boundary"), so this reuses that exact sub-pattern rather than defining a
+# divergent one. See _find_nearby_quote's own comment for what it is used for.
+_LIST_ITEM_OPEN_RE = re.compile(r"\n[ \t]*(?:[-*+]|\d+[.)])[ \t]")
+_CLASS_LIKE_RE = re.compile(r"^[A-Z][A-Za-z0-9_]*$")
+_ENTITY_CONTEXT_WINDOW = 300
+# Phase 0.36 (P1, T13a): bold-Markdown span, for the enumerated-symbol check at
+# the main idents-collection loop's own call site -- see that comment for the
+# full rationale. {2,80} mirrors _BACKTICK_RE's own span-length bound.
+_BOLD_RE = re.compile(r"\*\*([^*\n]{2,80})\*\*")
+# The one piece of project-adjacent vocabulary the bold-symbol check relies on --
+# a heading naming one of these is what turns a capitalized bold list item into a
+# checkable symbol claim; see that check's own comment for the precedent
+# (_SERVICE_SCOPE_RE, _DB_ROW_COUNT_CLAIM_RE) for why this file already accepts
+# this kind of narrow, named vocabulary elsewhere.
+_SYMBOL_ENUM_HEADING_RE = re.compile(
+    r"\b(?:tables?|models?|classes?|schemas?|entities|endpoints?|hooks?|"
+    r"components?|interfaces?)\b", re.IGNORECASE)
+
+
+def _enumerated_entity_for(answer: str, pos: int) -> str | None:
+    """The class/entity name this bare identifier's enumeration is FOR, when
+    `pos` sits on a list-item line, else None.
+
+    Phase 0.36 (P1 of the entity-attribution extension; T4): "...the
+    `PartyRegistration` model is defined at line 264:\n\n- `gstin`: ...\n-
+    `credit_limit`: ..." enumerates fields FOR PartyRegistration, regardless
+    of which class each one is ACTUALLY declared on -- `credit_limit` is a
+    real field, but of `Party`, not `PartyRegistration`. A plain existence
+    check (`declares`) only asks "does this symbol exist anywhere", which a
+    real-but-misattributed field always passes. This gives callers the
+    claimed owner so they can ask the stronger, already-existing `field_of`
+    question instead.
+
+    Deliberately narrow: only recognizes a class-like (capitalized)
+    backtick-quoted name within a bounded backward window, stopped at the
+    nearest markdown heading -- the same "past a heading the prose is about
+    something else" rule _find_nearby_quote already applies. Returns None
+    (never guesses) when `pos` is not itself a list item, or no such name is
+    found in range; callers fall back to their existing context-free check
+    unchanged, which is the overwhelming common case.
+    """
+    line_start = answer.rfind("\n", 0, pos)
+    this_line = ("\n" + answer[:pos]) if line_start < 0 else answer[line_start:pos + 1]
+    if not _LIST_ITEM_OPEN_RE.match(this_line):
+        return None
+    # Only the FIRST backtick span on this line is the field-name claim itself
+    # ("- `field_name`: `type_annotation` ..."); a later span on the same line
+    # is a type/value, not a field name, and must never be entity-scoped --
+    # live-caught fixing this check: `Column` inside `` `Column(UUID(...))` ``
+    # sits on the same list line as `` `party_id` `` and was briefly also
+    # getting synthesized as "Party.Column", turning its correct, benign
+    # REFERENCED verdict into a false NOT IN FILE.
+    if _BACKTICK_RE.search(this_line[:-1]):
+        return None
+    lo = max(0, pos - _ENTITY_CONTEXT_WINDOW)
+    window = answer[lo:pos]
+    heading = None
+    for h in _MD_HEADING_RE.finditer(window):
+        heading = h
+    if heading is not None:
+        window = window[heading.end():]
+    candidate = None
+    for m in _BACKTICK_RE.finditer(window):
+        span = m.group(1).strip()
+        if _CLASS_LIKE_RE.match(span):
+            candidate = span
+    return candidate
 
 
 def _is_proposed_new_claim(answer: str, start: int) -> bool:
@@ -2420,6 +2489,32 @@ def _find_nearby_quote(answer: str, pos: int, cite_start: int | None = None) -> 
             # The forward span belongs to the NEXT citation -- but a backward span, if
             # there is one, still belongs to THIS one.
             return back[0] if back else None
+    # Phase 0.36 (P0, T4): a citation immediately followed by a MULTI-ITEM
+    # markdown list ("...the model is defined at line 235:\n\n- `party_id`:
+    # ...\n- `tenant_id`: ...") is an enumeration, not a claim that the cited
+    # line is specifically where THIS bullet's content lives -- each bullet
+    # implicitly sits at its own, different real line, and the citation's
+    # line number is about the thing BEFORE the list (the class/model as a
+    # whole), not any one item in it. Pairing the first bullet's quote to
+    # that single line number manufactures a MISMATCH whenever the real
+    # per-field line happens to fall outside _LINE_TOLERANCE of the cited
+    # declaration line -- live-confirmed, T4 of the 2026-11-02 battery: a
+    # correct citation ("`API/inventory-service/models.py` at line 235",
+    # i.e. `class Party`) paired with the first bullet's `party_id`, whose
+    # real line (241) is 6 lines away, one past the 5-line tolerance,
+    # despite the citation and the quote both being entirely correct on
+    # their own terms.
+    #
+    # Detected structurally: the quote's own line opens with a list marker,
+    # AND at least one MORE list-marker-opened line follows within the same
+    # window -- two or more siblings is what makes this an enumeration
+    # rather than the single, specific "line N -- `content`" shape this
+    # function already handles correctly. A lone bullet with no sibling
+    # does not match this check and is verified exactly as before.
+    _line_start = window.rfind("\n", 0, m.start())
+    _this_line = ("\n" + window[:m.start()]) if _line_start < 0 else window[_line_start:]
+    if _LIST_ITEM_OPEN_RE.match(_this_line) and _LIST_ITEM_OPEN_RE.search(window[m.end():]):
+        return back[0] if back else None
     return quoted
 
 
@@ -2981,6 +3076,91 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
                 bases = [b.strip() for b in decl.group("args").split(",") if b.strip()]
                 if bases and tok not in decl_bases:
                     decl_bases[tok] = bases
+    # Phase 0.36 (P1, T13a): bold-Markdown class-like identifiers enumerated as
+    # sibling list items under a symbol-shaped heading -- "### Database Tables\n\n1.
+    # **Voucher**\n2. **VoucherLineItem**\n3. **VoucherType**" -- are symbol claims
+    # the SAME way a backtick-quoted one is, but the loop above structurally cannot
+    # see them: it only ever scans _BACKTICK_RE spans. Live-confirmed, T13a of the
+    # 2026-11-02 battery: `VoucherLineItem`/`VoucherType`, both fabricated, shipped
+    # through bounded-completion adoption, coverage-correction's own recheck, AND
+    # the Phase 0.35 final-draft _enforce_verification_invariant_final re-check,
+    # because none of those three calls into verify_claims ever saw them as claims
+    # at all -- not a scoping gap (Phase 0.35 already fixed that), a visibility one.
+    #
+    # Deliberately narrow, per this phase's own "do not interpret every bold phrase
+    # as a code identifier" constraint: added to `idents` only when ALL of --
+    #   (a) the span is class-like (_CLASS_LIKE_RE -- capitalized, identifier-shaped;
+    #       rejects "Note", "Important Caveat", anything with spaces/punctuation),
+    #   (b) it is the ONLY thing on its own list-item line (reuses the exact
+    #       first-backtick-span check _enumerated_entity_for uses, applied to bold
+    #       spans instead -- "**Voucher** - Fields: ..." qualifies, "See **Voucher**
+    #       for details" does not, since nothing precedes it on the list-item line
+    #       either way this check cares about: whether the bold span IS the item),
+    #   (c) at least one MORE list-item line, also bold-first, follows within the
+    #       same enumeration (two or more siblings is what makes this an
+    #       enumeration -- a single bold list item is left alone, same reasoning as
+    #       the multi-item-list quote-pairing fix above), and
+    #   (d) the nearest preceding Markdown heading names something symbol-shaped
+    #       (table/model/class/schema/endpoint/hook/component/interface) -- "Note"
+    #       under "### Caveats" never reaches this check; "Voucher" under
+    #       "### Database Tables" does. This is the one piece of project-adjacent
+    #       vocabulary this check relies on, consistent with this file's existing
+    #       precedent (_SERVICE_SCOPE_RE's "-service" suffix,
+    #       _DB_ROW_COUNT_CLAIM_RE's "N rows") rather than a new kind of inference.
+    # Reuses the SAME idents/ident_first_pos lists and the SAME negated/proposed
+    # exclusions the backtick loop already applies -- not a second pipeline.
+    for bm in _BOLD_RE.finditer(answer):
+        tok = bm.group(1).strip()
+        if not _CLASS_LIKE_RE.match(tok) or tok in idents or tok in proposed_idents:
+            continue
+        line_start = answer.rfind("\n", 0, bm.start())
+        this_line = ("\n" + answer[:bm.start()]) if line_start < 0 else answer[line_start:bm.start()]
+        if not _LIST_ITEM_OPEN_RE.match(this_line if this_line.startswith("\n") else "\n" + this_line):
+            continue
+        if _BACKTICK_RE.search(this_line) or _BOLD_RE.search(this_line):
+            continue  # not the first claim-shaped thing on this list item
+        lo = max(0, bm.start() - _ENTITY_CONTEXT_WINDOW)
+        window = answer[lo:bm.start()]
+        heading = None
+        for h in _MD_HEADING_RE.finditer(window):
+            heading = h
+        heading_text = window[heading.end():] if heading is not None else ""
+        # The heading itself is on the SAME line as its text in the source, which
+        # window[lo:bm.start()] does not include (the heading text sits in the
+        # ORIGINAL answer right after the match, not in this backward slice) --
+        # re-read it directly from `answer` instead of assuming it is in `window`.
+        if heading is not None:
+            _heading_line_end = answer.find("\n", lo + heading.start())
+            heading_text = answer[lo + heading.start():
+                                   _heading_line_end if _heading_line_end >= 0 else bm.start()]
+        if heading is None or not _SYMBOL_ENUM_HEADING_RE.search(heading_text):
+            continue
+        # A sibling in EITHER direction counts -- the forward-only check first
+        # written here missed the LAST item of a list (nothing follows it),
+        # live-caught validating against the exact T13a shape (`VoucherType`,
+        # list item 3 of 3, has no following sibling and was silently never
+        # added as a claim at all until this was widened to check backward too).
+        _back_sibling_start = lo + heading.end()
+        _has_sibling = (
+            _LIST_ITEM_OPEN_RE.search(answer[bm.end():bm.end() + _ENTITY_CONTEXT_WINDOW])
+            or _LIST_ITEM_OPEN_RE.search(answer[_back_sibling_start:line_start if line_start >= 0 else bm.start()])
+        )
+        if not _has_sibling:
+            continue  # no sibling -- a lone bold item is not an enumeration
+        if _is_negated_claim(answer, bm.start(), bm.end()):
+            if tok not in negated_idents:
+                negated_idents.append(tok)
+                negated_scope_ctx[tok] = answer[
+                    max(0, bm.start() - _SERVICE_SCOPE_WINDOW):
+                    min(len(answer), bm.end() + _SERVICE_SCOPE_WINDOW)
+                ]
+            continue
+        if _is_proposed_new_claim(answer, bm.start()):
+            proposed_idents.append(tok)
+            continue
+        idents.append(tok)
+        ident_first_pos[tok] = bm.start()
+
     # Fenced-code-block identifiers whose block sits right after a new/add/propose
     # heading (e.g. "Proposed Code Insertion") go to proposed_idents too -- see
     # _proposed_code_block_idents' docstring. Everything else from _code_idents
@@ -3261,9 +3441,32 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             # asserted_paths (the citation section owns it), and those are precisely
             # the most scoped claims an answer makes -- "models.py:264-290" is a
             # stronger statement of where to look than a bare mention.
-            structural = _structural_verdict(
-                tok, asserted_paths + [f for f, _ in file_lines]
-            )
+            #
+            # Phase 0.36 (entity-attribution extension, T4): a BARE token enumerated
+            # under a stated entity ("the `PartyRegistration` model... - `credit_limit`:
+            # ...") makes an IMPLICIT Owner.attribute claim exactly like the explicit
+            # dotted form _structural_verdict already resolves via field_of -- the only
+            # difference is the model wrote the owner in prose instead of as
+            # `Owner.attribute`. Synthesizing the dotted form and trying it FIRST reuses
+            # that existing, already-correct check rather than adding a second one; a
+            # real-but-misattributed field (real on Party, claimed for PartyRegistration)
+            # is caught the same way an explicit `PartyRegistration.credit_limit` claim
+            # already would be. Falls through to the plain, context-free check below
+            # whenever no entity context is found or the guessed entity is not a real,
+            # indexable class -- the overwhelming common case, byte-identical to before.
+            structural = None
+            if not dotted:
+                _entity = _enumerated_entity_for(answer, ident_first_pos.get(tok, -1))
+                if _entity and _entity != tok:
+                    structural = _structural_verdict(
+                        f"{_entity}.{tok}", asserted_paths + [f for f, _ in file_lines]
+                    )
+                    if structural is not None:
+                        structural = structural.replace(f"{_entity}.{tok}", tok, 1)
+            if structural is None:
+                structural = _structural_verdict(
+                    tok, asserted_paths + [f for f, _ in file_lines]
+                )
             if structural is not None:
                 # W2: a DECLARED/REFERENCED verdict says the symbol exists -- it says
                 # nothing about the base class the answer claimed for it. Only checked
