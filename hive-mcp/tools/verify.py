@@ -392,6 +392,112 @@ _DECORATOR_VERB_PATH_RE = re.compile(
     r"@\w+\.(get|post|put|patch|delete|options|head)\(\s*"
     r"['\"]([^'\"]+)['\"]"
 )
+# Phase 0.34 (T13a): a BARE PROSE route claim -- `` `DELETE /vouchers/{id}` `` --
+# as opposed to `@router.delete("/vouchers/{id}")` decorator syntax
+# (_DECORATOR_ROUTE_RE/_DECORATOR_VERB_PATH_RE above). Live-confirmed, T13a of the
+# 2026-11-02 groundedness battery: the Coordinator's final answer asserted this
+# exact claim -- a route that exists in neither recognized shape, and does not
+# exist in the repository under ANY verb -- and it passed FOUR separate
+# verify_claims calls cleanly, because the existing ROUTES section (fed by
+# _ROUTE_RE/_DECORATOR_ROUTE_RE) is path-only and verb-blind: it would have
+# reported this path as PLAUSIBLE anyway, since `/vouchers/{voucher_id}` is a
+# real path under GET and PUT in the same file. A verb-blind check cannot catch
+# a real path asserted under a verb that path never has. See
+# _prose_route_verb_mismatches below for the verb-aware check this claim shape
+# feeds.
+_PROSE_ROUTE_RE = re.compile(
+    r"`(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s+(/[A-Za-z0-9_\-/{}:.]+)`",
+    re.IGNORECASE,
+)
+
+
+def _prose_route_verb_mismatches(answer: str) -> list[tuple[str, str, str]]:
+    """Check bare prose `METHOD /path` route claims against the one router file
+    the answer names, verb included.
+
+    Returns (verb, path, verdict_detail) triples -- verdict_detail is either
+    "PLAUSIBLE" or a "NOT FOUND ..." reason string.
+
+    Deliberately conservative, per this phase's own "do not build a speculative
+    parser" constraint: fires only when EXACTLY ONE backtick-quoted `.py` path in
+    the whole answer looks like a router file (contains "router" or ends in
+    "_api.py") AND resolves to a real file on disk. Two or more candidates, or
+    zero, means route identity cannot be established reliably from the answer
+    alone -- left out entirely rather than guessed, the same "ambiguous name is
+    left out, not guessed" rule _resolves_as_suffix/_find_by_basename already
+    apply elsewhere in this file. Checked entirely within that ONE file's own
+    decorator text, never the whole repo -- sidesteps the router-mounting-prefix
+    ambiguity a repo-wide verb+path grep would hit (a router's own decorator may
+    omit a prefix supplied later by `include_router(prefix=...)`), at the cost of
+    never confirming a route whose verb+path legitimately split across two files.
+    """
+    claims = _PROSE_ROUTE_RE.findall(answer)
+    if not claims:
+        return []
+
+    candidates: list[str] = []
+    for p in _BACKTICK_PATH_RE.findall(answer):
+        if not p.endswith(".py"):
+            continue
+        if "router" not in p.lower() and not p.endswith("_api.py"):
+            continue
+        if p not in candidates:
+            candidates.append(p)
+    resolved = [p for p in candidates
+                if (PROJECT_ROOT / p.rstrip("/")).exists() or _resolves_as_suffix(p)]
+    if len(resolved) != 1:
+        return []  # ambiguous or unnamed source file -- route identity unresolved
+
+    target = PROJECT_ROOT / resolved[0].rstrip("/")
+    if not target.exists():
+        # _resolves_as_suffix matched a deeper real file by basename+suffix; find it
+        # the same way that check itself does, rather than re-deriving the real path.
+        basename = resolved[0].rstrip("/").rsplit("/", 1)[-1]
+        for dirpath, dirnames, filenames in os.walk(PROJECT_ROOT, topdown=True):
+            dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS and not d.startswith(".")]
+            if basename in filenames and (Path(dirpath) / basename).as_posix().endswith(resolved[0].rstrip("/")):
+                target = Path(dirpath) / basename
+                break
+    try:
+        file_text = target.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+
+    declared: list[tuple[str, str]] = _DECORATOR_VERB_PATH_RE.findall(file_text)
+    out: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for verb, path in claims:
+        key = (verb.lower(), path)
+        if key in seen:
+            continue
+        seen.add(key)
+        path = path.rstrip(".,;)")
+        segs = [s for s in path.split("/") if s]
+        if len(segs) < 2:
+            continue  # same >= 2 segment floor the ROUTES section already applies
+        path_hit_verbs: list[str] = []
+        for start in range(len(segs) - 1):
+            cand = "/".join(segs[start:])
+            pat = _PARAM_RE.sub(r"[^\"'`]+", re.escape(cand))
+            try:
+                compiled = re.compile(pat)
+            except re.error:
+                continue
+            for d_verb, d_path in declared:
+                if compiled.search(d_path):
+                    path_hit_verbs.append(d_verb)
+            if path_hit_verbs:
+                break  # longest-matching suffix wins, same as the ROUTES probe above
+        if verb.lower() in (v.lower() for v in path_hit_verbs):
+            out.append((verb.upper(), path, "PLAUSIBLE"))
+        elif path_hit_verbs:
+            real = ", ".join(sorted({v.upper() for v in path_hit_verbs}))
+            out.append((verb.upper(), path,
+                        f"NOT FOUND <-- {resolved[0]} has this path under {real}, not {verb.upper()}"))
+        else:
+            out.append((verb.upper(), path,
+                        f"NOT FOUND <-- no route matching this path at all in {resolved[0]}"))
+    return out
 # A backtick span that IS a code declaration ("class Voucher(BaseModel)", "class
 # Voucher(Base):", "class Voucher", "def get_voucher(...)", "async def
 # get_voucher(...)") rather than a bare symbol name or a call. The old tokenizer
@@ -2991,6 +3097,11 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
         if r not in routes:
             routes.append(r)
 
+    # Phase 0.34 (T13a): verb-aware check for bare prose `METHOD /path` claims --
+    # see _prose_route_verb_mismatches' own docstring for why this is separate
+    # from the verb-blind `routes` list above.
+    prose_route_results = _prose_route_verb_mismatches(answer)
+
     # ── asserted paths ────────────────────────────────────────────────────────
     # Existence-only, and deliberately so: this says nothing about whether the file
     # contains what the answer claims -- that is the citation check's job. It answers
@@ -3527,6 +3638,18 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
             else:
                 problems += 1
                 out.append(f"  NOT FOUND  {r:44s} <-- no trace of segment {probe!r}")
+        out.append("")
+
+    # ── route verbs (Phase 0.34, T13a) ───────────────────────────────────────
+    if prose_route_results:
+        out.append(f"ROUTE VERBS ({len(prose_route_results[:_MAX_CLAIMS])} checked):")
+        for verb, path, detail in prose_route_results[:_MAX_CLAIMS]:
+            label = f"{verb} {path}"
+            if detail == "PLAUSIBLE":
+                out.append(f"  PLAUSIBLE  {label:44s} (verb+path declared in the cited file)")
+            else:
+                problems += 1
+                out.append(f"  {detail.split(' <-- ')[0]:<11}{label:44s} <-- {detail.split(' <-- ', 1)[1]}")
         out.append("")
 
     blocks = _blocks_not_in_their_file(answer)

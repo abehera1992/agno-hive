@@ -67,6 +67,7 @@ tools:
       - run_docker
       - run_shell
     Researcher:
+      - compare_enumerations
       - db_query
       - db_schema
       - find_files
@@ -82,6 +83,7 @@ tools:
       - web_fetch
       - web_search
     Reviewer:
+      - compare_enumerations
       - find_files
       - get_file_content
       - git_diff
