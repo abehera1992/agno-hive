@@ -2635,7 +2635,7 @@ async def _verification_block(content: str, hive_mcp_url: str | None,
 
     try:
         report, bad, unavailable = await _verify_claims(
-            content, hive_mcp_url, hive_mcp_tools)
+            content, hive_mcp_url, hive_mcp_tools, team=team)
     except Exception as exc:                      # never let a check break the answer
         print(f"[team] verification block failed: {exc}", flush=True)
         return ledger_block
@@ -3544,7 +3544,8 @@ async def _computed_comparison(task: str, enumerations: dict | None,
 async def _verify_claims(content: str, hive_mcp_url: str | None,
                          hive_mcp_tools=None,
                          liveness_path: "str | None" = None,
-                         op_label: str = "") -> tuple[str, bool, bool]:
+                         op_label: str = "",
+                         team=None) -> tuple[str, bool, bool]:
     """Run hive-mcp's verify_claims over a draft answer.
 
     `liveness_path` (default None, 2026-10-24, T13a.D): when provided, touches
@@ -3581,9 +3582,39 @@ async def _verify_claims(content: str, hive_mcp_url: str | None,
     would be worse than the fabrication it is meant to catch, so any failure here is
     reported as "no problems, but unavailable" (see _UNVERIFIED_DISCLAIMER above for why
     callers must still surface this rather than treat it as a clean pass) and logged.
+
+    `team` (Phase 0.37, P0): optional, default None so every existing caller that does
+    not pass it keeps working byte-identically. When present, this reads the run's own
+    EvidenceLedger (team._evidence_ledger -- the SAME store _unresolved_ledger_citations/
+    _fabricated_execution_claims already read from, never a second, parallel one) for the
+    distinct paths of every genuine `file_read` observation this run, and forwards them
+    to hive-mcp's verify_claims as `context_files` -- facts ("these files were actually
+    read this run"), never a judgment about which one is a router or whether any route
+    on it is real; that filtering/verification stays entirely inside verify_claims
+    itself. Live-confirmed, T13a of the 2026-11-02 retest: the Researcher genuinely read
+    `vouchers_api.py` (45,338 chars, 30 declarations), but the final coverage-correction
+    text that shipped a fabricated `DELETE /vouchers/{id}` never re-named that file in
+    its OWN prose -- only `inventoryApi.ts` was mentioned -- so the existing in-text-only
+    file detection found zero candidates and the route-verb check never ran at all. This
+    closes that gap by giving the checker access to what was GENUINELY read this run,
+    independent of whether the specific correction pass happened to restate it.
     """
     if not content or not (hive_mcp_url or hive_mcp_tools):
         return "", False, False
+
+    _ledger = getattr(team, "_evidence_ledger", None) if team is not None else None
+    _context_files: list[str] = []
+    if _ledger is not None:
+        _seen_paths: set[str] = set()
+        for _rec in _ledger.list():
+            _path = getattr(_rec, "source_path", None)
+            _etype = getattr(_rec, "evidence_type", None)
+            if _etype == "file_read" and _path and _path not in _seen_paths:
+                _seen_paths.add(_path)
+                _context_files.append(_path)
+    _tool_args = {"answer": content}
+    if _context_files:
+        _tool_args["context_files"] = _context_files
 
     async def _call_on_live_session() -> str:
         """Reuse the connection the run is already holding.
@@ -3595,7 +3626,7 @@ async def _verify_claims(content: str, hive_mcp_url: str | None,
         open at this point -- verified by call-site nesting, not assumed.
         """
         session = await hive_mcp_tools.get_session_for_run()
-        return await session.call_tool("verify_claims", {"answer": content})
+        return await session.call_tool("verify_claims", _tool_args)
 
     async def _call_on_fresh_connection():
         from mcp import ClientSession
@@ -3604,7 +3635,7 @@ async def _verify_claims(content: str, hive_mcp_url: str | None,
         async with streamablehttp_client(hive_mcp_url) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                return await session.call_tool("verify_claims", {"answer": content})
+                return await session.call_tool("verify_claims", _tool_args)
 
     # One retry on failure, added 2026-08-20. This check is a deterministic grep with no
     # model involved, so a failure here is essentially always transient -- a busy or
@@ -8867,7 +8898,7 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
         try:
             _new_claim_report, _new_claim_bad, _new_claim_unavailable = await _verify_claims(
                 continuation, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path,
-                op_label=f"{truncation_reason}-completion:new-claim-check")
+                op_label=f"{truncation_reason}-completion:new-claim-check", team=team)
         except Exception as exc:  # noqa: BLE001
             # Same "a verifier that breaks the run would be worse than the
             # fabrication it is meant to catch" principle _verify_claims' own
@@ -10124,7 +10155,7 @@ async def _evidence_integrity_check(
             if not restripped_findings:
                 _rs_fab_report, _rs_fab_bad, _ = await _verify_claims(
                     restripped_content, hive_mcp_url, hive_mcp_tools,
-                    op_label="evidence_integrity_check:restripped-recheck")
+                    op_label="evidence_integrity_check:restripped-recheck", team=team)
                 if not _rs_fab_bad:
                     print(f"[team] evidence-integrity: retry still contradicted "
                           f"{[f['category'] for f in recheck]}, but the deterministic "
@@ -10155,7 +10186,7 @@ async def _evidence_integrity_check(
         # SAME disclosure instead of adding a second banner or a second retry.
         _retried_fab_report, _retried_fab_bad, _ = await _verify_claims(
             retried, hive_mcp_url, hive_mcp_tools,
-            op_label="evidence_integrity_check:retry-contradiction-recheck")
+            op_label="evidence_integrity_check:retry-contradiction-recheck", team=team)
         if _retried_fab_bad:
             print(f"[team] evidence-integrity: retry still contradicts "
                   f"{[f['category'] for f in recheck]} AND failed verify_claims — "
@@ -10188,7 +10219,7 @@ async def _evidence_integrity_check(
     # second verifier, the existing one -- closes that gap.
     _retried_fab_report, _retried_fab_bad, _retried_fab_unavailable = await _verify_claims(
         retried, hive_mcp_url, hive_mcp_tools,
-        op_label="evidence_integrity_check:reconciliation-recheck")
+        op_label="evidence_integrity_check:reconciliation-recheck", team=team)
     if _retried_fab_bad:
         print(f"[team] evidence-integrity: reconciliation candidate resolved the "
               f"comparison contradiction but failed verify_claims — "
@@ -10324,7 +10355,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # liveness snapshot. See _touch_liveness_snapshot's own docstring and
     # the T12.7 investigation this closes.
     _fab_report, _fab_bad, _fab_unavailable = await _verify_claims(
-        content, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path)
+        content, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path, team=team)
     # Phase Z (2026-09-17): identity of the exact text this verdict describes.
     # The reuse site near this function's bottom ("Re-using the verdict computed
     # up front, NOT re-running it") assumed content never changes between here and
@@ -11668,7 +11699,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
               "that will actually ship", flush=True)
         # T12.8: same liveness_path threading as the up-front check above.
         report, bad, unavailable = await _verify_claims(
-            content, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path)
+            content, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path, team=team)
     else:
         report, bad, unavailable = _fab_report, _fab_bad, _fab_unavailable
     if unavailable:
@@ -12051,7 +12082,7 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # _verify_claims calls above -- this is the citation-correction retry's
     # own recheck, a second plain grep call with no heartbeat task of its own.
     report2, still_bad, still_unavailable = await _verify_claims(
-        corrected, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path)
+        corrected, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path, team=team)
     # The verdict this run acted on, next to the length of the text it judged. Without
     # both, a later "why did this ship unflagged?" has nothing to work from -- which is
     # exactly where T11 left us: a clean re-check on text that fails the same check now.
@@ -13397,7 +13428,7 @@ async def _enforce_verification_invariant(
 
     fab_report, fab_bad, fab_unavailable = await _verify_claims(
         content, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path,
-        op_label=f"{op_prefix}:initial")
+        op_label=f"{op_prefix}:initial", team=team)
     if fab_bad and not fab_unavailable:
         missing = _not_found_claims(fab_report)
         if missing:
@@ -13407,7 +13438,7 @@ async def _enforce_verification_invariant(
             async def _recheck(text: str):
                 return await _verify_claims(
                     text, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path,
-                    op_label=f"{op_prefix}:repair-recheck")
+                    op_label=f"{op_prefix}:repair-recheck", team=team)
 
             return await _repair_verification_failure(
                 content, task, team, hive_mcp_url, hive_mcp_tools, liveness_path,
@@ -13591,7 +13622,7 @@ async def _attempt_evidence_grounded_reconstruction(
               flush=True)
         report_s, still_bad_s, unavailable_s = await _verify_claims(
             synthesized, hive_mcp_url, hive_mcp_tools,
-            op_label="attempt_evidence_grounded_reconstruction:synthesis-recheck")
+            op_label="attempt_evidence_grounded_reconstruction:synthesis-recheck", team=team)
         print(f"[team] deterministic reconstruction synthesis recheck: "
               f"still_bad={still_bad_s} unavailable={unavailable_s} | "
               f"{_verdict_digest(report_s)}", flush=True)
@@ -13624,7 +13655,7 @@ async def _attempt_evidence_grounded_reconstruction(
 
     report2, still_bad, unavailable2 = await _verify_claims(
         reconstructed, hive_mcp_url, hive_mcp_tools,
-        op_label="attempt_evidence_grounded_reconstruction:final-recheck")
+        op_label="attempt_evidence_grounded_reconstruction:final-recheck", team=team)
     # K7: narrow, deterministic defense-in-depth -- see
     # _reconstruction_category_conflict's own docstring. A no-op whenever
     # cmp_note isn't synthesis-eligible (e.g. every existing pre-Phase-L test
@@ -16464,11 +16495,11 @@ async def _attempt_coverage_correction(
 
     _retried_fab_report, _retried_fab_bad, _ = await _verify_claims(
         retried, hive_mcp_url, hive_mcp_tools,
-        op_label="attempt_coverage_correction:retry-recheck")
+        op_label="attempt_coverage_correction:retry-recheck", team=team)
     if _retried_fab_bad:
         _pre_report, _pre_bad, _ = await _verify_claims(
             content, hive_mcp_url, hive_mcp_tools,
-            op_label="attempt_coverage_correction:original-recheck")
+            op_label="attempt_coverage_correction:original-recheck", team=team)
         _new_flagged = _flagged_lines_set(_retried_fab_report) - _flagged_lines_set(_pre_report)
         if _new_flagged:
             # Phase 0.25: before discarding the retry wholesale, check whether
@@ -16597,7 +16628,7 @@ async def _attempt_integration_correction(
     # else while rewriting. Never adopt without this check.
     _retried_fab_report, _retried_fab_bad, _ = await _verify_claims(
         retried, hive_mcp_url, hive_mcp_tools,
-        op_label="attempt_integration_correction:retry-recheck")
+        op_label="attempt_integration_correction:retry-recheck", team=team)
     if _retried_fab_bad:
         # T12 accuracy (2026-10-24): `content` reaching this function is not
         # always verify_claims-clean -- when Phase H's own one retry already
@@ -16628,7 +16659,7 @@ async def _attempt_integration_correction(
         # dropped) is preserved either way.
         _pre_report, _pre_bad, _ = await _verify_claims(
             content, hive_mcp_url, hive_mcp_tools,
-            op_label="attempt_integration_correction:original-recheck")
+            op_label="attempt_integration_correction:original-recheck", team=team)
         _new_flagged = _flagged_lines_set(_retried_fab_report) - _flagged_lines_set(_pre_report)
         if _new_flagged:
             print(f"[team] integration-correction: retry now names the real "

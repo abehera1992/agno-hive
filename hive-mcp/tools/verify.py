@@ -452,7 +452,8 @@ def _labeled_route_claims(answer: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def _prose_route_verb_mismatches(answer: str) -> list[tuple[str, str, str]]:
+def _prose_route_verb_mismatches(
+        answer: str, context_files: "list[str] | None" = None) -> list[tuple[str, str, str]]:
     """Check bare prose `METHOD /path` route claims against the one router file
     the answer names, verb included.
 
@@ -471,6 +472,20 @@ def _prose_route_verb_mismatches(answer: str) -> list[tuple[str, str, str]]:
     ambiguity a repo-wide verb+path grep would hit (a router's own decorator may
     omit a prefix supplied later by `include_router(prefix=...)`), at the cost of
     never confirming a route whose verb+path legitimately split across two files.
+
+    `context_files` (Phase 0.37, P0): the caller's own genuine file-read evidence
+    for this run -- supplied by the orchestrator from the run's own evidence
+    ledger, never something to accept from the model's own prose. Used ONLY as a
+    fallback source of CANDIDATE router files when the in-text detection above
+    finds zero or multiple candidates; the same router-like filter and the same
+    single-candidate conservatism apply to it. This changes WHERE a candidate
+    file can come from, never whether a route claim is judged real -- a claim is
+    still rejected unless the resolved file's own decorator text actually
+    contains it. Live-confirmed gap this closes, T13a of the 2026-11-02 retest:
+    the Researcher genuinely read `vouchers_api.py`, but the final correction
+    pass that shipped a fabricated `DELETE /vouchers/{id}` never re-named that
+    file in its own prose, so the in-text-only detection found zero candidates
+    and this check never ran at all.
     """
     claims = list(_PROSE_ROUTE_RE.findall(answer))
     for verb, path in _labeled_route_claims(answer):
@@ -490,7 +505,23 @@ def _prose_route_verb_mismatches(answer: str) -> list[tuple[str, str, str]]:
     resolved = [p for p in candidates
                 if (PROJECT_ROOT / p.rstrip("/")).exists() or _resolves_as_suffix(p)]
     if len(resolved) != 1:
-        return []  # ambiguous or unnamed source file -- route identity unresolved
+        # Phase 0.37 (P0): the answer's own text did not name exactly one router
+        # file -- fall back to this run's genuine read evidence (context_files),
+        # same router-like filter, same single-candidate conservatism. Multiple
+        # genuinely-read router files is exactly as unresolved as multiple named
+        # in the text -- never guessed, never defaulted to "the first one read".
+        ctx_candidates: list[str] = []
+        for p in (context_files or []):
+            pl = p.lower()
+            if not pl.endswith(".py"):
+                continue
+            if "router" not in pl and not pl.endswith("_api.py"):
+                continue
+            if (PROJECT_ROOT / p.rstrip("/")).exists() and p not in ctx_candidates:
+                ctx_candidates.append(p)
+        if len(ctx_candidates) != 1:
+            return []  # still ambiguous or unresolved -- route identity unresolved
+        resolved = ctx_candidates
 
     target = PROJECT_ROOT / resolved[0].rstrip("/")
     if not target.exists():
@@ -522,7 +553,20 @@ def _prose_route_verb_mismatches(answer: str) -> list[tuple[str, str, str]]:
         path_hit_verbs: list[str] = []
         for start in range(len(segs) - 1):
             cand = "/".join(segs[start:])
-            pat = _PARAM_RE.sub(r"[^\"'`]+", re.escape(cand))
+            # Phase 0.37 (P0): excludes "/" from the param wildcard (matching the
+            # sibling ROUTES section's own probe convention, which this function
+            # had drifted from) AND anchors to the end of the declared path.
+            # Without both: a SHORTER claim ("/vouchers/{id}", 2 segments) was
+            # reported PLAUSIBLE against a real but MORE SPECIFIC 3-segment route
+            # ("/vouchers/{voucher_id}/post") -- the unanchored, "/"-permissive
+            # wildcard let `.search()` match the claim as a mere PREFIX of the
+            # real declared string, silently absorbing the extra "/post" instead
+            # of recognizing it as a materially different, more specific
+            # endpoint. Required by this phase's own P0 acceptance criteria: a
+            # generic `/vouchers/{id}` claim must be rejected when the real
+            # implementation only exposes the specific `/post` and `/cancel`
+            # actions, never a bare update route.
+            pat = _PARAM_RE.sub(r"[^\"'`/]+", re.escape(cand)) + r"$"
             try:
                 compiled = re.compile(pat)
             except re.error:
@@ -2911,7 +2955,8 @@ def _staged_fingerprint() -> tuple:
         return ()
 
 
-def verify_claims(answer: str, glob_filter: str = "") -> str:
+def verify_claims(answer: str, glob_filter: str = "",
+                   context_files: "list[str] | None" = None) -> str:
     """
     Check an answer's factual claims against the repository. Read-only, no approval.
 
@@ -2920,9 +2965,15 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     exist. If something comes back NOT FOUND, correct the answer — do not ship it.
 
     Args:
-        answer:      The text to check (your drafted answer, or another agent's).
-        glob_filter: Optional glob to narrow the search, e.g. '**/*.tsx'. Leave empty
-                     to search the whole project.
+        answer:        The text to check (your drafted answer, or another agent's).
+        glob_filter:   Optional glob to narrow the search, e.g. '**/*.tsx'. Leave empty
+                       to search the whole project.
+        context_files: Orchestrator-supplied only -- leave unset when calling this
+                       yourself. The caller's own record of files genuinely read this
+                       run, used as a fallback when a route claim's source file isn't
+                       named in `answer` itself. Passing file names here yourself does
+                       not make an unsupported claim pass -- the file's own real
+                       content is still what gets checked.
 
     Limits: proves EXISTENCE, not correctness. A symbol that exists but does not do what
     the answer claims will pass — this cannot read intent. When a citation is quoted
@@ -3351,7 +3402,7 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     # Phase 0.34 (T13a): verb-aware check for bare prose `METHOD /path` claims --
     # see _prose_route_verb_mismatches' own docstring for why this is separate
     # from the verb-blind `routes` list above.
-    prose_route_results = _prose_route_verb_mismatches(answer)
+    prose_route_results = _prose_route_verb_mismatches(answer, context_files=context_files)
 
     # ── asserted paths ────────────────────────────────────────────────────────
     # Existence-only, and deliberately so: this says nothing about whether the file
@@ -3422,7 +3473,7 @@ def verify_claims(answer: str, glob_filter: str = "") -> str:
     # "nothing to check", which made the path check inert on exactly the answers it
     # was built for. Found by calling verify_claims directly in the container.
     if (not (idents or file_lines or routes or proposed_idents or asserted_paths
-             or negated_idents or negated_paths)
+             or negated_idents or negated_paths or prose_route_results)
             and not _lint_code(answer)):
         return ("verify_claims: no checkable claims found (no backticked symbols, "
                 "code-block attribute references, file:line citations, API routes, "
