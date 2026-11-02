@@ -410,6 +410,47 @@ _PROSE_ROUTE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Phase 0.35 (P1): the SEPARATE labelled form -- `**Method**: `GET`` and
+# `**Path**: `/vouchers`` on their own lines -- live-confirmed to bypass
+# _PROSE_ROUTE_RE entirely (Phase 0.34's own live retest, 2026-11-02): the
+# redeployed fix ran without error, but this run's answer formatted every
+# endpoint as separate Method/Path bullets rather than one combined
+# `` `GET /vouchers` `` span, so zero claims were ever extracted from it.
+_LABELED_METHOD_RE = re.compile(
+    r"\*\*Method\*\*:?\s*`(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)`", re.IGNORECASE)
+_LABELED_PATH_RE = re.compile(
+    r"\*\*Path\*\*:?\s*`(/[A-Za-z0-9_\-/{}:.]+)`")
+# Blocks for the labelled form: a NUMBERED item, a heading, or a blank line --
+# deliberately NOT a bare `-`/`*`/`+` bullet, unlike verify.py's own
+# _ITEM_BOUNDARY_RE. The real incident shape nests Method and Path as SIBLING
+# bullets one level under a numbered entry ("1. **List Vouchers**\n   -
+# **Path**: ...\n   - **Method**: ..."); treating each bullet as its own
+# boundary would split Method and Path into different "blocks" and they would
+# never pair. The numbered/heading/blank-line boundary is the one that
+# actually separates DIFFERENT endpoints from each other in this shape.
+_LABELED_ROUTE_BLOCK_BOUNDARY_RE = re.compile(r"\n[ \t]*\d+[.)][ \t]|\n[ \t]*\n|\n[ \t]*#{1,6}[ \t]")
+
+
+def _labeled_route_claims(answer: str) -> list[tuple[str, str]]:
+    """(verb, path) pairs from the separate `**Method**`/`**Path**` labelled
+    form, paired only within one block and only when each label appears
+    exactly once in it -- two Methods or two Paths in the same block means the
+    pairing is genuinely ambiguous and is left out entirely, never guessed,
+    matching this file's existing "ambiguous name is left out, not guessed"
+    convention (_resolves_as_suffix, _find_by_basename, and
+    _prose_route_verb_mismatches' own router-file resolution all apply the
+    same rule).
+    """
+    bounds = [0] + [m.start() for m in _LABELED_ROUTE_BLOCK_BOUNDARY_RE.finditer(answer)] + [len(answer)]
+    pairs: list[tuple[str, str]] = []
+    for start, end in zip(bounds, bounds[1:]):
+        block = answer[start:end]
+        methods = _LABELED_METHOD_RE.findall(block)
+        paths = _LABELED_PATH_RE.findall(block)
+        if len(methods) == 1 and len(paths) == 1:
+            pairs.append((methods[0], paths[0]))
+    return pairs
+
 
 def _prose_route_verb_mismatches(answer: str) -> list[tuple[str, str, str]]:
     """Check bare prose `METHOD /path` route claims against the one router file
@@ -431,7 +472,10 @@ def _prose_route_verb_mismatches(answer: str) -> list[tuple[str, str, str]]:
     omit a prefix supplied later by `include_router(prefix=...)`), at the cost of
     never confirming a route whose verb+path legitimately split across two files.
     """
-    claims = _PROSE_ROUTE_RE.findall(answer)
+    claims = list(_PROSE_ROUTE_RE.findall(answer))
+    for verb, path in _labeled_route_claims(answer):
+        if (verb, path) not in claims:
+            claims.append((verb, path))
     if not claims:
         return []
 

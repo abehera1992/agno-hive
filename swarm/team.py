@@ -8353,6 +8353,17 @@ _RECOVERY_CONTINUATION_REJECTED_NOTE = (
     "identified as a continuation. The original answer has been preserved; "
     "the answer may be incomplete.]"
 )
+# Phase 0.35 (P0): a DIFFERENT rejection reason than the note above -- this
+# continuation WAS correctly identified (it carried the required marker), but
+# introduced specific claims this run's own verification could not confirm
+# against the real repository. Kept as its own distinct string rather than
+# reused text so a reader (or a later guard inspecting the disclosure) can
+# tell "no marker" apart from "marker present, content unsupported".
+_RECOVERY_CONTINUATION_UNSUPPORTED_NOTE = (
+    "\n\n[Completion note: the recovery output introduced claims that could "
+    "not be confirmed against the repository. The original answer has been "
+    "preserved; the answer may be incomplete.]"
+)
 
 
 def _final_content_is_incomplete(content: "str | None") -> bool:
@@ -8563,7 +8574,9 @@ def _missing_categories_continuation_note(missing_cats: list[str]) -> str:
 
 
 async def _complete_repetition_truncated_answer(content: str, task: str, team, all_results,
-                                                 result, liveness_path: str | None):
+                                                 result, liveness_path: str | None,
+                                                 hive_mcp_url: str | None = None,
+                                                 hive_mcp_tools=None):
     """One bounded completion pass when a generation was cut off before it reached
     a conclusion -- Z16's textual repetition guard, or (T58) _stream_team_run's
     semantic-stall guard; see truncation_reason below for how the two are told
@@ -8617,6 +8630,24 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
     left to that guard's own _adopt_retry comparison, unchanged, rather than folded in
     here. Z16's truncation behavior itself, and _stream_team_run's copy of it, are
     both completely unmodified by this function.
+
+    `hive_mcp_url`/`hive_mcp_tools` (Phase 0.35, P0): optional, default None so any
+    call site that does not pass them behaves exactly as before. When present, they
+    gate a structural check run on the marked continuation ONLY (never the whole
+    combined answer) immediately before it would otherwise be adopted -- see the
+    comment at that check's own call point below for why `_adopt_retry`'s read-count
+    comparison cannot, by itself, catch this. Live-confirmed, T4 of the 2026-11-02
+    Phase 0.34 battery: a completion pass with no tool access announced "I'll now
+    read the PartyRegistration model definition" and fabricated an entire plausible
+    field list for it, and the Phase 0.34 prompt-only instruction added here did not
+    stop it on retest. `_adopt_retry` cleared it anyway, because on this team shape
+    the Coordinator's own baseline read count is already ~0 (everything is
+    delegated), so a completion making 0 new reads still clears that bar regardless
+    of what it invented -- the count-based grounding weakness this phase's own brief
+    calls out by name. verify_claims is the existing, already-deployed mechanism
+    that CAN tell a real `PartyRegistration` field from a fabricated one (it greps
+    the real repository directly); this reuses it as a gate rather than only as
+    downstream disclosure.
     """
     # T58: a semantic-stall stop (_stream_team_run's OWN new signal -- see
     # its "T58" comment) is a DIFFERENT reason than Z16's textual
@@ -8818,6 +8849,45 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
         # never an empty answer merely because the marker is missing.
         return content.rstrip() + _RECOVERY_CONTINUATION_REJECTED_NOTE, result
     combined = f"{content.rstrip()}\n\n{continuation}" if content.strip() else continuation
+    # Phase 0.35 (P0): the structural evidence gate, immediately before adoption.
+    # `_adopt_retry` below only compares READ COUNTS -- on this team shape the
+    # Coordinator's own baseline is already ~0 (everything is delegated), so a
+    # completion that makes 0 new reads clears that bar no matter what it
+    # invented. Checked here, against `continuation` ONLY (the newly introduced
+    # text, never the already-adopted `content`) -- verify_claims is a stateless
+    # repo grep, so checking it alone correctly judges every NEW claim on its own
+    # merits without needing to diff against the prior draft first. Gated on
+    # hive_mcp_url/hive_mcp_tools being present so a caller that does not pass
+    # them (none currently exist, but future callers might not) behaves exactly
+    # as before -- additive, never a new hard requirement on this function's
+    # signature. A bare empty/non-fact continuation (e.g. "nothing further
+    # to add.") has nothing for verify_claims to check and reports no problems,
+    # so this never blocks a genuinely-grounded short completion.
+    if hive_mcp_url or hive_mcp_tools:
+        try:
+            _new_claim_report, _new_claim_bad, _new_claim_unavailable = await _verify_claims(
+                continuation, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path,
+                op_label=f"{truncation_reason}-completion:new-claim-check")
+        except Exception as exc:  # noqa: BLE001
+            # Same "a verifier that breaks the run would be worse than the
+            # fabrication it is meant to catch" principle _verify_claims' own
+            # docstring states -- a gate failure must never cost the run its
+            # (otherwise fine) pre-repeat draft.
+            print(f"[team] {truncation_reason}-completion new-claim check "
+                  f"raised ({exc}) -- treating as unavailable, not as a block",
+                  flush=True)
+            _new_claim_bad, _new_claim_unavailable = False, True
+        if _new_claim_bad and not _new_claim_unavailable:
+            print(f"[team] {truncation_reason}-truncation completion introduced "
+                  f"claim(s) this run's own verification could not confirm -- "
+                  f"rejecting the completion's new content rather than adopting "
+                  f"unsupported claims; keeping the pre-repeat draft, disclosed "
+                  f"as incomplete. verify_claims: "
+                  f"{_new_claim_report.splitlines()[-1] if _new_claim_report else ''}",
+                  flush=True)
+            if _ends_at_a_natural_stopping_point(content):
+                return content, result
+            return content.rstrip() + _RECOVERY_CONTINUATION_UNSUPPORTED_NOTE, result
     if nested_truncation:
         print(f"[team] {truncation_reason}-truncation completion was itself cut "
               f"short by a second stall/repetition ({nested_reason}) — adopting "
@@ -9985,7 +10055,8 @@ async def _evidence_integrity_check(
     was_truncated = _fallback_reason is not None
     pre_completion = retried
     retried, _ = await _complete_repetition_truncated_answer(
-        retried, task, team, [], None, liveness_path)
+        retried, task, team, [], None, liveness_path,
+        hive_mcp_url=hive_mcp_url, hive_mcp_tools=hive_mcp_tools)
     if (was_truncated and retried == pre_completion
             and _INCOMPLETE_ANSWER_MARKER not in retried
             and not _ends_at_a_natural_stopping_point(retried)):
@@ -10194,7 +10265,8 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # the identical, not-yet-truncated-looking string). Completing first means
     # verify_claims only ever examines finished text.
     content, result = await _complete_repetition_truncated_answer(
-        content, task, team, all_results, result, liveness_path)
+        content, task, team, all_results, result, liveness_path,
+        hive_mcp_url=hive_mcp_url, hive_mcp_tools=hive_mcp_tools)
     # Before any guard looks at the draft: if a member's report was lost to the tool-call
     # syntax leak, get it back. A guard chain reasoning about an answer written without
     # findings that ARE recoverable is measuring the wrong artefact.
@@ -13287,7 +13359,7 @@ async def _repair_verification_failure(
 
 async def _enforce_verification_invariant(
         content: str, task: str, team, hive_mcp_url: str | None, hive_mcp_tools,
-        liveness_path: str | None) -> str:
+        liveness_path: str | None, op_prefix: str = "enforce_verification_invariant") -> str:
     """Single choke point (Phase H): re-verify the FINAL text -- whatever
     _verified_answer's own internal guard chain produced, from whichever of its
     20+ return sites shipped it -- and repair-or-fail rather than let a still-
@@ -13304,13 +13376,28 @@ async def _enforce_verification_invariant(
     Scoped to verify_claims' NOT FOUND category and the term-citation check only --
     see the module-level comment above this section for why AMBIGUOUS/MISMATCH/lint
     findings are deliberately excluded from the strong "must repair or fail" path.
+
+    `op_prefix` (Phase 0.35, P1): this function is now called TWICE at its call
+    site -- once here (before _evidence_integrity_check/_attempt_integration_
+    correction/_attempt_coverage_correction run) and once more at the true end of
+    that chain. Each of those three later guards can itself rewrite `content` and
+    only re-verifies the SPECIFIC claim that triggered ITS OWN retry -- live-
+    confirmed, T13a of the 2026-11-02 battery: _attempt_coverage_correction's own
+    retry fixed two fabricated hook names and re-checked only those, while a
+    fabricated `DELETE /vouchers/{id}` route and an under-scoped table claim sitting
+    untouched elsewhere in the SAME answer were never re-examined by anything,
+    because this function's own first call already ran, found nothing wrong in the
+    pre-correction draft, and was never called again. Defaulting to the exact
+    literal string this function has always used keeps every existing call site and
+    test byte-identical; only the new second call site below passes a distinct
+    prefix, so the two invocations are told apart in the journal.
     """
     if not content or not (hive_mcp_url or hive_mcp_tools):
         return content
 
     fab_report, fab_bad, fab_unavailable = await _verify_claims(
         content, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path,
-        op_label="enforce_verification_invariant:initial")
+        op_label=f"{op_prefix}:initial")
     if fab_bad and not fab_unavailable:
         missing = _not_found_claims(fab_report)
         if missing:
@@ -13320,7 +13407,7 @@ async def _enforce_verification_invariant(
             async def _recheck(text: str):
                 return await _verify_claims(
                     text, hive_mcp_url, hive_mcp_tools, liveness_path=liveness_path,
-                    op_label="enforce_verification_invariant:repair-recheck")
+                    op_label=f"{op_prefix}:repair-recheck")
 
             return await _repair_verification_failure(
                 content, task, team, hive_mcp_url, hive_mcp_tools, liveness_path,
@@ -16363,7 +16450,8 @@ async def _attempt_coverage_correction(
     _fallback_reason = _current_truncation_reason(team)
     was_truncated = _fallback_reason is not None
     retried, _ = await _complete_repetition_truncated_answer(
-        retried, task, team, [], None, liveness_path)
+        retried, task, team, [], None, liveness_path,
+        hive_mcp_url=hive_mcp_url, hive_mcp_tools=hive_mcp_tools)
     if was_truncated and _INCOMPLETE_ANSWER_MARKER not in retried \
             and not _ends_at_a_natural_stopping_point(retried):
         retried = retried + _truncation_note_for_reason(_fallback_reason)
@@ -16486,7 +16574,8 @@ async def _attempt_integration_correction(
     _fallback_reason = _current_truncation_reason(team)
     was_truncated = _fallback_reason is not None
     retried, _ = await _complete_repetition_truncated_answer(
-        retried, task, team, [], None, liveness_path)
+        retried, task, team, [], None, liveness_path,
+        hive_mcp_url=hive_mcp_url, hive_mcp_tools=hive_mcp_tools)
     if was_truncated and _INCOMPLETE_ANSWER_MARKER not in retried \
             and not _ends_at_a_natural_stopping_point(retried):
         retried = retried + _truncation_note_for_reason(_fallback_reason)
@@ -31340,6 +31429,23 @@ async def run_task_async(
                             liveness_path=liveness_path))
                 except Exception as exc:
                     print(f"[team] evidence-grounded reconstruction warning: {exc}")
+                # Phase 0.35 (P1, T13a): the true LAST word -- _enforce_verification_
+                # invariant's OWN first call above runs BEFORE _evidence_integrity_check/
+                # _attempt_integration_correction/_attempt_coverage_correction, each of
+                # which can rewrite `content` and only re-verifies its own narrow retry.
+                # Re-running the SAME full, unscoped check here, on whatever those three
+                # passes (plus the reconstruction attempt directly above) actually
+                # produced, closes that gap with no new verification logic -- same
+                # function, same checks, a distinct op_prefix only for journal clarity.
+                try:
+                    content = await _timed_guard_call(
+                        "_enforce_verification_invariant_final", _run_id_for_trace, content,
+                        _enforce_verification_invariant(
+                            content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
+                            liveness_path=liveness_path,
+                            op_prefix="enforce_verification_invariant_final"))
+                except Exception as exc:
+                    print(f"[team] final verification invariant warning: {exc}")
                 # Phase V forensic instrumentation: log-only, never mutates `content`,
                 # never gates, never retries. Reuses Phase N's _evidence_fidelity_report
                 # (already built for exactly this question, previously unwired for lack
