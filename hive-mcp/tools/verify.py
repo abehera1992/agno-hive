@@ -1110,13 +1110,40 @@ def _enumerated_entity_for(answer: str, pos: int) -> str | None:
     heading = None
     for h in _MD_HEADING_RE.finditer(window):
         heading = h
+    # `window_base` is the absolute offset the (possibly heading-trimmed)
+    # `window` starts at, so a match's position within it can be translated
+    # back to an absolute position in `answer` below.
+    window_base = lo
     if heading is not None:
         window = window[heading.end():]
+        window_base = lo + heading.end()
     candidate = None
+    candidate_abs_start = None
     for m in _BACKTICK_RE.finditer(window):
         span = m.group(1).strip()
         if _CLASS_LIKE_RE.match(span):
             candidate = span
+            candidate_abs_start = window_base + m.start()
+    if candidate is None:
+        return None
+    # The candidate must be prose-introduced BEFORE the list, never another
+    # item INSIDE the same list -- live-caught, T3 of the 2026-11-02 battery:
+    # "The class declarations are:\n\n- `Base`\n- `BusinessType`\n-
+    # `BusinessStatus`\n..." is a FLAT list of sibling classes, not a field
+    # enumeration owned by one of them. The naive backward scan picked up
+    # `BusinessType` (itself a list item, immediately preceding `BusinessStatus`
+    # in the SAME list) as `BusinessStatus`'s "owner", synthesized
+    # `BusinessType.BusinessStatus`, and field_of() correctly answered "no
+    # field named BusinessStatus on BusinessType" -- a true answer to a
+    # nonsense question, reported as a false NOT IN FILE on six real,
+    # correctly-declared classes. A candidate that is ITSELF a list item
+    # (its own line also opens with a list marker) is a sibling, never an
+    # owner, and is rejected here rather than guessed.
+    _cand_line_start = answer.rfind("\n", 0, candidate_abs_start)
+    _cand_line = (("\n" + answer[:candidate_abs_start]) if _cand_line_start < 0
+                  else answer[_cand_line_start:candidate_abs_start + 1])
+    if _LIST_ITEM_OPEN_RE.match(_cand_line):
+        return None
     return candidate
 
 
