@@ -24845,6 +24845,84 @@ def _looks_like_repetition_decay(new_segment: str, prior_content: str) -> bool:
     return (len(set(ngrams)) / len(ngrams)) < _REPETITION_DECAY_RATIO_THRESHOLD
 
 
+# Phase 0.32 (2026-11-01). Confirmed root cause of the T13b/1,560s incident: the
+# model began reproducing a get_file_content result (models.py) verbatim as
+# answer content, moving steadily FORWARD through the file -- never repeating
+# the SAME span twice. Direct journal evidence: every "[repair-verify_claims]
+# content: +N chars" line throughout the whole incident took the non-repetition
+# `else:` branch below; neither _looks_like_repetition_loop nor
+# _looks_like_repetition_decay fired even once. This is not a detection-
+# strength gap in either of those two functions -- it is a comparison-universe
+# gap. Both compare new_segment only against THIS answer's own prior text
+# (`joined[:last_logged_len]`), and a segment that has never appeared in the
+# ANSWER before is, by their own correct definition, not a repeat -- even
+# though it is a verbatim copy of something this run ALREADY RETRIEVED via a
+# tool call minutes earlier. "Increasing leading whitespace defeating
+# detection" (the incident's own working theory) does not hold up under
+# inspection: _normalize_for_repetition_check already collapses ALL whitespace
+# via str.split() before every comparison tier, so indentation depth cannot
+# affect any of them either way.
+#
+# This closes the gap by widening the comparison universe, not by changing
+# either existing function: _stream_event_to_chunk already computes
+# "result_tokens" (_salient_tokens(result), the full untruncated result, not
+# the 200-char result_preview) on every tool-end event, for the SAME reason
+# the evidence-fidelity report needs it -- "did this fact come from a tool
+# this run?" is exactly the question being asked here too. No new expensive
+# call, no new tool-result storage: this reuses a value already computed for
+# every qualifying tool call regardless of whether this check exists.
+_SOURCE_RETRIEVAL_TOOLS = frozenset({"get_file_content", "get_files_batch"})
+# How many of the most recent source-retrieval tool results' token sets stay
+# "recent" for this comparison -- bounded (not the whole run's reading
+# history) so a file read 20 minutes ago and never revisited cannot flag a
+# legitimately different, later part of the answer.
+_TOOL_REGURGITATION_RECENT_READS = 3
+# A segment must carry at least this many of its OWN salient (identifier/
+# number/path-shaped) tokens before a ratio is even computed -- a prose
+# sentence that happens to name two or three real identifiers while writing
+# original explanatory text has very few salient tokens to begin with, and
+# dividing by a tiny denominator is exactly what would make ordinary citation
+# look identical to wholesale regurgitation. Floor chosen well above what a
+# single explanatory sentence naming a couple of real symbols produces.
+_TOOL_REGURGITATION_MIN_SEGMENT_TOKENS = 8
+# How much of a segment's own salient-token set must already exist in recently
+# retrieved tool results before the segment counts as "reproducing retrieved
+# content" rather than "citing some real evidence while writing new prose."
+# Deliberately high: measured against the real incident's own captured
+# chunks (column/class declarations straight out of models.py), overlap sits
+# at or near 1.0 -- every distinctive token in a verbatim source chunk is, by
+# construction, a token that source already contained. A paragraph that cites
+# a handful of real names inside otherwise-original sentences sits far below
+# this, not near it.
+_TOOL_REGURGITATION_OVERLAP_THRESHOLD = 0.85
+
+
+def _looks_like_tool_content_regurgitation(
+        new_segment: str, recent_tool_tokens: "frozenset[str]") -> bool:
+    """True if `new_segment` looks like it is mostly a verbatim reproduction of
+    content this run recently retrieved via a tool call, rather than newly
+    synthesized prose that merely cites some of what was retrieved.
+
+    Deliberately narrow, mirroring _looks_like_repetition_loop's own stated
+    philosophy: only segments carrying a real amount of their own salient
+    (identifier/number/path-shaped) content are judged at all
+    (_TOOL_REGURGITATION_MIN_SEGMENT_TOKENS), and only an OVERWHELMING overlap
+    with recently-retrieved tool tokens counts
+    (_TOOL_REGURGITATION_OVERLAP_THRESHOLD) -- a segment that cites a few real
+    names inside original explanatory sentences is exactly the case this must
+    NOT flag; see this check's own call site for how its result joins the
+    SAME repetition_count/Z16 disposition loop_detected and decay_detected
+    already use, rather than introducing a second termination mechanism.
+    """
+    if not recent_tool_tokens or len(new_segment) < _REPETITION_MIN_SEGMENT_LEN:
+        return False
+    seg_tokens = _salient_tokens(new_segment)
+    if len(seg_tokens) < _TOOL_REGURGITATION_MIN_SEGMENT_TOKENS:
+        return False
+    overlap = len(seg_tokens & recent_tool_tokens) / len(seg_tokens)
+    return overlap >= _TOOL_REGURGITATION_OVERLAP_THRESHOLD
+
+
 def _log_unclassified_stream_event(log_label: str, event, unrecognized_event_counts: dict[str, int]) -> None:
     """Log a stream event _stream_event_to_chunk() couldn't turn into a text delta or
     a tool-call sentinel -- most often a content-type event whose .content came back
@@ -29855,6 +29933,12 @@ async def _stream_team_run(
     semantic_stall_count = 0
     semantic_stall_stopped = False
     unrecognized_event_counts: dict[str, int] = {}
+    # Phase 0.32: the most recent _TOOL_REGURGITATION_RECENT_READS source-
+    # retrieval tool results' token sets, for _looks_like_tool_content_
+    # regurgitation -- see that function's own docstring and the comment
+    # above _SOURCE_RETRIEVAL_TOOLS for why. Function-local, like every other
+    # piece of this loop's state; discarded with this call, never persisted.
+    recent_tool_token_sets: list["frozenset[str]"] = []
     # Phase 0.11: drive the agno async generator manually (not `async for`) so
     # each individual __anext__() can be bounded by _STREAM_INACTIVITY_TIMEOUT_S
     # -- see that constant's own comment for what this bounds (inter-event gap,
@@ -29929,11 +30013,34 @@ async def _stream_team_run(
                     _record_enumerations(team)
                     new_segment = joined[last_logged_len:]
                     preview = new_segment[-300:]
-                    loop_detected = _looks_like_repetition_loop(new_segment, joined[:last_logged_len])
+                    # Phase 0.32 (Track C, cross-retry): best_draft() is the longest
+                    # content ANY pass of this run has produced so far, surviving
+                    # across separate _stream_team_run calls within one run (a
+                    # verify_claims correction retry's own `joined` starts empty,
+                    # but best_draft() does not) -- see _best_draft's own docstring.
+                    # Prepended, not appended: _looks_like_repetition_loop only ever
+                    # inspects the TAIL of its prior_content argument
+                    # (_REPETITION_LOOKBACK_CHARS), so once this call's own `joined`
+                    # exceeds that window the comparison naturally shifts back to
+                    # this call's own recent output, exactly as before this change.
+                    _prior_for_check = best_draft() + joined[:last_logged_len]
+                    loop_detected = _looks_like_repetition_loop(new_segment, _prior_for_check)
                     decay_detected = not loop_detected and _looks_like_repetition_decay(
-                        new_segment, joined[:last_logged_len]
+                        new_segment, _prior_for_check
                     )
-                    if loop_detected or decay_detected:
+                    # Phase 0.32 (Track A/B/D): a THIRD, independent axis -- not "does
+                    # this repeat the answer's own prior text" but "is this mostly a
+                    # verbatim reproduction of a tool result this run already
+                    # retrieved." See _looks_like_tool_content_regurgitation's own
+                    # docstring for why this is a separate check rather than a change
+                    # to either existing one, and the comment above
+                    # _SOURCE_RETRIEVAL_TOOLS for the confirmed incident this closes.
+                    regurgitation_detected = (
+                        not loop_detected and not decay_detected
+                        and _looks_like_tool_content_regurgitation(
+                            new_segment, frozenset().union(*recent_tool_token_sets)
+                            if recent_tool_token_sets else frozenset()))
+                    if loop_detected or decay_detected or regurgitation_detected:
                         # Count it (2026-08-27). Withholding progress credit -- the
                         # only response until now -- bites solely when repetition is
                         # CONTINUOUS: any genuine segment in between refreshes
@@ -29952,7 +30059,7 @@ async def _stream_team_run(
                                 f"content, not counted as progress: ...{preview!r}",
                                 flush=True,
                             )
-                        else:
+                        elif decay_detected:
                             print(
                                 f"[{log_label}] repetition DECAY detected -- the last "
                                 f"{len(new_segment)} chars have collapsed into a small "
@@ -29960,6 +30067,14 @@ async def _stream_team_run(
                                 f"content), not counted as progress -- unvalidated "
                                 f"threshold, see _looks_like_repetition_decay's own "
                                 f"docstring: ...{preview!r}",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"[{log_label}] tool-content regurgitation detected -- "
+                                f"the last {len(new_segment)} chars look like a verbatim "
+                                f"reproduction of content this run already retrieved via "
+                                f"a tool call, not counted as progress: ...{preview!r}",
                                 flush=True,
                             )
                         # Z16 (2026-09-26): stop consuming THIS generation in-process at
@@ -30034,6 +30149,17 @@ async def _stream_team_run(
                 _evt_name = out.get("name") if isinstance(out.get("name"), str) else None
                 if _evt_name:
                     activity["last_call_name"] = _evt_name
+                # Phase 0.32: capture this tool-end event's full-result salient
+                # tokens (already computed by _stream_event_to_chunk for every
+                # qualifying event, no new cost here) for the next segment's
+                # regurgitation check. Only on "end" events (result_tokens is
+                # None/absent on "start"), only for the source-retrieval tools
+                # this is actually about. Bounded to the most recent N reads.
+                if (out.get("__tool_event__") == "end"
+                        and _evt_name in _SOURCE_RETRIEVAL_TOOLS
+                        and out.get("result_tokens")):
+                    recent_tool_token_sets.append(out["result_tokens"])
+                    del recent_tool_token_sets[:-_TOOL_REGURGITATION_RECENT_READS]
                 # Stash listing counts on the team, alongside _read_state, so the
                 # answer-time count guard can reach them. Accumulates across a run's
                 # retries exactly like _read_state does.
@@ -30686,6 +30812,9 @@ async def run_task_async(
                     # run_agent_names tracks the whole run and is never reset.
                     segment_agent_names: set[str] = set()
                     run_agent_names: set[str] = set()
+                    # Phase 0.32: see _stream_team_run's identical declaration --
+                    # kept in sync deliberately, same as every other block in this loop.
+                    recent_tool_token_sets: list["frozenset[str]"] = []
                     try:
                         # Consuming the stream internally (2026-08-10) instead of one opaque
                         # blocking team.arun(task) -- external behavior (return type, downstream
@@ -30747,11 +30876,19 @@ async def run_task_async(
                                     _record_enumerations(team)
                                     new_segment = joined[last_logged_len:]
                                     preview = new_segment[-300:]
-                                    loop_detected = _looks_like_repetition_loop(new_segment, joined[:last_logged_len])
+                                    # Phase 0.32: see _stream_team_run's identical block for
+                                    # the full rationale -- kept in sync deliberately.
+                                    _prior_for_check = best_draft() + joined[:last_logged_len]
+                                    loop_detected = _looks_like_repetition_loop(new_segment, _prior_for_check)
                                     decay_detected = not loop_detected and _looks_like_repetition_decay(
-                                        new_segment, joined[:last_logged_len]
+                                        new_segment, _prior_for_check
                                     )
-                                    if loop_detected or decay_detected:
+                                    regurgitation_detected = (
+                                        not loop_detected and not decay_detected
+                                        and _looks_like_tool_content_regurgitation(
+                                            new_segment, frozenset().union(*recent_tool_token_sets)
+                                            if recent_tool_token_sets else frozenset()))
+                                    if loop_detected or decay_detected or regurgitation_detected:
                                         # Count it (2026-08-27). Withholding progress credit -- the
                                         # only response until now -- bites solely when repetition is
                                         # CONTINUOUS: any genuine segment in between refreshes
@@ -30770,7 +30907,7 @@ async def run_task_async(
                                                 f"...{preview!r}",
                                                 flush=True,
                                             )
-                                        else:
+                                        elif decay_detected:
                                             print(
                                                 f"[team] repetition DECAY detected -- the last "
                                                 f"{len(new_segment)} chars have collapsed into a "
@@ -30779,6 +30916,15 @@ async def run_task_async(
                                                 f"unvalidated threshold, see "
                                                 f"_looks_like_repetition_decay's own docstring: "
                                                 f"...{preview!r}",
+                                                flush=True,
+                                            )
+                                        else:
+                                            print(
+                                                f"[team] tool-content regurgitation detected -- "
+                                                f"the last {len(new_segment)} chars look like a "
+                                                f"verbatim reproduction of content this run already "
+                                                f"retrieved via a tool call, not counted as "
+                                                f"progress: ...{preview!r}",
                                                 flush=True,
                                             )
                                         # Z16: see _stream_team_run's identical block for the
@@ -30812,6 +30958,13 @@ async def run_task_async(
                                 raise _BackendRunError(out["message"])
                             elif isinstance(out, dict):
                                 activity["last_progress_at"] = time.monotonic()
+                                # Phase 0.32: see _stream_team_run's identical capture --
+                                # kept in sync deliberately.
+                                if (out.get("__tool_event__") == "end"
+                                        and out.get("name") in _SOURCE_RETRIEVAL_TOOLS
+                                        and out.get("result_tokens")):
+                                    recent_tool_token_sets.append(out["result_tokens"])
+                                    del recent_tool_token_sets[:-_TOOL_REGURGITATION_RECENT_READS]
                                 if _consume_stream_event(team, out):
                                     print(f"[team] {_stream_event_log_line(out)}", flush=True)
                                 last_segment_start = len(full_content)
