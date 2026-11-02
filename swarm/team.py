@@ -24652,7 +24652,71 @@ def _segment_introduces_new_identifier(new_segment: str, prior_content: str) -> 
     return bool(new_ids - _identifiers(older))
 
 
-def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:
+# Phase 0.33 (2026-11-02). Confirmed live, 2026-11-01 20:09:16-20:09:46 (run
+# 96e7ace329c5, project ekam): the Researcher correctly read vouchers_api.py
+# and began writing out all 9 real endpoints as a numbered markdown list
+# ("1. **GET** `/vouchers` - List vouchers\n2. **GET** `/vouchers/{voucher_
+# id}`...") -- a genuinely progressing, fully correct answer. Four
+# consecutive ticks were each flagged "repetition loop detected", crossing
+# config.liveness_repetition_threshold and truncating the whole answer to
+# the single "I" character generated before the list began. The Coordinator
+# then could never retrieve the Researcher's real report (every
+# forward_member_answer attempt was refused as stale while the delegation's
+# own completion-recovery pass was still running), was forced by the
+# progress guard to synthesize text with nothing real to draw on, and
+# confabulated 5 generic, partially nonexistent CRUD endpoints instead.
+#
+# _segment_introduces_new_identifier's existing veto (above) requires a true
+# CamelCase or snake_case token (>= 4 chars) absent from older content.
+# Consecutive list items that each name a DIFFERENT real endpoint
+# nonetheless often repeat the SAME parameter name across several items
+# ("voucher_id" appears in the GET/PUT/DELETE-shaped bullets for /vouchers/
+# {voucher_id}, /vouchers/{voucher_id}/post, /vouchers/{voucher_id}/cancel
+# alike) -- so a bullet whose only candidate identifier is one already used
+# by an earlier, different, equally-correct bullet is wrongly judged to
+# introduce nothing new, even though its actual distinguishing content (a
+# different HTTP-method word, a different trailing path segment) plainly is
+# new. Confirmed by direct reconstruction of the real captured text: the
+# identifier-only veto correctly resolves true for the plain prose case but
+# the overall mechanism still has no signal for "this bullet names a
+# different exact PATH," because "post"/"cancel"/"grn" are short, all-
+# lowercase, and carry no underscore or internal capital -- they fail
+# _IDENTIFIER_SHAPE_RE's own shape test even though a backtick-quoted path
+# containing them is obviously not prose.
+#
+# This adds a second, independent "is this genuinely new" signal, narrower
+# and safer than loosening the identifier shape test itself (which risks
+# reopening the T16 false positive that test was built to close): a
+# backtick-quoted literal (markdown inline code -- in this codebase's
+# answers, almost always an exact path, identifier, or filename) that does
+# not appear verbatim anywhere in prior content. Checked over the COMBINED
+# text (prior_content + new_segment), not new_segment alone -- a 10s-tick
+# chunk boundary can fall mid-backtick-pair, and a backtick-balance check
+# over the partial chunk alone is unreliable exactly because of that.
+_QUOTED_LITERAL_RE = re.compile(r"`([^`\n]{2,80})`")
+
+
+def _segment_introduces_new_quoted_literal(new_segment: str, prior_content: str) -> bool:
+    """True if `new_segment` contains a backtick-quoted literal (an exact
+    path, identifier, or filename, by this codebase's own markdown
+    convention) not seen verbatim anywhere in `prior_content`.
+
+    A second, independent veto alongside _segment_introduces_new_identifier
+    -- see the comment above _QUOTED_LITERAL_RE for the confirmed live
+    incident this closes. Deliberately narrow: only an EXACT, already-
+    delimited literal counts, never a bare word, so this cannot turn
+    ordinary prose into "new content" the way loosening the identifier
+    shape test would risk doing.
+    """
+    combined_quoted = set(_QUOTED_LITERAL_RE.findall(prior_content + new_segment))
+    if not combined_quoted:
+        return False
+    prior_quoted = set(_QUOTED_LITERAL_RE.findall(prior_content))
+    return bool(combined_quoted - prior_quoted)
+
+
+def _looks_like_repetition_loop(new_segment: str, prior_content: str,
+                                cross_pass_content: str = "") -> bool:
     """True if `new_segment` (freshly generated text, appended to the accumulated
     answer) is essentially a repeat of something generated recently, rather than
     genuine new progress -- either a literal repeat, or a lightly reworded /
@@ -24760,7 +24824,17 @@ def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:
         # this shared prefix names a new route/model/class/function/file, this
         # is the structural-repetition-with-progress shape (see
         # _segment_introduces_new_identifier's own docstring), not a loop.
-        if not _segment_introduces_new_identifier(new_segment, prior_content[-_REPETITION_LOOKBACK_CHARS:]):
+        # Phase 0.33: OR'd with the quoted-literal veto -- see its own comment
+        # for the confirmed live incident (a correct, progressing enumerated
+        # list of endpoints, each naming a different exact path) neither this
+        # identifier check alone nor the quoted-literal check alone was built
+        # to cover on its own, but together do: a bullet whose only shared
+        # token is a REUSED parameter name (not new by shape) still names a
+        # genuinely new backtick-quoted path.
+        if not (_segment_introduces_new_identifier(
+                    new_segment, prior_content[-_REPETITION_LOOKBACK_CHARS:])
+                or _segment_introduces_new_quoted_literal(
+                    new_segment, prior_content[-_REPETITION_LOOKBACK_CHARS:])):
             return True
 
     # Tier 4 (Phase 5): same prefix, same floor, checked against the WHOLE
@@ -24773,8 +24847,38 @@ def _looks_like_repetition_loop(new_segment: str, prior_content: str) -> bool:
     if full_filler_stripped_prior.count(prefix) >= 2:
         # Phase T16: same veto as tier 3, same reason -- a third (or later)
         # occurrence of a shared opening still is not a loop if THIS occurrence
-        # introduces a symbol none of the earlier ones had.
-        return not _segment_introduces_new_identifier(new_segment, prior_content)
+        # introduces a symbol none of the earlier ones had. Phase 0.33: same
+        # OR with the quoted-literal veto as tier 3, same reason.
+        if not (_segment_introduces_new_identifier(new_segment, prior_content)
+                or _segment_introduces_new_quoted_literal(new_segment, prior_content)):
+            return True
+
+    # Tier 5 (Phase 0.32B/0.33, cross-pass): `cross_pass_content` is
+    # best_draft() -- the longest content ANY pass of this run has produced,
+    # surviving across separate _stream_team_run calls within one run --
+    # passed SEPARATELY from `prior_content`, never blended into it. This
+    # closes Phase 0.32's own cross-retry gap (a correction retry's own
+    # `joined` starts empty, so it could not otherwise see the main pass's
+    # content at all) with the SAME veto discipline tiers 3/4 already use,
+    # rather than Phase 0.32's first attempt, which blended best_draft()
+    # directly into `prior_content` -- feeding tiers 1/2 above, which have
+    # NO veto at all, a content source other than this call's own text.
+    # Phase 0.32B/0.33's own audit found this an inconsistency worth
+    # correcting (every OTHER cross-content comparison in this function is
+    # vetoed; this was the one exception) rather than a demonstrated
+    # wrongful-termination bug -- a segment that mixes a reused opening with
+    # genuinely new content is NOT flagged here, same as tier 3/4; only a
+    # segment introducing nothing new of its own is, which is the same
+    # judgment tiers 3/4 already make for within-call repeats.
+    if cross_pass_content:
+        cross_tail = cross_pass_content[-_REPETITION_LOOKBACK_CHARS:]
+        filler_stripped_cross = _normalize_for_repetition_check(cross_tail)
+        cross_prefix = filler_stripped_new[:_REPETITION_PREFIX_CHARS]
+        if (len(cross_prefix) >= _REPETITION_MIN_SEGMENT_LEN
+                and cross_prefix in filler_stripped_cross
+                and not (_segment_introduces_new_identifier(new_segment, cross_tail)
+                         or _segment_introduces_new_quoted_literal(new_segment, cross_tail))):
+            return True
     return False
 
 
@@ -30013,20 +30117,30 @@ async def _stream_team_run(
                     _record_enumerations(team)
                     new_segment = joined[last_logged_len:]
                     preview = new_segment[-300:]
-                    # Phase 0.32 (Track C, cross-retry): best_draft() is the longest
-                    # content ANY pass of this run has produced so far, surviving
-                    # across separate _stream_team_run calls within one run (a
-                    # verify_claims correction retry's own `joined` starts empty,
-                    # but best_draft() does not) -- see _best_draft's own docstring.
-                    # Prepended, not appended: _looks_like_repetition_loop only ever
-                    # inspects the TAIL of its prior_content argument
-                    # (_REPETITION_LOOKBACK_CHARS), so once this call's own `joined`
-                    # exceeds that window the comparison naturally shifts back to
-                    # this call's own recent output, exactly as before this change.
-                    _prior_for_check = best_draft() + joined[:last_logged_len]
-                    loop_detected = _looks_like_repetition_loop(new_segment, _prior_for_check)
+                    # Phase 0.32 (Track C, cross-retry), REVISED Phase 0.32B/0.33:
+                    # best_draft() is the longest content ANY pass of this run has
+                    # produced so far, surviving across separate _stream_team_run
+                    # calls within one run (a verify_claims correction retry's own
+                    # `joined` starts empty, but best_draft() does not).
+                    #
+                    # Originally blended into `prior_content` itself (prepended).
+                    # Reverted: confirmed live in Phase 0.32B/0.33 scratch validation
+                    # that blending it into `prior_content` fed tiers 1/2 of
+                    # _looks_like_repetition_loop, which have NO identifier/quoted-
+                    # literal veto at all -- a correction retry's first segment
+                    # legitimately re-deriving one correct, reusable sentence from
+                    # an otherwise-abandoned draft was flagged with no escape. Now
+                    # passed as the SEPARATE `cross_pass_content` argument, which
+                    # _looks_like_repetition_loop only ever matches through its own
+                    # vetoed tier (see that function's own "Tier 5" comment) --
+                    # never through the unvetoed tiers 1/2. Decay has no veto
+                    # mechanism at all and no demonstrated defect was found for it
+                    # here, so its own prior_content argument is left as the
+                    # original joined[:last_logged_len], unblended.
+                    loop_detected = _looks_like_repetition_loop(
+                        new_segment, joined[:last_logged_len], cross_pass_content=best_draft())
                     decay_detected = not loop_detected and _looks_like_repetition_decay(
-                        new_segment, _prior_for_check
+                        new_segment, joined[:last_logged_len]
                     )
                     # Phase 0.32 (Track A/B/D): a THIRD, independent axis -- not "does
                     # this repeat the answer's own prior text" but "is this mostly a
@@ -30876,12 +30990,14 @@ async def run_task_async(
                                     _record_enumerations(team)
                                     new_segment = joined[last_logged_len:]
                                     preview = new_segment[-300:]
-                                    # Phase 0.32: see _stream_team_run's identical block for
-                                    # the full rationale -- kept in sync deliberately.
-                                    _prior_for_check = best_draft() + joined[:last_logged_len]
-                                    loop_detected = _looks_like_repetition_loop(new_segment, _prior_for_check)
+                                    # Phase 0.32, REVISED Phase 0.32B/0.33: see
+                                    # _stream_team_run's identical block for the full
+                                    # rationale -- kept in sync deliberately.
+                                    loop_detected = _looks_like_repetition_loop(
+                                        new_segment, joined[:last_logged_len],
+                                        cross_pass_content=best_draft())
                                     decay_detected = not loop_detected and _looks_like_repetition_decay(
-                                        new_segment, _prior_for_check
+                                        new_segment, joined[:last_logged_len]
                                     )
                                     regurgitation_detected = (
                                         not loop_detected and not decay_detected
