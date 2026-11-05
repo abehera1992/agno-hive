@@ -8622,6 +8622,56 @@ def _missing_categories_continuation_note(missing_cats: list[str]) -> str:
     )
 
 
+def _has_usable_current_generation_evidence(team) -> bool:
+    """True iff at least one delegated member's stored result in
+    `team._member_results` is both non-empty AND captured at-or-after that
+    member's CURRENT delegation generation.
+
+    Phase 0.44 (T11 no-evidence recovery invariant): reuses, rather than
+    reimplements, the exact two maps forward_member_answer's own Phase
+    0.23 staleness check already compares per-member before forwarding --
+    `team._delegation_generation` (the generation currently in flight for
+    each member) and `team._member_result_generation` (the generation that
+    produced whatever is currently stored for that member). A result whose
+    captured generation is behind the current one is a real answer, just
+    not to whatever was most recently delegated -- exactly the "stale
+    answer from a previous delegation generation" case forward_member_answer
+    itself already refuses to forward as current. This function asks the
+    same question in aggregate, across every member, rather than one named
+    member at a time: is there ANYTHING in hand right now that genuinely
+    answers the current round, as opposed to nothing yet (the run's single
+    delegation has not returned at all -- team._member_results is empty,
+    confirmed live on the T11 incident this phase fixes, run e2c519585f5a)
+    or something only from an earlier round.
+    """
+    results = getattr(team, "_member_results", None)
+    if not isinstance(results, dict) or not results:
+        return False
+    gens = getattr(team, "_delegation_generation", None)
+    captured = getattr(team, "_member_result_generation", None)
+    gens = gens if isinstance(gens, dict) else {}
+    captured = captured if isinstance(captured, dict) else {}
+    for key, text in results.items():
+        if not text:
+            continue
+        if gens.get(key, 0) > captured.get(key, 0):
+            continue  # stale -- an earlier generation's answer, not current
+        return True
+    return False
+
+
+_NO_EVIDENCE_RECOVERY_DISCLOSURE = (
+    "\n\n---\n**THIS RUN COULD NOT ANSWER THE QUESTION — the research this "
+    "answer would need to be grounded in has not completed, and nothing "
+    "else gathered this run answers it either. Rather than describe "
+    "services, functions, files, routes, or other specifics that were not "
+    "actually confirmed, this run is disclosing that plainly instead. "
+    "Re-running the request, or waiting for the pending research to "
+    "finish, is likely to produce a real answer; nothing above should be "
+    "read as one.**"
+)
+
+
 async def _complete_repetition_truncated_answer(content: str, task: str, team, all_results,
                                                  result, liveness_path: str | None,
                                                  hive_mcp_url: str | None = None,
@@ -8721,6 +8771,29 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
     if getattr(team, _REPETITION_COMPLETION_FLAG, False):
         return content, result
     setattr(team, _REPETITION_COMPLETION_FLAG, True)
+
+    # Phase 0.44 (T11 no-evidence recovery invariant): if NOTHING currently
+    # gathered this run answers the task -- the run's delegation(s) have not
+    # returned, or everything stored is from an earlier generation -- do not
+    # ask the model to "continue and finish" at all. Live-confirmed incident
+    # (run e2c519585f5a): with team._member_results empty at this exact
+    # point, this same completion path invented an entire plausible-but-
+    # fabricated 3-service chain (fake functions authenticate_seller/
+    # onboard_seller/upload_document), which verify_claims correctly caught
+    # and discarded afterward -- but only after the model was asked to
+    # produce facts it had nothing to ground them in. Skipping the
+    # generation here removes that risk at the source instead of relying
+    # solely on the downstream catch; _has_usable_current_generation_evidence
+    # reuses forward_member_answer's own generation-staleness maps, so a
+    # task with SOME current evidence (even if a different delegation is
+    # still unfinished) is unaffected and proceeds exactly as before.
+    if not _has_usable_current_generation_evidence(team):
+        print(f"[team] {truncation_reason}-truncation completion skipped -- no "
+              f"usable current-generation evidence exists yet for this task "
+              f"(delegation not finished, or only a stale earlier-generation "
+              f"answer is stored); disclosing incomplete research rather than "
+              f"asking the model to synthesize without evidence", flush=True)
+        return content + _NO_EVIDENCE_RECOVERY_DISCLOSURE, result
 
     # T12-FOLLOWUP (2026-10-03): _checkpoint_block(team) is the SAME re-injection
     # every other retry/reconciliation path in this file already uses (the
@@ -16429,6 +16502,86 @@ def _salvage_resolved_category_section(
     return merged if any_merged else None
 
 
+_FLAGGED_CLAIM_PHRASE_RE = re.compile(
+    r"^(?:" + "|".join(re.escape(p) for p in _VERDICT_FLAG_PREFIXES) + r")\s+(.+?)\s*<--"
+)
+
+
+def _claim_phrase_for_flagged_line(line: str) -> str | None:
+    """The bare claim phrase a flagged verify_claims line is about -- e.g.
+    'NOT FOUND POST /vouchers/{po_id}/grn <-- no route matching this path at
+    all in ...' -> 'POST /vouchers/{po_id}/grn'. Reuses the SAME prefix set
+    _flagged_lines_set/_flagged_symbol_names already filter on and the SAME
+    ' <-- explanation' delimiter every verify.py report line uses (route-
+    verb, citation, and symbol sections all share this one shape) -- this
+    reads the claim identity the checker's own report text already
+    carries, rather than adding a new extraction mechanism."""
+    m = _FLAGGED_CLAIM_PHRASE_RE.match(line.strip())
+    if not m:
+        return None
+    phrase = m.group(1).strip()
+    return phrase or None
+
+
+def _sanitize_claim_specific_rejections(
+        candidate: str, new_flagged: "set[str]") -> str | None:
+    """Phase 0.44 (T13a all-or-nothing adoption): when a coverage-correction
+    retry is rejected for introducing new verify_claims problems,
+    _salvage_resolved_category_section (above) already tries one narrow
+    exception -- an entire evidence-backed category section that is itself
+    clean. That exception has nothing to work with on the shape that
+    defeated it on the live incident this phase fixes (run b76d31e84176):
+    the retry was correct on 7 of its 9 endpoint claims, but two individual
+    claims (two URL path segments transposed: `/vouchers/{po_id}/grn`
+    instead of the real `/vouchers/grn/{po_id}`, same for credit-note) were
+    wrong, inside a category ("endpoints") that `_comparison_coverage_gap`
+    had not found new dependency evidence for -- so there was no existing
+    `content` section to replace it with, and the whole retry -- including
+    its 7 correct claims, its 5 correct hooks, and its correct 4-item gap
+    conclusion -- was discarded over 2 bad claims.
+
+    This is a second, narrower exception operating at claim granularity
+    instead of section granularity: for each newly-flagged line, extracts
+    the exact claim phrase from verify_claims' own report text (see
+    _claim_phrase_for_flagged_line), then replaces every literal
+    occurrence of that phrase anywhere in `candidate` -- including inside
+    a dependent gap/comparison conclusion that cites the same claim a
+    second time, so a conclusion that rests on a just-removed claim is
+    never left stating it as confirmed -- with a neutral, non-route-shaped
+    "(path unresolved...)" marker, preserving the rest of each line (the
+    operation name, surrounding prose) untouched.
+
+    Fails closed (returns None, leaving the caller's existing whole-retry-
+    rejection fallback unchanged) whenever a flagged line's claim phrase
+    cannot be extracted at all, or cannot be located anywhere in
+    `candidate` -- an unlocatable claim is never guessed at. The caller is
+    responsible for re-verifying the sanitized result before adopting it;
+    this function only performs the textual isolation, never a
+    verification judgment of its own.
+
+    Never applied to the original (pre-repeat) draft -- only to `retried`,
+    the candidate that actually has real content worth preserving."""
+    if not new_flagged or not candidate:
+        return None
+    lines = candidate.splitlines()
+    touched = False
+    for flagged in new_flagged:
+        phrase = _claim_phrase_for_flagged_line(flagged)
+        if not phrase:
+            return None
+        hit_idxs = [i for i, ln in enumerate(lines) if phrase in ln]
+        if not hit_idxs:
+            return None
+        for i in hit_idxs:
+            lines[i] = lines[i].replace(
+                phrase,
+                "(path unresolved — not confirmed by this run's verification)")
+            touched = True
+    if not touched:
+        return None
+    return "\n".join(lines)
+
+
 async def _attempt_coverage_correction(
         content: str, task: str, team, hive_mcp_url: str | None, hive_mcp_tools,
         liveness_path: str | None = None, synthesis_run: bool = False) -> str:
@@ -16574,6 +16727,28 @@ async def _attempt_coverage_correction(
                       f"own section is clean -- salvaging that section only, "
                       f"keeping the rest of the original content", flush=True)
                 return _salvaged + disclosure
+            # Phase 0.44 (T13a all-or-nothing adoption): the section-level salvage
+            # above has nothing to replace when `content` never had a section for
+            # the affected category in the first place (the near-empty pre-repeat
+            # draft, exactly what defeated it on run b76d31e84176). Try claim-level
+            # isolation on `retried` itself before giving up on it wholesale.
+            _sanitized = _sanitize_claim_specific_rejections(retried, _new_flagged)
+            if _sanitized is not None and _sanitized != retried:
+                _sanitized_report, _sanitized_bad, _ = await _verify_claims(
+                    _sanitized, hive_mcp_url, hive_mcp_tools,
+                    op_label="attempt_coverage_correction:sanitized-recheck", team=team)
+                _sanitized_new_flagged = (
+                    _flagged_lines_set(_sanitized_report) - _flagged_lines_set(_pre_report))
+                if not _sanitized_new_flagged:
+                    print(f"[team] coverage-correction: retry's {len(_new_flagged)} new "
+                          f"verify_claims problem(s) isolated and marked unresolved "
+                          f"in place -- adopting the sanitized retry, keeping its "
+                          f"other correct content", flush=True)
+                    return _sanitized + disclosure
+                print(f"[team] coverage-correction: claim-specific sanitization still "
+                      f"leaves new verify_claims problem(s) "
+                      f"{sorted(_sanitized_new_flagged)[:2]} -- keeping original "
+                      f"content", flush=True)
             print(f"[team] coverage-correction: retry introduced new verify_claims "
                   f"problem(s) not already present in content — "
                   f"{sorted(_new_flagged)[:2]} — keeping original content", flush=True)
