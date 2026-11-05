@@ -491,6 +491,29 @@ def _prose_route_verb_mismatches(
     for verb, path in _labeled_route_claims(answer):
         if (verb, path) not in claims:
             claims.append((verb, path))
+    # Phase 0.39: a THIRD claim shape -- decorator-syntax `@router.verb("path")`
+    # written directly in the answer (Python decorator syntax, so in practice
+    # always inside a fenced code block) -- as opposed to the bare backtick
+    # prose form (_PROSE_ROUTE_RE) or the labeled Method/Path form
+    # (_labeled_route_claims) above. Reuses _DECORATOR_VERB_PATH_RE exactly as
+    # declared (it already captures verb+path together, and is used
+    # identically against the REAL source file a few lines below) -- the same
+    # regex, pointed at the answer instead of the file, feeding the SAME
+    # claims list and the SAME comparison logic beneath it; no new pattern, no
+    # new verdict shape. Live-confirmed gap this closes (T13b, 2026-11-05): a
+    # repetition-completion pass correctly reproduced three real endpoints
+    # from this exact file, then fabricated `@router.put("/vouchers/
+    # {voucher_id}")` / `async def update_voucher` and `@router.delete(
+    # "/vouchers/{voucher_id}")` / `async def delete_voucher` -- neither verb
+    # exists on that path in the real file -- and it shipped unflagged: the
+    # generic, verb-BLIND _DECORATOR_ROUTE_RE (feeding the plain path-
+    # existence ROUTES section) extracted only the bare path, which IS real
+    # under GET, so existence-only checking passed it clean; this verb-aware
+    # check never saw the claim at all, because until now it had no
+    # decorator-syntax pattern -- only the bare-prose and labeled forms.
+    for verb, path in _DECORATOR_VERB_PATH_RE.findall(answer):
+        if (verb, path) not in claims:
+            claims.append((verb, path))
     if not claims:
         return []
 
