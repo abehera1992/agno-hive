@@ -16288,6 +16288,45 @@ def _mandatory_coverage_disclosure(missing_cats: "frozenset[str]", task_cats) ->
         f"treated as UNRESOLVED for {sorted(missing_cats)}, not confirmed absent.**")
 
 
+# Phase 0.38: the companion disclosure for the OTHER way this function's retry
+# can fail -- not "no new evidence existed to retry with" (that is
+# _mandatory_coverage_disclosure's own, category-shaped, case, above), but
+# "new evidence WAS found and a retry WAS dispatched asking the model to
+# reconcile its own prior gap/absence/completeness conclusion against it
+# (see the retry prompt below), and that retry produced nothing usable."
+# Reconstructed live from the 2026-11-05 T13a incident: the retry's own
+# generation (inside it, a Reviewer delegation genuinely re-read all three
+# real files) entered a repetition loop while RE-DERIVING the endpoint list
+# it had just re-read, and was truncated before ever stating a comparison
+# verdict -- "coverage-correction retry produced nothing usable" correctly
+# discarded that incomplete draft and fell back to `content`, the pre-retry
+# text, which still carried the ORIGINAL, never-reconciled "the frontend
+# hooks provide full CRUD operations" claim. `missing_cats` was empty at
+# that point (every category had a file read shaped like it), so
+# _mandatory_coverage_disclosure returned "" -- it answers "did you open the
+# right files," not "did your conclusion survive the reconciliation check
+# this run itself decided to run." Nothing disclosed that the reconciliation
+# this run dispatched specifically because of that conclusion never
+# completed, and the claim shipped unchallenged. This note is attached ONLY
+# at that one fallback (the `resolved` branch's "nothing usable" return) --
+# never at the `not resolved` early return (no retry was ever dispatched
+# there, nothing to disclose), never on a successful retry, and never when a
+# retry is rejected for a *different*, already-handled reason (verify_claims
+# flagging a new fabrication, which already gets its own narrower rejection
+# path). It does not touch compare_enumerations, T13b's grants, or the
+# Phase 0.35/0.36 guards elsewhere in this file -- it is a textual
+# disclosure appended at one existing return site, nothing more.
+_COVERAGE_RECONCILIATION_UNRESOLVED_NOTE = (
+    "\n\n---\n**A CONCLUSION ABOVE WAS FLAGGED FOR RECONCILIATION, NOT "
+    "CONFIRMED — this run found evidence it had not previously examined and "
+    "asked itself to reconcile any gap/absence/completeness conclusion "
+    "against it before finalizing. That reconciliation attempt did not "
+    "produce a usable result (see this run's own log). Any claim above that "
+    "something is fully covered, complete, or has no gap should be treated "
+    "as UNVERIFIED, not confirmed, until it is actually checked against the "
+    "evidence this run already has in hand.**")
+
+
 def _section_for_category(content: str, category: str) -> str | None:
     """The first markdown-heading-delimited block of `content` (heading
     through the line before the next heading, or end of content) whose
@@ -16509,7 +16548,7 @@ async def _attempt_coverage_correction(
             or retried.strip() == _BUDGET_EXHAUSTED_ANSWER \
             or _INCOMPLETE_ANSWER_MARKER in retried:
         print("[team] coverage-correction retry produced nothing usable", flush=True)
-        return content + disclosure
+        return content + disclosure + _COVERAGE_RECONCILIATION_UNRESOLVED_NOTE
 
     _retried_fab_report, _retried_fab_bad, _ = await _verify_claims(
         retried, hive_mcp_url, hive_mcp_tools,
