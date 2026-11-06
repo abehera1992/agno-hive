@@ -16958,6 +16958,233 @@ async def _attempt_integration_correction(
     return retried
 
 
+_CHAIN_COVERAGE_CORRECTION_FLAG = "_chain_coverage_correction_attempted"
+# Rendered inline in the disclosure below; kept separate from _MAX_INTEGRATION_SITES
+# and similar caps elsewhere in this file since this list is component ROOTS
+# (bounded by _MAX_COMPONENT_ROOTS, 40), a different quantity than any of those.
+_CHAIN_COVERAGE_RENDER_CAP = 12
+
+
+def _unresolved_chain_components(log, team) -> "list[str]":
+    """_uncovered_components (reused UNCHANGED below -- same call, same
+    _move_on_hint-facing behavior, same four existing duplicate-delegation
+    call sites untouched) only answers "was a delegation ever logged naming
+    this component" -- a component CAN clear that bar while the delegation
+    that named it never produced a real result (agno error, empty return,
+    budget exhaustion), which is a different state ("investigation attempted
+    but unavailable", Phase 0.49's own task framing) from genuinely having
+    evidence. This adds exactly that one additional case on top of the
+    unmodified function, never duplicating its target-matching logic, and
+    never read by _move_on_hint or any of its four call sites -- only by
+    _attempt_chain_coverage_correction's own, separate before/after check.
+
+    A component with ANY log entry carrying a real (non-empty string) result
+    is resolved even if an EARLIER entry for the same component came back
+    empty -- multiple delegations to the same component are a real pattern
+    (a narrow follow-up after a first broad one), and one of them succeeding
+    is what matters, not which one.
+    """
+    base = set(_uncovered_components(log, team))
+    roots = getattr(team, "_component_roots", None) or []
+    if not isinstance(log, list) or not roots:
+        return sorted(base)
+    targeted: set[str] = set()
+    has_result: set[str] = set()
+    for entry in log:
+        if not isinstance(entry, dict):
+            continue
+        tgt = ((entry.get("audit") or {}).get("target") or "").strip().lower()
+        if not tgt:
+            continue
+        for r in roots:
+            if r.lower() in tgt:
+                targeted.add(r)
+                _res = entry.get("result")
+                if isinstance(_res, str) and _res.strip():
+                    has_result.add(r)
+    base |= (targeted - has_result)
+    return sorted(base)
+
+
+def _chain_coverage_unresolved_note(components: "list[str]") -> str:
+    """Phase 0.48/0.49 (T11): the complete-inventory in `components` is real --
+    read from the repository by _component_roots, never guessed -- but whether
+    each one is RELEVANT to the task is exactly what this run never established.
+    Says so plainly rather than letting a bare absence read as "checked and
+    excluded". Mirrors the wording _move_on_hint already uses for the same
+    uncovered-component fact, so a reader who has seen one has seen the other --
+    deliberately not a new vocabulary for the same thing.
+    """
+    if not components:
+        return ""
+    shown = ", ".join(f"`{c}`" for c in components[:_CHAIN_COVERAGE_RENDER_CAP])
+    more = (f", and {len(components) - _CHAIN_COVERAGE_RENDER_CAP} more"
+             if len(components) > _CHAIN_COVERAGE_RENDER_CAP else "")
+    return (
+        f"\n\n---\n**UNRESOLVED SERVICE BOUNDARY — this question spans multiple "
+        f"components (`_is_chain_question`), and this run's own delegation record "
+        f"shows no adequate investigation evidence for: {shown}{more} -- either "
+        f"never delegated for, or delegated for without a usable result coming "
+        f"back. Some of these may play no part in this flow, but that was never "
+        f"established, so it is reported here as unresolved rather than as a "
+        f"considered exclusion.**"
+    )
+
+
+async def _attempt_chain_coverage_correction(
+        content: str, task: str, team, hive_mcp_url: str | None, hive_mcp_tools,
+        liveness_path: str | None = None, synthesis_run: bool = False) -> str:
+    """Phase 0.49: closes the gap Phase 0.48 traced on T11 -- a chain question
+    ("which services are involved end to end...") whose Coordinator delegated
+    to exactly one of the 14 real, repository-discovered components and then
+    simply stopped, never attempting a second delegation of any kind. The
+    preflight (_preflight_repo_facts, Phase a3a2464) already injects the full
+    component list with an explicit "examining one is not an answer" warning;
+    the one existing remediation for under-coverage (_move_on_hint's unseen-
+    component reminder) is wired ONLY into the duplicate-delegation gate (its
+    four call sites, unchanged by this phase) and therefore never fires for a
+    Coordinator that does not attempt a repeat delegation at all -- confirmed
+    live on the Phase 0.47 T11 incident (task k5gy71k8d): zero "move-on hint"
+    or "uncovered" log lines anywhere in that run's complete journal.
+
+    Deliberately NOT a new discovery or accounting mechanism: `_is_chain_
+    question`, `team._component_roots` (set by the SAME preflight call that
+    already ran), and `_uncovered_components`/`_move_on_hint` (unmodified) are
+    all reused exactly as the duplicate-delegation gate already uses them --
+    only the TRIGGER is new (pre-finalization, not post-repeat), via the SAME
+    real delegation log now also exposed on `team` (see the two-line addition
+    at its one append site in _make_duplicate_delegation_gate_hook).
+
+    "Investigated" is decided from the real delegation log, never from
+    narration, the preflight list, or a stale earlier generation -- a
+    component only leaves the uncovered set when _covered_targets finds an
+    actual delegation entry naming it THIS run. Progress is verified the same
+    way: the uncovered set is recomputed from the SAME live list after the
+    one retry, not inferred from what the retry's own prose claims to have
+    done. A retry that talks about a component without a new matching log
+    entry changes nothing here.
+
+    One-shot per run (own flag, independent of _INTEGRATION_CORRECTION_FLAG/
+    _COVERAGE_CORRECTION_FLAG -- a chain question can legitimately need any
+    combination of the three). Placed at the choke point AFTER
+    _attempt_coverage_correction and its Phase 0.46 revalidation, so neither
+    of those two can silently discard this disclosure via a later wholesale
+    replacement -- nothing in this file's own post-_verified_answer chain runs
+    a THIRD correction after this one that could do the same.
+    """
+    if synthesis_run or not content or getattr(team, _CHAIN_COVERAGE_CORRECTION_FLAG, False):
+        return content
+    if not _is_chain_question(task):
+        return content
+    setattr(team, _CHAIN_COVERAGE_CORRECTION_FLAG, True)
+
+    roots = getattr(team, "_component_roots", None)
+    if not isinstance(roots, list) or not roots:
+        # The preflight never discovered/injected a component set for this run
+        # (e.g. hive-mcp unreachable, or none found) -- nothing to hold the
+        # answer to. Silent, same conservatism as every sibling guard in this
+        # file: unknown is not missing.
+        return content
+
+    log = getattr(team, "_coordinator_delegation_log", None)
+    if not isinstance(log, list):
+        log = []
+    uncovered_before = _unresolved_chain_components(log, team)
+    if not uncovered_before:
+        print("[team] chain-coverage check: every discovered component has "
+              "adequate investigation evidence -- silent", flush=True)
+        return content
+
+    print(f"[team] chain-coverage check: {len(uncovered_before)} discovered "
+          f"component(s) never delegated for this run: "
+          f"{uncovered_before[:8]}{'…' if len(uncovered_before) > 8 else ''} "
+          f"-- one bounded investigation attempt", flush=True)
+
+    hint = _move_on_hint(log, team)
+    prompt = (
+        f"{task}\n\nYou already produced an answer to this task below, but this "
+        f"run's own delegation record shows the following components were never "
+        f"delegated for at all this run, even once:{hint}\n\nIf any of them "
+        f"genuinely play a part in this flow, delegate for them now using your "
+        f"normal tools before answering again. If, after checking, a component "
+        f"plays no part, say so explicitly together with the evidence that "
+        f"showed that. Do not guess, and do not invent a function, route, model, "
+        f"or service name for any component you have not actually opened -- if "
+        f"you cannot resolve one, say it remains unresolved rather than filling "
+        f"it in. Do not discard or rewrite content about components you already "
+        f"covered correctly.\n\n"
+        f"── Your previous answer ──\n{_without_forwarded_members_section(content)}\n"
+        f"── end of your previous answer ──"
+    )
+    try:
+        retried, _retry_result = await _stream_team_run(
+            team, prompt, log_label="chain-coverage-correction",
+            liveness_path=liveness_path)
+    except Exception as exc:
+        print(f"[team] chain-coverage-correction retry failed: {exc}", flush=True)
+        return content + _chain_coverage_unresolved_note(uncovered_before)
+
+    # Same post-retry truncation handling every sibling correction function
+    # uses -- the retry's OWN generation can hit the identical repetition
+    # stall the original draft did, and this is the one bounded, tool-less
+    # completion attempt for THAT text, not a second delegation opportunity.
+    _fallback_reason = _current_truncation_reason(team)
+    was_truncated = _fallback_reason is not None
+    retried, _ = await _complete_repetition_truncated_answer(
+        retried, task, team, [], None, liveness_path,
+        hive_mcp_url=hive_mcp_url, hive_mcp_tools=hive_mcp_tools)
+    if was_truncated and _INCOMPLETE_ANSWER_MARKER not in retried \
+            and not _ends_at_a_natural_stopping_point(retried):
+        retried = retried + _truncation_note_for_reason(_fallback_reason)
+
+    if not retried or not _strip_leaked_tool_tags(retried).strip() \
+            or retried.strip() == _BUDGET_EXHAUSTED_ANSWER \
+            or _INCOMPLETE_ANSWER_MARKER in retried:
+        print("[team] chain-coverage-correction retry produced nothing usable",
+              flush=True)
+        return content + _chain_coverage_unresolved_note(uncovered_before)
+
+    # The decisive check: did this retry actually cause a NEW delegation to be
+    # logged for a previously-uncovered component, or did it only talk? `log`
+    # is the same list object team._coordinator_delegation_log points at, so
+    # any real delegation made during the retry is already reflected in it.
+    uncovered_after = _unresolved_chain_components(log, team)
+    if len(uncovered_after) >= len(uncovered_before):
+        print(f"[team] chain-coverage-correction: retry made no new delegation "
+              f"progress ({len(uncovered_after)} still uncovered, was "
+              f"{len(uncovered_before)}) -- keeping original content with an "
+              f"unresolved-boundary disclosure", flush=True)
+        return content + _chain_coverage_unresolved_note(uncovered_before)
+
+    _retried_fab_report, _retried_fab_bad, _ = await _verify_claims(
+        retried, hive_mcp_url, hive_mcp_tools,
+        op_label="attempt_chain_coverage_correction:retry-recheck", team=team)
+    if _retried_fab_bad:
+        _pre_report, _pre_bad, _ = await _verify_claims(
+            content, hive_mcp_url, hive_mcp_tools,
+            op_label="attempt_chain_coverage_correction:original-recheck", team=team)
+        _new_flagged = _flagged_lines_set(_retried_fab_report) - _flagged_lines_set(_pre_report)
+        if _new_flagged:
+            print(f"[team] chain-coverage-correction: retry gained real "
+                  f"delegation coverage but introduced new verify_claims "
+                  f"problem(s) not already present in content — "
+                  f"{sorted(_new_flagged)[:2]} — keeping original content",
+                  flush=True)
+            return content + _chain_coverage_unresolved_note(uncovered_before)
+        print(f"[team] chain-coverage-correction: retry's only verify_claims "
+              f"problem(s) are ones content already carried unchanged "
+              f"({_verdict_digest(_retried_fab_report)}) — adopting, "
+              f"disclosure re-attached", flush=True)
+        return (retried + _flagged_draft_note(_retried_fab_report)
+                + _chain_coverage_unresolved_note(uncovered_after))
+
+    print(f"[team] chain-coverage-correction: retry gained real delegation "
+          f"coverage of {len(uncovered_before) - len(uncovered_after)} "
+          f"previously-uncovered component(s) and passes verify_claims -- "
+          f"adopting", flush=True)
+    return retried + _chain_coverage_unresolved_note(uncovered_after)
+
+
 # T36 Track C (2026-10-19 battery, T11): a cross-service tracing task asked "which
 # services are involved when X happens" named email-service and imagegen-service
 # alongside the correctly-traced business-service/storage-service chain. Traced to its
@@ -22132,6 +22359,19 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
             "args": dict(args or {}),
             "audit": _logged_audit,
         })
+        # Phase 0.49: this `log` has always been closure-local (see
+        # _covered_targets' own docstring: "there is no team._delegation_log"),
+        # which is exactly why _move_on_hint's unseen-component reminder could
+        # only ever reach the Coordinator reactively, via the duplicate-
+        # delegation gate below -- nothing outside this closure could read it.
+        # A later-running, independent pre-finalization check (_attempt_chain_
+        # coverage_correction) needs the SAME real per-target delegation record,
+        # not a second one -- so the list itself (not a copy) is exposed here,
+        # the one point in this file where `log` and `team` are both already in
+        # scope together. Appends after this line continue to mutate the SAME
+        # object, so no further wiring is needed as the run progresses.
+        if team is not None:
+            team._coordinator_delegation_log = log
         # Phase P.2 (2026-10-04): mark this freshly-appended entry as the one to tag
         # once this member's result actually materializes. `result` above is an
         # unconsumed async_generator at this point for both delegation tools (proven
@@ -31808,6 +32048,31 @@ async def run_task_async(
                             _pre_coverage_correction, content, task, _hive_url,
                             hive_mcp_tools=_hive_tools,
                             label="revalidate after coverage-correction"))
+                    # Phase 0.49 (T11): same choke-point placement, immediately
+                    # after the coverage-correction retry and its own Phase
+                    # 0.46 revalidation above -- a chain question ("which
+                    # services are involved end to end") whose Coordinator
+                    # delegated to only one of the preflight-discovered
+                    # components gets one bounded, tool-enabled opportunity to
+                    # cover the rest, or an explicit unresolved-boundary
+                    # disclosure if it cannot. See _attempt_chain_coverage_
+                    # correction's own docstring for the Phase 0.48 incident
+                    # this closes. No-ops immediately for any task
+                    # _is_chain_question does not match (e.g. T12).
+                    _pre_chain_coverage = content
+                    content = await _timed_guard_call(
+                        "_attempt_chain_coverage_correction", _run_id_for_trace,
+                        content,
+                        _attempt_chain_coverage_correction(
+                            content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
+                            liveness_path=liveness_path, synthesis_run=synthesis_run))
+                    content = await _timed_guard_call(
+                        "_revalidate_adopted_correction:chain-coverage",
+                        _run_id_for_trace, content,
+                        _revalidate_adopted_correction(
+                            _pre_chain_coverage, content, task, _hive_url,
+                            hive_mcp_tools=_hive_tools,
+                            label="revalidate after chain-coverage-correction"))
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
                 # Phase I (2026-09-23): the LAST word, deliberately after Phase R above --
