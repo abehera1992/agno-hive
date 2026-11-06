@@ -17179,6 +17179,67 @@ _CHAIN_COVERAGE_CORRECTION_FLAG = "_chain_coverage_correction_attempted"
 _CHAIN_COVERAGE_RENDER_CAP = 12
 
 
+# Phase 0.58 (T11 chain-coverage reconciliation): the same source-file
+# extension set _RELAY_FILENAME_RE (below, this file) already treats as "a
+# real file citation" -- duplicated here, not imported from that later
+# definition, so this function's own behavior does not depend on module
+# load order; keep the two lists in sync if either changes.
+_COMPONENT_EVIDENCE_EXT_RE = r"\.(?:py|ts|tsx|js|jsx|sql|md)\b"
+_COMPONENT_CITATION_PATTERN_CACHE: "dict[str, object]" = {}
+
+
+def _component_citation_pattern(root: str):
+    """A component's own basename (its last path segment, e.g.
+    "storage-service" for root "API/storage-service") immediately followed
+    by a path separator and more path characters ending in a recognized
+    source-file extension -- i.e. a real, path-shaped citation like
+    `storage-service/router/storage_api.py`, not a bare mention of the
+    component's name on its own. Cached per root string (the roots list is
+    small and fixed for a run, so this avoids recompiling the same pattern
+    on every log entry)."""
+    cached = _COMPONENT_CITATION_PATTERN_CACHE.get(root)
+    if cached is not None:
+        return cached
+    basename = root.rstrip("/\\").rsplit("/", 1)[-1]
+    pattern = re.compile(
+        r"\b" + re.escape(basename) + r"[/\\][\w./\\-]*" + _COMPONENT_EVIDENCE_EXT_RE,
+        re.IGNORECASE)
+    _COMPONENT_CITATION_PATTERN_CACHE[root] = pattern
+    return pattern
+
+
+def _component_has_specific_evidence(log, root: str) -> bool:
+    """Whether ANY delegation-log entry's own captured result text cites a
+    real, path-shaped reference to `root` (see _component_citation_pattern)
+    -- regardless of which target string that SPECIFIC entry's own dispatch
+    was logged under. Phase 0.58 (T11): live-confirmed that a broad-objective
+    delegation logged under target="API/business-service" can genuinely
+    investigate and report on `API/storage-service`'s own upload_file/
+    storage_api.py too -- the OLD per-target has_result check (below,
+    unmodified structure, stricter predicate) could never credit that
+    evidence to storage-service, because it only ever looked at entries
+    whose OWN target string already named storage-service. Scanning every
+    entry's result text, independent of its own target label, is what
+    makes a genuinely cross-labeled result creditable to the RIGHT
+    component instead of staying invisible to it.
+
+    A bare mention of the component's name with no such citation -- a
+    preamble like "I'll investigate the API/storage-service target now"
+    that never gets further, or a result that only restates the name --
+    does NOT satisfy this; see _component_citation_pattern's own docstring
+    for exactly what counts."""
+    if not isinstance(log, list) or not root:
+        return False
+    pattern = _component_citation_pattern(root)
+    for entry in log:
+        if not isinstance(entry, dict):
+            continue
+        res = entry.get("result")
+        if isinstance(res, str) and res.strip() and pattern.search(res):
+            return True
+    return False
+
+
 def _unresolved_chain_components(log, team) -> "list[str]":
     """_uncovered_components (reused UNCHANGED below -- same call, same
     _move_on_hint-facing behavior, same four existing duplicate-delegation
@@ -17192,31 +17253,35 @@ def _unresolved_chain_components(log, team) -> "list[str]":
     never read by _move_on_hint or any of its four call sites -- only by
     _attempt_chain_coverage_correction's own, separate before/after check.
 
-    A component with ANY log entry carrying a real (non-empty string) result
-    is resolved even if an EARLIER entry for the same component came back
-    empty -- multiple delegations to the same component are a real pattern
-    (a narrow follow-up after a first broad one), and one of them succeeding
-    is what matters, not which one.
+    Phase 0.58 (T11 chain-coverage reconciliation): a component that WAS
+    dispatched (cleared the `_uncovered_components` bar above) is now
+    resolved only when `_component_has_specific_evidence` finds a real,
+    path-shaped citation for it SOMEWHERE in the log -- never merely because
+    SOME entry naming it came back with any non-empty text (the old,
+    live-confirmed-too-weak bar: a one-sentence preamble with zero actual
+    findings satisfied it), and never merely because its name happened to
+    be bundled into a broader delegation's own target string (mission Rule
+    2/8: a bundled or broad target must not blanket-resolve every component
+    it names). The search is deliberately NOT restricted to entries whose
+    OWN target names this root -- real, specific evidence for a component
+    can legitimately surface inside a differently-labeled, broader-objective
+    delegation's own result (the confirmed Phase 0.57 T11 shape), and
+    requiring an exact target-label match would keep that evidence
+    permanently invisible to the component it is actually about. A
+    component never dispatched at all (still in `base` already) is left
+    alone -- dispatch remains a necessary, not sufficient, precondition
+    (mission Rule 1), so this never resolves something nothing ever even
+    attempted to investigate.
     """
     base = set(_uncovered_components(log, team))
     roots = getattr(team, "_component_roots", None) or []
     if not isinstance(log, list) or not roots:
         return sorted(base)
-    targeted: set[str] = set()
-    has_result: set[str] = set()
-    for entry in log:
-        if not isinstance(entry, dict):
-            continue
-        tgt = ((entry.get("audit") or {}).get("target") or "").strip().lower()
-        if not tgt:
-            continue
-        for r in roots:
-            if r.lower() in tgt:
-                targeted.add(r)
-                _res = entry.get("result")
-                if isinstance(_res, str) and _res.strip():
-                    has_result.add(r)
-    base |= (targeted - has_result)
+    for r in roots:
+        if r in base:
+            continue  # never even dispatched -- stays unresolved regardless of evidence elsewhere
+        if not _component_has_specific_evidence(log, r):
+            base.add(r)  # dispatched, but no component-specific, file-grounded evidence found
     return sorted(base)
 
 
