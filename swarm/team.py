@@ -17262,6 +17262,69 @@ def _salvage_truncated_prefix(text: str) -> "str | None":
     return None
 
 
+def _preserve_retry_progress_on_giveup(
+        content: str, team, uncovered_before: "list[str]",
+        uncovered_now: "list[str]") -> str:
+    """Phase 0.56 (T11): the give-up branches below in
+    _attempt_chain_coverage_correction both discard the retry's own narration
+    wholesale -- correctly, when that narration cannot be trusted (unsalvageable
+    repetition, or nothing usable at all) -- but until this phase they also threw
+    away whatever the retry genuinely accomplished through its TOOLS, a separate
+    question this function answers instead. Live-confirmed on the Phase 0.55 T11
+    run: a business-service delegation completed and was forwarded (3,924 chars,
+    status COMPLETE) during a retry whose OWN final narration then hit a second,
+    unsalvageable repetition stall on a later, unrelated storage-service
+    delegation -- the give-up discarded the whole retry, including the already-
+    captured, already-forwarded business-service evidence.
+
+    `uncovered_before`/`uncovered_now` are both derived from the SAME live
+    `_coordinator_delegation_log` via the unmodified `_unresolved_chain_
+    components` -- never from `retried`'s own prose -- so a component counts as
+    newly covered here only when a REAL delegation this retry logged a genuine
+    result for it (Case 1: a different component resolved independently of
+    whatever happened to a later one). This never has to decide Case 2 (a
+    same-component replacement that failed or contradicted an earlier result)
+    itself: forward_member_answer's own Phase 0.23 generation check already
+    refuses to forward a stale answer for a member whose newer delegation has
+    not yet produced a result, so a result this function would treat as "newly
+    covered" is only ever reachable here because it was genuinely captured and
+    explicitly handed to the Coordinator -- the same staleness protection every
+    other caller of forward_member_answer already depends on, left untouched.
+
+    The actual preservation reuses `_with_forwarded_evidence` -- the same,
+    already-idempotent, already-additive-only mechanism every other recovery
+    path in this file already relies on for the identical shape ("the answer
+    does not carry what a member already found"); see its own docstring. This
+    never surfaces unrelated or superseded member state: it only ever adds
+    members that were EXPLICITLY forwarded, and only text not already present
+    in `content`. No new component-identity heuristic is introduced -- filename
+    or service-name matching was deliberately not attempted; this leans entirely
+    on the delegation log's own existing target-matching
+    (_unresolved_chain_components, unmodified) to decide what counts as
+    resolved.
+
+    No-op (returns `content` unchanged) when no component newly cleared the
+    uncovered set -- the untouched give-up behavior for a retry that genuinely
+    made no delegation progress at all (mission Scenario B), and the safe
+    fallback if `_with_forwarded_evidence` itself raises.
+    """
+    newly_covered = sorted(set(uncovered_before) - set(uncovered_now))
+    if not newly_covered:
+        return content
+    try:
+        preserved = _with_forwarded_evidence(content, team)
+    except Exception as exc:
+        print(f"[team] chain-coverage-correction give-up: could not preserve "
+              f"retry progress on {newly_covered} -- {exc}", flush=True)
+        return content
+    if preserved != content:
+        print(f"[team] chain-coverage-correction give-up: retry's own narration "
+              f"was unusable, but the delegation log proves real progress on "
+              f"{newly_covered} this retry -- preserving that member evidence "
+              f"instead of reverting to the pre-retry draft untouched", flush=True)
+    return preserved
+
+
 async def _attempt_chain_coverage_correction(
         content: str, task: str, team, hive_mcp_url: str | None, hive_mcp_tools,
         liveness_path: str | None = None, synthesis_run: bool = False) -> str:
@@ -17400,7 +17463,9 @@ async def _attempt_chain_coverage_correction(
         if salvaged is None:
             print("[team] chain-coverage-correction retry produced nothing "
                   "usable (incomplete, nothing safely salvageable)", flush=True)
-            return content + _chain_coverage_unresolved_note(uncovered_now)
+            return (_preserve_retry_progress_on_giveup(
+                        content, team, uncovered_before, uncovered_now)
+                    + _chain_coverage_unresolved_note(uncovered_now))
         print(f"[team] chain-coverage-correction: retry hit a second repetition "
               f"stall, but {len(salvaged):,} of its {len(retried):,} chars read "
               f"as a genuinely complete prefix -- salvaging that prefix instead "
@@ -17411,7 +17476,9 @@ async def _attempt_chain_coverage_correction(
             or retried.strip() == _BUDGET_EXHAUSTED_ANSWER:
         print("[team] chain-coverage-correction retry produced nothing usable",
               flush=True)
-        return content + _chain_coverage_unresolved_note(uncovered_now)
+        return (_preserve_retry_progress_on_giveup(
+                    content, team, uncovered_before, uncovered_now)
+                + _chain_coverage_unresolved_note(uncovered_now))
 
     # The decisive check: did this retry actually cause a NEW delegation to be
     # logged for a previously-uncovered component, or did it only talk? `log`
