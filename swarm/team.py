@@ -2383,7 +2383,22 @@ def _move_on_hint(log, team=None) -> str:
     # Listing only what IS covered was measured insufficient: on T11 this hint attached
     # with all four covered files named, and the coordinator still concluded there were
     # no other services. "You have done X" does not imply "Y exists".
-    unseen = _uncovered_components(log, team) if team is not None else []
+    #
+    # Phase 0.51 (Objective D): reads the SAME live log through
+    # _unresolved_chain_components (Phase 0.49/0.50, unmodified) instead of the
+    # plain _uncovered_components it used before -- a strict superset of the
+    # same function (it computes _uncovered_components internally and adds
+    # exactly one more case: a target that WAS delegated for but produced no
+    # usable result). This can only ADD components to the reminder below, never
+    # remove one that genuinely has adequate evidence -- the "covered so far"
+    # list two paragraphs above (_covered_targets, the duplicate-delegation
+    # gate's own refusal-decision input) and all four existing call sites'
+    # refusal behavior are completely untouched; only THIS advisory sentence's
+    # accuracy improves. _unresolved_chain_components itself already degrades
+    # to _uncovered_components's own result whenever team._component_roots is
+    # absent or `log` is not a list (see its own body), so no separate
+    # fallback is needed here -- same `team is not None` guard as before.
+    unseen = _unresolved_chain_components(log, team) if team is not None else []
     unseen_note = ""
     if unseen:
         # Twelve, not the six the covered-list uses. These are sorted by path, so a
@@ -2395,10 +2410,11 @@ def _move_on_hint(log, team=None) -> str:
         print(f"[team] move-on hint: {len(unseen)} component(s) untouched so far: "
               f"{_shown}{_more}", flush=True)
         unseen_note = (
-            f"\n\nCOMPONENTS NOTHING IN THIS RUN HAS OPENED YET: {_shown}{_more}. That "
-            f"is a fact about this run, not about the task: some of these may have no "
-            f"part in it. But you have not looked, so you cannot yet say so — delegate "
-            f"for one of them, or state explicitly why it is out of scope.")
+            f"\n\nCOMPONENTS WITH NO USABLE INVESTIGATION RESULT YET: {_shown}{_more}. "
+            f"That is a fact about this run, not about the task: some of these may have "
+            f"no part in it. But none of them has a usable result in hand yet, so you "
+            f"cannot yet say so — delegate for one of them, or state explicitly why it "
+            f"is out of scope.")
     return (f"\n\nSO FAR THIS RUN YOU HAVE DELEGATED ONLY ABOUT: {shown}{more}. If the "
             f"task names anything else -- another file, another layer, another part of a "
             f"multi-part question -- delegate for THAT now instead of rewording this. If "
@@ -17014,6 +17030,27 @@ def _chain_coverage_unresolved_note(components: "list[str]") -> str:
     excluded". Mirrors the wording _move_on_hint already uses for the same
     uncovered-component fact, so a reader who has seen one has seen the other --
     deliberately not a new vocabulary for the same thing.
+
+    Phase 0.51 (Objective A): no longer names the internal classifier function
+    this gate is built on. Live-confirmed cause of a real verification failure
+    (Phase 0.50 T11 run, task kirx21980): the prior wording backtick-quoted
+    `_is_chain_question` -- an AgnoHive-internal name, never an EkamApp one --
+    purely as an explanatory aside, and verify_claims (hive-mcp/tools/verify.py)
+    extracted it as a bare backticked identifier claim (_IDENT_RE), found it
+    absent from `_NOISE` and `_MCP_TOOL_NAMES` (that set is hive-mcp's own
+    TOOL names, a different, unrelated category -- `_is_chain_question` is
+    neither a hive-mcp tool nor an EkamApp symbol, so adding it there would
+    have been the wrong exclusion for the wrong reason), and correctly -- by
+    its own, unweakened rules -- reported NOT FOUND against the EkamApp repo
+    it was checking. That single false-positive flag then triggered
+    `_enforce_verification_invariant_final`'s own repair/re-delegation
+    cascade, which itself stalled and discarded the whole, otherwise-honest
+    disclosure. The fix is ordinary wording, not a verifier exemption: this
+    disclosure never needed to name its own implementation to make its point
+    to a reader, and removing that one aside closes the false positive at its
+    actual source (the disclosure text) rather than teaching the verifier a
+    new, broader exception it would then have to carry for every future
+    phase's own internal names.
     """
     if not components:
         return ""
@@ -17022,12 +17059,12 @@ def _chain_coverage_unresolved_note(components: "list[str]") -> str:
              if len(components) > _CHAIN_COVERAGE_RENDER_CAP else "")
     return (
         f"\n\n---\n**UNRESOLVED SERVICE BOUNDARY — this question spans multiple "
-        f"components (`_is_chain_question`), and this run's own delegation record "
-        f"shows no adequate investigation evidence for: {shown}{more} -- either "
-        f"never delegated for, or delegated for without a usable result coming "
-        f"back. Some of these may play no part in this flow, but that was never "
-        f"established, so it is reported here as unresolved rather than as a "
-        f"considered exclusion.**"
+        f"components, and this run's own delegation record shows no adequate "
+        f"investigation evidence for: {shown}{more} -- either never delegated "
+        f"for, or delegated for without a usable result coming back. Some of "
+        f"these may play no part in this flow, but that was never established, "
+        f"so it is reported here as unresolved rather than as a considered "
+        f"exclusion.**"
     )
 
 
