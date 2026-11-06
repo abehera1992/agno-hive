@@ -17208,20 +17208,38 @@ def _component_citation_pattern(root: str):
     return pattern
 
 
+def _text_cites_component(text: str, root: str) -> bool:
+    """Pure, single-string check: does `text` contain a real, path-shaped
+    citation of `root` (see _component_citation_pattern)? Factored out of
+    _component_has_specific_evidence so Phase 0.59's own acceptance check
+    can reuse the exact same pattern-matching rule against a DIFFERENT text
+    source (forwarded member text) without duplicating the regex logic."""
+    if not text or not root:
+        return False
+    return bool(_component_citation_pattern(root).search(text))
+
+
 def _component_has_specific_evidence(log, root: str) -> bool:
-    """Whether ANY delegation-log entry's own captured result text cites a
-    real, path-shaped reference to `root` (see _component_citation_pattern)
-    -- regardless of which target string that SPECIFIC entry's own dispatch
-    was logged under. Phase 0.58 (T11): live-confirmed that a broad-objective
-    delegation logged under target="API/business-service" can genuinely
-    investigate and report on `API/storage-service`'s own upload_file/
-    storage_api.py too -- the OLD per-target has_result check (below,
-    unmodified structure, stricter predicate) could never credit that
-    evidence to storage-service, because it only ever looked at entries
-    whose OWN target string already named storage-service. Scanning every
-    entry's result text, independent of its own target label, is what
-    makes a genuinely cross-labeled result creditable to the RIGHT
-    component instead of staying invisible to it.
+    """DISCOVERY helper only, superseded as the RESOLUTION authority by
+    Phase 0.59's `_component_has_accepted_evidence` below (see that
+    function's own docstring for why). Kept in place, unmodified in
+    behavior, because it answers a question still worth asking on its own
+    terms: does ANY delegation-log entry's raw captured result -- forwarded
+    or not, admittedly-incomplete or not -- cite a real, path-shaped
+    reference to `root`, regardless of which target string that SPECIFIC
+    entry's own dispatch was logged under?
+
+    Phase 0.58 (T11): live-confirmed that a broad-objective delegation
+    logged under target="API/business-service" can genuinely investigate
+    and report on `API/storage-service`'s own upload_file/storage_api.py
+    too -- the OLD per-target has_result check (this function's own
+    predecessor) could never credit that evidence to storage-service,
+    because it only ever looked at entries whose OWN target string already
+    named storage-service. Scanning every entry's result text, independent
+    of its own target label, is what makes a genuinely cross-labeled result
+    discoverable for the RIGHT component instead of staying invisible to
+    it -- Phase 0.59 preserves this cross-entry reach, just over a
+    different (accepted-evidence) text source; see that function.
 
     A bare mention of the component's name with no such citation -- a
     preamble like "I'll investigate the API/storage-service target now"
@@ -17230,12 +17248,91 @@ def _component_has_specific_evidence(log, root: str) -> bool:
     for exactly what counts."""
     if not isinstance(log, list) or not root:
         return False
-    pattern = _component_citation_pattern(root)
     for entry in log:
         if not isinstance(entry, dict):
             continue
         res = entry.get("result")
-        if isinstance(res, str) and res.strip() and pattern.search(res):
+        if isinstance(res, str) and res.strip() and _text_cites_component(res, root):
+            return True
+    return False
+
+
+# Phase 0.59 (T11 evidence-ACCEPTED component resolution): a deliberately
+# narrow, generic, deterministic phrase family for a member's OWN explicit
+# admission that the relevant investigation was not actually completed --
+# "I found a related file, but did not confirm the thing you actually
+# asked about" in the member's own words. Live-confirmed exact Phase 0.58
+# T11 shape: a forwarded report cited `seaweedfs.py`'s own upload() helper
+# confidently, while its OWN "Files Not Examined" section said
+# `storage_api.py` (the actual router endpoint) was "already read, but not
+# fully analyzed for document upload". Never names a service, file, or
+# function -- matches only the admission phrasing itself, so it carries no
+# T11-specific special-casing.
+_EXPLICIT_INCOMPLETE_INVESTIGATION_RE = re.compile(
+    r"\bnot\s+(?:yet\s+)?(?:fully\s+)?(?:analy[sz]ed|examined|confirmed|explored|"
+    r"investigated)\b|"
+    r"\bhave\s+not\s+(?:yet\s+)?(?:fully\s+)?(?:analy[sz]ed|examined)\b|"
+    r"\bwas\s+not\s+(?:fully\s+)?analy[sz]ed\b|"
+    r"\bfiles?\s+not\s+examined\b",
+    re.IGNORECASE)
+
+
+def _component_has_accepted_evidence(team, root: str) -> bool:
+    """Phase 0.59 (T11 evidence-ACCEPTED component resolution): whether
+    `root` has evidence that cleared the STRONGEST acceptance-like state
+    this architecture actually, durably records.
+
+    Investigated and confirmed before writing this: there is no persisted
+    "this specific claim passed verify_claims" record anywhere in this
+    file. `forward_member_answer` itself never calls verify_claims --
+    forwarding is a purely deterministic, code-level relay of the
+    Coordinator's own EXPLICIT, deliberate tool call (never automatic, never
+    inferred from mere capture), recorded exactly once in
+    `team._forwarded_members`. verify_claims only ever runs later, on the
+    whole ASSEMBLED answer, at choke points this function has no way to
+    consult from here without a materially larger, out-of-scope change
+    (re-plumbing claim-level verification results back onto per-member
+    state). Given that gap, forwarding is the strongest available durable,
+    intentional signal that exists today -- stronger than raw capture
+    (Phase 0.58's own bar, and this phase's confirmed Scenario-E problem:
+    captured-but-never-forwarded text could resolve a component merely by
+    containing a path), because it required a deliberate Coordinator
+    action, never an automatic one.
+
+    This is NOT claimed as equivalent to verify_claims acceptance -- it is
+    the closest proxy this architecture has, used honestly as a proxy, not
+    mislabeled as the real thing. A forwarded text is additionally rejected
+    as evidence for ANY component if it matches
+    `_EXPLICIT_INCOMPLETE_INVESTIGATION_RE` -- a member that admits, in its
+    own words, that the actual investigation was not completed must not
+    have ITS OWN citations (even genuine ones, for some OTHER, already-
+    adequately-investigated detail) credited as adequate coverage; this is
+    deliberately whole-text, not scoped to the specific citation nearest
+    the admission -- Phase 0.58's T11 case showed a genuine, confident
+    citation (seaweedfs.py) sitting in the SAME text as an explicit
+    admission about a DIFFERENT, more relevant file (storage_api.py), and
+    this architecture has no reliable, non-task-hardcoded way to tell
+    which citation the admission is actually about, so it fails closed on
+    the whole text rather than guessing.
+
+    Known, accepted limitation (documented, not hidden): a citation to a
+    genuinely task-relevant file that the task did not actually need (or
+    vice versa -- a path-shaped citation to a file that exists, but is not
+    what the question asked for) is still indistinguishable from a citation
+    that IS task-relevant, because this architecture has no structured
+    representation of "the operation the task actually requires" to check
+    against. Building one would be a materially larger, task-semantics
+    change this phase does not attempt.
+    """
+    forwarded = getattr(team, "_forwarded_members", None)
+    if not isinstance(forwarded, dict) or not forwarded or not root:
+        return False
+    for text in forwarded.values():
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if _EXPLICIT_INCOMPLETE_INVESTIGATION_RE.search(text):
+            continue  # the Coordinator's own forwarded text admits the investigation was not completed
+        if _text_cites_component(text, root):
             return True
     return False
 
@@ -17253,36 +17350,52 @@ def _unresolved_chain_components(log, team) -> "list[str]":
     never read by _move_on_hint or any of its four call sites -- only by
     _attempt_chain_coverage_correction's own, separate before/after check.
 
-    Phase 0.58 (T11 chain-coverage reconciliation): a component that WAS
-    dispatched (cleared the `_uncovered_components` bar above) is now
-    resolved only when `_component_has_specific_evidence` finds a real,
-    path-shaped citation for it SOMEWHERE in the log -- never merely because
-    SOME entry naming it came back with any non-empty text (the old,
-    live-confirmed-too-weak bar: a one-sentence preamble with zero actual
-    findings satisfied it), and never merely because its name happened to
+    Phase 0.59 (T11 evidence-ACCEPTED component resolution): a component
+    that WAS dispatched (cleared the `_uncovered_components` bar above) is
+    now resolved only when `_component_has_accepted_evidence` finds a real,
+    path-shaped citation IN EXPLICITLY FORWARDED text that does not also
+    admit the investigation was incomplete -- never merely because SOME
+    raw, possibly-never-forwarded captured result happens to contain a
+    matching path (Phase 0.58's own bar, confirmed live-too-weak: Scenario
+    E showed a captured-but-unforwarded result could resolve a component on
+    citation presence alone), and never merely because its name happened to
     be bundled into a broader delegation's own target string (mission Rule
     2/8: a bundled or broad target must not blanket-resolve every component
     it names). The search is deliberately NOT restricted to entries whose
-    OWN target names this root -- real, specific evidence for a component
-    can legitimately surface inside a differently-labeled, broader-objective
-    delegation's own result (the confirmed Phase 0.57 T11 shape), and
-    requiring an exact target-label match would keep that evidence
+    OWN target names this root, and not restricted to the delegation-log
+    entry's own "result" field at all -- real, specific, ACCEPTED evidence
+    for a component can legitimately surface inside a differently-labeled,
+    broader-objective delegation's own forwarded text (the confirmed Phase
+    0.57 T11 shape), and requiring an exact target-label match, or
+    restricting the search to raw capture, would keep that evidence
     permanently invisible to the component it is actually about. A
-    component never dispatched at all (still in `base` already) is left
-    alone -- dispatch remains a necessary, not sufficient, precondition
-    (mission Rule 1), so this never resolves something nothing ever even
-    attempted to investigate.
+    component is resolved ONLY by accepted evidence, never by dispatch on
+    its own (mission Rule 1: dispatch alone remains insufficient -- a
+    component dispatched ten times with zero accepted evidence still stays
+    unresolved here) -- but Phase 0.59's own mandatory Scenario D requires
+    that a component be resolvable even when it was NEVER separately
+    dispatched under its own name at all, so long as genuinely accepted
+    evidence for it exists somewhere (a business-service-labeled
+    delegation's forwarded text can legitimately be the ONLY evidence
+    storage-service ever gets, with no entry's own target ever naming
+    storage-service). `_uncovered_components`'s own dispatch-presence check
+    is therefore no longer used to gate WHICH roots this function even
+    considers -- only `_component_has_accepted_evidence` decides, for every
+    root in `team._component_roots` alike. `log` is kept as a parameter
+    (and `_uncovered_components` is still called in the degenerate
+    no-roots-discovered case below) purely for interface stability with
+    this function's own callers and `_uncovered_components`'s own
+    unmodified, still-reused-elsewhere role -- not because dispatch
+    presence still gates resolution.
     """
-    base = set(_uncovered_components(log, team))
     roots = getattr(team, "_component_roots", None) or []
-    if not isinstance(log, list) or not roots:
-        return sorted(base)
-    for r in roots:
-        if r in base:
-            continue  # never even dispatched -- stays unresolved regardless of evidence elsewhere
-        if not _component_has_specific_evidence(log, r):
-            base.add(r)  # dispatched, but no component-specific, file-grounded evidence found
-    return sorted(base)
+    if not roots:
+        # The preflight never discovered a component set for this run --
+        # fall back to _uncovered_components's own (necessarily empty, by
+        # its own early return) result rather than inventing a different
+        # empty-case answer here.
+        return sorted(_uncovered_components(log, team))
+    return sorted(r for r in roots if not _component_has_accepted_evidence(team, r))
 
 
 def _chain_coverage_unresolved_note(components: "list[str]") -> str:
