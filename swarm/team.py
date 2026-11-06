@@ -17741,6 +17741,70 @@ async def _run_repo_derived_guards(task: str, content: str, hive_url: str | None
         return []
 
 
+# Phase 0.46: _verified_answer's own internal retry already rechecks a CORRECTED
+# answer against this same shared guard set (see the "recheck after retry" call site
+# a few hundred lines above) -- but _attempt_integration_correction and
+# _attempt_coverage_correction run LATER, at their own choke point outside
+# _verified_answer entirely (swarm/team.py's post-_verified_answer guard chain), and
+# neither one's successful-adoption return path re-runs anything repo-derived. Both
+# simply `return retried` (or a disclosure-decorated variant of it) on success. Live
+# proof this matters, not a hypothetical: Phase 0.45's own validation run
+# (task kqluvmwn7, session d15048e4) showed _scoped_coverage_gap correctly fire and
+# attach the full 23-router list against the 0-named pre-retry draft INSIDE
+# _verified_answer -- and then _attempt_integration_correction wholesale-replaced
+# that entire draft, banner included, with a freshly regenerated answer that was
+# NEVER rechecked against the repository at all. That run's regeneration happened to
+# be complete on its own; nothing guaranteed it would be.
+#
+# This is the one, narrow, shared place that closes that gap for BOTH correction
+# functions, following the exact precedent already established for a different
+# guard at the final-assembly choke point (_with_forwarded_evidence's own re-call
+# immediately before completion-control, Phase 0.24 above: "this is the SAME
+# mechanism, one more call, not a new one"). Not a new detector, not a new retry --
+# the same `_run_repo_derived_guards` _verified_answer's own retry path already
+# trusts, pointed at whatever a correction function actually shipped.
+#
+# `before`/`after` is a pure string-identity check, not a semantic one, and that is
+# deliberate: every ordinary return path of both correction functions either (a)
+# returns its input completely unchanged (no gap found, retry failed, nothing
+# usable) or (b) returns `content + <a note already computed from real evidence>`
+# -- both are a literal prefix match, and _run_repo_derived_guards already ran
+# against that same `content` upstream (inside _verified_answer, or by an earlier
+# call to this very function), so re-deriving the same facts again would only risk
+# a duplicate banner, never find something new. Only a WHOLESALE replacement --
+# `retried`, or a salvaged/sanitized derivative of it, none of which are built by
+# appending to the old string -- fails the prefix check, and that is exactly the one
+# case this phase exists to catch.
+async def _revalidate_adopted_correction(
+        before: str, after: str, task: str, hive_mcp_url: str | None,
+        hive_mcp_tools, label: str) -> str:
+    """Re-run the repo-derived completeness guards against whatever a correction
+    function (_attempt_integration_correction, _attempt_coverage_correction) just
+    shipped, but ONLY when it actually replaced the content wholesale rather than
+    appending to what was already checked.
+
+    Pure addition, never a replacement of its own: on firing, the guards' notes are
+    appended to `after`, exactly as `_run_repo_derived_guards`'s other caller
+    (_verified_answer's own retry-recheck) already does -- nothing here can discard
+    or rewrite the correction function's own output, only add verified evidence on
+    top of it. Each constituent guard (_scoped_coverage_gap, _declared_models_not_
+    reported, ...) keeps its own existing task-shape gating untouched, so a task
+    with no applicable scope costs nothing beyond those guards' own cheap, early
+    returns -- no new gating is added here. No model call is made, so this can
+    never trigger a further retry or recursive correction cycle; it is a read-only
+    repository recheck, bounded by `_run_repo_derived_guards`'s own existing
+    `_DRAFT_REPAIR_TIMEOUT_S` timeout, same as every other caller.
+    """
+    if not after or after == before or after.startswith(before):
+        return after
+    notes = await _run_repo_derived_guards(
+        task, after, hive_mcp_url, hive_mcp_tools, label)
+    if notes:
+        print(f"[team] {label}: content was replaced wholesale -- re-checked against "
+              f"the repository, {len(notes)} repair/disclosure note(s) reattached",
+              flush=True)
+    return after + "".join(notes)
+
 
 # "`public.parties` does not exist", "the parties table does not exist", "no such table
 # as parties". Anchored on the negation, because the failure this catches is always
@@ -31702,11 +31766,26 @@ async def run_task_async(
                     # integration gap _integration_mechanism_missing already finds
                     # deterministically, instead of only ever disclosing it after the
                     # fact at a later _run_repo_derived_guards call site.
+                    _pre_integration_correction = content
                     content = await _timed_guard_call(
                         "_attempt_integration_correction", _run_id_for_trace, content,
                         _attempt_integration_correction(
                             content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
                             liveness_path=liveness_path, synthesis_run=synthesis_run))
+                    # Phase 0.46: a successful _attempt_integration_correction can
+                    # replace `content` wholesale (see _revalidate_adopted_
+                    # correction's own docstring for the live Phase 0.45 run this
+                    # closes) -- re-run the repo-derived completeness guards
+                    # against whatever it actually shipped before the NEXT
+                    # correction stage sees it, rather than only ever having
+                    # checked the draft this stage just discarded.
+                    content = await _timed_guard_call(
+                        "_revalidate_adopted_correction:integration",
+                        _run_id_for_trace, content,
+                        _revalidate_adopted_correction(
+                            _pre_integration_correction, content, task, _hive_url,
+                            hive_mcp_tools=_hive_tools,
+                            label="revalidate after integration-correction"))
                     # T69.1 (2026-10-29): same choke-point placement, immediately
                     # after the integration-gap retry above -- a DIFFERENT gap
                     # shape (a multi-category comparison/gap-analysis conclusion
@@ -31714,11 +31793,21 @@ async def run_task_async(
                     # hooks failure) gets its own one-shot retry budget, backed by
                     # bounded dependency traversal rather than a plain disclosure.
                     # See _comparison_coverage_gap's own docstring.
+                    _pre_coverage_correction = content
                     content = await _timed_guard_call(
                         "_attempt_coverage_correction", _run_id_for_trace, content,
                         _attempt_coverage_correction(
                             content, task, team, _hive_url, hive_mcp_tools=_hive_tools,
                             liveness_path=liveness_path, synthesis_run=synthesis_run))
+                    # Phase 0.46: same reasoning as immediately above, for this
+                    # correction function's own wholesale-replace paths.
+                    content = await _timed_guard_call(
+                        "_revalidate_adopted_correction:coverage",
+                        _run_id_for_trace, content,
+                        _revalidate_adopted_correction(
+                            _pre_coverage_correction, content, task, _hive_url,
+                            hive_mcp_tools=_hive_tools,
+                            label="revalidate after coverage-correction"))
                 except Exception as exc:
                     print(f"[team] verify guard warning: {exc}")
                 # Phase I (2026-09-23): the LAST word, deliberately after Phase R above --
