@@ -13978,13 +13978,23 @@ _SCOPED_ASK_RE = re.compile(
     r"\b(?:overview|audit|describe|document|summar\w+)\b[^.]{0,60}?\bof\s+the\s+"
     r"([a-z][\w-]*)\s+service\b[^.]{0,140}?\b(?:routers?|models?|endpoints?)\b", re.I)
 _SCOPED_MIN_FILES = 4
-_SCOPED_COVERAGE_RATIO = 0.25
+# Phase 0.45: this guard now REPAIRS -- attaches the full missing inventory, read live
+# from the repo -- rather than only disclosing a capped preview, mirroring
+# _declared_models_not_reported's own reasoning for why a repair guard needs a higher
+# bar than a pure-disclosure one: a firing only costs the reader extra, verified names;
+# a silence costs them the names entirely. Set well above 0.5 (models' own bar) on
+# purpose: the live battery run this phase exists to fix named 12 of 23 (52%) -- a
+# 0.5 bar would have left that exact case silent, the same way the OLD 0.25 bar did
+# against the wrong (mounted-only) denominator. 0.75 is the lowest round number that
+# still catches it with margin.
+_SCOPED_REPAIR_RATIO = 0.75
+_SCOPED_REPAIR_CAP = 40
 
 
 async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None,
                                hive_mcp_tools=None, record: dict | None = None) -> str:
-    """The question named a service and asked for its routers; the answer names almost
-    none of them.
+    """The question named a service and asked for its routers; the answer does not cover
+    the complete, authoritative router-file inventory.
 
     T12, wrong in every run that completed: asked for the inventory service's routers,
     models, dependencies and business-service integration, it returned a project-wide
@@ -14000,24 +14010,40 @@ async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None
     _computed_comparison: the guard calls the tool itself instead of relying on the
     model to have done so.
 
-    Silent unless the directory really exists and really holds several files. A failed
-    lookup returns None and is skipped, an unresolvable service name simply never
-    matches, and fewer than _SCOPED_MIN_FILES is not a listing worth measuring.
+    Phase 0.45 root cause: a live battery run shipped a 12-of-23 (52%-complete) router
+    answer with no banner at all. The OLD version measured coverage against whichever
+    set happened to be in hand -- the 16 files mounted in main.py when main.py was
+    readable, the full 23-file directory only as a fallback when it was not -- so a
+    12-of-16 (75%) reading cleared even a strict bar while the true, complete-inventory
+    reading was 12-of-23 (52%). Comparing the 16-file mounted subset against the 23-file
+    directory as if either stood for "its routers" is exactly the conflation this phase
+    exists to stop. This version always reads BOTH structurally from the repo (never
+    hardcoded) and measures completeness against the full directory -- what "its
+    routers" actually asked about -- while still independently recording which of those
+    files are mounted, so the distinction reaches the final answer instead of one side
+    of it silently standing in for the ground truth.
+
+    Silent unless the directory really exists and really holds several files, and only
+    for a task that actually asks about routers -- _SCOPED_ASK_RE alone cannot tell a
+    routers question from a models-only or endpoints-only one sharing the same shape, so
+    this guard additionally requires the literal word, which the canonical T12 wording
+    ("its routers, its models, ...") always contains. A failed lookup returns None and
+    is skipped, an unresolvable service name simply never matches, and fewer than
+    _SCOPED_MIN_FILES is not a listing worth measuring.
     """
     m = _SCOPED_ASK_RE.search(task or "")
     if not m or not (content or "").strip():
         return ""
+    if not re.search(r"\brouters?\b", task or "", re.I):
+        return ""
     service = m.group(1).lower()
-    # Mounted routers first; the directory listing is the fallback, not the source of
-    # truth. See _mounted_router_files for the 23-vs-16 measurement behind that order.
-    names = await _mounted_router_files(service, hive_mcp_url, hive_mcp_tools)
-    basis = "mounted in main.py"
-    if names:
-        paths = names
-    else:
-        basis = "files in the router directory"
-        paths = await _repo_find_files(f"**/{service}-service/router/*.py",
-                                       hive_mcp_url, hive_mcp_tools)
+
+    # Always read the complete, authoritative directory inventory -- the denominator
+    # this guard measures completeness against -- and, independently, which of those
+    # files main.py actually mounts. Two separate facts, never one standing in for the
+    # other.
+    paths = await _repo_find_files(f"**/{service}-service/router/*.py",
+                                   hive_mcp_url, hive_mcp_tools)
     if not paths:
         # Logged because silence has two causes here and they must not look alike: a
         # lookup that failed and an answer that covered everything both return "".
@@ -14033,6 +14059,9 @@ async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None
         names.append(base)
     if len(names) < _SCOPED_MIN_FILES:
         return ""
+
+    mounted = set(await _mounted_router_files(service, hive_mcp_url, hive_mcp_tools))
+    mount_known = bool(mounted)
 
     # A router counts as named in EITHER notation: the filename (items_api.py) or the
     # mounted-module form the answer copies out of main.py (items_api.router).
@@ -14056,24 +14085,23 @@ async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None
     # not already there: _mounted_router_files derives the ground truth by parsing
     # include_router(x.router) in the first place, so the guard already only applies
     # where that convention holds.
-    named = [n for n in names
-             if n in content
-             or re.search(rf"(?<!\w){re.escape(n[:-3])}\.router\b", content)]
+    def _is_named(n: str) -> bool:
+        return (n in content
+                or re.search(rf"(?<!\w){re.escape(n[:-3])}\.router\b", content) is not None)
+
+    named = [n for n in names if _is_named(n)]
 
     # Presenting a router file the service does not MOUNT is a different error from
     # under-coverage and a worse one: under-coverage is incomplete, this is confidently
     # wrong. Of the 23 files in inventory-service/router/, seven are never
     # include_router'd, and every stored T12 answer names some of them -- six, four, one
     # and one. It happens because a member lists the directory and reports every file in
-    # it as "the routers"; nothing consults main.py. Checked only when the mounted set
-    # came from main.py, since the directory-listing fallback cannot tell the two apart.
+    # it as "the routers"; nothing consults main.py. Checked only when main.py was
+    # actually readable -- an unreadable main.py leaves mount status unknown, not false,
+    # per this phase's own "disclose ambiguity, never claim completeness" requirement.
     _unmounted_note = ""
-    if basis == "mounted in main.py":
-        _present = await _repo_find_files(f"**/{service}-service/router/*.py",
-                                          hive_mcp_url, hive_mcp_tools)
-        _files = {p.rsplit("/", 1)[-1] for p in (_present or [])}
-        _unmounted = sorted(f for f in _files - set(names)
-                            if not f.startswith("__") and f in content)
+    if mount_known:
+        _unmounted = sorted(f for f in names if f not in mounted and f in content)
         if _unmounted:
             print(f"[team] mount check: answer presents {len(_unmounted)} unmounted "
                   f"router file(s) for {service}-service: {_unmounted}", flush=True)
@@ -14086,25 +14114,44 @@ async def _scoped_coverage_gap(task: str, content: str, hive_mcp_url: str | None
 
     if record is not None:
         record["routers"] = len(named)
-        # Phase I: the denominator, alongside the existing numerator -- pure addition,
-        # `record["routers"]` itself is unchanged and every existing reader of it
-        # (_retry_lost_enumeration) is unaffected. Lets _coverage_verdict distinguish
-        # "13 of 16" (incomplete) from "13, denominator unknown" (unknown) without
-        # re-deriving the count itself, which stays computed exactly once, here.
+        # Phase I's denominator, now always the complete directory inventory rather
+        # than whichever of the two sets happened to be in hand (Phase 0.45 above) --
+        # _coverage_verdict and _retry_lost_enumeration both read this generically as
+        # "found vs. expected" and are unaffected by which set it counts.
         record["routers_total"] = len(names)
-    if len(named) > _SCOPED_COVERAGE_RATIO * len(names):
-        print(f"[team] scope check: {service}-service has {len(names)} routers "
-              f"({basis}), answer names {len(named)} — above threshold, silent",
-              flush=True)
+    if len(named) > _SCOPED_REPAIR_RATIO * len(names):
+        print(f"[team] scope check: {service}-service has {len(names)} router files "
+              f"({len(mounted) if mount_known else '?'} mounted), answer names "
+              f"{len(named)} — above threshold, silent", flush=True)
         return _unmounted_note
+
     missing = [n for n in names if n not in named]
-    print(f"[team] scope check: {service}-service has {len(names)} routers "
-          f"({basis}), answer names {len(named)}", flush=True)
-    return (f"\n\n---\n**THE ANSWER COVERS ALMOST NONE OF WHAT WAS ASKED ABOUT — the "
-            f"question asked about the {service} service's routers; it has {len(names)} "
-            f"({basis}) and the answer above names {len(named)} of them. Not yet "
-            f"covered: {', '.join(missing[:12])}"
-            f"{'…' if len(missing) > 12 else ''}.**" + _unmounted_note)
+    shown = missing[:_SCOPED_REPAIR_CAP]
+    if mount_known:
+        _lines = "\n".join(
+            f"- `{n}`" + (" — mounted in main.py" if n in mounted
+                          else " — present as a file but NOT mounted in main.py "
+                               "(not part of this service's API surface)")
+            for n in shown)
+        _mount_clause = f", of which {len(mounted)} are mounted in main.py"
+        _provenance = ("file list read from the router directory; mount status read "
+                       "from main.py's own include_router calls")
+    else:
+        _lines = "\n".join(f"- `{n}`" for n in shown)
+        _mount_clause = ""
+        _provenance = ("file list read from the router directory; mount status could "
+                       "not be independently verified for this service and is not "
+                       "claimed here")
+    print(f"[team] scope check: {service}-service has {len(names)} router files"
+          f"{' (' + str(len(mounted)) + ' mounted)' if mount_known else ''}, answer "
+          f"names {len(named)} — attaching the {len(missing)} it omitted", flush=True)
+    return (f"\n\n---\n**THE COMPLETE ROUTER INVENTORY ASKED FOR IS NOT IN THE ANSWER — "
+            f"{service}-service has {len(names)} router file(s) in its router "
+            f"directory{_mount_clause}. The answer above names {len(named)}. The "
+            f"rest, read directly from the repository ({_provenance}), not the "
+            f"model's recollection:**\n{_lines}"
+            + ("\n…" if len(missing) > len(shown) else "")
+            + _unmounted_note)
 
 
 # T36.1 Track A (T13a): a module-scoped audit asking for "frontend hooks" and the
