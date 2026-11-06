@@ -8696,10 +8696,57 @@ def _missing_categories_continuation_note(missing_cats: list[str]) -> str:
     )
 
 
+def _member_generation_targets(log, member_key: str) -> "dict[int, str]":
+    """Phase 0.57: reconstructs which delegation TARGET string belongs to each
+    of `member_key`'s own generation numbers -- purely from the EXISTING
+    delegation log, no new state. Generation 1 is this member's first
+    SINGULAR delegation dispatch this run (_SINGULAR_DELEGATION_TOOL_NAMES),
+    generation 2 its second, and so on, in the SAME order and against the
+    SAME two tool names the dispatch-time closure (_read_cache_tool_hook)
+    already counts against when it does `delegation_generation[target] += 1`
+    -- so generation N here is, by construction, the exact generation
+    `team._delegation_generation[member_key]` reaches after N of this
+    member's own dispatches, never a separately guessed count.
+    """
+    out: "dict[int, str]" = {}
+    if not isinstance(log, list) or not member_key:
+        return out
+    n = 0
+    for entry in log:
+        if not isinstance(entry, dict) or entry.get("tool") not in _SINGULAR_DELEGATION_TOOL_NAMES:
+            continue
+        _mid = _member_key(str((entry.get("args") or {}).get("member_id", "")).strip())
+        if _mid != member_key:
+            continue
+        n += 1
+        tgt = ((entry.get("audit") or {}).get("target") or "").strip()
+        if tgt:
+            out[n] = tgt
+    return out
+
+
+def _targets_share_a_component(a: str, b: str, roots: "list[str]") -> bool:
+    """Whether delegation-target strings `a` and `b` name at least one SAME
+    repository component root -- the exact substring-match convention
+    `_uncovered_components`/`_unresolved_chain_components` already use for
+    this project, reused rather than reinvented. Returns True (the
+    conservative, "still the same component" direction) whenever either
+    target fails to resolve to any known root -- an unresolved comparison
+    must never be read as proof of a DIFFERENT component."""
+    if not roots or not a or not b:
+        return True
+    a_l, b_l = a.lower(), b.lower()
+    a_roots = {r for r in roots if r.lower() in a_l}
+    b_roots = {r for r in roots if r.lower() in b_l}
+    if not a_roots or not b_roots:
+        return True
+    return bool(a_roots & b_roots)
+
+
 def _has_usable_current_generation_evidence(team) -> bool:
     """True iff at least one delegated member's stored result in
-    `team._member_results` is both non-empty AND captured at-or-after that
-    member's CURRENT delegation generation.
+    `team._member_results` is both non-empty AND, for a REASON this function
+    can actually establish, still current.
 
     Phase 0.44 (T11 no-evidence recovery invariant): reuses, rather than
     reimplements, the exact two maps forward_member_answer's own Phase
@@ -8717,6 +8764,35 @@ def _has_usable_current_generation_evidence(team) -> bool:
     delegation has not returned at all -- team._member_results is empty,
     confirmed live on the T11 incident this phase fixes, run e2c519585f5a)
     or something only from an earlier round.
+
+    Phase 0.57 (T11, component-aware validity): `team._delegation_generation`
+    is keyed PURELY by member identity (`_read_cache_tool_hook`'s own dispatch-
+    time `delegation_generation[target] = ... + 1`, target there meaning the
+    MEMBER id, never the repository component) -- so the original rule above
+    ("any pending newer generation makes this member's whole stored text
+    stale") could not distinguish a newer delegation that REPLACES what is
+    stored from a newer delegation for a completely different component that
+    merely happens to share the same member identity. Live-confirmed on the
+    Phase 0.56 T11 run: business-service's own, complete, 98k-char-grounded
+    result stayed captured at generation 1 while a SEPARATE, later delegation
+    (generation 2, bundling the 13 remaining uncovered components) stalled
+    before completing -- the original rule discarded business-service's
+    perfectly valid evidence solely because generation 2 existed at all.
+
+    The correction below activates ONLY when `team._component_roots` is
+    populated (a chain-spanning task with a real, repository-discovered
+    component set -- never inferred from filenames or prose) AND the
+    delegation log lets both the pending and the stored generation's own
+    targets be resolved. In that case, a pending newer generation for a
+    DIFFERENT component (no shared root, `_targets_share_a_component`) no
+    longer invalidates the stored result. Every other case -- no component
+    roots for this task, an unresolvable target, or the pending generation
+    sharing a root with the stored one (the SAME component, a genuine
+    pending replacement) -- falls through to the original, unmodified
+    staleness rule unchanged. This is a strictly narrower reading of
+    "current": it can only ever ADD usable evidence the old rule missed for
+    a provably different component; it never excuses a same-component
+    replacement, and never applies outside a chain-rooted task.
     """
     results = getattr(team, "_member_results", None)
     if not isinstance(results, dict) or not results:
@@ -8725,10 +8801,26 @@ def _has_usable_current_generation_evidence(team) -> bool:
     captured = getattr(team, "_member_result_generation", None)
     gens = gens if isinstance(gens, dict) else {}
     captured = captured if isinstance(captured, dict) else {}
+    log = getattr(team, "_coordinator_delegation_log", None)
+    roots = getattr(team, "_component_roots", None)
+    roots = roots if isinstance(roots, list) and roots else None
     for key, text in results.items():
         if not text:
             continue
-        if gens.get(key, 0) > captured.get(key, 0):
+        _pending_gen, _stored_gen = gens.get(key, 0), captured.get(key, 0)
+        if _pending_gen > _stored_gen:
+            if roots and isinstance(log, list):
+                _by_gen = _member_generation_targets(log, key)
+                _pending_target = _by_gen.get(_pending_gen, "")
+                _stored_target = _by_gen.get(_stored_gen, "")
+                if (_pending_target and _stored_target
+                        and not _targets_share_a_component(_pending_target, _stored_target, roots)):
+                    print(f"[team] usable-evidence check: {key!r}'s stored result "
+                          f"(generation {_stored_gen}, target {_stored_target!r}) stays "
+                          f"usable despite a newer pending generation {_pending_gen} -- "
+                          f"that pending delegation targets {_pending_target!r}, a "
+                          f"different component", flush=True)
+                    return True
             continue  # stale -- an earlier generation's answer, not current
         return True
     return False
