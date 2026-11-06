@@ -1872,6 +1872,19 @@ def _with_forwarded_evidence(content: str, team) -> str:
     answer -- nothing is inserted into it. Nothing forwarded -> `content` returned untouched,
     so a run that never calls the tool behaves exactly as before. Same append-never-substitute
     rule as render_member_findings.
+
+    Phase 0.60: each forwarded value is now a structured `ForwardedRecord`
+    (normalized via `_forwarded_record_parts`), not a bare string -- this
+    function still relays exactly `record.answer` (identical text to
+    before this phase), never the record's own Python repr, and never
+    drops a PARTIAL record from the relay merely because
+    `_component_has_accepted_evidence` cannot use it to resolve a
+    component. A PARTIAL record gets one extra, accurate qualifier on its
+    own heading so a reader is told it is a lead, not a finished finding --
+    evidence ACCEPTANCE (component resolution) and evidence RELAY (what
+    the user sees) are deliberately separate decisions; hiding PARTIAL
+    content from the relay would solve nothing this phase is about and
+    would throw away real, if incomplete, findings.
     """
     forwarded = getattr(team, "_forwarded_members", None)
     if not isinstance(forwarded, dict) or not forwarded:
@@ -1888,7 +1901,8 @@ def _with_forwarded_evidence(content: str, team) -> str:
     parts: list[str] = []
     full: list[str] = []
     partial: dict[str, str] = {}
-    for k, t in forwarded.items():
+    for k, value in forwarded.items():
+        status, t, _evidence, _unresolved, _raw = _forwarded_record_parts(value)
         if not (t and t.strip()):
             continue
         # T13 fix: a key may carry a "#2"/"#3" suffix (see forward_member_answer's own
@@ -1898,14 +1912,18 @@ def _with_forwarded_evidence(content: str, team) -> str:
         # "### From {member}" (never suffixed, since those fixtures only ever have one
         # entry per member) is unaffected.
         label = k.split("#", 1)[0]
+        _partial_note = (
+            " (partial — this member's own investigation did not fully complete; "
+            "a lead, not a finished finding)" if status == "PARTIAL" else "")
         mode, lines = _forwarded_gap(t, content)
         if mode == "full":
             full.append(k)
-            parts.append(f"\n\n### From {label}\n{t.strip()}")
+            parts.append(f"\n\n### From {label}{_partial_note}\n{t.strip()}")
         elif mode == "lines":
             partial[k] = f"{len(lines)} line(s), first: {lines[0].strip()[:70]!r}"
-            parts.append(f"\n\n### From {label} (only the lines the answer above does not contain)\n"
-                         + "\n".join(lines))
+            parts.append(
+                f"\n\n### From {label} (only the lines the answer above does not "
+                f"contain){_partial_note}\n" + "\n".join(lines))
     if not parts:
         return content
     if full:
@@ -1957,6 +1975,79 @@ class MemberResult:
     evidence: list
     unresolved: list
     raw: str
+
+
+@dataclass
+class ForwardedRecord:
+    """Phase 0.60: the structured value `forward_member_answer` now stores in
+    `team._forwarded_members`, replacing the old bare `forwarded[key] =
+    result.answer` string.
+
+    Confirmed by direct source inspection before this phase: a plain string
+    could not carry `MemberResult.status` past the forwarding boundary, so
+    every downstream reader (`_component_has_accepted_evidence`,
+    `_with_forwarded_evidence`) saw identical, status-blind text whether the
+    original report was COMPLETE or PARTIAL -- a PARTIAL report (the
+    runtime's OWN signal that the member's investigation was
+    disproportionately thin relative to what it read) could resolve a
+    component exactly as confidently as a COMPLETE one, because the one bit
+    that would have said otherwise was never carried this far.
+
+    member_key: the forwarding key this record was stored under (e.g.
+                "researcher", "researcher#2") -- carried on the record
+                itself, not just implied by its dict key, so a caller that
+                receives one record in isolation still knows whose it is.
+    status:     copied verbatim from `MemberResult.status` at forward time
+                -- "COMPLETE" or "PARTIAL" only; a BLOCKED result is never
+                forwarded at all (forward_member_answer's own existing
+                rejection, unchanged).
+    answer:     identical to `MemberResult.answer` -- the exact text relayed
+                to the final answer, unchanged from before this phase.
+    evidence:   copied from `MemberResult.evidence` (bare filenames the raw
+                report cites) -- locator metadata, never proof of
+                correctness, same caveat `MemberResult.evidence` already
+                carries.
+    unresolved: copied from `MemberResult.unresolved` -- the runtime-
+                injected notice(s), if any, that _build_member_result
+                already strips out of `answer`. Kept here so the fact that
+                something was flagged survives forwarding even though it
+                never appears in the user-facing text.
+    raw:        copied from `MemberResult.raw` -- the member's full,
+                unmodified text, for tracing only, mirroring
+                `MemberResult.raw`'s own "never read by the forwarding path
+                below" caveat (this field is likewise never read by
+                `_component_has_accepted_evidence`).
+    """
+    member_key: str
+    status: str
+    answer: str
+    evidence: list
+    unresolved: list
+    raw: str
+
+
+def _forwarded_record_parts(value) -> "tuple[str | None, str, list, list, str]":
+    """Normalizes one `team._forwarded_members` value to
+    `(status, answer, evidence, unresolved, raw)`, regardless of whether it
+    is a current-format `ForwardedRecord` or a legacy plain string.
+
+    No code path in this file writes a legacy plain string anymore as of
+    this phase -- `forward_member_answer` always stores a `ForwardedRecord`
+    now -- so this branch exists purely for forward compatibility with any
+    `team` object that was already constructed, or any external caller,
+    before this phase's own deploy reached it. A legacy string's `status`
+    is reported as `None` -- deliberately a THIRD value, distinct from both
+    "COMPLETE" and "PARTIAL" -- because a bare string carries no record of
+    which one it originally was; every status-gated caller in this file
+    checks `status == "COMPLETE"` explicitly, so `None` is correctly
+    treated as ineligible for component resolution (the safe direction)
+    without this helper having to guess.
+    """
+    if isinstance(value, ForwardedRecord):
+        return value.status, value.answer, value.evidence, value.unresolved, value.raw
+    if isinstance(value, str):
+        return None, value, [], [], value
+    return None, "", [], [], ""
 
 
 # Split just before an uppercase letter that follows sentence-ending punctuation, with or
@@ -2276,31 +2367,65 @@ def _make_forward_member_answer(
         # was unrecoverable at that point, not because it was never captured, but
         # because this single-slot-per-member map could only remember the newest one.
         #
-        # Fix: the first forward for a member keeps the exact pre-fix shape (a bare
-        # string at `forwarded[key]`) so every existing single-forward caller and test
-        # asserting that exact shape (e.g. `t._forwarded_members == {"researcher":
-        # LIST_ANSWER}`) is untouched. Only a SUBSEQUENT, genuinely DIFFERENT forward to
-        # the same member gets a new suffixed key (`f"{key}#2"`, `#3`, ...) instead of
-        # overwriting -- _with_forwarded_evidence already iterates forwarded.items()
-        # generically, so no change is needed there to pick these up. An identical
-        # re-forward of unchanged content (the Coordinator calling this twice in a row
-        # for the same member with no new delegation in between) is deliberately NOT
-        # given a new slot, so a run with no multi-delegation forwarding behaves
-        # byte-for-byte as before, and a repeated identical forward never inflates the
-        # final answer with duplicate evidence.
+        # Fix: the first forward for a member keeps the exact pre-fix key shape
+        # (plain `key`, no suffix) so every existing single-forward caller and test
+        # asserting that exact key (e.g. `"researcher" in t._forwarded_members`) is
+        # untouched. Only a SUBSEQUENT, genuinely DIFFERENT forward to the same member
+        # gets a new suffixed key (`f"{key}#2"`, `#3`, ...) instead of overwriting --
+        # _with_forwarded_evidence already iterates forwarded.items() generically, so
+        # no change is needed there to pick these up. An identical re-forward of
+        # unchanged content (the Coordinator calling this twice in a row for the same
+        # member with no new delegation in between) is deliberately NOT given a new
+        # slot, so a run with no multi-delegation forwarding behaves byte-for-byte as
+        # before, and a repeated identical forward never inflates the final answer
+        # with duplicate evidence.
+        #
+        # Phase 0.60: the STORED VALUE at each key is now a structured ForwardedRecord
+        # (status/evidence/unresolved/raw alongside answer), not the bare answer
+        # string -- see ForwardedRecord's own docstring for the exact defect this
+        # closes (a PARTIAL report could not be told apart from a COMPLETE one once
+        # reduced to plain text). The identity check for "is this a genuinely new
+        # forward, or an identical re-forward" now compares status and unresolved
+        # too, not just the visible answer text -- two reports with the same answer
+        # text but a different status (e.g. a corrected re-delegation that now comes
+        # back COMPLETE where the first attempt was PARTIAL) are NOT the same forward
+        # and must get their own slot, never silently merged.
         existing_keys = [key] + [k for k in forwarded if k.startswith(f"{key}#")]
-        if not any(forwarded.get(k) == result.answer for k in existing_keys):
+
+        def _same_forward(existing_value) -> bool:
+            _status, _answer, _unresolved = (
+                existing_value.status, existing_value.answer, existing_value.unresolved
+            ) if isinstance(existing_value, ForwardedRecord) else (None, existing_value, [])
+            return (_answer == result.answer and _status == result.status
+                    and _unresolved == list(result.unresolved))
+
+        if not any(_same_forward(forwarded.get(k)) for k in existing_keys):
+            record = ForwardedRecord(
+                member_key=key, status=result.status, answer=result.answer,
+                evidence=list(result.evidence), unresolved=list(result.unresolved),
+                raw=result.raw)
             if key not in forwarded:
-                forwarded[key] = result.answer
+                forwarded[key] = record
             else:
                 n = 2
                 while f"{key}#{n}" in forwarded:
                     n += 1
-                forwarded[f"{key}#{n}"] = result.answer
+                forwarded[f"{key}#{n}"] = record
+        # Phase 0.60: the receipt itself must not claim a PARTIAL report is
+        # complete or independently verified -- this tool never calls
+        # verify_claims (see _component_has_accepted_evidence's own docstring
+        # for the full reasoning), so "will appear in your final answer" stays
+        # true for either status, but only a COMPLETE report gets no further
+        # qualifier.
+        _status_note = (
+            " This member's own report was flagged PARTIAL -- its investigation did "
+            "not fully complete, so present it as a partial lead, not a finished finding."
+            if result.status == "PARTIAL" else "")
         return (
             f"FORWARDED: {key}'s answer ({len(result.answer):,} characters) is recorded and "
-            f"will appear in your final answer exactly as written. Do not retype it; add "
-            f"only your own ordering, explanation and anything the members did not cover."
+            f"will appear in your final answer exactly as written.{_status_note} Do not "
+            f"retype it; add only your own ordering, explanation and anything the members "
+            f"did not cover."
         )
 
     return forward_member_answer
@@ -17185,38 +17310,84 @@ _CHAIN_COVERAGE_RENDER_CAP = 12
 # definition, so this function's own behavior does not depend on module
 # load order; keep the two lists in sync if either changes.
 _COMPONENT_EVIDENCE_EXT_RE = r"\.(?:py|ts|tsx|js|jsx|sql|md)\b"
-_COMPONENT_CITATION_PATTERN_CACHE: "dict[str, object]" = {}
+_COMPONENT_CITATION_PATTERN_CACHE: "dict[tuple, object]" = {}
 
 
-def _component_citation_pattern(root: str):
-    """A component's own basename (its last path segment, e.g.
-    "storage-service" for root "API/storage-service") immediately followed
-    by a path separator and more path characters ending in a recognized
-    source-file extension -- i.e. a real, path-shaped citation like
-    `storage-service/router/storage_api.py`, not a bare mention of the
-    component's name on its own. Cached per root string (the roots list is
-    small and fixed for a run, so this avoids recompiling the same pattern
-    on every log entry)."""
-    cached = _COMPONENT_CITATION_PATTERN_CACHE.get(root)
+def _component_basename(root: str) -> str:
+    """The last path segment of a component root, e.g. "storage-service"
+    for "API/storage-service" -- the one piece _component_citation_pattern
+    always matched against before Phase 0.60, and still the default when
+    it is unambiguous among the run's own discovered roots."""
+    return (root or "").rstrip("/\\").rsplit("/", 1)[-1]
+
+
+def _ambiguous_basenames(roots: "list[str]") -> "set[str]":
+    """Phase 0.60 (Defect D): basenames shared by 2+ of the run's own
+    discovered component roots -- a citation naming only the shared
+    basename cannot be safely credited to one of them over the other, so
+    matching for any such basename must require more of the path than
+    just the final segment. Synthetic roots like
+    "API/service-a/storage-service" and "API/service-b/storage-service"
+    are the shape this guards against; ordinary EkamApp roots (one
+    component per top-level service directory) do not collide today, so
+    this is a no-op (empty set) on the current repository -- kept general
+    rather than assuming that stays true forever."""
+    seen: "dict[str, int]" = {}
+    for r in roots or []:
+        b = _component_basename(r).lower()
+        if b:
+            seen[b] = seen.get(b, 0) + 1
+    return {b for b, n in seen.items() if n > 1}
+
+
+def _component_citation_pattern(root: str, roots: "list[str] | None" = None):
+    """A real, path-shaped citation of `root` -- i.e. `storage-service/
+    router/storage_api.py`, not a bare mention of the component's name on
+    its own.
+
+    Phase 0.58's original version always matched on `root`'s own basename
+    alone. Phase 0.60 (Defect D): when `roots` is supplied and that
+    basename is shared by another discovered root (_ambiguous_basenames),
+    matching now requires `root`'s FULL path (every segment, either path
+    separator accepted between them) as the leading citation, not merely
+    its basename -- so a bare-basename citation stays ambiguous for
+    EITHER colliding root rather than being credited to one arbitrarily
+    (mission: "ambiguous matches must fail closed"). When `roots` is
+    omitted -- `_component_has_specific_evidence`, the discovery-only,
+    non-authoritative helper, has no roots list in scope and does not need
+    one for its own narrower purpose -- basename-only matching is used,
+    unchanged from Phase 0.58.
+
+    Cached per (root, ambiguous) pair -- the roots list is small and fixed
+    for a run, so this avoids recompiling the same pattern on every
+    forwarded record or log entry."""
+    ambiguous = bool(roots) and _component_basename(root).lower() in _ambiguous_basenames(roots)
+    cache_key = (root, ambiguous)
+    cached = _COMPONENT_CITATION_PATTERN_CACHE.get(cache_key)
     if cached is not None:
         return cached
-    basename = root.rstrip("/\\").rsplit("/", 1)[-1]
-    pattern = re.compile(
-        r"\b" + re.escape(basename) + r"[/\\][\w./\\-]*" + _COMPONENT_EVIDENCE_EXT_RE,
-        re.IGNORECASE)
-    _COMPONENT_CITATION_PATTERN_CACHE[root] = pattern
+    if ambiguous:
+        segments = [re.escape(s) for s in re.split(r"[/\\]+", root.strip("/\\")) if s]
+        leading = r"[/\\]".join(segments)
+    else:
+        leading = re.escape(_component_basename(root))
+    pattern = re.compile(r"\b" + leading + r"[/\\][\w./\\-]*" + _COMPONENT_EVIDENCE_EXT_RE,
+                         re.IGNORECASE)
+    _COMPONENT_CITATION_PATTERN_CACHE[cache_key] = pattern
     return pattern
 
 
-def _text_cites_component(text: str, root: str) -> bool:
+def _text_cites_component(text: str, root: str, roots: "list[str] | None" = None) -> bool:
     """Pure, single-string check: does `text` contain a real, path-shaped
     citation of `root` (see _component_citation_pattern)? Factored out of
     _component_has_specific_evidence so Phase 0.59's own acceptance check
     can reuse the exact same pattern-matching rule against a DIFFERENT text
-    source (forwarded member text) without duplicating the regex logic."""
+    source (forwarded member text) without duplicating the regex logic.
+    `roots`, when supplied, enables Phase 0.60's collision-aware matching;
+    omitted, this behaves exactly as it did in Phase 0.58/0.59."""
     if not text or not root:
         return False
-    return bool(_component_citation_pattern(root).search(text))
+    return bool(_component_citation_pattern(root, roots).search(text))
 
 
 def _component_has_specific_evidence(log, root: str) -> bool:
@@ -17277,8 +17448,64 @@ _EXPLICIT_INCOMPLETE_INVESTIGATION_RE = re.compile(
     re.IGNORECASE)
 
 
+def _record_admits_incomplete_investigation_for(
+        text: str, root: str, roots: "list[str]") -> bool:
+    """Phase 0.60 (Defect B): whether `text` contains an explicit
+    incomplete-investigation admission (_EXPLICIT_INCOMPLETE_INVESTIGATION_RE,
+    reused unchanged, not weakened) that can actually be ASSOCIATED with
+    `root` specifically -- never a whole-text admission anywhere poisoning
+    every component the same text also cites.
+
+    Splits on the SAME sentence boundary `_strip_member_narration` already
+    uses (`_MEMBER_SENTENCE_SPLIT_RE`) -- no new splitting convention. For
+    each sentence that matches the admission pattern, `root` is treated as
+    the sentence's own subject when the sentence names it -- either via a
+    real path-shaped citation (`_text_cites_component`, collision-aware via
+    `roots`) or, failing that, via root's own basename appearing as a bare
+    word in that ONE sentence (an admission sentence rarely carries a full
+    file-path citation of the very thing it says was not examined, so
+    requiring one here would make this check almost never fire, defeating
+    its purpose). A bare-basename match is only trusted when that basename
+    is UNAMBIGUOUS among the run's own discovered roots -- if it collides
+    with another root's basename (_ambiguous_basenames) and the sentence
+    does not also carry a disambiguating full-path citation, this sentence
+    cannot be safely associated with EITHER colliding root and is skipped
+    for both (mission: ambiguous association must fail closed, i.e. must
+    NOT be used to reject a component it cannot actually be tied to).
+
+    An admission sentence that names a DIFFERENT root, or names no
+    discovered root at all, never blocks THIS root -- mission point 7: an
+    admission that cannot be associated with any particular component must
+    not reject every independent component by default. The live Phase
+    0.58 T11 shape is exactly the positive case this is built for: "The
+    storage-service upload endpoint was not fully investigated" matches
+    the admission pattern AND names storage-service (bare basename,
+    unambiguous) -> blocks storage-service only; a separate sentence about
+    business-service's own endpoint, elsewhere in the same report, names
+    no incompleteness at all and is never touched by this function.
+    """
+    if not text or not root:
+        return False
+    basename = _component_basename(root).lower()
+    ambiguous = bool(basename) and basename in _ambiguous_basenames(roots)
+    for sentence in _MEMBER_SENTENCE_SPLIT_RE.split(text):
+        if not _EXPLICIT_INCOMPLETE_INVESTIGATION_RE.search(sentence):
+            continue
+        if _text_cites_component(sentence, root, roots):
+            return True
+        if not ambiguous and basename and basename in sentence.lower():
+            return True
+        # Ambiguous basename with no disambiguating full-path citation in
+        # THIS sentence, or no mention of this root at all -- this
+        # sentence's own admission (if it has one) is about something
+        # else, or is itself unassociated; either way it does not block
+        # `root`. Fall through and keep checking the report's other
+        # sentences.
+    return False
+
+
 def _component_has_accepted_evidence(team, root: str) -> bool:
-    """Phase 0.59 (T11 evidence-ACCEPTED component resolution): whether
+    """Phase 0.59/0.60 (T11 evidence-ACCEPTED component resolution): whether
     `root` has evidence that cleared the STRONGEST acceptance-like state
     this architecture actually, durably records.
 
@@ -17294,46 +17521,68 @@ def _component_has_accepted_evidence(team, root: str) -> bool:
     (re-plumbing claim-level verification results back onto per-member
     state). Given that gap, forwarding is the strongest available durable,
     intentional signal that exists today -- stronger than raw capture
-    (Phase 0.58's own bar, and this phase's confirmed Scenario-E problem:
+    (Phase 0.58's own bar, and Phase 0.59's confirmed Scenario-E problem:
     captured-but-never-forwarded text could resolve a component merely by
     containing a path), because it required a deliberate Coordinator
-    action, never an automatic one.
+    action, never an automatic one. This is NOT claimed as equivalent to
+    verify_claims acceptance -- it is the closest proxy this architecture
+    has, used honestly as a proxy, not mislabeled as the real thing.
 
-    This is NOT claimed as equivalent to verify_claims acceptance -- it is
-    the closest proxy this architecture has, used honestly as a proxy, not
-    mislabeled as the real thing. A forwarded text is additionally rejected
-    as evidence for ANY component if it matches
-    `_EXPLICIT_INCOMPLETE_INVESTIGATION_RE` -- a member that admits, in its
-    own words, that the actual investigation was not completed must not
-    have ITS OWN citations (even genuine ones, for some OTHER, already-
-    adequately-investigated detail) credited as adequate coverage; this is
-    deliberately whole-text, not scoped to the specific citation nearest
-    the admission -- Phase 0.58's T11 case showed a genuine, confident
-    citation (seaweedfs.py) sitting in the SAME text as an explicit
-    admission about a DIFFERENT, more relevant file (storage_api.py), and
-    this architecture has no reliable, non-task-hardcoded way to tell
-    which citation the admission is actually about, so it fails closed on
-    the whole text rather than guessing.
+    Phase 0.60 (Defect A): a forwarded `ForwardedRecord` whose `status` is
+    not exactly "COMPLETE" -- PARTIAL (the runtime's own signal that the
+    report was thin relative to what the member read), or the `None`
+    status a legacy plain-string value normalizes to -- is never used to
+    resolve a component here, regardless of what it cites. Confirmed live
+    cause this closes: before this phase, every forwarded value was
+    already a bare string by the time this function saw it, so PARTIAL and
+    COMPLETE reports were textually indistinguishable and a thin report
+    could resolve a component exactly as confidently as a thorough one.
 
-    Known, accepted limitation (documented, not hidden): a citation to a
-    genuinely task-relevant file that the task did not actually need (or
-    vice versa -- a path-shaped citation to a file that exists, but is not
-    what the question asked for) is still indistinguishable from a citation
-    that IS task-relevant, because this architecture has no structured
-    representation of "the operation the task actually requires" to check
-    against. Building one would be a materially larger, task-semantics
-    change this phase does not attempt.
+    Phase 0.60 (Defect B): an explicit incomplete-investigation admission
+    now only rejects the SPECIFIC component it can be associated with
+    (`_record_admits_incomplete_investigation_for`), never every component
+    the same COMPLETE report happens to also cite. Phase 0.59's own
+    whole-text rejection is replaced, not merely loosened -- see that
+    helper's own docstring for the live T11 example (a storage-service
+    admission no longer blocks an otherwise independently-cited
+    business-service finding in the same report).
+
+    Phase 0.60 (Defect D): citation matching is collision-aware
+    (`_text_cites_component(..., roots)`) -- a basename shared by two
+    discovered roots can no longer be credited to either of them from a
+    bare-basename citation alone; see `_component_citation_pattern`.
+
+    Known, accepted limitation (documented, not hidden; investigated, not
+    assumed -- see this phase's own report for what was checked): a
+    citation to a genuinely task-relevant file that the task did not
+    actually need (or vice versa) is still indistinguishable from a
+    citation that IS task-relevant. The one existing deterministic,
+    model-free evidence structure that comes close -- the declaration
+    index (`_extract_declarations`/`_declaration_index_block`,
+    `team._read_state["pending_declarations"]`) -- was checked and does
+    not close this gap: it is consumed and cleared per-delegation (not
+    durable team state by the time forwarding happens), and even where
+    live it only confirms WHICH declarations a file contains, never WHICH
+    one the task's own request actually needs -- a judgment this
+    architecture has no structured representation to make. Building one
+    would be a materially larger, task-semantics change this phase does
+    not attempt.
     """
     forwarded = getattr(team, "_forwarded_members", None)
     if not isinstance(forwarded, dict) or not forwarded or not root:
         return False
-    for text in forwarded.values():
-        if not isinstance(text, str) or not text.strip():
+    roots = getattr(team, "_component_roots", None) or []
+    for value in forwarded.values():
+        status, answer, _evidence, _unresolved, _raw = _forwarded_record_parts(value)
+        if status != "COMPLETE":
+            continue  # PARTIAL, BLOCKED (never forwarded), or unknown-provenance legacy text
+        if not answer or not answer.strip():
             continue
-        if _EXPLICIT_INCOMPLETE_INVESTIGATION_RE.search(text):
-            continue  # the Coordinator's own forwarded text admits the investigation was not completed
-        if _text_cites_component(text, root):
-            return True
+        if not _text_cites_component(answer, root, roots):
+            continue
+        if _record_admits_incomplete_investigation_for(answer, root, roots):
+            continue
+        return True
     return False
 
 
@@ -24695,13 +24944,14 @@ def _build_team(
     # gave up and fabricated plausible-sounding hook names instead of
     # waiting or disclosing uncertainty.
     member_result_generation: dict[str, int] = {}
-    # Exact member text captured by forward_member_answer at forward time; bound to
-    # team._forwarded_members below and read by _with_forwarded_evidence. Values are
-    # normally `str` (one forward per member, the pre-T13-fix shape every existing
-    # caller/test assumes); a member forwarded more than once with genuinely different
+    # Captured by forward_member_answer at forward time; bound to team._forwarded_members
+    # below and read by _with_forwarded_evidence / _component_has_accepted_evidence.
+    # Phase 0.60: values are `ForwardedRecord` (status/answer/evidence/unresolved/raw),
+    # not bare `str` -- see ForwardedRecord's own docstring. One forward per member is
+    # the normal shape; a member forwarded more than once with genuinely different
     # content gets an additional "{member}#2"/"#3" key instead of overwriting -- see
     # forward_member_answer's own write site for why.
-    forwarded_members: dict[str, str] = {}
+    forwarded_members: "dict[str, ForwardedRecord]" = {}
     # Phase F -- built from the SAME top-level `task` decompose_first_gate_hook/
     # search_before_browse_gate_hook already receive, unconditionally (unlike those two,
     # this has no team_gate_flags allowlist yet -- it never blocks at all unless `task`
