@@ -17031,6 +17031,94 @@ def _chain_coverage_unresolved_note(components: "list[str]") -> str:
     )
 
 
+# Phase 0.50: the live Phase 0.49 T11 run (task kre0m4jjm) established that a
+# chain-coverage retry can do everything right -- real second delegation,
+# real reads of the previously-uncovered components, a genuinely correct
+# 3,159-char synthesis -- and still be discarded WHOLESALE because its own
+# final paragraph independently hit a second repetition stall. The existing
+# rejection check a few lines below this comment (`_INCOMPLETE_ANSWER_MARKER
+# in retried`) is binary by design, matching every sibling correction
+# function's own all-or-nothing policy -- correct for THEM (see
+# _salvage_resolved_category_section/_sanitize_claim_specific_rejections,
+# which already exist for exactly this reason on _attempt_coverage_correction),
+# but this gate had no equivalent narrow exception of its own. These two
+# helpers are that exception, scoped ONLY to this one function -- never wired
+# into _attempt_integration_correction or _attempt_coverage_correction, per
+# this phase's own explicit "avoid broad changes" instruction.
+_INCOMPLETE_ANSWER_NOTES = (
+    _TRUNCATED_ANSWER_NOTE,
+    _SEMANTIC_STALL_TRUNCATED_NOTE,
+    _INACTIVITY_TIMEOUT_TRUNCATED_NOTE,
+)
+# Below this retained fraction of the pre-note text, a "complete" prefix is
+# not a genuine salvageable section -- it is a short preamble with nothing
+# substantive kept, and failing closed (None) is more honest than adopting a
+# technically-clean but practically-empty fragment.
+_CHAIN_COVERAGE_SALVAGE_MIN_RETENTION = 0.3
+
+
+def _strip_incomplete_answer_note(text: str) -> str:
+    """Removes a single trailing _INCOMPLETE_ANSWER_MARKER-bearing disclosure
+    note (one of _INCOMPLETE_ANSWER_NOTES above), if present as an exact
+    suffix. Every call site that attaches one of these three notes does so
+    via plain string concatenation (`content + note`), never interleaving or
+    rewording it -- confirmed by reading every attachment site in this file
+    -- so an exact trailing-substring match is precise, never a guess at
+    where disclosure prose ends and the model's own text begins. Returns
+    `text` unchanged if none of the three is present as a suffix."""
+    if not text:
+        return text
+    for note in _INCOMPLETE_ANSWER_NOTES:
+        if text.endswith(note):
+            return text[: -len(note)]
+    return text
+
+
+def _salvage_truncated_prefix(text: str) -> "str | None":
+    """The longest leading portion of `text` (with its trailing incomplete-
+    answer note, if any, first removed) that can be kept while still
+    genuinely ending at a natural stopping point -- never completes,
+    guesses, or rewrites anything; this only ever REMOVES trailing material,
+    the same operation Z16's own in-process repetition guard already
+    performs one layer up (keep the confirmed-non-repeat prefix, discard
+    what follows).
+
+    Splits on blank-line-delimited paragraph blocks -- the same granularity
+    _section_for_category/_without_forwarded_members_section already treat
+    as this file's unit of "one piece of the answer" -- and tries the
+    smallest drop first (the trailing block alone), widening one block at a
+    time. A candidate with an odd number of ``` fences is skipped even if it
+    otherwise reads as complete -- it means the cut point fell inside an
+    unfinished code block or route declaration (Phase 0.50 mission Scenario
+    D), which must never be adopted as if it were a finished fragment.
+
+    Returns None -- the caller's existing whole-rejection fallback is then
+    unchanged -- when: `text` is empty once its note is stripped; there is
+    no blank-line paragraph break to cut at (one undifferentiated block, so
+    nothing can be safely separated, mission Scenario F); no candidate ever
+    clears the natural-stopping-point bar; or the first candidate that does
+    retains less than _CHAIN_COVERAGE_SALVAGE_MIN_RETENTION of the original
+    length (a short preamble, not a genuine section worth keeping)."""
+    bare = _strip_incomplete_answer_note(text)
+    if not bare or not bare.strip():
+        return None
+    blocks = re.split(r"\n\s*\n", bare)
+    if len(blocks) < 2:
+        return None
+    total_len = len(bare)
+    for cut in range(1, len(blocks)):
+        candidate = "\n\n".join(blocks[: len(blocks) - cut]).rstrip()
+        if not candidate:
+            break
+        if candidate.count("```") % 2 != 0:
+            continue
+        if _ends_at_a_natural_stopping_point(candidate):
+            if len(candidate) < total_len * _CHAIN_COVERAGE_SALVAGE_MIN_RETENTION:
+                return None
+            return candidate
+    return None
+
+
 async def _attempt_chain_coverage_correction(
         content: str, task: str, team, hive_mcp_url: str | None, hive_mcp_tools,
         liveness_path: str | None = None, synthesis_run: bool = False) -> str:
@@ -17137,25 +17225,61 @@ async def _attempt_chain_coverage_correction(
             and not _ends_at_a_natural_stopping_point(retried):
         retried = retried + _truncation_note_for_reason(_fallback_reason)
 
-    if not retried or not _strip_leaked_tool_tags(retried).strip() \
-            or retried.strip() == _BUDGET_EXHAUSTED_ANSWER \
-            or _INCOMPLETE_ANSWER_MARKER in retried:
+    # Phase 0.50 (Requirement B): recomputed ONCE, right here, from the same
+    # live `log` object -- it already reflects any delegation the retry just
+    # made, whether or not its own PROSE survives what follows below. Every
+    # disclosure return in this function uses THIS value from here on, never
+    # the stale `uncovered_before` snapshot computed before the retry ran
+    # (Phase 0.49's own documented limitation, Section 13 #3: a retry
+    # rejected wholesale must not erase its own real investigation evidence
+    # from the disclosure). `uncovered_before` itself is kept only for the
+    # progress-delta comparison/messaging immediately below, which is a
+    # genuinely different question ("did this retry improve on where it
+    # started") that this recomputation does not change.
+    uncovered_now = _unresolved_chain_components(log, team)
+
+    # Phase 0.50 (Requirement A): before giving up on an incomplete retry
+    # wholesale, try to keep whatever genuinely-complete prefix it has --
+    # see _salvage_truncated_prefix's own docstring. `_salvaged_partial`
+    # tracks whether `retried` below is this salvaged prefix (never ending
+    # naturally on its own, by construction) rather than a clean retry, so
+    # every adoption path further down re-attaches the SAME incomplete-
+    # answer disclosure this retry already earned -- a salvage is never
+    # reported as a complete answer (mission Requirement C).
+    _salvaged_partial = False
+    if _INCOMPLETE_ANSWER_MARKER in retried:
+        salvaged = _salvage_truncated_prefix(retried)
+        if salvaged is None:
+            print("[team] chain-coverage-correction retry produced nothing "
+                  "usable (incomplete, nothing safely salvageable)", flush=True)
+            return content + _chain_coverage_unresolved_note(uncovered_now)
+        print(f"[team] chain-coverage-correction: retry hit a second repetition "
+              f"stall, but {len(salvaged):,} of its {len(retried):,} chars read "
+              f"as a genuinely complete prefix -- salvaging that prefix instead "
+              f"of discarding the whole retry", flush=True)
+        retried = salvaged
+        _salvaged_partial = True
+    elif not retried or not _strip_leaked_tool_tags(retried).strip() \
+            or retried.strip() == _BUDGET_EXHAUSTED_ANSWER:
         print("[team] chain-coverage-correction retry produced nothing usable",
               flush=True)
-        return content + _chain_coverage_unresolved_note(uncovered_before)
+        return content + _chain_coverage_unresolved_note(uncovered_now)
 
     # The decisive check: did this retry actually cause a NEW delegation to be
     # logged for a previously-uncovered component, or did it only talk? `log`
     # is the same list object team._coordinator_delegation_log points at, so
     # any real delegation made during the retry is already reflected in it.
-    uncovered_after = _unresolved_chain_components(log, team)
-    if len(uncovered_after) >= len(uncovered_before):
+    # Unaffected by the salvage above -- this compares delegation-log state,
+    # never the adopted text itself.
+    if len(uncovered_now) >= len(uncovered_before):
         print(f"[team] chain-coverage-correction: retry made no new delegation "
-              f"progress ({len(uncovered_after)} still uncovered, was "
+              f"progress ({len(uncovered_now)} still uncovered, was "
               f"{len(uncovered_before)}) -- keeping original content with an "
               f"unresolved-boundary disclosure", flush=True)
-        return content + _chain_coverage_unresolved_note(uncovered_before)
+        return content + _chain_coverage_unresolved_note(uncovered_now)
 
+    _completion_note = (_truncation_note_for_reason(_fallback_reason)
+                         if _salvaged_partial else "")
     _retried_fab_report, _retried_fab_bad, _ = await _verify_claims(
         retried, hive_mcp_url, hive_mcp_tools,
         op_label="attempt_chain_coverage_correction:retry-recheck", team=team)
@@ -17165,24 +17289,48 @@ async def _attempt_chain_coverage_correction(
             op_label="attempt_chain_coverage_correction:original-recheck", team=team)
         _new_flagged = _flagged_lines_set(_retried_fab_report) - _flagged_lines_set(_pre_report)
         if _new_flagged:
+            # Phase 0.50: a salvaged prefix that introduces a new verify_claims
+            # problem is not automatically worthless either -- reuse the SAME
+            # claim-level isolation _attempt_coverage_correction already uses
+            # for an identical shape (Phase 0.44's own _sanitize_claim_
+            # specific_rejections), rather than discarding the whole salvage
+            # over one bad claim phrase.
+            if _salvaged_partial:
+                _sanitized = _sanitize_claim_specific_rejections(retried, _new_flagged)
+                if _sanitized is not None and _sanitized != retried:
+                    _sanitized_report, _sanitized_bad, _ = await _verify_claims(
+                        _sanitized, hive_mcp_url, hive_mcp_tools,
+                        op_label="attempt_chain_coverage_correction:salvage-sanitized-recheck",
+                        team=team)
+                    _sanitized_new_flagged = (
+                        _flagged_lines_set(_sanitized_report) - _flagged_lines_set(_pre_report))
+                    if not _sanitized_new_flagged:
+                        print(f"[team] chain-coverage-correction: salvaged prefix's "
+                              f"{len(_new_flagged)} new verify_claims problem(s) "
+                              f"isolated and marked unresolved in place -- adopting "
+                              f"the sanitized salvage, disclosure re-attached",
+                              flush=True)
+                        return (_sanitized + _completion_note
+                                + _chain_coverage_unresolved_note(uncovered_now))
             print(f"[team] chain-coverage-correction: retry gained real "
                   f"delegation coverage but introduced new verify_claims "
                   f"problem(s) not already present in content — "
                   f"{sorted(_new_flagged)[:2]} — keeping original content",
                   flush=True)
-            return content + _chain_coverage_unresolved_note(uncovered_before)
+            return content + _chain_coverage_unresolved_note(uncovered_now)
         print(f"[team] chain-coverage-correction: retry's only verify_claims "
               f"problem(s) are ones content already carried unchanged "
               f"({_verdict_digest(_retried_fab_report)}) — adopting, "
               f"disclosure re-attached", flush=True)
-        return (retried + _flagged_draft_note(_retried_fab_report)
-                + _chain_coverage_unresolved_note(uncovered_after))
+        return (retried + _flagged_draft_note(_retried_fab_report) + _completion_note
+                + _chain_coverage_unresolved_note(uncovered_now))
 
     print(f"[team] chain-coverage-correction: retry gained real delegation "
-          f"coverage of {len(uncovered_before) - len(uncovered_after)} "
+          f"coverage of {len(uncovered_before) - len(uncovered_now)} "
           f"previously-uncovered component(s) and passes verify_claims -- "
-          f"adopting", flush=True)
-    return retried + _chain_coverage_unresolved_note(uncovered_after)
+          f"adopting{' (salvaged partial prefix, disclosed as incomplete)' if _salvaged_partial else ''}",
+          flush=True)
+    return retried + _completion_note + _chain_coverage_unresolved_note(uncovered_now)
 
 
 # T36 Track C (2026-10-19 battery, T11): a cross-service tracing task asked "which
