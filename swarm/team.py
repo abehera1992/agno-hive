@@ -2097,18 +2097,44 @@ def _build_member_result(raw_text: str) -> MemberResult:
 
     # Both notices, when present, are appended at the very tail of the raw text, in this
     # fixed order (_record_stream_artifacts: thin-report first, then the declaration index)
-    # -- so truncating at the EARLIEST marker's position removes both in one step, and
-    # everything from there to the end (both, if both are present) is kept verbatim as one
-    # combined `unresolved` entry rather than pulled apart, which would need to assume more
-    # about their internal shape than this phase needs to.
-    positions = [p for p in (raw.find(_THIN_REPORT_MARKER), raw.find(_DECLARATION_INDEX_MARKER))
-                if p != -1]
+    # -- so truncating at the EARLIEST marker's position removes both from `answer` in one
+    # step, regardless of which one (or both) is present.
+    #
+    # Phase 0.61 (Track B): `unresolved`, below, is populated ONLY from the thin-report
+    # marker onward, never from a stand-alone declaration index. Before this phase, ANY
+    # marker being present populated `unresolved` identically -- but the declaration
+    # index (_declaration_index_block) is routine, per-delegation tooling metadata
+    # ("extracted from the tool output by code... if the report above enumerates fewer
+    # than this list does, THIS list is the complete one"), not a signal that the
+    # investigation itself was flagged incomplete; it is attached whenever ANY file read
+    # that delegation had indexable declarations, which is common on a perfectly
+    # thorough report. Confirmed possible before this fix: a report with a declaration
+    # index but no thin-report flag produced `status="COMPLETE"` together with a
+    # NON-EMPTY `unresolved` -- a real, demonstrated violation of the invariant "COMPLETE
+    # implies unresolved is empty" at the construction level, investigated (not merely
+    # assumed) because Phase 0.60's own `ForwardedRecord.unresolved` now carries this
+    # value past forwarding. No downstream consumer currently branches on `unresolved`'s
+    # non-emptiness for acceptance purposes (confirmed by direct search), so this never
+    # caused an actual wrong-acceptance bug live -- but leaving the invariant merely
+    # true-by-accident, rather than true by construction, was an unnecessary latent risk
+    # for any future caller that DOES start reading it. This is the narrowest fix: stop
+    # mislabeling benign tooling metadata as an incompleteness notice at its one
+    # construction site, rather than adding a second, redundant check downstream.
+    thin_pos = raw.find(_THIN_REPORT_MARKER)
+    decl_pos = raw.find(_DECLARATION_INDEX_MARKER)
+    positions = [p for p in (thin_pos, decl_pos) if p != -1]
     unresolved = []
     body = raw
     if positions:
         cut = min(positions)
-        unresolved = [raw[cut:].strip()]
         body = raw[:cut].rstrip()
+        if thin_pos != -1:
+            # Captures the thin-report notice, and the declaration index too if it
+            # follows (same combined-entry shape as before this phase, for the one
+            # case where that combination is a genuine incompleteness signal).
+            unresolved = [raw[thin_pos:].strip()]
+        # else: only the declaration index was present -- already cut out of `body`
+        # above, but not recorded as an "unresolved" notice.
 
     evidence = sorted(set(_RELAY_FILENAME_RE.findall(raw)))
     answer = _strip_member_narration(body).strip()
@@ -2117,7 +2143,7 @@ def _build_member_result(raw_text: str) -> MemberResult:
         # thin-report flag with no prose at all. Genuinely nothing to hand a reader.
         return MemberResult(status="BLOCKED", answer="", evidence=evidence,
                             unresolved=unresolved, raw=raw)
-    status = "PARTIAL" if _THIN_REPORT_MARKER in raw else "COMPLETE"
+    status = "PARTIAL" if thin_pos != -1 else "COMPLETE"
     return MemberResult(status=status, answer=answer, evidence=evidence,
                         unresolved=unresolved, raw=raw)
 
@@ -17926,6 +17952,19 @@ async def _attempt_chain_coverage_correction(
         f"you cannot resolve one, say it remains unresolved rather than filling "
         f"it in. Do not discard or rewrite content about components you already "
         f"covered correctly.\n\n"
+        f"Once a new delegation returns a real result, call forward_member_answer "
+        f"for it before writing anything else about it -- do not describe or "
+        f"summarize a new finding from memory instead of forwarding it. Phase "
+        f"0.61 (T11): live-confirmed exact failure this closes -- a prior run's "
+        f"Researcher genuinely read storage-service's own upload endpoint "
+        f"(get_file_content succeeded, real declarations indexed), but the "
+        f"Coordinator never called forward_member_answer a second time for that "
+        f"new result and instead narrated it from memory, in the process "
+        f"inventing two services (an 'Auth Service' and an 'Onboarding Service') "
+        f"that do not exist in this repository -- verify_claims correctly "
+        f"rejected the fabrication, discarding the real storage-service finding "
+        f"along with it. Forwarding the real result directly avoids both the "
+        f"loss and the fabrication risk.\n\n"
         f"── Your previous answer ──\n{_without_forwarded_members_section(content)}\n"
         f"── end of your previous answer ──"
     )
