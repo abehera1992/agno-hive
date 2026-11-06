@@ -17781,6 +17781,9 @@ def _strip_incomplete_answer_note(text: str) -> str:
 _LIST_ITEM_BOUNDARY_RE = re.compile(r"\n(?=[ \t]*(?:\d+[.)]\s|[-*]\s))")
 
 
+_DANGLING_LABEL_COLON_RE = re.compile(r":[*_]{0,2}\s*$")
+
+
 def _list_item_candidate_is_safe(candidate: str) -> bool:
     """Whether a list-item-boundary candidate (see
     _salvage_truncated_prefix_at_list_item) is safe to adopt.
@@ -17799,9 +17802,27 @@ def _list_item_candidate_is_safe(candidate: str) -> bool:
     _ends_at_a_natural_stopping_point exists to catch that CAN still
     apply here -- a trailing ellipsis, or the model's own still-open
     stated intent -- are checked directly instead, reusing
-    _ends_with_unfinished_intent unmodified."""
+    _ends_with_unfinished_intent unmodified.
+
+    Phase 0.63 (Track C): a third risk is specific to THIS splitter and
+    has no analogue in the blank-line one. _LIST_ITEM_BOUNDARY_RE treats
+    a NESTED bullet as its own split item, same as a top-level one --
+    confirmed live against the exact Phase 0.61 reproduction: dropping
+    only the broken trailing nested bullet ("- Registers the document
+    <cut>") left a candidate ending at its own PARENT item's bare label
+    ("5. Business Service:"), which this check previously accepted
+    outright -- a heading/label whose own promised content was entirely
+    dropped along with its one broken child, not a complete item. Any
+    candidate whose own last line ends in a bare colon (optionally
+    wrapped in markdown bold/italic markers, e.g. "**Business Service:**")
+    is rejected on the same reasoning Track C's mission states directly:
+    a colon introducing content that never appears is never safe to
+    retain, regardless of which line it's on."""
     tail = candidate.rstrip()
     if not tail or tail.endswith("..."):
+        return False
+    last_line = tail.rsplit("\n", 1)[-1]
+    if _DANGLING_LABEL_COLON_RE.search(last_line):
         return False
     return not _ends_with_unfinished_intent(candidate)
 
