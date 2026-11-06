@@ -7525,8 +7525,8 @@ def _make_coordinator_progress_guard_hook():
     the liveness watchdog's timeout or threshold, and not a block on THIS call (which
     has already executed and returned by the time the force is applied -- a repeat
     that already landed is still delivered to the model normally; only the NEXT call
-    is affected). One-shot per run (mirrors _REPETITION_COMPLETION_FLAG's own
-    discipline): once forced, stays forced -- a model that is still generating after
+    is affected). One-shot per run (mirrors _REPETITION_COMPLETION_OPS_ATTR's own
+    per-op one-shot discipline, Phase 0.54): once forced, stays forced -- a model that is still generating after
     being told to answer now gets no further escalation from this hook, since
     _force_text_only already blocks every further tool call on its own.
 
@@ -8319,7 +8319,65 @@ async def _reask_after_syntax_loss(content: str, task: str, team, all_results,
     return adopted, adopted_result
 
 
-_REPETITION_COMPLETION_FLAG = "_repetition_completion_attempted"
+# Phase 0.54 (recovery-budget isolation): replaced the single run-wide
+# boolean this constant used to name (`_repetition_completion_attempted`,
+# removed -- grep finds no remaining reader) that meant
+# "one completion attempt per run, no matter which guard needed it" -- live-
+# confirmed incident (T13a, 2026-11-06): the Coordinator's own unrelated
+# first-pass narration stall spent this budget before coverage-correction's
+# retry ever got truncated, so coverage-correction's own call silently
+# became a no-op -- it returned its (correct, evidence-backed) truncated
+# text completely UNCHANGED, with no disclosure of its own, because it
+# never got to attempt anything. The caller then treated the later-attached
+# generic incomplete-answer note as proof the correction had failed and
+# discarded 2,688 chars of correct, verified content.
+#
+# Fix: the budget is now owned per NAMED recovery operation (the five fixed
+# call sites below), not globally. Each name gets exactly one attempt per
+# run -- still fully bounded (the set of valid names is fixed and finite;
+# nothing can mint a new one), but an unrelated operation's own stall can
+# no longer consume an operation it was never part of. `op_id` is a
+# required keyword-only argument on _complete_repetition_truncated_answer
+# specifically so a future caller cannot accidentally omit it and fall back
+# to a shared default that reintroduces this same cross-site interference.
+_REPETITION_COMPLETION_OPS_ATTR = "_repetition_completion_attempted_ops"
+_RECOVERY_OP_VERIFIED_ANSWER = "verified_answer"
+_RECOVERY_OP_EVIDENCE_INTEGRITY = "evidence_integrity"
+_RECOVERY_OP_COVERAGE_CORRECTION = "coverage_correction"
+_RECOVERY_OP_INTEGRATION_CORRECTION = "integration_correction"
+_RECOVERY_OP_CHAIN_COVERAGE_CORRECTION = "chain_coverage_correction"
+
+# Phase 0.54 (explicit completion-outcome contract): replaces inferring
+# "did a model call actually happen, and did it help" from string-identity
+# tricks (`retried == pre_completion`) or from the mere presence of the
+# shared incomplete-answer marker -- both of which conflate "attempted and
+# failed" with "never attempted because the budget was already spent
+# elsewhere," exactly the conflation that discarded the correct T13a
+# content. Every return point in _complete_repetition_truncated_answer now
+# reports exactly one of these; every caller receives it as this function's
+# third return value instead of re-deriving a weaker proxy for the same
+# fact.
+_RECOVERY_OUTCOME_NOT_REQUIRED = "not_required"
+_RECOVERY_OUTCOME_SKIPPED_BUDGET_EXHAUSTED = "skipped_budget_exhausted"
+_RECOVERY_OUTCOME_SKIPPED_NO_EVIDENCE = "skipped_no_evidence"
+_RECOVERY_OUTCOME_COMPLETED = "completed"
+_RECOVERY_OUTCOME_TRUNCATED = "truncated"
+_RECOVERY_OUTCOME_FAILED = "failed"
+_RECOVERY_OUTCOMES_NO_MODEL_CALL = frozenset({
+    _RECOVERY_OUTCOME_NOT_REQUIRED,
+    _RECOVERY_OUTCOME_SKIPPED_BUDGET_EXHAUSTED,
+    _RECOVERY_OUTCOME_SKIPPED_NO_EVIDENCE,
+})
+
+
+def _recovery_outcome_had_model_call(outcome: str) -> bool:
+    """True iff `outcome` (one of the _RECOVERY_OUTCOME_* constants above)
+    implies _complete_repetition_truncated_answer actually issued its own
+    nested _stream_team_run call, as opposed to returning early without
+    ever asking the model for anything."""
+    return outcome not in _RECOVERY_OUTCOMES_NO_MODEL_CALL
+
+
 # Phase 0.13: shared substring every incomplete-answer disclosure note below
 # contains, regardless of which cause produced it -- every existing
 # `_TRUNCATED_ANSWER_NOTE in X` / `not in X` containment check in this file
@@ -8691,7 +8749,8 @@ _NO_EVIDENCE_RECOVERY_DISCLOSURE = (
 async def _complete_repetition_truncated_answer(content: str, task: str, team, all_results,
                                                  result, liveness_path: str | None,
                                                  hive_mcp_url: str | None = None,
-                                                 hive_mcp_tools=None):
+                                                 hive_mcp_tools=None, *,
+                                                 op_id: str):
     """One bounded completion pass when a generation was cut off before it reached
     a conclusion -- Z16's textual repetition guard, or (T58) _stream_team_run's
     semantic-stall guard; see truncation_reason below for how the two are told
@@ -8774,7 +8833,7 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
     was_repetition = getattr(team, "_repetition_truncated", False)
     was_semantic_stall = getattr(team, "_semantic_stall_truncated", False)
     if not was_repetition and not was_semantic_stall:
-        return content, result
+        return content, result, _RECOVERY_OUTCOME_NOT_REQUIRED
     # Phase 0.13: snapshot the full 3-way reason (including the provenance
     # label distinguishing T58's semantic stall from Phase 0.11's inactivity
     # timeout, which share the _semantic_stall_truncated boolean) BEFORE
@@ -8784,9 +8843,20 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
     setattr(team, "_repetition_truncated", False)
     setattr(team, "_semantic_stall_truncated", False)
     setattr(team, "_stall_truncation_kind", None)
-    if getattr(team, _REPETITION_COMPLETION_FLAG, False):
-        return content, result
-    setattr(team, _REPETITION_COMPLETION_FLAG, True)
+    # Phase 0.54: budget is owned per-op (see _REPETITION_COMPLETION_OPS_ATTR's
+    # own module-level comment for the live incident this replaces) -- an
+    # unrelated op_id spending its own attempt no longer consumes this one's.
+    _attempted_ops = getattr(team, _REPETITION_COMPLETION_OPS_ATTR, None)
+    if not isinstance(_attempted_ops, set):
+        _attempted_ops = set()
+        setattr(team, _REPETITION_COMPLETION_OPS_ATTR, _attempted_ops)
+    if op_id in _attempted_ops:
+        print(f"[team] {truncation_reason}-truncation completion skipped for "
+              f"op_id={op_id!r} -- this operation's own one-shot recovery "
+              f"budget was already spent earlier in this run; returning the "
+              f"truncated text unchanged with no model call", flush=True)
+        return content, result, _RECOVERY_OUTCOME_SKIPPED_BUDGET_EXHAUSTED
+    _attempted_ops.add(op_id)
 
     # Phase 0.44 (T11 no-evidence recovery invariant): if NOTHING currently
     # gathered this run answers the task -- the run's delegation(s) have not
@@ -8809,7 +8879,7 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
               f"(delegation not finished, or only a stale earlier-generation "
               f"answer is stored); disclosing incomplete research rather than "
               f"asking the model to synthesize without evidence", flush=True)
-        return content + _NO_EVIDENCE_RECOVERY_DISCLOSURE, result
+        return content + _NO_EVIDENCE_RECOVERY_DISCLOSURE, result, _RECOVERY_OUTCOME_SKIPPED_NO_EVIDENCE
 
     # T12-FOLLOWUP (2026-10-03): _checkpoint_block(team) is the SAME re-injection
     # every other retry/reconciliation path in this file already uses (the
@@ -8876,7 +8946,7 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
     except Exception as exc:  # noqa: BLE001
         print(f"[team] repetition-truncation completion failed: {exc} — keeping the "
               f"truncated draft", flush=True)
-        return content + _truncation_note_for_reason(truncation_reason), result
+        return content + _truncation_note_for_reason(truncation_reason), result, _RECOVERY_OUTCOME_FAILED
     finally:
         team.tool_hooks = _original_tool_hooks
     # T12-FOLLOWUP: the _stream_team_run call just above can ITSELF trip its own
@@ -8922,10 +8992,10 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
             print(f"[team] {truncation_reason}-truncation completion returned "
                   f"nothing, but the pre-repeat draft already reads as complete "
                   f"— not disclosing it as incomplete", flush=True)
-            return content, result
+            return content, result, _RECOVERY_OUTCOME_COMPLETED
         print(f"[team] {truncation_reason}-truncation completion returned "
               f"nothing — keeping the truncated draft", flush=True)
-        return content + _truncation_note_for_reason(effective_reason), result
+        return content + _truncation_note_for_reason(effective_reason), result, _RECOVERY_OUTCOME_TRUNCATED
 
     adopted, adopted_result = _adopt_retry(
         "repetition-completion", content, result, completed, retry, team=team,
@@ -8938,11 +9008,11 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
             print(f"[team] {truncation_reason}-truncation completion was not more "
                   f"grounded, but the pre-repeat draft already reads as complete "
                   f"— not disclosing it as incomplete", flush=True)
-            return content, result
+            return content, result, _RECOVERY_OUTCOME_COMPLETED
         print(f"[team] {truncation_reason}-truncation completion was not more "
               f"grounded than the truncated draft — keeping the draft, disclosed "
               f"as incomplete", flush=True)
-        return content + _truncation_note_for_reason(effective_reason), result
+        return content + _truncation_note_for_reason(effective_reason), result, _RECOVERY_OUTCOME_TRUNCATED
     # PHASE N / TRACK A (2026-10-03): the prompt above tells the model it is
     # CONTINUING `content`, not replacing it -- but until now, once `completed`
     # cleared the grounding bar, it alone became the WHOLE returned answer,
@@ -8977,7 +9047,7 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
                   f"required continuation marker, but the pre-repeat draft "
                   f"already reads as complete — not disclosing it as incomplete",
                   flush=True)
-            return content, result
+            return content, result, _RECOVERY_OUTCOME_COMPLETED
         print(f"[team] {truncation_reason}-truncation completion lacked the "
               f"required continuation marker -- it cannot be safely identified "
               f"as a continuation, so it is not appended or adopted — keeping "
@@ -8985,7 +9055,7 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
         # content.rstrip() on empty/falsy `content` is "", so this is still a
         # real, non-empty disclosure even with no original draft to preserve --
         # never an empty answer merely because the marker is missing.
-        return content.rstrip() + _RECOVERY_CONTINUATION_REJECTED_NOTE, result
+        return content.rstrip() + _RECOVERY_CONTINUATION_REJECTED_NOTE, result, _RECOVERY_OUTCOME_TRUNCATED
     combined = f"{content.rstrip()}\n\n{continuation}" if content.strip() else continuation
     # Phase 0.35 (P0): the structural evidence gate, immediately before adoption.
     # `_adopt_retry` below only compares READ COUNTS -- on this team shape the
@@ -9024,18 +9094,18 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
                   f"{_new_claim_report.splitlines()[-1] if _new_claim_report else ''}",
                   flush=True)
             if _ends_at_a_natural_stopping_point(content):
-                return content, result
-            return content.rstrip() + _RECOVERY_CONTINUATION_UNSUPPORTED_NOTE, result
+                return content, result, _RECOVERY_OUTCOME_COMPLETED
+            return content.rstrip() + _RECOVERY_CONTINUATION_UNSUPPORTED_NOTE, result, _RECOVERY_OUTCOME_TRUNCATED
     if nested_truncation:
         print(f"[team] {truncation_reason}-truncation completion was itself cut "
               f"short by a second stall/repetition ({nested_reason}) — adopting "
               f"it but disclosing it as still incomplete rather than shipping it "
               f"silently", flush=True)
-        return combined + _truncation_note_for_reason(nested_reason), adopted_result
+        return combined + _truncation_note_for_reason(nested_reason), adopted_result, _RECOVERY_OUTCOME_TRUNCATED
     print(f"[team] {truncation_reason}-truncation completion adopted "
           f"({len(continuation):,} chars of marked continuation) — preserving "
           f"{len(content):,} pre-repeat chars alongside it", flush=True)
-    return combined, adopted_result
+    return combined, adopted_result, _RECOVERY_OUTCOME_COMPLETED
 
 
 # ============================================================================
@@ -10174,10 +10244,14 @@ async def _evidence_integrity_check(
     # judging the truncated text purely by whether a contradiction remains
     # in it.
     #
-    # Deliberately reuses _REPETITION_COMPLETION_FLAG, the SAME one-shot
-    # budget _verified_answer's own upfront call already spends from, not a
-    # second, parallel completion budget -- at most one repetition
-    # -completion pass happens per run, whichever stage needs it first.
+    # Phase 0.54: passes its own op_id (_RECOVERY_OP_EVIDENCE_INTEGRITY), a
+    # budget scoped to THIS guard alone -- no longer the single run-wide
+    # budget _verified_answer's own upfront call used to share with every
+    # other guard in this file. That sharing was the live incident Phase
+    # 0.54 fixes: an unrelated earlier stall (there, the Coordinator's own
+    # pre-delegation narration) could spend the one shared budget before
+    # this guard -- or coverage-correction's own retry -- ever got a chance
+    # to use it. Each named guard now gets exactly one attempt of its own.
     # `result=None`/a throwaway list are safe here: _count_read_calls
     # treats a None result as "undeterminable" (its own documented
     # fallback, always-adopt), and this function has no `result` object of
@@ -10191,20 +10265,21 @@ async def _evidence_integrity_check(
     # discipline as _complete_repetition_truncated_answer's own entry check.
     _fallback_reason = _current_truncation_reason(team)
     was_truncated = _fallback_reason is not None
-    pre_completion = retried
-    retried, _ = await _complete_repetition_truncated_answer(
+    retried, _, _completion_outcome = await _complete_repetition_truncated_answer(
         retried, task, team, [], None, liveness_path,
-        hive_mcp_url=hive_mcp_url, hive_mcp_tools=hive_mcp_tools)
-    if (was_truncated and retried == pre_completion
+        hive_mcp_url=hive_mcp_url, hive_mcp_tools=hive_mcp_tools,
+        op_id=_RECOVERY_OP_EVIDENCE_INTEGRITY)
+    if (was_truncated and _completion_outcome == _RECOVERY_OUTCOME_SKIPPED_BUDGET_EXHAUSTED
             and _INCOMPLETE_ANSWER_MARKER not in retried
             and not _ends_at_a_natural_stopping_point(retried)):
-        # _complete_repetition_truncated_answer's own one-shot budget had
-        # already been spent by an earlier stage in this same run -- it
-        # returned this truncated text completely unchanged, without its
-        # own usual incomplete-disclosure note, because it never got to
-        # attempt a completion at all. Add that disclosure here so this
-        # still-incomplete candidate is never mistaken for a finished one
-        # by the checks below.
+        # Phase 0.54: this op's own one-shot budget had already been spent
+        # by an earlier stage in this same run -- _complete_repetition_
+        # truncated_answer returned this truncated text completely
+        # unchanged, without its own usual incomplete-disclosure note,
+        # because it never got to attempt a completion at all (explicit
+        # outcome, not inferred from string identity as before). Add that
+        # disclosure here so this still-incomplete candidate is never
+        # mistaken for a finished one by the checks below.
         retried = retried + _truncation_note_for_reason(_fallback_reason)
     if _INCOMPLETE_ANSWER_MARKER in retried:
         print("[team] evidence-integrity: retry remains repetition-truncated "
@@ -10402,9 +10477,10 @@ async def _verified_answer(content: str, task: str, team, hive_mcp_url: str | No
     # model's own voluntary verify_claims call during generation had already checked
     # the identical, not-yet-truncated-looking string). Completing first means
     # verify_claims only ever examines finished text.
-    content, result = await _complete_repetition_truncated_answer(
+    content, result, _ = await _complete_repetition_truncated_answer(
         content, task, team, all_results, result, liveness_path,
-        hive_mcp_url=hive_mcp_url, hive_mcp_tools=hive_mcp_tools)
+        hive_mcp_url=hive_mcp_url, hive_mcp_tools=hive_mcp_tools,
+        op_id=_RECOVERY_OP_VERIFIED_ANSWER)
     # Before any guard looks at the draft: if a member's report was lost to the tool-call
     # syntax leak, get it back. A guard chain reasoning about an answer written without
     # findings that ARE recoverable is measuring the wrong artefact.
@@ -16753,17 +16829,36 @@ async def _attempt_coverage_correction(
     # discipline as the evidence-integrity guard's own fallback above.
     _fallback_reason = _current_truncation_reason(team)
     was_truncated = _fallback_reason is not None
-    retried, _ = await _complete_repetition_truncated_answer(
+    retried, _, _completion_outcome = await _complete_repetition_truncated_answer(
         retried, task, team, [], None, liveness_path,
-        hive_mcp_url=hive_mcp_url, hive_mcp_tools=hive_mcp_tools)
-    if was_truncated and _INCOMPLETE_ANSWER_MARKER not in retried \
-            and not _ends_at_a_natural_stopping_point(retried):
+        hive_mcp_url=hive_mcp_url, hive_mcp_tools=hive_mcp_tools,
+        op_id=_RECOVERY_OP_COVERAGE_CORRECTION)
+    # Phase 0.54 (live incident, T13a 2026-11-06): this op's own completion
+    # budget was spent earlier in the SAME run by an unrelated stall (the
+    # Coordinator's own pre-delegation narration), so this call above was a
+    # no-op -- `retried` came back completely unchanged, with no disclosure
+    # of its own. Only THIS specific outcome gets the generic note attached
+    # here; a genuine completed/truncated/failed outcome already carries
+    # its own correct disclosure inline (or none, if it finished cleanly).
+    if (was_truncated and _completion_outcome == _RECOVERY_OUTCOME_SKIPPED_BUDGET_EXHAUSTED
+            and _INCOMPLETE_ANSWER_MARKER not in retried
+            and not _ends_at_a_natural_stopping_point(retried)):
         retried = retried + _truncation_note_for_reason(_fallback_reason)
 
+    # Phase 0.54: only genuinely empty/placeholder output is rejected here.
+    # The OLD gate also rejected on `_INCOMPLETE_ANSWER_MARKER in retried` --
+    # exactly the defect this phase fixes: that marker means "this text may
+    # end mid-sentence," not "this text is wrong." The live incident lost
+    # 2,688 chars of correct, verified endpoint/hook/gap analysis this way,
+    # discarded for nothing more than a trailing clause. A truncated-but-
+    # substantive candidate must clear the SAME evidence bar below
+    # (verify_claims against the original) as any other candidate --
+    # sentence-ending punctuation is never allowed to be the deciding
+    # factor, per this phase's own mandate.
     if not retried or not _strip_leaked_tool_tags(retried).strip() \
-            or retried.strip() == _BUDGET_EXHAUSTED_ANSWER \
-            or _INCOMPLETE_ANSWER_MARKER in retried:
-        print("[team] coverage-correction retry produced nothing usable", flush=True)
+            or retried.strip() == _BUDGET_EXHAUSTED_ANSWER:
+        print(f"[team] coverage-correction retry produced nothing usable "
+              f"(completion outcome={_completion_outcome!r})", flush=True)
         return content + disclosure + _COVERAGE_RECONCILIATION_UNRESOLVED_NOTE
 
     _retried_fab_report, _retried_fab_bad, _ = await _verify_claims(
@@ -16822,8 +16917,9 @@ async def _attempt_coverage_correction(
               f"re-attached", flush=True)
         return retried + _flagged_draft_note(_retried_fab_report) + disclosure
 
-    print("[team] coverage-correction: retry reconciled against the new evidence "
-          "and passes verify_claims -- adopting", flush=True)
+    print(f"[team] coverage-correction: retry reconciled against the new evidence "
+          f"and passes verify_claims -- adopting (completion outcome="
+          f"{_completion_outcome!r})", flush=True)
     return retried + disclosure
 
 
@@ -16899,9 +16995,18 @@ async def _attempt_integration_correction(
     # discipline as the evidence-integrity guard's own fallback above.
     _fallback_reason = _current_truncation_reason(team)
     was_truncated = _fallback_reason is not None
-    retried, _ = await _complete_repetition_truncated_answer(
+    # Phase 0.54: op_id scopes this guard's own one-shot completion budget
+    # separately from every other recovery site (see
+    # _REPETITION_COMPLETION_OPS_ATTR's module-level comment) -- unpacking
+    # only; this function's own adoption policy (reject wholesale on the
+    # incomplete-answer marker) is intentionally left unchanged here, same
+    # "smallest safe change" scoping Phase 0.50 used when it fixed only
+    # _attempt_chain_coverage_correction's sibling adoption path and not
+    # this one.
+    retried, _, _completion_outcome = await _complete_repetition_truncated_answer(
         retried, task, team, [], None, liveness_path,
-        hive_mcp_url=hive_mcp_url, hive_mcp_tools=hive_mcp_tools)
+        hive_mcp_url=hive_mcp_url, hive_mcp_tools=hive_mcp_tools,
+        op_id=_RECOVERY_OP_INTEGRATION_CORRECTION)
     if was_truncated and _INCOMPLETE_ANSWER_MARKER not in retried \
             and not _ends_at_a_natural_stopping_point(retried):
         retried = retried + _truncation_note_for_reason(_fallback_reason)
@@ -16909,7 +17014,8 @@ async def _attempt_integration_correction(
     if not retried or not _strip_leaked_tool_tags(retried).strip() \
             or retried.strip() == _BUDGET_EXHAUSTED_ANSWER \
             or _INCOMPLETE_ANSWER_MARKER in retried:
-        print("[team] integration-correction retry produced nothing usable", flush=True)
+        print(f"[team] integration-correction retry produced nothing usable "
+              f"(completion outcome={_completion_outcome!r})", flush=True)
         return content + finding
 
     recheck = await _integration_mechanism_missing(task, retried, hive_mcp_url, hive_mcp_tools)
@@ -17255,9 +17361,14 @@ async def _attempt_chain_coverage_correction(
     # completion attempt for THAT text, not a second delegation opportunity.
     _fallback_reason = _current_truncation_reason(team)
     was_truncated = _fallback_reason is not None
-    retried, _ = await _complete_repetition_truncated_answer(
+    # Phase 0.54: op_id scopes this guard's own one-shot completion budget
+    # separately from every other recovery site; its own Phase 0.50 salvage
+    # policy (_salvage_truncated_prefix, below) is intentionally left
+    # unchanged -- unpacking only, same "smallest safe change" scoping.
+    retried, _, _completion_outcome = await _complete_repetition_truncated_answer(
         retried, task, team, [], None, liveness_path,
-        hive_mcp_url=hive_mcp_url, hive_mcp_tools=hive_mcp_tools)
+        hive_mcp_url=hive_mcp_url, hive_mcp_tools=hive_mcp_tools,
+        op_id=_RECOVERY_OP_CHAIN_COVERAGE_CORRECTION)
     if was_truncated and _INCOMPLETE_ANSWER_MARKER not in retried \
             and not _ends_at_a_natural_stopping_point(retried):
         retried = retried + _truncation_note_for_reason(_fallback_reason)
