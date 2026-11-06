@@ -1793,6 +1793,13 @@ class ClarificationOption(BaseModel):
 # so the MCP name-allowlist in _scope_coordinator_tools does not apply to it -- it is
 # attached beside request_clarification and gated on the DB grant instead.
 FORWARD_MEMBER_ANSWER_TOOL = "forward_member_answer"
+# Phase 0.63.2: the SQLite-gated name _patched_agno_get_delegate_task_function
+# below checks via team_config.get_extra_tools(team_name, "Coordinator"),
+# replacing the previous unconditional isinstance(team, _StructuredDelegationTeam)
+# grant -- see that function's own docstring for why SQLite now authoritatively
+# decides WHO receives the structured wrap, even though the interception
+# MECHANISM itself (patching Agno's module-level function) is unchanged.
+DELEGATE_STRUCTURED_TASK_TOOL = "delegate_structured_task"
 
 
 def _squash_ws(text: str) -> str:
@@ -24747,6 +24754,12 @@ class _StructuredDelegationTeam(Team):
     `super()` call would itself route through the now-patched `_default_tools.
     _get_delegate_task_function`, which already returns the structured tool -- wrapping
     it a second time).
+
+    Phase 0.63.2 (2026-11-06): this isinstance check is now a SCOPE LIMITER, not the
+    sole gate -- it only confirms "this is one of this codebase's own teams" before
+    _patched_agno_get_delegate_task_function additionally checks SQLite
+    (team_role_tools, role 'Coordinator') for an explicit grant. Both conditions must
+    hold; neither alone is sufficient any more.
     """
 
 
@@ -24771,9 +24784,41 @@ def _patched_agno_get_delegate_task_function(team, *args, **kwargs):
     Same signature and call shape as the function it replaces (`team` first, everything
     else forwarded through unchanged) -- this is what makes it transparent to both of
     agno's own call sites (see _StructuredDelegationTeam's docstring). Builds agno's
-    real tool first, always -- then, ONLY for this codebase's own Coordinator team,
-    wraps it into the structured contract. Every other Team instance (any other agno
-    user of this same installed package) gets agno's original, completely untouched.
+    real tool first, always -- then, ONLY when SQLite's team_role_tools explicitly
+    grants DELEGATE_STRUCTURED_TASK_TOOL to this team's Coordinator role, wraps it
+    into the structured contract. Every other Team instance (any other agno user of
+    this same installed package, or an AgnoHive team this grant was deliberately NOT
+    seeded for) gets agno's original, completely untouched.
+
+    Phase 0.63.2 (2026-11-06): the gate changed from a bare
+    `isinstance(team, _StructuredDelegationTeam)` (every AgnoHive team,
+    unconditionally) to this SQLite lookup, keyed by `team._agnohive_team_name`
+    (stashed by _build_team right after construction -- see that call site).
+    `isinstance` is KEPT as a scope limiter, not removed: it still confirms this
+    is one of this codebase's own teams before even attempting the DB-backed
+    lookup, so an isinstance check and a SQLite check are both satisfied, not
+    one replacing the other. `team_config.get_extra_tools` is the exact same
+    cached, sync, cache-only function forward_member_answer's own grant check
+    already uses (team_config.ensure_cache_loaded() is guaranteed to have run
+    before _build_team on every real request path) -- no new DB access pattern,
+    no new caching mechanism. A team with no `_agnohive_team_name` attribute
+    (never built by this codebase's own _build_team) or no matching SQLite row
+    gets agno's original tool, unwrapped -- fails closed to the SAME behavior
+    installing this patch at all would have, had the grant never existed.
+
+    This migration intentionally keeps the interception MECHANISM (patching
+    Agno's own module-level function) in place: Agno 2.5.17 provides no other
+    extension point for customizing per-call delegation-tool construction --
+    confirmed by source read, `_get_delegate_task_function` requires
+    run_response/session/run_context/team_run_context, none of which exist
+    before a run starts, so the result cannot be pre-built once at
+    _build_team()-time and cached as a static Function the way
+    forward_member_answer is; and a Team-subclass method override of this
+    same name is confirmed DEAD CODE in this exact Agno version (Phase S.1,
+    see _StructuredDelegationTeam's own docstring) since agno's real call
+    sites re-resolve the free function by module import on every call, never
+    via polymorphic dispatch. What Phase 0.63.2 removes is the UNCONDITIONAL
+    grant; SQLite is now the actual authority over WHO the wrap applies to.
 
     Phase T15 (2026-10-04): also stashes the SAME `team_run_context` dict agno just
     built for this call onto `team` itself, as `team._t15_team_run_context`. agno
@@ -24795,7 +24840,14 @@ def _patched_agno_get_delegate_task_function(team, *args, **kwargs):
             pass
     original_function = _ORIGINAL_AGNO_GET_DELEGATE_TASK_FUNCTION(team, *args, **kwargs)
     if isinstance(team, _StructuredDelegationTeam):
-        return _build_structured_delegation_tool(original_function, team)
+        _team_name = getattr(team, "_agnohive_team_name", None)
+        try:
+            _granted = DELEGATE_STRUCTURED_TASK_TOOL in set(
+                team_config.get_extra_tools(_team_name or "", "Coordinator"))
+        except Exception:  # noqa: BLE001 -- a lookup bug must never block delegation entirely
+            _granted = False
+        if _granted:
+            return _build_structured_delegation_tool(original_function, team)
     return original_function
 
 
@@ -25423,6 +25475,13 @@ def _build_team(
     # some other path (or a test double) simply has no attribute, which the reader
     # treats as "unknown" rather than "did not delegate" -- same -1-is-not-zero rule
     # _count_read_calls follows.
+    # Phase 0.63.2: lets _patched_agno_get_delegate_task_function look up this
+    # team's own SQLite grant later, during a run, when all it has is `team`
+    # itself -- the `team_name` closure variable _build_team holds right now
+    # is gone by then. Attribute, not a constructor kwarg: Team(...) has no
+    # such parameter, and this mirrors team._delegation_state immediately
+    # below (same "attach after construction, absent means unknown" pattern).
+    team._agnohive_team_name = team_name
     team._delegation_state = delegation_log_hook.state
     # T50 (2026-10-21): give the Coordinator its own MemberControlState, the SAME
     # progress-fingerprint machinery delegate_structured_task already registers for

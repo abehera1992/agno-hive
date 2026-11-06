@@ -195,6 +195,8 @@ async def load_cache() -> None:
         if policy_existing is None:
             await _seed_policy_defaults(conn)
 
+        await _seed_delegate_structured_task_grants(conn)
+
         tool_rows = (await conn.execute(select(db.team_role_tools))).mappings().all()
         skill_rows = (await conn.execute(select(db.team_role_skills))).mappings().all()
         overlay_rows = (
@@ -634,6 +636,51 @@ async def _seed_policy_defaults(conn) -> None:
         {"task_class": "repository_inventory", "capability_id": "repository.file_read",
          "requirement": "REQUIRED"},
     ])
+
+
+# Phase 0.63.2 (2026-11-06): the Coordinator-only structured-delegation tool.
+# Grants mirror the pre-existing, unconditional behaviour exactly -- every
+# team _build_team() constructs goes through the SAME module-level Agno
+# interception (see swarm/team.py's _patched_agno_get_delegate_task_function),
+# which is still the ONLY mechanism Agno 2.5.17 offers for customizing its
+# own per-call delegation-tool construction (confirmed by source read: the
+# function needs run_response/session/run_context/team_run_context, none of
+# which exist before a run starts, so it cannot be pre-built once and cached
+# as a static Function the way forward_member_answer is). What Phase 0.63.2
+# changes is the GATE: that interception now checks this exact grant via
+# team_config.get_extra_tools(team_name, "Coordinator") instead of a bare
+# isinstance(team, _StructuredDelegationTeam) check, making SQLite the
+# authoritative source for WHO receives it, not merely a decorative row
+# alongside a hardcoded blanket grant (see swarm/team.py's own comment at
+# the call site for why full removal of the interception itself is not
+# achievable without either reimplementing Agno's own delegation internals
+# or reverting to its native, differently-named tool -- both explicitly out
+# of this migration's scope). Seeded for all 4 shipped teams since all 4
+# received this tool unconditionally before this migration; narrowing to
+# fewer teams is a separate, explicitly-authorized decision, not a side
+# effect of this seed.
+_DELEGATE_STRUCTURED_TASK_TEAMS = ("engineering", "planning", "parallel-review", "sprint-master")
+
+
+async def _seed_delegate_structured_task_grants(conn) -> None:
+    """One-time, additive seed, idempotent the same way _seed_policy_defaults
+    is: gated on checking for this exact tool's own rows, not on
+    team_role_tools' overall emptiness (which is never true on an
+    already-deployed instance -- see load_cache()'s own call site)."""
+    existing = (
+        await conn.execute(
+            select(db.team_role_tools.c.team_name).where(
+                db.team_role_tools.c.tool_name == "delegate_structured_task"
+            ).limit(1)
+        )
+    ).first()
+    if existing is not None:
+        return
+    await conn.execute(
+        db.team_role_tools.insert(),
+        [{"team_name": t, "role_name": "Coordinator", "tool_name": "delegate_structured_task"}
+         for t in _DELEGATE_STRUCTURED_TASK_TEAMS],
+    )
 
 
 def resolve_effective_policy(
