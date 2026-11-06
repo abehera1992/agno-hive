@@ -37,3 +37,7 @@ unsloth_compiled_cache/
 # log, model routing. Machine-local generated state, not source; a deployment
 # pointing DATABASE_URL at Postgres/etc instead never creates this at all.
 data/
+# Phase 0.53: ops/lightrag_watchdog.py's own runtime state -- a per-machine
+# restart-budget ledger and lock file it creates on ZGX, never source.
+ops/.lightrag_watchdog_state.json
+ops/.lightrag_watchdog.lock

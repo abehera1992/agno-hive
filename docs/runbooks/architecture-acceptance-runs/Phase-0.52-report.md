@@ -114,38 +114,115 @@ used instead of the shadowing `1.9.4`. This is strictly smaller and
 lower-risk than any actual `pip install`, which is why it was chosen over
 every candidate that would require one.
 
-### 2.4 Issue #2741 and PR #2242 investigated separately
+### 2.4 Issue #2741, #2416, PR #2334, and #3142 investigated separately
 
-- **Issue #2741** could not be located via web search (results topped out
-  around #2398 as of the search date) — its existence, exact content, and
-  status could not be independently confirmed. Not conflated with the CVE
-  fix; treated as unconfirmed.
-- **PR #2242** ("fix: catch ClosedResourceError in `_handle_message` error
-  recovery path") targets a *different*, narrower code path
-  (`send_log_message()` inside the exception-notification branch of
-  `_handle_message`, linked to issue #2064 — a stateless-mode client
-  disconnect during request body reading) than the one this incident's own
-  traceback showed (`_send_response` → `respond()`, a normal successful
-  response being written late). Search results did not confirm whether
-  #2242 merged.
-  - A **related but distinct** report, issue #2416, was found describing a
-    crash still reachable in `respond()` on **mcp 1.27.0** — *after* PR
-    #2334 ("[v1.x] fix: handle ClosedResourceError when transport closes
-    mid-request", dated 2026-03-24) had already landed. `mcp-1.26.0` (the
-    version selected here) predates PR #2334 entirely (installed
-    2026-02-23, before the fix even existed).
-  - **This is explicitly not conflated with the CVE fix in this report.**
-    §3's own empirical test proves `1.26.0` correctly isolates *this
-    incident's exact failure shape* (late response after a client-side
-    timeout/disconnect, reaching `respond()`/`_send_response()`, hitting a
-    `ClosedResourceError`). It does **not** prove every possible
-    `ClosedResourceError` path is covered — #2416 describes a narrower,
-    separate scenario (apparently a mid-request transport closure, not a
-    late-response-after-clean-disconnect) that may or may not still be
-    reachable even in versions at or above `1.26.0`. **Documented here as
-    an open, unresolved residual risk** (§9 #2), not chased further this
-    phase, per the mission's own explicit instruction not to claim the CVE
-    fix guarantees every `ClosedResourceError` scenario is closed.
+> **Corrected in Phase 0.53.** The original version of this section was
+> written from web-search-result snippets rather than the actual GitHub
+> pages, and mischaracterized #2416 specifically (as a residual
+> `ClosedResourceError` in `respond()` — it is not) and could not locate
+> #2741 at all. Everything below was re-verified directly against each
+> page's own content (title, state, dates, and technical description),
+> not inferred or re-summarized from a prior search. §3's own regression
+> evidence is unchanged by this correction.
+
+- **Issue #2741** — "Stateful Streamable HTTP: in-session exceptions are
+  masked as an empty -32603; real cause only in a separate 'Session
+  crashed' log." Open, filed 2026-05-31. This is a **diagnosability /
+  error-reporting** issue, not a report that the server crashes: in
+  stateful mode, when a session's `app.run()` raises, the *client*
+  receives an unhelpfully empty JSON-RPC `-32603` error, while the real
+  exception is correctly caught and logged separately as `"Session <id>
+  crashed"` — the exact log line Phase 0.52's own live test (§3.2)
+  observed on `mcp==1.26.0`. The issue's own text explicitly distinguishes
+  this from the CVE's own server-wide crash (fixed at 1.10.0). No merged
+  fix is shown on the page. **This does not establish that the Phase 0.52
+  CVE failure remains exploitable on 1.26.0** — if anything, it
+  corroborates that per-session isolation (the exact property §3.2 tested)
+  is working as intended in the versions where this issue was filed
+  (1.27.1/1.27.2); its complaint is about the error message's clarity to
+  the client, not about the server surviving.
+- **Issue #2416** — "Bug: AssertionError: Request already responded to —
+  cancellation race in v1.27.0." Open, filed 2026-04-09. **This report
+  previously, incorrectly, described #2416 as a residual
+  `ClosedResourceError` crash in `respond()`. It is not.** The actual
+  failure is an `AssertionError` (`assert not self._completed`,
+  `mcp/shared/session.py`), triggered when a `notifications/cancelled`
+  message arrives after a tool handler has already returned but before
+  `respond()` has run — a race between cancellation and normal
+  completion, not an exception from a closed stream. The issue's own
+  thread states explicitly that PR #2334 covers the `ClosedResourceError`
+  path but not this assertion race. **Corrected conclusion: #2416 is
+  unrelated to the CVE-2025-53365 failure mode and to Phase 0.52's own
+  reproduction — a different exception type, on a different trigger.**
+- **PR #2334** — "[v1.x] fix: handle `ClosedResourceError` when transport
+  closes mid-request." Merged into the `v1.x` branch 2026-03-24 (commit
+  `6524782`), fixing issue #2328. The specific path it addresses: the
+  transport closes **mid-request** (e.g. stdin EOF, or invalid UTF-8 on
+  the wire) while a handler is still running, and the subsequent
+  `message.respond()` call hits `ClosedResourceError` on the now-closed
+  write stream — fixed by wrapping that call in
+  `try`/`except (BrokenResourceError, ClosedResourceError)` and cancelling
+  in-flight handlers via `try`/`finally` when the transport closes. **This
+  is a different trigger than the Phase 0.52 incident** (a request that
+  completes normally and only fails because the *client* has already
+  given up waiting — the transport itself does not close mid-request) and
+  a different trigger than #2416 (an assertion race, not a
+  `ClosedResourceError`). **`mcp==1.26.0` (installed 2026-02-23) predates
+  this PR's merge (2026-03-24) and therefore does not contain this
+  specific fix.** Phase 0.52's own pass/fail result (§3) is unaffected,
+  since it tested the CVE's own original failure shape, not PR #2334's
+  mid-request-closure shape — but whether `1.26.0` is also safe against
+  *that* narrower trigger remains genuinely **unverified** here, neither
+  confirmed safe nor confirmed unsafe.
+- **Issue #3142** — "[v1.x] Backport #2257 and cut a release: the
+  stateless Streamable HTTP client-disconnect fix (#2064) ships only in
+  2.0.0 pre-releases; latest stable v1.28.1 still carries the crashing
+  `send_log_message` call." Closed as *not planned*, 2026-08-14. Describes
+  a **stateless-mode-only** scenario (`lightrag_mcp/server.py` does not
+  set `stateless_http`, so it runs in the default *stateful* mode this
+  issue does not cover): a client aborting a POST request **mid-body**
+  raises a Starlette `ClientDisconnect` inside `_handle_post_request`,
+  logged as an empty `"Received exception from stream:"` error, which
+  then reaches a `send_log_message` call reported to crash in some
+  deployments. Confirmed on v1.28.1. **Explicitly distinct from both the
+  Phase 0.52 reproduction** (a clean request/response cycle where only the
+  client's own wait gives up, not a mid-body abort) **and from #2416** (an
+  assertion race, not a `ClientDisconnect`) — the issue's own text never
+  references #2416 and does not use the "late response after disconnect"
+  framing this report's own incident uses.
+- **GHSA-j975-95f5-7wqh / CVE-2025-53365** — confirmed directly from the
+  official advisory page: affected range `< 1.10.0`, patched at `1.10.0`,
+  published 2025-07-04, CWE-248. Description, verbatim from the advisory:
+  *"If a client deliberately triggers an exception after establishing a
+  streamable HTTP session, this can lead to an uncaught ClosedResourceError
+  on the server side, causing the server to crash and requiring a restart
+  to restore service."* This matches Phase 0.52's own §3.1 reproduction
+  exactly — unchanged, unweakened by this correction. The upstream fix,
+  **PR #967** ("Fix uncaught exception in MCP server," merged 2025-06-17,
+  commit `7b42065`), is terse on its own page — it names neither the
+  exception type nor the advisory directly; the link between that PR and
+  the `1.10.0` fix comes from the advisory's own reference list, not from
+  the PR's own text. (The commit hash is `7b42065`, not `7b420656` as
+  this phase's own mission text stated — a one-digit discrepancy, most
+  likely a short-SHA display difference; not independently significant to
+  anything this report concludes.)
+
+**Net correction:** none of #2741, #2416, or #3142 describe the *same*
+failure mode Phase 0.52 reproduced and fixed (CVE-2025-53365's
+late-response-after-disconnect `ClosedResourceError`). They describe three
+further, genuinely distinct MCP SDK transport/session issues — two
+(#2416, #3142) involving entirely different exception types or trigger
+conditions, and one (#2741) describing a diagnosability complaint about an
+error message's clarity rather than a crash. PR #2334 is a real, merged
+`ClosedResourceError` fix, but for a *different* trigger (mid-request
+transport closure) than the CVE's own trigger, and it postdates the
+specific `1.26.0` build selected in Phase 0.52 — so whether `1.26.0` is
+also safe against PR #2334's own narrower scenario remains genuinely
+**unverified**, not "probably fine," and **not** "the same gap as #2416"
+(it is not the same gap — #2416 is an unrelated assertion race). Phase
+0.52's own regression evidence (§3) — the byte-for-byte reproduction on
+`1.9.4` and the confirmed per-session isolation on `1.26.0` for the CVE's
+own specific scenario — is unchanged and not weakened by this correction.
 
 ### 2.5 Implementation
 
@@ -339,15 +416,18 @@ pre-existing file was modified, deleted, or reset.
    decision for the user, not something to do silently. Concrete, ready-to
    -apply recommendation: the identical `ops/lightrag.service.d/...conf`
    pattern, applied to `agno-api.service`'s own drop-in directory.
-2. **Issue #2416's narrower residual `ClosedResourceError` gap in
-   `respond()`** (reported present even at `mcp==1.27.0`, after PR #2334)
-   is explicitly **not** confirmed resolved by this phase's chosen
-   `1.26.0` — it predates the PR that reportedly only partially closed
-   that gap. Not chased further this phase (§2.4); the P0 watchdog (§4) is
-   the deliberate defense-in-depth layer for exactly this kind of residual
-   risk — any future crash shape, whether this one or a genuinely new one,
-   is now auto-detected and bounded-recovered rather than requiring a
-   human to notice a silent zombie state.
+2. **The mid-request transport-closure `ClosedResourceError` path PR #2334
+   fixes** (merged 2026-03-24) **postdates the specific `mcp==1.26.0`
+   build selected here** (installed 2026-02-23) — whether `1.26.0` is also
+   safe against *that* narrower trigger (not the CVE's own trigger, which
+   §3 confirms IS fixed) was not tested this phase and remains an open,
+   unverified risk. *(Corrected in Phase 0.53 — the original version of
+   this item conflated this with issue #2416, which is unrelated: #2416
+   is an `AssertionError`/cancellation race, not a `ClosedResourceError`,
+   and describes no gap in `respond()` of the kind originally stated
+   here; see §2.4.)* Not chased further; the P0 watchdog (§4, and Phase
+   0.53's own completion of it) remains the deliberate defense-in-depth
+   layer for any future crash shape, confirmed or not.
 3. **The watchdog's "second check" cosmetic detail-string gap** (§4):
    the literal "Task group is not initialized" substring was not captured
    in the one isolated-crash test performed, though the functional
