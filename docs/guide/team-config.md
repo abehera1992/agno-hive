@@ -54,6 +54,75 @@ All three read through one in-process cache module, `swarm/team_config.py` — s
 
 `decompose_first` and `search_before_browse` were previously ON/OFF purely by hardcoded set membership (`_GATE_ENABLED_TEAMS` / `_SEARCH_GATE_ENABLED_TEAMS` in `swarm/team.py`). `team_gate_flags` (`team_name, gate_name, enabled`) lets either be overridden per team without a code change, via `team_config.get_gate_enabled(team_name, gate_name, default=...)` — where `default` is exactly the old hardcoded boolean, so **a team with no override row behaves identically to before this feature existed**. `gate_name` is validated against a fixed set (`team_config.GATE_NAMES`) at write time — `POST /admin/team-config/gates` with an unrecognized name returns 400. Writing the same `(team_name, gate_name)` pair again upserts (updates the existing row) rather than erroring.
 
+## Beyond the three tiers — the complete tool-access model
+
+The three tiers above answer "does SQLite govern this tool's grant?" They do not, by
+themselves, answer "where does a given tool actually come from?" Phase 0.63.1's audit
+found that question needed a separate, explicit answer — reading `team_role_tools`
+alone gives a falsely complete picture of what a role actually ends up holding. Every
+tool a Coordinator or member agent can call falls into exactly one of these:
+
+1. **SQLite-governed (Tier 1, above).** The overwhelming majority — every member
+   role's full tool list in all 4 shipped teams, and the Coordinator's own MCP-tool
+   allowlist wherever its YAML doesn't explicitly override it.
+2. **YAML overrides.** An explicit `tools:`/`coordinator_tools:` in a team's YAML wins
+   outright over any DB row for that (team, role) — including an explicit empty list,
+   which is a deliberate disarm, not an omission (see Tier 1 above).
+3. **Hardcoded application tools.** `request_clarification` and `update_session_state`
+   are appended to every Coordinator's tool list unconditionally, in `swarm/team.py`'s
+   `_build_team()`, regardless of SQLite or YAML — both are local, side-effect-free
+   tools the code's own comments justify as safe for every team, including read-only
+   ones.
+4. **Locally implemented, SQLite-gated tools.** `forward_member_answer` is a local
+   Python function (not MCP-surfaced), but its grant to a Coordinator role IS read
+   from `team_role_tools` — via `team_config.get_extra_tools(team_name, "Coordinator")`,
+   checked directly in `_build_team()`, bypassing the Tier-1 YAML/DB-fallback path
+   entirely (that path is for the *MCP-tool* allowlist only). This is the same pattern
+   `delegate_structured_task` now uses — see point 7.
+5. **Capability-policy filtering (Phase P, 2026-10-04).** `agent_capability_policy` can
+   additionally *remove* (never add) a tool from the Coordinator's resolved list, via
+   `team_config.resolve_effective_policy()`, wrapped in try/except so a bug here fails
+   OPEN to the pre-Phase-P surface, never silently closed. Only one row is seeded today
+   (`engineering`/`Coordinator`/`member.forwarding`=REQUIRED, a REQUIRE row, not a
+   FORBID row) — in current practice this layer changes nothing. **It cannot affect
+   `delegate_structured_task` even if a FORBID row existed for it**: this filtering
+   runs inside `_build_team()`, against `coordinator_tools_list`, before the `Team`
+   object exists — but `delegate_structured_task` is injected later, during an actual
+   run, by point 7's own mechanism. The two layers never see each other.
+6. **Agno-native framework tools.** Agno's own built-ins (e.g. `get_member_information`)
+   follow Agno's own rules, outside this codebase's tool-grant machinery entirely.
+7. **The Coordinator-only delegation tool (`delegate_structured_task`).** This tool
+   is *not* attached via `coordinator_tools_list` at all — Agno 2.5.17 calls
+   `agno.team._default_tools._get_delegate_task_function(team, run_response=...,
+   session=..., run_context=..., team_run_context=..., ...)` itself, fresh, on every
+   single model generation (confirmed by source read: `agno/team/_tools.py`'s
+   `_determine_tools_for_model`, called from many sites in `agno/team/_run.py`,
+   re-imports this free function by name on every call rather than caching a
+   reference). Those per-call arguments don't exist before a run starts, so the
+   result cannot be pre-built once at `_build_team()`-time and cached as a static
+   `Function` object. `swarm/team.py` intercepts this exact module-level name
+   (`_patched_agno_get_delegate_task_function`) — the only extension point this Agno
+   version offers; an instance-method override on a `Team` subclass was tried first
+   and found to be dead code, since Agno's real call sites never use polymorphic
+   dispatch (Phase S.1/S.2). As of Phase 0.63.2, the interception checks
+   `team_config.get_extra_tools(team_name, "Coordinator")` for an explicit
+   `delegate_structured_task` grant (the same lookup `forward_member_answer` uses)
+   before wrapping Agno's real tool into the structured contract — SQLite is now the
+   actual authority over *who* receives it, though the interception *mechanism*
+   itself remains, since no alternative exists in this Agno version without either
+   reimplementing Agno's own delegation internals or reverting to its differently-
+   named native tool. A team/role combination with no matching grant gets Agno's
+   original, unwrapped tool — fails closed, never silently broadens access.
+8. **How ordinary members return findings without delegation authority.** A member
+   agent (Researcher, Coder, Reviewer, …) is a plain `Agent`, never itself a `Team` —
+   Agno's `_get_delegate_task_function` only ever runs for a `Team`'s own leader, so a
+   member structurally never reaches point 7's interception at all, regardless of
+   SQLite. A member's own findings reach the Coordinator exclusively through its
+   return value / the result-capture machinery (`_capture_member_result` →
+   `member_answers`), which the Coordinator must then explicitly relay via
+   `forward_member_answer` (point 4) — there is no path by which a member can itself
+   initiate a further delegation.
+
 ## Admin API
 
 Same FastAPI app, same trust boundary as every other endpoint (unauthenticated, reached only over Tailscale) — no dedicated admin service, matching [model routing's admin API](cloud-models.md#admin-api--editing-routes-at-runtime):
