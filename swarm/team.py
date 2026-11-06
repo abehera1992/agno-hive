@@ -17762,6 +17762,78 @@ def _strip_incomplete_answer_note(text: str) -> str:
     return text
 
 
+# Phase 0.62 (T11): live-confirmed exact shape (run e6cda8897228) that the
+# blank-line splitter below cannot recover from -- a genuinely correct,
+# fully-grounded 5-item numbered list (items 1-4 complete and accurate,
+# naming both real services, both real functions, and every real file;
+# item 5 cut mid-sentence by Z16's own repetition guard) with NO blank
+# line anywhere between its own items, the common, idiomatic way to write
+# a numbered list. To the blank-line splitter, that whole list is ONE
+# block -- its only candidate is "drop the entire list," which retains
+# under 30% of the text and is correctly rejected by the existing
+# retention floor, but for the wrong practical reason: four fully correct,
+# complete items were discarded along with the one broken one. This
+# fallback is tried ONLY after the blank-line splitter's own candidates
+# are exhausted -- never in place of it -- and enforces every one of its
+# existing safety checks unchanged (natural-stopping-point, balanced code
+# fences, the SAME retention floor). It only ever REMOVES a trailing list
+# item; it never rewrites, completes, or reorders anything.
+_LIST_ITEM_BOUNDARY_RE = re.compile(r"\n(?=[ \t]*(?:\d+[.)]\s|[-*]\s))")
+
+
+def _list_item_candidate_is_safe(candidate: str) -> bool:
+    """Whether a list-item-boundary candidate (see
+    _salvage_truncated_prefix_at_list_item) is safe to adopt.
+
+    Deliberately NOT the same bar as _ends_at_a_natural_stopping_point:
+    that function requires the tail to end in sentence-terminal
+    punctuation (`_NATURAL_STOP_RE`), which an ordinary, correctly-written
+    short list-item phrase ("3. Storage Service:" or "- Scans the file
+    for viruses") routinely omits by normal markdown style, with nothing
+    actually wrong or unfinished about it. The list-item splitter's own
+    candidates are structurally different from the blank-line splitter's:
+    they always end at a COMPLETE LINE -- the end of some earlier
+    sibling item's own text -- never mid-word or mid-clause, by
+    construction of the split itself (_LIST_ITEM_BOUNDARY_RE only ever
+    cuts immediately before a NEW item's own marker). The two risks
+    _ends_at_a_natural_stopping_point exists to catch that CAN still
+    apply here -- a trailing ellipsis, or the model's own still-open
+    stated intent -- are checked directly instead, reusing
+    _ends_with_unfinished_intent unmodified."""
+    tail = candidate.rstrip()
+    if not tail or tail.endswith("..."):
+        return False
+    return not _ends_with_unfinished_intent(candidate)
+
+
+def _salvage_truncated_prefix_at_list_item(bare: str, total_len: int) -> "str | None":
+    """Fallback for _salvage_truncated_prefix: cuts at numbered- or
+    bulleted-list-item boundaries instead of blank-line paragraph breaks --
+    see the module comment above _LIST_ITEM_BOUNDARY_RE for the live shape
+    this recovers. Same progressive-widening algorithm and the same
+    balanced-fence/retention-floor safety checks as the blank-line
+    splitter; see _list_item_candidate_is_safe for why its "ends
+    naturally" check is deliberately narrower here, not weaker."""
+    items = _LIST_ITEM_BOUNDARY_RE.split(bare)
+    if len(items) < 2:
+        return None
+    for cut in range(1, len(items)):
+        # Rejoin with "\n", not "" -- the split pattern is a zero-width
+        # lookahead on a bare newline, so that newline was consumed by
+        # re.split and must be put back or adjacent items collide
+        # (e.g. "...endpoint" + "3. Storage" -> "...endpoint3. Storage").
+        candidate = "\n".join(items[: len(items) - cut]).rstrip()
+        if not candidate:
+            break
+        if candidate.count("```") % 2 != 0:
+            continue
+        if _list_item_candidate_is_safe(candidate):
+            if len(candidate) < total_len * _CHAIN_COVERAGE_SALVAGE_MIN_RETENTION:
+                return None
+            return candidate
+    return None
+
+
 def _salvage_truncated_prefix(text: str) -> "str | None":
     """The longest leading portion of `text` (with its trailing incomplete-
     answer note, if any, first removed) that can be kept while still
@@ -17780,31 +17852,39 @@ def _salvage_truncated_prefix(text: str) -> "str | None":
     unfinished code block or route declaration (Phase 0.50 mission Scenario
     D), which must never be adopted as if it were a finished fragment.
 
+    Phase 0.62: if the blank-line splitter finds no acceptable candidate --
+    no blank-line break at all, no candidate clearing the natural-stopping-
+    point bar, or the best one too short -- this falls back to
+    _salvage_truncated_prefix_at_list_item (see its own docstring) before
+    giving up, rather than discarding a prefix the coarser splitter simply
+    could not see into. The blank-line splitter's own successful candidates
+    are returned exactly as before this phase; nothing about ITS behavior
+    changed, only what happens after it fails.
+
     Returns None -- the caller's existing whole-rejection fallback is then
-    unchanged -- when: `text` is empty once its note is stripped; there is
-    no blank-line paragraph break to cut at (one undifferentiated block, so
-    nothing can be safely separated, mission Scenario F); no candidate ever
-    clears the natural-stopping-point bar; or the first candidate that does
-    retains less than _CHAIN_COVERAGE_SALVAGE_MIN_RETENTION of the original
-    length (a short preamble, not a genuine section worth keeping)."""
+    unchanged -- when neither splitter can find an acceptable candidate:
+    `text` is empty once its note is stripped; no paragraph or list-item
+    break exists to cut at (one undifferentiated block, mission Scenario
+    F); no candidate from either splitter ever clears the natural-
+    stopping-point bar; or the best candidate from both retains less than
+    _CHAIN_COVERAGE_SALVAGE_MIN_RETENTION of the original length."""
     bare = _strip_incomplete_answer_note(text)
     if not bare or not bare.strip():
         return None
-    blocks = re.split(r"\n\s*\n", bare)
-    if len(blocks) < 2:
-        return None
     total_len = len(bare)
-    for cut in range(1, len(blocks)):
-        candidate = "\n\n".join(blocks[: len(blocks) - cut]).rstrip()
-        if not candidate:
-            break
-        if candidate.count("```") % 2 != 0:
-            continue
-        if _ends_at_a_natural_stopping_point(candidate):
-            if len(candidate) < total_len * _CHAIN_COVERAGE_SALVAGE_MIN_RETENTION:
-                return None
-            return candidate
-    return None
+    blocks = re.split(r"\n\s*\n", bare)
+    if len(blocks) >= 2:
+        for cut in range(1, len(blocks)):
+            candidate = "\n\n".join(blocks[: len(blocks) - cut]).rstrip()
+            if not candidate:
+                break
+            if candidate.count("```") % 2 != 0:
+                continue
+            if _ends_at_a_natural_stopping_point(candidate):
+                if len(candidate) >= total_len * _CHAIN_COVERAGE_SALVAGE_MIN_RETENTION:
+                    return candidate
+                break  # too short -- try the finer list-item fallback instead of giving up
+    return _salvage_truncated_prefix_at_list_item(bare, total_len)
 
 
 def _preserve_retry_progress_on_giveup(
