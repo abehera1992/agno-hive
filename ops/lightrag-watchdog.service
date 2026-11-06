@@ -1,0 +1,20 @@
+# Phase 0.52 (P0, defense in depth) -- bounded liveness check + auto-recovery
+# for lightrag.service's zombie-session-manager failure mode (see
+# ops/lightrag_watchdog.py and docs/runbooks/architecture-acceptance-runs/
+# Phase-0.52-report.md for the full incident history and reasoning).
+#
+# Deployment (ZGX, user systemd instance):
+#   cp ops/lightrag-watchdog.service ops/lightrag-watchdog.timer \
+#     ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now lightrag-watchdog.timer
+#
+# Not installed/enabled automatically by this repo -- a human applies it on
+# ZGX directly, same as every other systemd unit this project uses.
+[Unit]
+Description=Phase 0.52 lightrag.service liveness check (zombie-session-manager recovery)
+After=lightrag.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/abehera1992/miniforge3/envs/zgx/bin/python /home/abehera1992/agno-hive/ops/lightrag_watchdog.py

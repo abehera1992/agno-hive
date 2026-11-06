@@ -1,0 +1,19 @@
+# Phase 0.52 (P0, defense in depth). See lightrag-watchdog.service for the
+# unit it triggers and ops/lightrag_watchdog.py for the bounded check/
+# recovery logic.
+#
+# 120s period: short enough to catch the zombie state well within the span
+# of a single long-running agno_run (which can legitimately run 5-10+
+# minutes), long enough to stay well clear of the 10s per-check HTTP
+# timeout plus its own single retry, so two consecutive timer firings can
+# never overlap.
+[Unit]
+Description=Phase 0.52 lightrag.service liveness check timer
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=120
+AccuracySec=10
+
+[Install]
+WantedBy=timers.target
