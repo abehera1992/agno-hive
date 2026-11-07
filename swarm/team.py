@@ -26877,6 +26877,29 @@ _RECENT_IDENTIFIER_SPAN_CHARS = 500
 # different, earlier route's identifiers and treating those as "recent" too.
 
 
+def _identifiers(text: str) -> set[str]:
+    """Identifier-shaped tokens (true CamelCase or snake_case, >= 4 chars --
+    a route, model, class, function, or file-like name). Factored out of
+    _segment_introduces_new_identifier (Phase 0.86) so a second caller with
+    different windowing needs (_segment_introduces_new_identifier_overall,
+    below) can share the identical shape test without duplicating it --
+    both callers must agree on what counts as "identifier-shaped" or their
+    two different novelty judgments would be comparing different things.
+
+    findall, not whitespace-split + strip: a token like "select(TenantModule)"
+    has no internal space, so split() leaves "(" glued to "TenantModule" with
+    nothing in strip()'s char set able to separate them (the "(" sits between
+    two identifier characters, not at a token boundary) -- findall extracts
+    the identifier-shaped run directly, regardless of what punctuation
+    surrounds it.
+    """
+    return {
+        tok for tok in _IDENTIFIER_SHAPE_RE.findall(text)
+        if len(tok) >= _IDENTIFIER_MIN_LEN
+        and ("_" in tok or any(c.isupper() for c in tok[1:]))
+    }
+
+
 def _segment_introduces_new_identifier(new_segment: str, prior_content: str) -> bool:
     """True if the RECENT span (the end of `prior_content` plus `new_segment`)
     contains an identifier-shaped token (true CamelCase or snake_case, >= 4
@@ -26885,19 +26908,6 @@ def _segment_introduces_new_identifier(new_segment: str, prior_content: str) -> 
     PREFIX-only repetition match: a shared opening whose surrounding recent
     text names a genuinely new symbol is progress, not a repeat, regardless of
     exactly which 10s tick that symbol happened to stream in on."""
-    def _identifiers(text: str) -> set[str]:
-        # findall, not whitespace-split + strip: a token like "select(TenantModule)"
-        # has no internal space, so split() leaves "(" glued to "TenantModule" with
-        # nothing in strip()'s char set able to separate them (the "(" sits between
-        # two identifier characters, not at a token boundary) -- findall extracts
-        # the identifier-shaped run directly, regardless of what punctuation
-        # surrounds it.
-        return {
-            tok for tok in _IDENTIFIER_SHAPE_RE.findall(text)
-            if len(tok) >= _IDENTIFIER_MIN_LEN
-            and ("_" in tok or any(c.isupper() for c in tok[1:]))
-        }
-
     # prior_content shorter than the span has no "older" to meaningfully split
     # off -- falling through to an empty older side would make every identifier
     # in new_segment trivially "new" (nothing to subtract against) even when it
@@ -26911,6 +26921,36 @@ def _segment_introduces_new_identifier(new_segment: str, prior_content: str) -> 
     if not new_ids:
         return False
     return bool(new_ids - _identifiers(older))
+
+
+def _segment_introduces_new_identifier_overall(new_segment: str, prior_content: str) -> bool:
+    """True if `new_segment` contains an identifier-shaped token (same shape
+    test as `_identifiers`/`_segment_introduces_new_identifier`) absent from
+    the WHOLE of `prior_content` -- not a windowed recent-vs-older split.
+
+    Phase 0.86: built specifically for _looks_like_tool_content_regurgitation's
+    own veto, after direct testing showed _segment_introduces_new_identifier's
+    OWN windowed split is miscalibrated for this different use case and
+    cannot simply be reused unchanged. That function's _RECENT_IDENTIFIER_
+    SPAN_CHARS=500 window exists to forgive a differentiating identifier
+    landing one streaming-chunk tick early or late relative to a shared
+    100-char OPENING PREFIX (Z16 tier 3/4's own match shape) -- a genuinely
+    different question from this one. Confirmed by direct reproduction: fed
+    a verbatim REPEAT of a route signature already present in prior_content,
+    the windowed function incorrectly reported "new" whenever OTHER, later,
+    genuinely-new identifiers happened to fall within the trailing 500-char
+    window -- identifiers that have nothing to do with the repeated segment
+    itself, an artifact of the window's purely positional "older" cutoff
+    rather than a true before/after-this-segment comparison. A plain,
+    unwindowed check -- does new_segment's own identifier set contain
+    anything absent from prior_content in its entirety -- answers the actual
+    question this veto needs ("has the GENERATED RESPONSE said this before,
+    anywhere") without that artifact, at the cost of no longer forgiving a
+    chunk-boundary-timing edge case this use case does not have (regurgitation
+    checks the segment actually flagged, not a shared-prefix match split
+    across ticks).
+    """
+    return bool(_identifiers(new_segment) - _identifiers(prior_content))
 
 
 # Phase 0.33 (2026-11-02). Confirmed live, 2026-11-01 20:09:16-20:09:46 (run
@@ -27263,7 +27303,8 @@ _TOOL_REGURGITATION_OVERLAP_THRESHOLD = 0.85
 
 
 def _looks_like_tool_content_regurgitation(
-        new_segment: str, recent_tool_tokens: "frozenset[str]") -> bool:
+        new_segment: str, recent_tool_tokens: "frozenset[str]",
+        prior_content: str | None = None) -> bool:
     """True if `new_segment` looks like it is mostly a verbatim reproduction of
     content this run recently retrieved via a tool call, rather than newly
     synthesized prose that merely cites some of what was retrieved.
@@ -27278,6 +27319,41 @@ def _looks_like_tool_content_regurgitation(
     NOT flag; see this check's own call site for how its result joins the
     SAME repetition_count/Z16 disposition loop_detected and decay_detected
     already use, rather than introducing a second termination mechanism.
+
+    Phase 0.86: `prior_content` (optional, default None -- any caller that
+    omits it keeps this function's exact pre-existing behavior, since the
+    veto below only ever activates when a prior_content value, including a
+    genuinely empty string, was actually PASSED; None means "no information
+    given", not "nothing came before this segment" -- those are different
+    claims, and treating a real empty string as "skip the veto" would wrongly
+    exempt the very first flagged segment of a generation, where everything
+    in it is, correctly, new) is the SAME
+    per-generation accumulated response text _looks_like_repetition_loop's
+    own tiers 3-5 already compare against (`joined[:last_logged_len]` at
+    both real call sites) -- NOT the retrieved tool-result tokens, which is
+    a different comparison universe on purpose. Confirmed live, Phase 0.85
+    (incident `6e5a8003ebf04b88`): a delegation explicitly asking to "return
+    every route decorator and handler function definition verbatim" was cut
+    after 4 strikes, all 4 of them this function firing on 4 DIFFERENT, real,
+    correct route definitions -- each one overlaps overwhelmingly with the
+    just-read file by construction (that is what quoting it verbatim means),
+    so overlap against TOOL tokens alone can never distinguish a ninth new
+    route from a second repeat of the first one; only the GENERATED RESPONSE
+    so far can, since the ninth route's own name/signature has not appeared
+    there yet while the repeated first route's has.
+
+    Vetoed by _segment_introduces_new_identifier_overall (new this phase,
+    NOT _looks_like_repetition_loop's own windowed _segment_introduces_new_
+    identifier -- direct testing showed that function's recent-vs-older
+    500-char split is miscalibrated for this use case, see its own sibling
+    function's docstring for the confirmed reproduction) and the existing,
+    unmodified _segment_introduces_new_quoted_literal. _looks_like_
+    repetition_loop itself, its own tiers, and config.liveness_repetition_
+    threshold are completely untouched by this change. A segment whose only
+    overlap with prior_content is a REPEATED route/symbol (nothing new) is
+    still correctly flagged; a segment that mixes previously-quoted material
+    with a genuinely new symbol is vetoed, the same tradeoff
+    _looks_like_repetition_loop's own tiers 3-5 already accept and document.
     """
     if not recent_tool_tokens or len(new_segment) < _REPETITION_MIN_SEGMENT_LEN:
         return False
@@ -27285,7 +27361,13 @@ def _looks_like_tool_content_regurgitation(
     if len(seg_tokens) < _TOOL_REGURGITATION_MIN_SEGMENT_TOKENS:
         return False
     overlap = len(seg_tokens & recent_tool_tokens) / len(seg_tokens)
-    return overlap >= _TOOL_REGURGITATION_OVERLAP_THRESHOLD
+    if overlap < _TOOL_REGURGITATION_OVERLAP_THRESHOLD:
+        return False
+    if prior_content is not None and (
+            _segment_introduces_new_identifier_overall(new_segment, prior_content)
+            or _segment_introduces_new_quoted_literal(new_segment, prior_content)):
+        return False
+    return True
 
 
 def _log_unclassified_stream_event(log_label: str, event, unrecognized_event_counts: dict[str, int]) -> None:
@@ -32442,7 +32524,8 @@ async def _stream_team_run(
                         not loop_detected and not decay_detected
                         and _looks_like_tool_content_regurgitation(
                             new_segment, frozenset().union(*recent_tool_token_sets)
-                            if recent_tool_token_sets else frozenset()))
+                            if recent_tool_token_sets else frozenset(),
+                            prior_content=joined[:last_logged_len]))
                     if loop_detected or decay_detected or regurgitation_detected:
                         # Count it (2026-08-27). Withholding progress credit -- the
                         # only response until now -- bites solely when repetition is
@@ -33292,7 +33375,8 @@ async def run_task_async(
                                         not loop_detected and not decay_detected
                                         and _looks_like_tool_content_regurgitation(
                                             new_segment, frozenset().union(*recent_tool_token_sets)
-                                            if recent_tool_token_sets else frozenset()))
+                                            if recent_tool_token_sets else frozenset(),
+                                            prior_content=joined[:last_logged_len]))
                                     if loop_detected or decay_detected or regurgitation_detected:
                                         # Count it (2026-08-27). Withholding progress credit -- the
                                         # only response until now -- bites solely when repetition is
