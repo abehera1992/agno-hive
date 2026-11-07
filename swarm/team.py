@@ -2482,6 +2482,10 @@ def _make_forward_member_answer(
             " This member's own report was flagged PARTIAL -- its investigation did "
             "not fully complete, so present it as a partial lead, not a finished finding."
             if result.status == "PARTIAL" else "")
+        # Phase 0.80: only on this genuinely-new-forward path, never on the
+        # _already_forwarded short-circuit above (that one returns earlier).
+        print(f"[delegation-lifecycle] delegation_result_forwarded "
+              f"member_id={key!r} chars={len(result.answer):,} status={result.status!r}", flush=True)
         return (
             f"FORWARDED: {key}'s answer ({len(result.answer):,} characters) is recorded and "
             f"will appear in your final answer exactly as written.{_status_note} Do not "
@@ -24801,12 +24805,38 @@ def _build_structured_delegation_tool(original_function, team=None):
                 None if is_broadcast else _member_key(member_id)
             )
 
-        if is_broadcast:
-            async for item in original_entrypoint(task=canonical_task):
-                yield item
+        # Phase 0.80: minimal, application-only lifecycle telemetry for this one
+        # delegation invocation -- deliberately NOT inside installed Agno (which
+        # Phase 0.78.1/0.79 confirmed drives this same async-for loop from its
+        # OWN independent asyncio.Task, agno/models/base.py's process_async_
+        # generator). This function's own body IS that task's real work, so a
+        # plain try/except/else wrapping the existing, unchanged async-for below
+        # observes the SAME task from entirely application-side code, with zero
+        # change to what gets yielded, when, or to delegation/retry semantics.
+        # canonical_hash (already computed above, Phase T26/T27) is reused as
+        # the correlation id -- no new identifier scheme.
+        _delegation_target = "broadcast" if is_broadcast else _member_key(member_id)
+        print(f"[delegation-lifecycle] delegation_task_created "
+              f"delegation_id={canonical_hash} member_id={_delegation_target!r}", flush=True)
+        try:
+            if is_broadcast:
+                async for item in original_entrypoint(task=canonical_task):
+                    yield item
+            else:
+                async for item in original_entrypoint(member_id=member_id, task=canonical_task):
+                    yield item
+        except asyncio.CancelledError:
+            print(f"[delegation-lifecycle] delegation_task_cancelled "
+                  f"delegation_id={canonical_hash} member_id={_delegation_target!r}", flush=True)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print(f"[delegation-lifecycle] delegation_task_failed "
+                  f"delegation_id={canonical_hash} member_id={_delegation_target!r} "
+                  f"exception_type={type(exc).__name__}", flush=True)
+            raise
         else:
-            async for item in original_entrypoint(member_id=member_id, task=canonical_task):
-                yield item
+            print(f"[delegation-lifecycle] delegation_task_completed "
+                  f"delegation_id={canonical_hash} member_id={_delegation_target!r}", flush=True)
 
     new_function = Function.from_callable(
         delegate_structured_task, name="delegate_structured_task")
@@ -26037,6 +26067,12 @@ def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
     if not isinstance(getattr(team, "_member_results", None), dict):
         team._member_results = {}
     team._member_results[key] = text
+    # Phase 0.80: fires only on an actual, non-empty registration -- never on
+    # the early `if not text: return` above, so this event's mere presence
+    # already means real content was finalised, not merely that this function
+    # was called.
+    print(f"[delegation-lifecycle] delegation_result_registered "
+          f"member_id={key!r} chars={len(text):,}", flush=True)
     # Phase 0.23: record which delegation generation this text was captured
     # at, at the SAME moment it is written -- see member_result_generation's
     # own module-level comment for why forward_member_answer needs this.
@@ -33419,6 +33455,26 @@ async def run_task_async(
                     from swarm.sessions import save_handoff_summary
                     handoff = _extract_handoff_summary(task, content, final_run_output)
                     asyncio.ensure_future(save_handoff_summary(session_id, handoff))
+                # Phase 0.80: the critical ordering boundary this phase exists to
+                # observe -- Phase 0.78.1/0.79 established that a delegation's own
+                # background task (agno/models/base.py's process_async_generator)
+                # is fully independent of everything above this point, and that
+                # the worker subprocess's own asyncio.run() cancels any task still
+                # pending when _run_worker() returns, shortly after this function
+                # does. Snapshotting other pending tasks HERE, immediately before
+                # return, is the latest safe application-level point to observe
+                # that boundary without touching installed Agno or event-loop
+                # internals. Metadata only (name/id/done-state) -- never a stack,
+                # prompt, or tool payload.
+                _pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+                _pending_meta = [
+                    {"name": _t.get_name(), "id": id(_t), "done": _t.done()}
+                    for _t in _pending
+                ]
+                print(f"[delegation-lifecycle] worker_pending_tasks_at_shutdown "
+                      f"count={len(_pending)} tasks={_pending_meta}", flush=True)
+                print(f"[delegation-lifecycle] parent_run_returning "
+                      f"content_chars={len(content or ''):,}", flush=True)
                 return content, tokens, None
             except Exception as exc:
                 span.record_exception(exc)

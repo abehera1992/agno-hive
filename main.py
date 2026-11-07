@@ -182,6 +182,14 @@ async def _run_worker() -> dict:
             solo=payload.get("solo", False),
             execution_profile=payload.get("execution_profile"),
         )
+        # Phase 0.80: emitted immediately before this coroutine returns -- the
+        # top-level coroutine of this subprocess's own asyncio.run() call
+        # (see _run_worker_main below). Pairs with swarm/team.py's
+        # parent_run_returning/worker_pending_tasks_at_shutdown events to
+        # establish whether any delegation background task was still pending
+        # at this exact boundary, immediately before asyncio.run() cancels it.
+        print(f"[delegation-lifecycle] worker_coroutine_returning "
+              f"content_chars={len(content or ''):,}", flush=True)
         return {"content": content, "tokens": tokens, "clarification": clarification}
     except Exception as exc:
         return {"error": _describe_failure(exc)}
