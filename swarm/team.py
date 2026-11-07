@@ -218,6 +218,18 @@ _COORDINATOR_INSTRUCTIONS = [
     "  command is not available in this environment — I cannot proceed'. git was fine and",
     "  irrelevant; the answer was one delegation away. If you find yourself about to report",
     "  that the environment is broken, you have skipped the delegation — do that instead.",
+    "  The example above is for a task where that ONE tool call IS the whole thing asked for.",
+    "  When the user's task names FURTHER steps after it ('first call X, then read Y and Z,",
+    "  then follow the calls downstream', 'trace the flow end to end... name every file in the",
+    "  chain') — put ALL of those steps into THIS SAME delegation's objective/evidence_required/",
+    "  completion_criteria, not just the first one. Confirmed live, 2026-11-07 (Phase 0.83): a",
+    "  task that opened with 'first call lightrag_query(...), then read business_api.py and",
+    "  business_admin_api.py... to confirm the actual handler and what it calls downstream' got",
+    "  an objective of only 'call lightrag_query and return its raw output verbatim' — the exact",
+    "  wording of the worked example above, copied for only the FIRST named step — three times",
+    "  in a row, with the file-reading and downstream-tracing the task actually asked for never",
+    "  delegated at all. A successful discovery call is the START of the investigation the task",
+    "  asked for, never a substitute for the rest of it.",
     "── Tool restrictions ────────────────────────────────────────────",
     "  NEVER call the `agno_run` tool — you are the top-level coordinator;",
     "  calling agno_run would recurse back into this same swarm and deadlock.",
@@ -237,7 +249,10 @@ _COORDINATOR_INSTRUCTIONS = [
     "  Researcher now also decomposes tasks (merged with the former Planner role, 2026-08-14 —",
     "  see the \"AgnoHive - Engineering Team 2.0 Update\" Notion plan). For a task whose own",
     "  wording implies more than one discrete, independently-checkable claim ('compare X against",
-    "  Y', 'what's covered vs missing', 'audit all N of', 'which of these are done'): delegate the",
+    "  Y', 'what's covered vs missing', 'audit all N of', 'which of these are done'), OR names a",
+    "  sequence of steps to carry out in order ('trace X end to end... first call A, then read B",
+    "  and C', 'name every file/function in the chain', 'then confirm the handler and what it",
+    "  calls downstream'): delegate the",
     "  WHOLE task to Researcher in ONE delegate_structured_task call and let it decompose",
     "  internally (it has its own DECOMPOSE-FIRST rule for exactly this) — do NOT decompose the",
     "  task yourself into a long sequence of narrow, single-tool-shaped delegations ('search_files",
@@ -22549,6 +22564,60 @@ def _objective_names_new_entity(objective_norm: str, prior_objective_norm: str) 
     return False
 
 
+def _find_in_flight_equivalent_delegation(team, member_id: str, target: str, objective: str):
+    """Phase 0.83 (Track B/E3): is there an OWNED delegation (Phase 0.82's
+    team._owned_delegations registry) for this SAME member, matching this
+    SAME target+objective by the SAME criteria the duplicate-delegation gate
+    already uses for a COMPLETED result, that has not yet reached its own
+    terminal state?
+
+    Closes a gap confirmed live, 2026-11-07: the gate's only signal for "has
+    this already been asked" is team._member_results.get(member_id) -- a
+    completed, REGISTERED answer. When no such answer exists yet, the gate's
+    own documented policy (see _duplicate_delegation_gate_hook's own "Serve
+    the result, don't scold" comment) is to ALLOW the retry, reasoning that
+    an empty result means the earlier attempt produced nothing usable. That
+    reasoning is correct for a genuinely failed/empty earlier attempt, but
+    was confirmed WRONG for a live run where the earlier attempt (delegation
+    48521365ecab4630 / ca2297452d264447) was simply still actively running --
+    the gate had no way to tell "failed" apart from "not finished yet", so it
+    let two further, redundant delegations through for the identical
+    lightrag_query step while the first was already doing that exact work.
+
+    Deliberately reuses the gate's own existing match logic (normalized-
+    target equality, then same_wording OR not _objective_names_new_entity)
+    rather than inventing a second comparison scheme -- an in-flight match
+    and a completed-result match mean the same thing here: "this question is
+    already being answered", only the stage differs.
+
+    Returns the matching entry's own asyncio.Task (so the caller can report
+    roughly how it is progressing) or None if no genuinely in-flight
+    equivalent exists. Never considers a terminal entry (completed, failed,
+    or cancelled) -- those are exactly what the EXISTING prior-result checks
+    above already cover; this only adds visibility into what they could not
+    see at all.
+    """
+    owned = getattr(team, "_owned_delegations", None)
+    if not isinstance(owned, dict) or not owned:
+        return None
+    target_norm = _normalize_delegation_task(target)
+    for entry in owned.values():
+        if entry.get("terminal") or entry.get("member_key") != member_id:
+            continue
+        entry_target = entry.get("target")
+        if entry_target is None or _normalize_delegation_task(entry_target) != target_norm:
+            continue
+        entry_objective = entry.get("objective") or ""
+        same_wording = _normalize_delegation_task(entry_objective) == _normalize_delegation_task(objective)
+        if not same_wording and _objective_names_new_entity(
+                str(objective or ""), str(entry_objective or "")):
+            continue
+        task = entry.get("task")
+        if isinstance(task, asyncio.Task) and not task.done():
+            return task
+    return None
+
+
 def _make_duplicate_delegation_gate_hook(read_only: bool = False):
     """Mechanical backstop for _COORDINATOR_INSTRUCTIONS' own prose-only rule
     ("Before delegate_task_to_member(s): check whether an equivalent delegation is
@@ -23292,6 +23361,37 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                         + f" and returned:\n\n{prior}\n\n"
                         f"Use this. Do not delegate it again." + tail
                         + _move_on_hint(log, team)
+                    )
+                # Phase 0.83 (Track B/E3): before concluding "no usable prior
+                # result" means the earlier attempt failed, check whether an
+                # equivalent delegation is simply STILL RUNNING (Phase 0.82's
+                # team._owned_delegations registry -- this is the one signal
+                # this gate never had: _member_results only ever shows a
+                # COMPLETED, registered answer, never "someone is already
+                # doing this"). Confirmed live, 2026-11-07: this exact branch
+                # let a second, then a third, redundant lightrag_query
+                # delegation through while the first was still actively
+                # running -- not because it had failed, but because it
+                # simply had not finished yet.
+                _in_flight = _find_in_flight_equivalent_delegation(
+                    team, member_id, (args or {}).get("target"), (args or {}).get("objective"))
+                if _in_flight is not None:
+                    print(f"[team] duplicate delegation ({'exact' if same_wording else 'reworded'}) "
+                          f"to {member_id!r} — an equivalent delegation is already "
+                          f"in flight (not yet finished); redirected to wait instead "
+                          f"of dispatching a redundant copy", flush=True)
+                    return (
+                        f"WAIT — an equivalent delegation to {member_id!r} for "
+                        f"{(args or {}).get('target')!r} is ALREADY RUNNING this run "
+                        f"(same target, {'same' if same_wording else 'equivalent'} "
+                        f"objective) and has not finished yet. It is not stuck or "
+                        f"lost -- it simply has not returned yet. Do not dispatch "
+                        f"another copy of this same work. If you have other, "
+                        f"genuinely different work to do (a different target, a "
+                        f"different member, or writing up what you already have), "
+                        f"do that now; otherwise wait for this one to complete and "
+                        f"use its real result. This delegate_structured_task call "
+                        f"was NOT executed."
                     )
                 print(f"[team] duplicate delegation ({'exact' if same_wording else 'reworded'}) "
                       f"to {member_id!r} but no usable prior result — allowing the retry",
@@ -24852,6 +24952,15 @@ def _build_structured_delegation_tool(original_function, team=None):
                 "generation": _my_generation,
                 "local_chunks": [],
                 "terminal": False,
+                # Phase 0.83: the raw (un-normalized) target/objective this
+                # invocation was actually dispatched with -- added so the
+                # duplicate-delegation gate can recognize genuinely in-flight
+                # equivalent work (not yet in team._member_results) using the
+                # SAME match logic it already applies to completed results,
+                # instead of its only prior signal ("no result yet" == "that
+                # one must have failed", confirmed live, Phase 0.83 Track B,
+                # to also cover "that one just hasn't finished yet").
+                "target": target, "objective": objective,
             }
             team._owned_delegations[_delegation_id] = _owned_entry
         try:
