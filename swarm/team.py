@@ -26358,6 +26358,15 @@ def _stream_event_to_chunk(event, team=None) -> str | dict | None:
             # correct answer. A token set costs a few KB where the text would cost MBs.
             "result_tokens": _salient_tokens(result) if isinstance(result, str) else None,
             "agent_name": getattr(event, "agent_name", "") or "",
+            # Phase 0.76: ToolCallCompletedEvent carries its own run_id, same field
+            # (and same meaning -- one Agno "run" = one delegation invocation) as
+            # RunStartedEvent/RunContentCompletedEvent already use elsewhere in this
+            # function for member-result correlation (confirmed directly against the
+            # installed agno package's own event dataclasses, not assumed from
+            # naming) -- a real, already-existing delegation boundary, simply not
+            # read at this capture point before now. See _tool_evidence's own
+            # per-run_id fair-share gate below for why this is captured.
+            "run_id": getattr(event, "run_id", None),
             # Counts, not the body: this is the only point the FULL listing exists
             # (result_preview truncates at 200 chars, well inside a 24-entry listing),
             # and the count guard downstream needs the whole thing to count it.
@@ -28518,12 +28527,40 @@ def _record_stream_artifacts(team, out: dict) -> None:
         if out.get("result_preview"):
             if not isinstance(getattr(team, "_tool_evidence", None), list):
                 team._tool_evidence = []
-            if len(team._tool_evidence) < _TOOL_EVIDENCE_MAX_ITEMS:
+            # Phase 0.76 (fair-share gate, not a relevance filter): Phase 0.75
+            # established that this list has no delegation/generation partitioning
+            # at all -- a single delegation round's own tool calls can silently
+            # consume the entire _TOOL_EVIDENCE_MAX_ITEMS budget before a LATER,
+            # equally legitimate delegation round (e.g. a chain-coverage-correction
+            # re-delegation) ever gets a chance to contribute anything, live-
+            # confirmed shape in the 2026-11-06/Phase-0.74 T11 runs. The fix is
+            # narrow and content-blind (never judges a directory listing as less
+            # relevant than a file read, per this phase's own mission text): each
+            # DISTINCT run_id already present (plus this item's own, if new) gets
+            # an equal floor-divided share of the UNCHANGED total cap, computed
+            # fresh on every append -- so a run with only one delegation (the
+            # common case; e.g. every successful T13a/T13b run so far) behaves
+            # byte-for-byte as before (one run_id => its own share is the full
+            # cap), while a second delegation that starts contributing before the
+            # first has exhausted the cap is now guaranteed its own fair share
+            # rather than finding zero room left. This does NOT retroactively
+            # evict anything a run_id already added before a second one appeared
+            # -- no existing, already-captured evidence is ever discarded or
+            # re-ordered by this gate, only future appends are gated by it.
+            _rid = out.get("run_id")
+            _rid_counts: dict = {}
+            for _item in team._tool_evidence:
+                _rid_counts[_item.get("run_id")] = _rid_counts.get(_item.get("run_id"), 0) + 1
+            _distinct = len(set(_rid_counts) | {_rid})
+            _fair_share = max(1, _TOOL_EVIDENCE_MAX_ITEMS // _distinct)
+            if (len(team._tool_evidence) < _TOOL_EVIDENCE_MAX_ITEMS
+                    and _rid_counts.get(_rid, 0) < _fair_share):
                 team._tool_evidence.append({
                     "name": out["name"],
                     "agent": out.get("agent_name") or "",
                     "preview": out["result_preview"],
                     "chars": out.get("result_chars") or 0,
+                    "run_id": _rid,
                 })
             else:
                 # Phase 14, screw #3 (observability only -- no behaviour change).
