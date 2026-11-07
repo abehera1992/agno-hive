@@ -24813,11 +24813,47 @@ def _build_structured_delegation_tool(original_function, team=None):
         # plain try/except/else wrapping the existing, unchanged async-for below
         # observes the SAME task from entirely application-side code, with zero
         # change to what gets yielded, when, or to delegation/retry semantics.
-        # canonical_hash (already computed above, Phase T26/T27) is reused as
-        # the correlation id -- no new identifier scheme.
+        #
+        # Phase 0.82: canonical_hash is CONTENT-derived (Phase T26/T27) and the
+        # same task description can legitimately recur -- it is kept as-is for
+        # the existing content-correlation prints below, but ownership/drain
+        # tracking needs a genuinely unique per-invocation id, since two
+        # invocations could otherwise collide. _delegation_id is a fresh uuid4
+        # per call. Confirmed live, 2026-11-07 T11 run (commit 10f7713): both
+        # delegations in that run were still running their own background task
+        # when run_task_async returned and asyncio.run()'s own shutdown
+        # cancelled them before either's natural completion could register a
+        # result -- see this phase's own report for the full event sequence.
+        # This registry + fallback path exists specifically to give already-
+        # started work like that a bounded chance to still register, instead
+        # of being silently destroyed.
         _delegation_target = "broadcast" if is_broadcast else _member_key(member_id)
+        _delegation_id = uuid4().hex[:16]
         print(f"[delegation-lifecycle] delegation_task_created "
-              f"delegation_id={canonical_hash} member_id={_delegation_target!r}", flush=True)
+              f"delegation_id={_delegation_id} member_id={_delegation_target!r} "
+              f"canonical_hash={canonical_hash}", flush=True)
+        # Phase 0.82: register this invocation under team (fresh per /run
+        # request, confirmed Phase 0.75 -- natural per-parent-run isolation,
+        # no process-global registry). Skipped for broadcast: that dispatches
+        # to EVERY resolved member at once, not one trackable member/
+        # generation pair, and the drain below only ever needs the single-
+        # target Researcher-delegation shape this was built for.
+        _owned_entry = None
+        if not is_broadcast and team is not None:
+            if not isinstance(getattr(team, "_owned_delegations", None), dict):
+                team._owned_delegations = {}
+            _my_generation = 0
+            _dg_now = getattr(team, "_delegation_generation", None)
+            if isinstance(_dg_now, dict):
+                _my_generation = _dg_now.get(_delegation_target, 0)
+            _owned_entry = {
+                "task": asyncio.current_task(),
+                "member_key": _delegation_target,
+                "generation": _my_generation,
+                "local_chunks": [],
+                "terminal": False,
+            }
+            team._owned_delegations[_delegation_id] = _owned_entry
         try:
             if is_broadcast:
                 async for item in original_entrypoint(task=canonical_task):
@@ -24825,18 +24861,41 @@ def _build_structured_delegation_tool(original_function, team=None):
             else:
                 async for item in original_entrypoint(member_id=member_id, task=canonical_task):
                     yield item
+                    # Phase 0.82: mirror _accumulate_member_chunk's own content
+                    # extraction (swarm/team.py's _stream_event_to_chunk /
+                    # _CONTENT_EVENT_TYPES branch) locally, as a side observation
+                    # only -- never changes what is yielded upward. This is the
+                    # SAME item the normal Agno-relay chain would ALSO see if
+                    # _stream_team_run's own outer generator is still pulling;
+                    # this just keeps an independent, complete copy that survives
+                    # even if that chain was already abandoned for an unrelated
+                    # reason earlier in the run.
+                    if _owned_entry is not None:
+                        _chunk = getattr(item, "content", None)
+                        if isinstance(_chunk, str) and _chunk:
+                            _owned_entry["local_chunks"].append(_chunk)
         except asyncio.CancelledError:
+            if _owned_entry is not None:
+                _owned_entry["terminal"] = True
+                _owned_entry["outcome"] = "cancelled"
             print(f"[delegation-lifecycle] delegation_task_cancelled "
-                  f"delegation_id={canonical_hash} member_id={_delegation_target!r}", flush=True)
+                  f"delegation_id={_delegation_id} member_id={_delegation_target!r}", flush=True)
             raise
         except Exception as exc:  # noqa: BLE001
+            if _owned_entry is not None:
+                _owned_entry["terminal"] = True
+                _owned_entry["outcome"] = "failed"
             print(f"[delegation-lifecycle] delegation_task_failed "
-                  f"delegation_id={canonical_hash} member_id={_delegation_target!r} "
+                  f"delegation_id={_delegation_id} member_id={_delegation_target!r} "
                   f"exception_type={type(exc).__name__}", flush=True)
             raise
         else:
+            if _owned_entry is not None:
+                _owned_entry["terminal"] = True
+                _owned_entry["outcome"] = "completed"
+                _finalise_owned_delegation_fallback(team, _delegation_id)
             print(f"[delegation-lifecycle] delegation_task_completed "
-                  f"delegation_id={canonical_hash} member_id={_delegation_target!r}", flush=True)
+                  f"delegation_id={_delegation_id} member_id={_delegation_target!r}", flush=True)
 
     new_function = Function.from_callable(
         delegate_structured_task, name="delegate_structured_task")
@@ -26046,6 +26105,159 @@ def _claim_pending_entry_for_run(team, agent_name: str, run_id) -> None:
             team._pending_log_entry_by_run_id[run_id] = entry
             _check_member_concurrency_episode(team, agent_name)
             return
+
+
+# Phase 0.82: how long run_task_async's own return point will wait for an
+# owned delegation that is still running when the parent would otherwise
+# return, before explicitly cancelling it. 60s chosen from observed Researcher
+# delegation durations across Phases 0.74-0.80 (natural completions ranged
+# roughly 30s-900s; this is not meant to cover every case -- it is a bounded,
+# conservative LAST-CHANCE window for a delegation that is close to finishing,
+# not a replacement for the delegation's own existing tool/time budget). Env-
+# overridable for the same reason every other bounded constant in this file
+# is.
+_DELEGATION_DRAIN_DEADLINE_S = float(os.getenv("DELEGATION_DRAIN_DEADLINE_S", "60"))
+# Bounded allowance for observing cancellation delivery after the deadline
+# expires -- separate from the deadline itself so "how long we wait for
+# natural completion" and "how long we wait for a cancellation we already
+# requested to be confirmed" stay independently tunable and legible in logs.
+_DELEGATION_CANCEL_CLEANUP_S = 5.0
+
+
+def _finalise_owned_delegation_fallback(team, delegation_id: str) -> None:
+    """Phase 0.82: safety-net finalization for ONE owned delegation whose
+    natural completion may never reach _finalise_member_chunks through the
+    normal Agno event-relay chain.
+
+    Phase 0.78.1/0.79 established that chain's real dependency: a delegated
+    generator's own events only reach _finalise_member_chunks by being
+    relayed, item by item, all the way up through agno's own
+    arun_function_calls -> _arun_stream -> _stream_team_run's outer
+    `_agen.__anext__()` loop. If that outer loop has already stopped pulling
+    for an UNRELATED reason earlier in the same run (e.g. an earlier Z16 cut
+    on the Coordinator's own text, confirmed attribution-blind, Phase 0.78.1)
+    and its `finally: await _agen.aclose()` has already run, nothing is left
+    to relay this delegation's own later events -- even though Phase 0.78.1's
+    own experiments proved the delegation's background task keeps running
+    regardless, completely decoupled from that closure.
+
+    This function is called from INSIDE that same background task (see
+    delegate_structured_task's own `else` branch, right where this task
+    reaches its own natural completion) -- so it needs no relay at all; it
+    acts directly on the generation's own locally-accumulated text.
+
+    Deliberately idempotent and generation-gated, reusing the EXISTING
+    team._delegation_generation / team._member_result_generation bookkeeping
+    (Phase 0.23/0.57) rather than inventing new staleness logic:
+      - If _member_result_generation already shows THIS exact generation as
+        registered, the normal relay path already finalized it -- no-op.
+      - If team._delegation_generation for this member has moved past this
+        delegation's own captured generation (a newer delegation was
+        dispatched after this one started), this delegation's own text is
+        stale by the SAME rule forward_member_answer's own staleness check
+        already uses -- no-op, never finalized as if current.
+    Only once neither applies does it write this delegation's own complete
+    local buffer into team._member_chunks and call the existing, unmodified
+    _finalise_member_chunks -- so every downstream consequence (freshness
+    stamping, Phase P.2 log-entry tagging, the exact print line) is the
+    SAME finalization code every normal completion already goes through,
+    not a second, parallel registration path.
+    """
+    owned = getattr(team, "_owned_delegations", None)
+    if not isinstance(owned, dict):
+        return
+    entry = owned.get(delegation_id)
+    if entry is None:
+        return
+    member_key = entry["member_key"]
+    my_generation = entry["generation"]
+    captured = getattr(team, "_member_result_generation", None)
+    if isinstance(captured, dict) and captured.get(member_key, -1) == my_generation:
+        return  # the normal relay path already registered exactly this generation
+    current_gen = getattr(team, "_delegation_generation", None)
+    if isinstance(current_gen, dict) and current_gen.get(member_key, 0) != my_generation:
+        return  # a newer delegation for this member exists; this one is stale
+    text = "".join(entry.get("local_chunks") or []).strip()
+    if not text:
+        return
+    if not isinstance(getattr(team, "_member_chunks", None), dict):
+        team._member_chunks = {}
+    # Overwrite, not append: this delegation's own local buffer is the
+    # complete record of what IT produced; whatever partial amount (if any)
+    # the normal relay chain already placed here before being abandoned is
+    # a strict subset of this same text, never a different delegation's.
+    team._member_chunks[member_key] = text
+    print(f"[delegation-lifecycle] delegation_fallback_finalize "
+          f"delegation_id={delegation_id} member_id={member_key!r} chars={len(text):,}",
+          flush=True)
+    _finalise_member_chunks(team, member_key, run_id=None)
+
+
+async def _drain_owned_delegations(team) -> None:
+    """Phase 0.82: give delegations owned by THIS parent run a bounded,
+    final chance to reach their own natural completion before run_task_async
+    returns -- called immediately before that return, never blocking the
+    normal Agno event-consumption path (it does not touch `_agen` at all; it
+    only waits on the real asyncio.Task objects captured in
+    delegate_structured_task via asyncio.current_task(), confirmed Phase
+    0.78.1/0.79 to run fully independently of that generator's own fate).
+
+    Scope is strictly this team instance's own registry -- team objects are
+    confirmed fresh per /run request (Phase 0.75), so this can never wait for
+    or cancel a DIFFERENT request's own delegation. Only entries not already
+    marked terminal are waited on; nothing here re-examines or re-finalizes
+    an already-terminal entry.
+
+    On natural completion within the deadline, delegate_structured_task's own
+    `else` branch (where the task's underlying coroutine actually returns)
+    has already called _finalise_owned_delegation_fallback -- by the time
+    asyncio.wait() reports a task done, that has already run, in the same
+    task, before this function ever sees it finish. This function itself
+    performs no finalization of its own.
+
+    On deadline expiry, cancels ONLY the still-pending tasks THIS registry
+    holds -- never the generic MCP transport/session tasks Phase 0.80's own
+    worker_pending_tasks_at_shutdown snapshot already showed sharing the same
+    event loop, and never another request's own work.
+    """
+    owned = getattr(team, "_owned_delegations", None)
+    if not isinstance(owned, dict) or not owned:
+        return
+    pending = [
+        entry["task"] for entry in owned.values()
+        if not entry.get("terminal") and isinstance(entry.get("task"), asyncio.Task)
+        and not entry["task"].done()
+    ]
+    if not pending:
+        print(f"[delegation-lifecycle] drain_skipped reason=no_pending_owned_tasks "
+              f"registry_size={len(owned)}", flush=True)
+        return
+    print(f"[delegation-lifecycle] drain_started pending_count={len(pending)} "
+          f"deadline_s={_DELEGATION_DRAIN_DEADLINE_S}", flush=True)
+    done, still_pending = await asyncio.wait(
+        pending, timeout=_DELEGATION_DRAIN_DEADLINE_S, return_when=asyncio.ALL_COMPLETED)
+    print(f"[delegation-lifecycle] drain_deadline_reached completed_count={len(done)} "
+          f"still_pending_count={len(still_pending)}", flush=True)
+    if not still_pending:
+        return
+    # Deadline expired with work still outstanding -- cancel exactly those
+    # tasks (never anything else on the loop) and bound how long we wait for
+    # the cancellation itself to be delivered and observed.
+    for task in still_pending:
+        task.cancel()
+    cancelled_done, cancel_still_pending = await asyncio.wait(
+        still_pending, timeout=_DELEGATION_CANCEL_CLEANUP_S, return_when=asyncio.ALL_COMPLETED)
+    print(f"[delegation-lifecycle] drain_cancel_cleanup cancelled_observed={len(cancelled_done)} "
+          f"unresolved_after_cleanup_allowance={len(cancel_still_pending)}", flush=True)
+    if cancel_still_pending:
+        # Honest disclosure, not a silent gap: cleanup itself did not finish
+        # within the bounded allowance. The task's own exception handler
+        # (delegate_structured_task's `except asyncio.CancelledError`) will
+        # still run whenever the event loop actually gets to it -- this is
+        # reported, never claimed as confirmed-complete without evidence.
+        print(f"[delegation-lifecycle] drain_cleanup_incomplete "
+              f"unresolved_task_names={[t.get_name() for t in cancel_still_pending]}",
+              flush=True)
 
 
 def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
@@ -33466,6 +33678,16 @@ async def run_task_async(
                 # that boundary without touching installed Agno or event-loop
                 # internals. Metadata only (name/id/done-state) -- never a stack,
                 # prompt, or tool payload.
+                #
+                # Phase 0.82: give any still-running OWNED delegation a bounded
+                # last chance to reach natural completion (and, via its own
+                # `else` branch, register its result) BEFORE this snapshot and
+                # return -- this is the fix for exactly what that snapshot used
+                # to only observe after the fact. Runs unconditionally here
+                # (not gated on whether Z16 fired): a no-op, near-instant return
+                # whenever nothing owned is still pending, which is the common
+                # case for every successful T13a/T13b run already observed.
+                await _drain_owned_delegations(team)
                 _pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
                 _pending_meta = [
                     {"name": _t.get_name(), "id": id(_t), "done": _t.done()}
