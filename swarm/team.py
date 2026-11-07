@@ -24387,6 +24387,24 @@ def _build_canonical_researcher_task(
     duplicate RELEVANCE-FILTER's own content -- it only establishes that OBJECTIVE
     and COMPLETION CRITERIA above define WHEN a task is finished, never WHAT
     content is in scope; scope is always the Researcher's own standing rules.
+
+    Phase 0.65 (2026-11-06): BOUNDED EXECUTION's own wording ("Investigate only
+    the specified target", present since Phase S's original b5870f0) is a
+    genuine, confirmed instruction-level contradiction with a cross-component
+    OBJECTIVE -- live-confirmed on the November 6 T11 run: the Coordinator's
+    own delegation carried target='API/business-service' alongside an
+    objective asking "which services are involved" (plural), and the
+    Researcher was explicitly told to investigate ONLY the narrow target,
+    never reaching storage-service or the frontend at all despite the
+    objective asking about exactly that. The original wording's own intent
+    (preventing an open-ended, runaway single-delegation exploration -- the
+    SAME problem class engineering.yaml's own "rotated between 3 files 21
+    times... without ever converging" incident describes) is preserved by
+    every OTHER clause here (minimum tool calls, stop at completion, no
+    confidence-padding, no pseudo-tool syntax) -- only the one absolute,
+    target-as-exclusion-boundary sentence changed, to target-as-primary-focus
+    with explicit permission to follow a genuine cross-component connection
+    the objective itself describes.
     """
     _inherited_block = ""
     if inherited_context and inherited_context.strip():
@@ -24453,10 +24471,15 @@ def _build_canonical_researcher_task(
         f"literally every declaration/item present in the target regardless of "
         f"relevance. Never expand scope to satisfy a completion criterion.\n\n"
         f"BOUNDED EXECUTION:\n"
-        f"Investigate only the specified target. Use the minimum tool calls "
-        f"necessary to obtain the required evidence. Stop immediately once the "
-        f"completion criteria are satisfied and return the evidence obtained. "
-        f"Do not continue searching merely to increase confidence. Do not emit "
+        f"TARGET above names your primary focus, not an exclusion boundary. If "
+        f"your OBJECTIVE or COMPLETION CRITERIA describe a connection, "
+        f"dependency, or hand-off to another file, service, or component, "
+        f"follow it there too -- do not stop at TARGET's own boundary merely "
+        f"because the objective asks about something that lives elsewhere. "
+        f"Use the minimum tool calls necessary to obtain the required evidence, "
+        f"wherever it actually lives. Stop immediately once the completion "
+        f"criteria are satisfied and return the evidence obtained. Do not "
+        f"continue searching merely to increase confidence. Do not emit "
         f"pseudo-tool syntax of any kind."
     )
 
