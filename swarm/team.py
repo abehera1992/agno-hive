@@ -9219,7 +9219,18 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
     team.tool_hooks = [_make_no_delegation_hook()] + _original_tool_hooks
     try:
         completed, retry = await _stream_team_run(
-            team, prompt, log_label="repetition-completion", liveness_path=liveness_path)
+            # Phase 0.73: op_id-qualified, so a multi-event sequence (e.g. the
+            # Phase 0.71 live run's own two Z16 events under this same shared
+            # label) can be attributed to the actual recovery operation that
+            # produced it, instead of all five call sites printing identically
+            # -- see this function's own docstring and Phase 0.72's report for
+            # why that ambiguity could not be resolved from the journal alone.
+            # Purely cosmetic: log_label is interpolated into print() lines
+            # only, never parsed or matched anywhere (confirmed by inspecting
+            # every call site), and `repair-{finding.guard}` at this file's
+            # own line ~13791 is the exact same "label + dynamic suffix"
+            # pattern already in production use elsewhere in this file.
+            team, prompt, log_label=f"repetition-completion:{op_id}", liveness_path=liveness_path)
         all_results.append(retry)
     except Exception as exc:  # noqa: BLE001
         print(f"[team] repetition-truncation completion failed: {exc} — keeping the "
