@@ -2432,7 +2432,8 @@ def _make_forward_member_answer(
             return (_answer == result.answer and _status == result.status
                     and _unresolved == list(result.unresolved))
 
-        if not any(_same_forward(forwarded.get(k)) for k in existing_keys):
+        _already_forwarded = any(_same_forward(forwarded.get(k)) for k in existing_keys)
+        if not _already_forwarded:
             record = ForwardedRecord(
                 member_key=key, status=result.status, answer=result.answer,
                 evidence=list(result.evidence), unresolved=list(result.unresolved),
@@ -2444,6 +2445,33 @@ def _make_forward_member_answer(
                 while f"{key}#{n}" in forwarded:
                     n += 1
                 forwarded[f"{key}#{n}"] = record
+        # Phase 0.71: an identical re-forward (same member, same answer/status/
+        # unresolved -- _same_forward above) was, until this phase, given the
+        # EXACT SAME "FORWARDED: ... is recorded" receipt as a genuinely new
+        # forward -- live-confirmed root cause of the Phase 0.70 Coordinator
+        # loop (repeat=True progress=False, 5+ consecutive identical calls):
+        # the model had no signal from the tool's own return value that
+        # calling it again changed nothing. The external Coordinator
+        # progress guard (_make_coordinator_progress_guard_hook, T50) DOES
+        # eventually force text-only once the no-progress streak reaches
+        # config.liveness_repetition_threshold -- confirmed this phase, via
+        # direct source read, to be WHY that run completed naturally with no
+        # watchdog kill -- but that is a several-strikes-late external
+        # backstop, not the tool telling the model directly, on the very
+        # first redundant call, that nothing new happened. This gives the
+        # model that earlier, explicit signal, so it can stop on its own
+        # ahead of the guard's own bounded tolerance, instead of relying on
+        # it alone every time.
+        if _already_forwarded:
+            return (
+                f"ALREADY FORWARDED: {key}'s answer was already recorded by an earlier "
+                f"call -- this call made no new change, and calling it again for "
+                f"{key!r} with the same result will not either. If every member you "
+                f"need has already been forwarded, stop calling forward_member_answer "
+                f"and write your final answer now. If {key!r} has a genuinely NEW "
+                f"result (from a delegation you made after the last forward), "
+                f"delegate_structured_task first, then forward that new result."
+            )
         # Phase 0.60: the receipt itself must not claim a PARTIAL report is
         # complete or independently verified -- this tool never calls
         # verify_claims (see _component_has_accepted_evidence's own docstring
