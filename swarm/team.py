@@ -9152,12 +9152,47 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
     # task with SOME current evidence (even if a different delegation is
     # still unfinished) is unaffected and proceeds exactly as before.
     if not _has_usable_current_generation_evidence(team):
+        # Phase 0.74: a delegated member can do substantial, real, grounded
+        # tool-calling (file reads, searches) and still leave team._member_results
+        # empty, because that registration is keyed SOLELY on natural-language
+        # RunContent text (_accumulate_member_chunk/_finalise_member_chunks) --
+        # a turn that is entirely tool calls, with no concluding summary,
+        # legitimately finalizes to "" and registers nothing. Live-confirmed,
+        # 2026-11-06 T11 run: the Researcher made 10 real tool calls across two
+        # delegations (8 real get_file_content reads, 1 lightrag_query, 1
+        # update_session_state) and EVIDENCE_RECORDED fired 5 times for real
+        # content -- yet _has_usable_current_generation_evidence was correctly
+        # False (no member result exists to be stale-checked), and the prior
+        # disclosure said only "nothing else gathered this run answers it
+        # either", which was not true: real tool output existed the whole time.
+        #
+        # _captured_tool_evidence(team) is the EXISTING, already-production-
+        # proven mechanism for exactly this gap (built for T9, 2026-08-28: a
+        # relay that lost the tool's own real values) -- it reads team._tool_
+        # evidence, which _record_tool_end populates on every tool-call-end
+        # event regardless of which member made the call or whether that
+        # member ever produces a summary, so it is unaffected by the defect
+        # above. Appending it here does NOT change this function's own
+        # evidence-availability determination: _has_usable_current_generation_
+        # evidence(team) still returned False one line above, team._member_
+        # results is not written to, and no COMPLETE-only acceptance gate
+        # downstream reads team._tool_evidence -- this only enriches the
+        # disclosure TEXT with real, already-captured, already-attributed
+        # (`[Researcher]`) tool output, exactly as _captured_tool_evidence's
+        # own existing callers already use it elsewhere in this file. Returns
+        # "" when nothing was ever read, so a task with truly zero tool
+        # activity gets the exact unchanged disclosure as before.
+        _raw_tool_evidence = _captured_tool_evidence(team)
         print(f"[team] {truncation_reason}-truncation completion skipped -- no "
               f"usable current-generation evidence exists yet for this task "
               f"(delegation not finished, or only a stale earlier-generation "
               f"answer is stored); disclosing incomplete research rather than "
-              f"asking the model to synthesize without evidence", flush=True)
-        return content + _NO_EVIDENCE_RECOVERY_DISCLOSURE, result, _RECOVERY_OUTCOME_SKIPPED_NO_EVIDENCE
+              f"asking the model to synthesize without evidence"
+              + (f" -- appending {len(_raw_tool_evidence):,} chars of real "
+                 f"tool output this run already captured" if _raw_tool_evidence
+                 else " -- no tool evidence was captured either"), flush=True)
+        return (content + _NO_EVIDENCE_RECOVERY_DISCLOSURE + _raw_tool_evidence,
+                result, _RECOVERY_OUTCOME_SKIPPED_NO_EVIDENCE)
 
     # T12-FOLLOWUP (2026-10-03): _checkpoint_block(team) is the SAME re-injection
     # every other retry/reconciliation path in this file already uses (the
