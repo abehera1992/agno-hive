@@ -17773,6 +17773,89 @@ def _unresolved_chain_components(log, team) -> "list[str]":
     return sorted(r for r in roots if not _component_has_accepted_evidence(team, r))
 
 
+def _correction_pass_blocks_redundant_target(team, target, objective) -> "str | None":
+    """Phase 0.97/0.98: additional, narrowly-scoped rejection reason, checked
+    ONLY from inside the duplicate-delegation gate's existing "same target as
+    a prior entry, no novelty signal justifies it" branch, and ONLY while the
+    one-shot chain-coverage-correction retry is active
+    (team._chain_coverage_correction_attempted, set True by
+    _attempt_chain_coverage_correction before its own first tool call, never
+    reset -- so this also covers any further delegation later in the same
+    run, which is correct: the retry is one-shot, but its own purpose -- make
+    real progress on the uncovered list -- does not stop mattering the
+    instant the retry's single turn ends).
+
+    Confirmed live gap this closes (Phase 0.96 T11 run): seq 6/7/8 each
+    re-targeted 'API/business-service' (already resolved -- accepted,
+    forwarded, cited evidence existed for it) with a generic tool-call
+    objective (list_directory_tree, search_files('upload'),
+    search_files('document')) naming no other component. The EXISTING gate
+    correctly classified each as a duplicate (no novelty signal fired) and
+    served the softer ALREADY-DONE response twice, then hard-stopped on the
+    3rd -- by which point ~6 of the run's ~26 minutes had been spent on
+    delegations that could not possibly have advanced coverage, by
+    construction, since every component they could be about was already
+    resolved. This returns the same kind of rejection the 3-strike STOP
+    already uses, immediately, on the FIRST such attempt, instead of waiting
+    for the 3rd -- using the SAME authoritative, evidence-based coverage
+    check _attempt_chain_coverage_correction itself already trusts
+    (_component_has_accepted_evidence / _unresolved_chain_components), not a
+    second, competing definition of "covered".
+
+    Deliberately narrow -- returns None (defer entirely to the existing
+    duplicate-delegation logic) whenever:
+    - The correction pass has not started yet (flag unset) -- every
+      pre-correction delegation (seq 1-5 in the live incident) is completely
+      untouched.
+    - No component roots were discovered (nothing to check against).
+    - `target`/`objective` together name NO known component at all -- a
+      citation re-verification against a specific file path (the real T11
+      business_admin_api.py line-number lookup, seq 5) never reaches this
+      function's caller in the first place, because that target string never
+      matches a PRIOR entry's target_norm (it is a narrower, never-before-
+      seen target) -- but even if some future caller passed a never-matched
+      case here directly, naming no component is treated as "not this
+      function's call to make", not as evidence of redundancy.
+    - At least one named component is still genuinely uncovered -- real
+      progress is still possible, so this is not redundant, regardless of how
+      generic the objective's wording is. A genuinely new cross-service
+      objective naming an uncovered component is never blocked here.
+    """
+    if not getattr(team, _CHAIN_COVERAGE_CORRECTION_FLAG, False):
+        return None
+    roots = getattr(team, "_component_roots", None)
+    if not isinstance(roots, list) or not roots:
+        return None
+    named = {r for r in roots
+             if _mentions_component(str(target or ""), r)
+             or _mentions_component(str(objective or ""), r)}
+    if not named:
+        return None
+    if any(not _component_has_accepted_evidence(team, r) for r in named):
+        return None
+    log = getattr(team, "_coordinator_delegation_log", None)
+    remaining = _unresolved_chain_components(log if isinstance(log, list) else [], team)
+    if not remaining:
+        # Every discovered component is resolved -- nothing left to redirect
+        # toward, so blocking here would be a dead end, not a correction.
+        return None
+    _shown = ", ".join(repr(r) for r in remaining[:12])
+    _more = f", and {len(remaining) - 12} more" if len(remaining) > 12 else ""
+    print(f"[team] correction-pass progress gate: rejected delegation naming only "
+          f"already-covered component(s) {sorted(named)!r} -- {len(remaining)} "
+          f"component(s) still remain uncovered", flush=True)
+    return (
+        f"REJECTED (correction-pass progress gate) — this run already has accepted "
+        f"evidence for {sorted(named)!r}; delegating for it again with no new "
+        f"objective makes no progress toward what this correction pass exists to "
+        f"produce. COMPONENTS STILL UNCOVERED: {_shown}{_more}. Delegate for one of "
+        f"those instead, or — only if a specific, distinct, still-unresolved "
+        f"question about {sorted(named)!r} genuinely remains — say exactly what "
+        f"that question is and delegate for THAT. This delegate_structured_task "
+        f"call was NOT executed."
+    )
+
+
 def _chain_coverage_unresolved_note(components: "list[str]") -> str:
     """Phase 0.48/0.49 (T11): the complete-inventory in `components` is real --
     read from the repository by _component_roots, never guessed -- but whether
@@ -22494,9 +22577,32 @@ def _subject_categories(text: str) -> frozenset[str]:
     )
 
 
-def _objective_names_new_entity(objective_norm: str, prior_objective_norm: str) -> bool:
+def _mentions_component(text: str, root: str) -> bool:
+    """Whether `text` names `root` (a team._component_roots entry, e.g.
+    'API/storage-service') by its basename, as a standalone word.
+
+    Phase 0.97: matches the basename literally (case-insensitive), bounded on
+    both sides by a character that is not itself part of an identifier/path
+    segment -- deliberately NOT split on the hyphen (that is what let
+    'storage-service' slip past both existing novelty signals in the first
+    place, see _objective_names_new_entity's Signal 3 below) and deliberately
+    NOT a bare substring match ('storage' or 'service' alone never qualify,
+    nor does a longer component name that merely contains this one as a
+    substring) -- the exact failure mode Phase 0.96 warned against avoiding.
+    """
+    if not text or not root:
+        return False
+    basename = root.rsplit("/", 1)[-1].strip()
+    if not basename:
+        return False
+    pattern = r"(?<![A-Za-z0-9_-])" + re.escape(basename) + r"(?![A-Za-z0-9_-])"
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
+
+def _objective_names_new_entity(objective_norm: str, prior_objective_norm: str,
+                                 team=None) -> bool:
     """True if `objective_norm` introduces something the prior objective never
-    named -- either of two independent, orthogonal signals:
+    named -- either of three independent, orthogonal signals:
 
     1. An identifier-shaped token (true CamelCase or snake_case, >= 4 chars --
        a model/class/function/field name), e.g. 'Party' -> 'PartyRegistration'.
@@ -22561,6 +22667,27 @@ def _objective_names_new_entity(objective_norm: str, prior_objective_norm: str) 
     if new_cats and prior_cats and (new_cats - prior_cats):
         return True
 
+    # Signal 3 (Phase 0.97, confirmed Phase 0.96 gap): a different repository
+    # COMPONENT named -- reuses team._component_roots (populated once by the
+    # preflight, see _preflight_repo_facts; no new data source, no
+    # embeddings, no LLM call). A hyphenated component name like
+    # 'storage-service' is neither an identifier-shaped token (no
+    # underscore, no internal uppercase -- Signal 1 never fires) nor a
+    # recognized subject category (tokenizes via _CATEGORY_WORD_RE to the
+    # two plain words 'storage'/'service', present in none of
+    # _SUBJECT_CATEGORY_KEYWORDS -- Signal 2 never fires either), so a
+    # genuinely new cross-service objective naming it previously registered
+    # as zero novelty under both existing signals. Same "only something NEW"
+    # asymmetry as Signals 1/2: a narrower follow-up naming no component
+    # the prior objective didn't already name is still correctly a
+    # duplicate.
+    roots = getattr(team, "_component_roots", None) if team is not None else None
+    if isinstance(roots, list) and roots:
+        new_roots = {r for r in roots if _mentions_component(objective_norm, r)}
+        if new_roots and (new_roots - {r for r in roots
+                                        if _mentions_component(prior_objective_norm, r)}):
+            return True
+
     return False
 
 
@@ -22610,7 +22737,7 @@ def _find_in_flight_equivalent_delegation(team, member_id: str, target: str, obj
         entry_objective = entry.get("objective") or ""
         same_wording = _normalize_delegation_task(entry_objective) == _normalize_delegation_task(objective)
         if not same_wording and _objective_names_new_entity(
-                str(objective or ""), str(entry_objective or "")):
+                str(objective or ""), str(entry_objective or ""), team=team):
             continue
         task = entry.get("task")
         if isinstance(task, asyncio.Task) and not task.done():
@@ -23328,8 +23455,24 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                 # "partyregistration" has no internal uppercase letter left to find).
                 if not same_wording and _objective_names_new_entity(
                         str((args or {}).get("objective") or ""),
-                        str(prior_args.get("objective") or "")):
+                        str(prior_args.get("objective") or ""), team=team):
                     continue
+                # Phase 0.97/0.98: inside the one-shot chain-coverage-correction
+                # retry, a delegation that reaches THIS point (same target as a
+                # prior entry, no novelty signal justifies it) and names only
+                # components that already have accepted evidence makes no
+                # possible correction-pass progress, by construction. Escalate
+                # past the softer ALREADY-DONE/3-strike path below with an
+                # immediate, specific rejection naming the real remaining
+                # uncovered components -- see _correction_pass_blocks_
+                # redundant_target's own docstring for why this never touches
+                # a genuinely new target string (e.g. a narrower file-path
+                # re-read for a distinct fact, which never reaches this loop
+                # body at all since prior_target != target_norm for it).
+                _correction_block = _correction_pass_blocks_redundant_target(
+                    team, (args or {}).get("target"), (args or {}).get("objective"))
+                if _correction_block is not None:
+                    return _correction_block
                 repeats[member_id] = repeats.get(member_id, 0) + 1
                 n = repeats[member_id]
                 # Phase P.2: entry is already matched on target_norm above (line
