@@ -27016,6 +27016,86 @@ def _segment_introduces_new_quoted_literal(new_segment: str, prior_content: str)
     return bool(combined_quoted - prior_quoted)
 
 
+# Phase 0.89: run-ID-scoped repetition state. Phase 0.87 confirmed, directly
+# from source, that the comparison state these detectors run against --
+# accumulated text, last-checked offset, strike count, recent tool-token
+# history -- used to be flat and shared across every speaker and every
+# concurrent delegation within one _stream_team_run/run_task_async call, so
+# a Researcher's own generated text could combine with a LATER Coordinator
+# restatement to cross the shared 4-strike threshold, interrupting the
+# Coordinator for content it never itself repeated (and, symmetrically, two
+# concurrent delegations to the same member could contaminate each other).
+# Phase 0.88 established that Agno's own event.run_id -- confirmed present
+# on BOTH BaseAgentRunEvent and BaseTeamRunEvent, agno 2.5.17, on every
+# content and tool event, by direct read of the installed package -- is a
+# genuine, already-relied-upon identity for one independent stream: this
+# codebase's own _claim_pending_entry_for_run already depends on it being
+# correct under concurrent dispatch to the same member.
+#
+# Each run_id gets its own bucket of what used to be flat state. Only ONE
+# run_id -- whichever is first observed in this call's own stream, always
+# the top-level Coordinator/Team run, since nothing can be dispatched before
+# it starts -- is allowed to set the call's own global repetition_stopped
+# flag that breaks the outer consumption loop. Every OTHER run_id's own
+# threshold-hit marks only its own bucket "stopped" (its further content is
+# simply excluded from future comparisons, and Phase 0.82's own existing
+# bounded-drain/fallback-finalize machinery, left completely untouched,
+# remains what decides what becomes of that delegation's own task) without
+# ending the outer loop's ability to keep consuming any OTHER stream.
+def _new_run_repetition_bucket() -> dict:
+    """One independent stream's own repetition-comparison state."""
+    return {
+        "joined": "", "last_logged_len": 0, "repetition_count": 0,
+        "recent_tool_token_sets": [], "stopped": False,
+    }
+
+
+def _run_repetition_bucket(per_run: dict, run_id) -> dict | None:
+    """The bucket for `run_id`, created on first use -- or None if `run_id`
+    is missing. A missing run_id is deliberately never assigned a shared
+    sentinel bucket (that would recreate exactly the cross-stream
+    contamination this phase closes, now between two DIFFERENT
+    missing-run_id streams instead of two named ones) -- its content is
+    excluded from repetition comparison entirely, the conservative behavior
+    the mission's own Section 3 requires when a reliable isolated identity
+    cannot be established. See the content-event handling at both call
+    sites for where this exclusion -- and its own one-time diagnostic log --
+    actually happens."""
+    if run_id is None:
+        return None
+    return per_run.setdefault(run_id, _new_run_repetition_bucket())
+
+
+def _check_one_run_repetition(bucket: dict, best_draft_text: str) -> tuple[bool, str | None, str]:
+    """Runs the EXISTING, completely unmodified three detectors against ONE
+    run_id's own bucket only. Returns (flagged, detector_name_or_None,
+    preview) and mutates ONLY this bucket's own last_logged_len/
+    repetition_count -- never any other bucket's. `best_draft_text` is the
+    SAME cross-pass value (best_draft()) the pre-existing flat code already
+    passed to _looks_like_repetition_loop's own Tier 5; unchanged in meaning,
+    now supplied once per bucket check instead of once per flat tick."""
+    new_segment = bucket["joined"][bucket["last_logged_len"]:]
+    if not new_segment:
+        return False, None, ""
+    prior_content = bucket["joined"][:bucket["last_logged_len"]]
+    preview = new_segment[-300:]
+    loop_detected = _looks_like_repetition_loop(
+        new_segment, prior_content, cross_pass_content=best_draft_text)
+    decay_detected = not loop_detected and _looks_like_repetition_decay(new_segment, prior_content)
+    recent_tokens = (frozenset().union(*bucket["recent_tool_token_sets"])
+                      if bucket["recent_tool_token_sets"] else frozenset())
+    regurg_detected = (
+        not loop_detected and not decay_detected
+        and _looks_like_tool_content_regurgitation(
+            new_segment, recent_tokens, prior_content=prior_content))
+    bucket["last_logged_len"] = len(bucket["joined"])
+    if loop_detected or decay_detected or regurg_detected:
+        bucket["repetition_count"] += 1
+        detector = "loop" if loop_detected else ("decay" if decay_detected else "regurgitation")
+        return True, detector, preview
+    return False, None, preview
+
+
 def _looks_like_repetition_loop(new_segment: str, prior_content: str,
                                 cross_pass_content: str = "") -> bool:
     """True if `new_segment` (freshly generated text, appended to the accumulated
@@ -32414,6 +32494,18 @@ async def _stream_team_run(
     # above _SOURCE_RETRIEVAL_TOOLS for why. Function-local, like every other
     # piece of this loop's state; discarded with this call, never persisted.
     recent_tool_token_sets: list["frozenset[str]"] = []
+    # Phase 0.89: per-run_id repetition state (see the block above
+    # _looks_like_repetition_loop for the full design). per_run_repetition
+    # holds one bucket per Agno run_id observed on this call's own stream;
+    # top_level_run_id is set once, to the FIRST non-None run_id seen -- by
+    # construction the Coordinator/Team-level run, since nothing can be
+    # dispatched before it starts. recent_tool_token_sets above stays
+    # declared (unused directly now; each bucket carries its own copy) only
+    # because removing it would ripple into call sites not touched this
+    # phase -- left harmlessly inert rather than deleted.
+    per_run_repetition: dict = {}
+    top_level_run_id: str | None = None
+    _missing_run_id_logged = False
     # Phase 0.11: drive the agno async generator manually (not `async for`) so
     # each individual __anext__() can be bounded by _STREAM_INACTIVITY_TIMEOUT_S
     # -- see that constant's own comment for what this bounds (inter-event gap,
@@ -32480,131 +32572,104 @@ async def _stream_team_run(
                 _src = getattr(event, "agent_name", "") or ""
                 segment_agent_names.add(_src)
                 run_agent_names.add(_src)
+                # Phase 0.89: attribute this chunk to its own run_id's own
+                # bucket, in ADDITION to the unchanged flat full_content
+                # above (which still drives _record_draft/_record_enumerations/
+                # final-answer construction exactly as before -- untouched,
+                # Section 6). A missing run_id excludes this chunk from
+                # repetition comparison entirely (never a shared sentinel
+                # bucket -- see _run_repetition_bucket's own docstring);
+                # logged once per call so the gap is diagnosable, not silent.
+                _run_id = getattr(event, "run_id", None)
+                if _run_id is None:
+                    if not _missing_run_id_logged:
+                        print(f"[{log_label}] repetition-state: event with no run_id "
+                              f"(agent_name={_src!r}) -- excluded from repetition "
+                              f"comparison entirely (not a shared bucket); further "
+                              f"occurrences this call are not logged individually",
+                              flush=True)
+                        _missing_run_id_logged = True
+                else:
+                    if top_level_run_id is None:
+                        top_level_run_id = _run_id
+                        print(f"[{log_label}] repetition-state: top-level run_id="
+                              f"{top_level_run_id!r} (agent_name={_src!r})", flush=True)
+                    _run_repetition_bucket(per_run_repetition, _run_id)["joined"] += out
                 now = time.monotonic()
                 activity["last_token_at"] = now
                 if now - last_logged_at >= 10:
                     joined = "".join(full_content)
                     _record_draft(joined, team=team, run_agent_names=run_agent_names)
                     _record_enumerations(team)
-                    new_segment = joined[last_logged_len:]
-                    preview = new_segment[-300:]
-                    # Phase 0.32 (Track C, cross-retry), REVISED Phase 0.32B/0.33:
-                    # best_draft() is the longest content ANY pass of this run has
-                    # produced so far, surviving across separate _stream_team_run
-                    # calls within one run (a verify_claims correction retry's own
-                    # `joined` starts empty, but best_draft() does not).
-                    #
-                    # Originally blended into `prior_content` itself (prepended).
-                    # Reverted: confirmed live in Phase 0.32B/0.33 scratch validation
-                    # that blending it into `prior_content` fed tiers 1/2 of
-                    # _looks_like_repetition_loop, which have NO identifier/quoted-
-                    # literal veto at all -- a correction retry's first segment
-                    # legitimately re-deriving one correct, reusable sentence from
-                    # an otherwise-abandoned draft was flagged with no escape. Now
-                    # passed as the SEPARATE `cross_pass_content` argument, which
-                    # _looks_like_repetition_loop only ever matches through its own
-                    # vetoed tier (see that function's own "Tier 5" comment) --
-                    # never through the unvetoed tiers 1/2. Decay has no veto
-                    # mechanism at all and no demonstrated defect was found for it
-                    # here, so its own prior_content argument is left as the
-                    # original joined[:last_logged_len], unblended.
-                    loop_detected = _looks_like_repetition_loop(
-                        new_segment, joined[:last_logged_len], cross_pass_content=best_draft())
-                    decay_detected = not loop_detected and _looks_like_repetition_decay(
-                        new_segment, joined[:last_logged_len]
-                    )
-                    # Phase 0.32 (Track A/B/D): a THIRD, independent axis -- not "does
-                    # this repeat the answer's own prior text" but "is this mostly a
-                    # verbatim reproduction of a tool result this run already
-                    # retrieved." See _looks_like_tool_content_regurgitation's own
-                    # docstring for why this is a separate check rather than a change
-                    # to either existing one, and the comment above
-                    # _SOURCE_RETRIEVAL_TOOLS for the confirmed incident this closes.
-                    regurgitation_detected = (
-                        not loop_detected and not decay_detected
-                        and _looks_like_tool_content_regurgitation(
-                            new_segment, frozenset().union(*recent_tool_token_sets)
-                            if recent_tool_token_sets else frozenset(),
-                            prior_content=joined[:last_logged_len]))
-                    if loop_detected or decay_detected or regurgitation_detected:
-                        # Count it (2026-08-27). Withholding progress credit -- the
-                        # only response until now -- bites solely when repetition is
-                        # CONTINUOUS: any genuine segment in between refreshes
-                        # last_progress_at and resets the stall clock. The live 736s
-                        # run fired this 21 times and was never stopped by it. Tier 5
-                        # counts instead, the same shape as the stub-serve tiers.
-                        activity["repetition_count"] = (
-                            activity.get("repetition_count", 0) + 1)
-                        # Leave last_progress_at untouched -- it already reflects the
-                        # last time genuinely new content was confirmed, and neither a
-                        # repeat nor a local diversity collapse this window changes that.
-                        if loop_detected:
-                            print(
-                                f"[{log_label}] repetition loop detected -- the last "
-                                f"{len(new_segment)} chars look like a repeat of earlier "
-                                f"content, not counted as progress: ...{preview!r}",
-                                flush=True,
-                            )
-                        elif decay_detected:
-                            print(
-                                f"[{log_label}] repetition DECAY detected -- the last "
-                                f"{len(new_segment)} chars have collapsed into a small "
-                                f"recombined vocabulary (not a match against earlier "
-                                f"content), not counted as progress -- unvalidated "
-                                f"threshold, see _looks_like_repetition_decay's own "
-                                f"docstring: ...{preview!r}",
-                                flush=True,
-                            )
-                        else:
-                            print(
-                                f"[{log_label}] tool-content regurgitation detected -- "
-                                f"the last {len(new_segment)} chars look like a verbatim "
-                                f"reproduction of content this run already retrieved via "
-                                f"a tool call, not counted as progress: ...{preview!r}",
-                                flush=True,
-                            )
-                        # Z16 (2026-09-26): stop consuming THIS generation in-process at
-                        # the SAME repetition-count threshold api/server.py's Tier 5
-                        # liveness auto-kill already uses to justify a hard SIGKILL --
-                        # see config.liveness_repetition_threshold's own comment for the
-                        # data behind that number (max observed benign streak 3, so 4
-                        # leaves one firing of margin). Reusing it here, rather than a
-                        # new constant, means the in-process stop and the external kill
-                        # agree on "how many firings is a genuine loop" -- the only
-                        # difference is WHERE the stop happens and what survives it.
-                        #
-                        # Root cause (see this phase's own report): a stuck generation
-                        # doesn't discard its own already-complete answer before looping
-                        # past it, and the only prior stop was an EXTERNAL SIGKILL of the
-                        # whole worker process, which loses every in-memory guard/
-                        # verification pass and forces a lossy draft-plus-repair salvage
-                        # from disk. Breaking the stream here instead keeps the process
-                        # alive -- the truncation below discards the repeating tail, and
-                        # the answer that survives goes through the SAME guard chain
-                        # (verify_claims, evidence-integrity, etc.) any normal completion
-                        # does, rather than a parent-side repair of a raw draft.
-                        if activity["repetition_count"] >= config.liveness_repetition_threshold:
-                            print(
-                                f"[{log_label}] repetition threshold reached "
-                                f"({activity['repetition_count']} >= "
-                                f"{config.liveness_repetition_threshold}) -- stopping this "
-                                f"generation in-process and keeping the {last_good_len} "
-                                f"chars generated before the repeating segment began, "
-                                f"instead of waiting for an external liveness kill to "
-                                f"discard the whole run",
-                                flush=True,
-                            )
-                            repetition_stopped = True
-                            last_logged_at = now
-                            last_logged_len = len(joined)
-                            break
-                    else:
+                    # Phase 0.89: check EACH run_id's own bucket against ONLY its
+                    # own prior content -- never the flat `joined` above, which
+                    # mixes every speaker and every concurrent delegation (Phase
+                    # 0.87's own confirmed root cause). best_draft() is passed
+                    # identically to every bucket, same meaning as the pre-0.89
+                    # flat code's own Tier-5 cross_pass_content argument.
+                    _best_draft = best_draft()
+                    _top_level_flagged = False
+                    _any_global_stop = False
+                    for _rid, _bucket in list(per_run_repetition.items()):
+                        if _bucket["stopped"]:
+                            continue
+                        _flagged, _detector, _preview = _check_one_run_repetition(_bucket, _best_draft)
+                        if not _flagged:
+                            continue
+                        # Phase 0.89: activity["repetition_count"] feeds the EXTERNAL
+                        # Tier-5 liveness-watchdog snapshot (api/server.py, via
+                        # liveness_path) -- a SEPARATE safety net from this function's
+                        # own in-process break below. That external reader has no
+                        # notion of per-run_id buckets; reporting the MAX across every
+                        # bucket here keeps it able to see a genuinely stuck stream
+                        # (any stream, not just the top-level one) without reviving
+                        # the cross-stream false-positive this phase closes -- the
+                        # IN-PROCESS decision just below still uses only this ONE
+                        # bucket's own count.
+                        activity["repetition_count"] = max(
+                            activity.get("repetition_count", 0), _bucket["repetition_count"])
+                        _is_top = (_rid == top_level_run_id)
+                        _label = {"loop": "repetition loop detected", "decay": "repetition DECAY detected",
+                                   "regurgitation": "tool-content regurgitation detected"}[_detector]
+                        print(f"[{log_label}] {_label} (run_id={_rid!r}, "
+                              f"{'top-level' if _is_top else 'delegated'}) -- the last "
+                              f"{len(_preview)} chars look like a repeat for THIS stream "
+                              f"only, not counted as progress: ...{_preview!r}", flush=True)
+                        if _bucket["repetition_count"] >= config.liveness_repetition_threshold:
+                            if _is_top:
+                                print(f"[{log_label}] repetition threshold reached for the "
+                                      f"TOP-LEVEL run_id={_rid!r} "
+                                      f"({_bucket['repetition_count']} >= "
+                                      f"{config.liveness_repetition_threshold}) -- stopping "
+                                      f"this generation in-process and keeping the "
+                                      f"{last_good_len} chars generated before the repeating "
+                                      f"segment began, instead of waiting for an external "
+                                      f"liveness kill to discard the whole run", flush=True)
+                                repetition_stopped = True
+                                _any_global_stop = True
+                            else:
+                                print(f"[{log_label}] repetition threshold reached for "
+                                      f"DELEGATED run_id={_rid!r} "
+                                      f"({_bucket['repetition_count']} >= "
+                                      f"{config.liveness_repetition_threshold}) -- marking "
+                                      f"only this stream's own bucket stopped; the outer "
+                                      f"consumption loop and every OTHER stream continue "
+                                      f"unaffected (Phase 0.82's own existing drain/"
+                                      f"fallback-finalize machinery, unchanged, governs what "
+                                      f"becomes of this one delegation's own task)", flush=True)
+                                _bucket["stopped"] = True
+                        if _is_top:
+                            _top_level_flagged = True
+                    if _any_global_stop:
+                        last_logged_at = now
+                        last_logged_len = len(joined)
+                        break
+                    if not _top_level_flagged:
                         activity["last_progress_at"] = now
                         last_good_len = len(joined)
                         print(
                             f"[{log_label}] content: +{len(joined) - last_logged_len} chars "
-                            f"({len(joined)} total) -- ...{preview!r}",
-                            flush=True,
+                            f"({len(joined)} total)", flush=True,
                         )
                     last_logged_at = now
                     last_logged_len = len(joined)
@@ -32641,11 +32706,21 @@ async def _stream_team_run(
                 # regurgitation check. Only on "end" events (result_tokens is
                 # None/absent on "start"), only for the source-retrieval tools
                 # this is actually about. Bounded to the most recent N reads.
+                #
+                # Phase 0.89: filed into THIS tool call's own run_id bucket only
+                # -- a delegation's own retrieved content must never seed a
+                # DIFFERENT stream's own regurgitation check (Section 7 of this
+                # phase's own design report). A missing run_id on a tool-end
+                # event is excluded the same way a missing run_id on a content
+                # event is (never a shared sentinel bucket).
                 if (out.get("__tool_event__") == "end"
                         and _evt_name in _SOURCE_RETRIEVAL_TOOLS
                         and out.get("result_tokens")):
-                    recent_tool_token_sets.append(out["result_tokens"])
-                    del recent_tool_token_sets[:-_TOOL_REGURGITATION_RECENT_READS]
+                    _tool_run_id = out.get("run_id")
+                    _tool_bucket = _run_repetition_bucket(per_run_repetition, _tool_run_id)
+                    if _tool_bucket is not None:
+                        _tool_bucket["recent_tool_token_sets"].append(out["result_tokens"])
+                        del _tool_bucket["recent_tool_token_sets"][:-_TOOL_REGURGITATION_RECENT_READS]
                 # Stash listing counts on the team, alongside _read_state, so the
                 # answer-time count guard can reach them. Accumulates across a run's
                 # retries exactly like _read_state does.
@@ -33301,6 +33376,12 @@ async def run_task_async(
                     # Phase 0.32: see _stream_team_run's identical declaration --
                     # kept in sync deliberately, same as every other block in this loop.
                     recent_tool_token_sets: list["frozenset[str]"] = []
+                    # Phase 0.89: see _stream_team_run's identical declaration and the
+                    # design block above _looks_like_repetition_loop -- kept in sync
+                    # deliberately.
+                    per_run_repetition: dict = {}
+                    top_level_run_id: str | None = None
+                    _missing_run_id_logged = False
                     try:
                         # Consuming the stream internally (2026-08-10) instead of one opaque
                         # blocking team.arun(task) -- external behavior (return type, downstream
@@ -33354,92 +33435,89 @@ async def run_task_async(
                                 _src = getattr(event, "agent_name", "") or ""
                                 segment_agent_names.add(_src)
                                 run_agent_names.add(_src)
+                                # Phase 0.89: see _stream_team_run's identical block --
+                                # kept in sync deliberately.
+                                _run_id = getattr(event, "run_id", None)
+                                if _run_id is None:
+                                    if not _missing_run_id_logged:
+                                        print(f"[team] repetition-state: event with no run_id "
+                                              f"(agent_name={_src!r}) -- excluded from repetition "
+                                              f"comparison entirely (not a shared bucket); further "
+                                              f"occurrences this call are not logged individually",
+                                              flush=True)
+                                        _missing_run_id_logged = True
+                                else:
+                                    if top_level_run_id is None:
+                                        top_level_run_id = _run_id
+                                        print(f"[team] repetition-state: top-level run_id="
+                                              f"{top_level_run_id!r} (agent_name={_src!r})", flush=True)
+                                    _run_repetition_bucket(per_run_repetition, _run_id)["joined"] += out
                                 now = time.monotonic()
                                 activity["last_token_at"] = now
                                 if now - last_logged_at >= 10:
                                     joined = "".join(full_content)
                                     _record_draft(joined, team=team, run_agent_names=run_agent_names)
                                     _record_enumerations(team)
-                                    new_segment = joined[last_logged_len:]
-                                    preview = new_segment[-300:]
-                                    # Phase 0.32, REVISED Phase 0.32B/0.33: see
-                                    # _stream_team_run's identical block for the full
-                                    # rationale -- kept in sync deliberately.
-                                    loop_detected = _looks_like_repetition_loop(
-                                        new_segment, joined[:last_logged_len],
-                                        cross_pass_content=best_draft())
-                                    decay_detected = not loop_detected and _looks_like_repetition_decay(
-                                        new_segment, joined[:last_logged_len]
-                                    )
-                                    regurgitation_detected = (
-                                        not loop_detected and not decay_detected
-                                        and _looks_like_tool_content_regurgitation(
-                                            new_segment, frozenset().union(*recent_tool_token_sets)
-                                            if recent_tool_token_sets else frozenset(),
-                                            prior_content=joined[:last_logged_len]))
-                                    if loop_detected or decay_detected or regurgitation_detected:
-                                        # Count it (2026-08-27). Withholding progress credit -- the
-                                        # only response until now -- bites solely when repetition is
-                                        # CONTINUOUS: any genuine segment in between refreshes
-                                        # last_progress_at and resets the stall clock. The live 736s
-                                        # run fired this 21 times and was never stopped by it. Tier 5
-                                        # counts instead, the same shape as the stub-serve tiers.
-                                        activity["repetition_count"] = (
-                                            activity.get("repetition_count", 0) + 1)
-                                        # Leave last_progress_at untouched -- see
-                                        # _stream_team_run's identical block.
-                                        if loop_detected:
-                                            print(
-                                                f"[team] repetition loop detected -- the last "
-                                                f"{len(new_segment)} chars look like a repeat of "
-                                                f"earlier content, not counted as progress: "
-                                                f"...{preview!r}",
-                                                flush=True,
-                                            )
-                                        elif decay_detected:
-                                            print(
-                                                f"[team] repetition DECAY detected -- the last "
-                                                f"{len(new_segment)} chars have collapsed into a "
-                                                f"small recombined vocabulary (not a match against "
-                                                f"earlier content), not counted as progress -- "
-                                                f"unvalidated threshold, see "
-                                                f"_looks_like_repetition_decay's own docstring: "
-                                                f"...{preview!r}",
-                                                flush=True,
-                                            )
-                                        else:
-                                            print(
-                                                f"[team] tool-content regurgitation detected -- "
-                                                f"the last {len(new_segment)} chars look like a "
-                                                f"verbatim reproduction of content this run already "
-                                                f"retrieved via a tool call, not counted as "
-                                                f"progress: ...{preview!r}",
-                                                flush=True,
-                                            )
-                                        # Z16: see _stream_team_run's identical block for the
-                                        # full rationale -- kept in sync deliberately.
-                                        if activity["repetition_count"] >= config.liveness_repetition_threshold:
-                                            print(
-                                                f"[team] repetition threshold reached "
-                                                f"({activity['repetition_count']} >= "
-                                                f"{config.liveness_repetition_threshold}) -- "
-                                                f"stopping this generation in-process and keeping "
-                                                f"the {last_good_len} chars generated before the "
-                                                f"repeating segment began, instead of waiting for "
-                                                f"an external liveness kill to discard the whole run",
-                                                flush=True,
-                                            )
-                                            repetition_stopped = True
-                                            last_logged_at = now
-                                            last_logged_len = len(joined)
-                                            break
-                                    else:
+                                    # Phase 0.89: see _stream_team_run's identical block --
+                                    # kept in sync deliberately.
+                                    _best_draft = best_draft()
+                                    _top_level_flagged = False
+                                    _any_global_stop = False
+                                    for _rid, _bucket in list(per_run_repetition.items()):
+                                        if _bucket["stopped"]:
+                                            continue
+                                        _flagged, _detector, _preview = _check_one_run_repetition(_bucket, _best_draft)
+                                        if not _flagged:
+                                            continue
+                                        # Phase 0.89: see _stream_team_run's identical
+                                        # comment -- kept in sync deliberately.
+                                        activity["repetition_count"] = max(
+                                            activity.get("repetition_count", 0), _bucket["repetition_count"])
+                                        _is_top = (_rid == top_level_run_id)
+                                        _label = {"loop": "repetition loop detected",
+                                                   "decay": "repetition DECAY detected",
+                                                   "regurgitation": "tool-content regurgitation detected"}[_detector]
+                                        print(f"[team] {_label} (run_id={_rid!r}, "
+                                              f"{'top-level' if _is_top else 'delegated'}) -- the last "
+                                              f"{len(_preview)} chars look like a repeat for THIS stream "
+                                              f"only, not counted as progress: ...{_preview!r}", flush=True)
+                                        if _bucket["repetition_count"] >= config.liveness_repetition_threshold:
+                                            if _is_top:
+                                                print(f"[team] repetition threshold reached for the "
+                                                      f"TOP-LEVEL run_id={_rid!r} "
+                                                      f"({_bucket['repetition_count']} >= "
+                                                      f"{config.liveness_repetition_threshold}) -- "
+                                                      f"stopping this generation in-process and keeping "
+                                                      f"the {last_good_len} chars generated before the "
+                                                      f"repeating segment began, instead of waiting for "
+                                                      f"an external liveness kill to discard the whole run",
+                                                      flush=True)
+                                                repetition_stopped = True
+                                                _any_global_stop = True
+                                            else:
+                                                print(f"[team] repetition threshold reached for "
+                                                      f"DELEGATED run_id={_rid!r} "
+                                                      f"({_bucket['repetition_count']} >= "
+                                                      f"{config.liveness_repetition_threshold}) -- "
+                                                      f"marking only this stream's own bucket stopped; "
+                                                      f"the outer consumption loop and every OTHER "
+                                                      f"stream continue unaffected (Phase 0.82's own "
+                                                      f"existing drain/fallback-finalize machinery, "
+                                                      f"unchanged, governs what becomes of this one "
+                                                      f"delegation's own task)", flush=True)
+                                                _bucket["stopped"] = True
+                                        if _is_top:
+                                            _top_level_flagged = True
+                                    if _any_global_stop:
+                                        last_logged_at = now
+                                        last_logged_len = len(joined)
+                                        break
+                                    if not _top_level_flagged:
                                         activity["last_progress_at"] = now
                                         last_good_len = len(joined)
                                         print(
                                             f"[team] content: +{len(joined) - last_logged_len} chars "
-                                            f"({len(joined)} total) -- ...{preview!r}",
-                                            flush=True,
+                                            f"({len(joined)} total)", flush=True,
                                         )
                                     last_logged_at = now
                                     last_logged_len = len(joined)
@@ -33449,11 +33527,16 @@ async def run_task_async(
                                 activity["last_progress_at"] = time.monotonic()
                                 # Phase 0.32: see _stream_team_run's identical capture --
                                 # kept in sync deliberately.
+                                # Phase 0.89: filed into THIS tool call's own run_id bucket
+                                # only -- see _stream_team_run's identical block.
                                 if (out.get("__tool_event__") == "end"
                                         and out.get("name") in _SOURCE_RETRIEVAL_TOOLS
                                         and out.get("result_tokens")):
-                                    recent_tool_token_sets.append(out["result_tokens"])
-                                    del recent_tool_token_sets[:-_TOOL_REGURGITATION_RECENT_READS]
+                                    _tool_run_id = out.get("run_id")
+                                    _tool_bucket = _run_repetition_bucket(per_run_repetition, _tool_run_id)
+                                    if _tool_bucket is not None:
+                                        _tool_bucket["recent_tool_token_sets"].append(out["result_tokens"])
+                                        del _tool_bucket["recent_tool_token_sets"][:-_TOOL_REGURGITATION_RECENT_READS]
                                 if _consume_stream_event(team, out):
                                     print(f"[team] {_stream_event_log_line(out)}", flush=True)
                                 last_segment_start = len(full_content)
