@@ -491,6 +491,23 @@ def _liveness_kill_reason(snapshot: dict) -> str | None:
     # or twice, per _REPETITION_PREFIX_CHARS' own calibration notes) and well short of
     # the 21 that run reached -- it would have stopped it around the second duplicate
     # block instead of the seventh.
+    #
+    # Phase 0.90/0.91: this function's own contract is UNCHANGED (kill when
+    # snapshot["repetition_count"] >= threshold) -- what changed is what
+    # swarm/team.py's heartbeat now puts into that key. Phase 0.90 confirmed, from
+    # source, that it used to be the MAX repetition_count across every run_id's own
+    # bucket (top-level Coordinator AND every delegated member alike), so a single
+    # delegated Researcher's own four strikes -- already correctly, harmlessly
+    # isolated in-process by Phase 0.89's own per-run logic -- could independently
+    # authorize killing the ENTIRE worker, Coordinator included, with no attribution
+    # of which run actually produced the count. Phase 0.91 changed the PRODUCER only:
+    # "repetition_count" is now set exclusively from the run swarm/team.py's own
+    # per-event parent_run_id check confirms is the actual top-level Team/Coordinator
+    # run (never a delegated or unknown-identity one) -- see swarm/team.py's own
+    # _run_identity_from_event and the two in-loop sites that write this key. The old
+    # aggregate-across-everyone value is preserved, unchanged in meaning, under the
+    # separate "repetition_count_diagnostic_max" key, which this function deliberately
+    # does not read.
     repeats = snapshot.get("repetition_count", 0)
     if repeats >= config.liveness_repetition_threshold:
         return (

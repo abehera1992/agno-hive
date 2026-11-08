@@ -27043,11 +27043,96 @@ def _segment_introduces_new_quoted_literal(new_segment: str, prior_content: str)
 # remains what decides what becomes of that delegation's own task) without
 # ending the outer loop's ability to keep consuming any OTHER stream.
 def _new_run_repetition_bucket() -> dict:
-    """One independent stream's own repetition-comparison state."""
+    """One independent stream's own repetition-comparison state.
+
+    Phase 0.91: "identity" starts "unknown" and is resolved (via
+    _ensure_run_identity, below) to "top-level" or "delegated" the first
+    time an event carrying a determinable parent_run_id touches this
+    bucket -- never from arrival order (Phase 0.90's own confirmed root
+    cause for the prior first-observed-run_id heuristic). "unknown" is a
+    real, distinct, and SAFE terminal state too, not just a transient one:
+    an event type Agno never attaches parent_run_id to, or a genuinely
+    exhausted stream whose every event happened to lack it, leaves a
+    bucket at "unknown" forever -- treated identically to "delegated" by
+    every consumer below (never top-level-only interruption, never the
+    Tier-5 enforcement signal), exactly Track A2's own "missing metadata
+    is unknown, never silently top-level" requirement.
+
+    T58 state (semantic_stall_count/last_exploratory_preview/
+    semantic_stall_stopped) is bundled into the SAME per-run_id bucket
+    Z16 already uses, per this phase's own "use the existing Phase 0.89
+    run-bucket infrastructure where practical" instruction, rather than a
+    second parallel per-run dict. last_exploratory_preview starts None --
+    the existing flat code's own `_preview is not None` guard (preserved
+    unchanged at both call sites) already excludes a None preview from
+    ever counting as a match, so None is a safe "no prior preview" value,
+    not a comparison hazard.
+    """
     return {
         "joined": "", "last_logged_len": 0, "repetition_count": 0,
         "recent_tool_token_sets": [], "stopped": False,
+        "identity": "unknown",
+        "semantic_stall_count": 0, "last_exploratory_preview": None,
+        "semantic_stall_stopped": False,
     }
+
+
+_RUN_IDENTITY_ABSENT_SENTINEL = object()
+
+
+def _run_identity_from_event(event) -> str:
+    """Classify one agno stream event's own run as "top-level", "delegated",
+    or "unknown" from its own parent_run_id field.
+
+    Phase 0.90 (direct read of the installed agno 2.5.17 source, ON ZGX,
+    not just locally) confirmed: Agno's own _process_delegate_task_to_member
+    (agno/team/_default_tools.py:490, "Add team run id to the member run")
+    explicitly sets `member_agent_run_response.parent_run_id = run_response.
+    run_id` for every delegated member run, where run_response is the
+    TEAM's own run response -- the exact delegation path this codebase's
+    own delegate_structured_task wraps (agno/team/team.py:1455 ->
+    _default_tools._get_delegate_task_function). This codebase calls
+    team.arun(prompt, stream=True, ...) directly, never through an Agno
+    Workflow layer (the only other code path that ever assigns a
+    DIFFERENT parent_run_id meaning) -- so the top-level Team run's own
+    parent_run_id is never set by anything and stays at its own declared
+    default, None.
+
+    Arrival order plays no part. "unknown" (NEVER guessed as top-level)
+    only when the attribute is genuinely absent from this event object --
+    Phase 0.90's own source read found every relevant event class
+    (BaseAgentRunEvent, BaseTeamRunEvent, and everything that inherits
+    from them) declares this field with a default of None, so a live
+    "unknown" classification is not expected to occur, but is handled
+    explicitly per Track A2's own instruction rather than assumed
+    impossible.
+    """
+    _ABSENT = _RUN_IDENTITY_ABSENT_SENTINEL
+    _parent = getattr(event, "parent_run_id", _ABSENT)
+    if _parent is _ABSENT:
+        return "unknown"
+    return "top-level" if _parent is None else "delegated"
+
+
+def _ensure_run_identity(bucket: dict, event, log_label: str, run_id) -> None:
+    """Resolve and cache `bucket`'s own top-level/delegated/unknown identity
+    from `event`'s own parent_run_id, the first time it becomes
+    determinable -- never re-decided once resolved away from "unknown",
+    and never inferred from which event happened to arrive first (see
+    _run_identity_from_event; Phase 0.90/0.91). Called from every site that
+    touches a run_id's own bucket -- content chunks AND tool-call events --
+    so a delegation whose very first event happens to be a tool call (not
+    content) is still identified correctly. Logs once per bucket, only at
+    the point identity actually becomes known, not on every touch.
+    """
+    if bucket["identity"] != "unknown":
+        return
+    _identity = _run_identity_from_event(event)
+    if _identity != "unknown":
+        bucket["identity"] = _identity
+        print(f"[{log_label}] repetition-state: run_id={run_id!r} identified as "
+              f"{_identity!r} (via parent_run_id, independent of arrival order)",
+              flush=True)
 
 
 def _run_repetition_bucket(per_run: dict, run_id) -> dict | None:
@@ -28425,7 +28510,29 @@ async def _run_heartbeat(
                     # Tier 5 input: how many times the repetition detector has fired
                     # this run. Detection was never the gap -- 217 firings across the
                     # journal, 21 in one 736s run -- the response was.
+                    #
+                    # Phase 0.91: this key is now attributed to the ACTUAL top-level
+                    # Coordinator run's own bucket ONLY (see the two in-loop sites that
+                    # set it -- both only do so when _is_top is True), never the
+                    # aggregate across every delegated/unknown-identity stream. Phase
+                    # 0.90 confirmed, from source, that the OLD aggregate-MAX behavior
+                    # let a single delegated Researcher's own four strikes -- already
+                    # correctly, harmlessly isolated in-process -- also feed THIS value,
+                    # which _liveness_kill_reason reads to authorize a whole-worker
+                    # kill with no attribution of which run produced it. The aggregate
+                    # is NOT discarded -- see repetition_count_diagnostic_max just
+                    # below -- only no longer what Tier 5's own enforcement reads.
                     "repetition_count": activity.get("repetition_count", 0),
+                    # Phase 0.91: diagnostic-only twin of the above -- the highest
+                    # repetition_count observed across EVERY run_id's own bucket this
+                    # call (top-level, delegated, or unknown-identity alike), exactly
+                    # what "repetition_count" itself used to mean before this phase.
+                    # _liveness_kill_reason does not read this key; it exists purely
+                    # for logs/historical analysis, per this phase's own explicit
+                    # "preserve diagnostic visibility, never silently drop it"
+                    # instruction.
+                    "repetition_count_diagnostic_max": activity.get(
+                        "repetition_count_diagnostic_max", 0),
                     # Phase G: WHAT was observed at the moment of this tick, and for how
                     # long it has been that way -- a DURATION, not a raw monotonic
                     # timestamp, for the same cross-process-clock reason stagnant_seconds
@@ -32484,8 +32591,19 @@ async def _stream_team_run(
     # different preview resets the counter to 0 (fresh evidence), so
     # legitimate exploration that actually finds something new every time
     # is never penalized.
-    last_exploratory_preview: str | None = None
-    semantic_stall_count = 0
+    #
+    # Phase 0.91: the comparison state itself (what used to be the two flat
+    # locals last_exploratory_preview/semantic_stall_count) moved into each
+    # run_id's own per_run_repetition bucket, for the identical reason Z16's
+    # own state moved there in Phase 0.89 -- confirmed by direct code
+    # inspection (Phase 0.90) to have been flat and shared across every
+    # concurrent/sequential delegation, the same cross-stream contamination
+    # shape Phase 0.89 closed for Z16. semantic_stall_stopped remains a
+    # flat, call-level local: it still means exactly one thing -- the
+    # ACTUAL TOP-LEVEL run's own T58 threshold was reached -- mirroring
+    # repetition_stopped's own role for Z16. A delegated bucket's own T58
+    # threshold now sets ONLY that bucket's own "semantic_stall_stopped"
+    # key instead.
     semantic_stall_stopped = False
     unrecognized_event_counts: dict[str, int] = {}
     # Phase 0.32: the most recent _TOOL_REGURGITATION_RECENT_READS source-
@@ -32496,16 +32614,20 @@ async def _stream_team_run(
     recent_tool_token_sets: list["frozenset[str]"] = []
     # Phase 0.89: per-run_id repetition state (see the block above
     # _looks_like_repetition_loop for the full design). per_run_repetition
-    # holds one bucket per Agno run_id observed on this call's own stream;
-    # top_level_run_id is set once, to the FIRST non-None run_id seen -- by
-    # construction the Coordinator/Team-level run, since nothing can be
-    # dispatched before it starts. recent_tool_token_sets above stays
-    # declared (unused directly now; each bucket carries its own copy) only
-    # because removing it would ripple into call sites not touched this
-    # phase -- left harmlessly inert rather than deleted.
+    # holds one bucket per Agno run_id observed on this call's own stream.
+    # Phase 0.91: top-level vs. delegated identity is no longer "whichever
+    # run_id is first observed" (Phase 0.90 confirmed that heuristic
+    # unreliable -- a delegated member can stream content before the
+    # Coordinator narrates anything) -- each bucket's own "identity" field
+    # (see _ensure_run_identity) now carries this instead; there is no
+    # longer a single call-level "the first one is the Coordinator"
+    # variable. recent_tool_token_sets above stays declared (unused
+    # directly now; each bucket carries its own copy) only because
+    # removing it would ripple into call sites not touched this phase --
+    # left harmlessly inert rather than deleted.
     per_run_repetition: dict = {}
-    top_level_run_id: str | None = None
     _missing_run_id_logged = False
+    _t58_missing_run_id_logged = False
     # Phase 0.11: drive the agno async generator manually (not `async for`) so
     # each individual __anext__() can be bounded by _STREAM_INACTIVITY_TIMEOUT_S
     # -- see that constant's own comment for what this bounds (inter-event gap,
@@ -32590,11 +32712,9 @@ async def _stream_team_run(
                               flush=True)
                         _missing_run_id_logged = True
                 else:
-                    if top_level_run_id is None:
-                        top_level_run_id = _run_id
-                        print(f"[{log_label}] repetition-state: top-level run_id="
-                              f"{top_level_run_id!r} (agent_name={_src!r})", flush=True)
-                    _run_repetition_bucket(per_run_repetition, _run_id)["joined"] += out
+                    _bucket_c = _run_repetition_bucket(per_run_repetition, _run_id)
+                    _ensure_run_identity(_bucket_c, event, log_label, _run_id)
+                    _bucket_c["joined"] += out
                 now = time.monotonic()
                 activity["last_token_at"] = now
                 if now - last_logged_at >= 10:
@@ -32616,23 +32736,30 @@ async def _stream_team_run(
                         _flagged, _detector, _preview = _check_one_run_repetition(_bucket, _best_draft)
                         if not _flagged:
                             continue
-                        # Phase 0.89: activity["repetition_count"] feeds the EXTERNAL
-                        # Tier-5 liveness-watchdog snapshot (api/server.py, via
-                        # liveness_path) -- a SEPARATE safety net from this function's
-                        # own in-process break below. That external reader has no
-                        # notion of per-run_id buckets; reporting the MAX across every
-                        # bucket here keeps it able to see a genuinely stuck stream
-                        # (any stream, not just the top-level one) without reviving
-                        # the cross-stream false-positive this phase closes -- the
-                        # IN-PROCESS decision just below still uses only this ONE
-                        # bucket's own count.
-                        activity["repetition_count"] = max(
-                            activity.get("repetition_count", 0), _bucket["repetition_count"])
-                        _is_top = (_rid == top_level_run_id)
+                        # Phase 0.89/0.91: TWO distinct externally-visible signals, not
+                        # one. activity["repetition_count_diagnostic_max"] is the OLD
+                        # Phase 0.89 behavior renamed, unchanged in meaning: the highest
+                        # repetition_count observed across EVERY bucket this call, for
+                        # observability/historical analysis only -- api/server.py never
+                        # reads this key. activity["repetition_count"] -- the key
+                        # _liveness_kill_reason's own Tier-5 check actually consumes --
+                        # is now set ONLY from the ACTUAL top-level run's own bucket
+                        # (never from a delegated or unknown-identity one), closing the
+                        # confirmed Phase 0.90 gap where a Researcher's own four strikes
+                        # alone, via the old shared MAX, could authorize a whole-worker
+                        # kill despite being correctly, harmlessly isolated in-process
+                        # right here. No decay/reset introduced for either value --
+                        # Track B4's own explicit instruction.
+                        activity["repetition_count_diagnostic_max"] = max(
+                            activity.get("repetition_count_diagnostic_max", 0),
+                            _bucket["repetition_count"])
+                        _is_top = (_bucket["identity"] == "top-level")
+                        if _is_top:
+                            activity["repetition_count"] = _bucket["repetition_count"]
                         _label = {"loop": "repetition loop detected", "decay": "repetition DECAY detected",
                                    "regurgitation": "tool-content regurgitation detected"}[_detector]
                         print(f"[{log_label}] {_label} (run_id={_rid!r}, "
-                              f"{'top-level' if _is_top else 'delegated'}) -- the last "
+                              f"{_bucket['identity']}) -- the last "
                               f"{len(_preview)} chars look like a repeat for THIS stream "
                               f"only, not counted as progress: ...{_preview!r}", flush=True)
                         if _bucket["repetition_count"] >= config.liveness_repetition_threshold:
@@ -32648,8 +32775,14 @@ async def _stream_team_run(
                                 repetition_stopped = True
                                 _any_global_stop = True
                             else:
+                                # Phase 0.91: "unknown" identity (parent_run_id genuinely
+                                # absent from every event seen so far for this run_id) is
+                                # treated identically to "delegated" here -- never allowed
+                                # to break the outer loop or feed the top-level-only
+                                # enforcement signal above, per Track A2's own "missing
+                                # metadata is unknown, never silently top-level" rule.
                                 print(f"[{log_label}] repetition threshold reached for "
-                                      f"DELEGATED run_id={_rid!r} "
+                                      f"{_bucket['identity'].upper()} run_id={_rid!r} "
                                       f"({_bucket['repetition_count']} >= "
                                       f"{config.liveness_repetition_threshold}) -- marking "
                                       f"only this stream's own bucket stopped; the outer "
@@ -32719,6 +32852,7 @@ async def _stream_team_run(
                     _tool_run_id = out.get("run_id")
                     _tool_bucket = _run_repetition_bucket(per_run_repetition, _tool_run_id)
                     if _tool_bucket is not None:
+                        _ensure_run_identity(_tool_bucket, event, log_label, _tool_run_id)
                         _tool_bucket["recent_tool_token_sets"].append(out["result_tokens"])
                         del _tool_bucket["recent_tool_token_sets"][:-_TOOL_REGURGITATION_RECENT_READS]
                 # Stash listing counts on the team, alongside _read_state, so the
@@ -32726,52 +32860,92 @@ async def _stream_team_run(
                 # retries exactly like _read_state does.
                 if _consume_stream_event(team, out):
                     print(f"[{log_label}] {_stream_event_log_line(out)}", flush=True)
-                # T58: see this function's own "T58" comment above
-                # last_exploratory_preview's declaration for the live
-                # incident and reasoning. Checked only on the "end" event
-                # (the one carrying result_preview) for an exploratory
-                # tool; a "start" event has no result yet and is ignored
-                # here exactly as before.
+                # T58 (Phase 0.91: run-scoped). Checked only on the "end"
+                # event (the one carrying result_preview) for an
+                # exploratory tool; a "start" event has no result yet and
+                # is ignored here exactly as before. Comparison state
+                # (semantic_stall_count/last_exploratory_preview) now
+                # lives in THIS run_id's own bucket, not a flat call-level
+                # local -- the same cross-stream-contamination fix Phase
+                # 0.89 gave Z16, confirmed (Phase 0.90) to have been
+                # missing here. A missing run_id is excluded entirely,
+                # never a shared sentinel bucket, matching every other
+                # exclusion in this function. A bucket already marked
+                # semantic_stall_stopped is skipped entirely -- no further
+                # T58 checks, no further preview/count updates -- mirroring
+                # Z16's own "if _bucket['stopped']: continue" shape
+                # (Track C4: deliberately detection-only beyond this point,
+                # exactly like Z16; T58 never accumulated member content of
+                # its own to begin with, so there is no separate content-
+                # containment gap to close here).
                 if (out.get("__tool_event__") == "end"
                         and _evt_name in _EXPLORATORY_TOOLS):
-                    _preview = out.get("result_preview")
-                    if _preview is not None and _preview == last_exploratory_preview:
-                        semantic_stall_count += 1
-                        print(
-                            f"[{log_label}] semantic stall suspected -- "
-                            f"{_evt_name!r} returned the SAME result preview "
-                            f"as its own immediately preceding exploratory "
-                            f"call ({semantic_stall_count}/"
-                            f"{_SEMANTIC_STALL_THRESHOLD}), despite the "
-                            f"model narrating a different approach/pattern: "
-                            f"{_preview[:150]!r}",
-                            flush=True,
-                        )
-                        if semantic_stall_count >= _SEMANTIC_STALL_THRESHOLD:
+                    _t58_run_id = out.get("run_id")
+                    _t58_bucket = _run_repetition_bucket(per_run_repetition, _t58_run_id)
+                    if _t58_bucket is None:
+                        if not _t58_missing_run_id_logged:
+                            print(f"[{log_label}] semantic-stall-state: tool-end event "
+                                  f"with no run_id (name={_evt_name!r}) -- excluded from "
+                                  f"semantic-stall comparison entirely (not a shared "
+                                  f"bucket); further occurrences this call are not "
+                                  f"logged individually", flush=True)
+                            _t58_missing_run_id_logged = True
+                    elif not _t58_bucket["semantic_stall_stopped"]:
+                        _ensure_run_identity(_t58_bucket, event, log_label, _t58_run_id)
+                        _preview = out.get("result_preview")
+                        if _preview is not None and _preview == _t58_bucket["last_exploratory_preview"]:
+                            _t58_bucket["semantic_stall_count"] += 1
+                            _t58_is_top = (_t58_bucket["identity"] == "top-level")
                             print(
-                                f"[{log_label}] semantic stall threshold "
-                                f"reached ({semantic_stall_count} >= "
-                                f"{_SEMANTIC_STALL_THRESHOLD}) -- stopping "
-                                f"this generation in-process and keeping "
-                                f"the {last_good_len} chars generated "
-                                f"before the stall began; no new evidence "
-                                f"was obtained across "
-                                f"{_SEMANTIC_STALL_THRESHOLD} consecutive "
-                                f"exploratory calls despite varying "
-                                f"arguments each time",
+                                f"[{log_label}] semantic stall suspected (run_id="
+                                f"{_t58_run_id!r}, {_t58_bucket['identity']}) -- "
+                                f"{_evt_name!r} returned the SAME result preview "
+                                f"as its own immediately preceding exploratory "
+                                f"call ({_t58_bucket['semantic_stall_count']}/"
+                                f"{_SEMANTIC_STALL_THRESHOLD}), despite the "
+                                f"model narrating a different approach/pattern: "
+                                f"{_preview[:150]!r}",
                                 flush=True,
                             )
-                            semantic_stall_stopped = True
-                            last_logged_at = time.monotonic()
-                            last_logged_len = len(full_content)
-                            break
-                    else:
-                        # Genuinely new evidence (or the first exploratory
-                        # call this run) -- reset. Legitimate exploration
-                        # that finds something different every time is
-                        # never penalized.
-                        semantic_stall_count = 0
-                        last_exploratory_preview = _preview
+                            if _t58_bucket["semantic_stall_count"] >= _SEMANTIC_STALL_THRESHOLD:
+                                if _t58_is_top:
+                                    print(
+                                        f"[{log_label}] semantic stall threshold reached "
+                                        f"for the TOP-LEVEL run_id={_t58_run_id!r} "
+                                        f"({_t58_bucket['semantic_stall_count']} >= "
+                                        f"{_SEMANTIC_STALL_THRESHOLD}) -- stopping "
+                                        f"this generation in-process and keeping "
+                                        f"the {last_good_len} chars generated "
+                                        f"before the stall began; no new evidence "
+                                        f"was obtained across "
+                                        f"{_SEMANTIC_STALL_THRESHOLD} consecutive "
+                                        f"exploratory calls despite varying "
+                                        f"arguments each time",
+                                        flush=True,
+                                    )
+                                    semantic_stall_stopped = True
+                                    last_logged_at = time.monotonic()
+                                    last_logged_len = len(full_content)
+                                    break
+                                else:
+                                    print(
+                                        f"[{log_label}] semantic stall threshold reached "
+                                        f"for {_t58_bucket['identity'].upper()} run_id="
+                                        f"{_t58_run_id!r} ({_t58_bucket['semantic_stall_count']} "
+                                        f">= {_SEMANTIC_STALL_THRESHOLD}) -- marking only "
+                                        f"this stream's own bucket stopped for further "
+                                        f"semantic-stall checks; the outer consumption "
+                                        f"loop and every OTHER stream continue unaffected",
+                                        flush=True,
+                                    )
+                                    _t58_bucket["semantic_stall_stopped"] = True
+                        else:
+                            # Genuinely new evidence (or the first exploratory
+                            # call this run_id's own bucket has seen) -- reset.
+                            # Legitimate exploration that finds something
+                            # different every time is never penalized.
+                            _t58_bucket["semantic_stall_count"] = 0
+                            _t58_bucket["last_exploratory_preview"] = _preview
                 last_segment_start = len(full_content)
                 segment_agent_names = set()
             else:
@@ -33376,11 +33550,12 @@ async def run_task_async(
                     # Phase 0.32: see _stream_team_run's identical declaration --
                     # kept in sync deliberately, same as every other block in this loop.
                     recent_tool_token_sets: list["frozenset[str]"] = []
-                    # Phase 0.89: see _stream_team_run's identical declaration and the
-                    # design block above _looks_like_repetition_loop -- kept in sync
-                    # deliberately.
+                    # Phase 0.89/0.91: see _stream_team_run's identical declaration and
+                    # the design block above _looks_like_repetition_loop -- kept in sync
+                    # deliberately. No top_level_run_id local -- identity now lives per-
+                    # bucket (see _ensure_run_identity), resolved from parent_run_id, not
+                    # arrival order.
                     per_run_repetition: dict = {}
-                    top_level_run_id: str | None = None
                     _missing_run_id_logged = False
                     try:
                         # Consuming the stream internally (2026-08-10) instead of one opaque
@@ -33447,11 +33622,9 @@ async def run_task_async(
                                               flush=True)
                                         _missing_run_id_logged = True
                                 else:
-                                    if top_level_run_id is None:
-                                        top_level_run_id = _run_id
-                                        print(f"[team] repetition-state: top-level run_id="
-                                              f"{top_level_run_id!r} (agent_name={_src!r})", flush=True)
-                                    _run_repetition_bucket(per_run_repetition, _run_id)["joined"] += out
+                                    _bucket_c = _run_repetition_bucket(per_run_repetition, _run_id)
+                                    _ensure_run_identity(_bucket_c, event, "team", _run_id)
+                                    _bucket_c["joined"] += out
                                 now = time.monotonic()
                                 activity["last_token_at"] = now
                                 if now - last_logged_at >= 10:
@@ -33469,16 +33642,19 @@ async def run_task_async(
                                         _flagged, _detector, _preview = _check_one_run_repetition(_bucket, _best_draft)
                                         if not _flagged:
                                             continue
-                                        # Phase 0.89: see _stream_team_run's identical
+                                        # Phase 0.89/0.91: see _stream_team_run's identical
                                         # comment -- kept in sync deliberately.
-                                        activity["repetition_count"] = max(
-                                            activity.get("repetition_count", 0), _bucket["repetition_count"])
-                                        _is_top = (_rid == top_level_run_id)
+                                        activity["repetition_count_diagnostic_max"] = max(
+                                            activity.get("repetition_count_diagnostic_max", 0),
+                                            _bucket["repetition_count"])
+                                        _is_top = (_bucket["identity"] == "top-level")
+                                        if _is_top:
+                                            activity["repetition_count"] = _bucket["repetition_count"]
                                         _label = {"loop": "repetition loop detected",
                                                    "decay": "repetition DECAY detected",
                                                    "regurgitation": "tool-content regurgitation detected"}[_detector]
                                         print(f"[team] {_label} (run_id={_rid!r}, "
-                                              f"{'top-level' if _is_top else 'delegated'}) -- the last "
+                                              f"{_bucket['identity']}) -- the last "
                                               f"{len(_preview)} chars look like a repeat for THIS stream "
                                               f"only, not counted as progress: ...{_preview!r}", flush=True)
                                         if _bucket["repetition_count"] >= config.liveness_repetition_threshold:
@@ -33496,7 +33672,7 @@ async def run_task_async(
                                                 _any_global_stop = True
                                             else:
                                                 print(f"[team] repetition threshold reached for "
-                                                      f"DELEGATED run_id={_rid!r} "
+                                                      f"{_bucket['identity'].upper()} run_id={_rid!r} "
                                                       f"({_bucket['repetition_count']} >= "
                                                       f"{config.liveness_repetition_threshold}) -- "
                                                       f"marking only this stream's own bucket stopped; "
@@ -33535,6 +33711,7 @@ async def run_task_async(
                                     _tool_run_id = out.get("run_id")
                                     _tool_bucket = _run_repetition_bucket(per_run_repetition, _tool_run_id)
                                     if _tool_bucket is not None:
+                                        _ensure_run_identity(_tool_bucket, event, "team", _tool_run_id)
                                         _tool_bucket["recent_tool_token_sets"].append(out["result_tokens"])
                                         del _tool_bucket["recent_tool_token_sets"][:-_TOOL_REGURGITATION_RECENT_READS]
                                 if _consume_stream_event(team, out):
