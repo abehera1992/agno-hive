@@ -26718,6 +26718,18 @@ def _record_blocked_member_result(team, key: str, text: str, entry, reason: str)
           f"result, not forwardable, cannot be served as ALREADY DONE", flush=True)
 
 
+def _result_is_evidence_backed(team, key: str, text: str) -> bool:
+    """Whether a registered result is backed by evidence: this delegation completed a
+    successful investigation call, or the report names something found in its preloaded
+    context. Found live (Phase 1.00, 2026-11-12): a re-delegation that made no tool call and
+    wrote 'the output of run_shell is /home/...' was registered normally and, without this
+    check, cleared the disclosure for the delegation it was retrying."""
+    if _delegation_has_investigation_evidence(team, key):
+        return True
+    rec = (getattr(team, "_delegation_preloaded", None) or {}).get(key) or {}
+    return _report_grounded_in_preloaded(text, rec.get("text") or "", rec.get("echo") or "")
+
+
 def _clear_superseded_blocked(team, key: str, entry) -> None:
     """A later, real result for the same member and target supersedes an earlier blocked one."""
     items = getattr(team, "_blocked_delegations", None)
@@ -26890,7 +26902,8 @@ def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
             _pending_entry["blocked"] = True   # no "result": the gate must not serve one
         else:
             _pending_entry["result"] = text
-            _clear_superseded_blocked(team, key, _pending_entry)
+            if _result_is_evidence_backed(team, key, text):
+                _clear_superseded_blocked(team, key, _pending_entry)
     # T47: covers BOTH removal paths above (run_id-based pop at line ~18352
     # equivalent, and the FIFO-fallback pop) with one call site -- by this
     # point whichever path resolved _pending_entry has already removed it
