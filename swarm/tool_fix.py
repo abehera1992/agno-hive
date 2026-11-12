@@ -655,6 +655,35 @@ class _ToolCallRecoveryMixin:
         return model_response
 
 
+_LOGGED_DELEGATION_TOOL_MESSAGES: set = set()
+
+
+def _log_coordinator_delegation_input(messages) -> None:
+    """Phase 1.02/1.03 (B4 verification): log, once per tool message, exactly what a
+    delegation tool result looks like in the request about to be sent to the model. This is
+    the Coordinator's REAL input (agno builds it from what the relay yielded), so it is the
+    ground truth the relay's own log line cannot be. Bounded: one line per tool_call_id,
+    first 200 chars only, delegate_* tools only."""
+    try:
+        for m in messages or []:
+            if getattr(m, "role", None) != "tool":
+                continue
+            name = str(getattr(m, "tool_name", "") or "")
+            if not name.startswith("delegate_"):
+                continue
+            cid = getattr(m, "tool_call_id", None) or id(m)
+            if cid in _LOGGED_DELEGATION_TOOL_MESSAGES:
+                continue
+            _LOGGED_DELEGATION_TOOL_MESSAGES.add(cid)
+            c = getattr(m, "content", "")
+            c = c if isinstance(c, str) else str(c)
+            head = " ".join(c[:200].split())
+            print(f"[coordinator-input] tool={name} call_id={cid} chars={len(c):,} "
+                  f"head={head!r}", flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class _ForcedTextDirectiveMixin:
     """Inject the tools-disabled directive at every provider entry point.
 
@@ -672,6 +701,7 @@ class _ForcedTextDirectiveMixin:
     async def ainvoke(self, messages, *a, **kw):
         self._inject_forced_text_directive(messages, kw.get("tool_choice"))
         record_prompt_estimate(messages)
+        _log_coordinator_delegation_input(messages)
         return await super().ainvoke(messages, *a, **kw)
 
     def invoke_stream(self, messages, *a, **kw):
@@ -684,6 +714,7 @@ class _ForcedTextDirectiveMixin:
         # request that is actually about to go out rather than the one before it.
         self._inject_forced_text_directive(messages, kw.get("tool_choice"))
         record_prompt_estimate(messages)
+        _log_coordinator_delegation_input(messages)
         return super().ainvoke_stream(messages, *a, **kw)
 
 

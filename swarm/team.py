@@ -1969,7 +1969,7 @@ def _with_forwarded_evidence(content: str, team) -> str:
     if (not out or not _strip_leaked_tool_tags(out).strip()
             or out.strip() == _BUDGET_EXHAUSTED_ANSWER):
         return out
-    return out + _not_investigated_note(team, out)
+    return out + _withheld_note(team, out)
 
 
 @dataclass
@@ -2285,7 +2285,8 @@ def _make_forward_member_answer(
         member_answers: dict, forwarded: dict | None = None,
         delegation_generation: dict | None = None,
         member_result_generation: dict | None = None,
-        blocked_results: dict | None = None):
+        blocked_results: dict | None = None,
+        assessments: dict | None = None):
     """Build the coordinator's forward tool over the live member-results map.
 
     `forwarded` (default None = no recording, the pre-2026-09-21 behaviour) receives the
@@ -2363,8 +2364,18 @@ def _make_forward_member_answer(
             _blocked = blocked_results.get(key)
             _cur_gen = delegation_generation.get(key, 0) if delegation_generation is not None else 0
             if _blocked is not None and _blocked.get("generation", 0) >= _cur_gen:
+                _wstatus = _blocked.get("status", "BLOCKED")
                 print(f"[team] forward_member_answer: {key!r}'s latest delegation was "
-                      f"BLOCKED (no investigation) -- nothing to forward", flush=True)
+                      f"{_wstatus} -- nothing to forward", flush=True)
+                if _wstatus == "UNRESOLVED":
+                    return (
+                        f"{_UNRESOLVED_RESULT_MARK}: {member_id!r}'s most recent delegation "
+                        f"produced text that is not supported by anything it read or "
+                        f"retrieved, so it was withheld and there is no finding to forward; "
+                        f"its objective is UNRESOLVED. Delegate it again with a narrower "
+                        f"objective, or state plainly in your answer that this part is "
+                        f"unresolved."
+                    )
                 return (
                     f"{_NOT_INVESTIGATED_MARK}: {member_id!r}'s most recent delegation could "
                     f"not use any tool and read nothing, so there is no finding to forward "
@@ -2427,6 +2438,19 @@ def _make_forward_member_answer(
                 f"(empty, budget-exhausted, or only a runtime notice). Delegate again with "
                 f"a narrower task, or write the answer yourself from what you already know."
             )
+        # Phase 1.02 (B5): the assessed status of THIS delegation is authoritative over the
+        # text-only status above. PARTIAL carries the unsupported items as unresolved, so a
+        # PARTIAL result is forwarded as partial and cannot read as complete downstream.
+        _asmt = (assessments or {}).get(key)
+        _cur = delegation_generation.get(key, 0) if delegation_generation is not None else 0
+        if (isinstance(_asmt, dict) and _asmt.get("generation", 0) == _cur
+                and _asmt.get("status") == "PARTIAL"):
+            import dataclasses as _dc
+            result = _dc.replace(
+                result, status="PARTIAL",
+                unresolved=list(result.unresolved)
+                + [f"unsupported by this delegation's evidence: {u}"
+                   for u in _asmt.get("unsupported", [])[:8]])
         print(f"[team] forward_member_answer: forwarding {key!r}'s answer "
               f"({len(result.answer):,} chars of {len(text):,} raw, status={result.status}"
               f"{', unresolved' if result.unresolved else ''})", flush=True)
@@ -20818,13 +20842,26 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # does not exist never reaches this hook, and a tool that returned an error result is
     # not counted, so zero here means "nothing was actually investigated".
     delegation_investigation_calls: dict[str, int] = {}
+    # Phase 1.02/1.03: the full delegation-scoped evidence record (successful and failed
+    # calls per tool, paths actually read vs merely seen in results, search scopes, and
+    # the citable tokens this delegation's own successful tool results contained). Reset
+    # with the counters above; consumed by _assess_member_result.
+    delegation_evidence: dict[str, dict] = {}
 
-    def _count_investigation_call(agent, function_name: str) -> None:
+    def _count_investigation_call(agent, function_name: str, args=None,
+                                  result_text: str = "", ok: bool = True) -> None:
         if function_name in _NON_INVESTIGATION_TOOLS:
             return
         _who = _member_key(getattr(agent, "name", None) or "")
-        if _who:
+        if not _who:
+            return
+        if ok:
             delegation_investigation_calls[_who] = delegation_investigation_calls.get(_who, 0) + 1
+        _ev = delegation_evidence.get(_who)
+        if _ev is None:
+            _ev = delegation_evidence[_who] = _new_delegation_evidence(
+                unavailable_tool_snapshot().get("count", 0))
+        _record_call_in_evidence(_ev, function_name, args, result_text, ok)
     # Times each member has been refused for the ceiling in the CURRENT delegation.
     # Without this the refusal is a static condition and repeats forever.
     read_refusals: dict[str, int] = {}
@@ -20871,6 +20908,12 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                               f"(was {delegation_read_chars[target]:,})", flush=True)
                     delegation_read_chars[target] = 0
                     delegation_investigation_calls[target] = 0
+                    delegation_evidence[target] = _new_delegation_evidence(
+                        unavailable_tool_snapshot().get("count", 0))
+                    # Phase 1.02 (A2): "forced text-only" is a per-delegation fact. This set
+                    # used to be add-only for the process lifetime, so every later delegation
+                    # to a member that had once been forced was mislabelled in telemetry.
+                    _forced_text_only_members.discard(target)
                     read_refusals[target] = 0
                     member_obj = agent_objects.get(target)
                     if member_obj is not None:
@@ -20932,8 +20975,10 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 failure_counts[fail_key] = prior + 1
             else:
                 failure_counts.pop(fail_key, None)   # a success clears the streak
-                if not _investigation_result_failed(_result_preview_text(out)):
-                    _count_investigation_call(agent, function_name)
+            _out_text = _result_text(out)
+            _count_investigation_call(
+                agent, function_name, args, _out_text,
+                ok=not _investigation_result_failed(_out_text))
             # A FAILED apply_diff means this agent's anchor did not match the bytes
             # currently at that path -- the one case where re-reading is the documented
             # next step rather than a redundant repeat. Recorded here because this
@@ -21196,8 +21241,10 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         else:
             result = cache[cache_key]
 
-        if not _investigation_result_failed(_result_preview_text(result)):
-            _count_investigation_call(agent, function_name)
+        _res_text = _result_text(result)
+        _count_investigation_call(
+            agent, function_name, args, _res_text,
+            ok=not _investigation_result_failed(_res_text))
 
         if is_fresh_fetch:
             read_chars[norm_agent_key] = (
@@ -21566,7 +21613,8 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     _read_cache_tool_hook.delegation_generation = delegation_generation
     # Phase 1.00: live per-delegation progress counters, read by _delegation_has_
     # investigation_evidence (B1 directive probe, B2 blocked-result classification).
-    _read_cache_tool_hook.delegation_progress = {"calls": delegation_investigation_calls}
+    _read_cache_tool_hook.delegation_progress = {
+        "calls": delegation_investigation_calls, "evidence": delegation_evidence}
     return _read_cache_tool_hook
 
 
@@ -25040,6 +25088,12 @@ def _build_structured_delegation_tool(original_function, team=None):
                 _pre[_member_key(str(member_id))] = {
                     "text": _lightrag_context or "",
                     "echo": f"{target} {objective} {evidence_required} {completion_criteria}",
+                    # Phase 1.02: what the delegation asked, for the objective-class
+                    # decision and for supersede/disclosure wording.
+                    "target": str(target or ""), "objective": str(objective or ""),
+                    "evidence_required": str(evidence_required or ""),
+                    "task_text": f"{target} {objective} {evidence_required} "
+                                 f"{completion_criteria}",
                 }
         canonical_task = _build_canonical_researcher_task(
             target=target, objective=objective,
@@ -25164,21 +25218,16 @@ def _build_structured_delegation_tool(original_function, team=None):
                 async for item in original_entrypoint(task=canonical_task):
                     yield item
             else:
-                async for item in original_entrypoint(member_id=member_id, task=canonical_task):
+                # Phase 1.02/1.03 (A3/B4): the member's events go through the assessed relay,
+                # which relabels member content events (so agno does not concatenate raw
+                # member text into the Coordinator's tool message), keeps the Phase 0.82
+                # local-chunk mirror, and yields the Coordinator's own view of this
+                # delegation -- the member's text only if its assessed status allows it.
+                async for item in _assessed_member_relay(
+                        team, _delegation_target,
+                        original_entrypoint(member_id=member_id, task=canonical_task),
+                        _owned_entry, _my_generation):
                     yield item
-                    # Phase 0.82: mirror _accumulate_member_chunk's own content
-                    # extraction (swarm/team.py's _stream_event_to_chunk /
-                    # _CONTENT_EVENT_TYPES branch) locally, as a side observation
-                    # only -- never changes what is yielded upward. This is the
-                    # SAME item the normal Agno-relay chain would ALSO see if
-                    # _stream_team_run's own outer generator is still pulling;
-                    # this just keeps an independent, complete copy that survives
-                    # even if that chain was already abandoned for an unrelated
-                    # reason earlier in the run.
-                    if _owned_entry is not None:
-                        _chunk = getattr(item, "content", None)
-                        if isinstance(_chunk, str) and _chunk:
-                            _owned_entry["local_chunks"].append(_chunk)
         except asyncio.CancelledError:
             if _owned_entry is not None:
                 _owned_entry["terminal"] = True
@@ -25639,6 +25688,7 @@ def _build_team(
     # read nothing). Shared by reference with forward_member_answer and bound to
     # team._blocked_member_results below; see _zero_investigation_block_reason.
     blocked_member_results: dict[str, dict] = {}
+    member_assessments: dict[str, dict] = {}
     # Phase F -- built from the SAME top-level `task` decompose_first_gate_hook/
     # search_before_browse_gate_hook already receive, unconditionally (unlike those two,
     # this has no team_gate_flags allowlist yet -- it never blocks at all unless `task`
@@ -25856,7 +25906,7 @@ def _build_team(
             _make_forward_member_answer(
                 member_answers, forwarded_members,
                 read_cache_hook.delegation_generation, member_result_generation,
-                blocked_member_results))
+                blocked_member_results, member_assessments))
         # Copied, never mutated in place: `instructions` belongs to the caller and is
         # reused across runs in the same process, so appending to it directly would make
         # the block accumulate once per run.
@@ -26053,6 +26103,9 @@ def _build_team(
     # delegate_structured_task, and the unavailable-tool escalation marker.
     team._delegation_progress = read_cache_hook.delegation_progress
     team._blocked_member_results = blocked_member_results
+    team._member_assessments = member_assessments
+    team._result_assessments = {}
+    team._diagnostic_results = {}
     team._blocked_delegations = []
     team._delegation_preloaded = {}
     team._unavailable_forced_generation = {}
@@ -26685,53 +26738,393 @@ def _mark_unavailable_forced(team, member) -> None:
     team._unavailable_forced_generation[key] = gens.get(key, 0)
 
 
-def _zero_investigation_block_reason(team, key: str, text: str) -> "str | None":
-    forced = getattr(team, "_unavailable_forced_generation", None)
-    gens = getattr(team, "_delegation_generation", None)
-    if not isinstance(forced, dict) or not isinstance(gens, dict):
-        return None
-    if key not in forced or forced[key] != gens.get(key, 0):
-        return None
-    if _delegation_has_investigation_evidence(team, key):
-        return None
-    rec = (getattr(team, "_delegation_preloaded", None) or {}).get(key) or {}
-    if _report_grounded_in_preloaded(text, rec.get("text") or "", rec.get("echo") or ""):
-        return None
-    return ("forced text-only after unavailable tool calls, zero successful tool calls, "
-            "zero reads, report not supported by preloaded context")
+# ── Phase 1.02 / 1.03: delegation-scoped evidence, one assessed status, one funnel ─────────
+# Phase 1.00 blocked a result in _finalise_member_chunks only; Phase 1.01 found a second,
+# unconditional writer (_record_stream_artifacts) that re-registered the same text, and that
+# status was derived from the text alone. Everything below is the single replacement:
+#
+#   * the tool hook records, per delegation, what was actually obtained (successful and
+#     failed calls, paths read versus merely seen, search scopes, citable tokens);
+#   * _assess_member_result maps (report text, that evidence, the preloaded context, the
+#     objective) to COMPLETE / PARTIAL / UNRESOLVED / BLOCKED, deterministically and with a
+#     stated reason -- no model call;
+#   * _assessment_for memoises it per (member, generation), so both registration paths and
+#     the Coordinator relay all see the SAME verdict;
+#   * only COMPLETE and PARTIAL are ever written to _member_results.
+#
+# What the assessment establishes is PROVENANCE, not truth: a specific token in the report
+# appears in something this delegation's own tools returned (or in its preloaded context).
+# It does not prove an end-to-end claim; a search hit is a lead, and the final-answer
+# guards (verify_claims, the ledger citation checks) remain the correctness layer.
+_EVIDENCE_MAX_TOKENS = 150_000
+_EVIDENCE_MAX_PATHS = 3_000
+_EVIDENCE_MAX_SEARCHES = 200
+_RESULT_PATH_RE = re.compile(r"(?<![\w.-])/?[\w.-]+(?:/[\w.-]+)+(?![\w/])")
+_PATH_READ_TOOLS = frozenset({"get_file_content", "get_files_batch"})
+_SEARCH_SCOPE_TOOLS = frozenset({
+    "search_files", "search_files_batch", "find_files", "count_matches",
+    "list_directory", "list_directory_tree", "lightrag_query"})
+_EXEC_TOOL_NAMES = frozenset({
+    "run_shell", "run_command", "bash_run", "run_docker", "apply_diff", "write_file",
+    "run_migration", "get_env_info", "check_port", "list_processes"})
+_STATIC_TOOL_NAMES = (frozenset(_READ_TOOLS) | _EXEC_TOOL_NAMES | _NON_INVESTIGATION_TOOLS
+                      | frozenset({"get_files_batch", "search_files_batch",
+                                   "compare_enumerations", "verify_claims", "project_map",
+                                   "delegate_structured_task", "delegate_task_to_member"}))
+_INVESTIGATE_RE = re.compile(
+    r"\b(?:read|open|search|grep|locate|inspect|query|enumerate|trace|look up|which files?"
+    r"|where is|how many)\b", re.I)
+_ABSENCE_RE = re.compile(
+    r"\bthere (?:is|are) no\b|\bno matches\b|\bnot (?:found|present|defined|implemented)\b"
+    r"|\bdoes(?:n't| not) (?:exist|appear|contain)\b"
+    r"|\b(?:no|none|nothing)\b[^.\n]{0,50}\b(?:found|exists?|present|defined|implemented"
+    r"|matches|usages?|references?)\b", re.I)
+_PARTIAL_IDENT_TOLERANCE_COUNT = 3     # tunable, unmeasured
+_PARTIAL_IDENT_TOLERANCE_FRACTION = 0.25
+_WITHHELD_STATUSES = frozenset({"BLOCKED", "UNRESOLVED"})
+_REGISTRABLE_STATUSES = frozenset({"COMPLETE", "PARTIAL"})
+_UNRESOLVED_RESULT_MARK = "UNRESOLVED RESULT"
 
 
-def _record_blocked_member_result(team, key: str, text: str, entry, reason: str) -> None:
+def _new_delegation_evidence(unavail_base: int = 0) -> dict:
+    return {"ok": {}, "err": {}, "read_paths": set(), "seen_paths": set(),
+            "searches": [], "tokens": set(), "unavail_base": unavail_base}
+
+
+def _norm_evidence_path(p) -> str:
+    s = str(p or "").strip().strip("`'\"").replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    return s.lstrip("/").lower()
+
+
+def _evidence_tokens_of(text: str) -> set:
+    """Citable tokens of one tool result, WITHOUT _salient_tokens' 40k-char scan cap: a
+    claim from the tail of a large file read must not look unsupported."""
+    out: set = set()
+    for t in _SALIENT_RE.findall((text or "")[:500_000]):
+        t = t.strip(".,;:!?()[]{}'\"`")
+        if t and _citable(t):
+            out.add(t.lower())
+            if len(out) >= 20_000:
+                break
+    return out
+
+
+def _as_str_list(v) -> list:
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple, set)):
+        return [str(x) for x in v]
+    return [str(v)]
+
+
+def _record_call_in_evidence(ev: dict, function_name: str, args, text: str, ok: bool) -> None:
+    bucket = ev["ok"] if ok else ev["err"]
+    bucket[function_name] = bucket.get(function_name, 0) + 1
+    if not ok:
+        return
+    a = args if isinstance(args, dict) else {}
+    text = text or ""
+    if len(ev["tokens"]) < _EVIDENCE_MAX_TOKENS:
+        ev["tokens"] |= _evidence_tokens_of(text)
+    if function_name in _PATH_READ_TOOLS:
+        for v in _as_str_list(a.get("relative_path") or a.get("paths") or a.get("path")):
+            n = _norm_evidence_path(v)
+            if n:
+                ev["read_paths"].add(n)
+    if len(ev["seen_paths"]) < _EVIDENCE_MAX_PATHS:
+        for m in _RESULT_PATH_RE.finditer(text[:300_000]):
+            ev["seen_paths"].add(_norm_evidence_path(m.group(0)))
+            if len(ev["seen_paths"]) >= _EVIDENCE_MAX_PATHS:
+                break
+    if function_name in _SEARCH_SCOPE_TOOLS and len(ev["searches"]) < _EVIDENCE_MAX_SEARCHES:
+        scope = (a.get("glob_filter") or a.get("glob_filters") or a.get("relative_path")
+                 or a.get("glob_pattern") or "**/*")
+        ev["searches"].append({
+            "tool": function_name,
+            "pattern": str(a.get("pattern") or a.get("query") or a.get("glob_pattern") or ""),
+            "scope": " ".join(_as_str_list(scope)).lower(),
+            "zero": text.lstrip().startswith("No matches"),
+        })
+
+
+def _objective_class(target, objective, evidence_required) -> str:
+    """'action' (names an execution/write tool), 'investigation' (names a repository
+    token or an investigation verb) or 'reasoning' (neither). Content-derived, deterministic;
+    it decides only what a report with NO checkable claim and no activity means."""
+    txt = f"{target or ''} {objective or ''} {evidence_required or ''}"
+    if any(re.search(r"\b" + re.escape(t) + r"\b", txt) for t in _EXEC_TOOL_NAMES):
+        return "action"
+    if _specific_tokens(txt) or _INVESTIGATE_RE.search(txt):
+        return "investigation"
+    return "reasoning"
+
+
+def _known_tool_names(team) -> set:
+    names = set(_STATIC_TOOL_NAMES)
+    try:
+        for mem in getattr(team, "members", None) or []:
+            for t in getattr(mem, "tools", None) or []:
+                n = getattr(t, "name", None)
+                if n:
+                    names.add(str(n))
+    except Exception:  # noqa: BLE001
+        pass
+    return names
+
+
+def _is_path_shaped(tok: str) -> bool:
+    return "/" in tok or bool(re.search(r"\.[A-Za-z0-9]{1,6}$", tok))
+
+
+def _path_matches(norm: str, p: str) -> bool:
+    return (p == norm or p.endswith("/" + norm) or norm.endswith("/" + p)
+            or ("/" not in norm and p.rsplit("/", 1)[-1] == norm))
+
+
+def _claim_support(tok: str, ev: dict, preload: str):
+    """'tool' (appears in this delegation's own tool results / read or seen paths),
+    'preload' (appears in its preloaded context) or None."""
+    if tok.lower() in ev["tokens"]:
+        return "tool"
+    if _is_path_shaped(tok):
+        norm = _norm_evidence_path(tok)
+        for p in ev["read_paths"] | ev["seen_paths"]:
+            if _path_matches(norm, p):
+                return "tool"
+    if preload and re.search(r"(?<![\w.-])" + re.escape(tok) + r"(?![\w])", preload):
+        return "preload"
+    return None
+
+
+def _unread_inspection_claims(text: str, ev: dict) -> list:
+    """Paths the report says it read/inspected/searched that this delegation never read."""
+    out = []
+    for m in list(_CLAIMED_INSPECTION_RE.finditer(text or ""))[:_MAX_INSPECTION_CLAIMS_CHECKED]:
+        n = _norm_evidence_path(m.group(1))
+        if any(_path_matches(n, p) for p in ev["read_paths"]):
+            continue
+        if any(n in s["scope"] for s in ev["searches"]):
+            continue
+        out.append(m.group(1))
+    return out
+
+
+def _unsupported_action_claims(text: str, ev: dict) -> list:
+    """Execution tools whose output/result the report asserts, with no successful call to
+    that tool in this delegation. Narration is not an action result."""
+    out = []
+    for name in sorted(_EXEC_TOOL_NAMES):
+        if name not in (text or "") or ev["ok"].get(name):
+            continue
+        n = re.escape(name)
+        if re.search(
+                rf"\b(?:output|result|returned|returns|printed|stdout)\b[^.\n]{{0,60}}\b{n}\b"
+                rf"|\b{n}\b[^.\n]{{0,60}}\b(?:returned|returns|output|printed|gave|result)\b"
+                rf"|\b(?:ran|executed|called|invoked)\b[^.\n]{{0,40}}\b{n}\b"
+                rf"|\b{n}\b[^.\n]{{0,30}}\b(?:was|were) (?:run|executed|called)\b",
+                text, re.I):
+            out.append(name)
+    return out
+
+
+def _scope_covers(scope: str, target_norm: str) -> bool:
+    base = scope.split("*")[0].strip().rstrip("/")
+    base = _norm_evidence_path(base)
+    return (not base) or target_norm.startswith(base) or base.startswith(target_norm)
+
+
+def _search_scope_examined(ev: dict, target: str) -> bool:
+    """A negative finding needs evidence the relevant scope was actually examined: a
+    successful search/list call, covering the target when the target is path-shaped."""
+    if not ev["searches"] and not ev["read_paths"]:
+        return False
+    t = _norm_evidence_path(target)
+    if t and _is_path_shaped(t):
+        if any(_scope_covers(s["scope"], t) for s in ev["searches"]):
+            return True
+        return any(t in p or p in t for p in ev["read_paths"] | ev["seen_paths"])
+    return bool(ev["searches"] or ev["read_paths"])
+
+
+def _assess_member_result(team, key: str, text: str) -> dict:
+    """Deterministic, explainable status for ONE delegation's report. See the block comment
+    above for what this does and does not establish."""
     gen = (getattr(team, "_delegation_generation", None) or {}).get(key, 0)
+    base = {"status": "COMPLETE", "reason": "", "generation": gen, "claims": [],
+            "supported": [], "unsupported": [], "sources": {}, "objective_class": "unknown",
+            "activity": {"ok": 0, "err": 0, "unavailable": 0, "reads": 0, "searches": 0},
+            "paths": []}
+
+    def done(status, reason, **kw):
+        r = dict(base)
+        r.update(kw)
+        r["status"], r["reason"] = status, reason
+        return r
+
+    stripped = (text or "").strip()
+    if (not stripped or stripped == _BUDGET_EXHAUSTED_ANSWER
+            or not _strip_leaked_tool_tags(stripped).strip()):
+        return done("BLOCKED", "no usable text (empty, budget-exhausted, or tool-call syntax only)")
+    prog = getattr(team, "_delegation_progress", None)
+    evmap = prog.get("evidence") if isinstance(prog, dict) else None
+    calls = prog.get("calls") if isinstance(prog, dict) else None
+    if not isinstance(evmap, dict) and not isinstance(calls, dict):
+        return done("COMPLETE", "no delegation evidence tracking on this team (legacy behaviour)")
+    ev = next((v for k, v in (evmap or {}).items() if _member_key(k) == key), None)
+    if ev is None:
+        ev = _new_delegation_evidence(unavailable_tool_snapshot().get("count", 0))
+        # Counter-only tracking (no per-call record): the number of successful investigation
+        # calls is all that is known, so claims cannot be matched to results.
+        n = sum(v for k, v in (calls or {}).items() if _member_key(k) == key and v)
+        if n:
+            ev["ok"]["(untracked)"] = n
+
+    rec = (getattr(team, "_delegation_preloaded", None) or {}).get(key) or {}
+    preload, echo = rec.get("text") or "", rec.get("echo") or ""
+    ok_n, err_n = sum(ev["ok"].values()), sum(ev["err"].values())
+    unavail = max(0, unavailable_tool_snapshot().get("count", 0) - ev["unavail_base"])
+    forced = (getattr(team, "_unavailable_forced_generation", None) or {}).get(key) == gen
+    needs = _objective_class(rec.get("target"), rec.get("objective"), rec.get("evidence_required"))
+    activity = {"ok": ok_n, "err": err_n, "unavailable": unavail,
+                "reads": len(ev["read_paths"]), "searches": len(ev["searches"])}
+    paths = sorted(ev["read_paths"] | ev["seen_paths"])[:400]
+
+    tool_names = {n.lower() for n in _known_tool_names(team)}
+    claims = sorted(t for t in _specific_tokens(text)
+                    if t.lower() not in tool_names and t not in echo)
+    support, sources = {}, {"tool": 0, "preload": 0, "provided": 0}
+    task_text = rec.get("task_text") or ""
+    for t in claims:
+        s = _claim_support(t, ev, preload)
+        if s is None and needs == "reasoning" and task_text and t in task_text:
+            s = "provided"
+        support[t] = s
+        if s:
+            sources[s] += 1
+    supported = [t for t, s in support.items() if s]
+    unread = _unread_inspection_claims(text, ev)
+    action_bad = _unsupported_action_claims(text, ev)
+    path_unsup = [t for t, s in support.items() if not s and _is_path_shaped(t)]
+    ident_unsup = [t for t, s in support.items() if not s and not _is_path_shaped(t)]
+    tolerated = (len(ident_unsup) < _PARTIAL_IDENT_TOLERANCE_COUNT
+                 and len(ident_unsup) / max(1, len(claims)) <= _PARTIAL_IDENT_TOLERANCE_FRACTION)
+    unsupported = path_unsup + [f"read:{p}" for p in unread] + [f"action:{n}" for n in action_bad]
+    if not tolerated:
+        unsupported += ident_unsup
+    common = {"claims": claims, "supported": supported, "unsupported": unsupported,
+              "sources": sources, "objective_class": needs, "activity": activity,
+              "paths": paths}
+
+    if ok_n == 0 and (forced or err_n > 0 or unavail > 0) and not supported:
+        return done("BLOCKED", "only failed or unavailable tool attempts, and nothing in the "
+                    "report is supported by this delegation's evidence or preloaded context", **common)
+    if claims or unread or action_bad:
+        if not supported:
+            return done("UNRESOLVED", "no claim in the report is supported by anything this "
+                        "delegation obtained", **common)
+        if unsupported:
+            return done("PARTIAL", "some claims are supported, others are not", **common)
+    else:
+        if ok_n == 0 and needs != "reasoning":
+            return done("UNRESOLVED", "no tool activity and no checkable claim for an objective "
+                        "that needs evidence", **common)
+    if (needs != "reasoning" and _ABSENCE_RE.search(text)
+            and not _search_scope_examined(ev, rec.get("target") or "")):
+        return done("UNRESOLVED", "an absence claim without evidence that the relevant search "
+                    "scope was examined", **common)
+    if _EXPLICIT_INCOMPLETE_INVESTIGATION_RE.search(text) or _THIN_REPORT_MARKER in text:
+        return done("PARTIAL", "the report itself says part of the objective was not examined",
+                    **common)
+    src = [k for k, v in sources.items() if v]
+    return done("COMPLETE", "supported by: " + (", ".join(src) or "reasoning (no repository claim)"),
+                **common)
+
+
+def _assessment_for(team, key: str, text: str, generation=None) -> dict:
+    """The memoised assessment for (member, generation). Computed once, from whichever
+    path or relay sees the delegation's text first, then shared by every registration path
+    and the Coordinator relay so they cannot disagree."""
+    gens = getattr(team, "_delegation_generation", None) or {}
+    gen = gens.get(key, 0) if generation is None else generation
+    memo = getattr(team, "_result_assessments", None)
+    if not isinstance(memo, dict):
+        memo = team._result_assessments = {}
+    a = memo.get((key, gen))
+    if a is None:
+        try:
+            a = _assess_member_result(team, key, text)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[team] result assessment failed for {key!r}: {exc} -- legacy behaviour "
+                  f"(registered as COMPLETE)", flush=True)
+            return {"status": "COMPLETE", "reason": "assessment failed", "generation": gen,
+                    "claims": [], "supported": [], "unsupported": [], "sources": {},
+                    "objective_class": "unknown", "paths": [],
+                    "activity": {"ok": 0, "err": 0, "unavailable": 0, "reads": 0, "searches": 0}}
+        a["generation"] = gen
+        memo[(key, gen)] = a
+        if not isinstance(getattr(team, "_member_assessments", None), dict):
+            team._member_assessments = {}
+        team._member_assessments[key] = a
+        act = a["activity"]
+        print(f"[delegation-lifecycle] result_assessed member_id={key!r} generation={gen} "
+              f"status={a['status']} class={a['objective_class']} claims={len(a['claims'])} "
+              f"supported={len(a['supported'])} unsupported={len(a['unsupported'])} "
+              f"calls_ok={act['ok']} calls_err={act['err']} unavailable={act['unavailable']} "
+              f"reason={a['reason']!r}", flush=True)
+    return a
+
+
+def _record_withheld_member_result(team, key: str, text: str, entry, a: dict) -> None:
+    """Keep a BLOCKED or UNRESOLVED result for diagnostics and disclosure, and nowhere
+    else: it is not written to _member_results, cannot be forwarded, and cannot satisfy the
+    duplicate-delegation gate or component coverage. Idempotent per (member, generation)."""
+    store = getattr(team, "_blocked_member_results", None)
+    if not isinstance(store, dict):
+        store = team._blocked_member_results = {}
+    gen, status = a.get("generation", 0), a["status"]
+    prev = store.get(key)
+    if prev and prev.get("generation") == gen and prev.get("status") == status:
+        return
     args = (entry or {}).get("args") or {}
-    rec = {"generation": gen, "reason": reason, "chars": len(text),
-           "target": str(args.get("target") or ""),
-           "objective": str(args.get("objective") or "")}
-    if not isinstance(getattr(team, "_blocked_member_results", None), dict):
-        team._blocked_member_results = {}
-    team._blocked_member_results[key] = rec
+    pre = (getattr(team, "_delegation_preloaded", None) or {}).get(key) or {}
+    rec = {"generation": gen, "status": status, "reason": a["reason"], "chars": len(text),
+           "target": str(args.get("target") or pre.get("target") or ""),
+           "objective": str(args.get("objective") or pre.get("objective") or "")}
+    store[key] = rec
     if not isinstance(getattr(team, "_blocked_delegations", None), list):
         team._blocked_delegations = []
     team._blocked_delegations.append({"member": key, **rec})
-    print(f"[delegation-lifecycle] delegation_result_blocked member_id={key!r} "
-          f"generation={gen} chars={len(text):,} reason={reason!r} -- not registered as a "
-          f"result, not forwardable, cannot be served as ALREADY DONE", flush=True)
+    if not isinstance(getattr(team, "_diagnostic_results", None), dict):
+        team._diagnostic_results = {}
+    team._diagnostic_results[(key, gen)] = {
+        "status": status, "reason": a["reason"], "text": text[:4000],
+        "activity": a.get("activity"), "unsupported": a.get("unsupported", [])[:20]}
+    print(f"[delegation-lifecycle] delegation_result_{status.lower()} member_id={key!r} "
+          f"generation={gen} chars={len(text):,} reason={a['reason']!r} -- withheld: not "
+          f"registered as a result, not forwardable, cannot be served as ALREADY DONE", flush=True)
 
 
-def _result_is_evidence_backed(team, key: str, text: str) -> bool:
-    """Whether a registered result is backed by evidence: this delegation completed a
-    successful investigation call, or the report names something found in its preloaded
-    context. Found live (Phase 1.00, 2026-11-12): a re-delegation that made no tool call and
-    wrote 'the output of run_shell is /home/...' was registered normally and, without this
-    check, cleared the disclosure for the delegation it was retrying."""
-    if _delegation_has_investigation_evidence(team, key):
-        return True
-    rec = (getattr(team, "_delegation_preloaded", None) or {}).get(key) or {}
-    return _report_grounded_in_preloaded(text, rec.get("text") or "", rec.get("echo") or "")
+def _register_member_result(team, key: str, text: str) -> dict:
+    """THE registration funnel. Every path that would store a member's text in
+    team._member_results goes through here, so the assessed status governs all of them."""
+    a = _assessment_for(team, key, text)
+    if a["status"] in _REGISTRABLE_STATUSES:
+        if not isinstance(getattr(team, "_member_results", None), dict):
+            team._member_results = {}
+        team._member_results[key] = text
+        _dg = getattr(team, "_delegation_generation", None)
+        if isinstance(_dg, dict):
+            if not isinstance(getattr(team, "_member_result_generation", None), dict):
+                team._member_result_generation = {}
+            team._member_result_generation[key] = _dg.get(key, 0)
+    return a
 
 
 def _clear_superseded_blocked(team, key: str, entry) -> None:
-    """A later, real result for the same member and target supersedes an earlier blocked one."""
+    """A later COMPLETE result for the same member and target supersedes an earlier
+    withheld one."""
     items = getattr(team, "_blocked_delegations", None)
     target = _normalize_delegation_task(((entry or {}).get("args") or {}).get("target"))
     if not items or not target:
@@ -26740,38 +27133,148 @@ def _clear_superseded_blocked(team, key: str, entry) -> None:
             if not (b["member"] == key and _normalize_delegation_task(b.get("target")) == target)]
     if len(kept) != len(items):
         team._blocked_delegations[:] = kept
-        print(f"[delegation-lifecycle] blocked delegation superseded by a real result "
+        print(f"[delegation-lifecycle] withheld delegation superseded by a COMPLETE result "
               f"member_id={key!r} target={target!r}", flush=True)
 
 
-def _not_investigated_note(team, content: str) -> str:
-    """Disclosure appended to the final answer for every blocked delegation that no later
-    result superseded. Idempotent. No path or symbol is echoed beyond the objective's own
-    words, so it cannot introduce a claim for verify_claims to flag."""
+def _withheld_note(team, content: str) -> str:
+    """Disclosure appended to the final answer for every BLOCKED or UNRESOLVED delegation
+    that no later COMPLETE result superseded. Idempotent per status. Only the objective's own
+    words are echoed, so it cannot introduce a claim for verify_claims to flag."""
     items = getattr(team, "_blocked_delegations", None)
-    if not items or _NOT_INVESTIGATED_MARK in (content or ""):
+    if not items:
         return ""
-    parts = []
-    for b in items:
-        obj = " ".join((b.get("objective") or b.get("target") or "a delegated task")
-                       .replace("`", "").split())[:140]
-        parts.append(obj)
-    return (f"\n\n---\n**{_NOT_INVESTIGATED_MARK} — {len(items)} delegation(s) in this run "
-            f"could not use any tool and read nothing, so what they were asked is UNRESOLVED "
-            f"(neither confirmed nor ruled out), and nothing they wrote is evidence: "
-            f"{'; '.join(parts)}**")
+    out = ""
+    for status, mark, lead in (
+            ("BLOCKED", _NOT_INVESTIGATED_MARK,
+             "could not use any tool or establish any result, so what they were asked is "
+             "UNRESOLVED (neither confirmed nor ruled out), and nothing they wrote is evidence"),
+            ("UNRESOLVED", _UNRESOLVED_RESULT_MARK,
+             "produced text that is not supported by anything those delegations obtained, so "
+             "it was withheld; what they were asked is neither confirmed nor ruled out")):
+        rows = [b for b in items if b.get("status", "BLOCKED") == status]
+        if not rows or mark in (content or ""):
+            continue
+        objs = [" ".join((b.get("objective") or b.get("target") or "a delegated task")
+                         .replace("`", "").split())[:140] for b in rows]
+        out += (f"\n\n---\n**{mark} — {len(rows)} delegation(s) in this run {lead}: "
+                f"{'; '.join(objs)}**")
+    return out
 
 
 def _gate_prior_result(entry: dict, team, member_id: str):
-    """The prior result the duplicate-delegation gate may serve for a log entry. A BLOCKED
-    entry has none -- and must not fall through to the member-wide slot, which holds some
-    OTHER delegation's text -- so the gate lets the re-delegation through."""
+    """The prior result the duplicate-delegation gate may serve for a log entry. Only a
+    COMPLETE result counts as already done. PARTIAL, UNRESOLVED and BLOCKED have none (so a
+    legitimate retry is allowed), and must not fall through to the member-wide slot, which
+    holds some OTHER delegation's text. An entry with no recorded status (a legacy path)
+    keeps the previous behaviour."""
+    status = entry.get("status")
+    if status is not None and status != "COMPLETE":
+        return None
     result = entry.get("result")
     if isinstance(result, str) and result:
         return result
-    if entry.get("blocked"):
+    if entry.get("blocked") or status is not None:
         return None
     return (getattr(team, "_member_results", None) or {}).get(member_id)
+
+
+def _result_status_line(a: dict) -> str:
+    act = a.get("activity") or {}
+    return (f"tool calls: {act.get('ok', 0)} succeeded, {act.get('err', 0)} failed, "
+            f"{act.get('unavailable', 0)} unavailable-tool attempt(s); files read: "
+            f"{act.get('reads', 0)}")
+
+
+def _leader_facing_result(text: str, a: dict) -> str:
+    """The ONLY text the Coordinator receives for this delegation (agno builds the tool
+    message from what the relay yields). COMPLETE: the member's text, unchanged. PARTIAL: the
+    text under a header naming what is unsupported. UNRESOLVED / BLOCKED: a status message;
+    the raw text is withheld. See _assessed_member_relay."""
+    st = a["status"]
+    if st == "COMPLETE":
+        return text
+    line = _result_status_line(a)
+    unsup = ", ".join(sorted(a.get("unsupported", []))[:8]) or "see the reason"
+    if st == "PARTIAL":
+        return (f"[RESULT STATUS: PARTIAL — the report below is only partly supported by this "
+                f"delegation's own tool results ({a['reason']}). Treat these items as UNVERIFIED "
+                f"and do not state them as findings: {unsup}. {line}.]\n{text}")
+    if st == "UNRESOLVED":
+        return (f"[RESULT STATUS: UNRESOLVED — the member produced text, but it is not "
+                f"supported by anything this delegation read or retrieved ({a['reason']}). The "
+                f"text was withheld and must not be used as a finding. Unsupported items: "
+                f"{unsup}. {line}. Delegate again with a narrower objective, or state in your "
+                f"answer that this part is unresolved.]")
+    return (f"[RESULT STATUS: BLOCKED — this delegation could not establish any result "
+            f"({a['reason']}). Its output was withheld and is NOT evidence. {line}. Delegate it "
+            f"again if the objective still matters, or state in your answer that this part was "
+            f"not investigated.]")
+
+
+def _as_member_content_event(item):
+    """A copy of a member's RunContentEvent as an IntermediateRunContentEvent. agno builds
+    the Coordinator's tool message only from RunContentEvent content and plain strings, so
+    the relabelled event still reaches the app's stream (content, liveness, repetition
+    detection all see it -- _stream_event_to_chunk treats the marker as content) but is not
+    concatenated into the Coordinator's input."""
+    import dataclasses
+    from agno.run.agent import IntermediateRunContentEvent
+    kw = {f.name: getattr(item, f.name) for f in dataclasses.fields(IntermediateRunContentEvent)
+          if f.name != "event" and hasattr(item, f.name)}
+    ev = IntermediateRunContentEvent(**kw)
+    ev._hive_member_content = True
+    return ev
+
+
+async def _assessed_member_relay(team, member_key: str, events, owned_entry=None,
+                                 generation: int = 0):
+    """Wrap one member run's event stream. Everything the app consumes is unchanged except
+    that member content events are relabelled (see _as_member_content_event); the
+    Coordinator's own view of the delegation is the single plain string yielded at the end:
+    the member's text if COMPLETE, a header plus the text if PARTIAL, a status message
+    (no raw text) if UNRESOLVED or BLOCKED. The assessment is made when the first terminal
+    event arrives -- after every tool call and content chunk, before either registration
+    path sees the result -- so the registration paths and this relay share one verdict."""
+    from agno.run.agent import RunContentEvent, RunContentCompletedEvent, RunCompletedEvent
+    parts: list = []
+    assessed = None
+
+    def _assess():
+        return _assessment_for(team, member_key, "".join(parts), generation=generation)
+
+    async for item in events:
+        if team is None:
+            yield item
+            continue
+        if isinstance(item, RunContentEvent) and isinstance(getattr(item, "content", None), str):
+            parts.append(item.content)
+            out_item = _as_member_content_event(item)
+        else:
+            out_item = item
+            if assessed is None and isinstance(item, (RunContentCompletedEvent, RunCompletedEvent)):
+                assessed = _assess()
+        yield out_item
+        if owned_entry is not None:
+            _chunk = getattr(item, "content", None)
+            if isinstance(_chunk, str) and _chunk:
+                owned_entry["local_chunks"].append(_chunk)
+    if team is None:
+        return
+    text = "".join(parts)
+    try:
+        if assessed is None:
+            assessed = _assess()
+        leader_text = _leader_facing_result(text, assessed)
+        print(f"[coordinator-relay] member_id={member_key!r} status={assessed['status']} "
+              f"member_chars={len(text):,} leader_chars={len(leader_text):,} "
+              f"withheld={assessed['status'] in _WITHHELD_STATUSES}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[team] coordinator relay assessment failed for {member_key!r}: {exc} -- "
+              f"passing the member's text through unchanged", flush=True)
+        leader_text = text
+    if leader_text:
+        yield leader_text
 
 
 def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
@@ -26790,28 +27293,21 @@ def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
     text = (chunks.pop(key, "") or "").strip()
     if not text:
         return
-    # Phase 1.00 (B2): decided once, up front. A blocked result is never written to any
-    # result store below -- see _zero_investigation_block_reason.
-    _blocked_reason = _zero_investigation_block_reason(team, key, text)
-    if not isinstance(getattr(team, "_member_results", None), dict):
-        team._member_results = {}
-    if not _blocked_reason:
-        team._member_results[key] = text
+    # Phase 1.02 (A1/B2): the assessed status is decided ONCE, in the single registration
+    # funnel (_register_member_result), which also writes _member_results and
+    # _member_result_generation for COMPLETE/PARTIAL only. BLOCKED/UNRESOLVED text is never
+    # written to any result store here or in the second writer (_record_stream_artifacts).
+    _assessment = _register_member_result(team, key, text)
+    _blocked_reason = (_assessment["reason"] if _assessment["status"] in _WITHHELD_STATUSES
+                       else "")
     # Phase 0.80: fires only on an actual, non-empty registration -- never on
     # the early `if not text: return` above, so this event's mere presence
     # already means real content was finalised, not merely that this function
     # was called.
     if not _blocked_reason:
         print(f"[delegation-lifecycle] delegation_result_registered "
-              f"member_id={key!r} chars={len(text):,}", flush=True)
-    # Phase 0.23: record which delegation generation this text was captured
-    # at, at the SAME moment it is written -- see member_result_generation's
-    # own module-level comment for why forward_member_answer needs this.
-    _dg = getattr(team, "_delegation_generation", None)
-    if isinstance(_dg, dict) and not _blocked_reason:
-        if not isinstance(getattr(team, "_member_result_generation", None), dict):
-            team._member_result_generation = {}
-        team._member_result_generation[key] = _dg.get(key, 0)
+              f"member_id={key!r} chars={len(text):,} status={_assessment['status']}",
+              flush=True)
     # Phase P.2 (2026-10-04): tag the delegation-log entry this text actually belongs
     # to, now that it exists -- the bridge set at dispatch time (see the duplicate-
     # delegation gate's log.append call site).
@@ -26898,11 +27394,13 @@ def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
                 if isinstance(_by_run_cleanup, dict) and "run_id" in _pending_entry:
                     _by_run_cleanup.pop(_pending_entry["run_id"], None)
     if _pending_entry is not None:
+        _pending_entry["status"] = _assessment["status"]
         if _blocked_reason:
             _pending_entry["blocked"] = True   # no "result": the gate must not serve one
         else:
             _pending_entry["result"] = text
-            if _result_is_evidence_backed(team, key, text):
+            # Only a COMPLETE result supersedes an earlier withheld one for this target.
+            if _assessment["status"] == "COMPLETE":
                 _clear_superseded_blocked(team, key, _pending_entry)
     # T47: covers BOTH removal paths above (run_id-based pop at line ~18352
     # equivalent, and the FIFO-fallback pop) with one call site -- by this
@@ -26915,7 +27413,7 @@ def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
         # Phase 1.00 (B2): stop here. Nothing below (kill-recovery mirror, filename union,
         # relay accounting, the one-shot Phase O forwarding force) should treat this text
         # as a finished result.
-        _record_blocked_member_result(team, key, text, _pending_entry, _blocked_reason)
+        _record_withheld_member_result(team, key, text, _pending_entry, _assessment)
         return
     # Mirrored to module scope for the same reason _best_draft is: the liveness
     # heartbeat has no `team` in scope, and on an auto-kill the parent process is the
@@ -27091,7 +27589,10 @@ def _stream_event_to_chunk(event, team=None) -> str | dict | None:
         _claim_pending_entry_for_run(
             team, getattr(event, "agent_name", "") or "", getattr(event, "run_id", None))
         return None
-    if event_type in _CONTENT_EVENT_TYPES:
+    # Phase 1.02/1.03: a member content event relabelled by _assessed_member_relay (so agno
+    # keeps raw member text out of the Coordinator's tool message) is still member content
+    # for everything the app does with the stream.
+    if event_type in _CONTENT_EVENT_TYPES or getattr(event, "_hive_member_content", False):
         chunk = getattr(event, "content", None)
         if isinstance(chunk, str) and chunk:
             # Attribute the chunk to the member that produced it, as a SIDE EFFECT --
@@ -29522,17 +30023,16 @@ def _record_stream_artifacts(team, out: dict) -> None:
         out["content"] = content
         # Keyed by _member_key so 'context-router' and 'contextrouter' land in one
         # bucket, the same normalisation the delegation gate matches on.
-        if not isinstance(getattr(team, "_member_results", None), dict):
-            team._member_results = {}
         _mk = _member_key(out.get("agent_name", ""))
-        team._member_results[_mk] = out["content"]
-        # Phase 0.23: same generation-stamping as _finalise_member_chunks' own
-        # write site -- see member_result_generation's own module-level comment.
-        _dg = getattr(team, "_delegation_generation", None)
-        if isinstance(_dg, dict):
-            if not isinstance(getattr(team, "_member_result_generation", None), dict):
-                team._member_result_generation = {}
-            team._member_result_generation[_mk] = _dg.get(_mk, 0)
+        # Phase 1.02 (A1): this was the SECOND unconditional writer (Phase 1.01 finding) --
+        # it re-registered, as an ordinary result, text the first path had withheld. It now
+        # goes through the same funnel, which reuses the (member, generation) assessment the
+        # first path / relay already made and writes _member_results (and the generation
+        # stamp) for COMPLETE and PARTIAL only.
+        _assessment2 = _register_member_result(team, _mk, out["content"])
+        if _assessment2["status"] in _WITHHELD_STATUSES:
+            _record_withheld_member_result(team, _mk, out["content"], None, _assessment2)
+            return
         # Running total of what has landed in the COORDINATOR's context. Every member
         # result is appended there verbatim, so this is the quantity that actually
         # grows toward the model's context limit -- see _delegation_budget_exhausted.

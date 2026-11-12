@@ -231,6 +231,9 @@ def _slot(member: str) -> dict:
         "write_tool_calls_blocked": 0,
         "write_tools_seen": [],
         "tool_choice_escalations": 0,
+        # Phase 1.02 (A2): the same count scoped to the CURRENT delegation (reset in
+        # note_delegation_start); the key above stays cumulative for the whole run.
+        "tool_choice_escalations_this_delegation": 0,
         "tool_choice_raw": [],
     })
 
@@ -244,6 +247,7 @@ def note_delegation_start(member: str) -> None:
     counters must not be conflated."""
     try:
         _slot(member)["tool_calls_this_delegation"] = 0
+        _slot(member)["tool_choice_escalations_this_delegation"] = 0
     except Exception:  # noqa: BLE001
         pass
 
@@ -289,6 +293,7 @@ def note_tool_choice_forced(member: str, raw: str | None = None) -> None:
     try:
         s = _slot(member)
         s["tool_choice_escalations"] += 1
+        s["tool_choice_escalations_this_delegation"] += 1
         if raw and raw not in s["tool_choice_raw"]:
             s["tool_choice_raw"].append(raw)
     except Exception:  # noqa: BLE001
@@ -623,6 +628,8 @@ class Phase0Run:
                     "agno tool_call_limit refusals emit no hook call and no stream "
                     "event; they cannot be counted here"),
                 "tool_choice_escalations": act.get("tool_choice_escalations", 0),
+                "tool_choice_escalations_this_delegation": act.get(
+                    "tool_choice_escalations_this_delegation", 0),
                 "tool_choice_raw": act.get("tool_choice_raw", []),
                 "claimed_completion": claimed_completion(content, writes_exec),
                 **discard_snapshot(),
