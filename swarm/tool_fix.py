@@ -450,6 +450,25 @@ class _ToolCallRecoveryMixin:
         "guessing. " + _FORCED_DIRECTIVE_MARK
     )
 
+    # Phase 1.00 (B1, from Phase 0.99): the directive above tells the member to report
+    # "using only what you have already read". A delegation that was forced text-only
+    # before ANY tool call succeeded and with no usable preloaded context has read nothing,
+    # so that wording has no honest completion -- live (T13a, 2026-11-12) the member wrote a
+    # plan of "what I would do" naming files it never opened. This variant is used only when
+    # `_no_evidence_probe` (installed per member by _build_team) reports exactly that state;
+    # every other forced-text-only case keeps the unchanged directive above.
+    _FORCED_DIRECTIVE_NO_EVIDENCE = (
+        "TOOLS ARE NOW DISABLED for the remainder of this task, and NO tool call in this "
+        "task succeeded: you have read nothing and gathered no evidence. Do NOT write a "
+        "findings report. Reply with a SHORT blocked report in plain prose that says: (1) "
+        "no investigation was completed; (2) the objective is UNRESOLVED; (3) in one "
+        "sentence, what you were asked to find. Do not describe steps you would take as if "
+        "they were results, do not list files, functions, endpoints, hooks, tables or line "
+        "numbers, and do not name any file or symbol you did not open -- you opened none. "
+        "Any tool-call syntax you write will be discarded. " + _FORCED_DIRECTIVE_MARK
+    )
+    _no_evidence_probe = None   # callable() -> bool, set per member model by _build_team
+
     def _inject_forced_text_directive(self, messages, tool_choice) -> None:
         """When the harness has taken tools away, say so IN THE PROMPT, not just the API.
 
@@ -492,9 +511,19 @@ class _ToolCallRecoveryMixin:
         for m in reversed(messages):
             if self._FORCED_DIRECTIVE_MARK in (getattr(m, "content", None) or ""):
                 return
+        directive = self._FORCED_DIRECTIVE
+        probe = self._no_evidence_probe
+        if callable(probe):
+            try:
+                if probe():
+                    directive = self._FORCED_DIRECTIVE_NO_EVIDENCE
+                    print("[tool_fix] forced text-only with NO investigation evidence "
+                          "(no successful tool call, no usable preloaded context) -- "
+                          "using the blocked-report directive", flush=True)
+            except Exception:  # noqa: BLE001
+                directive = self._FORCED_DIRECTIVE   # a probe failure never changes behaviour
         try:
-            messages.append(type(messages[-1])(role="user",
-                                               content=self._FORCED_DIRECTIVE))
+            messages.append(type(messages[-1])(role="user", content=directive))
         except Exception:  # noqa: BLE001
             # Never let a prompt tweak break the model call it was meant to improve.
             return

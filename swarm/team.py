@@ -1882,7 +1882,7 @@ def _forwarded_gap(text: str, content: str) -> tuple[str, list[str]]:
     return ("full", []) if len(missing) == len(rows) else ("lines", missing)
 
 
-def _with_forwarded_evidence(content: str, team) -> str:
+def _with_forwarded_evidence_core(content: str, team) -> str:
     """`content` plus whatever of each forwarded member answer it does not already contain.
 
     forward_member_answer records the exact text at forward time (team._forwarded_members)
@@ -1957,6 +1957,19 @@ def _with_forwarded_evidence(content: str, team) -> str:
     return (content or "") + (
         "\n\n---\n**FORWARDED FROM THE MEMBERS — their own text, unedited, appended "
         "because the answer above did not carry all of it.**" + "".join(parts))
+
+
+def _with_forwarded_evidence(content: str, team) -> str:
+    """_with_forwarded_evidence_core, plus (Phase 1.00, B2) a disclosure for every delegation
+    that was BLOCKED -- could not use any tool and read nothing -- and never superseded by a
+    real result. A blocked result is not forwardable, so without this its unresolved part
+    would silently vanish from the final answer. A no-op (returns exactly what the core
+    returns) when nothing was blocked, and for the same non-answers the core leaves alone."""
+    out = _with_forwarded_evidence_core(content, team)
+    if (not out or not _strip_leaked_tool_tags(out).strip()
+            or out.strip() == _BUDGET_EXHAUSTED_ANSWER):
+        return out
+    return out + _not_investigated_note(team, out)
 
 
 @dataclass
@@ -2271,7 +2284,8 @@ def _make_required_tool_clearing_hook(required_tool_states: dict):
 def _make_forward_member_answer(
         member_answers: dict, forwarded: dict | None = None,
         delegation_generation: dict | None = None,
-        member_result_generation: dict | None = None):
+        member_result_generation: dict | None = None,
+        blocked_results: dict | None = None):
     """Build the coordinator's forward tool over the live member-results map.
 
     `forwarded` (default None = no recording, the pre-2026-09-21 behaviour) receives the
@@ -2341,6 +2355,24 @@ def _make_forward_member_answer(
         # execution boundary every tool call already passes through, for
         # whichever tool policy ever names next, not just this one.
         key = _member_key(str(member_id or "").strip())
+        # Phase 1.00 (B2): the member's LATEST delegation was blocked (it could not use any
+        # tool and read nothing). Checked first: falling through would either forward an
+        # earlier, unrelated delegation's text or tell the Coordinator to "wait" for a
+        # delegation that has already finished.
+        if blocked_results:
+            _blocked = blocked_results.get(key)
+            _cur_gen = delegation_generation.get(key, 0) if delegation_generation is not None else 0
+            if _blocked is not None and _blocked.get("generation", 0) >= _cur_gen:
+                print(f"[team] forward_member_answer: {key!r}'s latest delegation was "
+                      f"BLOCKED (no investigation) -- nothing to forward", flush=True)
+                return (
+                    f"{_NOT_INVESTIGATED_MARK}: {member_id!r}'s most recent delegation could "
+                    f"not use any tool and read nothing, so there is no finding to forward "
+                    f"and its objective is UNRESOLVED. Do not treat anything it wrote as "
+                    f"evidence. Delegate it again (a new delegation starts with working "
+                    f"tools) with the same objective, or state plainly in your answer that "
+                    f"this part was not investigated."
+                )
         # Phase 0.23: a NEWER delegation to this member is still in flight if its
         # own delegation_generation counter is ahead of the generation the
         # CURRENTLY stored answer was captured at -- the stored text is real,
@@ -20781,6 +20813,18 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # The per-run budget above is 450,000 and never fires in time to stop a member
     # reading 169,188 chars for one question and summarising them away (T13a).
     delegation_read_chars: dict[str, int] = {}
+    # Phase 1.00 (B1/B2): successful investigation tool calls per member in the CURRENT
+    # delegation, reset with delegation_read_chars. A call the model made to a tool that
+    # does not exist never reaches this hook, and a tool that returned an error result is
+    # not counted, so zero here means "nothing was actually investigated".
+    delegation_investigation_calls: dict[str, int] = {}
+
+    def _count_investigation_call(agent, function_name: str) -> None:
+        if function_name in _NON_INVESTIGATION_TOOLS:
+            return
+        _who = _member_key(getattr(agent, "name", None) or "")
+        if _who:
+            delegation_investigation_calls[_who] = delegation_investigation_calls.get(_who, 0) + 1
     # Times each member has been refused for the ceiling in the CURRENT delegation.
     # Without this the refusal is a static condition and repeats forever.
     read_refusals: dict[str, int] = {}
@@ -20826,6 +20870,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                         print(f"[team] delegation read counter reset for {target!r} "
                               f"(was {delegation_read_chars[target]:,})", flush=True)
                     delegation_read_chars[target] = 0
+                    delegation_investigation_calls[target] = 0
                     read_refusals[target] = 0
                     member_obj = agent_objects.get(target)
                     if member_obj is not None:
@@ -20887,6 +20932,8 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 failure_counts[fail_key] = prior + 1
             else:
                 failure_counts.pop(fail_key, None)   # a success clears the streak
+                if not _investigation_result_failed(_result_preview_text(out)):
+                    _count_investigation_call(agent, function_name)
             # A FAILED apply_diff means this agent's anchor did not match the bytes
             # currently at that path -- the one case where re-reading is the documented
             # next step rather than a redundant repeat. Recorded here because this
@@ -21148,6 +21195,9 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                       f"will be served from cache, not re-fetched", flush=True)
         else:
             result = cache[cache_key]
+
+        if not _investigation_result_failed(_result_preview_text(result)):
+            _count_investigation_call(agent, function_name)
 
         if is_fresh_fetch:
             read_chars[norm_agent_key] = (
@@ -21514,6 +21564,9 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # module-level comment (where member_answers is defined) for why
     # forward_member_answer needs read access to this live counter.
     _read_cache_tool_hook.delegation_generation = delegation_generation
+    # Phase 1.00: live per-delegation progress counters, read by _delegation_has_
+    # investigation_evidence (B1 directive probe, B2 blocked-result classification).
+    _read_cache_tool_hook.delegation_progress = {"calls": delegation_investigation_calls}
     return _read_cache_tool_hook
 
 
@@ -23197,9 +23250,7 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                     # Phase P.2: prefer THIS entry's own tagged result (matched by
                     # exact task text, hence by target) over the member-wide slot,
                     # which may have been overwritten by a different target since.
-                    _entry_result = entry.get("result")
-                    _prior_result = (_entry_result if isinstance(_entry_result, str) and _entry_result
-                                     else (getattr(team, "_member_results", None) or {}).get(member_id))
+                    _prior_result = _gate_prior_result(entry, team, member_id)
                     _entry_audit = entry.get("audit") or {}
                     _corrective_target = _entry_audit.get("target") or \
                         _derive_delegation_audit(raw_task)[0].get("target", "")
@@ -23233,9 +23284,7 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                     repeats[member_id] = repeats.get(member_id, 0) + 1
                     n = repeats[member_id]
                     # Phase P.2: same target-tagged-entry preference as above.
-                    _entry_result = entry.get("result")
-                    prior = (_entry_result if isinstance(_entry_result, str) and _entry_result
-                             else (getattr(team, "_member_results", None) or {}).get(member_id))
+                    prior = _gate_prior_result(entry, team, member_id)
                     print(f"[team] duplicate delegation to {member_id!r} (#{n}) — "
                           f"{'serving prior result' if prior else 'no prior result captured'}",
                           flush=True)
@@ -23298,9 +23347,7 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                         # set the exact-text tier shares.
                         # Phase P.2: prefer THIS entry's own tagged result (matched
                         # by target+action above) over the member-wide slot.
-                        _entry_result = entry.get("result")
-                        _prior_result = (_entry_result if isinstance(_entry_result, str) and _entry_result
-                                         else (getattr(team, "_member_results", None) or {}).get(member_id))
+                        _prior_result = _gate_prior_result(entry, team, member_id)
                         _corrective_key = (member_id, audit["target"])
                         if (_prior_result and audit["target"]
                                 and _read_tracking_active(team)
@@ -23337,9 +23384,7 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                         repeats[member_id] = repeats.get(member_id, 0) + 1
                         n = repeats[member_id]
                         # Phase P.2: same target-tagged-entry preference as above.
-                        _entry_result = entry.get("result")
-                        prior = (_entry_result if isinstance(_entry_result, str) and _entry_result
-                                 else (getattr(team, "_member_results", None) or {}).get(member_id))
+                        prior = _gate_prior_result(entry, team, member_id)
                         print(f"[team] duplicate delegation (reworded) to {member_id!r} "
                               f"(#{n}) — {'serving prior result' if prior else 'no prior result captured'}",
                               flush=True)
@@ -23477,9 +23522,7 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                 n = repeats[member_id]
                 # Phase P.2: entry is already matched on target_norm above (line
                 # ~15118); prefer its own tagged result over the member-wide slot.
-                _entry_result = entry.get("result")
-                prior = (_entry_result if isinstance(_entry_result, str) and _entry_result
-                         else (getattr(team, "_member_results", None) or {}).get(member_id))
+                prior = _gate_prior_result(entry, team, member_id)
                 print(f"[team] duplicate delegation ({'exact' if same_wording else 'reworded'}) "
                       f"to {member_id!r} for {(args or {}).get('target')!r} (#{n}) — "
                       f"{'serving prior result' if prior else 'no prior result captured'}",
@@ -24988,6 +25031,16 @@ def _build_structured_delegation_tool(original_function, team=None):
         # coverage gap, not a boundary).
         _lightrag_context = await _lightrag_prefetch_for_delegation(
             team, None if is_broadcast else member_id, target, objective, evidence_required)
+        # Phase 1.00 (B1/B2): remember what was preloaded for THIS member's delegation, plus
+        # the delegation's own wording (so a report that merely echoes the task is not
+        # mistaken for one grounded in the preloaded context).
+        if team is not None and not is_broadcast and member_id:
+            _pre = getattr(team, "_delegation_preloaded", None)
+            if isinstance(_pre, dict):
+                _pre[_member_key(str(member_id))] = {
+                    "text": _lightrag_context or "",
+                    "echo": f"{target} {objective} {evidence_required} {completion_criteria}",
+                }
         canonical_task = _build_canonical_researcher_task(
             target=target, objective=objective,
             evidence_required=evidence_required,
@@ -25582,6 +25635,10 @@ def _build_team(
     # content gets an additional "{member}#2"/"#3" key instead of overwriting -- see
     # forward_member_answer's own write site for why.
     forwarded_members: "dict[str, ForwardedRecord]" = {}
+    # Phase 1.00 (B2): latest BLOCKED delegation per member (it could not use any tool and
+    # read nothing). Shared by reference with forward_member_answer and bound to
+    # team._blocked_member_results below; see _zero_investigation_block_reason.
+    blocked_member_results: dict[str, dict] = {}
     # Phase F -- built from the SAME top-level `task` decompose_first_gate_hook/
     # search_before_browse_gate_hook already receive, unconditionally (unlike those two,
     # this has no team_gate_flags allowlist yet -- it never blocks at all unless `task`
@@ -25798,7 +25855,8 @@ def _build_team(
         coordinator_tools_list.append(
             _make_forward_member_answer(
                 member_answers, forwarded_members,
-                read_cache_hook.delegation_generation, member_result_generation))
+                read_cache_hook.delegation_generation, member_result_generation,
+                blocked_member_results))
         # Copied, never mutated in place: `instructions` belongs to the caller and is
         # reused across runs in the same process, so appending to it directly would make
         # the block accumulate once per run.
@@ -25959,10 +26017,23 @@ def _build_team(
             model._unavailable_owner = owner
             model._on_repeated_unavailable_tool = force
 
+    def _force_member_unavailable(_m):
+        # Phase 1.00: same actuator as before, plus a record of WHICH delegation generation
+        # this escalation happened in, so a blocked result can be attributed to it (B2).
+        _mark_unavailable_forced(team, _m)
+        _force_text_only(_m)
+
     for _m in members:
         _wire_unavailable_tool(
             getattr(_m, "model", None), getattr(_m, "name", "") or "member",
-            lambda _m=_m: _force_text_only(_m))
+            lambda _m=_m: _force_member_unavailable(_m))
+        # Phase 1.00 (B1): lets the forced-text-only directive tell a delegation that read
+        # nothing (and has no usable preloaded context) apart from one that did.
+        _mm = getattr(_m, "model", None)
+        if _mm is not None:
+            _mm._no_evidence_probe = (
+                lambda _k=_member_key(getattr(_m, "name", "") or ""):
+                _member_forced_text_has_no_evidence(team, _k))
     _wire_unavailable_tool(
         getattr(team, "model", None), "Coordinator",
         lambda: _force_text_only(None, team=team))
@@ -25977,6 +26048,14 @@ def _build_team(
     # generation's own module-level comment for the live incident this closes.
     team._delegation_generation = read_cache_hook.delegation_generation
     team._member_result_generation = member_result_generation
+    # Phase 1.00 (B1/B2): per-delegation progress counters (shared by reference with the
+    # tool hook), the blocked-result store, the preloaded-context record written by
+    # delegate_structured_task, and the unavailable-tool escalation marker.
+    team._delegation_progress = read_cache_hook.delegation_progress
+    team._blocked_member_results = blocked_member_results
+    team._blocked_delegations = []
+    team._delegation_preloaded = {}
+    team._unavailable_forced_generation = {}
     # Phase O.1 fix (2026-10-04, live NameError on first smoke test): _finalise_
     # member_chunks is a module-level function, not a closure inside _build_team
     # -- it never had `team_name` in scope. Attached here, same pattern as every
@@ -26512,6 +26591,177 @@ async def _drain_owned_delegations(team) -> None:
               flush=True)
 
 
+# ── Phase 1.00 (B1/B2, from Phase 0.99 Track B) ────────────────────────────────────────
+# Live (T13a, 2026-11-12): a delegation made two calls to a tool that does not exist, the
+# repeated-unavailable-tool rule forced it text-only, it had read nothing, and its
+# "here is what I would do" text -- naming files it never opened -- was registered as an
+# ordinary result, tagged COMPLETE, served back as ALREADY DONE, and delivered.
+#
+# A result is blocked only when ALL of: (1) the member was forced text-only by the
+# unavailable-tool escalation during THIS delegation generation; (2) it completed no
+# successful investigation tool call and read nothing in it; (3) its text is not supported by
+# the context the run preloaded for it. (3) is deliberately a property of the REPORT, not of
+# the prefetch merely existing: a usable LightRAG prefetch does not rescue a report that
+# ignores it, and a report that does cite something from it is not blocked.
+_NON_INVESTIGATION_TOOLS = frozenset({
+    "update_session_state", "load_skill", "forward_member_answer", "request_clarification",
+})
+_NOT_INVESTIGATED_MARK = "NOT INVESTIGATED"
+_IDENT_TOKEN_RE = re.compile(r"[A-Za-z_][\w./-]{2,}")
+_INVESTIGATION_FAILURE_PREFIXES = ("File not found:", "Error:", "ERROR:")
+
+
+def _investigation_result_failed(preview) -> bool:
+    """A tool result that is an error, for the investigation-call counter only. Wider than
+    _looks_like_tool_error (which the rest of the file relies on and is left unchanged):
+    hive-mcp's missing-file reply is 'File not found: <path>', which is a failed
+    investigation call, not evidence."""
+    if _looks_like_tool_error(preview):
+        return True
+    return isinstance(preview, str) and preview.lstrip().startswith(_INVESTIGATION_FAILURE_PREFIXES)
+
+
+def _delegation_has_investigation_evidence(team, member_key: str) -> bool:
+    """Whether this member's CURRENT delegation completed any successful investigation
+    tool call or read anything. Unknown state (no counters on the team) answers True, so a
+    caller that cannot tell never changes behaviour."""
+    prog = getattr(team, "_delegation_progress", None)
+    if not isinstance(prog, dict):
+        return True
+    calls = prog.get("calls")
+    if isinstance(calls, dict):
+        # Successful reads are successful investigation calls, so this one counter covers
+        # both. The per-delegation read-CHARS counter is deliberately not used: it also
+        # counts a failed read's error text ("File not found: ...") as characters read.
+        return any(v and _member_key(k) == member_key for k, v in calls.items())
+    return True
+
+
+def _delegation_has_usable_preloaded(team, member_key: str) -> bool:
+    rec = (getattr(team, "_delegation_preloaded", None) or {}).get(member_key)
+    return bool(isinstance(rec, dict) and (rec.get("text") or "").strip())
+
+
+def _specific_tokens(text: str) -> set[str]:
+    """Identifier-, path- or filename-shaped tokens: contain '_', '.', '/' or an interior
+    capital. Plain words never qualify, so a generic backticked word cannot ground a report."""
+    out: set[str] = set()
+    for m in _IDENT_TOKEN_RE.finditer(text or ""):
+        tok = m.group(0).strip(".,;:-/")
+        if len(tok) >= 4 and ("_" in tok or "." in tok or "/" in tok
+                              or re.search(r"[a-z][A-Z]", tok)):
+            out.add(tok)
+    return out
+
+
+def _report_grounded_in_preloaded(report: str, preloaded: str, echo: str) -> bool:
+    """True iff the report names at least one specific token that appears (as a whole token)
+    in the preloaded context and is NOT merely an echo of the delegation's own task text."""
+    if not (preloaded or "").strip():
+        return False
+    for tok in _specific_tokens(report):
+        if tok in (echo or ""):
+            continue
+        if re.search(r"(?<![\w.-])" + re.escape(tok) + r"(?![\w])", preloaded):
+            return True
+    return False
+
+
+def _member_forced_text_has_no_evidence(team, member_key: str) -> bool:
+    """B1 probe: forced text-only with nothing investigated AND nothing usable preloaded."""
+    return (not _delegation_has_investigation_evidence(team, member_key)
+            and not _delegation_has_usable_preloaded(team, member_key))
+
+
+def _mark_unavailable_forced(team, member) -> None:
+    """Called when the repeated-unavailable-tool rule flips a member text-only; records which
+    delegation generation it happened in so B2 can attribute the cause."""
+    key = _member_key(getattr(member, "name", "") or "")
+    gens = getattr(team, "_delegation_generation", None)
+    if not key or not isinstance(gens, dict):
+        return
+    if not isinstance(getattr(team, "_unavailable_forced_generation", None), dict):
+        team._unavailable_forced_generation = {}
+    team._unavailable_forced_generation[key] = gens.get(key, 0)
+
+
+def _zero_investigation_block_reason(team, key: str, text: str) -> "str | None":
+    forced = getattr(team, "_unavailable_forced_generation", None)
+    gens = getattr(team, "_delegation_generation", None)
+    if not isinstance(forced, dict) or not isinstance(gens, dict):
+        return None
+    if key not in forced or forced[key] != gens.get(key, 0):
+        return None
+    if _delegation_has_investigation_evidence(team, key):
+        return None
+    rec = (getattr(team, "_delegation_preloaded", None) or {}).get(key) or {}
+    if _report_grounded_in_preloaded(text, rec.get("text") or "", rec.get("echo") or ""):
+        return None
+    return ("forced text-only after unavailable tool calls, zero successful tool calls, "
+            "zero reads, report not supported by preloaded context")
+
+
+def _record_blocked_member_result(team, key: str, text: str, entry, reason: str) -> None:
+    gen = (getattr(team, "_delegation_generation", None) or {}).get(key, 0)
+    args = (entry or {}).get("args") or {}
+    rec = {"generation": gen, "reason": reason, "chars": len(text),
+           "target": str(args.get("target") or ""),
+           "objective": str(args.get("objective") or "")}
+    if not isinstance(getattr(team, "_blocked_member_results", None), dict):
+        team._blocked_member_results = {}
+    team._blocked_member_results[key] = rec
+    if not isinstance(getattr(team, "_blocked_delegations", None), list):
+        team._blocked_delegations = []
+    team._blocked_delegations.append({"member": key, **rec})
+    print(f"[delegation-lifecycle] delegation_result_blocked member_id={key!r} "
+          f"generation={gen} chars={len(text):,} reason={reason!r} -- not registered as a "
+          f"result, not forwardable, cannot be served as ALREADY DONE", flush=True)
+
+
+def _clear_superseded_blocked(team, key: str, entry) -> None:
+    """A later, real result for the same member and target supersedes an earlier blocked one."""
+    items = getattr(team, "_blocked_delegations", None)
+    target = _normalize_delegation_task(((entry or {}).get("args") or {}).get("target"))
+    if not items or not target:
+        return
+    kept = [b for b in items
+            if not (b["member"] == key and _normalize_delegation_task(b.get("target")) == target)]
+    if len(kept) != len(items):
+        team._blocked_delegations[:] = kept
+        print(f"[delegation-lifecycle] blocked delegation superseded by a real result "
+              f"member_id={key!r} target={target!r}", flush=True)
+
+
+def _not_investigated_note(team, content: str) -> str:
+    """Disclosure appended to the final answer for every blocked delegation that no later
+    result superseded. Idempotent. No path or symbol is echoed beyond the objective's own
+    words, so it cannot introduce a claim for verify_claims to flag."""
+    items = getattr(team, "_blocked_delegations", None)
+    if not items or _NOT_INVESTIGATED_MARK in (content or ""):
+        return ""
+    parts = []
+    for b in items:
+        obj = " ".join((b.get("objective") or b.get("target") or "a delegated task")
+                       .replace("`", "").split())[:140]
+        parts.append(obj)
+    return (f"\n\n---\n**{_NOT_INVESTIGATED_MARK} — {len(items)} delegation(s) in this run "
+            f"could not use any tool and read nothing, so what they were asked is UNRESOLVED "
+            f"(neither confirmed nor ruled out), and nothing they wrote is evidence: "
+            f"{'; '.join(parts)}**")
+
+
+def _gate_prior_result(entry: dict, team, member_id: str):
+    """The prior result the duplicate-delegation gate may serve for a log entry. A BLOCKED
+    entry has none -- and must not fall through to the member-wide slot, which holds some
+    OTHER delegation's text -- so the gate lets the re-delegation through."""
+    result = entry.get("result")
+    if isinstance(result, str) and result:
+        return result
+    if entry.get("blocked"):
+        return None
+    return (getattr(team, "_member_results", None) or {}).get(member_id)
+
+
 def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
     """Promote a member's buffered chunks to its finished result, and clear the buffer.
 
@@ -26528,20 +26778,25 @@ def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
     text = (chunks.pop(key, "") or "").strip()
     if not text:
         return
+    # Phase 1.00 (B2): decided once, up front. A blocked result is never written to any
+    # result store below -- see _zero_investigation_block_reason.
+    _blocked_reason = _zero_investigation_block_reason(team, key, text)
     if not isinstance(getattr(team, "_member_results", None), dict):
         team._member_results = {}
-    team._member_results[key] = text
+    if not _blocked_reason:
+        team._member_results[key] = text
     # Phase 0.80: fires only on an actual, non-empty registration -- never on
     # the early `if not text: return` above, so this event's mere presence
     # already means real content was finalised, not merely that this function
     # was called.
-    print(f"[delegation-lifecycle] delegation_result_registered "
-          f"member_id={key!r} chars={len(text):,}", flush=True)
+    if not _blocked_reason:
+        print(f"[delegation-lifecycle] delegation_result_registered "
+              f"member_id={key!r} chars={len(text):,}", flush=True)
     # Phase 0.23: record which delegation generation this text was captured
     # at, at the SAME moment it is written -- see member_result_generation's
     # own module-level comment for why forward_member_answer needs this.
     _dg = getattr(team, "_delegation_generation", None)
-    if isinstance(_dg, dict):
+    if isinstance(_dg, dict) and not _blocked_reason:
         if not isinstance(getattr(team, "_member_result_generation", None), dict):
             team._member_result_generation = {}
         team._member_result_generation[key] = _dg.get(key, 0)
@@ -26631,7 +26886,11 @@ def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
                 if isinstance(_by_run_cleanup, dict) and "run_id" in _pending_entry:
                     _by_run_cleanup.pop(_pending_entry["run_id"], None)
     if _pending_entry is not None:
-        _pending_entry["result"] = text
+        if _blocked_reason:
+            _pending_entry["blocked"] = True   # no "result": the gate must not serve one
+        else:
+            _pending_entry["result"] = text
+            _clear_superseded_blocked(team, key, _pending_entry)
     # T47: covers BOTH removal paths above (run_id-based pop at line ~18352
     # equivalent, and the FIFO-fallback pop) with one call site -- by this
     # point whichever path resolved _pending_entry has already removed it
@@ -26639,6 +26898,12 @@ def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
     # correct regardless of which branch fired (or neither, which is also
     # safe: a no-op re-check of an unchanged count).
     _clear_member_concurrency_episode_if_resolved(team, agent_name)
+    if _blocked_reason:
+        # Phase 1.00 (B2): stop here. Nothing below (kill-recovery mirror, filename union,
+        # relay accounting, the one-shot Phase O forwarding force) should treat this text
+        # as a finished result.
+        _record_blocked_member_result(team, key, text, _pending_entry, _blocked_reason)
+        return
     # Mirrored to module scope for the same reason _best_draft is: the liveness
     # heartbeat has no `team` in scope, and on an auto-kill the parent process is the
     # only thing left alive. Without this, a killed run hands back the coordinator's
@@ -30101,6 +30366,68 @@ _COMPLETENESS_CLAIM_RE = re.compile(
 # positive on the stored answers.
 _COMPLETENESS_NOT_A_CLAIM_RE = re.compile(r"\bif\s+no\s+other\b", re.IGNORECASE)
 
+# Phase 1.00 (C1, root cause established in Phase 0.99): the completeness regexes above and
+# below have no notion of negation, so "not all backend endpoints have corresponding
+# frontend hooks" was extracted as the positive claim "all backend endpoints have
+# corresponding" (11 of 12 negated test sentences were). A NegEx-style bounded scope check
+# is applied AFTER a match, never inside the patterns, so every existing positive match is
+# unchanged. Every ambiguity below resolves toward the OLD behaviour (extract the claim): a
+# terminator that is too eager only shortens the negation scope, never widens it.
+_NEGATION_SCOPE_END_RE = re.compile(
+    r"[.!?;:\n()\[\]]|--|—|–"
+    r"|\b(?:but|however|although|though|yet|whereas|while|nevertheless|nonetheless|except)\b"
+    r"|,\s*(?:and|so|then|which|therefore|thus|hence)\b",
+    re.IGNORECASE,
+)
+_NEGATION_CUE_RE = re.compile(
+    r"\bnot\b|\b\w+n't\b|\bnever\b|\bhardly\b|\brarely\b|\bbarely\b|\bscarcely\b"
+    r"|\bcannot\b|\bno\s+longer\b|\bfail(?:s|ed|ing)?\s+to\b"
+    r"|\b(?:wrong|incorrect|misleading)\s+to\s+(?:say|claim|state|assert|conclude)\b"
+    r"|\b(?:false|untrue|incorrect)\s+that\b"
+    r"|\bonly\s+(?:\d+|\w+)\s+of\b",
+    re.IGNORECASE,
+)
+# NegEx "pseudo-negations": cue words that do not negate what follows.
+_PSEUDO_NEGATION_RE = re.compile(
+    r"\bnot\s+(?:only|just|merely|surprisingly|unexpectedly|to\s+mention)\b"
+    r"|\bno\s+doubt\b|\bwithout\s+(?:a\s+)?doubt\b",
+    re.IGNORECASE,
+)
+_NEGATION_WINDOW_WORDS = 6
+# "all 9 endpoints have no corresponding hook" -- the match ends right before the negation.
+_NEGATION_FOLLOWS_RE = re.compile(r"\s*(?:not|never|no|none|neither)\b", re.IGNORECASE)
+_NEGATED_CLAIMS_LOGGED: set[str] = set()
+
+
+def _completeness_match_is_negated(body: str, start: int, end: int) -> bool:
+    """Whether a completeness-regex match at body[start:end] sits inside a negation.
+
+    Looks back from the match to the nearest clause boundary (sentence end, semicolon, colon,
+    bracket, dash, contrast word such as "but"/"however", or ", and"/", so") and checks the
+    last few words of that clause for a negation cue, after removing pseudo-negations ("not
+    only", "no doubt"). Also checks for a negation immediately AFTER the match, for patterns
+    whose match ends before the negated predicate ("all 9 endpoints have" + " no hook").
+    """
+    lead = body[max(0, start - 160):start]
+    scope_start = 0
+    for term in _NEGATION_SCOPE_END_RE.finditer(lead):
+        scope_start = term.end()
+    clause = _PSEUDO_NEGATION_RE.sub(" ", lead[scope_start:]).replace("’", "'")
+    tail = " ".join(clause.split()[-_NEGATION_WINDOW_WORDS:])
+    if _NEGATION_CUE_RE.search(tail):
+        return True
+    return bool(_NEGATION_FOLLOWS_RE.match(body[end:end + 12]))
+
+
+def _note_negated_completeness_match(body: str, start: int, end: int) -> None:
+    snippet = " ".join(body[max(0, start - 40):end + 20].split())[:100]
+    if snippet in _NEGATED_CLAIMS_LOGGED:
+        return
+    _NEGATED_CLAIMS_LOGGED.add(snippet)
+    print(f"[team] completeness claim suppressed -- the match is negated in its own "
+          f"clause, not a positive claim: {body[start:end]!r} in ...{snippet}...",
+          flush=True)
+
 
 def _completeness_claims(content: str) -> list[str]:
     """Every completeness assertion in an answer, as matched text.
@@ -30121,6 +30448,9 @@ def _completeness_claims(content: str) -> list[str]:
     body = (content or "").split("---\n**")[0]      # model's text, not guard banners
     for m in _COMPLETENESS_CLAIM_RE.finditer(body):
         if _COMPLETENESS_NOT_A_CLAIM_RE.search(body[max(0, m.start() - 12):m.start() + 12]):
+            continue
+        if _completeness_match_is_negated(body, m.start(), m.end()):
+            _note_negated_completeness_match(body, m.start(), m.end())
             continue
         out.append(m.group(0).strip())
     return out
@@ -30173,6 +30503,9 @@ def _reconcile_completeness_claims(content: str) -> list[str]:
     out = _completeness_claims(content)
     body = (content or "").split("---\n**")[0]
     for m in _RECONCILE_EXTRA_COMPLETENESS_RE.finditer(body):
+        if _completeness_match_is_negated(body, m.start(), m.end()):
+            _note_negated_completeness_match(body, m.start(), m.end())
+            continue
         out.append(m.group(0).strip())
     return out
 
