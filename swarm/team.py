@@ -2448,6 +2448,7 @@ def _make_forward_member_answer(
             import dataclasses as _dc
             result = _dc.replace(
                 result, status="PARTIAL",
+                answer=_partial_text_for_reader(result.answer, _asmt),
                 unresolved=list(result.unresolved)
                 + [f"unsupported by this delegation's evidence: {u}"
                    for u in _asmt.get("unsupported", [])[:8]])
@@ -26758,6 +26759,7 @@ def _mark_unavailable_forced(team, member) -> None:
 # guards (verify_claims, the ledger citation checks) remain the correctness layer.
 _EVIDENCE_MAX_TOKENS = 150_000
 _EVIDENCE_MAX_PATHS = 3_000
+_EVIDENCE_CORPUS_MAX_CHARS = 2_000_000
 _EVIDENCE_MAX_SEARCHES = 200
 _RESULT_PATH_RE = re.compile(r"(?<![\w.-])/?[\w.-]+(?:/[\w.-]+)+(?![\w/])")
 _PATH_READ_TOOLS = frozenset({"get_file_content", "get_files_batch"})
@@ -26788,7 +26790,12 @@ _UNRESOLVED_RESULT_MARK = "UNRESOLVED RESULT"
 
 def _new_delegation_evidence(unavail_base: int = 0) -> dict:
     return {"ok": {}, "err": {}, "read_paths": set(), "seen_paths": set(),
-            "searches": [], "tokens": set(), "unavail_base": unavail_base}
+            "searches": [], "tokens": set(), "unavail_base": unavail_base,
+            # Lower-cased text of this delegation's own successful tool results, bounded.
+            # Used ONLY for an exact-substring check of path- or dot-shaped claim tokens
+            # (route fragments, dotted code like router.get) that the token index cannot
+            # represent; it is never consulted for inspection or action claims.
+            "corpus": "", "corpus_chars": 0}
 
 
 def _norm_evidence_path(p) -> str:
@@ -26828,6 +26835,10 @@ def _record_call_in_evidence(ev: dict, function_name: str, args, text: str, ok: 
     text = text or ""
     if len(ev["tokens"]) < _EVIDENCE_MAX_TOKENS:
         ev["tokens"] |= _evidence_tokens_of(text)
+    if ev["corpus_chars"] < _EVIDENCE_CORPUS_MAX_CHARS:
+        chunk = text[:_EVIDENCE_CORPUS_MAX_CHARS - ev["corpus_chars"]].lower()
+        ev["corpus"] += chr(10) + chunk
+        ev["corpus_chars"] += len(chunk)
     if function_name in _PATH_READ_TOOLS:
         for v in _as_str_list(a.get("relative_path") or a.get("paths") or a.get("path")):
             n = _norm_evidence_path(v)
@@ -26893,9 +26904,36 @@ def _claim_support(tok: str, ev: dict, preload: str):
         for p in ev["read_paths"] | ev["seen_paths"]:
             if _path_matches(norm, p):
                 return "tool"
+    # Path- or dot-shaped tokens the index cannot hold (a route fragment such as
+    # "vouchers/grn", dotted code such as "router.get"): accept only if the EXACT string is
+    # in this delegation's own tool results. Not a loosening -- the string must be present.
+    if ("/" in tok or "." in tok) and len(tok.strip("/")) >= 4:
+        needle = tok.lower().strip("/")
+        if needle and needle in ev.get("corpus", ""):
+            return "tool"
     if preload and re.search(r"(?<![\w.-])" + re.escape(tok) + r"(?![\w])", preload):
         return "preload"
     return None
+
+
+_FILE_EXTENSIONS = frozenset({
+    "py", "ts", "tsx", "js", "jsx", "json", "yaml", "yml", "md", "scss", "css", "html", "sql",
+    "toml", "ini", "cfg", "env", "sh", "txt", "lock", "xml", "conf", "pem", "db", "ipynb", "mjs",
+    "cjs", "gradle", "kts", "properties", "csv", "svg", "png"})
+
+
+def _reject_reason(tok: str, ev: dict, preload: str) -> str:
+    """Why a claim token found no support. Diagnostic only -- it never changes a status.
+    absent        nothing in this delegation's evidence or preload contains it
+    basename_seen the token's final path segment appears in evidence but the full path does not
+    dotted_code   no '/' and the suffix is not a file extension (e.g. router.get): code, not a path"""
+    last = tok.rsplit("/", 1)[-1].lower()
+    if "/" not in tok and "." in tok and tok.rsplit(".", 1)[-1].lower() not in _FILE_EXTENSIONS:
+        return "dotted_code"
+    if "/" in tok and (last in ev["tokens"]
+                       or any(p.rsplit("/", 1)[-1] == last for p in ev["read_paths"] | ev["seen_paths"])):
+        return "basename_seen"
+    return "absent"
 
 
 def _unread_inspection_claims(text: str, ev: dict) -> list:
@@ -27013,8 +27051,13 @@ def _assess_member_result(team, key: str, text: str) -> dict:
     unsupported = path_unsup + [f"read:{p}" for p in unread] + [f"action:{n}" for n in action_bad]
     if not tolerated:
         unsupported += ident_unsup
+    _diag = {t: _reject_reason(t, ev, preload) for t in (path_unsup + ident_unsup)[:25]}
+    for p in unread:
+        _diag[f"read:{p}"] = "inspection_claim"
+    for n in action_bad:
+        _diag[f"action:{n}"] = "action_claim"
     common = {"claims": claims, "supported": supported, "unsupported": unsupported,
-              "sources": sources, "objective_class": needs, "activity": activity,
+              "diagnostics": _diag, "sources": sources, "objective_class": needs, "activity": activity,
               "paths": paths}
 
     if ok_n == 0 and (forced or err_n > 0 or unavail > 0) and not supported:
@@ -27073,6 +27116,11 @@ def _assessment_for(team, key: str, text: str, generation=None) -> dict:
               f"supported={len(a['supported'])} unsupported={len(a['unsupported'])} "
               f"calls_ok={act['ok']} calls_err={act['err']} unavailable={act['unavailable']} "
               f"reason={a['reason']!r}", flush=True)
+        if a.get("diagnostics"):
+            # Bounded: at most 12 claims, each token cut to 80 chars, reason code only.
+            print("[delegation-lifecycle] result_unsupported member_id=%r generation=%s %s" % (
+                key, gen, "; ".join(f"{t[:80]}={r}" for t, r in list(a["diagnostics"].items())[:12])),
+                flush=True)
     return a
 
 
@@ -27186,6 +27234,55 @@ def _result_status_line(a: dict) -> str:
             f"{act.get('reads', 0)}")
 
 
+def _partition_partial_text(text: str, a: dict):
+    """Split a PARTIAL report into (lines carrying no unsupported item, lines that do).
+    Line-level and substring-based on the assessment's own unsupported tokens, so the
+    split is deterministic and inspectable; a line is flagged when it contains any
+    unsupported path/identifier, or names a file it claims to have read but did not, or
+    asserts an execution tool's output with no such call. Blank lines stay with the clean
+    side. Nothing is rewritten: every line goes to exactly one side."""
+    toks = []
+    for u in a.get("unsupported", []):
+        if u.startswith("read:"):
+            toks.append(u[5:].rsplit("/", 1)[-1])
+        elif u.startswith("action:"):
+            toks.append(u[7:])
+        else:
+            toks.append(u)
+    toks = [t for t in toks if t]
+    clean, flagged = [], []
+    # A line is split further into sentences, because _build_member_result flattens a
+    # report into one paragraph: without this a single unsupported path would flag the
+    # whole report and discard its supported findings.
+    segments = []
+    for line in (text or "").splitlines():
+        if len(line) > 60:
+            segments += re.split(r"(?<=[.!?])\s+(?=[A-Z`*#\d-])", line)
+        else:
+            segments.append(line)
+    for seg in segments:
+        if seg.strip() and any(t in seg for t in toks):
+            flagged.append(seg.strip())
+        else:
+            clean.append(seg)
+    return "\n".join(clean).strip(), flagged
+
+
+def _partial_text_for_reader(text: str, a: dict) -> str:
+    """PARTIAL text with the unsupported lines moved under an explicit UNVERIFIED block, so
+    a reader (the Coordinator or the final answer) can tell a finding this delegation's own
+    tool results support from one it merely asserted. Same words, regrouped."""
+    clean, flagged = _partition_partial_text(text, a)
+    if not flagged:
+        return text
+    shown = flagged[:12]
+    more = f" (+{len(flagged) - len(shown)} more)" if len(flagged) > len(shown) else ""
+    block = "\n".join(f"- {ln[:300]}" for ln in shown)
+    return (f"{clean}\n\n[UNVERIFIED - {len(flagged)} line(s) below name items this delegation's "
+            f"own tool results do not support{more}; do not state them as findings, and do not "
+            f"count them toward coverage:]\n{block}")
+
+
 def _leader_facing_result(text: str, a: dict) -> str:
     """The ONLY text the Coordinator receives for this delegation (agno builds the tool
     message from what the relay yields). COMPLETE: the member's text, unchanged. PARTIAL: the
@@ -27198,8 +27295,10 @@ def _leader_facing_result(text: str, a: dict) -> str:
     unsup = ", ".join(sorted(a.get("unsupported", []))[:8]) or "see the reason"
     if st == "PARTIAL":
         return (f"[RESULT STATUS: PARTIAL — the report below is only partly supported by this "
-                f"delegation's own tool results ({a['reason']}). Treat these items as UNVERIFIED "
-                f"and do not state them as findings: {unsup}. {line}.]\n{text}")
+                f"delegation's own tool results ({a['reason']}). Unsupported items: {unsup}. "
+                f"{line}. Lines that name an unsupported item are grouped under UNVERIFIED at "
+                f"the end; use the rest as findings and treat the UNVERIFIED block as leads "
+                f"only.]\n{_partial_text_for_reader(text, a)}")
     if st == "UNRESOLVED":
         return (f"[RESULT STATUS: UNRESOLVED — the member produced text, but it is not "
                 f"supported by anything this delegation read or retrieved ({a['reason']}). The "

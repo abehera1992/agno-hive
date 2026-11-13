@@ -562,6 +562,28 @@ def _prose_route_verb_mismatches(
         return []
 
     declared: list[tuple[str, str]] = _DECORATOR_VERB_PATH_RE.findall(file_text)
+    # Phase 1.04 (D1): the single-file premise above only holds when the answer is about ONE
+    # router file. A cross-service answer (T11, 2026-11-12: business_api.py,
+    # business_admin_api.py AND storage_api.py) that happens to give just one of them as a
+    # full backtick path had EVERY route claim judged against that one file, so real
+    # business-service routes came back "no route matching this path at all in
+    # storage_api.py". When the answer names other router-like files, a claim is now judged
+    # against the union of ALL of them. A claim is still NOT FOUND unless no named file
+    # declares it, so a fabricated route is still caught.
+    _named = {m for m in re.findall(r"\b([A-Za-z0-9_]+_api\.py|[A-Za-z0-9_]*router[A-Za-z0-9_]*\.py)\b",
+                                    answer)}
+    _extra_files: list[str] = []
+    if len(_named) > 1:
+        try:
+            from .context import _find_by_basename
+            for _nm in sorted(_named):
+                _hits = _find_by_basename(_nm, max_results=2)
+                if len(_hits) == 1 and _hits[0] != target.relative_to(PROJECT_ROOT).as_posix():
+                    _extra = (PROJECT_ROOT / _hits[0]).read_text(encoding="utf-8", errors="ignore")
+                    declared = declared + _DECORATOR_VERB_PATH_RE.findall(_extra)
+                    _extra_files.append(_hits[0])
+        except Exception:  # noqa: BLE001 -- extending the search is best-effort
+            pass
     out: list[tuple[str, str, str]] = []
     seen: set[tuple[str, str]] = set()
     for verb, path in claims:
