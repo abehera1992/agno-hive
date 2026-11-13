@@ -22903,6 +22903,36 @@ def _find_in_flight_equivalent_delegation(team, member_id: str, target: str, obj
     return None
 
 
+def _revert_refused_delegation_generation(team, member_id: str) -> None:
+    """Phase 1.10 (WS5b): undo the dispatch-time generation bump for a delegation the duplicate
+    gate REFUSED (served the prior result instead of running it).
+
+    _read_cache_tool_hook bumps team._delegation_generation[member] when a delegation is
+    dispatched, before this gate decides. A refused call never runs, so nothing will ever
+    register a result for that generation; leaving the counter ahead makes the member's real,
+    complete stored result look "stale" forever (forward_member_answer answers NOT YET, and
+    _has_usable_current_generation_evidence is False, so a truncation completion is skipped and
+    the run is disclosed as unable to answer). Reverts exactly one step, only when the counter is
+    ahead of the stored result AND no real delegation for the member is still running."""
+    gens = getattr(team, "_delegation_generation", None)
+    captured = getattr(team, "_member_result_generation", None)
+    if not isinstance(gens, dict) or not isinstance(captured, dict):
+        return
+    cur = gens.get(member_id, 0)
+    if cur <= captured.get(member_id, 0):
+        return
+    owned = getattr(team, "_owned_delegations", None)
+    if isinstance(owned, dict):
+        for e in owned.values():
+            if (isinstance(e, dict) and e.get("member_key") == member_id and not e.get("terminal")
+                    and isinstance(e.get("task"), asyncio.Task) and not e["task"].done()):
+                return
+    gens[member_id] = cur - 1
+    print(f"[team] refused duplicate delegation to {member_id!r}: generation counter "
+          f"reverted {cur} -> {cur - 1} (nothing was dispatched; stored generation "
+          f"{captured.get(member_id, 0)} stays current)", flush=True)
+
+
 def _make_duplicate_delegation_gate_hook(read_only: bool = False):
     """Mechanical backstop for _COORDINATOR_INSTRUCTIONS' own prose-only rule
     ("Before delegate_task_to_member(s): check whether an equivalent delegation is
@@ -23633,6 +23663,7 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                       f"{'serving prior result' if prior else 'no prior result captured'}",
                       flush=True)
                 if n >= 3:
+                    _revert_refused_delegation_generation(team, member_id)
                     _force_text_only(None, team=team)
                     return (
                         f"STOP: you have now asked {member_id!r} for this same target "
@@ -23642,6 +23673,7 @@ def _make_duplicate_delegation_gate_hook(read_only: bool = False):
                         + (f"\n\nThe result, once more:\n{prior}" if prior else "")
                     )
                 if prior:
+                    _revert_refused_delegation_generation(team, member_id)
                     tail = ("" if n == 1 else
                             "\n\nThis is the last time this will be served — use it "
                             "and answer; asking again will not run anything.")
