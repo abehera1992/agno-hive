@@ -2109,9 +2109,18 @@ def _strip_member_narration(text: str) -> str:
     _MEMBER_NARRATION_OPENER_RE for exactly which ones and why."""
     if not text:
         return text
-    sentences = _MEMBER_SENTENCE_SPLIT_RE.split(text)
-    kept = [s.strip() for s in sentences if not _MEMBER_NARRATION_OPENER_RE.match(s.strip())]
-    return " ".join(s for s in kept if s)
+    # Phase 1.10 (WS5a): applied per LINE. The sentence splitter only breaks at [.!?] before a
+    # capital letter, so a narration opener ("Now that I have the information, let me compile
+    # the list:") followed by a markdown body ("### Endpoints ...", "- `GET /vouchers`") was one
+    # single "sentence" -- the opener matched, and the whole structured report after it was
+    # discarded as narration (status BLOCKED, "nothing forwardable"). A line break ends a
+    # narration sentence; the lines after it are kept untouched.
+    out = []
+    for line in text.split("\n"):
+        sentences = _MEMBER_SENTENCE_SPLIT_RE.split(line)
+        kept = [s.strip() for s in sentences if not _MEMBER_NARRATION_OPENER_RE.match(s.strip())]
+        out.append(" ".join(s for s in kept if s))
+    return re.sub("\n{3,}", "\n\n", "\n".join(out))
 
 
 def _build_member_result(raw_text: str) -> MemberResult:
