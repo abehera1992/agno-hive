@@ -525,7 +525,7 @@ _COORDINATOR_INSTRUCTIONS = [
     "inventory service', 'audit the auth service: its routers and models'):",
     "  1. Delegate ONE TARGETED READ PER FACET the question names, and name the service in each:",
     "     routers  -> 'read API/<name>-service/main.py and return every include_router line verbatim'",
-    "     models   -> 'read API/<name>-service/models.py and return every class declaration'",
+    "     models   -> 'read API/<name>-service/models.py and return the class declarations that belong to the feature the question names'",
     "     endpoints-> 'read API/<name>-service/router/<file>.py and return every route decorator'",
     "     integration -> 'search_files for <OTHER>_SERVICE_URL and return every call site'",
     "  2. Answer from those reads, naming every item returned. A count without the list is not",
