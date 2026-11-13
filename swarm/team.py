@@ -26377,6 +26377,34 @@ def _segment_note_event(team, agent_name: str, event_type: str, event=None) -> N
     _segment_trace_add(rec, "T" if src == "tool" else "M")
 
 
+def _reset_stream_boundary_state(team) -> None:
+    if team is None:
+        return
+    try:
+        team._last_content_run = None
+        st = getattr(team, "_segment_state", None)
+        if isinstance(st, dict):
+            st.pop(_COORDINATOR_KEY, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _source_change_prefix(team, event) -> str:
+    """Phase 1.06 (WS1): the answer stream interleaves content from the Coordinator and from
+    delegated members, each in its own run (distinct run_id). A chunk whose run_id differs from
+    the previous content chunk's is a different model response; joining it to the previous text
+    with nothing between them is what produced 'storage service.Thank you for the detailed
+    analysis' (member text, then Coordinator text). Chunks of the same run_id are untouched."""
+    if team is None:
+        return ""
+    rid = getattr(event, "run_id", None)
+    if rid is None:
+        return ""
+    last = getattr(team, "_last_content_run", None)
+    team._last_content_run = rid
+    return _SEGMENT_SEPARATOR if (last is not None and last != rid) else ""
+
+
 _COORDINATOR_KEY = "__coordinator__"
 _COORDINATOR_BOUNDARY_EVENTS = {"TeamToolCallStarted", "TeamToolCallCompleted",
                                 "TeamModelRequestStarted", "TeamModelRequestCompleted"}
@@ -27863,14 +27891,16 @@ def _stream_event_to_chunk(event, team=None) -> str | dict | None:
             # Attribute the chunk to the member that produced it, as a SIDE EFFECT --
             # the return value is unchanged (2026-08-27). See _accumulate_member_chunk.
             _accumulate_member_chunk(team, getattr(event, "agent_name", "") or "", chunk)
+            _src_prefix = _source_change_prefix(team, event)
             if event_type == "TeamRunContent" and not (getattr(event, "agent_name", "") or ""):
                 # Phase 1.06 (WS1): the Coordinator's own turns. A chunk that follows a
                 # Coordinator tool or model-request event, inside the same run, starts a new
                 # model response; give it the same blank-line boundary members get, so
                 # "...more details?" + "Now I'll check..." is not fused. The text of one
                 # response is returned exactly as emitted.
-                return _coordinator_boundary_prefix(team, event) + chunk
-            return chunk
+                _cb = _coordinator_boundary_prefix(team, event)
+                return (_cb or _src_prefix) + chunk
+            return _src_prefix + chunk
         return None
     if event_type in _MEMBER_RESULT_END_EVENT_TYPES:
         # Marker only: this event carries content=None. It says "that member is done",
@@ -33780,6 +33810,10 @@ async def _stream_team_run(
     # its own new Execution, parented to the run's root coordinator execution --
     # not a mutation of the execution being retried. Behavior/return value below
     # are completely unchanged; this only records identity around the existing call.
+    # Phase 1.06 (WS1): a retry / continuation pass is a new stream. Its first chunk must not be
+    # given a boundary separator against the previous pass's text (a continuation marker has to
+    # sit at the very start), so the stream-source and Coordinator boundary state start clean.
+    _reset_stream_boundary_state(team)
     _run_ctx = getattr(team, "_run_context", None)
     _retry_execution_id = None
     if _run_ctx is not None:
