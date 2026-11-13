@@ -9100,6 +9100,40 @@ _NO_EVIDENCE_RECOVERY_DISCLOSURE = (
 )
 
 
+# Phase 1.07: how long a truncation completion waits for delegations the Coordinator had ALREADY
+# dispatched. Measured live: in run 8f910fd7dd21 the storage-service delegation was dispatched 5 s
+# before the Coordinator's stream was truncated and registered its result 171 s later, during the
+# completion pass that never saw it. Bounded, never cancels (the end-of-run drain owns cancellation).
+_COMPLETION_INFLIGHT_WAIT_S = float(os.getenv("COMPLETION_INFLIGHT_WAIT_S", "240"))
+
+
+async def _await_inflight_delegations_for_completion(team, liveness_path, op_id: str) -> None:
+    """Wait (bounded) for delegations this run already started, so their results are registered
+    before the completion builds its evidence checkpoint. Changes ordering only: nothing is
+    forwarded, no result is accepted that registration would not already accept, repetition
+    detection is untouched, and nothing is cancelled on expiry."""
+    owned = getattr(team, "_owned_delegations", None)
+    if not isinstance(owned, dict) or not owned:
+        return
+    pending = [e["task"] for e in owned.values()
+               if not e.get("terminal") and isinstance(e.get("task"), asyncio.Task)
+               and not e["task"].done()]
+    if not pending:
+        return
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+    deadline = start + _COMPLETION_INFLIGHT_WAIT_S
+    print(f"[delegation-lifecycle] completion_waiting_for_inflight op_id={op_id!r} "
+          f"pending_count={len(pending)} deadline_s={_COMPLETION_INFLIGHT_WAIT_S:.0f}", flush=True)
+    while pending and loop.time() < deadline:
+        done, still = await asyncio.wait(pending, timeout=min(10.0, max(0.1, deadline - loop.time())),
+                                         return_when=asyncio.ALL_COMPLETED)
+        pending = list(still)
+        _touch_liveness_snapshot(liveness_path, "completion waiting for in-flight delegation")
+    print(f"[delegation-lifecycle] completion_inflight_wait_done op_id={op_id!r} "
+          f"waited_s={loop.time() - start:.1f} still_pending={len(pending)}", flush=True)
+
+
 async def _complete_repetition_truncated_answer(content: str, task: str, team, all_results,
                                                  result, liveness_path: str | None,
                                                  hive_mcp_url: str | None = None,
@@ -9211,6 +9245,10 @@ async def _complete_repetition_truncated_answer(content: str, task: str, team, a
               f"truncated text unchanged with no model call", flush=True)
         return content, result, _RECOVERY_OUTCOME_SKIPPED_BUDGET_EXHAUSTED
     _attempted_ops.add(op_id)
+
+    # Phase 1.07: let delegations already in flight register BEFORE the evidence check and the
+    # checkpoint below (see _await_inflight_delegations_for_completion).
+    await _await_inflight_delegations_for_completion(team, liveness_path, op_id)
 
     # Phase 0.44 (T11 no-evidence recovery invariant): if NOTHING currently
     # gathered this run answers the task -- the run's delegation(s) have not
@@ -26976,7 +27014,22 @@ def _new_delegation_evidence(unavail_base: int = 0) -> dict:
             # Used ONLY for an exact-substring check of path- or dot-shaped claim tokens
             # (route fragments, dotted code like router.get) that the token index cannot
             # represent; it is never consulted for inspection or action claims.
-            "corpus": "", "corpus_chars": 0}
+            "corpus": "", "corpus_chars": 0,
+            # Same text with whitespace around '/' and dashes removed and em/en dashes unified
+            # (see _norm_punct), so a source phrase "L2 - GSTIN / state branch" supports a
+            # report's "L2-GSTIN/state".
+            "corpus_norm": ""}
+
+
+def _norm_punct(s: str) -> str:
+    """Phase 1.07 (WS2): lower-case; em/en dashes become '-'; whitespace around '/' and '-' is
+    removed; remaining whitespace collapsed. Applied to BOTH the claim token and the evidence
+    corpus, so a member that reproduces a source phrase with its spacing or dash style changed
+    ('L2 — GSTIN / state branch' -> 'L2-GSTIN/state') is matched on the words, never on a
+    looser fragment. Nothing is matched that is not present, only reformatted."""
+    s = (s or "").lower().replace("—", "-").replace("–", "-")
+    s = re.sub(r"\s*([/\-])\s*", r"\1", s)
+    return re.sub(r"\s+", " ", s)
 
 
 def _norm_evidence_path(p) -> str:
@@ -27019,6 +27072,7 @@ def _record_call_in_evidence(ev: dict, function_name: str, args, text: str, ok: 
     if ev["corpus_chars"] < _EVIDENCE_CORPUS_MAX_CHARS:
         chunk = text[:_EVIDENCE_CORPUS_MAX_CHARS - ev["corpus_chars"]].lower()
         ev["corpus"] += chr(10) + chunk
+        ev["corpus_norm"] += chr(10) + _norm_punct(chunk)
         ev["corpus_chars"] += len(chunk)
     if function_name in _PATH_READ_TOOLS:
         for v in _as_str_list(a.get("relative_path") or a.get("paths") or a.get("path")):
@@ -27091,6 +27145,11 @@ def _claim_support(tok: str, ev: dict, preload: str):
     if ("/" in tok or "." in tok) and len(tok.strip("/")) >= 4:
         needle = tok.lower().strip("/")
         if needle and needle in ev.get("corpus", ""):
+            return "tool"
+    # Reformatted source phrase (spacing / dash style): compare on the normalised words.
+    if ("/" in tok or "-" in tok) and len(tok.strip("/")) >= 4:
+        nneedle = _norm_punct(tok).strip("/")
+        if len(nneedle) >= 4 and nneedle in ev.get("corpus_norm", ""):
             return "tool"
     if preload and re.search(r"(?<![\w.-])" + re.escape(tok) + r"(?![\w])", preload):
         return "preload"
