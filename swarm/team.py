@@ -26377,6 +26377,46 @@ def _segment_note_event(team, agent_name: str, event_type: str, event=None) -> N
     _segment_trace_add(rec, "T" if src == "tool" else "M")
 
 
+_COORDINATOR_KEY = "__coordinator__"
+_COORDINATOR_BOUNDARY_EVENTS = {"TeamToolCallStarted", "TeamToolCallCompleted",
+                                "TeamModelRequestStarted", "TeamModelRequestCompleted"}
+
+
+def _coordinator_note_event(team, event_type: str, event) -> None:
+    """Phase 1.06 (WS1): record that a Coordinator tool/model-request event happened since its
+    last content chunk. Team-level events carry no agent name (member events do), which is why
+    the member bookkeeping above ignores them."""
+    if team is None or event_type not in _COORDINATOR_BOUNDARY_EVENTS:
+        return
+    rec = _segment_state(team, _COORDINATOR_KEY)
+    rec["run_id"] = rec.get("run_id") or getattr(event, "run_id", None)
+    if not rec["pending"]:
+        src = "tool" if "ToolCall" in event_type else "model_request"
+        rec["boundaries"][src] = rec["boundaries"].get(src, 0) + 1
+    rec["pending"] = True
+
+
+def _coordinator_boundary_prefix(team, event) -> str:
+    """The separator to put before this Coordinator content chunk: a blank line if a boundary
+    event came since the previous chunk of the SAME run and text was already emitted, else ''.
+    State resets when the run id changes (a continuation or correction pass is a different run
+    and must start clean, so a continuation marker at its very start is never displaced)."""
+    if team is None:
+        return ""
+    rec = _segment_state(team, _COORDINATOR_KEY)
+    run_id = getattr(event, "run_id", None)
+    if run_id != rec.get("run_id"):
+        rec["run_id"] = run_id
+        rec["pending"] = False
+        rec["emitted"] = False
+    sep = _SEGMENT_SEPARATOR if (rec["pending"] and rec.get("emitted")) else ""
+    if sep:
+        rec["segments"] += 1
+    rec["pending"] = False
+    rec["emitted"] = True
+    return sep
+
+
 def _segment_trace_add(rec: dict, sym: str) -> None:
     tr = rec["trace"]
     if tr and tr[-1][0] == sym:
@@ -26781,6 +26821,31 @@ def _specific_tokens(text: str) -> set[str]:
     return out
 
 
+_PLAIN_SLASH_PAIR_RE = re.compile(r"^[A-Za-z]+/[A-Za-z]+$")
+
+
+def _ambiguous_slash_pairs(text: str) -> set:
+    """Phase 1.06 (WS2). A bare pair of plain words joined by one slash ("Public/private",
+    "read/write", "admin/files") cannot be told apart, from the text alone, as prose or as a
+    path -- the two look identical. Context decides what CAN be decided: a leading '/', an
+    inline-code backtick, a quote or an opening bracket directly before it marks a path or
+    route fragment (a full claim); with none of those it is ambiguous. An ambiguous pair that
+    the delegation's evidence supports counts as supported as usual. One that it does not
+    support is NOT counted toward PARTIAL, but is reported in the diagnostics as
+    ambiguous_slash_pair, so it is neither silently accepted nor treated as an unsupported
+    repository fact. Anything with an extension, a second slash, '_', '-', a digit or a dot is
+    not a plain pair and is never ambiguous."""
+    out = set()
+    text = text or ""
+    for m in _IDENT_TOKEN_RE.finditer(text):
+        tok = m.group(0).strip(".,;:-/")
+        if _PLAIN_SLASH_PAIR_RE.match(tok):
+            before = text[m.start() - 1] if m.start() > 0 else " "
+            if before not in "/`'\"([":
+                out.add(tok)
+    return out
+
+
 def _report_grounded_in_preloaded(report: str, preloaded: str, echo: str) -> bool:
     """True iff the report names at least one specific token that appears (as a whole token)
     in the preloaded context and is NOT merely an echo of the delegation's own task text."""
@@ -27128,14 +27193,19 @@ def _assess_member_result(team, key: str, text: str) -> dict:
     supported = [t for t, s in support.items() if s]
     unread = _unread_inspection_claims(text, ev)
     action_bad = _unsupported_action_claims(text, ev)
-    path_unsup = [t for t, s in support.items() if not s and _is_path_shaped(t)]
+    _amb = _ambiguous_slash_pairs(text)
+    path_unsup = [t for t, s in support.items()
+                  if not s and _is_path_shaped(t) and t not in _amb]
     ident_unsup = [t for t, s in support.items() if not s and not _is_path_shaped(t)]
+    _amb_unsup = [t for t, s in support.items() if not s and t in _amb]
     tolerated = (len(ident_unsup) < _PARTIAL_IDENT_TOLERANCE_COUNT
                  and len(ident_unsup) / max(1, len(claims)) <= _PARTIAL_IDENT_TOLERANCE_FRACTION)
     unsupported = path_unsup + [f"read:{p}" for p in unread] + [f"action:{n}" for n in action_bad]
     if not tolerated:
         unsupported += ident_unsup
     _diag = {t: _reject_reason(t, ev, preload) for t in (path_unsup + ident_unsup)[:25]}
+    for t in _amb_unsup[:10]:
+        _diag[t] = "ambiguous_slash_pair"
     for p in unread:
         _diag[f"read:{p}"] = "inspection_claim"
     for n in action_bad:
@@ -27775,6 +27845,7 @@ def _stream_event_to_chunk(event, team=None) -> str | dict | None:
     """
     event_type = getattr(event, "event", "")
     _segment_note_event(team, getattr(event, "agent_name", "") or "", event_type, event)
+    _coordinator_note_event(team, event_type, event)
     if event_type in _MEMBER_RESULT_START_EVENT_TYPES:
         # T41 (Track B): claim this invocation's run_id for the oldest unclaimed
         # pending entry, as early as possible -- see _claim_pending_entry_for_run's
@@ -27792,6 +27863,13 @@ def _stream_event_to_chunk(event, team=None) -> str | dict | None:
             # Attribute the chunk to the member that produced it, as a SIDE EFFECT --
             # the return value is unchanged (2026-08-27). See _accumulate_member_chunk.
             _accumulate_member_chunk(team, getattr(event, "agent_name", "") or "", chunk)
+            if event_type == "TeamRunContent" and not (getattr(event, "agent_name", "") or ""):
+                # Phase 1.06 (WS1): the Coordinator's own turns. A chunk that follows a
+                # Coordinator tool or model-request event, inside the same run, starts a new
+                # model response; give it the same blank-line boundary members get, so
+                # "...more details?" + "Now I'll check..." is not fused. The text of one
+                # response is returned exactly as emitted.
+                return _coordinator_boundary_prefix(team, event) + chunk
             return chunk
         return None
     if event_type in _MEMBER_RESULT_END_EVENT_TYPES:
