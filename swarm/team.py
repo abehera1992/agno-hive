@@ -1833,6 +1833,12 @@ _BARE_ITEM_LINE_RE = re.compile(
     r"^\s*(?:[-*•]|\d+[.)])?\s*(?:\[(?:FILE|DIR)\]\s*)?`?"
     r"(?P<item>(?=[^\s`]*[_./-])\w[\w./-]*[\w/])`?\s*[,;]?\s*$")
 _MIN_LIST_ITEMS = 3
+# Phase 1.10 (WS3): a bulleted/numbered line whose body is NOT a bare path/identifier (a route
+# decorator, a sentence). _BARE_ITEM_LINE_RE deliberately matches only whitespace-free tokens,
+# so a list of decorators was never "a list" to _forwarded_gap and was appended whole whenever
+# any one line (even the intro) differed -- duplicating every item the answer already carried.
+_BULLET_LINE_RE = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+\S")
+_BULLET_MARK_RE = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+")
 # A line that is only a Markdown code-fence marker. Markup, not content: it says how the
 # text was formatted and nothing about what the member found.
 _FENCE_LINE_RE = re.compile(r"^(?:`{3,}|~{3,})[\w+-]*$")
@@ -1868,7 +1874,25 @@ def _forwarded_gap(text: str, content: str) -> tuple[str, list[str]]:
             m = _BARE_ITEM_LINE_RE.match(line)
             rows.append((raw.rstrip(), m.group("item") if m else None))
     if sum(1 for _, item in rows if item is not None) < _MIN_LIST_ITEMS:
-        return "full", []
+        # Phase 1.10 (WS3): a list of NON-bare bullet lines is diffed line by line too, but a
+        # bullet counts as carried only when the SAME whole line (bullet marker, markdown and
+        # whitespace aside) is a line of `content` -- never a substring hit -- so a short bullet
+        # can not be mistaken for carried text and silently dropped. Non-bullet lines keep the
+        # existing verbatim-presence rule. Fewer than _MIN_LIST_ITEMS bullets: unchanged.
+        if sum(1 for raw, _ in rows if _BULLET_LINE_RE.match(raw)) < _MIN_LIST_ITEMS:
+            return "full", []
+        have_lines = {_squash_md(_BULLET_MARK_RE.sub("", ln)) for ln in content.splitlines()}
+        missing = []
+        for raw, _ in rows:
+            if _BULLET_LINE_RE.match(raw):
+                present = _squash_md(_BULLET_MARK_RE.sub("", raw)) in have_lines
+            else:
+                present = _squash_md(raw) in have
+            if not present:
+                missing.append(raw)
+        if not missing:
+            return "carried", []
+        return ("full", []) if len(missing) == len(rows) else ("lines", missing)
     missing = []
     for line, item in rows:
         if item is not None:
