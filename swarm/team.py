@@ -10853,7 +10853,15 @@ async def _evidence_integrity_check(
         else:
             print(f"[team] evidence-integrity: retry still contradicts "
                   f"{[f['category'] for f in recheck]} — forcing uncertainty", flush=True)
-        forced = _force_uncertainty_answer(retried, recheck)
+        # Phase 1.11 (WS2): this branch ships `retried` (a fresh, model-rewritten candidate)
+        # under an uncertainty banner, but unlike the adoption paths it did not re-apply the
+        # deterministic comparison this run already computed (recheck_cmp_note), so the
+        # tool-computed MATCH/PARTIAL/LEFT_ONLY block -- the authoritative gap list -- was
+        # dropped from the final answer (live T13b, Phase 1.10: four LEFT_ONLY operations
+        # in the ledger, none in the shipped answer). Re-apply it exactly as the adoption
+        # paths do; a no-op when the comparison is not eligible.
+        forced = _force_uncertainty_answer(
+            _reapply_comparison_synthesis_after_retry(retried, recheck_cmp_note), recheck)
         await _persist_evidence_integrity_trace(team, recheck, resolved=False, retried=True)
         return forced
 
@@ -10889,7 +10897,9 @@ async def _evidence_integrity_check(
             "category": "fabricated claim (verify_claims)",
             "real": _retried_fab_report.strip(),
         }]
-        forced = _force_uncertainty_answer(retried, _fab_finding)
+        # Phase 1.11 (WS2): same re-application as the branch above -- see its comment.
+        forced = _force_uncertainty_answer(
+            _reapply_comparison_synthesis_after_retry(retried, recheck_cmp_note), _fab_finding)
         await _persist_evidence_integrity_trace(team, _fab_finding, resolved=False,
                                                  retried=True)
         return forced
