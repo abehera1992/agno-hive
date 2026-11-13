@@ -16797,6 +16797,15 @@ async def _blind_category_search(
 _COVERAGE_CORRECTION_FLAG = "_coverage_correction_attempted"
 
 
+# Phase 1.10 (WS4): a file path the task names ("API/inventory-service/models.py") says WHERE to
+# look, it is not a subject category of the question. Tokenising the path made "models" a
+# required category for T13b, and _CATEGORY_CONTENT_SHAPE has no "models" detector, so the
+# coverage gate reported "models had no file read shaped like it" after models.py was read.
+# Only tokens that look like a file path (directory separator AND a file extension) are
+# removed, so "frontend/backend" or "hooks/endpoints" keep their words.
+_TASK_FILE_PATH_RE = re.compile(r"[\w.-]+(?:[/\\][\w.-]+)+\.[A-Za-z0-9]{1,5}\b")
+
+
 async def _comparison_coverage_gap(
         task: str, team,
         hive_mcp_url: str | None, hive_mcp_tools) -> "dict | None":
@@ -16853,7 +16862,7 @@ async def _comparison_coverage_gap(
     # original task instead fixes the preflight-inflation problem at its
     # actual source, with zero dependence on anything generated.
     original_task = getattr(team, "_original_task", None) or task or ""
-    task_cats = _subject_categories(original_task)
+    task_cats = _subject_categories(_TASK_FILE_PATH_RE.sub(" ", original_task))
     if len(task_cats) < 2 or not _COMPARISON_TASK_RE.search(original_task):
         return None
 
