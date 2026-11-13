@@ -26315,7 +26315,7 @@ def _ensure_member_run_id_patch_installed() -> None:
 _MEMBER_CHUNK_CAP = 60_000
 
 
-def _accumulate_member_chunk(team, agent_name: str, chunk: str) -> None:
+def _accumulate_member_chunk(team, agent_name: str, chunk: str) -> str:
     """Buffer one streamed content chunk against the member that produced it.
 
     Deliberately a side effect of _stream_event_to_chunk rather than a change to what
@@ -26328,7 +26328,7 @@ def _accumulate_member_chunk(team, agent_name: str, chunk: str) -> None:
     belongs to no member), or a non-string chunk.
     """
     if team is None or not agent_name or not isinstance(chunk, str) or not chunk:
-        return
+        return ""
     if not isinstance(getattr(team, "_member_chunks", None), dict):
         team._member_chunks = {}
     key = _member_key(agent_name)
@@ -26341,6 +26341,11 @@ def _accumulate_member_chunk(team, agent_name: str, chunk: str) -> None:
     sep = _segment_boundary_separator(team, key, bool(buf))
     if len(buf) < _MEMBER_CHUNK_CAP:
         team._member_chunks[key] = (buf + sep + chunk)[:_MEMBER_CHUNK_CAP]
+    # Phase 1.06 (WS1c): returned so the answer STREAM gets the same intra-run turn boundary the
+    # member buffer gets (the final-code T11 still showed 17 fused turns, all from member turns
+    # separated by a tool/model-request event inside ONE run, where the source-change rule
+    # cannot see them).
+    return sep
 
 
 _SEGMENT_SEPARATOR = "\n\n"
@@ -27890,8 +27895,8 @@ def _stream_event_to_chunk(event, team=None) -> str | dict | None:
         if isinstance(chunk, str) and chunk:
             # Attribute the chunk to the member that produced it, as a SIDE EFFECT --
             # the return value is unchanged (2026-08-27). See _accumulate_member_chunk.
-            _accumulate_member_chunk(team, getattr(event, "agent_name", "") or "", chunk)
-            _src_prefix = _source_change_prefix(team, event)
+            _member_sep = _accumulate_member_chunk(team, getattr(event, "agent_name", "") or "", chunk)
+            _src_prefix = _source_change_prefix(team, event) or _member_sep
             if event_type == "TeamRunContent" and not (getattr(event, "agent_name", "") or ""):
                 # Phase 1.06 (WS1): the Coordinator's own turns. A chunk that follows a
                 # Coordinator tool or model-request event, inside the same run, starts a new
