@@ -26333,8 +26333,81 @@ def _accumulate_member_chunk(team, agent_name: str, chunk: str) -> None:
         team._member_chunks = {}
     key = _member_key(agent_name)
     buf = team._member_chunks.get(key, "")
+    # Phase 1.05: chunks of ONE model response are joined exactly as emitted; a chunk that
+    # follows a model-request or tool event of the SAME member starts a new logical
+    # response, and is separated from the previous one by a blank line so two assistant
+    # turns are never fused into one sentence ("...endpoints." + "Based on..." -> the false
+    # identifier "endpoints.Based").
+    sep = _segment_boundary_separator(team, key, bool(buf))
     if len(buf) < _MEMBER_CHUNK_CAP:
-        team._member_chunks[key] = (buf + chunk)[:_MEMBER_CHUNK_CAP]
+        team._member_chunks[key] = (buf + sep + chunk)[:_MEMBER_CHUNK_CAP]
+
+
+_SEGMENT_SEPARATOR = "\n\n"
+_SEGMENT_BOUNDARY_EVENTS = {"ToolCallStarted", "ToolCallCompleted", "ModelRequestStarted",
+                            "ModelRequestCompleted"}
+
+
+def _segment_state(team, key: str) -> dict:
+    st = getattr(team, "_segment_state", None)
+    if not isinstance(st, dict):
+        st = team._segment_state = {}
+    rec = st.get(key)
+    if rec is None:
+        rec = st[key] = {"pending": False, "segments": 0, "boundaries": {}, "trace": [],
+                         "run_id": None, "parent_run_id": None}
+    return rec
+
+
+def _segment_note_event(team, agent_name: str, event_type: str, event=None) -> None:
+    """Record, per member, that a model-request or tool event happened since its last
+    content chunk. agno gives no message id on content events, but it does emit these
+    events between a member's model calls, and every event carries run_id / parent_run_id.
+    Team-level (Coordinator) events have no agent name and are ignored."""
+    if team is None or not agent_name or event_type not in _SEGMENT_BOUNDARY_EVENTS:
+        return
+    rec = _segment_state(team, _member_key(agent_name))
+    if event is not None:
+        rec["run_id"] = rec["run_id"] or getattr(event, "run_id", None)
+        rec["parent_run_id"] = rec["parent_run_id"] or getattr(event, "parent_run_id", None)
+    src = "tool" if event_type.startswith("ToolCall") else "model_request"
+    if not rec["pending"]:
+        rec["boundaries"][src] = rec["boundaries"].get(src, 0) + 1
+    rec["pending"] = True
+    _segment_trace_add(rec, "T" if src == "tool" else "M")
+
+
+def _segment_trace_add(rec: dict, sym: str) -> None:
+    tr = rec["trace"]
+    if tr and tr[-1][0] == sym:
+        tr[-1][1] += 1
+    elif len(tr) < 60:
+        tr.append([sym, 1])
+
+
+def _segment_boundary_separator(team, key: str, have_text: bool) -> str:
+    """The separator to put before the next content chunk of this member: a blank line when
+    a boundary event came since the previous chunk and there is already text, else ''."""
+    rec = _segment_state(team, key)
+    _segment_trace_add(rec, "C")
+    if rec["pending"] and have_text:
+        rec["pending"] = False
+        rec["segments"] += 1
+        return _SEGMENT_SEPARATOR
+    rec["pending"] = False
+    return ""
+
+
+def _segment_summary(team, key: str) -> str:
+    """One bounded diagnostic line for a finished member delegation, then reset."""
+    st = getattr(team, "_segment_state", None)
+    rec = st.pop(key, None) if isinstance(st, dict) else None
+    if not rec:
+        return "segment_boundaries=unavailable (no member events observed)"
+    trace = " ".join(f"{s}{n}" for s, n in rec["trace"][:40])
+    b = ",".join(f"{k}:{v}" for k, v in sorted(rec["boundaries"].items())) or "none"
+    return (f"run_id={rec['run_id']} parent_run_id={rec['parent_run_id']} "
+            f"segments={rec['segments'] + 1} boundaries_preserved={b} trace='{trace}'")
 
 
 def _check_member_concurrency_episode(team, agent_name: str) -> None:
@@ -26781,6 +26854,16 @@ _ABSENCE_RE = re.compile(
     r"|\bdoes(?:n't| not) (?:exist|appear|contain)\b"
     r"|\b(?:no|none|nothing)\b[^.\n]{0,50}\b(?:found|exists?|present|defined|implemented"
     r"|matches|usages?|references?)\b", re.I)
+# Phase 1.04 (live, 2026-11-13): a member's text is assembled from several model turns with no
+# space after the full stop ("...the directory.We found", "endpoints.Based on"), which the
+# token extractor reads as a dotted identifier and counted as an unsupported claim (14 of the
+# 17 'unsupported' tokens in the first three T11 assessments). Exactly this shape is excluded:
+# a lower-case word, a dot, then a common sentence-opening word. Real dotted code is untouched.
+_SENTENCE_JOIN_RE = re.compile(
+    r"^[a-z][a-z]{2,}\.(?:The|We|Let|Now|Based|Since|This|That|These|Those|It|Here|There|Next|"
+    r"Then|Also|And|But|So|After|Once|First|Finally|However|Each|All|Both|Some|Our|My|In|On|"
+    r"For|If|As|To|Thus|Therefore|Given|Looking|Having|Checking|Searching|Reading|Using|"
+    r"Because|When|While|With|Without|From|Perfect|Great|Okay|Good)$")
 _PARTIAL_IDENT_TOLERANCE_COUNT = 3     # tunable, unmeasured
 _PARTIAL_IDENT_TOLERANCE_FRACTION = 0.25
 _WITHHELD_STATUSES = frozenset({"BLOCKED", "UNRESOLVED"})
@@ -27031,7 +27114,8 @@ def _assess_member_result(team, key: str, text: str) -> dict:
 
     tool_names = {n.lower() for n in _known_tool_names(team)}
     claims = sorted(t for t in _specific_tokens(text)
-                    if t.lower() not in tool_names and t not in echo)
+                    if t.lower() not in tool_names and t not in echo
+                    and not _SENTENCE_JOIN_RE.match(t))
     support, sources = {}, {"tool": 0, "preload": 0, "provided": 0}
     task_text = rec.get("task_text") or ""
     for t in claims:
@@ -27338,6 +27422,7 @@ async def _assessed_member_relay(team, member_key: str, events, owned_entry=None
     from agno.run.agent import RunContentEvent, RunContentCompletedEvent, RunCompletedEvent
     parts: list = []
     assessed = None
+    pending_boundary = False
 
     def _assess():
         return _assessment_for(team, member_key, "".join(parts), generation=generation)
@@ -27347,10 +27432,17 @@ async def _assessed_member_relay(team, member_key: str, events, owned_entry=None
             yield item
             continue
         if isinstance(item, RunContentEvent) and isinstance(getattr(item, "content", None), str):
+            # Same rule as _accumulate_member_chunk (Phase 1.05): a chunk after a model-request
+            # or tool event of this member is a new logical response -- keep the boundary.
+            if pending_boundary and parts:
+                parts.append(_SEGMENT_SEPARATOR)
+            pending_boundary = False
             parts.append(item.content)
             out_item = _as_member_content_event(item)
         else:
             out_item = item
+            if getattr(item, "event", "") in _SEGMENT_BOUNDARY_EVENTS:
+                pending_boundary = True
             if assessed is None and isinstance(item, (RunContentCompletedEvent, RunCompletedEvent)):
                 assessed = _assess()
         yield out_item
@@ -27392,6 +27484,8 @@ def _finalise_member_chunks(team, agent_name: str, run_id=None) -> None:
     text = (chunks.pop(key, "") or "").strip()
     if not text:
         return
+    print(f"[segment-trace] member_id={key!r} chars={len(text):,} {_segment_summary(team, key)}",
+          flush=True)
     # Phase 1.02 (A1/B2): the assessed status is decided ONCE, in the single registration
     # funnel (_register_member_result), which also writes _member_results and
     # _member_result_generation for COMPLETE/PARTIAL only. BLOCKED/UNRESOLVED text is never
@@ -27680,6 +27774,7 @@ def _stream_event_to_chunk(event, team=None) -> str | dict | None:
       None — every other event type (dropped, same as the previous hard filter)
     """
     event_type = getattr(event, "event", "")
+    _segment_note_event(team, getattr(event, "agent_name", "") or "", event_type, event)
     if event_type in _MEMBER_RESULT_START_EVENT_TYPES:
         # T41 (Track B): claim this invocation's run_id for the oldest unclaimed
         # pending entry, as early as possible -- see _claim_pending_entry_for_run's
