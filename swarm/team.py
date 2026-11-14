@@ -29257,13 +29257,8 @@ async def run_task_stream(
                           f"exclude_tools entry naming a tool it does not have "
                           f"(excluded here: {_exclude}); agno drops the whole toolkit "
                           f"when one name does not resolve.")
-            except BaseException as e:  # noqa: BLE001
-                # An unreachable MCP server surfaces from agno/anyio as a BaseExceptionGroup wrapping a GeneratorExit, which is
-                # NOT an Exception: the old `except Exception` never saw it and the whole run died (Phase 1.20, found with
-                # LightRAG unreachable). Skip the server; cancellation and exit still propagate.
-                if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
-                    raise
-                print(f"[team] MCP unavailable, skipping ({url}): {type(e).__name__}: {str(e)[:120]}")
+            except Exception as e:
+                print(f"[team] MCP unavailable, skipping ({url}): {e}")
         if not mcp_list:
             raise RuntimeError("No MCP server available — check hive-mcp and project MCP are running")
 
@@ -34880,13 +34875,8 @@ async def run_task_async(
                           f"exclude_tools entry naming a tool it does not have "
                           f"(excluded here: {_exclude}); agno drops the whole toolkit "
                           f"when one name does not resolve.")
-            except BaseException as e:  # noqa: BLE001
-                # An unreachable MCP server surfaces from agno/anyio as a BaseExceptionGroup wrapping a GeneratorExit, which is
-                # NOT an Exception: the old `except Exception` never saw it and the whole run died (Phase 1.20, found with
-                # LightRAG unreachable). Skip the server; cancellation and exit still propagate.
-                if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
-                    raise
-                print(f"[team] MCP unavailable, skipping ({url}): {type(e).__name__}: {str(e)[:120]}")
+            except Exception as e:
+                print(f"[team] MCP unavailable, skipping ({url}): {e}")
         if not mcp_list:
             raise RuntimeError("No MCP server available — check hive-mcp and project MCP are running")
 

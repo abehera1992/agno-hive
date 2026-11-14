@@ -787,10 +787,8 @@ async def run_engineering_workflow(
             try:
                 mcp_list.append(await stack.enter_async_context(
                     MCPTools(url=url, transport="streamable-http", timeout_seconds=T._MCP_TIMEOUT, exclude_tools=excl)))
-            except BaseException as e:  # noqa: BLE001 -- an unreachable MCP server raises a BaseExceptionGroup (not an Exception)
-                if isinstance(e, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
-                    raise
-                print(f"[workflow] MCP unavailable, skipping ({url}): {type(e).__name__}: {str(e)[:120]}", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[workflow] MCP unavailable, skipping ({url}): {e}", flush=True)
         if not mcp_list:
             raise RuntimeError("No MCP server available — check hive-mcp and project MCP are running")
         await model_routing.ensure_cache_loaded()
