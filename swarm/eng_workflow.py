@@ -784,6 +784,9 @@ async def run_engineering_workflow(
         for url in all_mcp_urls:
             excl = (T._PROJECT_MCP_EXCLUDE_TOOLS if url == effective_mcp_url
                     else (T._LIGHTRAG_AGENT_EXCLUDE_TOOLS if url == T.config.lightrag_mcp_url else None))
+            if not await T._mcp_reachable(url):
+                print(f"[workflow] MCP unreachable, skipping ({url}) -- the run continues without it", flush=True)
+                continue
             try:
                 mcp_list.append(await stack.enter_async_context(
                     MCPTools(url=url, transport="streamable-http", timeout_seconds=T._MCP_TIMEOUT, exclude_tools=excl)))

@@ -15315,6 +15315,30 @@ async def _prepare_knowledge(task: str, project_id: str, mcp_urls, effective_mcp
         hive_url=_pick_hive_mcp_url(all_urls, effective_mcp_url), run_key=knowledge_key, caller=caller)
 
 
+async def _mcp_reachable(url: str, timeout: float = 3.0) -> bool:
+    """Cheap TCP reachability probe, run BEFORE agno's MCPTools is attached to `url`.
+
+    Why (Phase 1.20, reproduced in isolation with no knowledge-service code involved): agno's MCPTools swallows a failed connect
+    ("Failed to initialize MCP toolkit") and anyio then raises a spurious CancelledError out of the attach/teardown path, so ONE
+    unreachable MCP server (LightRAG, or any other) killed the whole execution with HTTP 500. A server that cannot be reached is
+    skipped instead; the run continues with the servers that can be."""
+    from urllib.parse import urlparse
+    u = urlparse(url)
+    host, port = u.hostname, u.port or (443 if u.scheme == "https" else 80)
+    if not host:
+        return False
+    try:
+        _r, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+        w.close()
+        try:
+            await w.wait_closed()
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _is_connect_failure(exc: BaseException) -> bool:
     """True when `exc` (or any exception inside an ExceptionGroup) is a connection-level failure."""
     stack = [exc]
@@ -29237,6 +29261,9 @@ async def run_task_stream(
         for url in all_mcp_urls:
             _exclude = (_PROJECT_MCP_EXCLUDE_TOOLS if url == _project_mcp_url
                         else (_LIGHTRAG_AGENT_EXCLUDE_TOOLS if url == config.lightrag_mcp_url else None))
+            if not await _mcp_reachable(url):
+                print(f"[team] MCP unreachable, skipping ({url}) -- the run continues without it", flush=True)
+                continue
             try:
                 mcp = await stack.enter_async_context(
                     MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=_exclude)
@@ -34855,6 +34882,9 @@ async def run_task_async(
         for url in all_mcp_urls:
             _exclude = (_PROJECT_MCP_EXCLUDE_TOOLS if url == _project_mcp_url
                         else (_LIGHTRAG_AGENT_EXCLUDE_TOOLS if url == config.lightrag_mcp_url else None))
+            if not await _mcp_reachable(url):
+                print(f"[team] MCP unreachable, skipping ({url}) -- the run continues without it", flush=True)
+                continue
             try:
                 mcp = await stack.enter_async_context(
                     MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=_exclude)
