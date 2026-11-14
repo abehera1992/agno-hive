@@ -360,11 +360,19 @@ class Ledger:
                 c.execute("UPDATE attempt SET state=?, invalidated_reason=?, ended_at=COALESCE(ended_at,?) WHERE attempt_id=?",
                           (ABANDONED, "owner process gone (recovery)", time.time(), r["attempt_id"]))
             tasks = {r["task_id"] for r in rows}
-            for t in tasks:
+            # A task that is still RUNNING after its worker (pid) or its whole service instance is gone can never be
+            # finalized by its own process: mark it INTERRUPTED (accepted attempts and decisions are kept untouched).
+            if pid is not None:
+                q2 = ("SELECT DISTINCT t.task_id FROM task t JOIN attempt a ON a.task_id=t.task_id "
+                      "WHERE t.status='RUNNING' AND a.owner_instance=? AND a.owner_pid=?")
+                stale = {r["task_id"] for r in c.execute(q2, (inst, pid)).fetchall()}
+            else:
+                stale = {r["task_id"] for r in c.execute("SELECT task_id FROM task WHERE status='RUNNING' AND instance_id=?", (inst,)).fetchall()}
+            for t in tasks | stale:
                 live = c.execute("SELECT COUNT(*) n FROM attempt WHERE task_id=? AND state IN (?,?)", (t, RUNNING, FINISHED)).fetchone()["n"]
                 if not live:
                     c.execute("UPDATE task SET status='INTERRUPTED' WHERE task_id=? AND status='RUNNING'", (t,))
-            return {"abandoned": [r["attempt_id"] for r in rows], "tasks_interrupted": sorted(tasks)}
+            return {"abandoned": [r["attempt_id"] for r in rows], "tasks_interrupted": sorted(tasks | stale)}
         return self._tx(go)
 
     # ------------------------------------------------------------------ read side
