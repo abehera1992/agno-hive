@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from swarm import acceptance as A
+from swarm.ledger import Ledger, LedgerError, RetryBudgetExhausted, decision_to_dict
 
 MAX_ATTEMPTS_PER_ITEM = 2                 # 1 original + at most 1 retry
 RETRYABLE_TERMINALS = {"FAILED", "INCOMPLETE"}   # never CANCELLED / TIMED_OUT (those are app/operator decisions)
@@ -138,6 +139,7 @@ class AttemptRecord:
     decision: object = None
     summary: dict = field(default_factory=dict)
     error: Optional[str] = None
+    ledger_error: Optional[str] = None       # a durable write for THIS attempt failed (or its budget was refused)
     tokens: dict = field(default_factory=lambda: {"in": 0, "out": 0})
 
 
@@ -153,6 +155,8 @@ class RunState:
     final: Optional[str] = None
     final_audit: Optional[dict] = None
     steps_run: list = field(default_factory=list)
+    ledger: object = None
+    ledger_task_created: bool = False
     t0: float = field(default_factory=time.time)
 
     def emit(self, kind: str, **kw):
@@ -225,14 +229,43 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
     from agno.agent import Agent
     from agno.run.agent import RunContentEvent
 
-    att = st.registry.start(st.task_id, wi.work_item_id, workflow_run_id=st.workflow_run_id)
+    led = st.ledger
+    lstart, lerr = None, None
+    if led is not None:
+        try:     # persisted BEFORE the Agent can run, so no accepted output can exist without a durable attempt
+            lstart = await led._a(led.start_attempt, st.task_id, wi.work_item_id, st.workflow_run_id, MAX_ATTEMPTS_PER_ITEM)
+        except RetryBudgetExhausted as e:
+            lerr = f"RETRY_EXHAUSTED: {e}"
+        except Exception as e:  # noqa: BLE001
+            lerr = f"LEDGER_ERROR: {repr(e)[:200]}"
+    att = st.registry.start(st.task_id, wi.work_item_id, workflow_run_id=st.workflow_run_id,
+                            attempt_id=(lstart or {}).get("attempt_id"), generation=(lstart or {}).get("generation"))
     rec = AttemptRecord(attempt=att)
+    rec.ledger_error = lerr
     st.records.append(rec)
+    if lerr:
+        st.emit("attempt_not_started", work_item=wi.work_item_id, attempt=att.attempt_id, reason=lerr[:120])
+        att.terminal = {"completed_event": False, "run_output_status": None, "run_error": f"not started: {lerr[:120]}",
+                        "cancelled_event": False, "timed_out": False, "stream_closed_early": False}
+        att.outcomes, att.text, att.source, att.state = [], "", "workflow-real", "FINISHED"
+        return rec
     st.emit("attempt_started", work_item=wi.work_item_id, attempt=att.attempt_id, generation=att.generation,
             workflow_run=st.workflow_run_id, attempt_no=attempt_no)
     trace = _Trace(T, RunContentEvent)
     old_ceiling = T._DELEGATION_READ_CEILING
-    outcome_rec = A.OutcomeRecorder(att.attempt_id, tool_deadline=controls.get("tool_deadline"))
+    async def persist_call(o):
+        if led is not None:
+            await led._a(led.record_tool_call, o, att.attempt_id, st.task_id, wi.work_item_id)
+
+    async def invalidate(state, reason):
+        if led is not None:
+            try:
+                await led._a(led.invalidate, att.attempt_id, state, reason)
+            except Exception as e:  # noqa: BLE001
+                rec.ledger_error = rec.ledger_error or f"LEDGER_ERROR: {repr(e)[:160]}"
+
+    outcome_rec = A.OutcomeRecorder(att.attempt_id, tool_deadline=controls.get("tool_deadline"),
+                                    on_call=persist_call if led is not None else None)
     fault = {"n": 0}
     try:
         if controls.get("ceiling") is not None:
@@ -306,6 +339,7 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
                     # Operator/application cancel: the APPLICATION invalidates the attempt first, independent of
                     # whether Agent.cancel_run() (or the tool) actually stops anything.
                     st.registry.cancel(att.attempt_id)
+                    await invalidate("CANCELLED", "cancelled by the application")
                     ret = Agent.cancel_run(trace.agent_run_id) if trace.agent_run_id else None
                     st.emit("attempt_cancelled", attempt=att.attempt_id, agent_cancel_returned=ret)
             deadline = float(controls.get("attempt_deadline_s") or ATTEMPT_DEADLINE_S)
@@ -313,6 +347,7 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
         except asyncio.TimeoutError:
             timed_out = True
             st.registry.cancel(att.attempt_id)
+            await invalidate("TIMED_OUT", f"attempt deadline {deadline}s exceeded")
             task.cancel()
             st.emit("attempt_timed_out", attempt=att.attempt_id, deadline_s=deadline)
         except asyncio.CancelledError:
@@ -348,16 +383,28 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
         st.emit("attempt_setup_error", attempt=att.attempt_id, error=rec.error)
     finally:
         T._DELEGATION_READ_CEILING = old_ceiling
+        if led is not None:
+            try:     # terminal facts + text, even for an invalidated attempt (history); never changes a decision
+                await led._a(led.record_terminal, att.attempt_id, att.terminal, att.agent_run_id, att.text)
+            except Exception as e:  # noqa: BLE001
+                rec.ledger_error = rec.ledger_error or f"LEDGER_ERROR: {repr(e)[:160]}"
+            if outcome_rec.persist_error:
+                rec.ledger_error = rec.ledger_error or f"LEDGER_ERROR: evidence not durable: {outcome_rec.persist_error}"
     return rec
 
 
-def assess_and_register(st: RunState, wi: WorkItem, rec: AttemptRecord, controls: dict = None):
-    """Acceptance authority = swarm.acceptance.decide (terminal state, validity, tool-outcome integrity,
-    evidence policy, assessor restricted-only, registry). Workflow status is NOT consulted here."""
+async def assess_and_register(st: RunState, wi: WorkItem, rec: AttemptRecord, controls: dict = None):
+    """Acceptance authority = swarm.acceptance.decide (terminal state, validity, tool-outcome integrity, evidence policy,
+    assessor restricted-only). With the durable ledger the REGISTRATION is one atomic conditional write in the ledger; the
+    in-memory registry only mirrors what the ledger decided. Workflow status is NOT consulted."""
     att = rec.attempt
+    led = st.ledger
+    if (controls or {}).get("hold_before_commit_s"):          # test control: widen the window between Agent end and acceptance
+        st.emit("hold", where="before_commit", seconds=controls["hold_before_commit_s"])
+        await asyncio.sleep(float(controls["hold_before_commit_s"]))
     att.workflow_status = "RunStatus.running"       # observed separately; never an input to acceptance
     try:
-        d = A.decide(att, wi.policy, st.registry)
+        d = A.decide(att, wi.policy, st.registry, register=(led is None))
     except BaseException as e:  # noqa: BLE001 -- the decision pipeline itself failed: nothing is accepted
         rec.error = (rec.error or "") + f" decide-error:{repr(e)[:200]}"
         d = A.Decision(identity={"task_id": att.task_id, "work_item_id": att.work_item_id,
@@ -367,12 +414,38 @@ def assess_and_register(st: RunState, wi: WorkItem, rec: AttemptRecord, controls
                        workflow_status=None, execution_status="UNKNOWN", execution_reason="decision pipeline error",
                        counts=A.count_outcomes(att.outcomes), gate={"applicable": False, "satisfied": [], "missing": []},
                        acceptance=A.NOT_ACCEPTED, not_accepted_cause="DECISION_ERROR", reason=rec.error)
-    rec.decision = d
-    rec.summary = A.summarize(d)
-    if (controls or {}).get("duplicate_register"):
+    if rec.ledger_error and d.acceptance != A.NOT_ACCEPTED:
+        d.overrides.append({"gate": "ledger", "assessor": d.assessor_status, "final": A.NOT_ACCEPTED, "why": rec.ledger_error})
+        d.acceptance = A.NOT_ACCEPTED
+        d.not_accepted_cause = "RETRY_EXHAUSTED" if rec.ledger_error.startswith("RETRY_EXHAUSTED") else "LEDGER_ERROR"
+        d.reason = f"durable ledger refused or failed ({rec.ledger_error[:100]}); nothing is accepted"
+    if led is not None:
+        reqs = [{"id": r.id, "description": r.description, "any_of_paths": r.any_of_paths} for r in wi.policy.requirements]
+        try:
+            res = await led._a(led.commit_decision, att.attempt_id, decision_to_dict(d, reqs), att.text)
+            if res.get("reason") != "IDEMPOTENT_DUPLICATE":
+                d.acceptance = res.get("acceptance", d.acceptance)
+                if res.get("override"):          # the ledger itself invalidated this attempt (stale / cancelled / abandoned ...)
+                    d.validity = res["override"]
+                    d.not_accepted_cause = d.not_accepted_cause or res["override"]
+                if res.get("reason_text"):
+                    d.reason = res["reason_text"]
+            st.registry.apply(att, d, res)
+            if (controls or {}).get("duplicate_register"):
+                again = await led._a(led.commit_decision, att.attempt_id, decision_to_dict(d, reqs), att.text)
+                st.emit("duplicate_register", attempt=att.attempt_id, first=res.get("reason"), second=again.get("reason"),
+                        accepted_for_item=(st.registry.accepted.get(wi.work_item_id) or {}).get("attempt_id"))
+        except Exception as e:  # noqa: BLE001 -- fail closed: no in-memory fallback to an accepted result
+            rec.ledger_error = rec.ledger_error or f"LEDGER_ERROR: {repr(e)[:160]}"
+            d.acceptance, d.not_accepted_cause = A.NOT_ACCEPTED, "LEDGER_ERROR"
+            d.reason = f"durable ledger could not record the decision ({repr(e)[:100]}); nothing is accepted"
+            st.registry.apply(att, d, {"registered": False, "reason": "LEDGER_ERROR", "kind": "rejected"})
+    elif (controls or {}).get("duplicate_register"):
         again = st.registry.register(att, d)         # control: re-register the SAME attempt/decision
         st.emit("duplicate_register", attempt=att.attempt_id, first=(d.registration or {}).get("reason"),
                 second=again.get("reason"), accepted_for_item=(st.registry.accepted.get(wi.work_item_id) or {}).get("attempt_id"))
+    rec.decision = d
+    rec.summary = A.summarize(d)
     st.emit("attempt_text", attempt=att.attempt_id, chars=len(att.text or ""),
             sha=A.sha(att.text), head=repr((att.text or "")[:100]))
     st.emit("attempt_decided", attempt=att.attempt_id, agent=d.execution_status, acceptance=d.acceptance,
@@ -443,7 +516,7 @@ def build_final(st: RunState) -> str:
             lines.append("")
             lines.append("Source files read by this attempt: " + (", ".join(f"`{p}`" for p in reads) or "none"))
             al = (d.counts or {}).get("all", {})
-            lines.append("Tool outcomes for this attempt: " + ", ".join(f"{n} {k}" for k, n in al.items() if n) )
+            lines.append("Tool outcomes for this attempt: " + ", ".join(f"{al[k]} {k}" for k in A.OUTCOMES if al.get(k)))
             if status == A.ACCEPTED_PARTIAL:
                 lines.append("")
                 lines.append("**Not established by this attempt (unresolved):**")
@@ -506,10 +579,45 @@ def _safe_final(st: RunState, problems: list) -> str:
             "Problems: " + "; ".join(problems[:5]) + "\n")
 
 
+def reconstruct_final(led, task_id: str) -> Optional[str]:
+    """Rebuild the final answer from DURABLE records only (task spec, attempts, stored decisions, stored attempt text,
+    the ledger's accepted pointer). Used as a check against the stored final and available after a restart."""
+    import json as _json
+    from types import SimpleNamespace as NS
+    raw = led.load_for_reconstruction(task_id)
+    if raw is None:
+        return None
+    st = RunState(task="", task_id=task_id, workflow_run_id=raw["task"]["workflow_run_id"], registry=A.Registry())
+    items = []
+    for it in raw["items"]:
+        w = it["work_item"]
+        spec = _json.loads(w["spec_json"])
+        wi = WorkItem(w["work_item_id"], w["title"], spec["target"], spec["objective"], spec["evidence_required"],
+                      spec["completion_criteria"], spec["paths"], derive_policy(spec["paths"]))
+        items.append(wi)
+        for a in it["attempts"]:
+            at = a["attempt"]
+            att = NS(attempt_id=at["attempt_id"], work_item_id=at["work_item_id"], generation=at["generation"],
+                     agent_run_id=at["agent_run_id"], text=a["text"])
+            d = a["decision"]
+            dec = None
+            if d is not None:
+                extra = _json.loads(d.get("extra_json") or "{}")
+                dec = NS(acceptance=d["acceptance"], execution_status=d["execution_status"], validity=d["validity"],
+                         reason=d["reason"], execution_reason=extra.get("execution_reason") or "",
+                         counts=_json.loads(d["counts_json"] or "{}"), gate=_json.loads(d["gate_json"] or "{}"),
+                         assessor_claims=_json.loads(d["assessor_claims_json"] or "{}"), assessor_status=d["assessor_status"])
+            st.records.append(AttemptRecord(attempt=att, decision=dec))
+        if w["accepted_attempt_id"]:
+            st.registry.accepted[w["work_item_id"]] = {"attempt_id": w["accepted_attempt_id"], "work_item_id": w["work_item_id"]}
+    st.plan = WorkPlan(task_id, items)
+    return build_final(st)
+
+
 # ---------------------------------------------------------------------------- the Workflow
 async def run_engineering_workflow(
     task: str, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
-    project_id: str, session_id, controls_raw=None, registry=None, work_items=None,
+    project_id: str, session_id, controls_raw=None, registry=None, work_items=None, idempotency_key=None,
 ):
     """Entry point called from swarm.team.run_task_async when orchestration == "workflow".
     Returns (content, tokens, clarification) exactly like the Team path."""
@@ -519,9 +627,36 @@ async def run_engineering_workflow(
     from swarm import model_routing, team_config
 
     controls = _controls(controls_raw)
-    task_id = f"task-{uuid.uuid4().hex[:10]}"
+    task_id = (f"task-{hashlib.sha256(str(idempotency_key).encode()).hexdigest()[:10]}" if idempotency_key
+               else f"task-{uuid.uuid4().hex[:10]}")
     wf_run_id = f"wf-{uuid.uuid4().hex[:8]}"
     st = RunState(task=task, task_id=task_id, workflow_run_id=wf_run_id, registry=registry or A.Registry())
+    led = Ledger()
+    try:
+        await led.ainit()
+    except Exception as e:  # noqa: BLE001 -- fail closed: create_task below will refuse to dispatch
+        print(f"[workflow] ledger init failed: {repr(e)[:160]}", flush=True)
+    if controls.get("ledger_fail"):
+        led.fail_next = controls["ledger_fail"]          # test control: next ledger op of that kind raises
+    st.ledger = led
+    if idempotency_key:
+        # Duplicate submission of the SAME task: never re-run. A finalized task returns its stored final answer; any
+        # other state is reported as-is (it is either still running elsewhere or was interrupted).
+        try:
+            prior = await led._a(led.get_task, task_id)
+        except Exception as e:  # noqa: BLE001
+            prior, st.final = None, _safe_final(st, [f"durable ledger unavailable ({repr(e)[:100]})"])
+            return st.final, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, None
+        if prior is not None:
+            if prior["status"] == "FINALIZED":
+                raw = await led._a(led.load_for_reconstruction, task_id)
+                st.emit("duplicate_submission", task=task_id, outcome="returned_stored_final")
+                return (raw["task"]["final_text"] + "\n_Duplicate submission: this task was already finalized; the stored result is returned and nothing was re-run._\n",
+                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, None)
+            st.emit("duplicate_submission", task=task_id, outcome=f"refused_status_{prior['status']}")
+            return (f"## Investigation result: NOT ESTABLISHED\ntask `{task_id}`\n\nThis task was already submitted and is "
+                    f"{prior['status']}; it was not started again. Inspect it via /ledger/tasks/{task_id}.\n",
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, None)
     LAST["state"] = st
     st.emit("workflow_start", task=task_id, workflow_run=wf_run_id, controls=sorted(controls) or None)
 
@@ -573,6 +708,16 @@ async def run_engineering_workflow(
         async def s_plan(step_input):
             st.steps_run.append("plan")
             st.plan = plan_work_items(work_items, task_id) if work_items else plan_request(task, task_id)
+            if st.plan.items and st.ledger is not None:
+                try:     # the plan is durable before ANY attempt can exist
+                    await st.ledger._a(st.ledger.create_task, task_id, wf_run_id, task, [
+                        {"work_item_id": w.work_item_id, "title": w.title,
+                         "spec": {"paths": w.paths, "target": w.target, "objective": w.objective,
+                                  "evidence_required": w.evidence_required, "completion_criteria": w.completion_criteria,
+                                  "policy": w.policy.name}} for w in st.plan.items])
+                    st.ledger_task_created = True
+                except Exception as e:  # noqa: BLE001 -- fail closed: nothing is dispatched without a durable plan
+                    st.plan = WorkPlan(task_id, [], f"durable ledger unavailable ({repr(e)[:120]}); request not dispatched")
             st.emit("step", name="plan", items=len(st.plan.items), rejected=st.plan.rejected_reason)
             return "plan-ok"
 
@@ -592,16 +737,16 @@ async def run_engineering_workflow(
                             c2 = {k: v for k, v in c.items() if k not in ("supersede_after_s", "delay_tool_s", "cancel_after_s")}
                             st.emit("supersede_started", work_item=wi.work_item_id)
                             rec2 = await run_attempt(st, wi, ctx, c2, 2)
-                            d2 = assess_and_register(st, wi, rec2, c)
+                            d2 = await assess_and_register(st, wi, rec2, c)
                             rec1 = await t1                       # the old attempt finishes LATE
-                            d1 = assess_and_register(st, wi, rec1, c)
+                            d1 = await assess_and_register(st, wi, rec1, c)
                             st.emit("supersede_result", work_item=wi.work_item_id, new=d2.acceptance, old=d1.acceptance,
                                     old_validity=d1.validity)
                             break
                         rec = t1.result()
                     else:
                         rec = await run_attempt(st, wi, ctx, c, n)
-                    d = assess_and_register(st, wi, rec, c)
+                    d = await assess_and_register(st, wi, rec, c)
                     retry = (d.execution_status in RETRYABLE_TERMINALS and d.validity == "CURRENT"
                              and n < MAX_ATTEMPTS_PER_ITEM)
                     st.emit("retry_decision", work_item=wi.work_item_id, attempt=rec.attempt.attempt_id,
@@ -615,6 +760,9 @@ async def run_engineering_workflow(
 
         async def s_finalize(step_input):
             st.steps_run.append("finalize")
+            if controls.get("hold_before_finalize_s"):       # test control: window between acceptance and finalization
+                st.emit("hold", where="before_finalize", seconds=controls["hold_before_finalize_s"])
+                await asyncio.sleep(float(controls["hold_before_finalize_s"]))
             if not st.plan or not st.plan.items:
                 st.final = ("## Investigation result: NOT ESTABLISHED\n"
                             f"task `{task_id}` · workflow run `{wf_run_id}`\n\n"
@@ -625,7 +773,20 @@ async def run_engineering_workflow(
                 audit = audit_final(st, final)
                 st.final_audit = audit
                 st.final = final if audit["ok"] else _safe_final(st, audit["problems"])
-                if controls.get("duplicate_finalize"):
+                if st.ledger is not None and st.ledger_task_created:
+                    try:
+                        fr = await st.ledger._a(st.ledger.finalize_task, task_id, st.final, audit)
+                        if not fr["finalized_now"]:
+                            st.final = fr["final_text"]          # idempotent: the stored final wins
+                        if controls.get("duplicate_finalize"):
+                            fr2 = await st.ledger._a(st.ledger.finalize_task, task_id, st.final, audit)
+                            st.emit("duplicate_finalize", reason=fr2["reason"], identical=fr2["identical"])
+                        rc = await st.ledger._a(reconstruct_final, st.ledger, task_id)
+                        st.emit("reconstruct", identical=(rc == st.final), chars=len(rc or ""))
+                    except Exception as e:  # noqa: BLE001 -- fail closed
+                        st.final = _safe_final(st, [f"durable ledger could not finalize the task ({repr(e)[:100]})"])
+                        st.final_audit = {"ok": False, "problems": ["ledger finalize failed"]}
+                elif controls.get("duplicate_finalize"):
                     again = build_final(st)               # control: finalize a second time, from the same registry
                     st.emit("duplicate_finalize", identical=(again == final))
             st.emit("step", name="finalize", audit_ok=st.final_audit["ok"], chars=len(st.final))

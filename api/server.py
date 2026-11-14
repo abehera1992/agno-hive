@@ -255,6 +255,69 @@ async def _load_model_routing_cache():
         print(f"[readiness] WARNING: {finding}")
 
 
+async def _ledger_recover(pid: int | None = None) -> dict | None:
+    """Phase 1.17 recovery. Marks live attempts of THIS instance (or of one dead worker pid) ABANDONED. Best effort and
+    silent when the Workflow was never used (no ledger file). Never raises: recovery must not break a request."""
+    try:
+        from swarm.ledger import Ledger
+        led = Ledger()
+        if not Path(led.path).exists():
+            return None
+        await led.ainit()
+        r = await led._a(led.recover, None, pid)
+        if r["abandoned"]:
+            print(f"[api] ledger recovery: abandoned={r['abandoned']} tasks_interrupted={r['tasks_interrupted']}", flush=True)
+        return r
+    except Exception as exc:  # noqa: BLE001
+        print(f"[api] ledger recovery skipped ({type(exc).__name__}: {exc})", flush=True)
+        return None
+
+
+@app.on_event("startup")
+async def _recover_workflow_ledger():
+    await _ledger_recover()
+
+
+@app.get("/ledger/tasks/{task_id}")
+async def ledger_task(task_id: str):
+    """Read-only structured status of one Workflow task from the durable ledger (no source text, hashes only)."""
+    from swarm.ledger import Ledger
+    led = Ledger()
+    if not Path(led.path).exists():
+        raise HTTPException(status_code=404, detail="no ledger")
+    rec = await led._a(led.get_task, task_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="unknown task")
+    return rec
+
+
+@app.get("/ledger/tasks/{task_id}/final")
+async def ledger_task_final(task_id: str):
+    """The final answer rebuilt from DURABLE records only (decisions, attempt text, accepted pointer), plus whether it equals
+    the stored final answer. Works after a restart; never re-runs anything."""
+    from swarm.ledger import Ledger
+    from swarm.eng_workflow import reconstruct_final
+    led = Ledger()
+    if not Path(led.path).exists():
+        raise HTTPException(status_code=404, detail="no ledger")
+    raw = await led._a(led.load_for_reconstruction, task_id)
+    if raw is None:
+        raise HTTPException(status_code=404, detail="unknown task")
+    rebuilt = await led._a(reconstruct_final, led, task_id)
+    stored = raw["task"].get("final_text")
+    return {"task_id": task_id, "status": raw["task"]["status"], "rebuilt": rebuilt, "stored_final_present": stored is not None,
+            "identical_to_stored": (stored == rebuilt) if stored is not None else None}
+
+
+@app.get("/ledger/tasks")
+async def ledger_tasks(limit: int = 20):
+    from swarm.ledger import Ledger
+    led = Ledger()
+    if not Path(led.path).exists():
+        return {"tasks": []}
+    return {"tasks": await led._a(led.list_tasks, max(1, min(limit, 100)))}
+
+
 @app.on_event("startup")
 async def _start_cleanup_loop():
     # Phase 1.16: a throw-away TEST instance (HIVE_TEST_INSTANCE=1, own port) must not run a second copy of the
@@ -812,6 +875,7 @@ async def _run_worker_subprocess(
         raise
     finally:
         _ACTIVE_WORKERS.pop(proc.pid, None)
+        await _ledger_recover(pid=proc.pid)       # Phase 1.17: attempts of a dead worker are ABANDONED, never accepted
         # Read the draft BEFORE the unlink below, not inside _salvage. This block runs
         # on every exit path, so by the time any error branch calls _salvage the file is
         # already gone — the first version of the salvage read it there and recovered
@@ -1105,6 +1169,7 @@ async def run(request: RunRequest, http_request: Request):
         "orchestration": _resolve_orchestration(request.orchestration),
         "workflow_controls": request.workflow_controls,
         "work_items": request.work_items,
+        "idempotency_key": request.idempotency_key,
     }
     result, tokens, clarification = await _run_worker_subprocess(http_request, worker_payload)
 

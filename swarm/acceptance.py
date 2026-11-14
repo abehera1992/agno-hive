@@ -213,12 +213,22 @@ class OutcomeRecorder:
     independent of normal return; `inner` (last in tool_hooks) runs only if the real tool entrypoint is reached,
     which proves the tool executed rather than a hook answering in its place. No monkeypatching of tools."""
 
-    def __init__(self, attempt_id: str, tool_deadline: float = None):
+    def __init__(self, attempt_id: str, tool_deadline: float = None, on_call=None):
         self.attempt_id = attempt_id
+        self.on_call = on_call          # Phase 1.17: async persistence callback, awaited once per finished call
+        self.persist_error = None       # set if the callback raised: the attempt's evidence is then NOT durable
         self.calls: list = []
         self._seq = itertools.count(1)
         self.deadline = tool_deadline
         self._succ_shas: set = set()
+
+    async def _emit(self, c) -> None:
+        if self.on_call is None:
+            return
+        try:
+            await asyncio.shield(self.on_call(c))
+        except BaseException as e:  # noqa: BLE001 -- never alters the tool result; flags the attempt instead
+            self.persist_error = repr(e)[:200]
 
     def hooks(self):
         me = self
@@ -244,10 +254,13 @@ class OutcomeRecorder:
             finally:
                 _CALL.reset(tok)
                 ATTEMPT_ID.reset(tok_a)
+                if c.outcome != UNKNOWN:          # exception paths: outcome already final
+                    await me._emit(c)
             text = out if isinstance(out, str) else _text_of(out)
             classify_return(c, out, text, me._succ_shas)
             if c.outcome == SUCCESS and c.result_sha:
                 me._succ_shas.add(c.result_sha)
+            await me._emit(c)
             return out
 
         async def acceptance_outcome_inner(function_name, function, args):
@@ -432,13 +445,15 @@ class Registry:
         self.log: list = []
         self._n = itertools.count(1)
 
-    def start(self, task_id, work_item_id, workflow_run_id=None) -> Attempt:
-        g = self.current_gen.get(work_item_id, -1) + 1
+    def start(self, task_id, work_item_id, workflow_run_id=None, attempt_id=None, generation=None) -> Attempt:
+        """`attempt_id`/`generation` (Phase 1.17): when the durable ledger allocated them, the in-memory registry adopts
+        exactly those values instead of numbering its own."""
+        g = self.current_gen.get(work_item_id, -1) + 1 if generation is None else generation
         for a in self.attempts.values():
             if a.work_item_id == work_item_id and a.state in ("RUNNING", "FINISHED") and a.generation < g:
                 a.state = "SUPERSEDED"
         self.current_gen[work_item_id] = g
-        a = Attempt(task_id, work_item_id, f"att-{next(self._n):03d}-g{g}", g, workflow_run_id)
+        a = Attempt(task_id, work_item_id, attempt_id or f"att-{next(self._n):03d}-g{g}", g, workflow_run_id)
         self.attempts[a.attempt_id] = a
         self.log.append(("start", a.attempt_id, g))
         return a
@@ -459,6 +474,20 @@ class Registry:
         if a.generation != reg.generation:
             return "GENERATION_MISMATCH"
         return "CURRENT"
+
+    def apply(self, a: Attempt, d: "Decision", result: dict) -> dict:
+        """Mirror a registration the DURABLE ledger already decided (the ledger is the authority; this keeps the
+        in-process view, which finalization reads, identical to it). Never accepts anything the ledger did not."""
+        rec = {"work_item_id": a.work_item_id, "attempt_id": a.attempt_id, "generation": a.generation,
+               "status": d.acceptance, "agent_run_id": a.agent_run_id, "workflow_run_id": a.workflow_run_id}
+        if result.get("registered") and d.acceptance in (ACCEPTED_COMPLETE, ACCEPTED_PARTIAL):
+            self.accepted[a.work_item_id] = rec
+            self.log.append(("accept", a.attempt_id, d.acceptance))
+        elif result.get("reason") != "IDEMPOTENT_DUPLICATE":
+            self.withheld.append(rec)
+            self.log.append(("withhold", a.attempt_id, d.acceptance))
+        d.registration = result
+        return result
 
     def register(self, a: Attempt, d: "Decision") -> dict:
         v = self.validity(a)

@@ -86,6 +86,8 @@ class RunRequest(BaseModel):
     # Phase 1.16: optional explicit work items for orchestration="workflow" (1..4 strings, each naming its own
     # repository files). Planning stays deterministic; nothing is decomposed by a model.
     work_items: list[str] | None = None
+    # Phase 1.17: optional. Submitting the same key again never re-runs the task (see swarm/eng_workflow.py).
+    idempotency_key: str | None = None
 
 class SessionMeta(BaseModel):
     session_id: str
