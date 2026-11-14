@@ -706,7 +706,7 @@ async def run_engineering_workflow(
                 stream_events=st.stream_events))
             await asyncio.sleep(SNAPSHOT_INTERVAL_S)
 
-    hb_task = asyncio.create_task(_snapshot_loop()) if liveness_path else None
+    hb_task = asyncio.create_task(_snapshot_loop()) if (liveness_path and not controls.get("no_snapshot")) else None   # no_snapshot: test control
     if idempotency_key:
         # Duplicate submission of the SAME task: never re-run. A finalized task returns its stored final answer; any
         # other state is reported as-is (it is either still running elsewhere or was interrupted).
