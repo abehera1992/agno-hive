@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import yaml
@@ -255,7 +256,7 @@ async def _load_model_routing_cache():
         print(f"[readiness] WARNING: {finding}")
 
 
-async def _ledger_recover(pid: int | None = None) -> dict | None:
+async def _ledger_recover(pid: int | None = None, reason: str | None = None) -> dict | None:
     """Phase 1.17 recovery. Marks live attempts of THIS instance (or of one dead worker pid) ABANDONED. Best effort and
     silent when the Workflow was never used (no ledger file). Never raises: recovery must not break a request."""
     try:
@@ -264,7 +265,7 @@ async def _ledger_recover(pid: int | None = None) -> dict | None:
         if not Path(led.path).exists():
             return None
         await led.ainit()
-        r = await led._a(led.recover, None, pid)
+        r = await led._a(led.recover, None, pid, reason)
         if r["abandoned"]:
             print(f"[api] ledger recovery: abandoned={r['abandoned']} tasks_interrupted={r['tasks_interrupted']}", flush=True)
         return r
@@ -485,6 +486,15 @@ def _liveness_kill_reason(snapshot: dict) -> str | None:
                 f"liveness_state={snapshot.get('liveness_state')!r}) is stale and not "
                 f"trustworthy"
             )
+    # Phase 1.18B: Workflow no-progress tier. Keys are written ONLY by swarm/eng_workflow.py's snapshot (a Team
+    # snapshot has none of them, so this block is inert for Team). Requires BOTH a streak of consecutive tool calls
+    # that added no new evidence AND elapsed time since the last real progress.
+    _wf_streak = snapshot.get("wf_no_progress_streak")
+    if (_wf_streak is not None and _wf_streak >= config.workflow_no_progress_calls
+            and snapshot.get("wf_no_progress_seconds", 0) >= config.workflow_no_progress_s):
+        return (f"no research progress: {_wf_streak} consecutive tool calls added no new evidence over "
+                f"{snapshot.get('wf_no_progress_seconds', 0):.0f}s (last tool {snapshot.get('last_tool')!r}, "
+                f"{snapshot.get('wf_identical_state_repeats', 0)} identical state-tool result repeat(s))")
     stagnant = snapshot.get("stagnant_seconds", 0)
     if stagnant > config.liveness_silence_threshold_s:
         base = f"no tool call or new stream content for over {config.liveness_silence_threshold_s:.0f}s"
@@ -637,6 +647,61 @@ def _read_liveness_snapshot(path: "Path") -> dict | None:
         return None
 
 
+def _snapshot_belongs(snapshot: dict | None, pid: int, nonce: str) -> bool:
+    """A Workflow snapshot is only trusted if it names THIS worker (pid) and THIS spawn (the nonce the parent generated)."""
+    return (isinstance(snapshot, dict) and snapshot.get("schema") == "workflow-liveness/1"
+            and snapshot.get("worker_pid") == pid and snapshot.get("nonce") == nonce)
+
+
+def _workflow_supervision_reason(snapshot: dict | None, *, pid: int, nonce: str, started_at: float,
+                                 now: float | None = None) -> str | None:
+    """Phase 1.18B. Parent-side checks specific to a Workflow worker. Missing, malformed or foreign snapshots are NEVER
+    read as healthy: after the grace period they are a reason to terminate. The overall deadline is a hard cap the worker
+    cannot extend (the snapshot may only SHORTEN it). Pure function: no I/O, no kill."""
+    now = time.time() if now is None else now
+    hard_cap = started_at + config.workflow_task_deadline_s + config.workflow_parent_deadline_grace_s
+    belongs = _snapshot_belongs(snapshot, pid, nonce)
+    effective = hard_cap
+    if belongs:
+        wall = snapshot.get("wf_task_deadline_wall")
+        if isinstance(wall, (int, float)):
+            effective = min(hard_cap, wall + config.workflow_parent_deadline_grace_s)
+    elif now - started_at > config.workflow_snapshot_grace_s:
+        why = "missing or unreadable" if snapshot is None else "does not belong to this worker (pid/nonce/schema mismatch)"
+        return (f"no valid liveness snapshot {now - started_at:.0f}s after spawn ({why}); a Workflow worker that "
+                f"cannot be supervised is terminated rather than assumed healthy")
+    if now > effective:
+        return (f"overall task deadline exceeded ({now - started_at:.0f}s since spawn; limit enforced by the parent "
+                f"at {effective - started_at:.0f}s) and the worker did not stop")
+    return None
+
+
+async def _workflow_supervised_final(payload: dict, snapshot: dict | None, pid: int, reason: str) -> tuple:
+    """After the parent kills a Workflow worker: record the termination in the durable ledger, then build the answer from
+    DURABLE records only (accepted work is preserved; the killed attempt is not accepted and its text is never shown)."""
+    banner = ("\n\n---\n**RUN TERMINATED BY THE SUPERVISOR — " + reason + ". Only findings that were already accepted "
+              "before termination are reported above; nothing from the terminated attempt is accepted.**")
+    text = None
+    try:
+        from swarm.ledger import Ledger
+        from swarm.eng_workflow import reconstruct_final
+        led = Ledger()
+        if Path(led.path).exists():
+            await led.ainit()
+            rec = await led._a(led.recover, None, pid, "terminated by parent supervisor: " + reason[:200])
+            tid = (snapshot or {}).get("task_id") or next(iter(rec.get("tasks_interrupted") or []), None)
+            if tid:
+                rebuilt = await led._a(reconstruct_final, led, tid)
+                if rebuilt:
+                    text = rebuilt.rstrip() + banner
+                    await led._a(led.finalize_task, tid, text, {"ok": True, "supervisor_terminated": reason[:200]})
+    except Exception as exc:  # noqa: BLE001
+        print(f"[api] supervised-final build failed ({type(exc).__name__}: {exc})", flush=True)
+    if text is None:
+        text = "## Investigation result: NOT ESTABLISHED\n\nThe run was terminated by the supervisor before any result was recorded." + banner
+    return text, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, None
+
+
 # Active swarm worker subprocesses, pid -> metadata. Populated on spawn, removed in
 # the same finally that cleans up the liveness file.
 #
@@ -758,7 +823,11 @@ async def _run_worker_subprocess(
     # to it closes that race with the same idiom the `finally:` block already
     # uses for its own cleanup, not new lifecycle machinery.
     liveness_path.unlink(missing_ok=True)
-    worker_payload = {**payload, "liveness_path": str(liveness_path)}
+    _wf_nonce = uuid.uuid4().hex
+    _is_wf = payload.get("orchestration") == "workflow" and config.workflow_supervision
+    _spawn_at = time.time()
+    _seen_snapshot = False
+    worker_payload = {**payload, "liveness_path": str(liveness_path), "liveness_nonce": _wf_nonce}
     proc.stdin.write(json.dumps(worker_payload).encode())
     proc.stdin.write_eof()
     await proc.stdin.drain()
@@ -775,7 +844,24 @@ async def _run_worker_subprocess(
                 await proc.wait()
                 print("[api] client disconnected — worker process killed, GPU work aborted")
                 raise HTTPException(status_code=499, detail="client disconnected")
-            if config.enable_liveness_autokill:
+            if _is_wf:
+                # Phase 1.18B: the SAME parent kill authority, applied to a Workflow worker. A snapshot is trusted only
+                # if it names this pid and this spawn's nonce; missing/foreign ones are judged, not assumed healthy.
+                _snap = _read_liveness_snapshot(liveness_path)
+                _ok = _snap if _snapshot_belongs(_snap, proc.pid, _wf_nonce) else None
+                if _ok is not None and not _seen_snapshot:
+                    _seen_snapshot = True
+                    print(f"[api] workflow supervision: snapshot observed pid={proc.pid} task={_ok.get('task_id')} "
+                          f"state={_ok.get('wf_state')}", flush=True)
+                _why = _workflow_supervision_reason(_snap, pid=proc.pid, nonce=_wf_nonce, started_at=_spawn_at)
+                if _why is None and _ok is not None:
+                    _why = _liveness_kill_reason(_ok)
+                if _why is not None:
+                    proc.kill()
+                    await proc.wait()
+                    print(f"[api] workflow run auto-terminated (supervisor): {_why}", flush=True)
+                    return await _workflow_supervised_final(payload, _ok, proc.pid, _why)
+            if config.enable_liveness_autokill and not _is_wf:
                 snapshot = _read_liveness_snapshot(liveness_path)
                 if snapshot is not None:
                     reason = _liveness_kill_reason(snapshot)
@@ -1166,7 +1252,8 @@ async def run(request: RunRequest, http_request: Request):
         "synthesis_run": request.synthesis_run,
         "solo": request.solo,
         "execution_profile": request.execution_profile,
-        "orchestration": _resolve_orchestration(request.orchestration),
+        "orchestration": ("workflow" if (_resolve_orchestration(request.orchestration) == "workflow"
+                                         and gate_team_name == "engineering" and agent_specs) else "team"),
         "workflow_controls": request.workflow_controls,
         "work_items": request.work_items,
         "idempotency_key": request.idempotency_key,

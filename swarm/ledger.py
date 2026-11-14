@@ -344,7 +344,7 @@ class Ledger:
         return self._tx(go)
 
     # ------------------------------------------------------------------ recovery
-    def recover(self, instance_id: Optional[str] = None, pid: Optional[int] = None) -> dict:
+    def recover(self, instance_id: Optional[str] = None, pid: Optional[int] = None, reason: Optional[str] = None) -> dict:
         """Mark orphaned live attempts ABANDONED (never accepted, never resumed). With `pid`: only that worker's attempts.
         Without: every live attempt of this instance (called at service start, when no worker of the previous process
         can still be legitimately running). Tasks left with no live attempts and no final are marked INTERRUPTED."""
@@ -358,7 +358,7 @@ class Ledger:
             rows = c.execute(q, args).fetchall()
             for r in rows:
                 c.execute("UPDATE attempt SET state=?, invalidated_reason=?, ended_at=COALESCE(ended_at,?) WHERE attempt_id=?",
-                          (ABANDONED, "owner process gone (recovery)", time.time(), r["attempt_id"]))
+                          (ABANDONED, reason or "owner process gone (recovery)", time.time(), r["attempt_id"]))
             tasks = {r["task_id"] for r in rows}
             # A task that is still RUNNING after its worker (pid) or its whole service instance is gone can never be
             # finalized by its own process: mark it INTERRUPTED (accepted attempts and decisions are kept untouched).

@@ -30,6 +30,10 @@ from typing import Optional
 
 from swarm import acceptance as A
 from swarm.ledger import Ledger, LedgerError, RetryBudgetExhausted, decision_to_dict
+from swarm import liveness as L
+
+SNAPSHOT_INTERVAL_S = 5.0
+MIN_ATTEMPT_START_S = 120.0
 
 MAX_ATTEMPTS_PER_ITEM = 2                 # 1 original + at most 1 retry
 RETRYABLE_TERMINALS = {"FAILED", "INCOMPLETE"}   # never CANCELLED / TIMED_OUT (those are app/operator decisions)
@@ -158,6 +162,19 @@ class RunState:
     ledger: object = None
     ledger_task_created: bool = False
     t0: float = field(default_factory=time.time)
+    # Phase 1.18B: overall task deadline + liveness telemetry (the parent supervisor judges the snapshot)
+    deadline_mono: Optional[float] = None       # None = not enforced by the worker (parent still enforces the wall deadline)
+    deadline_wall: Optional[float] = None
+    reserve_s: float = 90.0
+    deadline_hit: bool = False
+    tracker: object = None
+    identity: dict = field(default_factory=dict)
+    wf_state: str = "starting"
+    attempt_deadline_wall: Optional[float] = None
+    stream_events: int = 0
+
+    def remaining(self) -> Optional[float]:
+        return None if self.deadline_mono is None else self.deadline_mono - time.monotonic()
 
     def emit(self, kind: str, **kw):
         rec = {"t": round(time.time() - self.t0, 2), "event": kind, **kw}
@@ -264,8 +281,16 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
             except Exception as e:  # noqa: BLE001
                 rec.ledger_error = rec.ledger_error or f"LEDGER_ERROR: {repr(e)[:160]}"
 
-    outcome_rec = A.OutcomeRecorder(att.attempt_id, tool_deadline=controls.get("tool_deadline"),
-                                    on_call=persist_call if led is not None else None)
+    st.tracker = L.ProgressTracker()                       # progress is judged per attempt
+    st.identity = {"task_id": st.task_id, "workflow_run_id": st.workflow_run_id, "work_item_id": wi.work_item_id,
+                   "attempt_id": att.attempt_id, "generation": att.generation, "attempt_no": attempt_no, "agent_run_id": None}
+    st.wf_state = "executing"
+
+    async def on_finished(o):
+        st.tracker.on_call(o)
+        await persist_call(o)
+
+    outcome_rec = A.OutcomeRecorder(att.attempt_id, tool_deadline=controls.get("tool_deadline"), on_call=on_finished)
     fault = {"n": 0}
     try:
         if controls.get("ceiling") is not None:
@@ -312,6 +337,10 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
             researcher.model.base_url = "http://127.0.0.1:9/v1"
             for attr in ("client", "async_client"):
                 setattr(researcher.model, attr, None)
+        if controls.get("model_base_url"):                 # test control: point the Researcher at a scripted endpoint
+            researcher.model.base_url = controls["model_base_url"]
+            for attr in ("client", "async_client"):
+                setattr(researcher.model, attr, None)
 
         async def consume():
             tok = A.ATTEMPT_ID.set(att.attempt_id)
@@ -322,8 +351,14 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
                         trace.run_output = ev
                     else:
                         trace.add(ev)
+                        st.stream_events += 1
+                        if getattr(ev, "event", None) == "ToolCallStarted":
+                            st.tracker.on_tool_start()
+                        else:
+                            st.tracker.on_event()
                         if trace.agent_run_id and att.agent_run_id is None:
                             att.agent_run_id = trace.agent_run_id
+                            st.identity["agent_run_id"] = att.agent_run_id
                             st.emit("agent_started", attempt=att.attempt_id, agent_run=att.agent_run_id)
             finally:
                 A.ATTEMPT_ID.reset(tok)
@@ -343,13 +378,20 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
                     ret = Agent.cancel_run(trace.agent_run_id) if trace.agent_run_id else None
                     st.emit("attempt_cancelled", attempt=att.attempt_id, agent_cancel_returned=ret)
             deadline = float(controls.get("attempt_deadline_s") or ATTEMPT_DEADLINE_S)
+            cause = "attempt"
+            remaining = st.remaining()
+            if remaining is not None and remaining - st.reserve_s < deadline:
+                deadline, cause = max(1.0, remaining - st.reserve_s), "task"     # the OVERALL deadline binds first
+            st.attempt_deadline_wall = time.time() + deadline
             await asyncio.wait_for(asyncio.shield(task), deadline)
         except asyncio.TimeoutError:
             timed_out = True
+            if cause == "task":
+                st.deadline_hit = True
             st.registry.cancel(att.attempt_id)
-            await invalidate("TIMED_OUT", f"attempt deadline {deadline}s exceeded")
+            await invalidate("TIMED_OUT", f"{cause} deadline {deadline:.0f}s exceeded")
             task.cancel()
-            st.emit("attempt_timed_out", attempt=att.attempt_id, deadline_s=deadline)
+            st.emit("attempt_timed_out", attempt=att.attempt_id, deadline_s=round(deadline, 1), cause=cause)
         except asyncio.CancelledError:
             task.cancel()
             raise
@@ -498,6 +540,8 @@ def build_final(st: RunState) -> str:
     overall = ("COMPLETE" if n_c == len(per_item) and per_item else
                "PARTIAL" if (n_c + n_p) > 0 else "NOT ESTABLISHED")
     lines.append(f"## Investigation result: {overall}")
+    if getattr(st, "deadline_hit", False):
+        lines.append("_The overall task deadline was reached; work that had not completed is reported as not established._")
     lines.append(f"task `{st.task_id}` · workflow run `{st.workflow_run_id}` · "
                  f"{len(per_item)} work item(s) · {len(st.records)} attempt(s)")
     lines.append("")
@@ -530,7 +574,8 @@ def build_final(st: RunState) -> str:
                 for u in _unresolved_items(d):
                     lines.append(f"- not established: {u}")
             else:
-                lines.append("Reason: no attempt produced a decision.")
+                lines.append("Reason: not started because the overall task deadline was reached."
+                             if getattr(st, "deadline_hit", False) else "Reason: no attempt produced a decision.")
         hist = [r for r in st.records if r.attempt.work_item_id == wi.work_item_id]
         if len(hist) > 1 or (hist and not accepted):
             lines.append("")
@@ -588,6 +633,10 @@ def reconstruct_final(led, task_id: str) -> Optional[str]:
     if raw is None:
         return None
     st = RunState(task="", task_id=task_id, workflow_run_id=raw["task"]["workflow_run_id"], registry=A.Registry())
+    try:
+        st.deadline_hit = bool(_json.loads(raw["task"].get("audit_json") or "{}").get("deadline_hit"))
+    except Exception:  # noqa: BLE001
+        st.deadline_hit = False
     items = []
     for it in raw["items"]:
         w = it["work_item"]
@@ -618,6 +667,7 @@ def reconstruct_final(led, task_id: str) -> Optional[str]:
 async def run_engineering_workflow(
     task: str, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
     project_id: str, session_id, controls_raw=None, registry=None, work_items=None, idempotency_key=None,
+    liveness_path=None, liveness_nonce=None,
 ):
     """Entry point called from swarm.team.run_task_async when orchestration == "workflow".
     Returns (content, tokens, clarification) exactly like the Team path."""
@@ -639,6 +689,24 @@ async def run_engineering_workflow(
     if controls.get("ledger_fail"):
         led.fail_next = controls["ledger_fail"]          # test control: next ledger op of that kind raises
     st.ledger = led
+    # Overall task deadline. `ignore_task_deadline` (test control) leaves the WORKER unenforced so the parent's
+    # independent hard cap can be demonstrated; the wall-clock deadline is published either way.
+    from config.config import config as _cfg
+    _dl = float(controls.get("task_deadline_s") or _cfg.workflow_task_deadline_s)
+    st.reserve_s = float(_cfg.workflow_deadline_reserve_s)
+    st.deadline_wall = time.time() + _dl
+    st.deadline_mono = None if controls.get("ignore_task_deadline") else time.monotonic() + _dl
+    st.identity = {"task_id": task_id, "workflow_run_id": wf_run_id}
+
+    async def _snapshot_loop():
+        while True:
+            L.write_snapshot(liveness_path, L.build_snapshot(
+                nonce=liveness_nonce, state=st.wf_state, identity=st.identity, tracker=st.tracker,
+                task_deadline_wall=st.deadline_wall, attempt_deadline_wall=st.attempt_deadline_wall,
+                stream_events=st.stream_events))
+            await asyncio.sleep(SNAPSHOT_INTERVAL_S)
+
+    hb_task = asyncio.create_task(_snapshot_loop()) if liveness_path else None
     if idempotency_key:
         # Duplicate submission of the SAME task: never re-run. A finalized task returns its stored final answer; any
         # other state is reported as-is (it is either still running elsewhere or was interrupted).
@@ -707,6 +775,7 @@ async def run_engineering_workflow(
 
         async def s_plan(step_input):
             st.steps_run.append("plan")
+            st.wf_state = "planning"
             st.plan = plan_work_items(work_items, task_id) if work_items else plan_request(task, task_id)
             if st.plan.items and st.ledger is not None:
                 try:     # the plan is durable before ANY attempt can exist
@@ -727,6 +796,12 @@ async def run_engineering_workflow(
                 c = item_controls(controls, wi.work_item_id)
                 n = 1
                 while n <= MAX_ATTEMPTS_PER_ITEM:
+                    rem = st.remaining()
+                    if st.deadline_hit or (rem is not None and rem < MIN_ATTEMPT_START_S):
+                        if not st.deadline_hit:
+                            st.deadline_hit = True
+                        st.emit("task_deadline_no_start", work_item=wi.work_item_id, remaining_s=None if rem is None else round(rem, 1))
+                        break
                     sup = c.get("supersede_after_s") if n == 1 else None
                     if sup:
                         # Control: a newer generation starts while attempt 1 is still running. The registry marks
@@ -760,6 +835,7 @@ async def run_engineering_workflow(
 
         async def s_finalize(step_input):
             st.steps_run.append("finalize")
+            st.wf_state = "finalizing"
             if controls.get("hold_before_finalize_s"):       # test control: window between acceptance and finalization
                 st.emit("hold", where="before_finalize", seconds=controls["hold_before_finalize_s"])
                 await asyncio.sleep(float(controls["hold_before_finalize_s"]))
@@ -775,7 +851,8 @@ async def run_engineering_workflow(
                 st.final = final if audit["ok"] else _safe_final(st, audit["problems"])
                 if st.ledger is not None and st.ledger_task_created:
                     try:
-                        fr = await st.ledger._a(st.ledger.finalize_task, task_id, st.final, audit)
+                        fr = await st.ledger._a(st.ledger.finalize_task, task_id, st.final,
+                                                dict(audit, deadline_hit=bool(st.deadline_hit)))
                         if not fr["finalized_now"]:
                             st.final = fr["final_text"]          # idempotent: the stored final wins
                         if controls.get("duplicate_finalize"):
@@ -823,6 +900,12 @@ async def run_engineering_workflow(
     if str(wf_status).startswith("EXC") and st.final and "did not report a normal finish" not in st.final:
         st.final += ("\n_Note: the Workflow engine reported an error after the steps ran; this answer is the "
                      "application's own finalization from its registry._\n")
+    st.wf_state = "done"
+    if hb_task is not None:
+        hb_task.cancel()
+        L.write_snapshot(liveness_path, L.build_snapshot(
+            nonce=liveness_nonce, state="done", identity=st.identity, tracker=st.tracker,
+            task_deadline_wall=st.deadline_wall, stream_events=st.stream_events))
     tin = sum(r.tokens["in"] for r in st.records)
     tout = sum(r.tokens["out"] for r in st.records)
     print("[workflow] decisions " + "; ".join(

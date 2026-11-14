@@ -462,6 +462,25 @@ class Config:
     liveness_snapshot_stale_threshold_s: float = float(
         os.getenv("LIVENESS_SNAPSHOT_STALE_THRESHOLD_S", "120"))
 
+    # Phase 1.18B -- Workflow supervision (api/server.py reads these; swarm/eng_workflow.py writes the
+    # snapshot they judge). Applies ONLY to orchestration="workflow" runs; the Team thresholds above are unchanged.
+    # No-progress: kill when this many CONSECUTIVE tool calls added no new evidence (state-tool calls, identical results,
+    # duplicate-read/refused stubs, failed calls) AND at least `workflow_no_progress_s` seconds have passed since the
+    # last real progress (a newly read source file or a new distinct tool result). Both conditions, so a quick burst
+    # of state updates before a long final answer, or a long generation, is never condemned.
+    workflow_supervision: bool = os.getenv("HIVE_WORKFLOW_SUPERVISION", "true").lower() == "true"
+    workflow_no_progress_calls: int = int(os.getenv("HIVE_WF_NO_PROGRESS_CALLS", "3"))
+    workflow_no_progress_s: float = float(os.getenv("HIVE_WF_NO_PROGRESS_S", "240"))
+    # Overall task deadline (all work items, attempts, retries, planning, finalization). The worker enforces it with a
+    # finalization reserve; the parent enforces an independent hard cap of deadline + grace that a worker cannot extend.
+    workflow_task_deadline_s: float = float(os.getenv("HIVE_WF_TASK_DEADLINE_S", "3600"))
+    workflow_deadline_reserve_s: float = float(os.getenv("HIVE_WF_DEADLINE_RESERVE_S", "90"))
+    workflow_min_attempt_s: float = float(os.getenv("HIVE_WF_MIN_ATTEMPT_S", "120"))
+    workflow_parent_deadline_grace_s: float = float(os.getenv("HIVE_WF_PARENT_GRACE_S", "120"))
+    # A Workflow worker must publish its first valid snapshot within this many seconds of spawn, or the parent treats
+    # the run as unsupervised (missing != healthy) and terminates it.
+    workflow_snapshot_grace_s: float = float(os.getenv("HIVE_WF_SNAPSHOT_GRACE_S", "90"))
+
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))
     session_window: int = int(os.getenv("AGNO_SESSION_WINDOW", "6"))
