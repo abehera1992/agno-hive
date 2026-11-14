@@ -1216,8 +1216,79 @@ def _resolve_orchestration(requested: str | None) -> str:
     return v if v in ("team", "workflow") else "team"
 
 
+# --- Phase 1.18E: API-level idempotency ------------------------------------------------------------
+from swarm import idempotency as _idem  # noqa: E402
+IDEM = _idem.IdempotencyStore()
+
+
+@app.on_event("startup")
+async def _idempotency_startup():
+    n = IDEM.recover_startup()
+    print(f"[idempotency] startup: {n} request(s) of this instance were cut off by the restart and are now INTERRUPTED "
+          f"(their keys may be retried)", flush=True)
+
+
+@app.get("/admin/idempotency")
+async def admin_idempotency(key: str | None = None):
+    """Inspect one key (without its stored response body) or the table summary."""
+    if key:
+        return IDEM.get(key) or {"key": key, "status": "UNKNOWN"}
+    return IDEM.stats()
+
+
+def _idem_fields(request: RunRequest) -> dict:
+    """The fields that define 'the same request' for deduplication."""
+    return {"task": request.task, "project_id": request.project_id, "team": request.team, "mode": request.mode,
+            "agents": [a.model_dump() for a in request.agents] if request.agents else None,
+            "orchestration": _resolve_orchestration(request.orchestration), "work_items": request.work_items,
+            "read_only": request.read_only, "solo": request.solo, "execution_profile": request.execution_profile,
+            "synthesis_run": request.synthesis_run, "workflow_controls": request.workflow_controls}
+
+
 @app.post("/run", response_model=RunResponse)
 async def run(request: RunRequest, http_request: Request):
+    try:
+        key = _idem.normalize_key(request.idempotency_key)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    if key is None:                      # keyless: not deduplicated, exactly the previous behaviour
+        return await _run_impl(request, http_request)
+    sha = _idem.request_sha(_idem_fields(request))
+    engine = _resolve_orchestration(request.orchestration)
+    try:
+        d = IDEM.begin(key, sha, engine)
+    except Exception as e:  # noqa: BLE001 -- fail closed: without the store we cannot promise "at most once"
+        print(f"[idempotency] store unavailable: {repr(e)[:160]}", flush=True)
+        raise HTTPException(status_code=503, detail="idempotency store unavailable; request not started")
+    oc = d["outcome"]
+    print(f"[idempotency] key={key[:40]} -> {oc}" + (f" (attempt {d['attempt']})" if "attempt" in d else ""), flush=True)
+    if oc == _idem.CONFLICT:
+        raise HTTPException(status_code=422, detail={"error": "idempotency_key_conflict", "outcome": oc, "key": key,
+                            "reason": "this idempotency_key was already used for a different request; use a new key"})
+    if oc == _idem.DUPLICATE_RUNNING:
+        raise HTTPException(status_code=409, headers={"Retry-After": "15"}, detail={
+            "error": "idempotency_in_progress", "outcome": oc, "key": key, "started_at": d.get("created_at"),
+            "reason": "a request with this key and the same payload is still running; it was not started again"})
+    if oc == _idem.DUPLICATE_FINAL:
+        return JSONResponse(content=json.loads(d["response_json"]), headers={"Idempotent-Replay": "true"})
+    attempt = d["attempt"]
+    worker_req = request.model_copy(update={"idempotency_key": key if attempt == 1 else f"{key}#a{attempt}"})
+    try:
+        resp = await _run_impl(worker_req, http_request)
+    except BaseException as e:  # noqa: BLE001 -- includes cancellation; the key must never stay RUNNING
+        try:
+            IDEM.fail(key, attempt, f"{type(e).__name__}: {str(getattr(e, 'detail', e))[:200]}")
+        except Exception as e2:  # noqa: BLE001
+            print(f"[idempotency] could not record failure for {key[:40]}: {repr(e2)[:120]}", flush=True)
+        raise
+    try:
+        IDEM.finish(key, attempt, resp.model_dump_json())
+    except Exception as e:  # noqa: BLE001 -- the answer exists; return it even if it could not be stored
+        print(f"[idempotency] could not store final for {key[:40]}: {repr(e)[:120]}", flush=True)
+    return resp
+
+
+async def _run_impl(request: RunRequest, http_request: Request):
     from api.models import SessionMeta
     start = time.perf_counter()
 
