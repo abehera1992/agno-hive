@@ -342,8 +342,12 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
         canon = T._build_canonical_researcher_task(
             target=wi.target, objective=wi.objective, evidence_required=wi.evidence_required,
             completion_criteria=wi.completion_criteria, knowledge_brief=ctx.get("knowledge_brief"))
+        team._knowledge_run = getattr(st.knowledge, "run_key", "")      # tags this attempt's AGENT_* tool events
+        _kb = ctx.get("knowledge_brief") or ""
         K.emit("KNOWLEDGE_DOSSIER_REUSED", run=getattr(st.knowledge, "run_key", None), task=st.task_id, attempt=att.attempt_id,
-               status=getattr(st.knowledge, "status", None), brief_chars=len(ctx.get("knowledge_brief") or ""))
+               status=getattr(st.knowledge, "status", None), brief_chars=len(_kb))
+        K.emit("KNOWLEDGE_CONTEXT_SUPPLIED", run=getattr(st.knowledge, "run_key", None), attempt=att.attempt_id, task_chars=len(canon),
+               brief_chars=len(_kb), brief_in_task=bool(_kb.strip() and _kb.strip() in canon))
         if controls.get("break_model") or attempt_no in (controls.get("break_model_attempts") or ()):
             researcher.model.base_url = "http://127.0.0.1:9/v1"
             for attr in ("client", "async_client"):

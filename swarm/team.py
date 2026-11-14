@@ -25161,6 +25161,10 @@ def _build_structured_delegation_tool(original_function, team=None):
             inherited_context=_session_summary if _relevant else None,
             knowledge_brief=_lightrag_context,
         )
+        if _dossier is not None:
+            # what this Researcher execution ACTUALLY receives: the size of its task and whether the brief is inside it
+            _knowledge_emit("KNOWLEDGE_CONTEXT_SUPPLIED", run=getattr(_dossier, "run_key", None), member=member_id, task_chars=len(canonical_task),
+                            brief_chars=len(_lightrag_context), brief_in_task=bool(_lightrag_context and _lightrag_context.strip() in canonical_task))
         canonical_hash = hashlib.sha256(
             canonical_task.encode("utf-8", errors="replace")).hexdigest()[:16]
         print(f"[team] delegate_structured_task: member_id={member_id!r} "
