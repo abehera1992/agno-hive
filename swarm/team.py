@@ -36,6 +36,8 @@ from swarm import phase0
 from swarm import context_pack
 from swarm import execution_context
 from swarm import execution_store
+# Phase 1.14c/d: structured refusal marker + attempt-id context (see swarm/acceptance.py).
+from swarm.acceptance import ToolRefusal, ATTEMPT_ID as _ATTEMPT_ID
 
 _tracer = trace.get_tracer("agno-hive.team")
 
@@ -20948,11 +20950,32 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             return
         if ok:
             delegation_investigation_calls[_who] = delegation_investigation_calls.get(_who, 0) + 1
+        _ev = _evidence_for_attempt(_who)
+        _record_call_in_evidence(_ev, function_name, args, result_text, ok)
+
+    def _evidence_for_attempt(_who: str) -> dict:
+        """The evidence record for this member, scoped to the CURRENT attempt (D4). With no attempt id in
+        context (every existing Team caller) this is exactly the previous per-member record. When an attempt
+        id is set, a record that belongs to a DIFFERENT attempt is never reused: a fresh one replaces it."""
+        _aid = _ATTEMPT_ID.get()
         _ev = delegation_evidence.get(_who)
+        if _ev is not None and _aid is not None and _ev.get("attempt_id") not in (None, _aid):
+            _ev = None
         if _ev is None:
             _ev = delegation_evidence[_who] = _new_delegation_evidence(
                 unavailable_tool_snapshot().get("count", 0))
-        _record_call_in_evidence(_ev, function_name, args, result_text, ok)
+        if _aid is not None and _ev.get("attempt_id") is None:
+            _ev["attempt_id"] = _aid
+        return _ev
+
+    def _refuse(agent, function_name: str, args, kind: str, text: str):
+        """Return an APPLICATION refusal as a structured ToolRefusal (D2) and record it as a refused call, so
+        it can never be mistaken for a successful read. The string content/behaviour is unchanged."""
+        _who = _member_key(getattr(agent, "name", None) or "")
+        if _who and function_name not in _NON_INVESTIGATION_TOOLS:
+            _ev = _evidence_for_attempt(_who)
+            _ev["refused"][function_name] = _ev["refused"].get(function_name, 0) + 1
+        return ToolRefusal(text, kind)
     # Times each member has been refused for the ceiling in the CURRENT delegation.
     # Without this the refusal is a static condition and repeats forever.
     read_refusals: dict[str, int] = {}
@@ -21053,15 +21076,22 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             if prior >= _MAX_IDENTICAL_FAILURES:
                 print(f"[team] {function_name} has failed identically {prior}x for "
                       f"this agent — collapsing further attempts", flush=True)
-                return (
+                return _refuse(agent, function_name, args, "repeated_failure_collapsed", (
                     f"REPEATED FAILURE COLLAPSED: this exact {function_name} call has "
                     f"already failed {prior} times this run with the same arguments. It "
                     f"was NOT executed again. The result will not change by asking "
                     f"again — either call it with genuinely different arguments, use a "
                     f"different tool, or answer from what you already have and say "
                     f"plainly which part you could not determine."
-                )
-            out = await function(**args)
+                ))
+            try:
+                out = await function(**args)
+            except Exception:
+                # D1 (Phase 1.14c/d): a raised exception used to skip the recorder below entirely, so
+                # the assessor saw neither a success nor a failure. Recorded once here, then re-raised
+                # unchanged (Agno's own ToolCallCompleted(error)+ToolCallError pair is NOT counted).
+                _count_investigation_call(agent, function_name, args, "", ok=False)
+                raise
             if _looks_like_tool_error(_result_preview_text(out)):
                 failure_counts[fail_key] = prior + 1
             else:
@@ -21173,7 +21203,8 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 activity["total_stub_serve_count"] = activity.get("total_stub_serve_count", 0) + 1
             _collapse_prior_stub_messages(run_context, function_name, args_key)
             _bump_consecutive_stub_and_maybe_force_text_only(norm_agent_key, agent, consecutive_stub_count)
-            return _not_found_retry_stub(relative_path, count)
+            return _refuse(agent, function_name, args, "not_found_retry",
+                           _not_found_retry_stub(relative_path, count))
 
         # Per-member read budget (2026-08-22). A cache HIT is free -- that content is
         # already in this agent's context -- so only a genuinely fresh fetch is charged,
@@ -21267,19 +21298,19 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                           f"{_n} times — forcing text-only so the turn ends", flush=True)
                     _bump_consecutive_stub_and_maybe_force_text_only(
                         norm_agent_key, agent, consecutive_stub_count)
-                    return (
+                    return _refuse(agent, function_name, args, "read_ceiling_escalated", (
                         "STOP READING AND ANSWER. You have been told "
                         f"{_n} times that this delegation's read budget is spent, and "
                         "each retry has returned this same refusal. No read will run "
                         "again in this delegation. Write your report from what you "
                         "already have, copying enumerable findings verbatim, and name "
                         "what you did not examine."
-                    )
+                    ))
                 print(f"[team] {agent_key or 'coordinator'} has read {_dl_read:,} chars "
                       f"in this delegation (ceiling {_DELEGATION_READ_CEILING:,}) — "
                       f"refusing further reads until it reports "
                       f"(refusal {_n}/{_MAX_READ_REFUSALS})", flush=True)
-                return (
+                return _refuse(agent, function_name, args, "read_ceiling", (
                     f"REPORT NOW: you have read {_dl_read:,} characters in this one "
                     f"delegation, which is the ceiling. No further reads will run until "
                     f"you report.\n"
@@ -21291,7 +21322,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     f"Then say plainly what you have NOT examined. You will be delegated "
                     f"to again if more is needed, and this ceiling resets when that "
                     f"happens — so an honest partial report costs you nothing."
-                )
+                ))
 
         if function_name == "get_files_batch" and cache_key not in cache:
             _nb = batch_counts.get((norm_agent_key, "get_files_batch"), 0)
@@ -21299,7 +21330,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 print(f"[team] {agent_key or 'coordinator'} has made {_nb} batch reads "
                       f"(cap {_MAX_BATCH_READS_PER_MEMBER}) — refusing, one file at a "
                       f"time from here", flush=True)
-                return (
+                return _refuse(agent, function_name, args, "batch_read_cap", (
                     f"REFUSED: {_nb} batch reads is the cap for this run. Batching is "
                     f"what produced the worst measured answer on this system — a run "
                     f"with 10 batch reads reported 6 of 31 models, while runs with 4 or "
@@ -21308,11 +21339,15 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     f"missing.\n"
                     f"Read the files you still need ONE AT A TIME with "
                     f"get_file_content(path), and report each one's findings as you go."
-                )
+                ))
 
         is_fresh_fetch = cache_key not in cache
         if is_fresh_fetch:
-            result = await function(**args)
+            try:
+                result = await function(**args)
+            except Exception:
+                _count_investigation_call(agent, function_name, args, "", ok=False)   # D1, see above
+                raise
             cache[cache_key] = result
             cache_origin_generation[cache_key] = generation
             # Record a whole-file serve so the NEXT ranged read of this path collapses
@@ -21649,8 +21684,10 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             _collapse_prior_stub_messages(run_context, function_name, args_key)
             _bump_consecutive_stub_and_maybe_force_text_only(norm_agent_key, agent, consecutive_stub_count)
             if total is not None and total >= _FORCED_ANSWER_AGGREGATE_THRESHOLD:
-                return _forced_answer_nudge(agent_key, total)
-            return _duplicate_read_stub(function_name, args, agent_key, count, len(str(result)))
+                return _refuse(agent, function_name, args, "forced_answer_nudge",
+                               _forced_answer_nudge(agent_key, total))
+            return _refuse(agent, function_name, args, "duplicate_read",
+                           _duplicate_read_stub(function_name, args, agent_key, count, len(str(result))))
         consecutive_stub_count[norm_agent_key] = 0
         # Cross-generation evidence reuse marker (Option B: restore, explicitly
         # tagged -- see cache_origin_generation's own comment above). Fires only on
@@ -26827,6 +26864,11 @@ def _finalise_owned_delegation_fallback(team, delegation_id: str) -> None:
     captured = getattr(team, "_member_result_generation", None)
     if isinstance(captured, dict) and captured.get(member_key, -1) == my_generation:
         return  # the normal relay path already registered exactly this generation
+    if entry.get("agent_terminal") in ("FAILED", "CANCELLED"):
+        print(f"[delegation-lifecycle] delegation_fallback_not_registered delegation_id={delegation_id} "
+              f"member_id={member_key!r} agent_terminal={entry['agent_terminal']} -- partial output is "
+              f"diagnostic only", flush=True)
+        return   # D7: never register the partial output of a failed/cancelled member run
     current_gen = getattr(team, "_delegation_generation", None)
     if isinstance(current_gen, dict) and current_gen.get(member_key, 0) != my_generation:
         return  # a newer delegation for this member exists; this one is stale
@@ -27094,6 +27136,9 @@ _UNRESOLVED_RESULT_MARK = "UNRESOLVED RESULT"
 def _new_delegation_evidence(unavail_base: int = 0) -> dict:
     return {"ok": {}, "err": {}, "read_paths": set(), "seen_paths": set(),
             "searches": [], "tokens": set(), "unavail_base": unavail_base,
+            # Phase 1.14c/d: application-REFUSED calls (read ceiling, batch cap, ...) are neither
+            # successes nor failures of the tool, and `attempt_id` scopes this record to ONE attempt.
+            "refused": {}, "attempt_id": None,
             # Lower-cased text of this delegation's own successful tool results, bounded.
             # Used ONLY for an exact-substring check of path- or dot-shaped claim tokens
             # (route fragments, dotted code like router.get) that the token index cannot
@@ -27159,7 +27204,15 @@ def _record_call_in_evidence(ev: dict, function_name: str, args, text: str, ok: 
         ev["corpus_norm"] += chr(10) + _norm_punct(chunk)
         ev["corpus_chars"] += len(chunk)
     if function_name in _PATH_READ_TOOLS:
-        for v in _as_str_list(a.get("relative_path") or a.get("paths") or a.get("path")):
+        _requested = _as_str_list(a.get("relative_path") or a.get("paths") or a.get("path"))
+        if function_name == "get_files_batch":
+            # Phase 1.14c/d: a batch result is per-file. Only files whose section actually carries source
+            # content count as read; a requested path that came back as ERROR / File-not-found / empty /
+            # skeleton / cut off by the output cap, or has no section at all, was NOT read. (Previously every
+            # REQUESTED path was recorded as read.) get_file_content is unchanged.
+            from swarm.acceptance import parse_files_batch as _pfb
+            _requested = [r.path for r in _pfb(text, _requested) if r.status == "READ"]
+        for v in _requested:
             n = _norm_evidence_path(v)
             if n:
                 ev["read_paths"].add(n)
@@ -27310,13 +27363,16 @@ def _search_scope_examined(ev: dict, target: str) -> bool:
     return bool(ev["searches"] or ev["read_paths"])
 
 
-def _assess_member_result(team, key: str, text: str) -> dict:
+def _assess_member_result(team, key: str, text: str, attempt_id=None) -> dict:
     """Deterministic, explainable status for ONE delegation's report. See the block comment
-    above for what this does and does not establish."""
+    above for what this does and does not establish.
+
+    `attempt_id` (Phase 1.14c/d, D4): when given, evidence recorded under a DIFFERENT attempt id is
+    never consulted -- the delegation is judged as having no evidence rather than another attempt's."""
     gen = (getattr(team, "_delegation_generation", None) or {}).get(key, 0)
     base = {"status": "COMPLETE", "reason": "", "generation": gen, "claims": [],
             "supported": [], "unsupported": [], "sources": {}, "objective_class": "unknown",
-            "activity": {"ok": 0, "err": 0, "unavailable": 0, "reads": 0, "searches": 0},
+            "activity": {"ok": 0, "err": 0, "unavailable": 0, "reads": 0, "searches": 0, "refused": 0},
             "paths": []}
 
     def done(status, reason, **kw):
@@ -27335,22 +27391,29 @@ def _assess_member_result(team, key: str, text: str) -> dict:
     if not isinstance(evmap, dict) and not isinstance(calls, dict):
         return done("COMPLETE", "no delegation evidence tracking on this team (legacy behaviour)")
     ev = next((v for k, v in (evmap or {}).items() if _member_key(k) == key), None)
+    _other_attempt_ev = False
+    if (ev is not None and attempt_id is not None
+            and ev.get("attempt_id") not in (None, attempt_id)):
+        ev = None   # D4: another attempt's evidence is not this attempt's evidence
+        _other_attempt_ev = True
     if ev is None:
         ev = _new_delegation_evidence(unavailable_tool_snapshot().get("count", 0))
         # Counter-only tracking (no per-call record): the number of successful investigation
-        # calls is all that is known, so claims cannot be matched to results.
-        n = sum(v for k, v in (calls or {}).items() if _member_key(k) == key and v)
+        # calls is all that is known, so claims cannot be matched to results. NOT used when the
+        # record was discarded as another attempt's: that counter is per member, not per attempt.
+        n = 0 if _other_attempt_ev else sum(v for k, v in (calls or {}).items() if _member_key(k) == key and v)
         if n:
             ev["ok"]["(untracked)"] = n
 
     rec = (getattr(team, "_delegation_preloaded", None) or {}).get(key) or {}
     preload, echo = rec.get("text") or "", rec.get("echo") or ""
     ok_n, err_n = sum(ev["ok"].values()), sum(ev["err"].values())
+    refused_n = sum((ev.get("refused") or {}).values())
     unavail = max(0, unavailable_tool_snapshot().get("count", 0) - ev["unavail_base"])
     forced = (getattr(team, "_unavailable_forced_generation", None) or {}).get(key) == gen
     needs = _objective_class(rec.get("target"), rec.get("objective"), rec.get("evidence_required"))
     activity = {"ok": ok_n, "err": err_n, "unavailable": unavail,
-                "reads": len(ev["read_paths"]), "searches": len(ev["searches"])}
+                "reads": len(ev["read_paths"]), "searches": len(ev["searches"]), "refused": refused_n}
     paths = sorted(ev["read_paths"] | ev["seen_paths"])[:400]
 
     tool_names = {n.lower() for n in _known_tool_names(team)}
@@ -27390,7 +27453,7 @@ def _assess_member_result(team, key: str, text: str) -> dict:
               "diagnostics": _diag, "sources": sources, "objective_class": needs, "activity": activity,
               "paths": paths}
 
-    if ok_n == 0 and (forced or err_n > 0 or unavail > 0) and not supported:
+    if ok_n == 0 and (forced or err_n > 0 or refused_n > 0 or unavail > 0) and not supported:
         return done("BLOCKED", "only failed or unavailable tool attempts, and nothing in the "
                     "report is supported by this delegation's evidence or preloaded context", **common)
     if claims or unread or action_bad:
@@ -27407,6 +27470,15 @@ def _assess_member_result(team, key: str, text: str) -> dict:
             and not _search_scope_examined(ev, rec.get("target") or "")):
         return done("UNRESOLVED", "an absence claim without evidence that the relevant search "
                     "scope was examined", **common)
+    # D3 (Phase 1.14c/d): a report for an INVESTIGATION objective that carries no checkable claim of
+    # its own (every specific token it names was already in the delegation wording, or it names none)
+    # while NO source file was read is a restatement of the task, not a finding. Previously any single
+    # successful call of any kind (even a directory listing) let it through as COMPLETE. An absence
+    # report is exempt: it is judged by the scope check above.
+    if (needs == "investigation" and not claims and not unread and not action_bad
+            and not ev["read_paths"] and not _ABSENCE_RE.search(text)):
+        return done("UNRESOLVED", "the report adds no checkable claim beyond the delegation's own "
+                    "wording and no source file was read by this delegation", **common)
     if _EXPLICIT_INCOMPLETE_INVESTIGATION_RE.search(text) or _THIN_REPORT_MARKER in text:
         return done("PARTIAL", "the report itself says part of the objective was not examined",
                     **common)
@@ -27415,19 +27487,35 @@ def _assess_member_result(team, key: str, text: str) -> dict:
                 **common)
 
 
-def _assessment_for(team, key: str, text: str, generation=None) -> dict:
-    """The memoised assessment for (member, generation). Computed once, from whichever
-    path or relay sees the delegation's text first, then shared by every registration path
-    and the Coordinator relay so they cannot disagree."""
+def _evidence_fingerprint(team, key: str):
+    """A cheap fingerprint of the evidence an assessment would read, so a memoised verdict is never
+    reused after the evidence behind it changed (D5)."""
+    prog = getattr(team, "_delegation_progress", None)
+    evmap = prog.get("evidence") if isinstance(prog, dict) else None
+    ev = next((v for k, v in (evmap or {}).items() if _member_key(k) == key), None) if isinstance(evmap, dict) else None
+    if not isinstance(ev, dict):
+        return None
+    return (sum(ev.get("ok", {}).values()), sum(ev.get("err", {}).values()),
+            sum((ev.get("refused") or {}).values()), len(ev.get("read_paths", ())),
+            len(ev.get("searches", ())), ev.get("corpus_chars", 0), ev.get("attempt_id"))
+
+
+def _assessment_for(team, key: str, text: str, generation=None, attempt_id=None) -> dict:
+    """The memoised assessment, keyed by (member, generation, attempt, TEXT, EVIDENCE state) (D5). Computed
+    once per distinct (text, evidence), then shared by every registration path and the Coordinator relay so
+    they cannot disagree. The previous key (member, generation) let a verdict for a partial text, or for
+    evidence that has since changed, be returned for a later, different result."""
     gens = getattr(team, "_delegation_generation", None) or {}
     gen = gens.get(key, 0) if generation is None else generation
     memo = getattr(team, "_result_assessments", None)
     if not isinstance(memo, dict):
         memo = team._result_assessments = {}
-    a = memo.get((key, gen))
+    _mkey = (key, gen, attempt_id, hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()[:16],
+             _evidence_fingerprint(team, key))
+    a = memo.get(_mkey)
     if a is None:
         try:
-            a = _assess_member_result(team, key, text)
+            a = _assess_member_result(team, key, text, attempt_id=attempt_id)
         except Exception as exc:  # noqa: BLE001
             print(f"[team] result assessment failed for {key!r}: {exc} -- legacy behaviour "
                   f"(registered as COMPLETE)", flush=True)
@@ -27436,7 +27524,8 @@ def _assessment_for(team, key: str, text: str, generation=None) -> dict:
                     "objective_class": "unknown", "paths": [],
                     "activity": {"ok": 0, "err": 0, "unavailable": 0, "reads": 0, "searches": 0}}
         a["generation"] = gen
-        memo[(key, gen)] = a
+        a["attempt_id"] = attempt_id
+        memo[_mkey] = a
         if not isinstance(getattr(team, "_member_assessments", None), dict):
             team._member_assessments = {}
         team._member_assessments[key] = a
@@ -27484,19 +27573,39 @@ def _record_withheld_member_result(team, key: str, text: str, entry, a: dict) ->
           f"registered as a result, not forwardable, cannot be served as ALREADY DONE", flush=True)
 
 
-def _register_member_result(team, key: str, text: str) -> dict:
+def _register_member_result(team, key: str, text: str, generation=None, attempt_id=None,
+                            terminal_ok: bool = True) -> dict:
     """THE registration funnel. Every path that would store a member's text in
-    team._member_results goes through here, so the assessed status governs all of them."""
-    a = _assessment_for(team, key, text)
+    team._member_results goes through here, so the assessed status governs all of them.
+
+    Phase 1.14c/d: (D6) the generation stamped on a registered result is the ASSESSMENT's own generation,
+    fixed when the result was assessed, never re-read from mutable current state at registration time; and
+    when the caller states the generation its result belongs to, a result whose generation is no longer the
+    member's current one is rejected (stale/late). (D7) `terminal_ok=False` (the member run failed, was
+    cancelled, timed out, or never reached a terminal event) never registers: such text is diagnostic only.
+    With no new arguments the behaviour for existing callers is unchanged."""
+    a = _assessment_for(team, key, text, generation=generation, attempt_id=attempt_id)
+    _dg = getattr(team, "_delegation_generation", None)
+    if not terminal_ok:
+        a = dict(a)
+        a["registration"] = "rejected: non-terminal agent outcome"
+        print(f"[delegation-lifecycle] result_not_registered member_id={key!r} generation={a.get('generation')} "
+              f"reason='agent run did not reach a normal terminal state'", flush=True)
+        return a
+    if generation is not None and isinstance(_dg, dict) and _dg.get(key, 0) != generation:
+        a = dict(a)
+        a["registration"] = "rejected: stale generation"
+        print(f"[delegation-lifecycle] result_not_registered member_id={key!r} generation={generation} "
+              f"current={_dg.get(key, 0)} reason='stale generation'", flush=True)
+        return a
     if a["status"] in _REGISTRABLE_STATUSES:
         if not isinstance(getattr(team, "_member_results", None), dict):
             team._member_results = {}
         team._member_results[key] = text
-        _dg = getattr(team, "_delegation_generation", None)
         if isinstance(_dg, dict):
             if not isinstance(getattr(team, "_member_result_generation", None), dict):
                 team._member_result_generation = {}
-            team._member_result_generation[key] = _dg.get(key, 0)
+            team._member_result_generation[key] = a.get("generation", _dg.get(key, 0))
     return a
 
 
@@ -27665,10 +27774,15 @@ async def _assessed_member_relay(team, member_key: str, events, owned_entry=None
     (no raw text) if UNRESOLVED or BLOCKED. The assessment is made when the first terminal
     event arrives -- after every tool call and content chunk, before either registration
     path sees the result -- so the registration paths and this relay share one verdict."""
-    from agno.run.agent import RunContentEvent, RunContentCompletedEvent, RunCompletedEvent
+    from agno.run.agent import (RunContentEvent, RunContentCompletedEvent, RunCompletedEvent,
+                                RunErrorEvent, RunCancelledEvent)
     parts: list = []
     assessed = None
     pending_boundary = False
+    # D7 (Phase 1.14c/d): the member's own terminal outcome, from EXPLICIT events only. A stream that
+    # ends with no terminal event at all is left as "UNKNOWN" (unchanged behaviour): this relay is also
+    # used for Team members, whose streams are not proven to always carry RunCompleted.
+    agent_terminal = "UNKNOWN"
 
     def _assess():
         return _assessment_for(team, member_key, "".join(parts), generation=generation)
@@ -27677,6 +27791,12 @@ async def _assessed_member_relay(team, member_key: str, events, owned_entry=None
         if team is None:
             yield item
             continue
+        if isinstance(item, RunCompletedEvent):
+            agent_terminal = "COMPLETED"
+        elif isinstance(item, RunErrorEvent):
+            agent_terminal = "FAILED"
+        elif isinstance(item, RunCancelledEvent):
+            agent_terminal = "CANCELLED"
         if isinstance(item, RunContentEvent) and isinstance(getattr(item, "content", None), str):
             # Same rule as _accumulate_member_chunk (Phase 1.05): a chunk after a model-request
             # or tool event of this member is a new logical response -- keep the boundary.
@@ -27699,6 +27819,17 @@ async def _assessed_member_relay(team, member_key: str, events, owned_entry=None
     if team is None:
         return
     text = "".join(parts)
+    if owned_entry is not None:
+        owned_entry["agent_terminal"] = agent_terminal
+    if agent_terminal in ("FAILED", "CANCELLED"):
+        # D7: partial output from a failed or cancelled member run is diagnostic only. It is not shown to the
+        # Coordinator as a result, and _finalise_owned_delegation_fallback will not register it.
+        print(f"[coordinator-relay] member_id={member_key!r} agent_terminal={agent_terminal} "
+              f"member_chars={len(text):,} -- NOT accepted, not forwarded as a result", flush=True)
+        yield (f"[RESULT STATUS: NOT_ACCEPTED — this delegation's agent run ended {agent_terminal}. Any partial "
+               f"output it produced was withheld and is NOT evidence. Delegate it again if the objective still "
+               f"matters, or state in your answer that this part was not completed.]")
+        return
     try:
         if assessed is None:
             assessed = _assess()
