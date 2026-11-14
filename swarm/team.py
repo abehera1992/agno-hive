@@ -36,6 +36,7 @@ from swarm import phase0
 from swarm import context_pack
 from swarm import execution_context
 from swarm import execution_store
+from swarm import run_reconcile
 # Phase 1.14c/d: structured refusal marker + attempt-id context (see swarm/acceptance.py).
 from swarm.acceptance import ToolRefusal, ATTEMPT_ID as _ATTEMPT_ID
 
@@ -29482,6 +29483,9 @@ async def run_task_stream(
         # only two boundaries this phase ever checkpoints at.
         await execution_store.guard(execution_store.persist_checkpoint(
             team._run_context, run_status="running"))
+        # Phase 1.18C: record which worker owns this run (existing acquire_run_ownership, lease renewed while the run
+        # lives, released below). A killed worker's run is then reconciled instead of staying `running` forever.
+        team._run_lease = await run_reconcile.claim_run(team._run_context.run_id)
 
         full_content: list[str] = []
         # See _stream_team_run's own docstring for the narration-leak incident this
@@ -29631,6 +29635,7 @@ async def run_task_stream(
                         _run_ctx, status=_final_status,
                         error=str(sys.exc_info()[1]) if sys.exc_info()[1] is not None else None,
                     ))
+                    await run_reconcile.release_run(getattr(team, "_run_lease", None))
                     # Phase H: terminal checkpoint -- the run reached a clean,
                     # in-process-observable end (never written for a SIGKILL,
                     # which is the whole point: see persist_checkpoint's own
@@ -35131,6 +35136,9 @@ async def run_task_async(
         # this phase ever checkpoints at.
         await execution_store.guard(execution_store.persist_checkpoint(
             team._run_context, run_status="running"))
+        # Phase 1.18C: record which worker owns this run (existing acquire_run_ownership, lease renewed while the run
+        # lives, released below). A killed worker's run is then reconciled instead of staying `running` forever.
+        team._run_lease = await run_reconcile.claim_run(team._run_context.run_id)
 
         # ContextPack (Phase 2, Experiment 2). Resolved ONCE here, before the team
         # runs, so the delegation hook does no I/O. Targets come from the TASK rather
@@ -35855,6 +35863,7 @@ async def run_task_async(
                         _run_ctx, status=_final_status,
                         error=str(_exc) if _exc is not None else None,
                     ))
+                    await run_reconcile.release_run(getattr(team, "_run_lease", None))
                     # Phase H: terminal checkpoint -- runs strictly after any
                     # retries have already finished (this finally wraps the
                     # whole function, including _verified_answer's own

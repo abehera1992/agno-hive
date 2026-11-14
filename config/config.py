@@ -481,6 +481,11 @@ class Config:
     # the run as unsupervised (missing != healthy) and terminates it.
     workflow_snapshot_grace_s: float = float(os.getenv("HIVE_WF_SNAPSHOT_GRACE_S", "90"))
 
+    # Phase 1.18C -- startup reconciliation of Team runs left `running` by a dead worker. Runs OWNED by this instance
+    # whose worker is verifiably gone are always reconciled. Old, unowned, inactive HISTORICAL rows are only classified and
+    # logged ("report", the default); "apply" transitions them. "off" disables startup reconciliation entirely.
+    reconcile_historical: str = os.getenv("HIVE_RECONCILE_HISTORICAL", "report").strip().lower()
+
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))
     session_window: int = int(os.getenv("AGNO_SESSION_WINDOW", "6"))

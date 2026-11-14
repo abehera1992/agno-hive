@@ -274,9 +274,41 @@ async def _ledger_recover(pid: int | None = None, reason: str | None = None) -> 
         return None
 
 
+async def _reconcile_runs_on_exit(pid: int) -> None:
+    """Phase 1.18C. Called after the parent observed a worker's exit: any Team run still `running` and owned by that
+    worker is terminated (recorded `failed` with the cause). Best effort: never raises, never blocks a response."""
+    if config.reconcile_historical == "off":
+        return
+    try:
+        from swarm import run_reconcile
+        r = await run_reconcile.reconcile_worker_exit(pid)
+        if r.get("applied"):
+            print(f"[api] reconciled {r['applied']} unfinished Team run(s) of exited worker {pid}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[api] run reconciliation skipped ({type(exc).__name__}: {exc})", flush=True)
+
+
 @app.on_event("startup")
 async def _recover_workflow_ledger():
     await _ledger_recover()
+
+
+@app.on_event("startup")
+async def _reconcile_team_runs_startup():
+    if config.reconcile_historical == "off":
+        return
+    from swarm import run_reconcile
+    await run_reconcile.reconcile_startup(config.reconcile_historical)
+
+
+@app.get("/admin/runs/reconcile-report")
+async def reconcile_report(limit: int = 50):
+    """Read-only dry run: every Team run still marked `running`, classified from evidence (nothing is changed)."""
+    from swarm import run_reconcile
+    items = await run_reconcile.classify_running_runs()
+    return {"summary": run_reconcile.summarize(items), "items": [
+        {k: i[k] for k in ("run_id", "cls", "reason", "applicable")} | {"evidence": i["evidence"]}
+        for i in items[:max(1, min(limit, 500))]]}
 
 
 @app.get("/ledger/tasks/{task_id}")
@@ -962,6 +994,7 @@ async def _run_worker_subprocess(
     finally:
         _ACTIVE_WORKERS.pop(proc.pid, None)
         await _ledger_recover(pid=proc.pid)       # Phase 1.17: attempts of a dead worker are ABANDONED, never accepted
+        await _reconcile_runs_on_exit(proc.pid)   # Phase 1.18C: a Team run its worker never completed is no longer `running`
         # Read the draft BEFORE the unlink below, not inside _salvage. This block runs
         # on every exit path, so by the time any error branch calls _salvage the file is
         # already gone — the first version of the salvage read it there and recovered
@@ -1121,6 +1154,7 @@ async def _stream_worker_subprocess(http_request, payload: dict, argv: list[str]
         if proc.returncode is None:
             proc.kill()
             await proc.wait()
+        await _reconcile_runs_on_exit(proc.pid)
 
 
 def _resolve_orchestration(requested: str | None) -> str:
