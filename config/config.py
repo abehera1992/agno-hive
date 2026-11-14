@@ -489,6 +489,8 @@ class Config:
     max_active_workers: int = int(os.getenv("HIVE_MAX_ACTIVE_WORKERS", "4"))
     worker_queue_max: int = int(os.getenv("HIVE_WORKER_QUEUE_MAX", "4"))
     worker_queue_wait_s: float = float(os.getenv("HIVE_WORKER_QUEUE_WAIT_S", "120"))
+    # Phase 1.18F: route the supervisor's stop decisions through the shared guard layer (swarm/guards.py). Off = original inline path.
+    shared_guards: bool = os.getenv("HIVE_SHARED_GUARDS", "0").strip().lower() in ("1", "true", "yes", "on")
 
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))

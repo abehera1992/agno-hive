@@ -734,6 +734,44 @@ async def _workflow_supervised_final(payload: dict, snapshot: dict | None, pid: 
     return text, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, None
 
 
+# --- Phase 1.18F: shared guard layer ---------------------------------------------------------------
+# The decision functions above are wrapped, not rewritten. With HIVE_SHARED_GUARDS=1 the supervisor asks this layer
+# for the stop decision; with it off (default) the original inline code runs. Never both. The supervisor stays the only
+# thing that kills a worker.
+from swarm import guards as _guards  # noqa: E402
+
+
+def _g_workflow_supervision(ctx):
+    return _workflow_supervision_reason(ctx.snapshot, pid=ctx.ref.worker_pid, nonce=ctx.ref.nonce,
+                                        started_at=ctx.started_at, now=ctx.now)
+
+
+def _g_liveness(ctx):
+    if ctx.snapshot is None or not ctx.belongs:
+        return None
+    return _liveness_kill_reason(ctx.snapshot)
+
+
+GUARDS = _guards.GuardLayer([
+    _guards.CallableGuard("workflow_supervision", {_guards.WORKFLOW}, 0, _g_workflow_supervision),
+    _guards.CallableGuard("liveness", {_guards.TEAM, _guards.WORKFLOW}, 10, _g_liveness),
+], enabled=config.shared_guards)
+
+
+def _guard_ctx(engine: str, pid: int, snapshot, belongs: bool, started_at: float, nonce: str | None = None):
+    s = snapshot or {}
+    ref = _guards.ExecutionRef(engine=engine, worker_pid=pid, task_id=s.get("task_id"),
+                               run_id=s.get("workflow_run_id") or s.get("run_id"), unit_id=s.get("work_item_id"),
+                               attempt_id=s.get("attempt_id"), nonce=nonce)
+    return _guards.GuardContext(engine=engine, ref=ref, snapshot=snapshot, belongs=belongs, started_at=started_at, now=time.time())
+
+
+@app.get("/admin/guards")
+async def admin_guards():
+    """The shared guard layer: registered guards, whether it is the active decision path, counters, recent decisions."""
+    return GUARDS.status()
+
+
 # Active swarm worker subprocesses, pid -> metadata. Populated on spawn, removed in
 # the same finally that cleans up the liveness file.
 #
@@ -937,9 +975,16 @@ async def _run_worker_subprocess_inner(
                     _seen_snapshot = True
                     print(f"[api] workflow supervision: snapshot observed pid={proc.pid} task={_ok.get('task_id')} "
                           f"state={_ok.get('wf_state')}", flush=True)
-                _why = _workflow_supervision_reason(_snap, pid=proc.pid, nonce=_wf_nonce, started_at=_spawn_at)
-                if _why is None and _ok is not None:
-                    _why = _liveness_kill_reason(_ok)
+                if config.shared_guards:      # Phase 1.18F: one decision path, never both
+                    _dec = GUARDS.evaluate(_guard_ctx("workflow", proc.pid, _snap, _ok is not None, _spawn_at, _wf_nonce))
+                    _why = _dec.reason if _dec is not None else None
+                    if _dec is not None:
+                        print(f"[guards] decision guard={_dec.guard} action={_dec.action} engine={_dec.engine} "
+                              f"pid={proc.pid} task={_dec.ref.task_id}", flush=True)
+                else:
+                    _why = _workflow_supervision_reason(_snap, pid=proc.pid, nonce=_wf_nonce, started_at=_spawn_at)
+                    if _why is None and _ok is not None:
+                        _why = _liveness_kill_reason(_ok)
                 if _why is not None:
                     proc.kill()
                     await proc.wait()
@@ -948,7 +993,14 @@ async def _run_worker_subprocess_inner(
             if config.enable_liveness_autokill and not _is_wf:
                 snapshot = _read_liveness_snapshot(liveness_path)
                 if snapshot is not None:
-                    reason = _liveness_kill_reason(snapshot)
+                    if config.shared_guards:      # Phase 1.18F: one decision path, never both
+                        _dec = GUARDS.evaluate(_guard_ctx("team", proc.pid, snapshot, True, _spawn_at))
+                        reason = _dec.reason if _dec is not None else None
+                        if _dec is not None:
+                            print(f"[guards] decision guard={_dec.guard} action={_dec.action} engine={_dec.engine} "
+                                  f"pid={proc.pid}", flush=True)
+                    else:
+                        reason = _liveness_kill_reason(snapshot)
                     if reason is not None:
                         proc.kill()
                         await proc.wait()
@@ -1045,6 +1097,7 @@ async def _run_worker_subprocess_inner(
         raise
     finally:
         _ACTIVE_WORKERS.pop(proc.pid, None)
+        GUARDS.forget(proc.pid)                   # Phase 1.18F: the pid may be reused later
         await _ledger_recover(pid=proc.pid)       # Phase 1.17: attempts of a dead worker are ABANDONED, never accepted
         await _reconcile_runs_on_exit(proc.pid)   # Phase 1.18C: a Team run its worker never completed is no longer `running`
         # Read the draft BEFORE the unlink below, not inside _salvage. This block runs
