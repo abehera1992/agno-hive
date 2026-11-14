@@ -324,6 +324,9 @@ class EvidencePolicy:
     name: str
     requirements: list
     links: list = field(default_factory=list)
+    # Phase 1.23: content-level coverage obligations, evaluated by enum_requirement_result() and
+    # folded into gate_evaluate()'s satisfied/missing alongside `requirements` -- see EnumRequirement.
+    enum_requirements: list = field(default_factory=list)
 
 
 _FORM = "auth/register/business/businessregistrationform.tsx"
@@ -370,6 +373,96 @@ def _section_for(o, p) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------- Phase 1.23: deterministic coverage
+@dataclass
+class EnumRequirement:
+    """A coverage obligation satisfied only when a specific named item appears in the attempt's OWN
+    final answer text AND is traceable to source text this attempt actually read (Track B property 3:
+    a claim alone never satisfies an obligation). `items` is a list of (item_id, pattern) pairs; pattern
+    is matched case-insensitively as a regex against both the answer and the scoped source text.
+    `source_paths` mirrors Requirement.any_of_paths (ANY_SOURCE for "any file this attempt read").
+    An item whose membership cannot be reliably decided by substring/regex matching (e.g. a word that is
+    also the task's own generic topic noun) should use pattern=None and is reported NOT_EVALUATED rather
+    than guessed -- this stays an accuracy/framing question for the existing assessor, never silently
+    scored as satisfied."""
+    id: str
+    description: str
+    items: list
+    source_paths: list
+    mandatory: bool = True
+
+
+def enum_requirement_result(req: "EnumRequirement", srcs: dict, text: str) -> dict:
+    report = text or ""
+    if list(req.source_paths) == [ANY_SOURCE]:
+        scoped_src, scope_read = "\n".join(srcs.values()), bool(srcs)
+    else:
+        parts = [t for p, t in srcs.items() if any(p.endswith(norm_path(c)) for c in req.source_paths)]
+        scoped_src, scope_read = "\n".join(parts), bool(parts)
+    items_out = []
+    for item_id, pattern in req.items:
+        if pattern is None:
+            items_out.append({"item_id": item_id, "status": "NOT_EVALUATED",
+                              "why": "no reliable deterministic pattern for this item (see EnumRequirement docstring)"})
+            continue
+        in_answer = bool(re.search(pattern, report, re.I))
+        if not in_answer:
+            items_out.append({"item_id": item_id, "status": "MISSING", "in_answer": False, "in_evidence": None})
+            continue
+        in_evidence = scope_read and bool(re.search(pattern, scoped_src, re.I))
+        items_out.append({"item_id": item_id, "status": "SATISFIED" if in_evidence else "INSUFFICIENT_EVIDENCE",
+                          "in_answer": True, "in_evidence": in_evidence})
+    evaluated = [i for i in items_out if i["status"] != "NOT_EVALUATED"]
+    if not evaluated:
+        overall = "NOT_EVALUATED"
+    elif any(i["status"] == "MISSING" for i in evaluated):
+        overall = "MISSING"
+    elif any(i["status"] == "INSUFFICIENT_EVIDENCE" for i in evaluated):
+        overall = "INSUFFICIENT_EVIDENCE"
+    else:
+        overall = "SATISFIED"
+    return {"id": req.id, "description": req.description, "mandatory": req.mandatory, "status": overall,
+            "items": items_out}
+
+
+def _voucher_pat(*alts) -> str:
+    return "|".join(alts)
+
+
+T13_ENDPOINTS_REQ = EnumRequirement(
+    "EP_endpoints", "all 9 voucher endpoints named, backed by vouchers_api.py", [
+        ("list_vouchers", _voucher_pat(r"list_vouchers\b", r"\blist\s+vouchers\b", r"get\s*/vouchers\b(?!/)")),
+        ("get_voucher", _voucher_pat(r"get_voucher\b", r"\bget\s+voucher\b(?!s)", r"/vouchers/\{?\s*voucher_id")),
+        ("create_voucher", _voucher_pat(r"create_voucher\b", r"\bcreate\s+voucher\b(?!s)", r"post\s*/vouchers\b(?!/)")),
+        ("post_voucher", _voucher_pat(r"post_voucher\b", r"\bpost\s+(?:a\s+)?voucher\b", r"/vouchers/.{0,24}/post\b")),
+        ("cancel_voucher", _voucher_pat(r"cancel_voucher\b", r"\bcancel\s+(?:a\s+)?voucher\b", r"/vouchers/.{0,24}/cancel\b")),
+        ("create_grn_from_po", _voucher_pat(r"create_grn_from_po", r"\bgrn\b")),
+        ("create_credit_note", _voucher_pat(r"create_credit_note", r"credit[\s_-]?note")),
+        ("create_stock_adjustment", _voucher_pat(r"create_stock_adjustment", r"stock[\s_-]?adjustment")),
+        ("create_stock_transfer", _voucher_pat(r"create_stock_transfer", r"stock[\s_-]?transfer")),
+    ], ["api/inventory-service/router/vouchers_api.py"])
+T13_HOOKS_REQ = EnumRequirement(
+    "EP_hooks", "all 5 voucher frontend hooks named, backed by inventoryApi.ts", [
+        ("useGetVouchersQuery", r"useGetVouchersQuery"),
+        ("useGetVoucherQuery", r"useGetVoucherQuery"),
+        ("useCreateVoucherMutation", r"useCreateVoucherMutation"),
+        ("usePostVoucherMutation", r"usePostVoucherMutation"),
+        ("useCancelVoucherMutation", r"useCancelVoucherMutation"),
+    ], ["client/ecommclient-web/ekamweb/src/lib/api/services/inventory/inventoryapi.ts"])
+T13_TABLES_REQ = EnumRequirement(
+    "EP_tables", "voucher-owned tables named (Voucher's own bare name is NOT_EVALUATED by design -- "
+    "'voucher(s)' is this task's own generic topic noun and cannot be discriminated from casual mention "
+    "by substring matching; VoucherSeries/VoucherVersion are distinctive enough to check)", [
+        ("Voucher", None),
+        ("VoucherSeries", _voucher_pat(r"VoucherSeries", r"voucher_series", r"voucher\s+series")),
+        ("VoucherVersion", _voucher_pat(r"VoucherVersion", r"voucher_version", r"voucher\s+version")),
+    ], ["api/inventory-service/models.py"])
+T13_VOUCHER_POLICY = EvidencePolicy(
+    name="t13-voucher-audit",
+    requirements=[],   # T13a names no files (deliberately); T13b's 3 named files get their own Requirements
+                       # from derive_policy()'s existing per-path mechanism and are merged in, not duplicated here.
+    enum_requirements=[T13_ENDPOINTS_REQ, T13_HOOKS_REQ, T13_TABLES_REQ])
+
 ANY_SOURCE = "*"      # Phase 1.20: a generic requirement -- ANY successful source read of this attempt satisfies it
 
 
@@ -386,7 +479,7 @@ def _req_source(req, srcs):
 def gate_evaluate(policy, outcomes, text) -> dict:
     """Only SUCCESS source_read outcomes of THIS attempt satisfy R1-R4; R5 needs source-text evidence of each hop."""
     if policy is None:
-        return {"applicable": False, "satisfied": [], "missing": [], "reads": {}}
+        return {"applicable": False, "satisfied": [], "missing": [], "reads": {}, "enum_detail": [], "not_evaluated": []}
     srcs = _read_sources(outcomes)
     sat, miss = [], []
     by_req = {}
@@ -418,8 +511,27 @@ def gate_evaluate(policy, outcomes, text) -> dict:
         (sat if ok5 else miss).append({"id": "R5_traceable_relationships",
                                        "description": "evidence-backed relationships between upload, storage, registration, verification",
                                        "links": link_results})
+    # Phase 1.23: content-level enumeration obligations. SATISFIED -> sat (same shape as a Requirement,
+    # decide()'s n_sat/missing-id logic only reads "id"); mandatory MISSING/INSUFFICIENT_EVIDENCE -> miss
+    # (so decide()'s existing PARTIAL/UNRESOLVED/BLOCKED computation picks these up with zero changes to
+    # decide() itself); optional-and-unsatisfied and NOT_EVALUATED NEVER enter sat or miss -- Track B
+    # property 7 (optional must not block) and property 6 (an unverifiable obligation must be reported,
+    # not guessed as satisfied OR held against the attempt as missing).
+    enum_detail, not_evaluated = [], []
+    for er in policy.enum_requirements:
+        res = enum_requirement_result(er, srcs, text)
+        enum_detail.append(res)
+        if res["status"] == "SATISFIED":
+            sat.append({"id": res["id"], "description": res["description"], "items": res["items"]})
+        elif res["status"] == "NOT_EVALUATED":
+            not_evaluated.append({"id": res["id"], "description": res["description"], "items": res["items"]})
+        elif er.mandatory:
+            miss.append({"id": res["id"], "description": res["description"], "items": res["items"]})
+        else:
+            not_evaluated.append({"id": res["id"], "description": res["description"], "items": res["items"],
+                                  "note": "optional, unsatisfied -- does not block completion"})
     return {"applicable": True, "satisfied": sat, "missing": miss, "links": link_results,
-            "reads": {p: True for p in srcs}}
+            "reads": {p: True for p in srcs}, "enum_detail": enum_detail, "not_evaluated": not_evaluated}
 
 
 # ---------------------------------------------------------------------------- attempts and registry
@@ -606,6 +718,12 @@ class Decision:
     registration: Optional[dict] = None
     steps: list = field(default_factory=list)
     not_accepted_cause: Optional[str] = None   # why NOT_ACCEPTED when it is not an Agent/validity cause
+    # Phase 1.23: reported SEPARATELY from `acceptance` (which stays the existing combined/restricted
+    # verdict, derivation unchanged) so a reader can distinguish "no valid terminal result was even
+    # selected" from "a coverage obligation is missing" from "accuracy of what WAS said is in question" --
+    # Track C's explicit requirement not to collapse these into one score.
+    terminal_integrity: str = "N/A"    # VALID | MISSING | N/A (gate not reached: error/cancel/timeout upstream)
+    coverage_status: str = "N/A"       # SATISFIED | MISSING_MANDATORY | N/A (no coverage policy applicable)
 
 
 def _to_acceptance(assessor_status: str) -> str:
@@ -637,6 +755,10 @@ def decide(a: Attempt, policy, registry: Registry = None, outcomes=None, registe
                  assessor_reason=asm["reason"],
                  assessor_claims={"claims": len(asm["claims"]), "supported": len(asm["supported"]),
                                   "unsupported": list(asm["unsupported"])[:20]})
+    # Phase 1.23: reported independent of `acceptance`'s combined derivation (see Decision's own docstring note).
+    rss = (a.terminal or {}).get("result_selection_status")
+    d.terminal_integrity = {"TERMINAL_SELECTED": "VALID", "MISSING_TERMINAL": "MISSING"}.get(rss, "N/A")
+    d.coverage_status = "N/A" if not gate["applicable"] else ("MISSING_MANDATORY" if gate["missing"] else "SATISFIED")
     d.validity = registry.validity(a) if registry else "CURRENT"
     steps.append(("3.attempt_validity", d.validity))
     if d.validity != "CURRENT":
@@ -695,4 +817,7 @@ def summarize(d: Decision) -> dict:
             "outcomes_S_F_R_C_T_U": [d.counts["all"][k] for k in OUTCOMES], "source_files_read": len(d.counts["source_files_read"]),
             "requirements_missing": [m["id"] for m in d.gate["missing"]] if d.gate["applicable"] else "n/a",
             "assessor": d.assessor_status, "acceptance": d.acceptance, "reason": d.reason[:200],
-            "registration": (d.registration or {}).get("reason")}
+            "registration": (d.registration or {}).get("reason"),
+            # Phase 1.23: the five dimensions Track C requires reported separately.
+            "terminal_integrity": d.terminal_integrity, "accuracy": d.assessor_status,
+            "coverage": d.coverage_status, "execution": d.execution_status, "overall_acceptance": d.acceptance}

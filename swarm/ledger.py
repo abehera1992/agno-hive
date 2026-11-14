@@ -343,7 +343,10 @@ class Ledger:
                       (attempt_id, a["task_id"], a["work_item_id"], a["generation"], acceptance, d.get("execution_status"), validity,
                        d.get("assessor_status"), (d.get("assessor_reason") or "")[:300], cause, reason_text,
                        _j(d.get("overrides")), _j(d.get("gate")), _j(d.get("counts")), _j(d.get("assessor_claims")),
-                       _j(d.get("requirements")), _j({"execution_reason": d.get("execution_reason"), "identity": d.get("identity")}),
+                       _j(d.get("requirements")), _j({"execution_reason": d.get("execution_reason"), "identity": d.get("identity"),
+                       # Phase 1.23: additive, no schema change -- extra_json is the pre-existing designed
+                       # extension point for exactly this (see this column's own DDL comment history).
+                       "terminal_integrity": d.get("terminal_integrity"), "coverage_status": d.get("coverage_status")}),
                        sha, time.time()))
             c.execute("INSERT INTO registration(attempt_id,task_id,work_item_id,generation,kind,status,reason,registered_at) VALUES(?,?,?,?,?,?,?,?)",
                       (attempt_id, a["task_id"], a["work_item_id"], a["generation"], kind, status, cause or "", time.time()))
@@ -473,4 +476,11 @@ def decision_to_dict(d, requirements=None) -> dict:
     return {"acceptance": d.acceptance, "execution_status": d.execution_status, "validity": d.validity,
             "assessor_status": d.assessor_status, "assessor_reason": d.assessor_reason, "not_accepted_cause": d.not_accepted_cause,
             "reason": d.reason, "overrides": d.overrides, "gate": d.gate, "counts": d.counts, "assessor_claims": d.assessor_claims,
-            "requirements": requirements, "execution_reason": d.execution_reason, "identity": d.identity}
+            "requirements": requirements, "execution_reason": d.execution_reason, "identity": d.identity,
+            # Phase 1.23: no schema change -- these ride inside the existing JSON blob this function already
+            # produces (same additive principle as `gate` already carrying d.gate's new enum_detail/not_evaluated
+            # keys with zero changes needed here). A pre-Phase-1.23 historical decision simply has no such key
+            # when read back (not a fabricated "N/A" written retroactively) -- see decision_from_dict-equivalent
+            # readers, which must treat a missing key as absence of information, never as a value.
+            "terminal_integrity": getattr(d, "terminal_integrity", None),
+            "coverage_status": getattr(d, "coverage_status", None)}

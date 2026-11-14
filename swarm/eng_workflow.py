@@ -76,11 +76,40 @@ def extract_paths(text: str) -> list:
     return out
 
 
-def derive_policy(paths: list):
+# Phase 1.23: a small, explicit, hand-maintained registry mapping a KNOWN runbook task's own
+# distinctive wording to its own pre-authored content-coverage policy. This exists because T11 and
+# T13a deliberately name no files in their prompt text (that is the point of those two tests -- see
+# docs/runbooks/groundedness-battery.md), so extract_paths()-based policy derivation below can never
+# reach them; without this registry those tasks fall into the generic "read at least one file" policy,
+# which is the root cause Phase 1.23 investigated (a file was read -> gate satisfied, regardless of
+# whether the answer actually covers what the task asked for). Matching is a short, distinctive
+# substring, case-insensitive -- never a full-prompt hash, so a word-level prompt edit degrades to the
+# safer failure direction (falls through to the generic/per-path policy, looser coverage) rather than a
+# false, stricter block. Extend this list only for a runbook prompt with its own vetted ground truth;
+# never invent a policy for a task that hasn't been independently verified.
+_KNOWN_TASK_POLICIES = (
+    ("when a seller uploads a document", A.T11_DOC_UPLOAD_POLICY),
+    ("audit the vouchers module", A.T13_VOUCHER_POLICY),
+)
+
+
+def _known_policy_for(task: str):
+    t = (task or "").lower()
+    for phrase, policy in _KNOWN_TASK_POLICIES:
+        if phrase in t:
+            return policy
+    return None
+
+
+def derive_policy(paths: list, task: str = ""):
     """Deterministic evidence policy: one requirement per named file (a SUCCESS source_read of that file by the
-    attempt). The known T11 doc-upload chain additionally gets its evidence-backed relationship links."""
+    attempt). The known T11 doc-upload chain additionally gets its evidence-backed relationship links. A task
+    matching a known runbook prompt (Phase 1.23, _known_policy_for) also gets that prompt's own content-coverage
+    obligations (EvidencePolicy.enum_requirements), merged with whatever per-named-file requirements the task's
+    own wording independently produces -- never replacing them."""
+    known = _known_policy_for(task)
     if not paths:
-        return A.EvidencePolicy(name="generic-source-evidence", requirements=[
+        return known if known is not None else A.EvidencePolicy(name="generic-source-evidence", requirements=[
             A.Requirement("G1_source_read", "at least one source file was actually read in this attempt (any file)", [A.ANY_SOURCE])])
     t11 = {A.norm_path(c): r for r in A.T11_DOC_UPLOAD_POLICY.requirements for c in r.any_of_paths}
     reqs, used = [], set()
@@ -93,8 +122,9 @@ def derive_policy(paths: list):
         else:
             reqs.append(A.Requirement(f"F{i}_read_{os.path.basename(p)}", f"read source file {p}", [n]))
     links = list(A.T11_DOC_UPLOAD_POLICY.links) if used >= {r.id for r in A.T11_DOC_UPLOAD_POLICY.requirements} else []
+    enum_reqs = list(known.enum_requirements) if known is not None else []
     return A.EvidencePolicy(name="derived-" + hashlib.sha256("|".join(paths).encode()).hexdigest()[:8],
-                            requirements=reqs, links=links)
+                            requirements=reqs, links=links, enum_requirements=enum_reqs)
 
 
 MAX_WORK_ITEMS = 4
@@ -140,7 +170,7 @@ def plan_request(task: str, task_id: str) -> WorkPlan:
         target=("Files named in the request: " + " ; ".join(paths)) if paths else
                "The request as stated. It names no file; use your own search and read tools to find and read the relevant source.",
         objective=task, evidence_required=evidence, completion_criteria=criteria,
-        paths=paths, policy=derive_policy(paths))
+        paths=paths, policy=derive_policy(paths, task))
     return WorkPlan(task_id, [wi])
 
 
@@ -747,7 +777,7 @@ def reconstruct_final(led, task_id: str) -> Optional[str]:
         w = it["work_item"]
         spec = _json.loads(w["spec_json"])
         wi = WorkItem(w["work_item_id"], w["title"], spec["target"], spec["objective"], spec["evidence_required"],
-                      spec["completion_criteria"], spec["paths"], derive_policy(spec["paths"]))
+                      spec["completion_criteria"], spec["paths"], derive_policy(spec["paths"], spec["objective"]))
         items.append(wi)
         for a in it["attempts"]:
             at = a["attempt"]
