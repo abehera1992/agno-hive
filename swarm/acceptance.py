@@ -511,6 +511,7 @@ def build_assessor_state(a: Attempt, outcomes):
     from swarm import team as T
     ev = T._new_delegation_evidence(T.unavailable_tool_snapshot().get("count", 0))
     ev["attempt_id"] = a.attempt_id
+    ev["compose_routes"] = True     # Phase 1.16: same-file router-prefix composition is recognised on this path only
     for o in outcomes:
         if o.tool in STATE_TOOLS:
             continue

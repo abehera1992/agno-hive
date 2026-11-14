@@ -88,6 +88,27 @@ def derive_policy(paths: list):
                             requirements=reqs, links=links)
 
 
+MAX_WORK_ITEMS = 4
+
+
+def plan_work_items(items: list, task_id: str) -> WorkPlan:
+    """Caller-provided explicit work items (each a string naming its own repository files). Deterministic and
+    validated: 1..MAX_WORK_ITEMS items, each must name at least one file. Every item gets its own id, evidence
+    policy and attempts; nothing is decomposed or routed by a model. One bad item rejects the whole plan."""
+    texts = [str(i).strip() for i in (items or []) if str(i).strip()]
+    if not texts or len(texts) > MAX_WORK_ITEMS:
+        return WorkPlan(task_id, [], f"work_items must contain 1..{MAX_WORK_ITEMS} non-empty items (got {len(texts)})")
+    out = []
+    for k, t in enumerate(texts, 1):
+        p = plan_request(t, task_id)
+        if not p.items:
+            return WorkPlan(task_id, [], f"work item {k} rejected: {p.rejected_reason}")
+        wi = p.items[0]
+        wi.work_item_id, wi.title = f"wi-{k}", f"Work item {k}"
+        out.append(wi)
+    return WorkPlan(task_id, out)
+
+
 def plan_request(task: str, task_id: str) -> WorkPlan:
     """Application-owned plan. Validation: the request must name at least one repository file; otherwise the
     application cannot define required evidence, and refuses to dispatch rather than let a model invent scope."""
@@ -98,14 +119,14 @@ def plan_request(task: str, task_id: str) -> WorkPlan:
     if not paths:
         return WorkPlan(task_id, [], "the request names no repository file path, so the application cannot define "
                                      "required source evidence (workflow path is investigation of named files)")
+    evidence = ("For each named file: the file path you read, the function/handler name, and the route path "
+                "or URL, taken from file content you actually read.")
+    criteria = ("Done when each named file has a source-backed finding, or an explicit statement of "
+                "which file or step could not be evidenced and why.")
     wi = WorkItem(
         work_item_id="wi-1", title="Investigate the named files",
         target="Files named in the request: " + " ; ".join(paths),
-        objective=task,
-        evidence_required=("For each named file: the file path you read, the function/handler name, and the route path "
-                           "or URL, taken from file content you actually read."),
-        completion_criteria=("Done when each named file has a source-backed finding, or an explicit statement of "
-                             "which file or step could not be evidenced and why."),
+        objective=task, evidence_required=evidence, completion_criteria=criteria,
         paths=paths, policy=derive_policy(paths))
     return WorkPlan(task_id, [wi])
 
@@ -188,6 +209,13 @@ def _controls(raw) -> dict:
     return dict(raw)
 
 
+def item_controls(controls: dict, work_item_id: str) -> dict:
+    """Global controls with per-work-item overrides (controls["items"][work_item_id]) applied."""
+    base = {k: v for k, v in (controls or {}).items() if k != "items"}
+    base.update(((controls or {}).get("items") or {}).get(work_item_id) or {})
+    return base
+
+
 async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, attempt_no: int):
     """Create a NEW attempt (new id + generation via the registry), run the real Researcher under it, observe the
     Agent's own terminal facts, and return the AttemptRecord. Never raises."""
@@ -247,7 +275,7 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
         canon = T._build_canonical_researcher_task(
             target=wi.target, objective=wi.objective, evidence_required=wi.evidence_required,
             completion_criteria=wi.completion_criteria)
-        if controls.get("break_model"):
+        if controls.get("break_model") or attempt_no in (controls.get("break_model_attempts") or ()):
             researcher.model.base_url = "http://127.0.0.1:9/v1"
             for attr in ("client", "async_client"):
                 setattr(researcher.model, attr, None)
@@ -280,12 +308,13 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
                     st.registry.cancel(att.attempt_id)
                     ret = Agent.cancel_run(trace.agent_run_id) if trace.agent_run_id else None
                     st.emit("attempt_cancelled", attempt=att.attempt_id, agent_cancel_returned=ret)
-            await asyncio.wait_for(asyncio.shield(task), ATTEMPT_DEADLINE_S)
+            deadline = float(controls.get("attempt_deadline_s") or ATTEMPT_DEADLINE_S)
+            await asyncio.wait_for(asyncio.shield(task), deadline)
         except asyncio.TimeoutError:
             timed_out = True
             st.registry.cancel(att.attempt_id)
             task.cancel()
-            st.emit("attempt_timed_out", attempt=att.attempt_id, deadline_s=ATTEMPT_DEADLINE_S)
+            st.emit("attempt_timed_out", attempt=att.attempt_id, deadline_s=deadline)
         except asyncio.CancelledError:
             task.cancel()
             raise
@@ -322,7 +351,7 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
     return rec
 
 
-def assess_and_register(st: RunState, wi: WorkItem, rec: AttemptRecord):
+def assess_and_register(st: RunState, wi: WorkItem, rec: AttemptRecord, controls: dict = None):
     """Acceptance authority = swarm.acceptance.decide (terminal state, validity, tool-outcome integrity,
     evidence policy, assessor restricted-only, registry). Workflow status is NOT consulted here."""
     att = rec.attempt
@@ -340,6 +369,10 @@ def assess_and_register(st: RunState, wi: WorkItem, rec: AttemptRecord):
                        acceptance=A.NOT_ACCEPTED, not_accepted_cause="DECISION_ERROR", reason=rec.error)
     rec.decision = d
     rec.summary = A.summarize(d)
+    if (controls or {}).get("duplicate_register"):
+        again = st.registry.register(att, d)         # control: re-register the SAME attempt/decision
+        st.emit("duplicate_register", attempt=att.attempt_id, first=(d.registration or {}).get("reason"),
+                second=again.get("reason"), accepted_for_item=(st.registry.accepted.get(wi.work_item_id) or {}).get("attempt_id"))
     st.emit("attempt_text", attempt=att.attempt_id, chars=len(att.text or ""),
             sha=A.sha(att.text), head=repr((att.text or "")[:100]))
     st.emit("attempt_decided", attempt=att.attempt_id, agent=d.execution_status, acceptance=d.acceptance,
@@ -476,7 +509,7 @@ def _safe_final(st: RunState, problems: list) -> str:
 # ---------------------------------------------------------------------------- the Workflow
 async def run_engineering_workflow(
     task: str, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
-    project_id: str, session_id, controls_raw=None, registry=None,
+    project_id: str, session_id, controls_raw=None, registry=None, work_items=None,
 ):
     """Entry point called from swarm.team.run_task_async when orchestration == "workflow".
     Returns (content, tokens, clarification) exactly like the Team path."""
@@ -539,22 +572,45 @@ async def run_engineering_workflow(
 
         async def s_plan(step_input):
             st.steps_run.append("plan")
-            st.plan = plan_request(task, task_id)
+            st.plan = plan_work_items(work_items, task_id) if work_items else plan_request(task, task_id)
             st.emit("step", name="plan", items=len(st.plan.items), rejected=st.plan.rejected_reason)
             return "plan-ok"
 
         async def s_execute(step_input):
             st.steps_run.append("execute")
             for wi in (st.plan.items if st.plan else []):
-                for n in range(1, MAX_ATTEMPTS_PER_ITEM + 1):
-                    rec = await run_attempt(st, wi, ctx, controls, n)
-                    d = assess_and_register(st, wi, rec)
+                c = item_controls(controls, wi.work_item_id)
+                n = 1
+                while n <= MAX_ATTEMPTS_PER_ITEM:
+                    sup = c.get("supersede_after_s") if n == 1 else None
+                    if sup:
+                        # Control: a newer generation starts while attempt 1 is still running. The registry marks
+                        # attempt 1 SUPERSEDED the moment attempt 2 starts; attempt 1 keeps running and finishes late.
+                        t1 = asyncio.ensure_future(run_attempt(st, wi, ctx, c, 1))
+                        done, _ = await asyncio.wait({t1}, timeout=float(sup))
+                        if not done:
+                            c2 = {k: v for k, v in c.items() if k not in ("supersede_after_s", "delay_tool_s", "cancel_after_s")}
+                            st.emit("supersede_started", work_item=wi.work_item_id)
+                            rec2 = await run_attempt(st, wi, ctx, c2, 2)
+                            d2 = assess_and_register(st, wi, rec2, c)
+                            rec1 = await t1                       # the old attempt finishes LATE
+                            d1 = assess_and_register(st, wi, rec1, c)
+                            st.emit("supersede_result", work_item=wi.work_item_id, new=d2.acceptance, old=d1.acceptance,
+                                    old_validity=d1.validity)
+                            break
+                        rec = t1.result()
+                    else:
+                        rec = await run_attempt(st, wi, ctx, c, n)
+                    d = assess_and_register(st, wi, rec, c)
                     retry = (d.execution_status in RETRYABLE_TERMINALS and d.validity == "CURRENT"
                              and n < MAX_ATTEMPTS_PER_ITEM)
                     st.emit("retry_decision", work_item=wi.work_item_id, attempt=rec.attempt.attempt_id,
-                            agent=d.execution_status, retry=retry)
+                            agent=d.execution_status, retry=retry, attempts_left=MAX_ATTEMPTS_PER_ITEM - n)
                     if not retry:
+                        if d.execution_status in RETRYABLE_TERMINALS and n >= MAX_ATTEMPTS_PER_ITEM:
+                            st.emit("retry_exhausted", work_item=wi.work_item_id, attempts=n)
                         break
+                    n += 1
             return "execute-done"
 
         async def s_finalize(step_input):
@@ -569,6 +625,9 @@ async def run_engineering_workflow(
                 audit = audit_final(st, final)
                 st.final_audit = audit
                 st.final = final if audit["ok"] else _safe_final(st, audit["problems"])
+                if controls.get("duplicate_finalize"):
+                    again = build_final(st)               # control: finalize a second time, from the same registry
+                    st.emit("duplicate_finalize", identical=(again == final))
             st.emit("step", name="finalize", audit_ok=st.final_audit["ok"], chars=len(st.final))
             return "finalize-ok"
 

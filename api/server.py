@@ -257,6 +257,11 @@ async def _load_model_routing_cache():
 
 @app.on_event("startup")
 async def _start_cleanup_loop():
+    # Phase 1.16: a throw-away TEST instance (HIVE_TEST_INSTANCE=1, own port) must not run a second copy of the
+    # long-lived service's shared-queue loops. Unset in production, so this is a no-op there.
+    if os.environ.get("HIVE_TEST_INSTANCE") == "1":
+        print("[api] HIVE_TEST_INSTANCE=1: session-cleanup and outcome-drain loops NOT started", flush=True)
+        return
     asyncio.create_task(_session_cleanup_loop())
     # Same pattern, different queue. Started HERE and not in the worker on purpose:
     # this process is long-lived, so a 30-60s LightRAG extraction can finish. The worker
@@ -1099,6 +1104,7 @@ async def run(request: RunRequest, http_request: Request):
         "execution_profile": request.execution_profile,
         "orchestration": _resolve_orchestration(request.orchestration),
         "workflow_controls": request.workflow_controls,
+        "work_items": request.work_items,
     }
     result, tokens, clarification = await _run_worker_subprocess(http_request, worker_payload)
 

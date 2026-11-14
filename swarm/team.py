@@ -27147,7 +27147,40 @@ def _new_delegation_evidence(unavail_base: int = 0) -> dict:
             # Same text with whitespace around '/' and dashes removed and em/en dashes unified
             # (see _norm_punct), so a source phrase "L2 - GSTIN / state branch" supports a
             # report's "L2-GSTIN/state".
-            "corpus_norm": ""}
+            "corpus_norm": "",
+            # Phase 1.16 (Workflow path only, off by default): routes composed WITHIN ONE read file from an
+            # APIRouter(prefix=...) line and a decorator path in that same file. See _routes_of_source.
+            "compose_routes": False, "composed_routes": set()}
+
+
+_ROUTER_PREFIX_RE = re.compile(r"^\s*(\w+)\s*=\s*APIRouter\([^)]*?prefix\s*=\s*[\"']([^\"']*)[\"']", re.M)
+_ROUTE_DECORATOR_RE = re.compile(r"^\s*@(\w+)\.(?:get|post|put|patch|delete|head|options)\(\s*[\"']([^\"']*)[\"']", re.M)
+_SRC_LINE_NO_RE = re.compile(r"^\s*\d+	", re.M)
+
+
+def _routes_of_source(text: str) -> set:
+    """Phase 1.16. Normalised (lower-case, no outer slashes) routes a SINGLE source file defines by composing
+    its own `<router> = APIRouter(prefix="P")` with its own `@<router>.<verb>("D")` decorators, each also
+    in a form with trailing `{param}` segments removed (a report cites `business/admin/verify`, the decorator
+    says `/verify/{business_id}`). Same file only: a prefix is never combined with a decorator from another
+    file, and nothing is guessed (no include_router prefixes, no gateway rewrites)."""
+    src = _SRC_LINE_NO_RE.sub("", text or "")
+    prefixes = {m.group(1): m.group(2) for m in _ROUTER_PREFIX_RE.finditer(src)}
+    out = set()
+    for m in _ROUTE_DECORATOR_RE.finditer(src):
+        pre = prefixes.get(m.group(1))
+        if pre is None:
+            continue
+        full = (pre.rstrip("/") + "/" + m.group(2).lstrip("/")).strip("/").lower()
+        if not full:
+            continue
+        out.add(full)
+        segs = full.split("/")
+        while segs and segs[-1].startswith("{"):
+            segs.pop()
+        if segs:
+            out.add("/".join(segs))
+    return out
 
 
 def _norm_punct(s: str) -> str:
@@ -27203,6 +27236,18 @@ def _record_call_in_evidence(ev: dict, function_name: str, args, text: str, ok: 
         ev["corpus"] += chr(10) + chunk
         ev["corpus_norm"] += chr(10) + _norm_punct(chunk)
         ev["corpus_chars"] += len(chunk)
+    if ev.get("compose_routes") and function_name in _PATH_READ_TOOLS:
+        if function_name == "get_files_batch":
+            from swarm.acceptance import _BATCH_HEADER as _BH, classify_file_body as _cfb
+            _hd = list(_BH.finditer(text))
+            for _i, _h in enumerate(_hd):
+                _body = text[_h.end(): _hd[_i + 1].start() if _i + 1 < len(_hd) else len(text)]
+                if _cfb(_body)[0] == "READ":
+                    ev["composed_routes"] |= _routes_of_source(_body)
+        else:
+            from swarm.acceptance import classify_file_body as _cfb
+            if _cfb(text)[0] == "READ":
+                ev["composed_routes"] |= _routes_of_source(text)
     if function_name in _PATH_READ_TOOLS:
         _requested = _as_str_list(a.get("relative_path") or a.get("paths") or a.get("path"))
         if function_name == "get_files_batch":
@@ -27283,6 +27328,10 @@ def _claim_support(tok: str, ev: dict, preload: str):
         needle = tok.lower().strip("/")
         if needle and needle in ev.get("corpus", ""):
             return "tool"
+    # Phase 1.16 (Workflow path only): a route the report composes from a router prefix and a decorator that
+    # BOTH appear in one file this attempt read. Exact equality with a composed route; wrong routes stay unsupported.
+    if ev.get("compose_routes") and "/" in tok and tok.strip("/").lower() in ev.get("composed_routes", ()):
+        return "tool"
     # Reformatted source phrase (spacing / dash style): compare on the normalised words.
     if ("/" in tok or "-" in tok) and len(tok.strip("/")) >= 4:
         nneedle = _norm_punct(tok).strip("/")
@@ -27497,7 +27546,8 @@ def _evidence_fingerprint(team, key: str):
         return None
     return (sum(ev.get("ok", {}).values()), sum(ev.get("err", {}).values()),
             sum((ev.get("refused") or {}).values()), len(ev.get("read_paths", ())),
-            len(ev.get("searches", ())), ev.get("corpus_chars", 0), ev.get("attempt_id"))
+            len(ev.get("searches", ())), ev.get("corpus_chars", 0), ev.get("attempt_id"),
+            len(ev.get("composed_routes", ())))
 
 
 def _assessment_for(team, key: str, text: str, generation=None, attempt_id=None,
@@ -34675,6 +34725,7 @@ async def run_task_async(
     execution_profile: str | None = None,
     orchestration: str | None = None,
     workflow_controls: dict | None = None,
+    work_items: list | None = None,
 ) -> tuple[str, dict, dict | None]:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer.
 
@@ -34727,7 +34778,7 @@ async def run_task_async(
                   "(Team/Coordinator path not used for this request)", flush=True)
             return await run_engineering_workflow(
                 task, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
-                project_id, session_id, controls_raw=workflow_controls)
+                project_id, session_id, controls_raw=workflow_controls, work_items=work_items)
         print(f"[team] orchestration=workflow requested but team_name={team_name!r} is not 'engineering' "
               f"(or no roster) -- using the Team path", flush=True)
     # Rebound BEFORE the roster is composed -- see run_task_stream for the reason.

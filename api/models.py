@@ -83,6 +83,9 @@ class RunRequest(BaseModel):
     # Fault/budget controls for controlled validation. Ignored unless the process was started
     # with HIVE_WORKFLOW_TEST_CONTROLS=1.
     workflow_controls: dict | None = None
+    # Phase 1.16: optional explicit work items for orchestration="workflow" (1..4 strings, each naming its own
+    # repository files). Planning stays deterministic; nothing is decomposed by a model.
+    work_items: list[str] | None = None
 
 class SessionMeta(BaseModel):
     session_id: str
