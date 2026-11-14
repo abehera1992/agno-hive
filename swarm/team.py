@@ -29476,7 +29476,7 @@ async def run_task_stream(
         # docstring).
         await execution_store.guard(execution_store.persist_run_started(
             team._run_context, team_name=team_name, run_type="stream",
-            task_preview=(task or "")[:200]))
+            task_preview=(task or "")[:200], engine="team"))
         # Phase H: baseline checkpoint -- the run has started, nothing has
         # completed yet. See execution_store.persist_checkpoint's own
         # docstring for why this and the terminal checkpoint below are the
@@ -35129,7 +35129,7 @@ async def run_task_async(
         await execution_store.guard(execution_store.persist_run_started(
             team._run_context, team_name=team_name,
             run_type="synthesis" if synthesis_run else "single",
-            task_preview=(task or "")[:200]))
+            task_preview=(task or "")[:200], engine="team"))
         # Phase H: baseline checkpoint -- see persist_checkpoint's own
         # docstring for why this and run_task_async's own terminal checkpoint
         # (in this function's outermost finally) are the only two boundaries

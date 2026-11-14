@@ -257,6 +257,8 @@ runs = Table(
     # the EXISTING runs row rather than a second table -- see
     # execution_store.acquire_run_ownership/release_run_ownership.
     Column("owner_worker_id", Text, nullable=True),
+    # Phase 1.19: the engine that ran this run ("team"); NULL on rows written before engine tracking existed.
+    Column("engine", Text, nullable=True),
     Column("owner_lease_expires_at", DateTime(timezone=True), nullable=True),
 )
 Index("runs_session_idx", runs.c.session_id, runs.c.started_at.asc())

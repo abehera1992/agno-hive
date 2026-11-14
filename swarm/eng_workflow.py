@@ -31,6 +31,7 @@ from typing import Optional
 from swarm import acceptance as A
 from swarm.ledger import Ledger, LedgerError, RetryBudgetExhausted, decision_to_dict
 from swarm import liveness as L
+from swarm import discovery as D
 
 SNAPSHOT_INTERVAL_S = 5.0
 MIN_ATTEMPT_START_S = 120.0
@@ -114,23 +115,29 @@ def plan_work_items(items: list, task_id: str) -> WorkPlan:
     return WorkPlan(task_id, out)
 
 
-def plan_request(task: str, task_id: str) -> WorkPlan:
-    """Application-owned plan. Validation: the request must name at least one repository file; otherwise the
-    application cannot define required evidence, and refuses to dispatch rather than let a model invent scope."""
+def plan_request(task: str, task_id: str, discovered=None, discovery_reason=None) -> WorkPlan:
+    """Application-owned plan. The files to investigate are the ones the request NAMES; if it names none, the ones the
+    application's own discover stage identified and verified (swarm/discovery.py). With neither, the application cannot
+    define required evidence and refuses to dispatch rather than let a model invent scope."""
     task = (task or "").strip()
     if not task:
         return WorkPlan(task_id, [], "empty request")
     paths = extract_paths(task)
+    named = bool(paths)
+    if not paths and discovered:
+        paths = list(discovered)
     if not paths:
-        return WorkPlan(task_id, [], "the request names no repository file path, so the application cannot define "
-                                     "required source evidence (workflow path is investigation of named files)")
+        return WorkPlan(task_id, [], "the request names no repository file path" +
+                        (f" and the application's discovery found none to investigate ({discovery_reason})" if discovery_reason else "") +
+                        ", so the application cannot define required source evidence")
     evidence = ("For each named file: the file path you read, the function/handler name, and the route path "
                 "or URL, taken from file content you actually read.")
     criteria = ("Done when each named file has a source-backed finding, or an explicit statement of "
                 "which file or step could not be evidenced and why.")
     wi = WorkItem(
         work_item_id="wi-1", title="Investigate the named files",
-        target="Files named in the request: " + " ; ".join(paths),
+        target=("Files named in the request: " if named else
+                "Files the application identified as relevant (retrieved from the project index and verified to exist): ") + " ; ".join(paths),
         objective=task, evidence_required=evidence, completion_criteria=criteria,
         paths=paths, policy=derive_policy(paths))
     return WorkPlan(task_id, [wi])
@@ -172,6 +179,7 @@ class RunState:
     wf_state: str = "starting"
     attempt_deadline_wall: Optional[float] = None
     stream_events: int = 0
+    discovery: Optional[dict] = None      # Phase 1.19: result of the application's discover stage (None = not run)
 
     def remaining(self) -> Optional[float]:
         return None if self.deadline_mono is None else self.deadline_mono - time.monotonic()
@@ -748,6 +756,19 @@ async def run_engineering_workflow(
                         f"── Skill: {name} (auto-loaded — this task matches its shape) ──", text]
     specs, ctools = T._strip_mutating(specs, coordinator_tools)     # investigation-only: ALWAYS read-only
 
+    # Phase 1.19 discover stage. Its I/O runs HERE, before the Workflow opens its own MCP sessions (a second connection to
+    # a server the run already holds open is the step known to hang); the step below records it in the graph.
+    if work_items or extract_paths(task):
+        st.discovery = {"skipped": "the request already names the files to investigate", "paths": []}
+    else:
+        st.wf_state = "discovering"
+        _lr = getattr(T.config, "lightrag_mcp_url", None)
+        st.discovery = await D.discover(task, lightrag_url=(_lr if _lr in all_mcp_urls else None),
+                                        hive_url=T._pick_hive_mcp_url(all_mcp_urls, effective_mcp_url), project_id=project_id)
+        _dg = st.discovery.get("diagnostics") or {}
+        st.emit("discovery", files=len(st.discovery["paths"]), reason=st.discovery.get("reason"), candidates=_dg.get("source_candidates"),
+                verified=_dg.get("verified"), elapsed_s=_dg.get("elapsed_s"), paths=";".join(st.discovery["paths"])[:600])
+
     async with AsyncExitStack() as stack:
         mcp_list = []
         for url in all_mcp_urls:
@@ -773,10 +794,18 @@ async def run_engineering_workflow(
             st.emit("step", name="intake", task_chars=len(task))
             return "intake-ok"
 
+        async def s_discover(step_input):
+            st.steps_run.append("discover")
+            d = st.discovery or {}
+            st.emit("step", name="discover", files=len(d.get("paths") or []), skipped=d.get("skipped"), reason=d.get("reason"))
+            return "discover-ok"
+
         async def s_plan(step_input):
             st.steps_run.append("plan")
             st.wf_state = "planning"
-            st.plan = plan_work_items(work_items, task_id) if work_items else plan_request(task, task_id)
+            _d = st.discovery or {}
+            st.plan = (plan_work_items(work_items, task_id) if work_items
+                       else plan_request(task, task_id, discovered=_d.get("paths"), discovery_reason=_d.get("reason")))
             if st.plan.items and st.ledger is not None:
                 try:     # the plan is durable before ANY attempt can exist
                     await st.ledger._a(st.ledger.create_task, task_id, wf_run_id, task, [
@@ -852,7 +881,7 @@ async def run_engineering_workflow(
                 if st.ledger is not None and st.ledger_task_created:
                     try:
                         fr = await st.ledger._a(st.ledger.finalize_task, task_id, st.final,
-                                                dict(audit, deadline_hit=bool(st.deadline_hit)))
+                                                dict(audit, deadline_hit=bool(st.deadline_hit), engine="workflow"))
                         if not fr["finalized_now"]:
                             st.final = fr["final_text"]          # idempotent: the stored final wins
                         if controls.get("duplicate_finalize"):
@@ -871,6 +900,7 @@ async def run_engineering_workflow(
 
         wf = Workflow(name="engineering-workflow", steps=[
             Step(name="intake", executor=s_intake, max_retries=0),
+            Step(name="discover", executor=s_discover, max_retries=0),
             Step(name="plan", executor=s_plan, max_retries=0),
             Step(name="execute", executor=s_execute, max_retries=0),
             Step(name="finalize", executor=s_finalize, max_retries=0)])
@@ -884,7 +914,7 @@ async def run_engineering_workflow(
                 finalized=st.final is not None)
 
         # A completed Workflow is not proof of anything: the answer comes only from application finalization.
-        if st.final is None or st.steps_run != ["intake", "plan", "execute", "finalize"]:
+        if st.final is None or st.steps_run != ["intake", "discover", "plan", "execute", "finalize"]:
             problems = [f"workflow did not run every step (ran: {st.steps_run}, status: {wf_status})"]
             if st.plan and st.plan.items and st.records:
                 try:

@@ -166,6 +166,7 @@ async def persist_run_started(
     team_name: str | None = None,
     run_type: str | None = None,
     task_preview: str | None = None,
+    engine: str | None = None,
 ) -> None:
     """INSERT the `runs` row AND its root coordinator `executions` row in ONE
     transaction, so a persisted execution can never reference a run that does
@@ -201,6 +202,7 @@ async def persist_run_started(
                 run_type=run_type,
                 team_name=team_name,
                 task_preview=task_preview,
+                engine=engine,
                 status="running",
             ))
             await conn.execute(db.executions.insert().values(

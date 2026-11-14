@@ -491,6 +491,8 @@ class Config:
     worker_queue_wait_s: float = float(os.getenv("HIVE_WORKER_QUEUE_WAIT_S", "120"))
     # Phase 1.18F: route the supervisor's stop decisions through the shared guard layer (swarm/guards.py). Off = original inline path.
     shared_guards: bool = os.getenv("HIVE_SHARED_GUARDS", "0").strip().lower() in ("1", "true", "yes", "on")
+    # Phase 1.19: the default execution engine when a request does not name one: "workflow" (default) or "team" (rollback).
+    default_engine: str = os.getenv("HIVE_ORCHESTRATION", "workflow").strip().lower()
 
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))

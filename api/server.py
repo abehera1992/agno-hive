@@ -726,7 +726,7 @@ async def _workflow_supervised_final(payload: dict, snapshot: dict | None, pid: 
                 rebuilt = await led._a(reconstruct_final, led, tid)
                 if rebuilt:
                     text = rebuilt.rstrip() + banner
-                    await led._a(led.finalize_task, tid, text, {"ok": True, "supervisor_terminated": reason[:200]})
+                    await led._a(led.finalize_task, tid, text, {"ok": True, "supervisor_terminated": reason[:200], "engine": "workflow"})
     except Exception as exc:  # noqa: BLE001
         print(f"[api] supervised-final build failed ({type(exc).__name__}: {exc})", flush=True)
     if text is None:
@@ -1262,11 +1262,79 @@ async def _stream_worker_subprocess_inner(http_request, payload: dict, argv: lis
         await _reconcile_runs_on_exit(proc.pid)
 
 
+_ENGINES = ("team", "workflow")
+
+
+def _engine_requested(raw) -> str | None:
+    """The caller's explicit engine choice: None when unspecified, "team" or "workflow" otherwise. Anything else is
+    REJECTED (422) -- before Phase 1.19 an unknown value was silently treated as "team"."""
+    if raw is None or str(raw).strip() == "":
+        return None
+    v = str(raw).strip().lower()
+    if v not in _ENGINES:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_engine", "orchestration": str(raw)[:40], "allowed": list(_ENGINES),
+            "reason": "orchestration must be 'team' or 'workflow' (or omitted to use the default engine)"})
+    return v
+
+
+def _default_engine() -> str:
+    v = (config.default_engine or "workflow").strip().lower()
+    return v if v in _ENGINES else "workflow"
+
+
 def _resolve_orchestration(requested: str | None) -> str:
-    """Phase 1.15 switch. Request value wins, then HIVE_ORCHESTRATION, default "team" (rollback = unset it).
-    Anything other than the two known values is treated as "team"."""
-    v = (requested or os.environ.get("HIVE_ORCHESTRATION") or "team").strip().lower()
-    return v if v in ("team", "workflow") else "team"
+    """The engine NAME this request asks for before applicability is known (used for hashing and logging):
+    the explicit request, else the configured default (HIVE_ORCHESTRATION, default "workflow")."""
+    return _engine_requested(requested) or _default_engine()
+
+
+def _workflow_inapplicable_reasons(*, entry: str, team_name: str | None, custom_agents: bool, read_only: bool) -> list:
+    """Why the Workflow engine cannot serve this execution. The Workflow is the application-owned, INVESTIGATION-ONLY
+    engineering engine: it always strips mutating tools, exists only for the engineering team, runs no streaming and
+    no session-chained chunks."""
+    why = []
+    if entry != "run":
+        why.append(f"the {entry} entry point has no Workflow implementation")
+    if team_name != "engineering":
+        why.append(f"the Workflow exists only for the engineering team (this request resolved to {team_name or 'a custom roster'!r})")
+    if custom_agents:
+        why.append("a custom agent roster was supplied; the Workflow uses the engineering team's own roster")
+    if not read_only:
+        why.append("the Workflow is investigation-only and always read-only; this request has read_only=false (writes need the Team engine)")
+    return why
+
+
+def _select_engine(entry: str, requested, *, team_name: str | None, custom_agents: bool, read_only: bool) -> tuple:
+    """THE single engine-selection point for every entry point (Phase 1.19). Returns (engine, reason).
+
+    explicit "team"      -> Team.
+    explicit "workflow"  -> Workflow, or a clear 422 when the Workflow cannot serve this execution. NEVER a silent Team.
+    unspecified          -> the configured default engine (Workflow) where it can serve the execution; otherwise Team,
+                            with the reason recorded. That is a determination made BEFORE the run from what the Workflow
+                            is capable of -- it is not a fallback from a Workflow failure, and a Workflow that fails
+                            after selection is reported as failed, never re-run through the Team.
+    """
+    req = _engine_requested(requested)
+    why = _workflow_inapplicable_reasons(entry=entry, team_name=team_name, custom_agents=custom_agents, read_only=read_only)
+    if req == "team":
+        engine, reason = "team", "explicit request: orchestration=team"
+    elif req == "workflow":
+        if why:
+            raise HTTPException(status_code=422, detail={"error": "workflow_not_applicable", "entry": entry, "reasons": why,
+                                "hint": "send orchestration=team, or change the request so the Workflow can serve it"})
+        engine, reason = "workflow", "explicit request: orchestration=workflow"
+    else:
+        default = _default_engine()
+        if default == "workflow" and not why:
+            engine, reason = "workflow", "default engine (orchestration not specified)"
+        elif default == "workflow":
+            engine, reason = "team", "default engine is workflow but it cannot serve this execution: " + "; ".join(why)
+        else:
+            engine, reason = "team", "default engine is team (HIVE_ORCHESTRATION=team)"
+    print(f"[engine] entry={entry} team={team_name} selected={engine} requested={req or 'unspecified'} "
+          f"read_only={read_only} reason={reason}", flush=True)
+    return engine, reason
 
 
 # --- Phase 1.18E: API-level idempotency ------------------------------------------------------------
@@ -1344,6 +1412,7 @@ async def run(request: RunRequest, http_request: Request):
 async def _run_impl(request: RunRequest, http_request: Request):
     from api.models import SessionMeta
     start = time.perf_counter()
+    _engine_requested(request.orchestration)      # Phase 1.19: reject an invalid engine BEFORE any routing or session work
 
     # Reject a malformed session_id instead of silently running unchained (2026-08-30).
     # Verified live: posting session_id="{not-a-uuid}" returned HTTP 200 with a normal
@@ -1447,6 +1516,8 @@ async def _run_impl(request: RunRequest, http_request: Request):
     # the original in-process cooperative-cancellation path (DisconnectSignal,
     # _run_cancel_on_disconnect) on 2026-08-12 once validated live: three clean
     # kills, zero anyio errors, including one mid-write.
+    engine, engine_reason = _select_engine("run", request.orchestration, team_name=gate_team_name,
+                                           custom_agents=bool(request.agents), read_only=request.read_only)
     worker_payload = {
         "task": request.task,
         "agent_specs": [a.model_dump() for a in agent_specs] if agent_specs else None,
@@ -1462,8 +1533,7 @@ async def _run_impl(request: RunRequest, http_request: Request):
         "synthesis_run": request.synthesis_run,
         "solo": request.solo,
         "execution_profile": request.execution_profile,
-        "orchestration": ("workflow" if (_resolve_orchestration(request.orchestration) == "workflow"
-                                         and gate_team_name == "engineering" and agent_specs) else "team"),
+        "orchestration": engine,
         "workflow_controls": request.workflow_controls,
         "work_items": request.work_items,
         "idempotency_key": request.idempotency_key,
@@ -1507,6 +1577,7 @@ async def _run_impl(request: RunRequest, http_request: Request):
         output_tokens=tokens.get("output_tokens", 0),
         total_tokens=tokens.get("total_tokens", 0),
         needs_clarification=ClarificationRequest(**clarification) if clarification else None,
+        engine=engine, engine_reason=engine_reason,
     )
 
 
@@ -1568,6 +1639,7 @@ async def run_chunked(request: ChunkedRunRequest, http_request: Request):
             mode=request.mode, mcp_url=request.mcp_url, mcp_urls=request.mcp_urls,
             read_only=request.read_only, persist=request.persist,
             session_id=session_id,          # None on chunk 1 -- the server creates it
+            orchestration="team",           # Phase 1.19: chunks depend on session-chained context; engine pinned and logged by /run
         )
         try:
             resp = await run(sub, http_request)
@@ -1643,7 +1715,7 @@ async def run_chunked(request: ChunkedRunRequest, http_request: Request):
                 task=synth_task, project_id=request.project_id, team=request.team,
                 mcp_url=request.mcp_url, mcp_urls=request.mcp_urls,
                 read_only=True, session_id=session_id,
-                synthesis_run=True), http_request)
+                synthesis_run=True, orchestration="team"), http_request)
             # APPENDED, NEVER SUBSTITUTED. `synthesis` carries the verbatim chunk
             # findings FIRST and the model's conclusion after it, so a consumer reading
             # only this field still has every finding.
@@ -1682,6 +1754,9 @@ async def plan(request: RunRequest):
     Used by the hive CLI --review flag for human-in-the-loop approval before execution.
     """
     start = time.perf_counter()
+    # Phase 1.19: /plan always runs the planning team, which has no Workflow definition. Team, reason logged; an explicit
+    # orchestration=workflow is rejected (422) rather than ignored.
+    _select_engine("plan", request.orchestration, team_name="planning", custom_agents=False, read_only=request.read_only)
     agent_specs, coordinator_model, _, coordinator_tools = _load_team("planning")
     mcp_url = request.mcp_url or config.mcp_url
 
@@ -1756,6 +1831,11 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
         agent_specs, coordinator_model, stream_mode, coordinator_tools = _load_team("engineering")
         stream_mode = request.mode or stream_mode
         gate_team_name = "engineering"
+
+    # Phase 1.19: /stream has no Workflow implementation. An unspecified engine is Team (reason logged and returned in the
+    # done event); an explicit orchestration=workflow is rejected with 422 rather than silently run as Team.
+    engine, engine_reason = _select_engine("stream", request.orchestration, team_name=gate_team_name,
+                                           custom_agents=bool(request.agents), read_only=request.read_only)
 
     mcp_url = request.mcp_url or config.mcp_url
 
@@ -1850,6 +1930,7 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
                         "input_tokens": tokens.get("input_tokens", 0),
                         "output_tokens": tokens.get("output_tokens", 0),
                         "total_tokens": tokens.get("total_tokens", 0),
+                        "engine": engine, "engine_reason": engine_reason,
                     }
                     clarification = chunk.get("clarification")
                     if clarification:

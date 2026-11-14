@@ -131,6 +131,9 @@ class RunResponse(BaseModel):
     # then re-call /run with the same session_id and the chosen option folded into
     # the next task text to continue.
     needs_clarification: ClarificationRequest | None = None
+    # Phase 1.19: the engine that ACTUALLY ran this request and why it was selected.
+    engine: str | None = None
+    engine_reason: str | None = None
 
 
 class PlanResponse(BaseModel):
