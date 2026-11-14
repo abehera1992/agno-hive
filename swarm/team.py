@@ -27500,7 +27500,8 @@ def _evidence_fingerprint(team, key: str):
             len(ev.get("searches", ())), ev.get("corpus_chars", 0), ev.get("attempt_id"))
 
 
-def _assessment_for(team, key: str, text: str, generation=None, attempt_id=None) -> dict:
+def _assessment_for(team, key: str, text: str, generation=None, attempt_id=None,
+                    fail_closed: bool = False) -> dict:
     """The memoised assessment, keyed by (member, generation, attempt, TEXT, EVIDENCE state) (D5). Computed
     once per distinct (text, evidence), then shared by every registration path and the Coordinator relay so
     they cannot disagree. The previous key (member, generation) let a verdict for a partial text, or for
@@ -27517,6 +27518,12 @@ def _assessment_for(team, key: str, text: str, generation=None, attempt_id=None)
         try:
             a = _assess_member_result(team, key, text, attempt_id=attempt_id)
         except Exception as exc:  # noqa: BLE001
+            if fail_closed:
+                # Phase 1.15: the application-owned acceptance path must never turn an assessor
+                # exception into COMPLETE. The Team path keeps its legacy fail-open default.
+                print(f"[team] result assessment failed for {key!r}: {exc} -- fail-closed caller, "
+                      f"re-raising (NOT registered as COMPLETE)", flush=True)
+                raise
             print(f"[team] result assessment failed for {key!r}: {exc} -- legacy behaviour "
                   f"(registered as COMPLETE)", flush=True)
             return {"status": "COMPLETE", "reason": "assessment failed", "generation": gen,
@@ -34666,8 +34673,15 @@ async def run_task_async(
     synthesis_run: bool = False,
     solo: bool = False,
     execution_profile: str | None = None,
+    orchestration: str | None = None,
+    workflow_controls: dict | None = None,
 ) -> tuple[str, dict, dict | None]:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer.
+
+    `orchestration` (Phase 1.15): None/"team" = the existing Coordinator Team path, unchanged. "workflow" =
+    the application-controlled engineering Workflow in swarm/eng_workflow.py (engineering team only; any other
+    team name falls back to the Team path). `workflow_controls` is honoured only when the process runs with
+    HIVE_WORKFLOW_TEST_CONTROLS=1.
 
     `execution_profile` (Workstream B, 2026-10-24) -- see run_task_stream's
     own docstring for the full explanation; same resolution, same
@@ -34704,6 +34718,18 @@ async def run_task_async(
     """
     effective_mcp_url = mcp_url or config.mcp_url
     effective_coordinator = coordinator_model or config.leader_model
+    if orchestration == "workflow":
+        if team_name == "engineering" and agent_specs:
+            from swarm.eng_workflow import run_engineering_workflow
+            reset_unavailable_tool_state()
+            reset_peak_token_state()
+            print("[team] orchestration=workflow -- application-controlled engineering Workflow "
+                  "(Team/Coordinator path not used for this request)", flush=True)
+            return await run_engineering_workflow(
+                task, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
+                project_id, session_id, controls_raw=workflow_controls)
+        print(f"[team] orchestration=workflow requested but team_name={team_name!r} is not 'engineering' "
+              f"(or no roster) -- using the Team path", flush=True)
     # Rebound BEFORE the roster is composed -- see run_task_stream for the reason.
     if read_only and agent_specs:
         agent_specs, _ = _strip_mutating(agent_specs, None)

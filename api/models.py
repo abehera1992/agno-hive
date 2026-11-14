@@ -76,6 +76,14 @@ class RunRequest(BaseModel):
     # exhaustive" constraint.
     execution_profile: str | None = None
 
+    # Phase 1.15: "team" (default) = existing Coordinator Team path; "workflow" = the
+    # application-controlled engineering Workflow (swarm/eng_workflow.py), engineering team
+    # only, investigation-only. Omitted -> HIVE_ORCHESTRATION env, else "team".
+    orchestration: str | None = None
+    # Fault/budget controls for controlled validation. Ignored unless the process was started
+    # with HIVE_WORKFLOW_TEST_CONTROLS=1.
+    workflow_controls: dict | None = None
+
 class SessionMeta(BaseModel):
     session_id: str
     turn: int         # message pairs completed (message_count // 2)

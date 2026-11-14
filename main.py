@@ -181,6 +181,8 @@ async def _run_worker() -> dict:
             synthesis_run=payload.get("synthesis_run", False),
             solo=payload.get("solo", False),
             execution_profile=payload.get("execution_profile"),
+            orchestration=payload.get("orchestration"),
+            workflow_controls=payload.get("workflow_controls"),
         )
         # Phase 0.80: emitted immediately before this coroutine returns -- the
         # top-level coroutine of this subprocess's own asyncio.run() call

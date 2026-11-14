@@ -1,6 +1,7 @@
 """AgnoHive FastAPI server — accepts task requests from remote clients over Tailscale."""
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import time
@@ -967,6 +968,13 @@ async def _stream_worker_subprocess(http_request, payload: dict, argv: list[str]
             await proc.wait()
 
 
+def _resolve_orchestration(requested: str | None) -> str:
+    """Phase 1.15 switch. Request value wins, then HIVE_ORCHESTRATION, default "team" (rollback = unset it).
+    Anything other than the two known values is treated as "team"."""
+    v = (requested or os.environ.get("HIVE_ORCHESTRATION") or "team").strip().lower()
+    return v if v in ("team", "workflow") else "team"
+
+
 @app.post("/run", response_model=RunResponse)
 async def run(request: RunRequest, http_request: Request):
     from api.models import SessionMeta
@@ -1089,6 +1097,8 @@ async def run(request: RunRequest, http_request: Request):
         "synthesis_run": request.synthesis_run,
         "solo": request.solo,
         "execution_profile": request.execution_profile,
+        "orchestration": _resolve_orchestration(request.orchestration),
+        "workflow_controls": request.workflow_controls,
     }
     result, tokens, clarification = await _run_worker_subprocess(http_request, worker_payload)
 

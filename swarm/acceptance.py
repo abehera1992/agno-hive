@@ -467,7 +467,7 @@ class Registry:
             return {"registered": False, "reason": v}
         if d.acceptance == NOT_ACCEPTED:
             self.log.append(("reject", a.attempt_id, "not-accepted-execution"))
-            return {"registered": False, "reason": "NOT_ACCEPTED:" + d.execution_status}
+            return {"registered": False, "reason": "NOT_ACCEPTED:" + (d.not_accepted_cause or d.execution_status)}
         if any(x["attempt_id"] == a.attempt_id for x in self.accepted.values()) or \
                 any(x["attempt_id"] == a.attempt_id for x in self.withheld):
             return {"registered": False, "reason": "IDEMPOTENT_DUPLICATE", "no_status_regression": True}
@@ -549,6 +549,7 @@ class Decision:
     reason: str = ""
     registration: Optional[dict] = None
     steps: list = field(default_factory=list)
+    not_accepted_cause: Optional[str] = None   # why NOT_ACCEPTED when it is not an Agent/validity cause
 
 
 def _to_acceptance(assessor_status: str) -> str:
@@ -571,9 +572,10 @@ def decide(a: Attempt, policy, registry: Registry = None, outcomes=None, registe
     cnt = count_outcomes(outcomes)
     ns, ev = build_assessor_state(a, outcomes)
     try:
-        asm = T._assessment_for(ns, KEY, a.text or "", generation=a.generation, attempt_id=a.attempt_id)
-    except Exception as e:  # noqa: BLE001
-        asm = {"status": "ERROR", "reason": repr(e), "claims": [], "supported": [], "unsupported": []}
+        asm = T._assessment_for(ns, KEY, a.text or "", generation=a.generation, attempt_id=a.attempt_id,
+                                fail_closed=True)
+    except Exception as e:  # noqa: BLE001 -- Phase 1.15: an assessor error is NOT an Agent failure and NEVER accepts
+        asm = {"status": "ERROR", "reason": repr(e)[:300], "claims": [], "supported": [], "unsupported": []}
     gate = gate_evaluate(policy, outcomes, a.text)
     d = Decision(ident, a.workflow_status, ex, ex_reason, cnt, gate, assessor_status=asm["status"],
                  assessor_reason=asm["reason"],
@@ -592,6 +594,17 @@ def decide(a: Attempt, policy, registry: Registry = None, outcomes=None, registe
     else:
         steps.append(("4.tool_outcome_integrity", {"counts": cnt["all"], "unknown_never_success": True}))
         steps.append(("5.required_evidence_policy", gate))
+        if asm["status"] == "ERROR":
+            d.acceptance = NOT_ACCEPTED
+            d.not_accepted_cause = "ASSESSOR_ERROR"
+            d.overrides.append({"gate": "assessor-error", "assessor": "ERROR", "final": NOT_ACCEPTED, "why": asm["reason"]})
+            d.reason = f"assessor raised ({asm['reason'][:120]}); the Agent completed but nothing is accepted"
+            steps.append(("6-7.assessor_reconciled", {"assessor": "ERROR", "final": NOT_ACCEPTED}))
+            if registry is not None and register:
+                d.registration = registry.register(a, d)
+                steps.append(("8.register", d.registration))
+            d.steps = steps
+            return d
         final = asm["status"] if asm["status"] in _RESTRICTION else "UNRESOLVED"
         if gate["applicable"] and gate["missing"]:
             n_req = len(policy.requirements)
