@@ -193,6 +193,27 @@ class RunState:
 
 # ---------------------------------------------------------------------------- one Researcher attempt
 class _Trace:
+    """Phase 1.22: tracks BOTH the complete diagnostic trace (`text`, unchanged
+    behavior from before this phase) AND, additively, which turn in the
+    tool-calling loop is the TERMINAL one (`terminal_text`).
+
+    Terminal-result boundary (established live against the installed Agno
+    2.5.17, not assumed from documentation -- see docs/reports/phase-1.22-report.md
+    Section 2 for the full event-sequence evidence): Agno's own agentic loop
+    (agno/models/base.py's `while True:`) only issues another model request
+    when the PRIOR turn's assistant message carried tool_calls; it stops the
+    instant a turn carries none. One real model turn is therefore bounded by
+    exactly one ModelRequestStarted .. ModelRequestCompleted span (confirmed
+    live: a scripted 3-turn model produced EXACTLY that pairing, in order,
+    once per turn, with RunContentEvent deltas landing strictly inside each
+    span). A span is "closed" -- provably NOT the turn that ended the loop --
+    the moment a ToolCallStarted fires after it. The terminal segment is the
+    LAST span that is never closed, PROVIDED the run's own RunCompleted event
+    fired (never RunError/RunCancelled/an early-closed stream) -- i.e. the
+    exact structural condition under which Agno's own loop stopped normally.
+    This is a pure event/position signal: no content, no phrase, no length
+    heuristic of any kind is consulted.
+    """
     def __init__(self, T, RunContentEvent):
         self.T, self.RCE = T, RunContentEvent
         self.parts, self.pending = [], False
@@ -201,14 +222,24 @@ class _Trace:
         self.completed = self.cancelled = False
         self.error = None
         self.tin = self.tout = 0
+        # Phase 1.22 additions -- segment-aware terminal-result tracking, built
+        # from the SAME event stream `add()` already consumes; no new event
+        # source, no change to the diagnostic trace above.
+        self._segments: list = []           # one entry per ModelRequestStarted..Completed span
+        self._last_segment_closed = False   # True once a ToolCallStarted fires after the last-opened span
 
     def add(self, ev):
         name = getattr(ev, "event", None) or type(ev).__name__
         if name == "RunStarted":
             self.agent_run_id = ev.run_id
+        elif name == "ModelRequestStarted":
+            self._segments.append("")
+            self._last_segment_closed = False
         elif name == "ModelRequestCompleted":
             self.tin += ev.input_tokens or 0
             self.tout += ev.output_tokens or 0
+        elif name == "ToolCallStarted":
+            self._last_segment_closed = True
         elif name == "RunCompleted":
             self.completed = True
         elif name == "RunError":
@@ -220,12 +251,32 @@ class _Trace:
                 self.parts.append(self.T._SEGMENT_SEPARATOR)
             self.pending = False
             self.parts.append(ev.content)
+            if self._segments:
+                self._segments[-1] += ev.content
         elif name in self.T._SEGMENT_BOUNDARY_EVENTS:
             self.pending = True
 
     @property
     def text(self):
+        """Complete diagnostic trace -- every turn, unchanged from before Phase 1.22.
+        Evidence only; never the canonical result (see terminal_text)."""
         return "".join(self.parts)
+
+    @property
+    def terminal_text(self):
+        """Phase 1.22: the canonical terminal answer, or "" if none was
+        structurally selectable. Callers MUST treat "" as a missing/invalid
+        result and must NOT fall back to `text` -- that is exactly the
+        substitution Phase 1.22 was scoped to prevent."""
+        if not self.completed or self.cancelled or self.error:
+            return ""
+        if not self._segments or self._last_segment_closed:
+            return ""
+        return self._segments[-1]
+
+    @property
+    def segment_count(self):
+        return len(self._segments)
 
 
 def _controls(raw) -> dict:
@@ -272,8 +323,10 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
     if lerr:
         st.emit("attempt_not_started", work_item=wi.work_item_id, attempt=att.attempt_id, reason=lerr[:120])
         att.terminal = {"completed_event": False, "run_output_status": None, "run_error": f"not started: {lerr[:120]}",
-                        "cancelled_event": False, "timed_out": False, "stream_closed_early": False}
-        att.outcomes, att.text, att.source, att.state = [], "", "workflow-real", "FINISHED"
+                        "cancelled_event": False, "timed_out": False, "stream_closed_early": False,
+                        "result_selection_status": "MISSING_TERMINAL", "segments_total": 0,
+                        "terminal_chars": 0, "trace_chars": 0}
+        att.outcomes, att.text, att.trace_text, att.source, att.state = [], "", "", "workflow-real", "FINISHED"
         return rec
     st.emit("attempt_started", work_item=wi.work_item_id, attempt=att.attempt_id, generation=att.generation,
             workflow_run=st.workflow_run_id, attempt_no=attempt_no)
@@ -416,6 +469,15 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
             exc_text = repr(task.exception())[:300]
         att.agent_run_id = trace.agent_run_id or att.agent_run_id
         ro = trace.run_output
+        # Phase 1.22: select the canonical terminal result via _Trace's own
+        # structural boundary (see its docstring), never by content/phrase.
+        # trace.terminal_text is "" both when the run genuinely produced no
+        # terminal segment AND when it did not complete normally -- the two
+        # cases terminal_gate()'s new MISSING_TERMINAL check (swarm/acceptance.py)
+        # exists to route to NOT_ACCEPTED rather than let an empty att.text
+        # reach the assessor on its own.
+        _terminal = trace.terminal_text
+        _selection_status = "TERMINAL_SELECTED" if _terminal else "MISSING_TERMINAL"
         att.terminal = {
             "completed_event": trace.completed,
             "run_output_status": str(getattr(ro, "status", None)) if ro is not None else None,
@@ -423,9 +485,16 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
             "cancelled_event": trace.cancelled,
             "timed_out": timed_out,
             "stream_closed_early": (not trace.completed) and not trace.cancelled and not (trace.error or exc_text),
+            # Phase 1.22 provenance (Section 3C): how the canonical result below was
+            # selected, independent of whether the selection succeeded.
+            "result_selection_status": _selection_status,
+            "segments_total": trace.segment_count,
+            "terminal_chars": len(_terminal or ""),
+            "trace_chars": len(trace.text or ""),
         }
         att.outcomes = outcome_rec.calls
-        att.text = T._strip_leaked_tool_tags(trace.text or "")
+        att.text = T._strip_leaked_tool_tags(_terminal or "")
+        att.trace_text = T._strip_leaked_tool_tags(trace.text or "")
         att.source = "workflow-real"
         rec.tokens = {"in": trace.tin, "out": trace.tout}
         if att.state == "RUNNING":
@@ -433,16 +502,21 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
     except BaseException as e:  # noqa: BLE001 -- setup failure: recorded as an Agent-level failure, never raised
         rec.error = repr(e)[:300]
         att.terminal = {"completed_event": False, "run_output_status": None, "run_error": f"setup: {rec.error}",
-                        "cancelled_event": False, "timed_out": False, "stream_closed_early": False}
+                        "cancelled_event": False, "timed_out": False, "stream_closed_early": False,
+                        "result_selection_status": "MISSING_TERMINAL", "segments_total": 0,
+                        "terminal_chars": 0, "trace_chars": 0}
         att.outcomes = outcome_rec.calls
         att.text = ""
+        att.trace_text = ""
         att.source = "workflow-real"
         st.emit("attempt_setup_error", attempt=att.attempt_id, error=rec.error)
     finally:
         T._DELEGATION_READ_CEILING = old_ceiling
         if led is not None:
-            try:     # terminal facts + text, even for an invalidated attempt (history); never changes a decision
-                await led._a(led.record_terminal, att.attempt_id, att.terminal, att.agent_run_id, att.text)
+            try:     # terminal facts + canonical text + full trace, even for an invalidated attempt (history);
+                      # never changes a decision
+                await led._a(led.record_terminal, att.attempt_id, att.terminal, att.agent_run_id, att.text,
+                             trace_text=att.trace_text)
             except Exception as e:  # noqa: BLE001
                 rec.ledger_error = rec.ledger_error or f"LEDGER_ERROR: {repr(e)[:160]}"
             if outcome_rec.persist_error:
@@ -504,7 +578,15 @@ async def assess_and_register(st: RunState, wi: WorkItem, rec: AttemptRecord, co
     rec.decision = d
     rec.summary = A.summarize(d)
     st.emit("attempt_text", attempt=att.attempt_id, chars=len(att.text or ""),
-            sha=A.sha(att.text), head=repr((att.text or "")[:100]))
+            sha=A.sha(att.text), head=repr((att.text or "")[:100]),
+            # Phase 1.22 (Section 5, bounded to Workflow execution -- Team logging untouched):
+            # the terminal-selection outcome and the full trace's own identity, so a human
+            # watching the event stream can see WHY att.text is what it is without querying
+            # the ledger: how many model-request turns ran, whether a terminal segment was
+            # found at all, and how the selected text's size compares to the full trace.
+            result_selection_status=att.terminal.get("result_selection_status"),
+            segments_total=att.terminal.get("segments_total"),
+            trace_chars=len(att.trace_text or ""), trace_sha=A.sha(att.trace_text))
     st.emit("attempt_decided", attempt=att.attempt_id, agent=d.execution_status, acceptance=d.acceptance,
             registered=(d.registration or {}).get("registered"), reason=(d.reason or "")[:120])
     return d

@@ -435,6 +435,13 @@ class Attempt:
     terminal: dict = field(default_factory=dict)
     outcomes: list = field(default_factory=list)
     text: str = ""
+    # Phase 1.22: the complete diagnostic trace (every turn: narration, tool-call rounds,
+    # tool results, every assistant response) -- kept SEPARATE from `text`, which is now
+    # the selected canonical terminal answer only. Never consumed by acceptance or
+    # build_final(); evidence only. See swarm/eng_workflow.py's _Trace.terminal_text for
+    # the selection boundary and terminal_gate() below for how a missing terminal result
+    # is refused rather than silently replaced by this trace.
+    trace_text: str = ""
     source: str = ""
     state: str = "RUNNING"            # RUNNING | FINISHED | SUPERSEDED | CANCELLED
     preloaded: dict = field(default_factory=dict)
@@ -532,6 +539,19 @@ def terminal_gate(a: Attempt) -> tuple:
         return "FAILED", f"agent RunError: {str(t['run_error'])[:120]}"
     if t.get("stream_closed_early"):
         return "INCOMPLETE", "stream closed before a terminal event"
+    if t.get("result_selection_status") == "MISSING_TERMINAL":
+        # Phase 1.22: the Agno run itself reported a normal completion (RunCompleted,
+        # no error/cancel/early-close -- all three checks above already passed), but
+        # the structural terminal-result boundary (swarm/eng_workflow.py's
+        # _Trace.terminal_text: the last model turn, only if it was never followed by
+        # a ToolCallStarted) found no content to select. This is a DISTINCT failure
+        # mode from every case above: the agent did not fail, error, or get cut off --
+        # it simply produced no selectable terminal answer. Routed through the SAME
+        # "not COMPLETED" -> NOT_ACCEPTED path as those cases (decide()'s own
+        # `elif ex != "COMPLETED"` branch), not a new acceptance rule: a missing
+        # terminal result must never reach the assessor, which would otherwise see an
+        # empty a.text and could vacuously report zero unsupported claims as COMPLETE.
+        return "INCOMPLETE", "agent completed but no terminal-result segment was selected (see result_selection_status)"
     ros = str(t.get("run_output_status") or "").lower()
     if not t.get("completed_event") or "completed" not in ros:
         return "INCOMPLETE", (f"no normal terminal completion (completed_event={t.get('completed_event')}, "

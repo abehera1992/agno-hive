@@ -26,7 +26,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2   # Phase 1.22: + attempt.trace_sha (full diagnostic trace, kept separate
+                     # from the canonical attempt.text_sha -- see init_schema()'s migration)
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / "data" / "workflow_ledger.db"
 
 # attempt states. Terminal ones never change again except RUNNING/FINISHED -> invalidated.
@@ -68,7 +69,7 @@ CREATE TABLE IF NOT EXISTS attempt (
   attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, work_item_id TEXT NOT NULL, generation INTEGER NOT NULL,
   workflow_run_id TEXT NOT NULL, agent_run_id TEXT, state TEXT NOT NULL,
   owner_instance TEXT NOT NULL, owner_pid INTEGER, started_at REAL NOT NULL, ended_at REAL,
-  invalidated_reason TEXT, terminal_json TEXT, text_sha TEXT,
+  invalidated_reason TEXT, terminal_json TEXT, text_sha TEXT, trace_sha TEXT,
   FOREIGN KEY (task_id, work_item_id) REFERENCES work_item(task_id, work_item_id),
   UNIQUE (task_id, work_item_id, generation));
 CREATE TABLE IF NOT EXISTS tool_call (
@@ -160,9 +161,26 @@ class Ledger:
                 c.execute(stmt)
             row = c.execute("SELECT v FROM ledger_meta WHERE k='schema_version'").fetchone()
             if row is None:
+                # Fresh database: _DDL above already declares trace_sha, nothing to migrate.
                 c.execute("INSERT INTO ledger_meta(k,v) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
-            elif int(row["v"]) != SCHEMA_VERSION:
-                raise LedgerError(f"ledger schema version {row['v']} != expected {SCHEMA_VERSION}; refusing to use it")
+                return
+            current = int(row["v"])
+            if current == SCHEMA_VERSION:
+                return
+            if current == 1 and SCHEMA_VERSION == 2:
+                # Phase 1.22, additive only: separate the full diagnostic trace from the
+                # canonical attempt result. No existing row is altered or removed;
+                # trace_sha is NULL for every attempt recorded before this migration
+                # (a full trace was never captured for them -- this is honest, not a
+                # backfill). `CREATE TABLE IF NOT EXISTS` above cannot add a column to
+                # an existing table, so this is an explicit, idempotent ALTER.
+                cols = {r["name"] for r in c.execute("PRAGMA table_info(attempt)").fetchall()}
+                if "trace_sha" not in cols:
+                    c.execute("ALTER TABLE attempt ADD COLUMN trace_sha TEXT")
+                c.execute("UPDATE ledger_meta SET v=? WHERE k='schema_version'", (str(SCHEMA_VERSION),))
+                return
+            raise LedgerError(f"ledger schema version {current} != expected {SCHEMA_VERSION} "
+                              f"(no migration path from {current}); refusing to use it")
         self._tx(go)
         self._ready = True
 
@@ -229,20 +247,27 @@ class Ledger:
                        (o.reason or "")[:300], sha, o.result_len, o.agent_run_id, time.time()))
         self._tx(go)
 
-    def record_terminal(self, attempt_id, terminal: dict, agent_run_id, text: str, new_state: Optional[str] = None):
-        """Persist the Agent's own terminal facts and text hash. Transitions RUNNING->FINISHED unless the attempt was
-        already invalidated (state kept; facts still recorded)."""
+    def record_terminal(self, attempt_id, terminal: dict, agent_run_id, text: str, new_state: Optional[str] = None,
+                        trace_text: Optional[str] = None):
+        """Persist the Agent's own terminal facts, the canonical text hash, and (Phase 1.22, additive) the full
+        diagnostic trace's own hash under a SEPARATE column -- the same content-addressed evidence_blob store, so an
+        identical trace never duplicates storage. `trace_text=None` (every caller before Phase 1.22, and this one's
+        own default) leaves trace_sha NULL rather than writing an empty-string hash, so "no trace was captured" stays
+        distinguishable from "a trace was captured and happened to be empty". Transitions RUNNING->FINISHED unless the
+        attempt was already invalidated (state kept; facts still recorded)."""
         def go(c):
             a = c.execute("SELECT state FROM attempt WHERE attempt_id=?", (attempt_id,)).fetchone()
             if a is None:
                 raise LedgerError(f"unknown attempt {attempt_id}")
             sha = self._store_blob(c, text or "")
+            trace_sha = self._store_blob(c, trace_text) if trace_text is not None else None
             st = a["state"]
             target = new_state or FINISHED
             if st == RUNNING and target in TRANSITIONS[RUNNING]:
                 st = target
-            c.execute("UPDATE attempt SET agent_run_id=COALESCE(?,agent_run_id), terminal_json=?, text_sha=?, state=?, ended_at=COALESCE(ended_at,?) WHERE attempt_id=?",
-                      (agent_run_id, _j(terminal), sha, st, time.time(), attempt_id))
+            c.execute("UPDATE attempt SET agent_run_id=COALESCE(?,agent_run_id), terminal_json=?, text_sha=?, "
+                      "trace_sha=COALESCE(?,trace_sha), state=?, ended_at=COALESCE(ended_at,?) WHERE attempt_id=?",
+                      (agent_run_id, _j(terminal), sha, trace_sha, st, time.time(), attempt_id))
         self._tx(go)
 
     def invalidate(self, attempt_id, state: str, reason: str):
