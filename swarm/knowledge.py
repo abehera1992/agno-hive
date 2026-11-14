@@ -99,9 +99,12 @@ def _json_lines(block: str) -> tuple:
     out, bad = [], 0
     for ln in block.splitlines():
         s = ln.strip()
-        if s.startswith("{") and s.endswith("}"):
+        if s.startswith("{"):
+            # any line that opens a JSON object must be a complete, valid one; otherwise it is malformed (never silently ignored)
             try:
-                out.append(json.loads(s))
+                v = json.loads(s)
+                out.append(v) if isinstance(v, dict) else None
+                bad += 0 if isinstance(v, dict) else 1
             except Exception:  # noqa: BLE001
                 bad += 1
     return out, bad
