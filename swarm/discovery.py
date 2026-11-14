@@ -10,8 +10,8 @@ deterministically and with a bounded, inspectable procedure, instead of letting 
   3. Keep only source evidence files (.py/.ts/.tsx/.js/.jsx), dropping migrations, tests and generated/asset files.
   4. VERIFY each candidate exists in the repository (`find_files`, exactly one match required); an unverifiable or
      ambiguous path is dropped, never guessed. A partial path that resolves uniquely is canonicalised.
-  5. Rank by how many retrieval modes agree, then spread across services (round-robin over the service root) so a
-     cross-service request is not satisfied by five files from one service. Cap the number of files.
+  5. Rank by how many retrieval modes agree (ties by retrieval rank), with a per-service cap so one service cannot
+     flood the selection. Cap the number of files.
 
 Nothing in here knows any acceptance prompt. There is no keyword list, no per-prompt rule and no model call; the only
 model-dependent input is the retrieval index's own ranking, which is recorded in the result so a run can be audited.
@@ -32,7 +32,8 @@ MODES = ("hybrid", "local", "naive")
 SOURCE_EXT = (".py", ".ts", ".tsx", ".js", ".jsx")
 EXCLUDE_FRAGMENTS = ("/migrations/", "/node_modules/", "/tests/", "/__tests__/", "/__pycache__/", ".test.", ".spec.",
                      "/alembic/", "__init__.py")
-DEFAULT_LIMIT = 6
+DEFAULT_LIMIT = 8
+PER_SERVICE_CAP = 3
 MAX_VERIFY = 24
 
 _PATH_RE = re.compile(r"(?<![\w./-])((?:[\w()\[\]@.-]+/)+[\w()\[\]@.-]+\.[A-Za-z0-9]{1,8})(?![\w/])")
@@ -75,9 +76,13 @@ def parse_find_files(text: str) -> list:
     return [ln.strip() for ln in t.splitlines()[1:] if ln.strip()]
 
 
-def rank_and_select(per_mode: dict, verified: dict, limit: int) -> list:
+def rank_and_select(per_mode: dict, verified: dict, limit: int, per_service_cap: int = PER_SERVICE_CAP) -> list:
     """Pure: `per_mode` {mode: [candidate paths in retrieval order]}, `verified` {candidate: canonical path | None}.
-    Score = number of modes that returned the file; ties broken by best rank; then round-robin across service roots."""
+    Agreement dominates: score = number of retrieval modes that returned the file, ties broken by best rank. A per-service
+    cap keeps one service from flooding the selection; it never promotes a lower-agreement file over a higher one that
+    still fits under its service's cap. (A first draft spread round-robin across services, which put a one-mode file from a
+    fourth service ahead of a three-mode file from a service already represented; found on the discovery probe, before
+    any acceptance run.)"""
     score, best_rank = {}, {}
     for mode, paths in per_mode.items():
         for rank, cand in enumerate(paths):
@@ -87,15 +92,16 @@ def rank_and_select(per_mode: dict, verified: dict, limit: int) -> list:
             score.setdefault(canon, set()).add(mode)
             best_rank[canon] = min(best_rank.get(canon, 10**9), rank)
     ordered = sorted(score, key=lambda c: (-len(score[c]), best_rank[c], c))
-    groups: dict = {}
-    for c in ordered:
-        groups.setdefault(_service_root(c), []).append(c)
-    roots = sorted(groups, key=lambda r: (-len(score[groups[r][0]]), best_rank[groups[r][0]], r))
+    used: dict = {}
     picked: list = []
-    while len(picked) < limit and any(groups.values()):
-        for r in roots:
-            if groups[r] and len(picked) < limit:
-                picked.append(groups[r].pop(0))
+    for c in ordered:
+        root = _service_root(c)
+        if used.get(root, 0) >= per_service_cap:
+            continue
+        used[root] = used.get(root, 0) + 1
+        picked.append(c)
+        if len(picked) >= limit:
+            break
     return picked
 
 
