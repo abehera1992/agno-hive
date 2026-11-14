@@ -82,7 +82,7 @@ def derive_policy(paths: list):
             reqs.append(hit)
             used.add(hit.id)
         else:
-            reqs.append(A.Requirement(f"R{i}_read_{os.path.basename(p)}", f"read source file {p}", [n]))
+            reqs.append(A.Requirement(f"F{i}_read_{os.path.basename(p)}", f"read source file {p}", [n]))
     links = list(A.T11_DOC_UPLOAD_POLICY.links) if used >= {r.id for r in A.T11_DOC_UPLOAD_POLICY.requirements} else []
     return A.EvidencePolicy(name="derived-" + hashlib.sha256("|".join(paths).encode()).hexdigest()[:8],
                             requirements=reqs, links=links)
