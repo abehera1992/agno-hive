@@ -169,7 +169,7 @@ def get_model(
 
 _BASE_PREAMBLE = [
     "SESSION CONTEXT: At session start, if project context hasn't been provided by the coordinator, try get_file_content('hive.md') once for a pre-built project overview (directory tree, per-module summaries). Skip silently if not found — it's optional.",
-    "lightrag_query is always connected server-side (api/server.py's _resolve_mcp_urls appends it regardless of caller opt-in) — call it with relevant keywords before starting.",
+    "A KNOWLEDGE PREPARATION brief (project knowledge retrieved by the application before you started) may be included in your task; treat it as leads and read the real files yourself. You have no LightRAG query tool.",
     "Do NOT call lightrag_insert on the project namespace — successful outcomes are captured automatically into a separate experience namespace by the feedback loop. Free-text inserts into the project namespace poison code-grounding retrieval.",
     "HONESTY: never claim a change was made or that a task succeeded if a tool returned an error, an empty result, or did not apply. Report the exact failure instead. A partial result is a FAILURE, not a success.",
     "SHARED STATE: your context includes read_log — files already read this run, by whom, tracked automatically. Before reading a file, check whether it's already listed — if so, use what the prior reader found instead of reading it again. You also have update_session_state — use it for a small, genuinely reusable fact or decision (never full file content) so a later step in this run doesn't have to re-derive it.",
@@ -341,7 +341,7 @@ def make_agent_from_spec(
     instructions = instructions + _VERBATIM_REPORT_INSTRUCTIONS
     if project_id:
         instructions = [
-            f"── This project's LightRAG namespace (for lightrag_query/lightrag_insert/index_project's "
+            f"── This project's LightRAG namespace (for lightrag_insert/index_project's "
             f"project_id argument): '{project_id}' — ALWAYS use this EXACT value. Never guess, invent, or "
             f"infer a different project_id (not a directory name, not a UUID, not a variant spelling) — an "
             f"unrecognized value returns empty/no-context results or a hard error, not a helpful failure. ──",
@@ -547,8 +547,7 @@ def make_context_router(*mcps: MCPTools) -> Agent:
             "  - Overview/structure questions → list_directory_tree() if available, else find_files('**/*')",
             "  - 'How does X work' questions  → search_files(X, '**/*') across the whole codebase",
             "  - Specific file/symbol         → find_files() or search_files() with a targeted pattern",
-            "  - Semantic/memory questions    → lightrag_query() if available, else search_knowledge_graph()",
-            "  - Cross-project patterns       → lightrag_query(query, 'global', mode='hybrid') if available",
+            "  - Semantic/memory questions    → search_knowledge_graph() if available (project retrieval is prepared by the application in a KNOWLEDGE PREPARATION brief)",
             "  - User shares a URL or GitHub link → web_fetch(url) immediately if available",
             "  - External tool/library/repo   → web_search(name) then web_fetch on best result if available",
             "Return only the retrieved context. Do not answer the question yourself.",

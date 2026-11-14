@@ -28,7 +28,6 @@ tools:
       - find_files
       - get_file_content
       - lightrag_insert
-      - lightrag_query
       - list_directory
       - load_skill
       - run_command
@@ -37,7 +36,6 @@ tools:
       - write_file
     ContextRouter:
       - find_files
-      - lightrag_query
       - list_directory
       - list_directory_tree
       - load_skill
@@ -72,7 +70,6 @@ tools:
       - db_schema
       - find_files
       - get_file_content
-      - lightrag_query
       - list_directory
       - list_directory_tree
       - load_skill
@@ -89,7 +86,6 @@ tools:
       - git_diff
       - git_status
       - lightrag_insert
-      - lightrag_query
       - load_skill
       - search_files
       - search_knowledge_graph
@@ -98,7 +94,6 @@ tools:
       - find_files
       - get_context_section
       - get_file_content
-      - lightrag_query
       - list_directory
       - list_directory_tree
       - load_skill
@@ -107,13 +102,11 @@ tools:
     PerformanceReviewer:
       - find_files
       - get_file_content
-      - lightrag_query
       - load_skill
       - search_files
     Researcher:
       - find_files
       - get_file_content
-      - lightrag_query
       - list_directory_tree
       - load_skill
       - search_files
@@ -121,14 +114,12 @@ tools:
       - find_files
       - get_file_content
       - git_diff
-      - lightrag_query
       - load_skill
       - search_files
   planning:
     ContextRouter:
       - find_files
       - get_file_content
-      - lightrag_query
       - list_directory
       - list_directory_tree
       - notion_get_page
@@ -141,7 +132,6 @@ tools:
       - find_files
       - get_context_section
       - get_file_content
-      - lightrag_query
       - list_directory
       - list_directory_tree
       - notion_get_page
@@ -151,7 +141,6 @@ tools:
     Planner:
       - find_files
       - get_file_content
-      - lightrag_query
       - notion_get_page
       - notion_search
       - search_files
@@ -159,7 +148,6 @@ tools:
     Researcher:
       - find_files
       - get_file_content
-      - lightrag_query
       - list_directory
       - list_directory_tree
       - notion_get_page

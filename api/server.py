@@ -820,6 +820,8 @@ async def _run_worker_subprocess(http_request, payload: dict, argv: list[str] | 
         return await _run_worker_subprocess_inner(http_request, payload, argv, barren_attempt=0)
     finally:
         ADMISSION.release(ticket)
+        from swarm import knowledge as _K
+        _K.drop_cached(payload.get("knowledge_key"))       # Phase 1.20: the dossier lives for this top-level request only
 
 
 async def _stream_worker_subprocess(http_request, payload: dict, argv: list[str] | None = None):
@@ -829,6 +831,8 @@ async def _stream_worker_subprocess(http_request, payload: dict, argv: list[str]
             yield chunk
     finally:
         ADMISSION.release(ticket)
+        from swarm import knowledge as _K
+        _K.drop_cached(payload.get("knowledge_key"))
 
 
 @app.get("/admin/workers")
@@ -1537,6 +1541,7 @@ async def _run_impl(request: RunRequest, http_request: Request):
         "workflow_controls": request.workflow_controls,
         "work_items": request.work_items,
         "idempotency_key": request.idempotency_key,
+        "knowledge_key": "kn-" + uuid.uuid4().hex[:16],      # Phase 1.20: one retrieval per top-level request
     }
     result, tokens, clarification = await _run_worker_subprocess(http_request, worker_payload)
 
@@ -1891,6 +1896,7 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
                 "read_only": request.read_only,
                 "team_name": gate_team_name,
                 "execution_profile": request.execution_profile,
+                "knowledge_key": "kn-" + uuid.uuid4().hex[:16],
             })
 
             async for chunk in stream_source:

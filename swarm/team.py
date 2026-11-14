@@ -59,6 +59,7 @@ _tracer = trace.get_tracer("agno-hive.team")
 # Lowered to 180s so a stuck tool call fails cleanly, with a real logged exception,
 # well before the 300s liveness kill would otherwise silently eat the whole window.
 # See test_mcp_timeout_has_headroom_before_liveness_kill for the invariant this relies on.
+from swarm.knowledge import render_brief as _knowledge_render, emit as _knowledge_emit  # Phase 1.20 shared Knowledge Preparation
 _MCP_TIMEOUT = 180  # lightrag_query synthesis ~90-120s; large file reads over Docker bind mounts can be slow — headroom so multi-read tasks don't die mid-read
 
 # 2026-08-19 (T6 follow-up, found live watching task koi6p1bkd): _MCP_TIMEOUT above
@@ -177,6 +178,10 @@ def _model_verify_claims_unavailable_result() -> str:
 #
 # So: a tool that no longer EXISTS needs no exclusion, and adding one is actively
 # harmful. Only list names the server actually serves and agents must not call.
+# Phase 1.20: agents have no LightRAG query tool. Retrieval is run by the application (swarm/knowledge.py) through its own
+# session; these two are excluded from the MCP tool objects handed to agents so no allowlist fallback or inheritance path can
+# re-attach them. (Both exist on the LightRAG server, so excluding them cannot zero out that server's remaining tools.)
+_LIGHTRAG_AGENT_EXCLUDE_TOOLS = ["lightrag_query", "lightrag_query_context"]
 _PROJECT_MCP_EXCLUDE_TOOLS = [
     "agno_run", "agno_list_teams",
     # graphify's graph.json is Claude Code/Cline's stack, not hive's — hive's
@@ -226,9 +231,9 @@ _COORDINATOR_INSTRUCTIONS = [
     "  then follow the calls downstream', 'trace the flow end to end... name every file in the",
     "  chain') — put ALL of those steps into THIS SAME delegation's objective/evidence_required/",
     "  completion_criteria, not just the first one. Confirmed live, 2026-11-07 (Phase 0.83): a",
-    "  task that opened with 'first call lightrag_query(...), then read business_api.py and",
+    "  task that opened with 'first call search_files(...), then read business_api.py and",
     "  business_admin_api.py... to confirm the actual handler and what it calls downstream' got",
-    "  an objective of only 'call lightrag_query and return its raw output verbatim' — the exact",
+    "  an objective of only 'call search_files and return its raw output verbatim' — the exact",
     "  wording of the worked example above, copied for only the FIRST named step — three times",
     "  in a row, with the file-reading and downstream-tracing the task actually asked for never",
     "  delegated at all. A successful discovery call is the START of the investigation the task",
@@ -555,9 +560,9 @@ _COORDINATOR_INSTRUCTIONS = [
     "For 'how does X work' / feature questions ('trace X from the API route to the",
     "database model', 'how does Y verification work'):",
     "  1. delegate_structured_task to researcher — target: the whole codebase, objective:",
-    "     call lightrag_query with the FULL topic phrase FIRST (e.g. \"seller verification\",",
-    "     never a single generic noun like \"seller\" alone), then search_files for that same",
-    "     full phrase and any specific symbol/term the lightrag_query result surfaces, and",
+    "     use the KNOWLEDGE PREPARATION brief the application already gave it, then search_files with the FULL topic phrase (e.g. \"seller verification\",",
+    "     never a single generic noun like \"seller\" alone) and",
+    "     any specific symbol/term the brief surfaces, and",
     "     return every matching file:line.",
     "  → A single common noun ('seller', 'order', 'user') matches dozens of unrelated files",
     "    across the whole repo (migrations, docs, email templates, frontend styles) and",
@@ -567,7 +572,7 @@ _COORDINATOR_INSTRUCTIONS = [
     "    the single bare noun from the question, not the full phrase — returned 60+ hits",
     "    across README/DOCS/migrations/email templates, never identified the real route",
     "    (business_admin_api.py's verify_seller) or model (models.py's VerificationCheck),",
-    "    and lightrag_query was never called at all in that run.",
+    "    and no retrieval-informed search was ever run in that run.",
     "  2. get_file_content() yourself on the SPECIFIC route/handler file the search points",
     "     to — not simply the 2-3 files mentioning the term most often, which skews toward",
     "     docs/config that happen to repeat a common word. Then follow THAT file's own",
@@ -1131,7 +1136,7 @@ def _project_id_preamble(project_id: str) -> list[str]:
     _team_roster_preamble, not team-scoped).
     """
     return [
-        f"── This project's LightRAG namespace (for lightrag_query/lightrag_insert/index_project's project_id argument): '{project_id}' — ALWAYS use this EXACT value. Never guess, invent, or infer a different project_id (not a directory name, not a UUID, not a variant spelling) — an unrecognized value returns empty/no-context results or a hard error, not a helpful failure. ──",
+        f"── This project's LightRAG namespace (for lightrag_insert/index_project's project_id argument): '{project_id}' — ALWAYS use this EXACT value. Never guess, invent, or infer a different project_id (not a directory name, not a UUID, not a variant spelling) — an unrecognized value returns empty/no-context results or a hard error, not a helpful failure. ──",
         "",
     ]
 
@@ -15248,26 +15253,11 @@ async def _repo_search_text(pattern: str, glob_filter: str, hive_mcp_url: str | 
     return box["text"]
 
 
-# ── Mandatory LightRAG-first pre-fetch (2026-10-23) ─────────────────────────
+# ── LightRAG retrieval helpers (Phase 1.20) ─────────────────────────────────
 #
-# teams/engineering.yaml's own "SEARCH BEFORE YOU BROWSE, ALWAYS, NO EXCEPTIONS"
-# instruction already told the Researcher to call lightrag_query before any
-# exploratory search -- and the 2026-10-23 T7-T13b battery (6 full live runs,
-# ~17:09-18:46 EDT on ZGX) proves, via direct journal correlation (every
-# "lightrag" line in that window classified: all 18 were member-surface tool
-# LISTINGS, zero were tool_hook/stream-event INVOCATIONS), that it never once
-# did. The same lesson _computed_comparison's own docstring already recorded
-# for a different tool -- "the gate worked mechanically... and the model
-# re-read both files and ran 60 search_files calls instead... stop asking...
-# do it here and show the result" -- applies here: a prompt instruction is
-# not an execution guarantee. This enforces the attempt deterministically, in
-# Python, at delegate_structured_task's own established interception point
-# (_build_canonical_researcher_task's docstring: "Every delegation funnels
-# through this ONE function regardless of which member or task generated
-# it, making it the correct interception point" -- written for
-# inherited_context, equally true here) instead of relying on the model to
-# remember an instruction it has already been shown to ignore.
-_LIGHTRAG_PREFETCH_CACHE_ATTR = "_lightrag_prefetch_cache"
+# Retrieval is performed ONLY by the application's shared Knowledge Preparation (swarm/knowledge.py), once per
+# top-level execution, through _repo_lightrag_query below. Agents have no LightRAG query tool: the earlier per-delegation
+# prefetch (2026-10-23) and the model-callable lightrag_query it was working around were both removed.
 # Generic repo-retrieval gate: any member whose OWN capability surface
 # (team.members[i].tools -- "the canonical, already-logged capability
 # source", per _build_structured_delegation_tool's own docstring) includes at
@@ -15314,6 +15304,26 @@ def _lightrag_result_is_usable(text: str) -> bool:
 
 
 _LIGHTRAG_CONTEXT_TIMEOUT = float(os.getenv("LIGHTRAG_CONTEXT_TIMEOUT_S", "30"))
+
+
+async def _prepare_knowledge(task: str, project_id: str, mcp_urls, effective_mcp_url, knowledge_key, caller: str):
+    """Phase 1.20: the ONE place a top-level execution obtains its Knowledge Dossier (both engines, all entry points)."""
+    from swarm import knowledge as _K
+    all_urls = [u for u in (mcp_urls or []) + [effective_mcp_url] if u]
+    return await _K.prepare_run_knowledge(
+        task, project_id=project_id, lightrag_url=config.lightrag_mcp_url,
+        hive_url=_pick_hive_mcp_url(all_urls, effective_mcp_url), run_key=knowledge_key, caller=caller)
+
+
+def _is_connect_failure(exc: BaseException) -> bool:
+    """True when `exc` (or any exception inside an ExceptionGroup) is a connection-level failure."""
+    stack = [exc]
+    while stack:
+        e = stack.pop()
+        if isinstance(e, (ConnectionError, OSError)) or "Connect" in type(e).__name__:
+            return True
+        stack.extend(getattr(e, "exceptions", []) or [])
+    return False
 
 
 async def _repo_lightrag_query(query: str, project_id: str,
@@ -15419,7 +15429,8 @@ async def _repo_lightrag_query(query: str, project_id: str,
     except Exception as exc:  # noqa: BLE001
         print(f"[team] lightrag-prefetch: session failed "
               f"({type(exc).__name__}: {exc or '<no message>'})", flush=True)
-        return "error", ""
+        # Phase 1.20: a connection-level failure is UNAVAILABLE (the service cannot be reached), not a generic error.
+        return ("unavailable" if _is_connect_failure(exc) else "error"), ""
 
     text = box["text"]
     # lightrag_mcp/server.py's own fix (2026-10-23 hardening phase): a
@@ -15459,93 +15470,7 @@ def _any_member_eligible_for_lightrag(team) -> bool:
     return False
 
 
-async def _lightrag_prefetch_for_delegation(
-        team, member_id: "str | None",
-        target: str, objective: str, evidence_required: str) -> "str | None":
-    """The mandatory, deterministic LightRAG-first attempt for ONE
-    delegation, or None when either this delegation is not a
-    repository/code-understanding retrieval task (gated on
-    _LIGHTRAG_REPO_RETRIEVAL_TOOLS, above) or the attempt produced nothing
-    usable (Section 6: the existing search/read workflow always continues
-    regardless either way -- this function's return value is additive
-    evidence only, never a gate on normal retrieval).
-
-    `member_id=None` (2026-10-23 hardening phase) signals a broadcast
-    delegation -- teams/parallel-review.yaml's own members are already
-    instructed to use lightrag_query, confirming broadcast work genuinely
-    does repository retrieval, so excluding it entirely (the original
-    2026-10-23 behavior) was a real coverage gap, not an intentional
-    boundary. Eligibility is then "_any_member_eligible_for_lightrag", not
-    one member's capability set -- exactly one shared query either way,
-    never one per recipient, since delegate_structured_task calls this
-    function exactly once per delegate_structured_task invocation
-    regardless of how many real members a broadcast resolves to.
-
-    Cached on the run-scoped `team` object, keyed by a hash of
-    (target, objective, evidence_required) computed HERE -- deliberately NOT
-    the caller's own canonical_hash, which is a hash of the FULL canonical
-    task text that this function's own result is about to become part of
-    (delegate_structured_task builds canonical_task only AFTER this call
-    returns); reusing that hash would be circular. A reworded-duplicate
-    delegation to the same target/objective (confirmed live during this
-    project's own T13a battery run: "ALREADY DONE -- 'researcher' was
-    already asked about ... earlier this run, worded differently") still
-    hits this cache, since completion_criteria -- the one field that can
-    differ on a reworded repeat -- is deliberately excluded from this key.
-    The key does not depend on member_id, so a broadcast and a
-    (hypothetical) non-broadcast call sharing the same target/objective/
-    evidence_required within the same run correctly reuse one result --
-    consistent with "no duplicate query... when one shared query is
-    sufficient."
-    """
-    if team is None:
-        return None
-    if member_id is None:
-        if not _any_member_eligible_for_lightrag(team):
-            return None
-    else:
-        available = _member_capability_tools(team, member_id)
-        if not available or not (available & _LIGHTRAG_REPO_RETRIEVAL_TOOLS):
-            return None
-
-    cache_key = hashlib.sha256(
-        f"{target}\x00{objective}\x00{evidence_required}"
-        .encode("utf-8", errors="replace")).hexdigest()[:16]
-    cache = getattr(team, _LIGHTRAG_PREFETCH_CACHE_ATTR, None)
-    if cache is None:
-        cache = {}
-        setattr(team, _LIGHTRAG_PREFETCH_CACHE_ATTR, cache)
-    if cache_key in cache:
-        print(f"[team] LIGHTRAG_PREFETCH: prefetch_key={cache_key} "
-              f"outcome='cached' (duplicate delegation, reusing prior result)",
-              flush=True)
-        return cache[cache_key]
-
-    project_id = getattr(team, "_project_id", None) or "default"
-    query = f"{target} -- {objective} {evidence_required}".strip()
-    # Execution-profile deadline (2026-10-24): team._execution_deadline is a
-    # monotonic end-time set once at run start (see run_task_async/
-    # run_task_stream's own ExecutionProfile resolution) -- None for the
-    # standard profile (unbounded, today's unchanged default). When set,
-    # _repo_lightrag_query further bounds its own timeout to whatever time
-    # remains, so a prefetch can never, by itself, consume more of an
-    # exhaustive task's budget than is actually left.
-    deadline = getattr(team, "_execution_deadline", None)
-    start = time.monotonic()
-    outcome, text = await _repo_lightrag_query(
-        query, project_id, config.lightrag_mcp_url, deadline=deadline)
-    duration = time.monotonic() - start
-    usable = outcome == "usable"
-    # Structured, explicit-field log line (Section 7). fallback_continues is
-    # always True and logged anyway -- a reader should never have to infer
-    # "did normal search still run" from its absence elsewhere.
-    print(f"[team] LIGHTRAG_PREFETCH: prefetch_key={cache_key} "
-          f"member_id={member_id!r} outcome={outcome!r} usable={usable} "
-          f"duration_s={duration:.1f} chars={len(text)} "
-          f"fallback_continues=True", flush=True)
-    result = text if usable else None
-    cache[cache_key] = result
-    return result
+# Phase 1.20: _lightrag_prefetch_for_delegation (per-delegation retrieval, cached head-truncation) was removed. See swarm/knowledge.py.
 
 
 # "...and how it integrates with the business service" -- the subject service comes from
@@ -24635,6 +24560,11 @@ def _make_tool_interception_hook(
                 await execution_store.guard(execution_store.persist_tool_call_completed(
                     _tool_call_db_id, _tool_call, _evidence))
             print(f"[team] tool_hook: {function_name}({args}) -> {elapsed:.2f}s", flush=True)
+            try:
+                from swarm import knowledge as _K
+                _K.tool_event(function_name, args, True, run=str(getattr(team, "_knowledge_run", "") or ""), where="agent")
+            except Exception:  # noqa: BLE001 -- observability only; never affects a tool call
+                pass
             # Write-action observation (2026-09-11). Pure observer: it reads the call
             # and its result and records them, and cannot alter either. This hook is
             # registered OUTERMOST and always runs, which makes it the one exact
@@ -24813,7 +24743,7 @@ _INHERITED_CONTEXT_CAP = 2000
 # magnitude larger than the synthesized-prose shape _INHERITED_CONTEXT_CAP
 # was sized for. A separate, larger cap keeps several real entity/relation
 # descriptions intact instead of truncating to a fragment of the first one.
-_LIGHTRAG_CONTEXT_BLOCK_CAP = 6000
+# (Phase 1.20: the per-delegation 6,000-char LightRAG block was removed; the shared dossier brief is rendered by swarm/knowledge.py)
 
 # Phase T27: live testing of T26 found the inherited-context block attached
 # unconditionally (whenever team._session_summary was non-empty) bled into an
@@ -24906,7 +24836,7 @@ def _inherited_context_is_relevant(
 def _build_canonical_researcher_task(
     target: str, objective: str, evidence_required: str, completion_criteria: str,
     inherited_context: str | None = None,
-    lightrag_context: str | None = None,
+    knowledge_brief: str | None = None,
 ) -> str:
     """Pure, deterministic text construction -- Phase S Test B requires
     canonical_task(x) == canonical_task(x) for identical inputs. No model call, no
@@ -25000,41 +24930,17 @@ def _build_canonical_researcher_task(
             f"investigate your own target fresh -- do not force an unrelated answer "
             f"to reuse it.\n\n"
         )
-    # LightRAG-first prefetch (2026-10-23): a deterministic pre-fetch already ran
-    # for this delegation BEFORE this task text was built (see
-    # _lightrag_prefetch_for_delegation, called from delegate_structured_task just
-    # above its own call to this function) -- this block only renders what it
-    # returned, with provenance preserved exactly as INHERITED CONTEXT's own block
-    # above does, and the SAME explicit "not independently confirmed" framing: a
-    # semantic-search result can describe a file's role correctly without quoting
-    # its literal content (see teams/parallel-review.yaml's own documented
-    # incident), so it is disclosed as a lead, never promoted to a citation.
-    _lightrag_block = ""
-    if lightrag_context and lightrag_context.strip():
-        _lr_text = lightrag_context.strip()
-        if len(_lr_text) > _LIGHTRAG_CONTEXT_BLOCK_CAP:
-            _lr_text = _lr_text[:_LIGHTRAG_CONTEXT_BLOCK_CAP] + "\n... (truncated)"
-        _lightrag_block = (
-            f"LIGHTRAG RETRIEVAL (ran automatically before this task was "
-            f"dispatched to you -- raw retrieved entity/relationship data, NOT "
-            f"independently confirmed, and NOT a substitute for reading the "
-            f"actual file. Not filtered for relevance the way a composed answer "
-            f"would be -- retrieval returns its closest matches regardless of "
-            f"true topical fit):\n{_lr_text}\n\n"
-            f"This may name real files/symbols worth reading directly, or may "
-            f"only describe a file's role without quoting its literal content, "
-            f"or may be off-topic for this specific objective. Use it to target "
-            f"your own search/read faster if it helps; do not cite it in place "
-            f"of a real file you have read, and do not skip your own "
-            f"investigation merely because this block is nonempty.\n\n"
-        )
+    # Phase 1.20: the application's Knowledge Dossier brief (swarm/knowledge.py), prepared ONCE for this top-level execution
+    # and rendered here as compact labelled context. Not raw retrieval, not repeated retrieval: each Researcher execution
+    # receives it once.
+    _knowledge_block = f"{knowledge_brief.strip()}\n\n" if knowledge_brief and knowledge_brief.strip() else ""
     return (
         f"TARGET:\n{target}\n\n"
         f"OBJECTIVE:\n{objective}\n\n"
         f"EVIDENCE REQUIRED:\n{evidence_required}\n\n"
         f"COMPLETION CRITERIA:\n{completion_criteria}\n\n"
         f"{_inherited_block}"
-        f"{_lightrag_block}"
+        f"{_knowledge_block}"
         f"SCOPE PRECEDENCE:\n"
         f"The objective and completion criteria above define WHEN this task is "
         f"complete. They do NOT define WHAT content is in scope -- your own "
@@ -25225,21 +25131,13 @@ def _build_structured_delegation_tool(original_function, team=None):
         print(f"[team] T27 inherited-context relevance: included={_relevant} "
               f"member_id={member_id!r} session_summary_present={bool(_session_summary)}",
               flush=True)
-        # LightRAG-first prefetch (2026-10-23): mandatory, deterministic attempt
-        # for this ONE delegation, awaited before canonical_task is built so a
-        # usable result is already part of what the member receives -- not a
-        # prompt instruction for the member to call it themselves (see
-        # _lightrag_prefetch_for_delegation's own docstring for why that already
-        # failed live, across this project's entire 2026-10-23 T7-T13b battery).
-        # Broadcast hardening (same day, follow-up phase): is_broadcast dispatches
-        # to every real member internally, so member_id=None signals
-        # _lightrag_prefetch_for_delegation to check ANY resolved member's
-        # eligibility instead of one named member's -- one shared query either
-        # way (teams/parallel-review.yaml, the only broadcast-mode team, already
-        # instructs its members to use lightrag_query, confirming this is a real
-        # coverage gap, not a boundary).
-        _lightrag_context = await _lightrag_prefetch_for_delegation(
-            team, None if is_broadcast else member_id, target, objective, evidence_required)
+        # Phase 1.20: NO per-delegation retrieval. The Knowledge Dossier was prepared once, at the top of this top-level
+        # execution (run_task_async / run_task_stream), and is only rendered here for this Researcher execution.
+        _dossier = getattr(team, "_knowledge_dossier", None)
+        _lightrag_context = _knowledge_render(_dossier, "researcher") if _dossier is not None else ""
+        if _dossier is not None:
+            _knowledge_emit("KNOWLEDGE_DOSSIER_REUSED", run=getattr(_dossier, "run_key", None), member=member_id,
+                            status=_dossier.status, brief_chars=len(_lightrag_context))
         # Phase 1.00 (B1/B2): remember what was preloaded for THIS member's delegation, plus
         # the delegation's own wording (so a report that merely echoes the task is not
         # mistaken for one grounded in the preloaded context).
@@ -25261,7 +25159,7 @@ def _build_structured_delegation_tool(original_function, team=None):
             evidence_required=evidence_required,
             completion_criteria=completion_criteria,
             inherited_context=_session_summary if _relevant else None,
-            lightrag_context=_lightrag_context,
+            knowledge_brief=_lightrag_context,
         )
         canonical_hash = hashlib.sha256(
             canonical_task.encode("utf-8", errors="replace")).hexdigest()[:16]
@@ -29154,6 +29052,7 @@ async def run_task_stream(
     read_only: bool = False,
     team_name: str | None = None,
     execution_profile: str | None = None,
+    knowledge_key: str | None = None,
 ):
     """Same setup as run_task_async but yields text chunks as the coordinator generates them.
 
@@ -29183,6 +29082,8 @@ async def run_task_stream(
     """
     effective_mcp_url = mcp_url or config.mcp_url
     effective_coordinator = coordinator_model or config.leader_model
+    # Phase 1.20: shared Knowledge Preparation, once per top-level execution, before any agent starts.
+    _knowledge = await _prepare_knowledge(task, project_id, mcp_urls, effective_mcp_url, knowledge_key, "run_task_stream")
     # Rebound BEFORE the roster is composed: the Coordinator's roster preamble prints each
     # member's tools, and a read_only run was advertising tools _strip_mutating removes
     # later. Idempotent with the strip below, which then removes nothing further.
@@ -29266,6 +29167,9 @@ async def run_task_stream(
     # zero delegations, zero real evidence, then fabricated an answer -- caught by
     # existing guards but the task went unanswered).
     instructions += _tool_naming_hint_lines(task, coordinator_tools)
+    # Phase 1.20: the Coordinator gets only a compact status + starting files; the Researcher receives the fuller brief with
+    # each delegation. The application, not this model, decided retrieval would happen and what to do when it fails.
+    instructions += ["", _knowledge_render(_knowledge, "coordinator")]
 
     if skill_catalog:
         instructions += ["", format_skill_catalog(skill_catalog, None)]
@@ -29327,7 +29231,8 @@ async def run_task_stream(
         # 0 tools for that server, so this must stay project-mcp-only.
         _project_mcp_url = effective_mcp_url
         for url in all_mcp_urls:
-            _exclude = _PROJECT_MCP_EXCLUDE_TOOLS if url == _project_mcp_url else None
+            _exclude = (_PROJECT_MCP_EXCLUDE_TOOLS if url == _project_mcp_url
+                        else (_LIGHTRAG_AGENT_EXCLUDE_TOOLS if url == config.lightrag_mcp_url else None))
             try:
                 mcp = await stack.enter_async_context(
                     MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=_exclude)
@@ -29437,6 +29342,8 @@ async def run_task_stream(
         # parameter, never guessed (see _lightrag_namespace_instruction's own
         # docstring for why a guessed value is a real, recurring failure mode).
         team._project_id = project_id
+        team._knowledge_dossier = _knowledge        # Phase 1.20: read by delegate_structured_task (rendered, never re-retrieved)
+        team._knowledge_run = getattr(_knowledge, "run_key", "")
         # Workstream B (2026-10-24): _exec_profile was already resolved ABOVE,
         # before _build_team (see that call's own comment) -- reused here, not
         # re-resolved, so the bonus baked into the agents' real tool_call_limit
@@ -34733,6 +34640,7 @@ async def run_task_async(
     work_items: list | None = None,
     idempotency_key: str | None = None,
     liveness_nonce: str | None = None,
+    knowledge_key: str | None = None,
 ) -> tuple[str, dict, dict | None]:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer.
 
@@ -34776,6 +34684,9 @@ async def run_task_async(
     """
     effective_mcp_url = mcp_url or config.mcp_url
     effective_coordinator = coordinator_model or config.leader_model
+    # Phase 1.20: shared Knowledge Preparation, once per top-level execution, BEFORE the engine branch so the Team and the
+    # Workflow use the exact same service and the exact same dossier ownership point.
+    _knowledge = await _prepare_knowledge(task, project_id, mcp_urls, effective_mcp_url, knowledge_key, "run_task_async")
     if orchestration == "workflow":
         if team_name == "engineering" and agent_specs:
             from swarm.eng_workflow import run_engineering_workflow
@@ -34787,7 +34698,7 @@ async def run_task_async(
                 task, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
                 project_id, session_id, controls_raw=workflow_controls, work_items=work_items,
                 idempotency_key=idempotency_key, liveness_path=liveness_path,
-                liveness_nonce=liveness_nonce)
+                liveness_nonce=liveness_nonce, knowledge=_knowledge)
         print(f"[team] orchestration=workflow requested but team_name={team_name!r} is not 'engineering' "
               f"(or no roster) -- using the Team path", flush=True)
     # Rebound BEFORE the roster is composed -- see run_task_stream for the reason.
@@ -34872,6 +34783,9 @@ async def run_task_async(
     # zero delegations, zero real evidence, then fabricated an answer -- caught by
     # existing guards but the task went unanswered).
     instructions += _tool_naming_hint_lines(task, coordinator_tools)
+    # Phase 1.20: the Coordinator gets only a compact status + starting files; the Researcher receives the fuller brief with
+    # each delegation. The application, not this model, decided retrieval would happen and what to do when it fails.
+    instructions += ["", _knowledge_render(_knowledge, "coordinator")]
 
     if skill_catalog:
         instructions += ["", format_skill_catalog(skill_catalog, None)]
@@ -34935,7 +34849,8 @@ async def run_task_async(
         # 0 tools for that server, so this must stay project-mcp-only.
         _project_mcp_url = effective_mcp_url
         for url in all_mcp_urls:
-            _exclude = _PROJECT_MCP_EXCLUDE_TOOLS if url == _project_mcp_url else None
+            _exclude = (_PROJECT_MCP_EXCLUDE_TOOLS if url == _project_mcp_url
+                        else (_LIGHTRAG_AGENT_EXCLUDE_TOOLS if url == config.lightrag_mcp_url else None))
             try:
                 mcp = await stack.enter_async_context(
                     MCPTools(url=url, transport="streamable-http", timeout_seconds=_MCP_TIMEOUT, exclude_tools=_exclude)
@@ -35091,6 +35006,8 @@ async def run_task_async(
         # as team._session_summary/_task above -- see the matching line + comment
         # in run_task_stream.
         team._project_id = project_id
+        team._knowledge_dossier = _knowledge        # Phase 1.20: read by delegate_structured_task (rendered, never re-retrieved)
+        team._knowledge_run = getattr(_knowledge, "run_key", "")
         # Workstream B (2026-10-24): _exec_profile already resolved above,
         # before _build_team -- reused here, not re-resolved. Same slots as
         # run_task_stream.

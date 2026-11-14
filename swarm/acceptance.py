@@ -370,7 +370,12 @@ def _section_for(o, p) -> str:
     return ""
 
 
+ANY_SOURCE = "*"      # Phase 1.20: a generic requirement -- ANY successful source read of this attempt satisfies it
+
+
 def _req_source(req, srcs):
+    if list(req.any_of_paths) == [ANY_SOURCE]:
+        return next(iter(srcs.values()), None) if srcs else None
     for p, t in srcs.items():
         for cand in req.any_of_paths:
             if p.endswith(norm_path(cand)):
@@ -387,8 +392,9 @@ def gate_evaluate(policy, outcomes, text) -> dict:
     by_req = {}
     for r in policy.requirements:
         t = _req_source(r, srcs)
+        generic = list(r.any_of_paths) == [ANY_SOURCE]
         calls = sorted({o.seq for o in outcomes if o.outcome == SUCCESS and o.evidence_kind == "source_read"
-                        and any(p.endswith(norm_path(c)) for p in o.paths_read for c in r.any_of_paths)})
+                        and (generic or any(p.endswith(norm_path(c)) for p in o.paths_read for c in r.any_of_paths))})
         by_req[r.id] = t
         (sat if t is not None else miss).append({"id": r.id, "description": r.description, "satisfied_by_calls": calls})
     link_results = []
