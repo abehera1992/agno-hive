@@ -751,6 +751,58 @@ async def _workflow_supervised_final(payload: dict, snapshot: dict | None, pid: 
 _ACTIVE_WORKERS: dict[int, dict] = {}
 
 
+# --- Phase 1.18D: worker admission control ---------------------------------------------------------
+# One process-local controller bounds how many worker processes exist at once. Measured on ZGX (single GB10 GPU,
+# ~151 MB RSS per worker, host memory not the constraint): latency grows 41s -> 52s -> 82s for 1/2/4 concurrent
+# runs and vLLM starts queueing at 4, so the cap protects the GPU, not RAM. Beyond cap+queue a request gets 429.
+from swarm.admission import WorkerAdmission, AdmissionRejected  # noqa: E402
+ADMISSION = WorkerAdmission(config.max_active_workers, config.worker_queue_max, config.worker_queue_wait_s)
+
+
+def _admission_http_error(e: AdmissionRejected) -> HTTPException:
+    return HTTPException(status_code=429, detail=e.detail(), headers={"Retry-After": str(e.retry_after_s)})
+
+
+async def _admit(kind: str, http_request):
+    try:
+        return await ADMISSION.acquire(kind, http_request)
+    except AdmissionRejected as e:
+        print(f"[admission] REJECTED {kind}: {e.reason} (active={e.active} queued={e.queued})", flush=True)
+        raise _admission_http_error(e)
+
+
+async def _run_worker_subprocess(http_request, payload: dict, argv: list[str] | None = None,
+                                 barren_attempt: int = 0) -> tuple[str, dict, dict | None]:
+    """Admission wrapper. The barren-retry re-entry (barren_attempt > 0) reuses the slot the first attempt holds:
+    that attempt's worker was already killed, so the retry is the same logical run."""
+    if barren_attempt:
+        return await _run_worker_subprocess_inner(http_request, payload, argv, barren_attempt=barren_attempt)
+    ticket = await _admit("run", http_request)
+    try:
+        return await _run_worker_subprocess_inner(http_request, payload, argv, barren_attempt=0)
+    finally:
+        ADMISSION.release(ticket)
+
+
+async def _stream_worker_subprocess(http_request, payload: dict, argv: list[str] | None = None):
+    ticket = await _admit("stream", http_request)
+    try:
+        async for chunk in _stream_worker_subprocess_inner(http_request, payload, argv):
+            yield chunk
+    finally:
+        ADMISSION.release(ticket)
+
+
+@app.get("/admin/workers")
+async def admin_workers():
+    """Admission state: caps, active, queued, and lifetime counters."""
+    return {**ADMISSION.status(), "workers": [
+        {"pid": pid, "elapsed_s": round(time.time() - m["started_at"], 1), "team": m.get("team")}
+        for pid, m in _ACTIVE_WORKERS.items()]}
+
+
+
+
 @app.get("/runs")
 async def list_active_runs():
     """Swarm workers running right now, newest first."""
@@ -782,7 +834,7 @@ async def cancel_run(pid: int):
 _MAX_BARREN_RETRIES = 1
 
 
-async def _run_worker_subprocess(
+async def _run_worker_subprocess_inner(
     http_request, payload: dict, argv: list[str] | None = None,
     barren_attempt: int = 0,
 ) -> tuple[str, dict, dict | None]:
@@ -1088,7 +1140,7 @@ async def _run_worker_subprocess(
     return result["content"], result["tokens"], result["clarification"]
 
 
-async def _stream_worker_subprocess(http_request, payload: dict, argv: list[str] | None = None):
+async def _stream_worker_subprocess_inner(http_request, payload: dict, argv: list[str] | None = None):
     """Streaming counterpart to _run_worker_subprocess (Phase 3 of process-
     boundary cancellation, see DOCS.md "Process-Boundary Cancellation") --
     spawns `python main.py --stream-worker` (main.py's _run_stream_worker())
@@ -1605,6 +1657,13 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
     context_size = 0 if is_chain_handoff else len(prior_messages)
 
     resolved_mcp_urls = _resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url)
+
+    if ADMISSION.would_reject():   # Phase 1.18D: answer 429 before the SSE response starts
+        ADMISSION.rejected += 1
+        raise _admission_http_error(AdmissionRejected(
+            f"all {ADMISSION.cap} worker slots are busy and the wait queue ({ADMISSION.max_queue}) is full",
+            active=ADMISSION.active, queued=len(ADMISSION.waiters), cap=ADMISSION.cap,
+            max_queue=ADMISSION.max_queue, retry_after_s=30))
 
     async def generate():
         try:

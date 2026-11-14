@@ -485,6 +485,10 @@ class Config:
     # whose worker is verifiably gone are always reconciled. Old, unowned, inactive HISTORICAL rows are only classified and
     # logged ("report", the default); "apply" transitions them. "off" disables startup reconciliation entirely.
     reconcile_historical: str = os.getenv("HIVE_RECONCILE_HISTORICAL", "report").strip().lower()
+    # Phase 1.18D: worker admission (0 = unlimited, the previous behaviour)
+    max_active_workers: int = int(os.getenv("HIVE_MAX_ACTIVE_WORKERS", "4"))
+    worker_queue_max: int = int(os.getenv("HIVE_WORKER_QUEUE_MAX", "4"))
+    worker_queue_wait_s: float = float(os.getenv("HIVE_WORKER_QUEUE_WAIT_S", "120"))
 
     # Session persistence
     session_ttl_days: int = int(os.getenv("SESSION_TTL_DAYS", "30"))
