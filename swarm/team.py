@@ -21100,6 +21100,17 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # Times each member has been refused for the ceiling in the CURRENT delegation.
     # Without this the refusal is a static condition and repeats forever.
     read_refusals: dict[str, int] = {}
+    # Phase 1.33: how many times THIS EXACT (agent, tool, args) call has been refused
+    # by the read-ceiling path specifically, in this same work item's current attempt
+    # (same closure scope/lifetime as read_refusals above -- fresh per attempt, shared
+    # across the coordinator and every member). Live T13b finding: a model refused at
+    # `remaining allowance 16` retried the byte-for-byte identical ranged read ~2
+    # minutes later and was refused again, identically, with no change in approach --
+    # the general refusal text alone did not register as "this specific call will
+    # never succeed," only as "budget is tight." A second identical refusal gets a
+    # different, structured message naming the repeat explicitly (see its own
+    # construction below) instead of the same generic budget text repeated.
+    _refused_call_counts: dict[tuple, int] = {}
     # Closure-local record of every REAL (fresh, non-stubbed) read this run, at any
     # delegation depth (2026-08-21). This hook instance is shared across the coordinator
     # and every member, so its closure sees all of them -- which session_state does not.
@@ -21689,11 +21700,62 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     if function_name in ("get_file_content", "get_symbol") and 0 < _remaining < _MIN_USEFUL_ADAPTED_RESERVATION
                     else ""
                 )
+                # Phase 1.33: context-aware symbol-retrieval hint, scoped narrowly --
+                # ONLY for a get_file_content refusal (not get_symbol's own: a model
+                # already using get_symbol doesn't need to be told about it), ONLY for
+                # a Python/TypeScript source file (where get_symbol's AST/textual
+                # extraction actually applies), and ONLY when get_symbol is actually in
+                # THIS agent's own tool surface (read directly off `agent`, the same
+                # object/attribute the pre-existing "[team] member surface" log already
+                # reads -- no second lookup mechanism). Explicitly caveated: symbol
+                # retrieval needs a KNOWN name and is not a substitute for enumerating
+                # most of a file -- never claims it always helps.
+                _relpath = (args or {}).get("relative_path") or ""
+                _file_ext = _relpath.rsplit(".", 1)[-1].lower() if "." in _relpath else ""
+                _agent_tool_names = {getattr(t, "name", "") for t in (getattr(agent, "tools", None) or [])}
+                _symbol_hint = (
+                    f" If you already know the SPECIFIC function, class, or method name "
+                    f"you need from this file, get_symbol('{_relpath}', '<name>') retrieves "
+                    f"just that declaration and is bounded separately from this refusal -- "
+                    f"it may still succeed even though this read cannot. It requires a "
+                    f"known name; it is not a way to enumerate most of this file's own "
+                    f"content, which this refusal has already ruled out for now."
+                    if (function_name == "get_file_content" and _file_ext in ("py", "ts", "tsx")
+                        and "get_symbol" in _agent_tool_names)
+                    else ""
+                )
+                # Phase 1.33: identical-refusal protection. `args_key` is the SAME key
+                # already computed above for cache lookup (same (function_name, args)
+                # identity) -- no second args-hashing mechanism. Scoped to THIS work
+                # item's current attempt (closure-local, same lifetime as read_refusals
+                # above). Never substitutes a tool or changes scope on the model's
+                # behalf -- only names the repeat and requires the model choose its own
+                # different strategy.
+                _repeat_key = (norm_agent_key, function_name, args_key)
+                _repeat_n = _refused_call_counts.get(_repeat_key, 0)
+                _refused_call_counts[_repeat_key] = _repeat_n + 1
+                if _repeat_n >= 1:
+                    print(f"[team] {agent_key or 'coordinator'} repeated an IDENTICAL "
+                          f"refused {function_name} call ({_repeat_n + 1}x) — returning "
+                          f"the repeat-specific refusal instead of the generic one", flush=True)
+                    return _refuse(agent, function_name, args, f"{_label}_ceiling_repeated", (
+                        f"REFUSED (repeat): this EXACT {function_name} call, with these "
+                        f"exact arguments, was already refused {_repeat_n} time(s) before "
+                        f"in this delegation for the same reason (the {_label} budget is "
+                        f"spent). Retrying it unchanged will not produce a different "
+                        f"result.{_symbol_hint}\n"
+                        f"A genuinely different strategy is required now -- a different "
+                        f"file, a differently-shaped request, or writing up what you "
+                        f"already have and naming this specific gap as unexamined. This "
+                        f"message does not substitute a tool or change what you are being "
+                        f"asked to investigate on your behalf; the choice of what to try "
+                        f"next, if anything, is still yours."
+                    ))
                 return _refuse(agent, function_name, args, f"{_label}_ceiling", (
                     f"REFUSED (budget): this {_label} call's worst-case size "
                     f"(~{_worst_case:,} chars) would exceed the remaining {_label} "
                     f"allowance ({_remaining:,} of {_ceiling:,} chars left in this task, "
-                    f"across the initial attempt and any recovery).{_adapt_note} This "
+                    f"across the initial attempt and any recovery).{_adapt_note}{_symbol_hint} This "
                     f"refusal means the BUDGET is spent or this one call is too large "
                     f"for what remains -- never report an absence based on this refusal "
                     f"alone; it is not a signal that anything you were looking for does "
