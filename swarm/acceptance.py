@@ -353,6 +353,14 @@ class EvidencePolicy:
     # Phase 1.23: content-level coverage obligations, evaluated by enum_requirement_result() and
     # folded into gate_evaluate()'s satisfied/missing alongside `requirements` -- see EnumRequirement.
     enum_requirements: list = field(default_factory=list)
+    # Phase 1.34: ABSENCE-disclosure obligations, evaluated by gap_disclosure_result() -- see
+    # GapDisclosureRequirement. Deliberately a separate list, not folded into enum_requirements:
+    # an EnumRequirement's evidence check proves an item EXISTS (pattern found in both the answer
+    # and the source read); a gap-disclosure item proves the opposite (a backend-side operation
+    # has NO frontend counterpart), which needs the inverted evidence check below -- reusing
+    # enum_requirement_result() unchanged for this would always fail, since "no frontend hook"
+    # language never appears in source code for enum_requirement_result's in-evidence check to find.
+    gap_disclosure_requirements: list = field(default_factory=list)
 
 
 _FORM = "auth/register/business/businessregistrationform.tsx"
@@ -468,8 +476,93 @@ def enum_requirement_result(req: "EnumRequirement", srcs: dict, text: str) -> di
             "items": items_out}
 
 
+@dataclass
+class GapDisclosureRequirement:
+    """Phase 1.34: an obligation that the final answer EXPLICITLY STATES a specific backend-side
+    operation has no frontend counterpart -- the counterpart failure mode to EnumRequirement
+    (which proves an item exists). Root cause this addresses: T13b's Phase 1.33 live run found
+    all 9 backend voucher endpoints and all 5 real frontend hooks, cited every one of them
+    correctly with real names, and STILL produced a final answer stating "the frontend has all
+    the corresponding voucher-related hooks" -- false (9 endpoints, 5 hooks, 4 uncovered), and
+    the existing EP_hooks/EP_endpoints EnumRequirements both independently passed regardless,
+    since each only checks "does this name appear in the answer", never whether a cross-reference
+    between the two sides was ever actually stated. Finding every individual fact is not the
+    same as comparing them -- this requirement enforces the comparison was actually disclosed.
+    `items` is a list of (item_id, source_pattern, disclosure_pattern) triples:
+    - source_pattern: the SAME keyword used elsewhere to detect this operation's own presence
+      (e.g. the EP_endpoints pattern for "grn") -- checked against the scoped SOURCE to confirm
+      the claimed absence is genuinely true, not merely unexamined or fabricated.
+    - disclosure_pattern: checked against the ANSWER text to confirm the gap was actually
+      stated in those terms, not merely true by omission (an answer that never mentions an
+      operation at all is not "disclosing" its absence)."""
+    id: str
+    description: str
+    items: list
+    source_paths: list
+    mandatory: bool = True
+
+
+def gap_disclosure_result(req: "GapDisclosureRequirement", srcs: dict, text: str) -> dict:
+    """Absence-claim counterpart to enum_requirement_result() -- see GapDisclosureRequirement's
+    own docstring for why this needs an inverted evidence check rather than reusing that function.
+    SATISFIED only when BOTH: the answer actually states the gap (disclosure_pattern matches the
+    answer), AND the frontend-side file that would contain the hook if one existed was actually
+    read AND genuinely does not contain this operation's keyword (source_pattern absent from the
+    scoped source) -- so the disclosed absence is grounded, not an unverified guess. MISSING when
+    the gap was never stated at all. INSUFFICIENT_EVIDENCE when the gap was stated but the
+    relevant source was never actually read, so the claim -- true or not -- was never verified by
+    this attempt."""
+    report = text or ""
+    if list(req.source_paths) == [ANY_SOURCE]:
+        scoped_src, scope_read = "\n".join(srcs.values()), bool(srcs)
+    else:
+        parts = [t for p, t in srcs.items() if any(p.endswith(norm_path(c)) for c in req.source_paths)]
+        scoped_src, scope_read = "\n".join(parts), bool(parts)
+    items_out = []
+    for item_id, source_pattern, disclosure_pattern in req.items:
+        disclosed = bool(re.search(disclosure_pattern, report, re.I))
+        if not disclosed:
+            items_out.append({"item_id": item_id, "status": "MISSING", "disclosed": False, "absence_confirmed": None})
+            continue
+        absence_confirmed = scope_read and not re.search(source_pattern, scoped_src, re.I)
+        items_out.append({"item_id": item_id,
+                          "status": "SATISFIED" if absence_confirmed else "INSUFFICIENT_EVIDENCE",
+                          "disclosed": True, "absence_confirmed": absence_confirmed})
+    if any(i["status"] == "MISSING" for i in items_out):
+        overall = "MISSING"
+    elif any(i["status"] == "INSUFFICIENT_EVIDENCE" for i in items_out):
+        overall = "INSUFFICIENT_EVIDENCE"
+    else:
+        overall = "SATISFIED"
+    return {"id": req.id, "description": req.description, "mandatory": req.mandatory, "status": overall,
+            "items": items_out}
+
+
 def _voucher_pat(*alts) -> str:
     return "|".join(alts)
+
+
+# Phase 1.34: deliberately broad and inclusive of common phrasings a model might actually use --
+# a false negative here (a real disclosure the regex fails to recognize) is the costlier failure
+# mode, since it would wrongly fail an answer that DID disclose the gap in different words. Kept
+# as one named constant, not inlined per item, so every item's disclosure check stays consistent.
+_GAP_DISCLOSURE_TERMS = (
+    r"no\s+(?:matching|corresponding)?\s*(?:frontend|client)|"
+    r"missing\s+(?:a\s+)?(?:frontend|client)|missing\s+(?:a\s+)?hook|"
+    r"not\s+(?:yet\s+)?(?:implemented|covered|built|exposed|present)|"
+    r"\bno\s+hook\b|without\s+a\s+(?:frontend\s+)?hook|\buncovered\b|\bunmatched\b|\bunexposed\b|"
+    r"lacks?\s+(?:a\s+)?(?:frontend|hook)|\bgap\b"
+)
+
+
+def _gap_disclosure_pat(op_pattern: str) -> str:
+    """Bidirectional proximity match, pure regex (never model-based, per this phase's own
+    guardrail): the operation's own keyword and a gap-disclosure term within 300 chars of each
+    other, in EITHER order -- a model might write "create_grn_from_po has no frontend hook" or
+    "the following have no frontend hook: ...create_grn_from_po...", and both are genuine
+    disclosures. 300 chars is generous enough to span a short list item or sentence without
+    spanning into an unrelated paragraph."""
+    return rf"(?:{op_pattern})[^\n]{{0,300}}(?:{_GAP_DISCLOSURE_TERMS})|(?:{_GAP_DISCLOSURE_TERMS})[^\n]{{0,300}}(?:{op_pattern})"
 
 
 T13_ENDPOINTS_REQ = EnumRequirement(
@@ -500,11 +593,26 @@ T13_TABLES_REQ = EnumRequirement(
         ("VoucherSeries", _voucher_pat(r"VoucherSeries", r"voucher_series", r"voucher\s+series")),
         ("VoucherVersion", _voucher_pat(r"VoucherVersion", r"voucher_version", r"voucher\s+version")),
     ], ["api/inventory-service/models.py"])
+T13_GAP_DISCLOSURE_REQ = GapDisclosureRequirement(
+    "EP_gap_disclosure",
+    "each backend voucher operation with no frontend hook (create_grn_from_po, create_credit_note, "
+    "create_stock_adjustment, create_stock_transfer) is explicitly disclosed in the answer as missing "
+    "a frontend counterpart -- naming the 5 existing hooks correctly must not stand in for this", [
+        ("create_grn_from_po", _voucher_pat(r"create_grn_from_po", r"\bgrn\b"),
+         _gap_disclosure_pat(_voucher_pat(r"create_grn_from_po", r"\bgrn\b"))),
+        ("create_credit_note", _voucher_pat(r"create_credit_note", r"credit[\s_-]?note"),
+         _gap_disclosure_pat(_voucher_pat(r"create_credit_note", r"credit[\s_-]?note"))),
+        ("create_stock_adjustment", _voucher_pat(r"create_stock_adjustment", r"stock[\s_-]?adjustment"),
+         _gap_disclosure_pat(_voucher_pat(r"create_stock_adjustment", r"stock[\s_-]?adjustment"))),
+        ("create_stock_transfer", _voucher_pat(r"create_stock_transfer", r"stock[\s_-]?transfer"),
+         _gap_disclosure_pat(_voucher_pat(r"create_stock_transfer", r"stock[\s_-]?transfer"))),
+    ], ["client/ecommclient-web/ekamweb/src/lib/api/services/inventory/inventoryapi.ts"])
 T13_VOUCHER_POLICY = EvidencePolicy(
     name="t13-voucher-audit",
     requirements=[],   # T13a names no files (deliberately); T13b's 3 named files get their own Requirements
                        # from derive_policy()'s existing per-path mechanism and are merged in, not duplicated here.
-    enum_requirements=[T13_ENDPOINTS_REQ, T13_HOOKS_REQ, T13_TABLES_REQ])
+    enum_requirements=[T13_ENDPOINTS_REQ, T13_HOOKS_REQ, T13_TABLES_REQ],
+    gap_disclosure_requirements=[T13_GAP_DISCLOSURE_REQ])
 
 ANY_SOURCE = "*"      # Phase 1.20: a generic requirement -- ANY successful source read of this attempt satisfies it
 
@@ -573,8 +681,23 @@ def gate_evaluate(policy, outcomes, text) -> dict:
         else:
             not_evaluated.append({"id": res["id"], "description": res["description"], "items": res["items"],
                                   "note": "optional, unsatisfied -- does not block completion"})
+    # Phase 1.34: absence-disclosure obligations -- same satisfied/missing/not_evaluated folding
+    # as the enum_requirements loop just above, via gap_disclosure_result() instead of
+    # enum_requirement_result() (see GapDisclosureRequirement's own docstring for why).
+    gap_detail = []
+    for gr in policy.gap_disclosure_requirements:
+        res = gap_disclosure_result(gr, srcs, text)
+        gap_detail.append(res)
+        if res["status"] == "SATISFIED":
+            sat.append({"id": res["id"], "description": res["description"], "items": res["items"]})
+        elif gr.mandatory:
+            miss.append({"id": res["id"], "description": res["description"], "items": res["items"]})
+        else:
+            not_evaluated.append({"id": res["id"], "description": res["description"], "items": res["items"],
+                                  "note": "optional, unsatisfied -- does not block completion"})
     return {"applicable": True, "satisfied": sat, "missing": miss, "links": link_results,
-            "reads": {p: True for p in srcs}, "enum_detail": enum_detail, "not_evaluated": not_evaluated}
+            "reads": {p: True for p in srcs}, "enum_detail": enum_detail, "not_evaluated": not_evaluated,
+            "gap_detail": gap_detail}
 
 
 # ---------------------------------------------------------------------------- attempts and registry
@@ -999,6 +1122,9 @@ def requirement_source_paths(policy, req_id: str) -> list:
     for er in policy.enum_requirements:
         if er.id == req_id:
             return list(er.source_paths)
+    for gr in policy.gap_disclosure_requirements:
+        if gr.id == req_id:
+            return list(gr.source_paths)
     return []
 
 
