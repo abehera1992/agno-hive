@@ -18,6 +18,7 @@ extend scope speculatively — add them here only if the same failure mode shows
 """
 import ast
 import asyncio
+import hashlib
 import os
 import re
 import sys
@@ -998,6 +999,200 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0,
         f"# or get_file_content('{relative_path}', offset=<line>, limit=<n>) for a line range.\n\n"
         f"===== HEAD =====\n{head}\n\n===== TAIL =====\n{tail}"
     )
+
+
+_MAX_SYMBOL_CHARS = _MAX_RENDERED_CHARS  # Phase 1.31: shares get_file_content's own
+# rendered-output ceiling -- one real maximum per output-bounded tool, not a second,
+# independently-tuned number that application-side reservations would need to track
+# separately. See swarm/team.py's own _reserve_worst_case for the matching reservation.
+
+
+def _py_symbol_candidates(src: str, symbol_name: str) -> "list[dict] | None":
+    """Every Python symbol in `src` whose own bare name OR fully-qualified name
+    (e.g. 'SellerAdmin.verify_seller') equals `symbol_name`, each carrying everything
+    get_symbol() needs to retrieve and label its actual source: qualified_name, name,
+    type (class/function/async_function/method/async_method), the FULL declaration
+    span (start_line through end_line -- decorators through the LAST line of the body,
+    from the AST node's own end_lineno, Python 3.8+), decorator source text, and
+    is_async. Returns None when `src` does not parse at all -- a genuine syntax error,
+    distinct from zero candidates, so the caller never reports "symbol not found" for a
+    file it could not actually read structurally.
+
+    Deliberately a NEW walk, not a reuse of symbol_index.py's _py_index(): that index
+    exists to answer yes/no containment questions for verify_claims (does class C
+    declare field F), and intentionally drops qualification, nesting depth, decorator
+    text, async-ness and full body spans because none of its callers need them, keeping
+    only the first same-named function it meets (fine for "does this exist anywhere",
+    wrong for "retrieve THIS specific one and tell me if there were others"). This walk
+    keeps all of that, on purpose, because retrieval -- unlike containment -- must be
+    able to tell two same-named methods apart and return a real body, not a line number.
+    """
+    try:
+        tree = ast.parse(src.lstrip("﻿"))
+    except (SyntaxError, ValueError):
+        return None
+    out: list[dict] = []
+
+    def full_span(node) -> tuple[int, int]:
+        decs = getattr(node, "decorator_list", None) or []
+        start = decs[0].lineno if decs else node.lineno
+        end = node.end_lineno if getattr(node, "end_lineno", None) else node.lineno
+        return start, end
+
+    def decorator_texts(node) -> list[str]:
+        texts = []
+        for dec in getattr(node, "decorator_list", None) or []:
+            seg = ast.get_source_segment(src, dec)
+            if seg:
+                texts.append("@" + seg)
+        return texts
+
+    def walk(node, qualifier: str):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                qname = f"{qualifier}.{child.name}" if qualifier else child.name
+                start, end = full_span(child)
+                out.append({"qualified_name": qname, "name": child.name, "type": "class",
+                           "start_line": start, "end_line": end,
+                           "decorators": decorator_texts(child), "is_async": False})
+                walk(child, qname)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qname = f"{qualifier}.{child.name}" if qualifier else child.name
+                start, end = full_span(child)
+                is_async = isinstance(child, ast.AsyncFunctionDef)
+                kind = ("async_method" if qualifier else "async_function") if is_async \
+                    else ("method" if qualifier else "function")
+                out.append({"qualified_name": qname, "name": child.name, "type": kind,
+                           "start_line": start, "end_line": end,
+                           "decorators": decorator_texts(child), "is_async": is_async})
+                walk(child, qname)
+            else:
+                # Recurse through everything else (if/for/try/with bodies, etc.) so a
+                # class or function nested inside a conditional or a function body is
+                # still found -- only ClassDef/FunctionDef introduce a new qualifier.
+                walk(child, qualifier)
+
+    walk(tree, "")
+    return [c for c in out if c["name"] == symbol_name or c["qualified_name"] == symbol_name]
+
+
+def get_symbol(relative_path: str, symbol_name: str, max_output_chars: int = 0) -> str:
+    """
+    Retrieve ONE named Python symbol's actual source -- a function, async function,
+    method, or class -- with its real line boundaries, instead of reading the whole
+    file to find it. A targeted alternative to get_file_content for "show me function
+    X" or "show me class Y", not a replacement for it: enumeration, imports, module-
+    level structure, and non-Python files still need get_file_content or the skeleton
+    it already returns for large files.
+
+    `symbol_name` may be bare ('verify_seller') or qualified ('SellerAdmin.verify_seller')
+    with dots for nested classes/methods. A bare name that exists in more than one place
+    (e.g. two classes each with their own __init__) returns every candidate's qualified
+    name and line instead of guessing — call again with the qualified form to disambiguate.
+    A route handler's own decorator (e.g. @router.post(...)) is returned as part of the
+    function's source, which is how you resolve a route to its handler: look up the
+    handler function by name and its decorator is right there above it.
+
+    Only Python (.py) files are supported via real AST extraction. For any other
+    language this returns extraction_method: unsupported — fall back to get_file_content
+    (whole file) or search_files (textual search) for those; this tool never claims
+    AST-level guarantees it cannot back up.
+
+    A result naming call sites via search_files elsewhere is a TEXTUAL match only --
+    it proves the name appears there, never that the code actually runs through it.
+
+    Args:
+        relative_path: e.g. 'API/business-service/router/business_admin_api.py'
+        symbol_name: bare or qualified name, e.g. 'verify_seller' or 'Foo.verify_seller'
+        max_output_chars: as get_file_content's own — request a smaller cap than this
+            tool's default maximum; 0 means use the default.
+    """
+    _eff_cap = min(max_output_chars, _MAX_SYMBOL_CHARS) if max_output_chars > 0 else _MAX_SYMBOL_CHARS
+    basename = Path(relative_path).name
+    target = PROJECT_ROOT / relative_path
+    if basename in _EXCLUDED_ASSISTANT_FILES or is_excluded(relative_path) or not target.exists() or not target.is_file():
+        # Reuse get_file_content's own existence/exclusion/candidate-suggestion
+        # handling verbatim rather than duplicating it -- same UX, one source of truth.
+        return get_file_content(relative_path)
+    if target.suffix.lower() != ".py":
+        return (
+            f"get_symbol: extraction_method=unsupported for '{relative_path}' "
+            f"(only Python .py files are AST-extractable here). This is NOT evidence "
+            f"the symbol is absent -- use get_file_content for this file, or "
+            f"search_files('{symbol_name}') for a textual (not AST-verified) location.\n"
+        )
+    try:
+        data = target.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return f"Could not read {relative_path}: {e}"
+    if not data:
+        return f"# {relative_path} EXISTS and is EMPTY (0 bytes) -- no symbols to find.\n"
+
+    candidates = _py_symbol_candidates(data, symbol_name)
+    content_id = hashlib.sha256(data.encode("utf-8", "replace")).hexdigest()[:16]
+    if candidates is None:
+        return (
+            f"get_symbol: extraction_method=ast, STATUS: PARSE_ERROR for '{relative_path}'.\n"
+            f"This file could not be parsed as Python at all -- NOT evidence that "
+            f"'{symbol_name}' is absent, only that structural extraction failed here. "
+            f"Fall back to get_file_content or search_files.\n"
+        )
+    if not candidates:
+        return (
+            f"get_symbol: extraction_method=ast, STATUS: NOT_FOUND.\n"
+            f"path: {relative_path}\n"
+            f"content_id: {content_id}\n"
+            f"No class, function, async function or method named '{symbol_name}' is "
+            f"declared in this file. This file WAS successfully parsed (the extraction "
+            f"itself did not fail) -- a genuine absence in THIS file, never proof the "
+            f"symbol does not exist anywhere in the project. It may be declared "
+            f"elsewhere, under a different name, or be an attribute/variable rather "
+            f"than a class/function. Try search_files('{symbol_name}') across the "
+            f"project, or confirm the file path with find_files.\n"
+        )
+    if len(candidates) > 1:
+        lines = [f"  {c['qualified_name']} ({c['type']}, line {c['start_line']}-{c['end_line']})"
+                 for c in sorted(candidates, key=lambda c: c["start_line"])]
+        return (
+            f"get_symbol: extraction_method=ast, STATUS: AMBIGUOUS.\n"
+            f"path: {relative_path}\n"
+            f"content_id: {content_id}\n"
+            f"'{symbol_name}' matches {len(candidates)} declarations in this file -- "
+            f"none was silently picked. Call again with the QUALIFIED name shown below "
+            f"to disambiguate:\n" + "\n".join(lines) + "\n"
+        )
+
+    sym = candidates[0]
+    lines = data.splitlines()
+    start, end = sym["start_line"], sym["end_line"]
+
+    def make_wrapper(body, last_lineno, truncated, line_itself_truncated):
+        status = (
+            f"STATUS: TRUNCATED -- this symbol's own body is longer than the "
+            f"{_eff_cap:,}-char output cap "
+            f"{'(the full default maximum)' if _eff_cap == _MAX_SYMBOL_CHARS else '(a smaller cap requested via max_output_chars)'}; "
+            f"shown through line {last_lineno} of {end} declared. Read the remainder "
+            f"directly with get_file_content('{relative_path}', offset={last_lineno}, "
+            f"limit=200). Do NOT conclude anything about what follows in this symbol's "
+            f"own body from what is missing below.\n"
+            if truncated else
+            f"STATUS: COMPLETE -- the full declaration (decorators through its last line) is shown.\n"
+        )
+        decorators_line = (f"decorators: {' '.join(sym['decorators'])}\n" if sym["decorators"] else "")
+        return (
+            f"get_symbol: extraction_method=ast, retrieval_mode=symbol\n"
+            f"path: {relative_path}\n"
+            f"content_id: {content_id}\n"
+            f"qualified_name: {sym['qualified_name']}\n"
+            f"type: {sym['type']}\n"
+            f"line_range: {start}-{end}\n"
+            + decorators_line + status +
+            f"# A textual match for this name elsewhere (e.g. via search_files) is a "
+            f"call SITE, not proof this declaration is the one actually invoked there.\n\n"
+            + body
+        )
+
+    return _fit_complete_response(lines[start - 1:end], start, _eff_cap, make_wrapper)
 
 
 async def get_files_batch(paths: list[str]) -> str:

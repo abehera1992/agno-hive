@@ -28,6 +28,7 @@ from tools.context import (
     project_map,
     get_file_content,
     get_files_batch,
+    get_symbol,
     find_files,
     search_files,
     search_files_batch,
@@ -183,6 +184,7 @@ _tool(get_project_context)
 _tool(project_map)
 _tool(get_file_content)
 _tool(get_files_batch)
+_tool(get_symbol)
 _tool(find_files)
 _tool(search_files)
 _tool(search_files_batch)

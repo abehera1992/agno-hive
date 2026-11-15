@@ -19730,7 +19730,7 @@ _LIGHTRAG_QUERY_CAP = int(os.getenv("LIGHTRAG_QUERY_CAP", "15"))
 
 
 _CACHEABLE_READ_TOOLS = {
-    "get_file_content", "get_files_batch", "search_files", "search_files_batch",
+    "get_file_content", "get_files_batch", "get_symbol", "search_files", "search_files_batch",
     "find_files", "list_directory", "list_directory_tree", "count_matches",
     # lightrag_query added 2026-08-15 -- live-confirmed the exact same self-
     # reinforcing loop this whole cache exists for (see the block comment right
@@ -20996,6 +20996,16 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             if _requested > 0:
                 return min(int(_requested), _MAX_RENDERED_CHARS_LOCAL)
             return _MAX_RENDERED_CHARS_LOCAL
+        if fn_name == "get_symbol":
+            # Phase 1.31: hive-mcp's own _MAX_SYMBOL_CHARS is defined as an alias of
+            # _MAX_RENDERED_CHARS (one real maximum shared with get_file_content, not a
+            # second independently-tuned ceiling), enforced the same way via
+            # _fit_complete_response -- so the reservation logic is identical to
+            # get_file_content's own, immediately above.
+            _requested = (call_args or {}).get("max_output_chars") or 0
+            if _requested > 0:
+                return min(int(_requested), _MAX_RENDERED_CHARS_LOCAL)
+            return _MAX_RENDERED_CHARS_LOCAL
         return 0  # uncategorized tool (e.g. lightrag_query) -- excluded from both ceilings, unchanged since Phase 1.24
 
     # Mirrors hive-mcp/tools/context.py's own _MAX_FULL_BYTES (40,000) and (Phase 1.29)
@@ -21449,7 +21459,12 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 # the ACTUAL call down to fit -- the producer enforces this exact same
                 # smaller cap (hive-mcp's own _eff_rendered_cap), so this is never an
                 # unproven estimate, only a smaller real cap than the default.
-                if (function_name == "get_file_content" and not (args or {}).get("max_output_chars")):
+                if (function_name in ("get_file_content", "get_symbol")
+                        and not (args or {}).get("max_output_chars")):
+                    # Phase 1.31: get_symbol shares get_file_content's exact max_output_chars
+                    # contract (same parameter, same producer-enforced meaning via hive-mcp's
+                    # own _MAX_SYMBOL_CHARS alias of _MAX_RENDERED_CHARS) -- the same adaptive
+                    # shrink applies to both, not a second, parallel mechanism.
                     _remaining_now = max(_ceiling - _committed - _reserved - _task_offset, 0)
                     if _worst_case > _remaining_now >= _MIN_USEFUL_ADAPTED_RESERVATION:
                         # Phase 1.29d: MUTATE the existing dict in place -- do NOT
@@ -21509,7 +21524,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     # itself -- no separate lock, no window for a second concurrent
                     # call on the same work item to grant a duplicate increment.
                     _jit_record = None
-                    if function_name == "get_file_content" and _ceiling_cat == "read":
+                    if function_name in ("get_file_content", "get_symbol") and _ceiling_cat == "read":
                         _missing_paths = (activity or {}).get("missing_source_paths")
                         _remaining_before = max(_ceiling - _committed - _reserved - _task_offset, 0)
                         _jit_record = {
@@ -21587,7 +21602,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 if _admit:
                     _reserved_dict[norm_agent_key] = _reserved + _worst_case
             if _admit and _adapted:
-                print(f"[team] {agent_key or 'coordinator'} get_file_content adapted to "
+                print(f"[team] {agent_key or 'coordinator'} {function_name} adapted to "
                       f"max_output_chars={_worst_case:,} (the full default would have "
                       f"exceeded the remaining {_label} allowance) -- a smaller, still "
                       f"fully-bounded read was admitted instead of refusing outright", flush=True)
@@ -21629,7 +21644,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     f"but the {_remaining:,} chars remaining is below the minimum "
                     f"useful size ({_MIN_USEFUL_ADAPTED_RESERVATION:,} chars) for this "
                     f"tool, so none was attempted."
-                    if function_name == "get_file_content" and 0 < _remaining < _MIN_USEFUL_ADAPTED_RESERVATION
+                    if function_name in ("get_file_content", "get_symbol") and 0 < _remaining < _MIN_USEFUL_ADAPTED_RESERVATION
                     else ""
                 )
                 return _refuse(agent, function_name, args, f"{_label}_ceiling", (
@@ -30704,7 +30719,10 @@ _MAX_BATCH_READS_PER_MEMBER = 4
 _DISCOVERY_TOOLS_FOR_CEILING = frozenset({
     "search_files", "search_files_batch", "list_directory_tree", "count_matches",
 })
-_SOURCE_READ_TOOLS_FOR_CEILING = frozenset({"get_file_content", "get_files_batch"})
+_SOURCE_READ_TOOLS_FOR_CEILING = frozenset({"get_file_content", "get_files_batch",
+                                            "get_symbol"})  # Phase 1.31: same budget pool as
+# get_file_content, never a second, unaccounted side channel -- both return actual source
+# content and are checked against the SAME task-scoped read ceiling.
 _READ_TOOLS_FOR_CEILING = _DISCOVERY_TOOLS_FOR_CEILING | _SOURCE_READ_TOOLS_FOR_CEILING
 
 # 12,000 -> 20,000 -> 15,000. The 20,000 was calibrated on T12 alone, where 31/31 was
