@@ -425,7 +425,15 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
                 # work item is ever attempted, never a separately-tracked number.
                 "work_item_id": wi.work_item_id,
                 "read_ceiling": st.task_read_ceiling.get(wi.work_item_id, T._DELEGATION_READ_CEILING),
-                "discovery_ceiling": st.task_discovery_ceiling.get(wi.work_item_id, T._DELEGATION_DISCOVERY_CEILING)}
+                "discovery_ceiling": st.task_discovery_ceiling.get(wi.work_item_id, T._DELEGATION_DISCOVERY_CEILING),
+                # Phase 1.32: explicit, scratch/comparison-only test controls -- absent
+                # (the production default) means FULLY ENABLED. Neither flag exists in
+                # any real caller's normal path; both are read straight through from
+                # `controls`, which only a scratch harness ever sets, so there is no
+                # second, silently-different production configuration -- a run that
+                # never sets these behaves exactly as Phases 1.30/1.31 already do.
+                "disable_jit_extension": bool(controls.get("disable_jit_extension")),
+                "disable_symbol_tools": bool(controls.get("disable_symbol_tools"))}
     if extra_activity:
         activity.update(extra_activity)
     try:

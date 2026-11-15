@@ -21095,6 +21095,16 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     evidence_ledger = _EvidenceLedger()
 
     async def _read_cache_tool_hook(function_name, function, args, agent=None, run_context=None):
+        # Phase 1.32: scratch/comparison-only kill switch for the whole Phase 1.31
+        # retrieval path -- absent or falsy (the production default) never reaches
+        # this branch at all. Refused the same way any other tool refusal is, before
+        # any cache/budget work runs, never a different code path for "disabled."
+        if function_name == "get_symbol" and (activity or {}).get("disable_symbol_tools"):
+            return _refuse(agent, function_name, args, "symbol_tools_disabled", (
+                "REFUSED: get_symbol is disabled for this run (a scratch/comparison "
+                "configuration, never the production default). Use get_file_content "
+                "for this read instead."
+            ))
         if function_name in _DELEGATION_TOOL_NAMES:
             if function_name in _SINGULAR_DELEGATION_TOOL_NAMES:
                 # _member_key, not _member_id: this is a BUCKETING key, so two
@@ -21524,7 +21534,10 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     # itself -- no separate lock, no window for a second concurrent
                     # call on the same work item to grant a duplicate increment.
                     _jit_record = None
-                    if function_name in ("get_file_content", "get_symbol") and _ceiling_cat == "read":
+                    # Phase 1.32: scratch/comparison-only kill switch -- absent or
+                    # falsy (the production default) never changes this path at all.
+                    if (function_name in ("get_file_content", "get_symbol") and _ceiling_cat == "read"
+                            and not (activity or {}).get("disable_jit_extension")):
                         _missing_paths = (activity or {}).get("missing_source_paths")
                         _remaining_before = max(_ceiling - _committed - _reserved - _task_offset, 0)
                         _jit_record = {
