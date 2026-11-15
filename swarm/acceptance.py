@@ -557,12 +557,18 @@ _GAP_DISCLOSURE_TERMS = (
 
 def _gap_disclosure_pat(op_pattern: str) -> str:
     """Bidirectional proximity match, pure regex (never model-based, per this phase's own
-    guardrail): the operation's own keyword and a gap-disclosure term within 300 chars of each
+    guardrail): the operation's own keyword and a gap-disclosure term within 400 chars of each
     other, in EITHER order -- a model might write "create_grn_from_po has no frontend hook" or
     "the following have no frontend hook: ...create_grn_from_po...", and both are genuine
-    disclosures. 300 chars is generous enough to span a short list item or sentence without
-    spanning into an unrelated paragraph."""
-    return rf"(?:{op_pattern})[^\n]{{0,300}}(?:{_GAP_DISCLOSURE_TERMS})|(?:{_GAP_DISCLOSURE_TERMS})[^\n]{{0,300}}(?:{op_pattern})"
+    disclosures. Uses [\\s\\S] (matches any character INCLUDING newlines), never [^\\n] -- a
+    real live run (Phase 1.34's own validation) disclosed the gap as a markdown header
+    ("### Backend Endpoints with No Frontend Counterpart:") followed by each operation on its
+    OWN separate bullet line; [^\\n] cannot cross even one of the several newlines between the
+    header and a later bullet, so a line-restricted version of this pattern would wrongly score
+    that exact, genuine disclosure as MISSING. 400 chars (numerically measured against that real
+    disclosure: the header-to-furthest-item span was ~230-250 chars) is generous enough to span a
+    short header+list or paragraph without reaching into an unrelated section."""
+    return rf"(?:{op_pattern})[\s\S]{{0,400}}(?:{_GAP_DISCLOSURE_TERMS})|(?:{_GAP_DISCLOSURE_TERMS})[\s\S]{{0,400}}(?:{op_pattern})"
 
 
 T13_ENDPOINTS_REQ = EnumRequirement(
