@@ -425,6 +425,59 @@ def _section_for(o, p) -> str:
     return ""
 
 
+def has_new_source_evidence(prior_outcomes, new_outcomes) -> bool:
+    """Phase 1.37: did `new_outcomes` establish anything that was not already known from
+    `prior_outcomes`? Same criteria swarm/liveness.py's ProgressTracker.on_call() already uses to
+    decide what counts as real research progress (a SUCCESS source_read of a path not seen
+    before, or a SUCCESS non-source-read result whose sha was not seen before) -- re-implemented
+    here as a pure, stateless, batch check rather than shared code, because ProgressTracker is an
+    incremental, per-call, cross-process tracker (it runs in a liveness snapshot the SUPERVISOR
+    process reads from disk) and this needs a one-shot comparison of two already-complete outcome
+    lists inside the SAME process -- but the DEFINITION of "progress" is deliberately identical,
+    not a second, divergent one, so a human reading both never has to reconcile two different
+    answers to the same question. update_session_state and the other STATE_TOOLS entries are
+    never evidence here either, for the same reason they are never progress there."""
+    prior_paths = {p for o in (prior_outcomes or []) for p in (o.paths_read or [])
+                  if o.outcome == SUCCESS and o.evidence_kind == "source_read"}
+    prior_shas = {o.result_sha for o in (prior_outcomes or [])
+                 if o.outcome == SUCCESS and o.evidence_kind != "source_read" and o.result_sha}
+    for o in (new_outcomes or []):
+        if o.outcome != SUCCESS or o.tool in STATE_TOOLS:
+            continue
+        if o.evidence_kind == "source_read":
+            if any(p not in prior_paths for p in (o.paths_read or [])):
+                return True
+        elif o.result_sha and o.result_sha not in prior_shas:
+            return True
+    return False
+
+
+def describe_evidence_without_text(outcomes) -> str:
+    """Phase 1.37: a deterministic, APPLICATION-WRITTEN account of what a textless attempt's own
+    tool outcomes actually established -- used only when has_new_source_evidence() above is True
+    for an attempt whose own `text` is empty, so that real evidence is never silently reported as
+    "no new content" merely because the model itself never narrated it. Lists only facts the
+    outcomes themselves carry (path read, size) -- never a claim about what the content MEANS,
+    which is exactly the kind of self-declared interpretation Phase 1.37 was built not to trust
+    at face value. Never reads session_state; never treats the model's own narration (if any) as
+    the source of truth -- only the raw, already-recorded tool outcomes."""
+    reads = [o for o in (outcomes or []) if o.outcome == SUCCESS and o.evidence_kind == "source_read"]
+    if not reads:
+        return "(no new content beyond what the original pass already established)"
+    lines = ["The recovery pass read the following source(s) but did not produce narrative text "
+             "of its own describing them -- listed here from the tool record directly, not from "
+             "any claim the model made about them:"]
+    seen = set()
+    for o in reads:
+        for p in (o.paths_read or []):
+            if p in seen:
+                continue
+            seen.add(p)
+            n = len(_section_for(o, p) or "")
+            lines.append(f"- `{p}` ({n:,} chars read)")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------- Phase 1.23: deterministic coverage
 @dataclass
 class EnumRequirement:

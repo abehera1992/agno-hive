@@ -811,7 +811,18 @@ def reconcile_attempts(orig_att, orig_d, rec_att) -> tuple:
     dropped = len(rec_paras) - len(rec_new)
     missing_ids = [m["id"] for m in orig_d.gate["missing"]]
     header = f"## Recovery pass — added to resolve: {', '.join(missing_ids)}" if missing_ids else "## Recovery pass"
-    body = "\n\n".join(rec_new) if rec_new else "(no new content beyond what the original pass already established)"
+    # Phase 1.37: a recovery pass with no narrative text of its own (the model stalled before
+    # ever writing one) is no longer described as "no new content" when it genuinely read
+    # something new -- that phrasing was never reachable before this phase (the caller discarded
+    # any textless recovery outright), and is simply false once a textless-but-evidenced recovery
+    # can reach here. describe_evidence_without_text() renders only what the raw tool outcomes
+    # themselves establish -- never the model's own session_state self-declaration.
+    if rec_new:
+        body = "\n\n".join(rec_new)
+    elif A.has_new_source_evidence(orig_att.outcomes, rec_att.outcomes):
+        body = A.describe_evidence_without_text(rec_att.outcomes)
+    else:
+        body = "(no new content beyond what the original pass already established)"
     reconciled_text = "## Original pass\n\n" + (orig_att.text or "").strip() + f"\n\n{header}\n\n{body}"
     reconciled_trace = (orig_att.trace_text or "") + "\n\n---(recovery pass trace)---\n\n" + (rec_att.trace_text or "")
     combined_outcomes = list(orig_att.outcomes) + list(rec_att.outcomes)
@@ -869,18 +880,37 @@ async def recover_and_reconcile(st: RunState, wi: WorkItem, ctx: dict, controls:
     # run_attempt()'s own early-exit paths) -- rec2.error/rec2.ledger_error are what actually
     # distinguish a genuine run from one that never got to call the Researcher at all.
     _t2 = rec2.attempt.terminal or {}
-    _recovery_run_failed = bool(_t2.get("run_error") or _t2.get("cancelled_event") or _t2.get("timed_out")
-                                or _t2.get("result_selection_status") == "MISSING_TERMINAL")
-    if rec2.attempt.state != "FINISHED" or rec2.error or (rec2.ledger_error and not rec2.attempt.text) or _recovery_run_failed:
+    _recovery_run_failed = bool(_t2.get("run_error") or _t2.get("cancelled_event") or _t2.get("timed_out"))
+    _missing_terminal = _t2.get("result_selection_status") == "MISSING_TERMINAL"
+    # Phase 1.37: a recovery attempt that produced no final text (the model stalled on
+    # non-progress tool calls, e.g. repeated update_session_state, instead of ever writing an
+    # answer -- the live T13b incident this phase addresses) is NOT automatically discarded
+    # anymore. If it genuinely established new evidence -- the SAME criteria
+    # swarm/liveness.py's ProgressTracker already uses to classify real progress, re-checked
+    # here as a pure function, never the model's own session_state self-declaration -- that
+    # evidence proceeds to reconciliation and an INDEPENDENT re-decision below, same as any
+    # other recovery attempt. If it produced neither text NOR new evidence, the original
+    # abort-and-fall-back-to-orig behavior is unchanged: there is nothing here worth keeping.
+    _recovery_has_new_evidence = (_missing_terminal and
+                                  A.has_new_source_evidence(orig_rec.attempt.outcomes, rec2.attempt.outcomes))
+    if _missing_terminal and _recovery_has_new_evidence:
+        st.emit("recovery_evidence_without_text", work_item=wi.work_item_id, attempt=rec2.attempt.attempt_id,
+                reason="recovery attempt produced no final text but established new, real source "
+                       "evidence -- proceeding to reconciliation and an independent re-decision "
+                       "instead of discarding it")
+    if (rec2.attempt.state != "FINISHED" or rec2.error or (rec2.ledger_error and not rec2.attempt.text)
+            or _recovery_run_failed or (_missing_terminal and not _recovery_has_new_evidence)):
         # Track 8.2: a recovery pass that itself errors, times out, is cancelled, or selects no
-        # valid terminal result aborts recovery cleanly -- the ORIGINAL (orig_rec, orig_d) stays
-        # the work item's result; the recovery attempt's own failure is never treated as a reason
-        # to discard an already-accepted, if partial, original answer.
+        # valid terminal result AND established no new evidence either aborts recovery cleanly --
+        # the ORIGINAL (orig_rec, orig_d) stays the work item's result; the recovery attempt's own
+        # failure is never treated as a reason to discard an already-accepted, if partial,
+        # original answer. (Phase 1.37: a missing-terminal recovery that DID establish new
+        # evidence no longer takes this branch -- see _recovery_has_new_evidence above.)
         st.emit("recovery_aborted", work_item=wi.work_item_id,
                 reason=rec2.error or rec2.ledger_error or _t2.get("run_error") or
                        ("cancelled" if _t2.get("cancelled_event") else None) or
                        ("timed_out" if _t2.get("timed_out") else None) or
-                       ("missing_terminal" if _t2.get("result_selection_status") == "MISSING_TERMINAL" else None) or
+                       ("missing_terminal" if _missing_terminal else None) or
                        "recovery attempt did not finish")
         return None
     # The RAW recovery text/trace are already durably recorded under rec2.attempt.attempt_id by
