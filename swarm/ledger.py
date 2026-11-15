@@ -346,7 +346,13 @@ class Ledger:
                        _j(d.get("requirements")), _j({"execution_reason": d.get("execution_reason"), "identity": d.get("identity"),
                        # Phase 1.23: additive, no schema change -- extra_json is the pre-existing designed
                        # extension point for exactly this (see this column's own DDL comment history).
-                       "terminal_integrity": d.get("terminal_integrity"), "coverage_status": d.get("coverage_status")}),
+                       "terminal_integrity": d.get("terminal_integrity"), "coverage_status": d.get("coverage_status"),
+                       # Phase 1.25: durable recovery provenance + budget snapshot, same extra_json
+                       # extension point -- no schema change. is_recovery/recovery_info are None/False
+                       # for every initial attempt; budget is set for every attempt (initial or
+                       # recovery) by run_attempt()'s own finally block.
+                       "is_recovery": d.get("is_recovery"), "recovery_info": d.get("recovery_info"),
+                       "budget": d.get("budget")}),
                        sha, time.time()))
             c.execute("INSERT INTO registration(attempt_id,task_id,work_item_id,generation,kind,status,reason,registered_at) VALUES(?,?,?,?,?,?,?,?)",
                       (attempt_id, a["task_id"], a["work_item_id"], a["generation"], kind, status, cause or "", time.time()))
@@ -483,4 +489,10 @@ def decision_to_dict(d, requirements=None) -> dict:
             # when read back (not a fabricated "N/A" written retroactively) -- see decision_from_dict-equivalent
             # readers, which must treat a missing key as absence of information, never as a value.
             "terminal_integrity": getattr(d, "terminal_integrity", None),
-            "coverage_status": getattr(d, "coverage_status", None)}
+            "coverage_status": getattr(d, "coverage_status", None),
+            # Phase 1.25: same additive principle -- a pre-Phase-1.25 historical decision has none
+            # of these keys when read back; is_recovery/recovery_info default to False/None (never
+            # fabricated as "yes" for an attempt that predates this phase).
+            "is_recovery": getattr(d, "is_recovery", False),
+            "recovery_info": getattr(d, "recovery_info", None),
+            "budget": getattr(d, "budget", None)}

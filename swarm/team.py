@@ -21262,7 +21262,19 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         if _ceiling_cat is not None and cache_key not in cache:
             _chars_dict = delegation_discovery_chars if _ceiling_cat == "discovery" else delegation_read_chars
             _ceiling = _DELEGATION_DISCOVERY_CEILING if _ceiling_cat == "discovery" else _DELEGATION_READ_CEILING
-            _dl_read = _chars_dict.get(norm_agent_key, 0)
+            # Phase 1.25: task-scoped budget. `activity["task_discovery_offset"]`/
+            # `["task_read_offset"]` is what THIS SAME logical task (one work_item_id,
+            # across the initial attempt and any recovery attempt) has already spent in a
+            # PRIOR attempt -- the caller (swarm/eng_workflow.py's run_attempt()) reads the
+            # running cumulative total before building this fresh, per-attempt closure and
+            # seeds it here, so a recovery attempt sees the real remaining balance instead
+            # of a fresh 90,000. The per-attempt dict above is untouched/still 0-based --
+            # this offset is added only at the comparison point, so per-attempt diagnostics
+            # (this dict's own value) and task-level totals (this sum) stay independently
+            # reportable, exactly as required.
+            _task_offset_key = "task_discovery_offset" if _ceiling_cat == "discovery" else "task_read_offset"
+            _task_offset = (activity or {}).get(_task_offset_key, 0)
+            _dl_read = _chars_dict.get(norm_agent_key, 0) + _task_offset
             if _dl_read >= _ceiling:
                 _rkey = (norm_agent_key, _ceiling_cat)
                 read_refusals[_rkey] = read_refusals.get(_rkey, 0) + 1
@@ -21368,6 +21380,14 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             elif _ceiling_cat == "read":
                 delegation_read_chars[norm_agent_key] = (
                     delegation_read_chars.get(norm_agent_key, 0) + len(str(result)))
+            # Phase 1.25: expose this attempt's OWN (0-based, per-delegation) running totals to
+            # the caller via the existing `activity` extension point -- overwritten on every
+            # charge, so by the time this attempt ends it holds the final per-attempt figure.
+            # The task-level cumulative total is computed by the caller (run_attempt()) as
+            # task_offset + this value; nothing here mutates the offset itself.
+            if activity is not None:
+                activity["attempt_discovery_chars"] = delegation_discovery_chars.get(norm_agent_key, 0)
+                activity["attempt_read_chars"] = delegation_read_chars.get(norm_agent_key, 0)
             # Log the running total on every fresh read, not only when the budget trips
             # (2026-08-23). The budget shipped without this and promptly went unmeasured:
             # battery T12 stalled with Researcher at 40/50 tool calls and the guard

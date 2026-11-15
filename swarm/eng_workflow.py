@@ -211,6 +211,13 @@ class RunState:
     attempt_deadline_wall: Optional[float] = None
     stream_events: int = 0
     knowledge: object = None              # Phase 1.20: the run's KnowledgeDossier (prepared once by the shared service)
+    # Phase 1.25: TASK-scoped (one logical delegated task = one work_item_id) cumulative discovery/
+    # source-read consumption, carried across attempts within that work item (initial + any
+    # recovery) -- so a recovery attempt sees the balance already spent, not a fresh 90K/90K.
+    # Per-attempt figures are reported separately (see run_attempt()'s own att.terminal["budget"])
+    # and are NEVER lost; this dict only ever holds the running CUMULATIVE total per work item.
+    task_discovery_chars: dict = field(default_factory=dict)
+    task_read_chars: dict = field(default_factory=dict)
 
     def remaining(self) -> Optional[float]:
         return None if self.deadline_mono is None else self.deadline_mono - time.monotonic()
@@ -389,6 +396,14 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
 
     outcome_rec = A.OutcomeRecorder(att.attempt_id, tool_deadline=controls.get("tool_deadline"), on_call=on_finished)
     fault = {"n": 0}
+    # Phase 1.25: the balance this work item has ALREADY spent, across every attempt so far (0 for
+    # the initial attempt; non-zero for a recovery attempt) -- read BEFORE the team is built so the
+    # fresh per-attempt hook closure can be told the task-level starting point via `activity`
+    # (the existing, pre-Phase-1.25 extension point _make_read_cache_tool_hook already writes
+    # diagnostics into), rather than silently starting a recovery attempt at 0/90,000 again.
+    _task_discovery_before = st.task_discovery_chars.get(wi.work_item_id, 0)
+    _task_read_before = st.task_read_chars.get(wi.work_item_id, 0)
+    activity = {"task_discovery_offset": _task_discovery_before, "task_read_offset": _task_read_before}
     try:
         if controls.get("ceiling") is not None:
             T._DELEGATION_READ_CEILING = controls["ceiling"]
@@ -398,6 +413,7 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
         team = T._build_team(
             ctx["specs"], ctx["coordinator"], ctx["ctools"], "coordinate", ctx["mcp_list"], [],
             read_only=True, skill_catalog=ctx["catalog"], task=wi.objective, team_name="engineering",
+            activity=activity,
             project_id=ctx["project_id"], tool_call_limit_bonus=ctx["profile"].tool_call_limit_bonus)
         team._hive_mcp_url = ctx["hive_url"]
         team._task = wi.objective
@@ -551,6 +567,25 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
     finally:
         T._DELEGATION_READ_CEILING = old_ceiling
         T._DELEGATION_DISCOVERY_CEILING = old_discovery_ceiling
+        # Phase 1.25: read back what THIS attempt actually spent (0 if it never reached a tool
+        # call, e.g. a setup failure) and fold it into the TASK-level (work_item_id-scoped)
+        # cumulative total, which the NEXT attempt on this same work item -- a recovery pass --
+        # will read as its own starting offset. Runs in `finally` so a failed/cancelled/aborted
+        # attempt still correctly contributes whatever it actually spent, never silently
+        # resetting or being excluded from the task-level total.
+        _attempt_discovery = activity.get("attempt_discovery_chars", 0)
+        _attempt_read = activity.get("attempt_read_chars", 0)
+        _task_discovery_after = _task_discovery_before + _attempt_discovery
+        _task_read_after = _task_read_before + _attempt_read
+        st.task_discovery_chars[wi.work_item_id] = _task_discovery_after
+        st.task_read_chars[wi.work_item_id] = _task_read_after
+        if att.terminal is not None:
+            att.terminal["budget"] = {
+                "attempt_discovery_chars": _attempt_discovery, "attempt_read_chars": _attempt_read,
+                "task_discovery_chars_before": _task_discovery_before, "task_read_chars_before": _task_read_before,
+                "task_discovery_chars_after": _task_discovery_after, "task_read_chars_after": _task_read_after,
+                "task_discovery_ceiling": T._DELEGATION_DISCOVERY_CEILING, "task_read_ceiling": T._DELEGATION_READ_CEILING,
+            }
         if led is not None:
             try:     # terminal facts + canonical text + full trace, even for an invalidated attempt (history);
                       # never changes a decision
@@ -694,9 +729,24 @@ def reconcile_attempts(orig_att, orig_d, rec_att) -> tuple:
     reconciled_text = "## Original pass\n\n" + (orig_att.text or "").strip() + f"\n\n{header}\n\n{body}"
     reconciled_trace = (orig_att.trace_text or "") + "\n\n---(recovery pass trace)---\n\n" + (rec_att.trace_text or "")
     combined_outcomes = list(orig_att.outcomes) + list(rec_att.outcomes)
-    before_after = {"missing_before": missing_ids, "dropped_duplicate_paragraphs": dropped,
-                    "original_attempt_id": orig_att.attempt_id, "recovery_attempt_id": rec_att.attempt_id}
-    return reconciled_text, reconciled_trace, combined_outcomes, before_after
+    # Phase 1.25 Track 5: durable recovery provenance. Deliberately NOT duplicating fields the
+    # final decision row already carries on its own -- is_recovery/execution_status/
+    # terminal_integrity/acceptance (this same row), per-attempt+task-level budget (d.budget,
+    # set separately in run_attempt()'s finally block), and the AFTER-recovery obligation
+    # statuses (this same row's own gate_json, computed by decide() right after this function
+    # returns -- not yet known here). What IS captured here, and nowhere else: the BEFORE state
+    # (orig_d's own gate, as it stood before recovery ran), the trigger/reason, the parent
+    # attempt link, and the reconciliation outcome.
+    recovery_info = {
+        "original_attempt_id": orig_att.attempt_id, "recovery_attempt_id": rec_att.attempt_id,
+        "recovery_trigger": "coverage_missing_mandatory",
+        "recovery_reason": "mandatory coverage obligation(s) missing or insufficient after the initial "
+                           "attempt: " + (", ".join(missing_ids) if missing_ids else "(none recorded)"),
+        "missing_before": missing_ids,
+        "satisfied_before": [s["id"] for s in orig_d.gate.get("satisfied", [])],
+        "dropped_duplicate_paragraphs": dropped,
+    }
+    return reconciled_text, reconciled_trace, combined_outcomes, recovery_info
 
 
 async def recover_and_reconcile(st: RunState, wi: WorkItem, ctx: dict, controls: dict,
@@ -744,10 +794,10 @@ async def recover_and_reconcile(st: RunState, wi: WorkItem, ctx: dict, controls:
     # still reference what the recovery pass produced on its own (Track 6: "Retain... Recovery
     # answer... Recovery trace"); the ledger's own attempt row is untouched by what follows.
     raw_recovery_text, raw_recovery_trace = rec2.attempt.text, rec2.attempt.trace_text
-    reconciled_text, reconciled_trace, combined_outcomes, before_after = reconcile_attempts(
+    reconciled_text, reconciled_trace, combined_outcomes, recovery_info = reconcile_attempts(
         orig_rec.attempt, orig_d, rec2.attempt)
-    before_after["raw_recovery_text_sha"] = A.sha(raw_recovery_text)
-    before_after["raw_recovery_chars"] = len(raw_recovery_text or "")
+    recovery_info["raw_recovery_text_sha"] = A.sha(raw_recovery_text)
+    recovery_info["raw_recovery_chars"] = len(raw_recovery_text or "")
     # Mutate rec2.attempt IN PLACE (never construct a separate object) -- rec2 is the SAME
     # AttemptRecord instance run_attempt() already appended to st.records, and _final_record()
     # looks up the accepted attempt by attempt_id inside st.records; a separate reconciled copy
@@ -755,13 +805,18 @@ async def recover_and_reconcile(st: RunState, wi: WorkItem, ctx: dict, controls:
     rec2.attempt.text = reconciled_text
     rec2.attempt.trace_text = reconciled_trace
     rec2.attempt.outcomes = combined_outcomes
-    rec2.attempt.terminal = {"result_selection_status": "RECONCILED", "completed_event": True,
-                             "run_output_status": "RunStatus.completed", "run_error": None,
-                             "cancelled_event": False, "timed_out": False, "stream_closed_early": False,
-                             "recovery_of": orig_rec.attempt.attempt_id, "before_after": before_after}
+    # Phase 1.25: merge into the EXISTING terminal dict (preserving the "budget" key run_attempt()'s
+    # own finally block already wrote for this same attempt) rather than replacing it outright --
+    # Phase 1.24 replaced the whole dict here, which would have silently discarded Phase 1.25's own
+    # budget snapshot for this attempt had this still been a flat reassignment.
+    rec2.attempt.terminal = dict(rec2.attempt.terminal or {},
+                                 result_selection_status="RECONCILED", completed_event=True,
+                                 run_output_status="RunStatus.completed", run_error=None,
+                                 cancelled_event=False, timed_out=False, stream_closed_early=False,
+                                 recovery_of=orig_rec.attempt.attempt_id, recovery_info=recovery_info)
     d2 = await assess_and_register(st, wi, rec2, controls)
     st.emit("recovery_reconciled", work_item=wi.work_item_id, original=orig_rec.attempt.attempt_id,
-            recovery=rec2.attempt.attempt_id, missing_before=before_after["missing_before"],
+            recovery=rec2.attempt.attempt_id, missing_before=recovery_info["missing_before"],
             coverage_after=d2.coverage_status, acceptance_after=d2.acceptance)
     return rec2, d2
 

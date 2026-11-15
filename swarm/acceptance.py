@@ -724,6 +724,15 @@ class Decision:
     # Track C's explicit requirement not to collapse these into one score.
     terminal_integrity: str = "N/A"    # VALID | MISSING | N/A (gate not reached: error/cancel/timeout upstream)
     coverage_status: str = "N/A"       # SATISFIED | MISSING_MANDATORY | N/A (no coverage policy applicable)
+    # Phase 1.25: durable recovery provenance, read from a.terminal (set by
+    # eng_workflow.recover_and_reconcile() before this decide() call) and carried into
+    # decision_to_dict()'s extra_json -- so the final, committed decision row for a
+    # recovery attempt is self-describing without needing application logs: is_recovery,
+    # which attempt it recovered from, why, what was missing before, and the per-attempt/
+    # task-level budget snapshot at the moment this attempt ran.
+    is_recovery: bool = False
+    recovery_info: Optional[dict] = None   # None for an initial attempt; a dict (see recover_and_reconcile) for a recovery
+    budget: Optional[dict] = None          # per-attempt + task-level discovery/read consumption (see run_attempt)
 
 
 def _to_acceptance(assessor_status: str) -> str:
@@ -764,6 +773,13 @@ def decide(a: Attempt, policy, registry: Registry = None, outcomes=None, registe
     d.terminal_integrity = {"TERMINAL_SELECTED": "VALID", "MISSING_TERMINAL": "MISSING",
                             "RECONCILED": "VALID_RECONCILED"}.get(rss, "N/A")
     d.coverage_status = "N/A" if not gate["applicable"] else ("MISSING_MANDATORY" if gate["missing"] else "SATISFIED")
+    # Phase 1.25: durable recovery provenance -- read from a.terminal, set (only for a recovery
+    # attempt) by eng_workflow.recover_and_reconcile() before this decide() call runs. An initial
+    # attempt's terminal never carries "recovery_info", so is_recovery stays False and recovery_info
+    # stays None for it -- no behavior change for any non-recovery attempt.
+    d.recovery_info = (a.terminal or {}).get("recovery_info")
+    d.is_recovery = d.recovery_info is not None
+    d.budget = (a.terminal or {}).get("budget")
     d.validity = registry.validity(a) if registry else "CURRENT"
     steps.append(("3.attempt_validity", d.validity))
     if d.validity != "CURRENT":
@@ -859,4 +875,6 @@ def summarize(d: Decision) -> dict:
             "registration": (d.registration or {}).get("reason"),
             # Phase 1.23: the five dimensions Track C requires reported separately.
             "terminal_integrity": d.terminal_integrity, "accuracy": d.assessor_status,
-            "coverage": d.coverage_status, "execution": d.execution_status, "overall_acceptance": d.acceptance}
+            "coverage": d.coverage_status, "execution": d.execution_status, "overall_acceptance": d.acceptance,
+            # Phase 1.25: recovery/budget provenance, reported separately rather than inferred.
+            "is_recovery": d.is_recovery, "recovery_info": d.recovery_info, "budget": d.budget}
