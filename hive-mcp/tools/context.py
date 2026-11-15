@@ -634,7 +634,8 @@ def _rank_candidates_by_relevance(guessed_path: str, candidates: list[str]) -> l
     return sorted(candidates, key=lambda c: -_shared_leading_segments(guessed_path, c))
 
 
-def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str:
+def get_file_content(relative_path: str, offset: int = 0, limit: int = 0,
+                     max_output_chars: int = 0) -> str:
     """
     Read a file from the project by its path relative to the project root.
     Always read a file before editing it — get the exact content to use as old_string in apply_diff.
@@ -662,7 +663,23 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
         relative_path: e.g. 'src/api/routes.py', 'package.json', 'docker-compose.yml'
         offset: 0-based first line for a ranged read (default 0 = start of file)
         limit:  number of lines to return from offset (default 0 = to end / whole file)
+        max_output_chars: (Phase 1.29c) request a SMALLER output cap than this tool's
+            own default maximum -- e.g. if you were just told only ~20,000 chars of
+            your task's read budget remain, pass max_output_chars=20000 so a read you
+            would otherwise need to skip can still return a smaller, still-complete-or-
+            honestly-truncated result instead of being refused outright. Default 0 means
+            "use this tool's own normal maximum" (unchanged pre-1.29c behavior). This can
+            only make the result SMALLER than normal, never larger -- passing a huge
+            number has no effect beyond this tool's own real ceiling.
     """
+    # Phase 1.29c: an effective, request-scoped cap -- never larger than this tool's
+    # own real ceiling, only ever smaller when the caller asks for less. Computed once,
+    # used at every render path below (whole-file, the "fits whole" shortcut, skeleton,
+    # and the genuinely-ranged path) so the producer and the caller agree on exactly one
+    # number for this one call, rather than the caller's request and the tool's own
+    # ceiling ever disagreeing about what "the maximum for this call" means.
+    _eff_rendered_cap = min(max_output_chars, _MAX_RENDERED_CHARS) if max_output_chars > 0 else _MAX_RENDERED_CHARS
+    _eff_ranged_cap = min(max_output_chars, _MAX_RANGED_READ_CHARS) if max_output_chars > 0 else _MAX_RANGED_READ_CHARS
     basename = Path(relative_path).name
     if basename in _EXCLUDED_ASSISTANT_FILES:
         return (
@@ -782,7 +799,8 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
                 return (
                     f"# {relative_path} — offset/limit ignored: the whole file is {len(data):,} "
                     f"bytes ({total} lines) and fits in one read's SOURCE size, but its "
-                    f"RENDERED text exceeded the {_MAX_RENDERED_CHARS:,}-char output cap.\n"
+                    f"RENDERED text exceeded the {_eff_rendered_cap:,}-char output cap "
+                    f"{'(the full default maximum)' if _eff_rendered_cap == _MAX_RENDERED_CHARS else '(a smaller cap requested via max_output_chars)'}.\n"
                     f"# STATUS: TRUNCATED -- lines {_render_start + 1}..{last_lineno} of {total} shown "
                     f"({'the last line was also too long and was clipped' if line_itself_truncated else 'all shown lines are complete, uncut'}).\n"
                     f"# Continue with offset={next_offset}, limit=200 to get the rest. Do NOT "
@@ -814,7 +832,7 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
         # wrapper's header/status + the body) fits _MAX_RENDERED_CHARS -- replacing
         # Phase 1.29's reliance on an empirical, unproven application-side margin for
         # this header/status overhead.
-        return _fit_complete_response(all_lines[_render_start:], _render_start + 1, _MAX_RENDERED_CHARS, _wrap1)
+        return _fit_complete_response(all_lines[_render_start:], _render_start + 1, _eff_rendered_cap, _wrap1)
 
     if offset or limit:
         lines = data.splitlines()
@@ -861,8 +879,9 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
                 remaining = len(lines) - next_offset
                 note = (
                     f"\n# STATUS: TRUNCATED -- this result hit the "
-                    f"{_MAX_RANGED_READ_CHARS:,}-char output cap before reaching the "
-                    f"requested end (line {min(end, len(lines))}).\n"
+                    f"{_eff_ranged_cap:,}-char output cap "
+                    f"{'(the full default maximum)' if _eff_ranged_cap == _MAX_RANGED_READ_CHARS else '(a smaller cap requested via max_output_chars)'} "
+                    f"before reaching the requested end (line {min(end, len(lines))}).\n"
                     f"# Lines {start + 1}..{last_lineno} of {len(lines)} are shown above "
                     f"({'the last line itself was also too long and was clipped -- see its '
                        'own inline marker' if line_itself_truncated else 'all shown lines are complete, uncut'}).\n"
@@ -889,7 +908,7 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
 
         # Phase 1.29b: same fixed-point completeness guarantee as the other two
         # get_file_content branches -- see _fit_complete_response's own docstring.
-        return _fit_complete_response(lines[start:end], start + 1, _MAX_RANGED_READ_CHARS, _wrap2)
+        return _fit_complete_response(lines[start:end], start + 1, _eff_ranged_cap, _wrap2)
 
     if len(data) <= _MAX_FULL_BYTES:
         all_lines = data.splitlines()
@@ -908,7 +927,8 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
             return (
                 f"# {relative_path} is {len(data):,} source bytes (fits under the "
                 f"{_MAX_FULL_BYTES:,}-byte whole-file threshold), but its RENDERED text "
-                f"exceeded the {_MAX_RENDERED_CHARS:,}-char output cap.\n"
+                f"exceeded the {_eff_rendered_cap:,}-char output cap "
+                f"{'(the full default maximum)' if _eff_rendered_cap == _MAX_RENDERED_CHARS else '(a smaller cap requested via max_output_chars)'}.\n"
                 f"# STATUS: TRUNCATED -- lines 1..{last_lineno} of {total} shown "
                 f"({'the last line was also too long and was clipped' if line_itself_truncated else 'all shown lines are complete, uncut'}).\n"
                 f"# Continue with offset={last_lineno}, limit=200 to get the rest. Do NOT "
@@ -919,8 +939,9 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
             )
 
         # Phase 1.29b: same fixed-point completeness guarantee as the other two
-        # get_file_content branches.
-        return _fit_complete_response(all_lines, 1, _MAX_RENDERED_CHARS, _wrap3)
+        # get_file_content branches. Phase 1.29c: _eff_rendered_cap, not the bare
+        # constant, so an explicit max_output_chars request is honored here too.
+        return _fit_complete_response(all_lines, 1, _eff_rendered_cap, _wrap3)
 
     # Oversized file — reduce it so it can't blow the context window.
     ext = target.suffix.lower()
@@ -932,10 +953,12 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
             # above that) -- so the same per-line rendering overhead this phase proved
             # for whole-file reads is unbounded here, not merely 6.67x. _cap_rendered_text
             # truncates the already-rendered skeleton string at its last complete line.
-            skel_capped, skel_truncated = _cap_rendered_text(skel, _MAX_RENDERED_CHARS)
+            skel_capped, skel_truncated = _cap_rendered_text(skel, _eff_rendered_cap)
             status_line = (
-                f"# STATUS: TRUNCATED -- this skeleton hit the {_MAX_RENDERED_CHARS:,}-char "
-                f"output cap. Signatures past this point are not shown; re-read a later "
+                f"# STATUS: TRUNCATED -- this skeleton hit the {_eff_rendered_cap:,}-char "
+                f"output cap "
+                f"{'(the full default maximum)' if _eff_rendered_cap == _MAX_RENDERED_CHARS else '(a smaller cap requested via max_output_chars)'}. "
+                f"Signatures past this point are not shown; re-read a later "
                 f"part of the file directly with get_file_content('{relative_path}', "
                 f"offset=<line>, limit=200) once you know which line to target from "
                 f"search_files, or request more of the skeleton is not supported -- the "

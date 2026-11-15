@@ -20979,6 +20979,17 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             # is smaller and already covered by this same larger figure). The
             # reservation now matches the producer's own proven maximum exactly, with
             # nothing left to a measured-but-unproven margin.
+            #
+            # Phase 1.29c: if THIS call's own args already specify max_output_chars
+            # (either because the model explicitly requested a smaller read, or because
+            # the admission check below adapted it down to fit the remaining budget),
+            # the reservation must match THAT smaller request, not the tool's full
+            # default -- the producer enforces exactly this same effective cap (see
+            # hive-mcp's own _eff_rendered_cap), so reserving the full default here
+            # would over-reserve and defeat the entire point of a smaller request.
+            _requested = (call_args or {}).get("max_output_chars") or 0
+            if _requested > 0:
+                return min(int(_requested), _MAX_RENDERED_CHARS_LOCAL)
             return _MAX_RENDERED_CHARS_LOCAL
         return 0  # uncategorized tool (e.g. lightrag_query) -- excluded from both ceilings, unchanged since Phase 1.24
 
@@ -21371,6 +21382,10 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         # tool), so nothing needs releasing for it.
         _reservation_cat = None
         _reservation_amt = 0
+        # Phase 1.29c: defined here (not only inside the categorized branch below) so
+        # the cache-store guard further down can safely check it regardless of whether
+        # this call was categorized at all.
+        _adapted = False
         if _ceiling_cat is not None and cache_key not in cache:
             _chars_dict = delegation_discovery_chars if _ceiling_cat == "discovery" else delegation_read_chars
             _reserved_dict = delegation_discovery_reserved if _ceiling_cat == "discovery" else delegation_read_reserved
@@ -21388,7 +21403,13 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             _task_offset_key = "task_discovery_offset" if _ceiling_cat == "discovery" else "task_read_offset"
             _task_offset = (activity or {}).get(_task_offset_key, 0)
             _label = "discovery" if _ceiling_cat == "discovery" else "read"
-            _worst_case = _reserve_worst_case(function_name, args)
+            # Phase 1.29c: a floor below which adapting the request down further is not
+            # worth attempting -- a "successful" read of only a few hundred characters
+            # is not useful evidence, and refusing clearly is more honest than serving
+            # something this thin. Chosen well below the smallest tool reservation
+            # (count_matches/list_directory_tree at 3,000/8,000) so it never interferes
+            # with those; it only matters for get_file_content's own adaptive path below.
+            _MIN_USEFUL_ADAPTED_RESERVATION = 2_000
             # Phase 1.26: hard admission. Reserve this call's own worst-case size BEFORE
             # it runs and check committed + already-reserved + this reservation against
             # the ceiling -- not just committed-so-far as Phase 1.25 did, which let one
@@ -21399,6 +21420,24 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             async with _budget_lock(f"{norm_agent_key}:{_ceiling_cat}"):
                 _committed = _chars_dict.get(norm_agent_key, 0)
                 _reserved = _reserved_dict.get(norm_agent_key, 0)
+                _worst_case = _reserve_worst_case(function_name, args)
+                # Phase 1.29c: the Phase 1.29b regression, fixed. Phase 1.29b reserved
+                # get_file_content's FULL default maximum (60,000) for every call,
+                # refusing outright whenever less than that remained -- even when the
+                # remaining budget (e.g. 55,946 chars, live on T11) could comfortably
+                # fit a smaller, still fully-bounded and honestly-truncated read. If the
+                # model did not already request a smaller max_output_chars itself, and
+                # the default reservation would not fit but a smaller one would, adapt
+                # the ACTUAL call down to fit -- the producer enforces this exact same
+                # smaller cap (hive-mcp's own _eff_rendered_cap), so this is never an
+                # unproven estimate, only a smaller real cap than the default.
+                if (function_name == "get_file_content" and not (args or {}).get("max_output_chars")):
+                    _remaining_now = max(_ceiling - _committed - _reserved - _task_offset, 0)
+                    if _worst_case > _remaining_now >= _MIN_USEFUL_ADAPTED_RESERVATION:
+                        args = dict(args or {})
+                        args["max_output_chars"] = _remaining_now
+                        _worst_case = _reserve_worst_case(function_name, args)
+                        _adapted = True
                 _projected = _committed + _reserved + _task_offset + _worst_case
                 if _worst_case == 0:
                     _admit = True  # should not happen for a categorized tool; fail open rather than wedge the run
@@ -21407,6 +21446,11 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 else:
                     _admit = True
                     _reserved_dict[norm_agent_key] = _reserved + _worst_case
+            if _admit and _adapted:
+                print(f"[team] {agent_key or 'coordinator'} get_file_content adapted to "
+                      f"max_output_chars={_worst_case:,} (the full default would have "
+                      f"exceeded the remaining {_label} allowance) -- a smaller, still "
+                      f"fully-bounded read was admitted instead of refusing outright", flush=True)
             if not _admit:
                 _rkey = (norm_agent_key, _ceiling_cat)
                 read_refusals[_rkey] = read_refusals.get(_rkey, 0) + 1
@@ -21439,14 +21483,24 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 # ("File not found", produced by hive-mcp itself, not this hook) and a
                 # tool execution failure (an exception, handled separately below) can
                 # never reach this message, so a model cannot mistake this for either.
+                _adapt_note = (
+                    f" A smaller read was considered (this tool supports "
+                    f"max_output_chars=<n> to request less than its default maximum) "
+                    f"but the {_remaining:,} chars remaining is below the minimum "
+                    f"useful size ({_MIN_USEFUL_ADAPTED_RESERVATION:,} chars) for this "
+                    f"tool, so none was attempted."
+                    if function_name == "get_file_content" and 0 < _remaining < _MIN_USEFUL_ADAPTED_RESERVATION
+                    else ""
+                )
                 return _refuse(agent, function_name, args, f"{_label}_ceiling", (
                     f"REFUSED (budget): this {_label} call's worst-case size "
                     f"(~{_worst_case:,} chars) would exceed the remaining {_label} "
                     f"allowance ({_remaining:,} of {_ceiling:,} chars left in this task, "
-                    f"across the initial attempt and any recovery). This refusal means "
-                    f"the BUDGET is spent or this one call is too large for what remains "
-                    f"-- never report an absence based on this refusal alone; it is not "
-                    f"a signal that anything you were looking for does not exist.\n"
+                    f"across the initial attempt and any recovery).{_adapt_note} This "
+                    f"refusal means the BUDGET is spent or this one call is too large "
+                    f"for what remains -- never report an absence based on this refusal "
+                    f"alone; it is not a signal that anything you were looking for does "
+                    f"not exist.\n"
                     f"Write up what you have ALREADY read, and copy enumerable findings "
                     f"verbatim — every route decorator, class declaration or column you "
                     f"actually saw, exactly as it appeared. A report that summarises a "
@@ -21502,13 +21556,26 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     _rd = delegation_discovery_reserved if _reservation_cat == "discovery" else delegation_read_reserved
                     _rd[norm_agent_key] = max(0, _rd.get(norm_agent_key, 0) - _reservation_amt)
                 raise
-            cache[cache_key] = result
-            cache_origin_generation[cache_key] = generation
+            # Phase 1.29c: never cache a result from an ADAPTED (smaller than default)
+            # request under the ORIGINAL cache_key. The cache key was computed from the
+            # model's own original args, which did not include max_output_chars -- if a
+            # budget-adapted (and therefore possibly more-truncated-than-necessary)
+            # result were cached there, a LATER call with the SAME original args (after
+            # more budget frees up, or in a recovery attempt with a larger remaining
+            # balance) would incorrectly receive this stale, smaller-than-needed result
+            # instead of a fresh, correctly-sized one.
+            if not _adapted:
+                cache[cache_key] = result
+                cache_origin_generation[cache_key] = generation
             # Record a whole-file serve so the NEXT ranged read of this path collapses
             # onto this entry. Read off hive-mcp's own marker rather than guessing from
             # size: the tool owns the threshold, and duplicating it here would drift.
+            # Phase 1.29c: also skipped for an ADAPTED result, for the same reason as
+            # the cache-store guard just above -- an adapted (possibly more-truncated-
+            # than-necessary) read must never become the canonical cached answer for
+            # this path's later ranged reads.
             _path = (args or {}).get("relative_path")
-            if (function_name == "get_file_content" and _path
+            if (not _adapted and function_name == "get_file_content" and _path
                     and _path not in whole_file_paths
                     and "offset/limit ignored" in _result_text(result)[:400]):
                 whole_file_paths.add(_path)
