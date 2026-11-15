@@ -123,13 +123,13 @@ def derive_policy(paths: list, task: str = ""):
             reqs.append(A.Requirement(f"F{i}_read_{os.path.basename(p)}", f"read source file {p}", [n]))
     links = list(A.T11_DOC_UPLOAD_POLICY.links) if used >= {r.id for r in A.T11_DOC_UPLOAD_POLICY.requirements} else []
     enum_reqs = list(known.enum_requirements) if known is not None else []
-    # Phase 1.34: absence-disclosure obligations carried forward the same way enum_reqs already
-    # are -- merged in, never replacing the per-named-file requirements the task's own wording
-    # independently produced.
-    gap_reqs = list(known.gap_disclosure_requirements) if known is not None else []
+    # Phase 1.34/1.35: two-sided comparison obligations carried forward the same way enum_reqs
+    # already are -- merged in, never replacing the per-named-file requirements the task's own
+    # wording independently produced.
+    xref_reqs = list(known.cross_reference_requirements) if known is not None else []
     return A.EvidencePolicy(name="derived-" + hashlib.sha256("|".join(paths).encode()).hexdigest()[:8],
                             requirements=reqs, links=links, enum_requirements=enum_reqs,
-                            gap_disclosure_requirements=gap_reqs)
+                            cross_reference_requirements=xref_reqs)
 
 
 MAX_WORK_ITEMS = 4

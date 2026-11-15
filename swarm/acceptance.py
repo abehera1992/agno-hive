@@ -353,14 +353,15 @@ class EvidencePolicy:
     # Phase 1.23: content-level coverage obligations, evaluated by enum_requirement_result() and
     # folded into gate_evaluate()'s satisfied/missing alongside `requirements` -- see EnumRequirement.
     enum_requirements: list = field(default_factory=list)
-    # Phase 1.34: ABSENCE-disclosure obligations, evaluated by gap_disclosure_result() -- see
-    # GapDisclosureRequirement. Deliberately a separate list, not folded into enum_requirements:
-    # an EnumRequirement's evidence check proves an item EXISTS (pattern found in both the answer
-    # and the source read); a gap-disclosure item proves the opposite (a backend-side operation
-    # has NO frontend counterpart), which needs the inverted evidence check below -- reusing
-    # enum_requirement_result() unchanged for this would always fail, since "no frontend hook"
-    # language never appears in source code for enum_requirement_result's in-evidence check to find.
-    gap_disclosure_requirements: list = field(default_factory=list)
+    # Phase 1.34/1.35: two-sided comparison obligations, evaluated by cross_reference_result() --
+    # see CrossReferenceRequirement. Deliberately a separate list, not folded into
+    # enum_requirements: an EnumRequirement's evidence check proves an item EXISTS (pattern found
+    # in both the answer and the source read); a cross-reference item proves a LEFT item has NO
+    # matching RIGHT item, which needs the inverted evidence check that function performs --
+    # reusing enum_requirement_result() unchanged for this would always fail, since "no matching
+    # counterpart" language never appears in source code for its in-evidence check to find.
+    # Carries NO project-specific content itself -- see CrossReferenceRequirement's own docstring.
+    cross_reference_requirements: list = field(default_factory=list)
 
 
 _FORM = "auth/register/business/businessregistrationform.tsx"
@@ -477,111 +478,168 @@ def enum_requirement_result(req: "EnumRequirement", srcs: dict, text: str) -> di
 
 
 @dataclass
-class GapDisclosureRequirement:
-    """Phase 1.34: an obligation that the final answer EXPLICITLY STATES a specific backend-side
-    operation has no frontend counterpart -- the counterpart failure mode to EnumRequirement
-    (which proves an item exists). Root cause this addresses: T13b's Phase 1.33 live run found
-    all 9 backend voucher endpoints and all 5 real frontend hooks, cited every one of them
-    correctly with real names, and STILL produced a final answer stating "the frontend has all
-    the corresponding voucher-related hooks" -- false (9 endpoints, 5 hooks, 4 uncovered), and
-    the existing EP_hooks/EP_endpoints EnumRequirements both independently passed regardless,
-    since each only checks "does this name appear in the answer", never whether a cross-reference
-    between the two sides was ever actually stated. Finding every individual fact is not the
-    same as comparing them -- this requirement enforces the comparison was actually disclosed.
-    `items` is a list of (item_id, source_pattern, disclosure_pattern) triples:
-    - source_pattern: the SAME keyword used elsewhere to detect this operation's own presence
-      (e.g. the EP_endpoints pattern for "grn") -- checked against the scoped SOURCE to confirm
-      the claimed absence is genuinely true, not merely unexamined or fabricated.
-    - disclosure_pattern: checked against the ANSWER text to confirm the gap was actually
-      stated in those terms, not merely true by omission (an answer that never mentions an
-      operation at all is not "disclosing" its absence)."""
+class CrossReferenceRequirement:
+    """Phase 1.35: project-agnostic cross-layer comparison primitive. Replaces Phase 1.34's
+    GapDisclosureRequirement, which hardcoded one task's own item names, a frontend file path,
+    and voucher-specific regex patterns directly in this GENERIC acceptance module -- a real
+    EkamApp-specific instance (T13_GAP_DISCLOSURE_REQ) was removed entirely (see
+    docs/reports/phase-1.35-report.md); this class itself carries NO project-specific content.
+    Every item name, pattern, and file path below is supplied by the CALLER as task-provided
+    policy data -- the same separation EnumRequirement/EvidencePolicy already establish for
+    ordinary presence checks, now extended to a two-sided comparison.
+
+    Computes, DETERMINISTICALLY from evidence (never from the model's own claims about what
+    corresponds to what), which `left_items` are confirmed present (found in the answer AND
+    backed by an actual read of `left_source_paths`) but have no `right_items` entry ALSO
+    confirmed present that `match()` pairs it with -- the unmatched set -- then checks the
+    final answer explicitly discloses each one, grounded in a genuine read of
+    `right_source_paths` (never merely inferred from the left item's own presence, and never
+    merely true by omission).
+
+    `left_items`/`right_items`: lists of (item_id, presence_pattern) pairs -- the SAME shape
+    EnumRequirement.items already uses, by design: an existing EnumRequirement's own `.items`
+    and `.source_paths` can be passed here directly rather than duplicated as a second,
+    separately-maintained copy of the same list (the duplication Phase 1.34 fell into when its
+    gap-disclosure item list repeated the same 4 operation names EP_endpoints already declared).
+    A pattern of `None` for an item (EnumRequirement's own "cannot be reliably discriminated by
+    substring matching" escape hatch) makes that item NOT_EVALUATED here too -- never guessed.
+
+    `match(left_item_id, right_item_id) -> bool`: task-supplied correspondence rule. Default
+    `None` uses exact case-insensitive item_id equality. A task needing semantic correspondence
+    (e.g. "create_X" on one side, "useCreateXMutation" on the other) supplies its own function
+    -- still deterministic application logic, never a model call. When the right side's own
+    evidence was never read at all, a left item is reported UNCERTAIN, never MISSING or
+    SATISFIED: Track B's distinction between "absent from inspected evidence" and "proven not to
+    exist" is preserved explicitly, not collapsed into a guess in either direction."""
     id: str
     description: str
-    items: list
-    source_paths: list
+    left_items: list
+    left_source_paths: list
+    right_items: list
+    right_source_paths: list
+    match: object = None   # Callable[[str, str], bool] | None
     mandatory: bool = True
 
 
-def gap_disclosure_result(req: "GapDisclosureRequirement", srcs: dict, text: str) -> dict:
-    """Absence-claim counterpart to enum_requirement_result() -- see GapDisclosureRequirement's
-    own docstring for why this needs an inverted evidence check rather than reusing that function.
-    SATISFIED only when BOTH: the answer actually states the gap (disclosure_pattern matches the
-    answer), AND the frontend-side file that would contain the hook if one existed was actually
-    read AND genuinely does not contain this operation's keyword (source_pattern absent from the
-    scoped source) -- so the disclosed absence is grounded, not an unverified guess. MISSING when
-    the gap was never stated at all. INSUFFICIENT_EVIDENCE when the gap was stated but the
-    relevant source was never actually read, so the claim -- true or not -- was never verified by
-    this attempt."""
+def _alt_pattern(*alts) -> str:
+    """Generic regex-alternation helper (join with `|`) -- used by any EnumRequirement or
+    CrossReferenceRequirement item needing several equivalent phrasings for one item. Carries
+    no project-specific content itself; renamed from the pre-Phase-1.35 `_voucher_pat` (same
+    body, misleading name -- see docs/reports/phase-1.35-report.md's audit)."""
+    return "|".join(alts)
+
+
+# Phase 1.34/1.35: generic vocabulary for "this item is confirmed absent on the other side" --
+# no project-specific terms, and deliberately NOUN-AGNOSTIC (caught live during this phase's own
+# scratch validation with synthetic, non-EkamApp data: an earlier draft required a specific noun
+# after "no matching" -- frontend/client/counterpart/hook -- so a genuinely generic disclosure
+# like "no matching gadget handler" failed to match; a domain-specific noun list is exactly the
+# kind of residual non-genericity this phase exists to remove). Matches the STRUCTURE of a
+# disclosure ("no matching ___", "X has no ___", "missing a ___") without requiring any
+# particular noun to follow. A false negative here (a real disclosure the regex fails to
+# recognize) is the costlier failure mode, since it would wrongly fail an answer that DID
+# disclose the gap in different words.
+_UNMATCHED_DISCLOSURE_TERMS = (
+    r"no\s+matching\b|no\s+corresponding\b|no\s+counterpart\b|"
+    r"has\s+no\b|does(?:n'?t|\s+not)\s+have\b|"
+    r"missing(?:\s+a)?\b|"
+    r"not\s+(?:yet\s+)?(?:implemented|covered|built|exposed|present|matched)\b|"
+    r"\buncovered\b|\bunmatched\b|\bunexposed\b|"
+    r"lacks?\b|\bgap\b|without\s+a\b"
+)
+
+
+def _proximity_disclosure_pat(item_pattern: str) -> str:
+    """Bidirectional proximity match, pure regex (never model-based): an item's own presence
+    pattern and a disclosure term within 400 chars of each other, in EITHER order -- a model
+    might write "X has no matching counterpart" or "the following have no counterpart: ...X...",
+    and both are genuine disclosures. Uses [\\s\\S] (any character INCLUDING newlines), never
+    [^\\n] -- a real live run (Phase 1.34's own validation, before this generalization) disclosed
+    a gap as a markdown header followed by each item on its own bullet line; [^\\n] cannot cross
+    even one of the several newlines between the header and a later bullet, so a line-restricted
+    version of this pattern wrongly scored that exact, genuine disclosure as MISSING. 400 chars
+    (measured against that real disclosure: the header-to-furthest-item span was ~230-250 chars)
+    is generous enough to span a short header+list or paragraph without reaching into an
+    unrelated section."""
+    return rf"(?:{item_pattern})[\s\S]{{0,400}}(?:{_UNMATCHED_DISCLOSURE_TERMS})|(?:{_UNMATCHED_DISCLOSURE_TERMS})[\s\S]{{0,400}}(?:{item_pattern})"
+
+
+def _presence(pattern, report: str, scoped_src: str, scope_read: bool):
+    """Shared by both sides of a CrossReferenceRequirement -- the SAME in_answer/in_evidence
+    check enum_requirement_result() already performs per item, extracted here so
+    cross_reference_result() does not duplicate that logic. Returns None (NOT_EVALUATED) for a
+    pattern of None, exactly as EnumRequirement's own escape hatch already does."""
+    if pattern is None:
+        return None
+    if not re.search(pattern, report, re.I):
+        return False
+    return scope_read and bool(re.search(pattern, scoped_src, re.I))
+
+
+def cross_reference_result(req: "CrossReferenceRequirement", srcs: dict, text: str) -> dict:
+    """See CrossReferenceRequirement's own docstring. Three deterministic stages: (1) presence
+    on each side via _presence(), reusing enum_requirement_result()'s own check; (2) matching --
+    pure application logic, req.match() or exact item_id equality, never a model call; (3)
+    disclosure -- for each left item confirmed present with no matching right item confirmed
+    present, was the gap actually stated, reusing the item's OWN presence pattern (not a
+    separately-maintained disclosure pattern) so synonyms already declared for presence-checking
+    are honored for disclosure-checking too."""
     report = text or ""
-    if list(req.source_paths) == [ANY_SOURCE]:
-        scoped_src, scope_read = "\n".join(srcs.values()), bool(srcs)
-    else:
-        parts = [t for p, t in srcs.items() if any(p.endswith(norm_path(c)) for c in req.source_paths)]
-        scoped_src, scope_read = "\n".join(parts), bool(parts)
+
+    def scoped(paths):
+        if list(paths) == [ANY_SOURCE]:
+            return "\n".join(srcs.values()), bool(srcs)
+        parts = [t for p, t in srcs.items() if any(p.endswith(norm_path(c)) for c in paths)]
+        return "\n".join(parts), bool(parts)
+
+    l_src, l_read = scoped(req.left_source_paths)
+    r_src, r_read = scoped(req.right_source_paths)
+    match_fn = req.match or (lambda a, b: a.lower() == b.lower())
+
+    left_present = {iid: _presence(pat, report, l_src, l_read) for iid, pat in req.left_items}
+    right_present = {iid: _presence(pat, report, r_src, r_read) for iid, pat in req.right_items}
+    right_pattern_of = dict(req.right_items)
+
     items_out = []
-    for item_id, source_pattern, disclosure_pattern in req.items:
-        disclosed = bool(re.search(disclosure_pattern, report, re.I))
-        if not disclosed:
-            items_out.append({"item_id": item_id, "status": "MISSING", "disclosed": False, "absence_confirmed": None})
+    for l_id, l_pattern in req.left_items:
+        if not left_present.get(l_id):
+            continue   # not confirmed present on the left side (or NOT_EVALUATED) -- nothing to compare yet
+        if not r_read:
+            # the right side's own evidence was never read at all -- matching cannot be
+            # determined either way. UNCERTAIN, never MISSING or SATISFIED (Track B).
+            items_out.append({"item_id": l_id, "status": "UNCERTAIN",
+                              "reason": "right-side evidence was never read; matching cannot be determined"})
             continue
-        absence_confirmed = scope_read and not re.search(source_pattern, scoped_src, re.I)
-        items_out.append({"item_id": item_id,
-                          "status": "SATISFIED" if absence_confirmed else "INSUFFICIENT_EVIDENCE",
-                          "disclosed": True, "absence_confirmed": absence_confirmed})
-    if any(i["status"] == "MISSING" for i in items_out):
-        overall = "MISSING"
-    elif any(i["status"] == "INSUFFICIENT_EVIDENCE" for i in items_out):
-        overall = "INSUFFICIENT_EVIDENCE"
+        matched = any(right_present.get(r_id) and match_fn(l_id, r_id) for r_id, _ in req.right_items)
+        if matched:
+            continue   # covered -- no disclosure obligation for this item
+        disclosed = bool(re.search(_proximity_disclosure_pat(l_pattern), report, re.I))
+        items_out.append({"item_id": l_id,
+                          "status": "SATISFIED" if disclosed else "MISSING",
+                          "disclosed": disclosed, "right_side_read": True})
+    blocking = [i for i in items_out if i["status"] in ("MISSING", "INSUFFICIENT_EVIDENCE")]
+    uncertain = [i for i in items_out if i["status"] == "UNCERTAIN"]
+    if blocking:
+        overall = blocking[0]["status"]
+    elif uncertain and not any(i["status"] == "SATISFIED" for i in items_out):
+        overall = "UNCERTAIN"
     else:
         overall = "SATISFIED"
     return {"id": req.id, "description": req.description, "mandatory": req.mandatory, "status": overall,
             "items": items_out}
 
 
-def _voucher_pat(*alts) -> str:
-    return "|".join(alts)
-
-
-# Phase 1.34: deliberately broad and inclusive of common phrasings a model might actually use --
-# a false negative here (a real disclosure the regex fails to recognize) is the costlier failure
-# mode, since it would wrongly fail an answer that DID disclose the gap in different words. Kept
-# as one named constant, not inlined per item, so every item's disclosure check stays consistent.
-_GAP_DISCLOSURE_TERMS = (
-    r"no\s+(?:matching|corresponding)?\s*(?:frontend|client)|"
-    r"missing\s+(?:a\s+)?(?:frontend|client)|missing\s+(?:a\s+)?hook|"
-    r"not\s+(?:yet\s+)?(?:implemented|covered|built|exposed|present)|"
-    r"\bno\s+hook\b|without\s+a\s+(?:frontend\s+)?hook|\buncovered\b|\bunmatched\b|\bunexposed\b|"
-    r"lacks?\s+(?:a\s+)?(?:frontend|hook)|\bgap\b"
-)
-
-
-def _gap_disclosure_pat(op_pattern: str) -> str:
-    """Bidirectional proximity match, pure regex (never model-based, per this phase's own
-    guardrail): the operation's own keyword and a gap-disclosure term within 400 chars of each
-    other, in EITHER order -- a model might write "create_grn_from_po has no frontend hook" or
-    "the following have no frontend hook: ...create_grn_from_po...", and both are genuine
-    disclosures. Uses [\\s\\S] (matches any character INCLUDING newlines), never [^\\n] -- a
-    real live run (Phase 1.34's own validation) disclosed the gap as a markdown header
-    ("### Backend Endpoints with No Frontend Counterpart:") followed by each operation on its
-    OWN separate bullet line; [^\\n] cannot cross even one of the several newlines between the
-    header and a later bullet, so a line-restricted version of this pattern would wrongly score
-    that exact, genuine disclosure as MISSING. 400 chars (numerically measured against that real
-    disclosure: the header-to-furthest-item span was ~230-250 chars) is generous enough to span a
-    short header+list or paragraph without reaching into an unrelated section."""
-    return rf"(?:{op_pattern})[\s\S]{{0,400}}(?:{_GAP_DISCLOSURE_TERMS})|(?:{_GAP_DISCLOSURE_TERMS})[\s\S]{{0,400}}(?:{op_pattern})"
-
-
 T13_ENDPOINTS_REQ = EnumRequirement(
     "EP_endpoints", "all 9 voucher endpoints named, backed by vouchers_api.py", [
-        ("list_vouchers", _voucher_pat(r"list_vouchers\b", r"\blist\s+vouchers\b", r"get\s*/vouchers\b(?!/)")),
-        ("get_voucher", _voucher_pat(r"get_voucher\b", r"\bget\s+voucher\b(?!s)", r"/vouchers/\{?\s*voucher_id")),
-        ("create_voucher", _voucher_pat(r"create_voucher\b", r"\bcreate\s+voucher\b(?!s)", r"post\s*/vouchers\b(?!/)")),
-        ("post_voucher", _voucher_pat(r"post_voucher\b", r"\bpost\s+(?:a\s+)?voucher\b", r"/vouchers/.{0,24}/post\b")),
-        ("cancel_voucher", _voucher_pat(r"cancel_voucher\b", r"\bcancel\s+(?:a\s+)?voucher\b", r"/vouchers/.{0,24}/cancel\b")),
-        ("create_grn_from_po", _voucher_pat(r"create_grn_from_po", r"\bgrn\b")),
-        ("create_credit_note", _voucher_pat(r"create_credit_note", r"credit[\s_-]?note")),
-        ("create_stock_adjustment", _voucher_pat(r"create_stock_adjustment", r"stock[\s_-]?adjustment")),
-        ("create_stock_transfer", _voucher_pat(r"create_stock_transfer", r"stock[\s_-]?transfer")),
+        ("list_vouchers", _alt_pattern(r"list_vouchers\b", r"\blist\s+vouchers\b", r"get\s*/vouchers\b(?!/)")),
+        ("get_voucher", _alt_pattern(r"get_voucher\b", r"\bget\s+voucher\b(?!s)", r"/vouchers/\{?\s*voucher_id")),
+        ("create_voucher", _alt_pattern(r"create_voucher\b", r"\bcreate\s+voucher\b(?!s)", r"post\s*/vouchers\b(?!/)")),
+        ("post_voucher", _alt_pattern(r"post_voucher\b", r"\bpost\s+(?:a\s+)?voucher\b", r"/vouchers/.{0,24}/post\b")),
+        ("cancel_voucher", _alt_pattern(r"cancel_voucher\b", r"\bcancel\s+(?:a\s+)?voucher\b", r"/vouchers/.{0,24}/cancel\b")),
+        ("create_grn_from_po", _alt_pattern(r"create_grn_from_po", r"\bgrn\b")),
+        ("create_credit_note", _alt_pattern(r"create_credit_note", r"credit[\s_-]?note")),
+        ("create_stock_adjustment", _alt_pattern(r"create_stock_adjustment", r"stock[\s_-]?adjustment")),
+        ("create_stock_transfer", _alt_pattern(r"create_stock_transfer", r"stock[\s_-]?transfer")),
     ], ["api/inventory-service/router/vouchers_api.py"])
 T13_HOOKS_REQ = EnumRequirement(
     "EP_hooks", "all 5 voucher frontend hooks named, backed by inventoryApi.ts", [
@@ -596,29 +654,26 @@ T13_TABLES_REQ = EnumRequirement(
     "'voucher(s)' is this task's own generic topic noun and cannot be discriminated from casual mention "
     "by substring matching; VoucherSeries/VoucherVersion are distinctive enough to check)", [
         ("Voucher", None),
-        ("VoucherSeries", _voucher_pat(r"VoucherSeries", r"voucher_series", r"voucher\s+series")),
-        ("VoucherVersion", _voucher_pat(r"VoucherVersion", r"voucher_version", r"voucher\s+version")),
+        ("VoucherSeries", _alt_pattern(r"VoucherSeries", r"voucher_series", r"voucher\s+series")),
+        ("VoucherVersion", _alt_pattern(r"VoucherVersion", r"voucher_version", r"voucher\s+version")),
     ], ["api/inventory-service/models.py"])
-T13_GAP_DISCLOSURE_REQ = GapDisclosureRequirement(
-    "EP_gap_disclosure",
-    "each backend voucher operation with no frontend hook (create_grn_from_po, create_credit_note, "
-    "create_stock_adjustment, create_stock_transfer) is explicitly disclosed in the answer as missing "
-    "a frontend counterpart -- naming the 5 existing hooks correctly must not stand in for this", [
-        ("create_grn_from_po", _voucher_pat(r"create_grn_from_po", r"\bgrn\b"),
-         _gap_disclosure_pat(_voucher_pat(r"create_grn_from_po", r"\bgrn\b"))),
-        ("create_credit_note", _voucher_pat(r"create_credit_note", r"credit[\s_-]?note"),
-         _gap_disclosure_pat(_voucher_pat(r"create_credit_note", r"credit[\s_-]?note"))),
-        ("create_stock_adjustment", _voucher_pat(r"create_stock_adjustment", r"stock[\s_-]?adjustment"),
-         _gap_disclosure_pat(_voucher_pat(r"create_stock_adjustment", r"stock[\s_-]?adjustment"))),
-        ("create_stock_transfer", _voucher_pat(r"create_stock_transfer", r"stock[\s_-]?transfer"),
-         _gap_disclosure_pat(_voucher_pat(r"create_stock_transfer", r"stock[\s_-]?transfer"))),
-    ], ["client/ecommclient-web/ekamweb/src/lib/api/services/inventory/inventoryapi.ts"])
+# Phase 1.35: the Phase 1.34 EP_gap_disclosure instance (T13_GAP_DISCLOSURE_REQ, hardcoded
+# voucher operation names + frontend path + voucher regex, all living in this GENERIC file) was
+# removed entirely -- not redesigned-in-place, not moved elsewhere under a new name. The
+# CAPABILITY it provided is now CrossReferenceRequirement above, which carries no project-
+# specific content; this means T13b's own live acceptance no longer has an instance enforcing
+# its specific gap-disclosure obligation (an honest, reported trade-off -- see
+# docs/reports/phase-1.35-report.md section on why re-wiring a T13b-specific instance back in
+# here, even by reusing T13_ENDPOINTS_REQ/T13_HOOKS_REQ's own item lists via
+# CrossReferenceRequirement, would still be task-specific WIRING embedded in generic
+# acceptance.py -- the same architectural pattern this phase's audit flags more broadly for
+# T13_ENDPOINTS_REQ/T13_HOOKS_REQ/T13_TABLES_REQ/T13_VOUCHER_POLICY themselves, pre-dating this
+# phase, and explicitly out of this phase's own narrow scope to migrate wholesale).
 T13_VOUCHER_POLICY = EvidencePolicy(
     name="t13-voucher-audit",
     requirements=[],   # T13a names no files (deliberately); T13b's 3 named files get their own Requirements
                        # from derive_policy()'s existing per-path mechanism and are merged in, not duplicated here.
-    enum_requirements=[T13_ENDPOINTS_REQ, T13_HOOKS_REQ, T13_TABLES_REQ],
-    gap_disclosure_requirements=[T13_GAP_DISCLOSURE_REQ])
+    enum_requirements=[T13_ENDPOINTS_REQ, T13_HOOKS_REQ, T13_TABLES_REQ])
 
 ANY_SOURCE = "*"      # Phase 1.20: a generic requirement -- ANY successful source read of this attempt satisfies it
 
@@ -687,23 +742,29 @@ def gate_evaluate(policy, outcomes, text) -> dict:
         else:
             not_evaluated.append({"id": res["id"], "description": res["description"], "items": res["items"],
                                   "note": "optional, unsatisfied -- does not block completion"})
-    # Phase 1.34: absence-disclosure obligations -- same satisfied/missing/not_evaluated folding
-    # as the enum_requirements loop just above, via gap_disclosure_result() instead of
-    # enum_requirement_result() (see GapDisclosureRequirement's own docstring for why).
-    gap_detail = []
-    for gr in policy.gap_disclosure_requirements:
-        res = gap_disclosure_result(gr, srcs, text)
-        gap_detail.append(res)
+    # Phase 1.34/1.35: two-sided comparison obligations -- same satisfied/missing/not_evaluated
+    # folding as the enum_requirements loop just above, via cross_reference_result() instead of
+    # enum_requirement_result() (see CrossReferenceRequirement's own docstring for why). UNCERTAIN
+    # (the right side's own evidence was never read, so matching could not be determined either
+    # way) folds into not_evaluated, same as NOT_EVALUATED/optional-unsatisfied -- never held
+    # against the attempt as a failure, per Track B's absence-vs-proof distinction.
+    xref_detail = []
+    for xr in policy.cross_reference_requirements:
+        res = cross_reference_result(xr, srcs, text)
+        xref_detail.append(res)
         if res["status"] == "SATISFIED":
             sat.append({"id": res["id"], "description": res["description"], "items": res["items"]})
-        elif gr.mandatory:
+        elif res["status"] == "UNCERTAIN":
+            not_evaluated.append({"id": res["id"], "description": res["description"], "items": res["items"],
+                                  "note": "right-side evidence never read -- matching undetermined, not held against the attempt"})
+        elif xr.mandatory:
             miss.append({"id": res["id"], "description": res["description"], "items": res["items"]})
         else:
             not_evaluated.append({"id": res["id"], "description": res["description"], "items": res["items"],
                                   "note": "optional, unsatisfied -- does not block completion"})
     return {"applicable": True, "satisfied": sat, "missing": miss, "links": link_results,
             "reads": {p: True for p in srcs}, "enum_detail": enum_detail, "not_evaluated": not_evaluated,
-            "gap_detail": gap_detail}
+            "cross_reference_detail": xref_detail}
 
 
 # ---------------------------------------------------------------------------- attempts and registry
@@ -1128,9 +1189,18 @@ def requirement_source_paths(policy, req_id: str) -> list:
     for er in policy.enum_requirements:
         if er.id == req_id:
             return list(er.source_paths)
-    for gr in policy.gap_disclosure_requirements:
-        if gr.id == req_id:
-            return list(gr.source_paths)
+    for xr in policy.cross_reference_requirements:
+        if xr.id == req_id:
+            # both sides, deduplicated -- a recovery attempt resolving this obligation may need
+            # either the left-side source (if presence there was the gap) or the right-side
+            # source (to confirm/disclose the absence), and the caller does not know in advance
+            # which this specific missing item needs.
+            seen, out = set(), []
+            for p in list(xr.left_source_paths) + list(xr.right_source_paths):
+                if p not in seen:
+                    seen.add(p)
+                    out.append(p)
+            return out
     return []
 
 
