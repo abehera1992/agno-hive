@@ -327,9 +327,13 @@ def item_controls(controls: dict, work_item_id: str) -> dict:
     return base
 
 
-async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, attempt_no: int):
+async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, attempt_no: int, task_override: str = None):
     """Create a NEW attempt (new id + generation via the registry), run the real Researcher under it, observe the
-    Agent's own terminal facts, and return the AttemptRecord. Never raises."""
+    Agent's own terminal facts, and return the AttemptRecord. Never raises.
+    `task_override` (Phase 1.24): if given, replaces wi.objective ONLY for the text actually sent to the
+    Researcher this attempt (a bounded recovery pass targeting specific missing obligations) -- wi.target/
+    wi.policy/wi.evidence_required/wi.completion_criteria are unchanged, so the SAME coverage policy still
+    governs this attempt's own decide() call. The work item's own `objective` field is never mutated."""
     import functools
     import inspect
     import swarm.team as T
@@ -362,6 +366,7 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
             workflow_run=st.workflow_run_id, attempt_no=attempt_no)
     trace = _Trace(T, RunContentEvent)
     old_ceiling = T._DELEGATION_READ_CEILING
+    old_discovery_ceiling = T._DELEGATION_DISCOVERY_CEILING   # Phase 1.24: same test-control pattern as above
     async def persist_call(o):
         if led is not None:
             await led._a(led.record_tool_call, o, att.attempt_id, st.task_id, wi.work_item_id)
@@ -387,6 +392,8 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
     try:
         if controls.get("ceiling") is not None:
             T._DELEGATION_READ_CEILING = controls["ceiling"]
+        if controls.get("discovery_ceiling") is not None:
+            T._DELEGATION_DISCOVERY_CEILING = controls["discovery_ceiling"]
         # A fresh team (hence a fresh Researcher, hooks and evidence state) per attempt: a retry inherits nothing.
         team = T._build_team(
             ctx["specs"], ctx["coordinator"], ctx["ctools"], "coordinate", ctx["mcp_list"], [],
@@ -418,12 +425,13 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
                         return await r if inspect.isawaitable(r) else r
                     return wrapped
                 fn.entrypoint = mk()
-        echo = f"{wi.target} {wi.objective} {wi.evidence_required} {wi.completion_criteria}"
-        att.preloaded = {"text": ctx.get("knowledge_brief") or "", "echo": echo, "target": wi.target, "objective": wi.objective,
+        _objective = task_override if task_override is not None else wi.objective
+        echo = f"{wi.target} {_objective} {wi.evidence_required} {wi.completion_criteria}"
+        att.preloaded = {"text": ctx.get("knowledge_brief") or "", "echo": echo, "target": wi.target, "objective": _objective,
                          "evidence_required": wi.evidence_required, "task_text": echo}
         team._delegation_preloaded[A.KEY] = dict(att.preloaded)
         canon = T._build_canonical_researcher_task(
-            target=wi.target, objective=wi.objective, evidence_required=wi.evidence_required,
+            target=wi.target, objective=_objective, evidence_required=wi.evidence_required,
             completion_criteria=wi.completion_criteria, knowledge_brief=ctx.get("knowledge_brief"))
         team._knowledge_run = getattr(st.knowledge, "run_key", "")      # tags this attempt's AGENT_* tool events
         _kb = ctx.get("knowledge_brief") or ""
@@ -542,6 +550,7 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
         st.emit("attempt_setup_error", attempt=att.attempt_id, error=rec.error)
     finally:
         T._DELEGATION_READ_CEILING = old_ceiling
+        T._DELEGATION_DISCOVERY_CEILING = old_discovery_ceiling
         if led is not None:
             try:     # terminal facts + canonical text + full trace, even for an invalidated attempt (history);
                       # never changes a decision
@@ -620,6 +629,141 @@ async def assess_and_register(st: RunState, wi: WorkItem, rec: AttemptRecord, co
     st.emit("attempt_decided", attempt=att.attempt_id, agent=d.execution_status, acceptance=d.acceptance,
             registered=(d.registration or {}).get("registered"), reason=(d.reason or "")[:120])
     return d
+
+
+# ---------------------------------------------------------------------------- Phase 1.24: recovery and reconciliation
+def build_recovery_task(wi: WorkItem, orig_att, orig_d) -> str:
+    """Phase 1.24 Track 3.3/5: the recovery attempt's own task text. Carries the ORIGINAL
+    objective and ESTABLISHED FINDINGS (never just a bare list of missing obligation IDs), plus
+    exactly which mandatory obligations remain, why, and which specific files to target -- all
+    derived deterministically from this work item's own policy (Track 4: reuse, never a parallel
+    framework) and the original attempt's own Decision. No model judgment is involved in deciding
+    WHAT to ask for; only the Researcher's own subsequent reads decide what it finds there."""
+    missing_lines = []
+    for m in orig_d.gate["missing"]:
+        paths = A.requirement_source_paths(wi.policy, m["id"])
+        target = ", ".join(sorted(set(paths))) if paths else "the relevant source (no specific file resolved)"
+        why = ""
+        if "items" in m:
+            unmet = [i["item_id"] for i in m["items"] if i.get("status") in ("MISSING", "INSUFFICIENT_EVIDENCE")]
+            if unmet:
+                why = f" -- specifically still needed: {', '.join(unmet)}"
+        elif "links" in m:
+            probs = [p for ln in m["links"] for p in ln.get("problems", [])]
+            if probs:
+                why = " -- " + "; ".join(probs[:3])
+        missing_lines.append(f"- {m['id']} ({m['description']}){why}. Read: {target}.")
+    established = (orig_att.text or "").strip()
+    return (
+        f"RECOVERY PASS on a task you have already partly investigated. Original objective: "
+        f"{wi.objective}\n\n"
+        f"You already produced the ESTABLISHED FINDINGS below in a prior attempt on this exact "
+        f"task. They are already correct and accepted -- do NOT re-derive, re-read, or discard "
+        f"them; build on them:\n---\n{established}\n---\n\n"
+        f"The following MANDATORY obligations from this task's own evidence policy remain "
+        f"unresolved. Read the specific file(s) named for each one and establish the missing "
+        f"fact directly from that source -- do not guess, and do not conclude something is "
+        f"absent merely because an earlier attempt could not read it (a budget limit is not "
+        f"evidence of non-existence):\n" + "\n".join(missing_lines) + "\n\n"
+        f"Write your answer as the full, updated result: restate what is still true from the "
+        f"established findings above (briefly -- do not re-paste large blocks verbatim unless "
+        f"they are short), and ADD what you establish now for the obligations listed. If you "
+        f"still cannot establish one of them, say so plainly rather than guessing."
+    )
+
+
+def reconcile_attempts(orig_att, orig_d, rec_att) -> tuple:
+    """Phase 1.24 Track 6: deterministic evidence reconciliation -- never an LLM merge, never a
+    blind concatenation or a blind overwrite. Both passes' full text are kept, clearly attributed
+    by provenance (original vs. recovery), so a reader or the assessor can see and judge any
+    disagreement directly rather than have one silently absorbed into the other (Track 6: 'Do not
+    rely on an LLM merge as the authority for evidence validity' -- this function detects no
+    semantic conflict; it exposes both passages side by side for that judgment). Exact-duplicate
+    paragraphs (after stripping) are dropped from the recovery section only -- a deterministic,
+    non-semantic de-duplication, consistent with this project's existing discipline against
+    heuristic/phrase-based mechanisms. Returns (reconciled_text, reconciled_trace_text,
+    combined_outcomes, before_after)."""
+    orig_paras = [p.strip() for p in (orig_att.text or "").split("\n\n") if p.strip()]
+    rec_paras = [p.strip() for p in (rec_att.text or "").split("\n\n") if p.strip()]
+    seen = set(orig_paras)
+    rec_new = [p for p in rec_paras if p not in seen]
+    dropped = len(rec_paras) - len(rec_new)
+    missing_ids = [m["id"] for m in orig_d.gate["missing"]]
+    header = f"## Recovery pass — added to resolve: {', '.join(missing_ids)}" if missing_ids else "## Recovery pass"
+    body = "\n\n".join(rec_new) if rec_new else "(no new content beyond what the original pass already established)"
+    reconciled_text = "## Original pass\n\n" + (orig_att.text or "").strip() + f"\n\n{header}\n\n{body}"
+    reconciled_trace = (orig_att.trace_text or "") + "\n\n---(recovery pass trace)---\n\n" + (rec_att.trace_text or "")
+    combined_outcomes = list(orig_att.outcomes) + list(rec_att.outcomes)
+    before_after = {"missing_before": missing_ids, "dropped_duplicate_paragraphs": dropped,
+                    "original_attempt_id": orig_att.attempt_id, "recovery_attempt_id": rec_att.attempt_id}
+    return reconciled_text, reconciled_trace, combined_outcomes, before_after
+
+
+async def recover_and_reconcile(st: RunState, wi: WorkItem, ctx: dict, controls: dict,
+                                orig_rec: AttemptRecord, orig_d, attempt_no: int):
+    """Phase 1.24 Track 5/6: ONE bounded, application-controlled recovery attempt targeting
+    specifically the mandatory obligations orig_d.gate['missing'] identifies, followed by
+    deterministic evidence reconciliation and an INDEPENDENT final decide() (Track 6: the final
+    answer is rebuilt from reconciled evidence and re-evaluated, never just the recovery pass's
+    own raw output). The recovery attempt is a real run_attempt() call -- its own raw text/trace
+    are durably recorded under its own attempt_id by record_terminal() exactly as any attempt's
+    are (Track 6: 'Retain... Recovery answer... Recovery trace'), BEFORE this function ever runs.
+    This function then mutates that SAME attempt object's text/trace/outcomes/terminal in place
+    (never a separate copy -- st.records already holds the one object _final_record() will look
+    up by attempt_id) and runs the ONE decision/ledger commit for that attempt_id through the
+    existing, unchanged assess_and_register() -- so the ledger's `decision` row for this
+    attempt_id reflects the reconciled, independently re-evaluated result, while its `attempt` row
+    (text_sha/trace_sha, written earlier by record_terminal()) still holds exactly what the
+    recovery pass itself produced raw, unaffected by the later mutation.
+    Returns (AttemptRecord, Decision) to use as this work item's result; never raises -- a failure
+    anywhere in recovery leaves the ORIGINAL (orig_rec, orig_d) as the work item's result, since
+    the caller only replaces its own (rec, d) locals on a non-None return."""
+    task_override = build_recovery_task(wi, orig_rec.attempt, orig_d)
+    rec2 = await run_attempt(st, wi, ctx, controls, attempt_no, task_override=task_override)
+    # rec2.attempt.state is "FINISHED" even on a ledger-start failure or setup error (see
+    # run_attempt()'s own early-exit paths) -- rec2.error/rec2.ledger_error are what actually
+    # distinguish a genuine run from one that never got to call the Researcher at all.
+    _t2 = rec2.attempt.terminal or {}
+    _recovery_run_failed = bool(_t2.get("run_error") or _t2.get("cancelled_event") or _t2.get("timed_out")
+                                or _t2.get("result_selection_status") == "MISSING_TERMINAL")
+    if rec2.attempt.state != "FINISHED" or rec2.error or (rec2.ledger_error and not rec2.attempt.text) or _recovery_run_failed:
+        # Track 8.2: a recovery pass that itself errors, times out, is cancelled, or selects no
+        # valid terminal result aborts recovery cleanly -- the ORIGINAL (orig_rec, orig_d) stays
+        # the work item's result; the recovery attempt's own failure is never treated as a reason
+        # to discard an already-accepted, if partial, original answer.
+        st.emit("recovery_aborted", work_item=wi.work_item_id,
+                reason=rec2.error or rec2.ledger_error or _t2.get("run_error") or
+                       ("cancelled" if _t2.get("cancelled_event") else None) or
+                       ("timed_out" if _t2.get("timed_out") else None) or
+                       ("missing_terminal" if _t2.get("result_selection_status") == "MISSING_TERMINAL" else None) or
+                       "recovery attempt did not finish")
+        return None
+    # The RAW recovery text/trace are already durably recorded under rec2.attempt.attempt_id by
+    # record_terminal() (called inside run_attempt() above, before this function ever runs) --
+    # captured here, before being overwritten below, purely so this function's own return/emit can
+    # still reference what the recovery pass produced on its own (Track 6: "Retain... Recovery
+    # answer... Recovery trace"); the ledger's own attempt row is untouched by what follows.
+    raw_recovery_text, raw_recovery_trace = rec2.attempt.text, rec2.attempt.trace_text
+    reconciled_text, reconciled_trace, combined_outcomes, before_after = reconcile_attempts(
+        orig_rec.attempt, orig_d, rec2.attempt)
+    before_after["raw_recovery_text_sha"] = A.sha(raw_recovery_text)
+    before_after["raw_recovery_chars"] = len(raw_recovery_text or "")
+    # Mutate rec2.attempt IN PLACE (never construct a separate object) -- rec2 is the SAME
+    # AttemptRecord instance run_attempt() already appended to st.records, and _final_record()
+    # looks up the accepted attempt by attempt_id inside st.records; a separate reconciled copy
+    # would silently never be found there, leaving the raw (un-reconciled) text displayed instead.
+    rec2.attempt.text = reconciled_text
+    rec2.attempt.trace_text = reconciled_trace
+    rec2.attempt.outcomes = combined_outcomes
+    rec2.attempt.terminal = {"result_selection_status": "RECONCILED", "completed_event": True,
+                             "run_output_status": "RunStatus.completed", "run_error": None,
+                             "cancelled_event": False, "timed_out": False, "stream_closed_early": False,
+                             "recovery_of": orig_rec.attempt.attempt_id, "before_after": before_after}
+    d2 = await assess_and_register(st, wi, rec2, controls)
+    st.emit("recovery_reconciled", work_item=wi.work_item_id, original=orig_rec.attempt.attempt_id,
+            recovery=rec2.attempt.attempt_id, missing_before=before_after["missing_before"],
+            coverage_after=d2.coverage_status, acceptance_after=d2.acceptance)
+    return rec2, d2
 
 
 # ---------------------------------------------------------------------------- deterministic finalization
@@ -983,6 +1127,23 @@ async def run_engineering_workflow(
                     if not retry:
                         if d.execution_status in RETRYABLE_TERMINALS and n >= MAX_ATTEMPTS_PER_ITEM:
                             st.emit("retry_exhausted", work_item=wi.work_item_id, attempts=n)
+                        # Phase 1.24 Track 5: application-controlled coverage recovery -- a
+                        # SEPARATE, deterministic trigger from the execution-failure retry
+                        # above, never requested by the Coordinator/Researcher. `not sup`
+                        # excludes the test-controls concurrent-attempt path on purpose (see
+                        # recover_and_reconcile's own docstring on sequential-only recovery).
+                        if (not sup and n < MAX_ATTEMPTS_PER_ITEM and d.validity == "CURRENT"
+                                and A.recovery_eligible(d)):
+                            rem2 = st.remaining()
+                            if st.deadline_hit or (rem2 is not None and rem2 < MIN_ATTEMPT_START_S):
+                                st.emit("recovery_skipped", work_item=wi.work_item_id, reason="deadline")
+                            else:
+                                st.emit("recovery_triggered", work_item=wi.work_item_id,
+                                        attempt=rec.attempt.attempt_id,
+                                        missing=[m["id"] for m in d.gate["missing"]])
+                                recovered = await recover_and_reconcile(st, wi, ctx, c, rec, d, n + 1)
+                                if recovered is not None:
+                                    rec, d = recovered
                         break
                     n += 1
             return "execute-done"

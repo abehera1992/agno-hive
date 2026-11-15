@@ -20880,6 +20880,16 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # The per-run budget above is 450,000 and never fires in time to stop a member
     # reading 169,188 chars for one question and summarising them away (T13a).
     delegation_read_chars: dict[str, int] = {}
+    # Phase 1.24: discovery/search consumption (search_files, search_files_batch,
+    # list_directory_tree, count_matches) tracked SEPARATELY from delegation_read_chars
+    # above, which Phase 1.24 narrows to genuine source-content reads only
+    # (get_file_content, get_files_batch). Before this split both categories shared one
+    # ceiling (_DELEGATION_READ_CEILING, see _READ_TOOLS_FOR_CEILING's old membership) --
+    # a live T13a run spent ~22,600 chars on three legitimate discovery calls before its
+    # two source reads (~80,100 chars) pushed the SHARED total over the ceiling, refusing
+    # the third, essential read (inventoryApi.ts) outright. Splitting the accounting does
+    # not raise either ceiling's number -- see _DELEGATION_DISCOVERY_CEILING's own comment.
+    delegation_discovery_chars: dict[str, int] = {}
     # Phase 1.00 (B1/B2): successful investigation tool calls per member in the CURRENT
     # delegation, reset with delegation_read_chars. A call the model made to a tool that
     # does not exist never reaches this hook, and a tool that returned an error result is
@@ -20971,6 +20981,10 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                         print(f"[team] delegation read counter reset for {target!r} "
                               f"(was {delegation_read_chars[target]:,})", flush=True)
                     delegation_read_chars[target] = 0
+                    if delegation_discovery_chars.get(target):
+                        print(f"[team] delegation discovery counter reset for {target!r} "
+                              f"(was {delegation_discovery_chars[target]:,})", flush=True)
+                    delegation_discovery_chars[target] = 0
                     delegation_investigation_calls[target] = 0
                     delegation_evidence[target] = _new_delegation_evidence(
                         unavailable_tool_snapshot().get("count", 0))
@@ -20978,7 +20992,10 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     # used to be add-only for the process lifetime, so every later delegation
                     # to a member that had once been forced was mislabelled in telemetry.
                     _forced_text_only_members.discard(target)
-                    read_refusals[target] = 0
+                    # Phase 1.24: read_refusals is now keyed (target, category) -- "discovery"
+                    # and "read" each get their own refusal-escalation count, reset together.
+                    read_refusals[(target, "discovery")] = 0
+                    read_refusals[(target, "read")] = 0
                     member_obj = agent_objects.get(target)
                     if member_obj is not None:
                         member_obj.tool_choice = None
@@ -21232,38 +21249,51 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 f"a complete-sounding one built from semantic summaries."
             )
 
-        # Per-delegation read ceiling. Checked BEFORE the read runs -- a notice after
-        # the fact is what the coordinator already ignored on T13a, and by then the
-        # member has the pile and will summarise it.
-        if function_name in _READ_TOOLS_FOR_CEILING and cache_key not in cache:
-            _dl_read = delegation_read_chars.get(norm_agent_key, 0)
-            if _dl_read >= _DELEGATION_READ_CEILING:
-                read_refusals[norm_agent_key] = read_refusals.get(norm_agent_key, 0) + 1
-                _n = read_refusals[norm_agent_key]
+        # Per-delegation ceilings. Checked BEFORE the call runs -- a notice after the
+        # fact is what the coordinator already ignored on T13a, and by then the member
+        # has the pile and will summarise it. Phase 1.24: discovery (search_files,
+        # search_files_batch, list_directory_tree, count_matches) and genuine
+        # source-content reads (get_file_content, get_files_batch) are accounted and
+        # capped SEPARATELY -- before this split they shared one ceiling, and a few
+        # legitimate discovery calls could exhaust it before the source reads mandatory
+        # evidence actually needed ever ran (the live T13a incident this closes).
+        _ceiling_cat = ("discovery" if function_name in _DISCOVERY_TOOLS_FOR_CEILING
+                        else "read" if function_name in _SOURCE_READ_TOOLS_FOR_CEILING else None)
+        if _ceiling_cat is not None and cache_key not in cache:
+            _chars_dict = delegation_discovery_chars if _ceiling_cat == "discovery" else delegation_read_chars
+            _ceiling = _DELEGATION_DISCOVERY_CEILING if _ceiling_cat == "discovery" else _DELEGATION_READ_CEILING
+            _dl_read = _chars_dict.get(norm_agent_key, 0)
+            if _dl_read >= _ceiling:
+                _rkey = (norm_agent_key, _ceiling_cat)
+                read_refusals[_rkey] = read_refusals.get(_rkey, 0) + 1
+                _n = read_refusals[_rkey]
+                _label = "discovery" if _ceiling_cat == "discovery" else "read"
                 # Escalate rather than repeat. The model demonstrably reads this string
                 # as an ordinary tool result and calls again; forcing text-only is the
                 # only lever here that ends the turn instead of inviting another try.
                 if _n > _MAX_READ_REFUSALS:
-                    print(f"[team] {agent_key or 'coordinator'} ignored the read ceiling "
+                    print(f"[team] {agent_key or 'coordinator'} ignored the {_label} ceiling "
                           f"{_n} times — forcing text-only so the turn ends", flush=True)
                     _bump_consecutive_stub_and_maybe_force_text_only(
                         norm_agent_key, agent, consecutive_stub_count)
-                    return _refuse(agent, function_name, args, "read_ceiling_escalated", (
+                    return _refuse(agent, function_name, args, f"{_label}_ceiling_escalated", (
                         "STOP READING AND ANSWER. You have been told "
-                        f"{_n} times that this delegation's read budget is spent, and "
-                        "each retry has returned this same refusal. No read will run "
-                        "again in this delegation. Write your report from what you "
-                        "already have, copying enumerable findings verbatim, and name "
-                        "what you did not examine."
+                        f"{_n} times that this delegation's {_label} budget is spent, and "
+                        "each retry has returned this same refusal. No further "
+                        f"{_label} call will run again in this delegation. Write your "
+                        "report from what you already have, copying enumerable findings "
+                        "verbatim, and name what you did not examine."
                     ))
-                print(f"[team] {agent_key or 'coordinator'} has read {_dl_read:,} chars "
-                      f"in this delegation (ceiling {_DELEGATION_READ_CEILING:,}) — "
-                      f"refusing further reads until it reports "
+                print(f"[team] {agent_key or 'coordinator'} has spent {_dl_read:,} {_label} "
+                      f"chars in this delegation (ceiling {_ceiling:,}) — "
+                      f"refusing further {_label} calls until it reports "
                       f"(refusal {_n}/{_MAX_READ_REFUSALS})", flush=True)
-                return _refuse(agent, function_name, args, "read_ceiling", (
-                    f"REPORT NOW: you have read {_dl_read:,} characters in this one "
-                    f"delegation, which is the ceiling. No further reads will run until "
-                    f"you report.\n"
+                return _refuse(agent, function_name, args, f"{_label}_ceiling", (
+                    f"REPORT NOW: you have spent {_dl_read:,} characters on {_label} calls "
+                    f"in this one delegation, which is the {_label} ceiling. No further "
+                    f"{_label} call will run until you report. This refusal means the "
+                    f"BUDGET is spent, not that anything you were looking for does not "
+                    f"exist -- never report an absence based on this refusal alone.\n"
                     f"Write up what you have ALREADY read, and copy enumerable findings "
                     f"verbatim — every route decorator, class declaration or column you "
                     f"actually saw, exactly as it appeared. A report that summarises a "
@@ -21326,9 +21356,18 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             read_chars[norm_agent_key] = (
                 read_chars.get(norm_agent_key, 0) + len(str(result))
             )
-            delegation_read_chars[norm_agent_key] = (
-                delegation_read_chars.get(norm_agent_key, 0) + len(str(result))
-            )
+            # Phase 1.24: charge ONLY the category this tool actually belongs to (or
+            # neither, for tools outside both sets -- e.g. lightrag_query, which has its
+            # own separate call-count cap, _LIGHTRAG_QUERY_CAP, and should not silently
+            # also eat into either character ceiling here). Before this split EVERY
+            # fresh fetch through this hook -- including tools never checked against the
+            # ceiling -- inflated the one shared delegation_read_chars counter.
+            if _ceiling_cat == "discovery":
+                delegation_discovery_chars[norm_agent_key] = (
+                    delegation_discovery_chars.get(norm_agent_key, 0) + len(str(result)))
+            elif _ceiling_cat == "read":
+                delegation_read_chars[norm_agent_key] = (
+                    delegation_read_chars.get(norm_agent_key, 0) + len(str(result)))
             # Log the running total on every fresh read, not only when the budget trips
             # (2026-08-23). The budget shipped without this and promptly went unmeasured:
             # battery T12 stalled with Researcher at 40/50 tool calls and the guard
@@ -30187,6 +30226,18 @@ def _consume_stream_event(team, out: dict) -> bool:
 # of which are ordinary work for a whole-service survey -- and it still scored 31/31, so
 # the ceiling was interrupting a HEALTHY run. 90,000 clears both without clipping it.
 _DELEGATION_READ_CEILING = 90_000
+# Phase 1.24: discovery (search_files, search_files_batch, list_directory_tree,
+# count_matches) gets its OWN ceiling, independent of the source-content-read ceiling
+# above. Before this split both categories shared _DELEGATION_READ_CEILING under the
+# single name _READ_TOOLS_FOR_CEILING -- a live T13a run spent ~22,600 chars on three
+# legitimate, necessary discovery calls, which then counted against the SAME budget as
+# its two large source reads (~80,100 chars combined), pushing the shared total over
+# 90,000 and refusing the third read (inventoryApi.ts) before it could even run. Kept at
+# the SAME number as the pre-split ceiling (not raised, not lowered) -- this is a
+# correction to what gets counted where, not a budget increase: see this file's own
+# Phase 1.24 report for the demonstration that the T13a source reads alone (80,100
+# chars) were comfortably under 90,000 on their own.
+_DELEGATION_DISCOVERY_CEILING = 90_000
 # How many times one member may be refused before the refusal stops being advice. A
 # static condition that answers identically forever is not a stop, it is a loop: 59
 # refusals against two totals in one run. After this many, the member is forced
@@ -30198,10 +30249,16 @@ _MAX_READ_REFUSALS = 3
 # A batch read is precisely the shape that builds an undifferentiated pile in one
 # context, which is the condition long-context recall degrades in.
 _MAX_BATCH_READS_PER_MEMBER = 4
-_READ_TOOLS_FOR_CEILING = frozenset({
-    "get_file_content", "get_files_batch", "search_files", "search_files_batch",
-    "list_directory_tree", "count_matches",
+# Phase 1.24: split from the single _READ_TOOLS_FOR_CEILING set. Discovery/search tools
+# -- cheap to call, typically small results, never themselves the mandatory evidence --
+# versus genuine source-content reads, which are what coverage obligations are actually
+# checked against (swarm/acceptance.py's _read_sources()/EnumRequirement). The combined
+# name is kept as an alias below for any external reference, equal to the union of both.
+_DISCOVERY_TOOLS_FOR_CEILING = frozenset({
+    "search_files", "search_files_batch", "list_directory_tree", "count_matches",
 })
+_SOURCE_READ_TOOLS_FOR_CEILING = frozenset({"get_file_content", "get_files_batch"})
+_READ_TOOLS_FOR_CEILING = _DISCOVERY_TOOLS_FOR_CEILING | _SOURCE_READ_TOOLS_FOR_CEILING
 
 # 12,000 -> 20,000 -> 15,000. The 20,000 was calibrated on T12 alone, where 31/31 was
 # scored at 11,270 / 18,738 / 15,103 and the only collapse was at 23,494 -- so the line

@@ -756,8 +756,13 @@ def decide(a: Attempt, policy, registry: Registry = None, outcomes=None, registe
                  assessor_claims={"claims": len(asm["claims"]), "supported": len(asm["supported"]),
                                   "unsupported": list(asm["unsupported"])[:20]})
     # Phase 1.23: reported independent of `acceptance`'s combined derivation (see Decision's own docstring note).
+    # Phase 1.24: RECONCILED is a third, honest provenance -- the text was deterministically
+    # assembled by the application from two prior valid attempts (see eng_workflow.reconcile_attempts()),
+    # not freshly selected from a live model turn. It is a genuinely valid terminal result (never
+    # MISSING), but kept distinguishable from a live TERMINAL_SELECTED rather than conflated with it.
     rss = (a.terminal or {}).get("result_selection_status")
-    d.terminal_integrity = {"TERMINAL_SELECTED": "VALID", "MISSING_TERMINAL": "MISSING"}.get(rss, "N/A")
+    d.terminal_integrity = {"TERMINAL_SELECTED": "VALID", "MISSING_TERMINAL": "MISSING",
+                            "RECONCILED": "VALID_RECONCILED"}.get(rss, "N/A")
     d.coverage_status = "N/A" if not gate["applicable"] else ("MISSING_MANDATORY" if gate["missing"] else "SATISFIED")
     d.validity = registry.validity(a) if registry else "CURRENT"
     steps.append(("3.attempt_validity", d.validity))
@@ -809,6 +814,40 @@ def decide(a: Attempt, policy, registry: Registry = None, outcomes=None, registe
         steps.append(("8.register", d.registration))
     d.steps = steps
     return d
+
+
+# ---------------------------------------------------------------------------- Phase 1.24: recovery eligibility
+def recovery_eligible(d: Decision) -> bool:
+    """Phase 1.24 Track 5: application-controlled and fully deterministic -- the Coordinator and
+    Researcher are never asked whether to retry. Recovery is considered ONLY when ALL of:
+      - execution completed normally (terminal_gate's own COMPLETED, never FAILED/INCOMPLETE/
+        CANCELLED/TIMED_OUT -- those already use the separate, pre-existing RETRYABLE_TERMINALS
+        path, checked by the caller before this one, and never doubled up with recovery);
+      - a valid terminal result was actually selected (Phase 1.22's terminal_integrity VALID or,
+        for a second recovery round that is never currently triggered, VALID_RECONCILED -- never
+        on a MISSING or unknown terminal);
+      - the accuracy assessor actually ran without erroring;
+      - a MANDATORY coverage obligation is specifically missing or insufficient -- coverage_status
+        is exactly MISSING_MANDATORY, never SATISFIED (nothing to recover) or N/A (no evidence
+        policy applies, or only optional/unmapped obligations remain, which must never block or
+        trigger recovery per Track 5's own explicit list)."""
+    return (d.execution_status == "COMPLETED"
+            and d.terminal_integrity in ("VALID", "VALID_RECONCILED")
+            and d.assessor_status not in (None, "ERROR")
+            and d.coverage_status == "MISSING_MANDATORY")
+
+
+def requirement_source_paths(policy, req_id: str) -> list:
+    """The file paths (or ANY_SOURCE) a missing requirement/enum-requirement needs evidence from,
+    resolved from the SAME policy object that produced the obligation in the first place -- never
+    guessed or hardcoded per task (Track 4: reuse the existing policy structures)."""
+    for r in policy.requirements:
+        if r.id == req_id:
+            return list(r.any_of_paths)
+    for er in policy.enum_requirements:
+        if er.id == req_id:
+            return list(er.source_paths)
+    return []
 
 
 def summarize(d: Decision) -> dict:
