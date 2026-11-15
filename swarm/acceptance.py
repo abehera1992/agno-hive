@@ -339,14 +339,31 @@ T11_DOC_UPLOAD_POLICY = EvidencePolicy(
         Requirement("R4_business_admin_seller_verification", "business-admin seller verification", ["api/business-service/router/business_admin_api.py"]),
     ],
     links=[
+        # Phase 1.26 (Track B): report_tokens retains only the handler-function name,
+        # not the literal route fragment. Verified first, not assumed: AST inspection of
+        # the real EkamApp source (not textual proximity) confirmed each to_regex match
+        # is the SOLE decorator on the SOLE function matching it in its named file --
+        # router.post("/upload", ...) at storage_api.py:32 is the only decorator on
+        # upload_file (storage_api.py:33); router.post("/{business_id}/documents", ...)
+        # at business_api.py:483 is the only decorator on register_documents
+        # (business_api.py:484); router.post("/verify/{business_id}") at
+        # business_admin_api.py:84 is the only decorator on verify_seller
+        # (business_admin_api.py:85). Each raw-text to_regex pattern also matches
+        # exactly once in its file, so there is no second candidate to confuse it with.
+        # from_regex/to_regex (the actual source-backed relationship check) and
+        # any_of_paths (the fixed, policy-named files) are UNCHANGED below -- this only
+        # retires a report-text requirement that was redundant with to_regex given that
+        # verified uniqueness, after live battery evidence (Phase 1.25 T11 recovery)
+        # showed the model consistently names the real handler function it read but
+        # never transcribes the raw internal URL fragment verbatim in its own prose.
         Link("L1_frontend_to_storage", "R1_frontend_business_registration_form", "R2_storage_upload_handler",
-             r"/api/storageservice/upload", r'@router\.post\(\s*"/upload"', ["storageservice/upload", "upload_file"],
+             r"/api/storageservice/upload", r'@router\.post\(\s*"/upload"', ["upload_file"],
              "form posts to the upload URL; storage router exposes POST /upload"),
         Link("L2_frontend_to_registration", "R1_frontend_business_registration_form", "R3_business_document_registration",
              r"/api/businessservice/business/[^`'\"]*/documents", r'@router\.post\(\s*"/\{business_id\}/documents"',
-             ["/documents", "register_documents"], "form posts file refs to /documents; business router registers them"),
+             ["register_documents"], "form posts file refs to /documents; business router registers them"),
         Link("L3_registration_to_verification", "R3_business_document_registration", "R4_business_admin_seller_verification",
-             r"BusinessDocument\(", r'@router\.post\(\s*"/verify/\{business_id\}"', ["verify_seller", "/verify/"],
+             r"BusinessDocument\(", r'@router\.post\(\s*"/verify/\{business_id\}"', ["verify_seller"],
              "registration creates BusinessDocument rows; admin router verifies the seller by business_id"),
     ])
 
