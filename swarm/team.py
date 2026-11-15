@@ -17677,6 +17677,35 @@ _EXPLICIT_INCOMPLETE_INVESTIGATION_RE = re.compile(
     r"\bfiles?\s+not\s+examined\b",
     re.IGNORECASE)
 
+# Live T13a finding (this phase): reconcile_attempts() (swarm/eng_workflow.py) deliberately
+# keeps the ORIGINAL pass's own full text verbatim in the reconciled answer, prefixed "##
+# Original pass" -- by design, for transparency ("expose both passages side by side... never
+# rely on an LLM merge as the authority"), never because it is still the current, authoritative
+# statement of what has been examined. Recovery runs exactly once, targeting specifically the
+# obligations the original pass left unresolved -- so the moment a "## Recovery pass" section
+# exists at all, it is unconditionally the more current statement, and the original pass's own
+# admission of a gap recovery went on to close is stale by construction, not evidence the
+# RECONCILED answer is still incomplete. Confirmed live: T13a's recovery pass explicitly read
+# the remaining hooks and stated "All obligations have been satisfied with evidence from the
+# actual source files," yet the overall verdict stayed PARTIAL because the ORIGINAL pass's own
+# superseded "Files Not Fully Examined" sentence was still scanned as if it described the
+# answer actually being delivered.
+_RECONCILED_RECOVERY_HEADER_PREFIX = "## Recovery pass"
+
+
+def _latest_pass_text(text: str) -> str:
+    """For a reconcile_attempts()-built reconciled answer, the text from the recovery
+    section onward only -- the current, authoritative statement of what was examined.
+    For any other text (no recovery ever ran, or a caller outside that reconciliation
+    path entirely), returns `text` unchanged: this narrows what two specific staleness-
+    prone checks look at, never what the reconciled answer itself displays or what any
+    other assessor check (claim support, absence-without-scope, etc.) still evaluates
+    against the full text."""
+    if not text:
+        return text
+    idx = text.find(_RECONCILED_RECOVERY_HEADER_PREFIX)
+    return text[idx:] if idx != -1 else text
+
 
 def _record_admits_incomplete_investigation_for(
         text: str, root: str, roots: "list[str]") -> bool:
@@ -27969,7 +27998,11 @@ def _assess_member_result(team, key: str, text: str, attempt_id=None) -> dict:
             and not ev["read_paths"] and not _ABSENCE_RE.search(text)):
         return done("UNRESOLVED", "the report adds no checkable claim beyond the delegation's own "
                     "wording and no source file was read by this delegation", **common)
-    if _EXPLICIT_INCOMPLETE_INVESTIGATION_RE.search(text) or _THIN_REPORT_MARKER in text:
+    # Scoped to the latest (recovery, if one ran) pass only -- see _latest_pass_text's
+    # own docstring. A superseded admission from a since-resolved original pass must
+    # never be read as describing the reconciled answer actually being delivered.
+    _latest_text = _latest_pass_text(text)
+    if _EXPLICIT_INCOMPLETE_INVESTIGATION_RE.search(_latest_text) or _THIN_REPORT_MARKER in _latest_text:
         return done("PARTIAL", "the report itself says part of the objective was not examined",
                     **common)
     src = [k for k, v in sources.items() if v]
