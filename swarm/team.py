@@ -38,7 +38,7 @@ from swarm import execution_context
 from swarm import execution_store
 from swarm import run_reconcile
 # Phase 1.14c/d: structured refusal marker + attempt-id context (see swarm/acceptance.py).
-from swarm.acceptance import ToolRefusal, ATTEMPT_ID as _ATTEMPT_ID
+from swarm.acceptance import ToolRefusal, ATTEMPT_ID as _ATTEMPT_ID, _RAW_ARGS as _ACCEPTANCE_RAW_ARGS
 
 _tracer = trace.get_tracer("agno-hive.team")
 
@@ -21436,26 +21436,34 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     if _worst_case > _remaining_now >= _MIN_USEFUL_ADAPTED_RESERVATION:
                         # Phase 1.29d: MUTATE the existing dict in place -- do NOT
                         # rebind `args` to a new dict object. Confirmed by reading
-                        # Agno 2.5.17's own tools/function.py directly (the Phase
-                        # 1.29c root cause): `execute_entrypoint_async`, the innermost
-                        # step of the tool_hooks chain, ignores its own `args`
-                        # parameter entirely and instead reads `self.arguments` LIVE
-                        # (`arguments.update(self.arguments)`) at call time. This
-                        # hook is the OUTERMOST in `self.function.tool_hooks` (built
-                        # via `reduce(create_hook_wrapper, reversed(hooks), ...)`), so
-                        # the `args` it receives on the hook chain's very first call
-                        # (`execution_chain(name, entrypoint, self.arguments or {})`)
-                        # IS `self.arguments` itself -- the same object, not a copy,
-                        # since a non-empty dict is truthy and `X or {}` returns `X`.
-                        # Rebinding this local name to a NEW dict (the Phase 1.29c
-                        # code) only ever updated OUR OWN reference, never
-                        # `self.arguments`, so the entrypoint call never saw it --
-                        # confirmed live: a call adapted to max_output_chars=21,267
-                        # reached the producer with only {'relative_path': ...} and
-                        # returned its full, unbounded 24,035-char default. Mutating
-                        # the SAME dict object in place is visible to every other
-                        # holder of that reference, including `self.arguments`.
+                        # Agno 2.5.17's own tools/function.py directly: `execute_
+                        # entrypoint_async`, the innermost step of the tool_hooks
+                        # chain, ignores its own `args` parameter entirely and
+                        # instead reads `self.arguments` LIVE at call time.
                         args["max_output_chars"] = _remaining_now
+                        # Second root cause, found live AFTER the fix above still let
+                        # a real overshoot through (hive.md: adapted to 10,104,
+                        # producer returned the full, unbounded 15,055-char render).
+                        # This hook is NOT always the outermost tool_hooks entry --
+                        # swarm/eng_workflow.py installs OutcomeRecorder's own pair
+                        # around it: `[o_hook] + <this hook and others> + [i_hook]`
+                        # (needed so OutcomeRecorder sees every call, including ones
+                        # this hook refuses outright without ever calling `function`,
+                        # which a reorder would silently stop recording -- not safe to
+                        # change). So `args` here is only ever a freshly repacked
+                        # kwargs dict, created anew at every hop by Agno's own
+                        # `next_func(**kwargs)` forwarding -- mutating it only affects
+                        # what the NEXT hook down sees, never `self.arguments` itself,
+                        # which is what execute_entrypoint_async actually reads.
+                        # `swarm/acceptance.py`'s acceptance_outcome_outer -- which IS
+                        # always genuinely outermost -- publishes that real object via
+                        # the _RAW_ARGS contextvar before forwarding. Mutating THAT
+                        # object directly (whenever it differs from our own `args`,
+                        # i.e. whenever something sits between it and us) reaches
+                        # self.arguments regardless of chain position or stacking.
+                        _raw = _ACCEPTANCE_RAW_ARGS.get()
+                        if _raw is not None and _raw is not args:
+                            _raw["max_output_chars"] = _remaining_now
                         _worst_case = _reserve_worst_case(function_name, args)
                         _adapted = True
                 _projected = _committed + _reserved + _task_offset + _worst_case

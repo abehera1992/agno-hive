@@ -206,6 +206,25 @@ def classify_return(c: ToolOutcome, out, out_text: str, prior_success_shas: set)
 
 
 _CALL: contextvars.ContextVar = contextvars.ContextVar("hive_tool_call", default=None)
+# Phase 1.29d Track 1 (second root cause, found live after the first propagation fix):
+# the TRUE outermost tool_hooks entry is whichever hook actually receives Agno's own
+# self.arguments object as its own `args` parameter (same object, not a copy -- confirmed
+# by reading Agno 2.5.17's tools/function.py directly: the hook chain's first call passes
+# self.arguments itself, since a non-empty dict is truthy). acceptance_outcome_outer below
+# is installed as [o_hook] + <everything else, including swarm/team.py's budget hook> +
+# [i_hook] by swarm/eng_workflow.py -- so IT, not the budget hook, is the true outermost.
+# A hook anywhere else in the chain receives a freshly repacked kwargs dict at every hop
+# (Agno's `next_func(**kwargs)` forwarding always creates a new dict), so mutating that
+# dict in place only ever affects what the NEXT hook down sees -- never what
+# execute_entrypoint_async actually uses, since it reads self.arguments directly and
+# ignores its own `args` parameter entirely. Live evidence: a get_file_content call on
+# hive.md was correctly adapted to max_output_chars=10,104 by the budget hook (mid-chain),
+# but reached the real producer with no cap at all and returned the full 15,055-char
+# render -- the budget hook's own object was never self.arguments.
+# This contextvar lets any hook in the chain reach the SAME object the outermost hook
+# holds, so a downstream hook can mutate the real self.arguments directly instead of its
+# own (possibly different) `args` parameter.
+_RAW_ARGS: contextvars.ContextVar = contextvars.ContextVar("hive_raw_args", default=None)
 
 
 class OutcomeRecorder:
@@ -239,6 +258,12 @@ class OutcomeRecorder:
             me.calls.append(c)
             tok = _CALL.set(c)
             tok_a = ATTEMPT_ID.set(me.attempt_id)
+            # Phase 1.29d: this `args` IS Agno's own self.arguments object (same reference,
+            # not a copy) because this hook is always installed outermost. Publish it so a
+            # hook further down the chain -- which only ever sees a freshly repacked kwargs
+            # dict at its own position, never this object -- can mutate THIS one directly
+            # when it needs the real producer call to see an adaptation.
+            tok_r = _RAW_ARGS.set(args)
             try:
                 coro = function(**args)
                 out = await (asyncio.wait_for(coro, me.deadline) if me.deadline else coro)
@@ -254,6 +279,7 @@ class OutcomeRecorder:
             finally:
                 _CALL.reset(tok)
                 ATTEMPT_ID.reset(tok_a)
+                _RAW_ARGS.reset(tok_r)
                 if c.outcome != UNKNOWN:          # exception paths: outcome already final
                     await me._emit(c)
             text = out if isinstance(out, str) else _text_of(out)
