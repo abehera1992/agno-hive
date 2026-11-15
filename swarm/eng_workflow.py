@@ -218,6 +218,13 @@ class RunState:
     # and are NEVER lost; this dict only ever holds the running CUMULATIVE total per work item.
     task_discovery_chars: dict = field(default_factory=dict)
     task_read_chars: dict = field(default_factory=dict)
+    # Phase 1.30: the task-specific AUTHORIZED ceiling per work item (distinct from the
+    # cumulative-consumption dicts above) -- absent means "still at the unextended default."
+    # Both the upfront (Phase 1.29d) and just-in-time (Phase 1.30) grant paths read and write
+    # the SAME dict, so there is exactly one authorized-ceiling number per work item, never two
+    # independently-tracked ones racing to describe the same task.
+    task_read_ceiling: dict = field(default_factory=dict)
+    task_discovery_ceiling: dict = field(default_factory=dict)
 
     def remaining(self) -> Optional[float]:
         return None if self.deadline_mono is None else self.deadline_mono - time.monotonic()
@@ -334,13 +341,20 @@ def item_controls(controls: dict, work_item_id: str) -> dict:
     return base
 
 
-async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, attempt_no: int, task_override: str = None):
+async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, attempt_no: int, task_override: str = None,
+                      extra_activity: dict = None):
     """Create a NEW attempt (new id + generation via the registry), run the real Researcher under it, observe the
     Agent's own terminal facts, and return the AttemptRecord. Never raises.
     `task_override` (Phase 1.24): if given, replaces wi.objective ONLY for the text actually sent to the
     Researcher this attempt (a bounded recovery pass targeting specific missing obligations) -- wi.target/
     wi.policy/wi.evidence_required/wi.completion_criteria are unchanged, so the SAME coverage policy still
-    governs this attempt's own decide() call. The work item's own `objective` field is never mutated."""
+    governs this attempt's own decide() call. The work item's own `objective` field is never mutated.
+    `extra_activity` (Phase 1.30): optional extra seed values merged into this attempt's own `activity`
+    dict before the team is built -- currently used by recover_and_reconcile() to carry
+    missing_source_paths/missing_obligation_ids (deterministically derived from the ORIGINAL attempt's
+    own Decision via the existing requirement_source_paths(), the same call build_recovery_task() already
+    makes) so the just-in-time extension check in swarm/team.py's budget hook has something real to match
+    a blocked read's path against, never model text."""
     import functools
     import inspect
     import swarm.team as T
@@ -403,7 +417,17 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
     # diagnostics into), rather than silently starting a recovery attempt at 0/90,000 again.
     _task_discovery_before = st.task_discovery_chars.get(wi.work_item_id, 0)
     _task_read_before = st.task_read_chars.get(wi.work_item_id, 0)
-    activity = {"task_discovery_offset": _task_discovery_before, "task_read_offset": _task_read_before}
+    activity = {"task_discovery_offset": _task_discovery_before, "task_read_offset": _task_read_before,
+                # Phase 1.30: the task's currently-authorized ceiling, keyed by work_item_id so it
+                # persists correctly across the initial attempt and any recovery attempt -- this is
+                # the ONE value both the upfront (Phase 1.29d) and just-in-time (Phase 1.30) grant
+                # paths read and raise; defaults to the module-level constant the very first time a
+                # work item is ever attempted, never a separately-tracked number.
+                "work_item_id": wi.work_item_id,
+                "read_ceiling": st.task_read_ceiling.get(wi.work_item_id, T._DELEGATION_READ_CEILING),
+                "discovery_ceiling": st.task_discovery_ceiling.get(wi.work_item_id, T._DELEGATION_DISCOVERY_CEILING)}
+    if extra_activity:
+        activity.update(extra_activity)
     try:
         if controls.get("ceiling") is not None:
             T._DELEGATION_READ_CEILING = controls["ceiling"]
@@ -579,6 +603,16 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
         _task_read_after = _task_read_before + _attempt_read
         st.task_discovery_chars[wi.work_item_id] = _task_discovery_after
         st.task_read_chars[wi.work_item_id] = _task_read_after
+        # Phase 1.30: the authorized ceiling actually used by this attempt's own budget
+        # hook is `activity["read_ceiling"]`/["discovery_ceiling"] -- it may have been
+        # raised mid-attempt by a just-in-time grant, which never touches the bare
+        # module global. Persist it back to RunState (task-scoped, so the NEXT attempt
+        # on this work item, if any, inherits it) and use it for reporting below instead
+        # of the possibly-stale module global.
+        _read_ceiling_final = activity.get("read_ceiling", st.task_read_ceiling.get(wi.work_item_id, T._DELEGATION_READ_CEILING))
+        _disc_ceiling_final = activity.get("discovery_ceiling", st.task_discovery_ceiling.get(wi.work_item_id, T._DELEGATION_DISCOVERY_CEILING))
+        st.task_read_ceiling[wi.work_item_id] = _read_ceiling_final
+        st.task_discovery_ceiling[wi.work_item_id] = _disc_ceiling_final
         if att.terminal is not None:
             # Phase 1.26: reservation leak check -- see swarm/team.py's own comment at the
             # activity["attempt_discovery_reserved"] write site. Should be 0/0 whenever the
@@ -590,14 +624,19 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
                 "attempt_discovery_chars": _attempt_discovery, "attempt_read_chars": _attempt_read,
                 "task_discovery_chars_before": _task_discovery_before, "task_read_chars_before": _task_read_before,
                 "task_discovery_chars_after": _task_discovery_after, "task_read_chars_after": _task_read_after,
-                "task_discovery_ceiling": T._DELEGATION_DISCOVERY_CEILING, "task_read_ceiling": T._DELEGATION_READ_CEILING,
+                "task_discovery_ceiling": _disc_ceiling_final, "task_read_ceiling": _read_ceiling_final,
                 "discovery_reserved_leaked": _disc_reserved, "read_reserved_leaked": _read_reserved,
-                "task_discovery_remaining": max(T._DELEGATION_DISCOVERY_CEILING - _task_discovery_after, 0),
-                "task_read_remaining": max(T._DELEGATION_READ_CEILING - _task_read_after, 0),
+                "task_discovery_remaining": max(_disc_ceiling_final - _task_discovery_after, 0),
+                "task_read_remaining": max(_read_ceiling_final - _task_read_after, 0),
                 # Phase 1.29: durable evidence of any budget-contract violation this
                 # attempt's own activity dict recorded (swarm/team.py's own write site,
                 # just above its _reservation_amt check) -- empty list means none.
                 "budget_contract_violations": activity.get("budget_contract_violations", []),
+                # Phase 1.30: durable record of every just-in-time extension decision
+                # (grant or denial) this attempt's own budget hook made, whether or not
+                # any of them were ultimately granted -- see swarm/team.py's own write
+                # site at the admission-refusal branch for the exact fields recorded.
+                "jit_extensions": activity.get("jit_extension_decisions", []),
             }
         if led is not None:
             try:     # terminal facts + canonical text + full trace, even for an invalidated attempt (history);
@@ -783,7 +822,15 @@ async def recover_and_reconcile(st: RunState, wi: WorkItem, ctx: dict, controls:
     anywhere in recovery leaves the ORIGINAL (orig_rec, orig_d) as the work item's result, since
     the caller only replaces its own (rec, d) locals on a non-None return."""
     task_override = build_recovery_task(wi, orig_rec.attempt, orig_d)
-    rec2 = await run_attempt(st, wi, ctx, controls, attempt_no, task_override=task_override)
+    # Phase 1.30: the same deterministic derivation build_recovery_task() just used to
+    # build the recovery prompt's own "Read: <paths>" lines -- reused here, not
+    # reimplemented, so the just-in-time extension check in swarm/team.py's budget hook
+    # has the identical set of expected source paths to match a blocked read against.
+    _missing_ids = [m["id"] for m in orig_d.gate["missing"]]
+    _missing_paths = sorted({p for mid in _missing_ids for p in A.requirement_source_paths(wi.policy, mid)})
+    rec2 = await run_attempt(st, wi, ctx, controls, attempt_no, task_override=task_override,
+                             extra_activity={"missing_source_paths": _missing_paths,
+                                             "missing_obligation_ids": _missing_ids})
     # rec2.attempt.state is "FINISHED" even on a ledger-start failure or setup error (see
     # run_attempt()'s own early-exit paths) -- rec2.error/rec2.ledger_error are what actually
     # distinguish a genuine run from one that never got to call the Researcher at all.
@@ -1234,8 +1281,16 @@ async def run_engineering_workflow(
                                     c_recovery = dict(c)
                                     if ext["new_read_ceiling"]:
                                         c_recovery["ceiling"] = ext["new_read_ceiling"]
+                                        # Phase 1.30: write into the SAME task-scoped ceiling
+                                        # state the just-in-time mechanism reads/writes, so
+                                        # the recovery attempt's own seeded activity["read_
+                                        # ceiling"] already reflects this upfront grant --
+                                        # one authorized-ceiling number per work item, not
+                                        # two independently-tracked ones.
+                                        st.task_read_ceiling[wi.work_item_id] = ext["new_read_ceiling"]
                                     if ext["new_discovery_ceiling"]:
                                         c_recovery["discovery_ceiling"] = ext["new_discovery_ceiling"]
+                                        st.task_discovery_ceiling[wi.work_item_id] = ext["new_discovery_ceiling"]
                                     st.emit("budget_extension_granted", work_item=wi.work_item_id,
                                             attempt=rec.attempt.attempt_id,
                                             read_extension=ext["read_extension"],

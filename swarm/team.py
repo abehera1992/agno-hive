@@ -38,7 +38,12 @@ from swarm import execution_context
 from swarm import execution_store
 from swarm import run_reconcile
 # Phase 1.14c/d: structured refusal marker + attempt-id context (see swarm/acceptance.py).
-from swarm.acceptance import ToolRefusal, ATTEMPT_ID as _ATTEMPT_ID, _RAW_ARGS as _ACCEPTANCE_RAW_ARGS
+from swarm.acceptance import (
+    ToolRefusal, ATTEMPT_ID as _ATTEMPT_ID, _RAW_ARGS as _ACCEPTANCE_RAW_ARGS,
+    TASK_READ_EXTENSION_INCREMENT as _JIT_READ_INCREMENT,
+    TASK_READ_ABSOLUTE_CEILING as _JIT_READ_ABSOLUTE_CEILING,
+    EXTENSION_MIN_PROGRESS_CHARS as _JIT_MIN_PROGRESS_CHARS,
+)
 
 _tracer = trace.get_tracer("agno-hive.team")
 
@@ -21389,7 +21394,20 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         if _ceiling_cat is not None and cache_key not in cache:
             _chars_dict = delegation_discovery_chars if _ceiling_cat == "discovery" else delegation_read_chars
             _reserved_dict = delegation_discovery_reserved if _ceiling_cat == "discovery" else delegation_read_reserved
-            _ceiling = _DELEGATION_DISCOVERY_CEILING if _ceiling_cat == "discovery" else _DELEGATION_READ_CEILING
+            # Phase 1.30: a task-specific authorized ceiling, keyed through `activity`
+            # (per-attempt, but seeded from RunState.task_read_ceiling/task_discovery_
+            # ceiling by swarm/eng_workflow.py so it persists correctly across the
+            # initial attempt and any recovery attempt on the same work item) takes
+            # precedence over the bare module global whenever eng_workflow.py has set
+            # it. A caller that never sets it (any existing scratch test, or a path this
+            # phase doesn't touch) falls through to the unchanged default -- no
+            # behavior change for anything that doesn't opt in. This is also the single
+            # value a just-in-time grant below raises, so the upfront (Phase 1.29d) and
+            # just-in-time (Phase 1.30) grant paths share one authorized ceiling, not
+            # two independently-tracked numbers.
+            _ceiling_key = "discovery_ceiling" if _ceiling_cat == "discovery" else "read_ceiling"
+            _ceiling = (activity or {}).get(
+                _ceiling_key, _DELEGATION_DISCOVERY_CEILING if _ceiling_cat == "discovery" else _DELEGATION_READ_CEILING)
             # Phase 1.25: task-scoped budget. `activity["task_discovery_offset"]`/
             # `["task_read_offset"]` is what THIS SAME logical task (one work_item_id,
             # across the initial attempt and any recovery attempt) has already spent in a
@@ -21471,8 +21489,102 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     _admit = True  # should not happen for a categorized tool; fail open rather than wedge the run
                 elif _projected > _ceiling:
                     _admit = False
+                    # Phase 1.30: just-in-time extension, evaluated at the EXACT point
+                    # this get_file_content call would otherwise be refused -- not at
+                    # the recovery-planning boundary (Phase 1.29d's own upfront check
+                    # in swarm/eng_workflow.py, still in effect, unaffected, and sharing
+                    # the SAME authorized-ceiling value via `activity` above so the two
+                    # trigger points can never independently grant overlapping
+                    # increments). Deterministic, no model text consulted: a recovery
+                    # attempt is, by construction, known to have at least one
+                    # outstanding mandatory obligation (recovery_eligible's own
+                    # coverage_status == MISSING_MANDATORY gate) -- eng_workflow.py
+                    # precomputes each one's expected source path(s) via the existing
+                    # requirement_source_paths(policy, req_id) and seeds them into
+                    # activity["missing_source_paths"] before this attempt starts.
+                    # A grant requires the BLOCKED call's own requested path to match
+                    # one of those paths; nothing else qualifies. Runs inside the SAME
+                    # _budget_lock this whole admission decision already holds, so the
+                    # check-and-grant is atomic with the refusal/admission decision
+                    # itself -- no separate lock, no window for a second concurrent
+                    # call on the same work item to grant a duplicate increment.
+                    _jit_record = None
+                    if function_name == "get_file_content" and _ceiling_cat == "read":
+                        _missing_paths = (activity or {}).get("missing_source_paths")
+                        _remaining_before = max(_ceiling - _committed - _reserved - _task_offset, 0)
+                        _jit_record = {
+                            "work_item_id": (activity or {}).get("work_item_id"),
+                            "attempt_id": _ATTEMPT_ID.get(), "category": _ceiling_cat,
+                            "requested_path": args.get("relative_path"),
+                            "missing_obligations": (activity or {}).get("missing_obligation_ids", []),
+                            "prior_ceiling": _ceiling, "committed": _committed,
+                            "reserved": _reserved, "task_offset": _task_offset,
+                            "remaining_before": _remaining_before,
+                            "absolute_ceiling": _JIT_READ_ABSOLUTE_CEILING,
+                        }
+                        if _missing_paths is None:
+                            _jit_record.update(eligible=False, matched_path=None,
+                                                reason="not a recovery attempt -- no known outstanding obligation to check against")
+                        else:
+                            _norm_req = _normalize_delegation_target(args.get("relative_path", ""))
+                            _matched = next((p for p in _missing_paths
+                                              if _normalize_delegation_target(p) == _norm_req), None)
+                            if _matched is None:
+                                _jit_record.update(eligible=False, matched_path=None,
+                                                    reason="requested path does not match any outstanding obligation's source path")
+                            elif _committed < _JIT_MIN_PROGRESS_CHARS:
+                                # This attempt's OWN spend only -- `_task_offset` is what a
+                                # PRIOR attempt already spent before this one even started,
+                                # and is not evidence of progress happening now. Matches
+                                # Phase 1.29d's own upfront check, which uses
+                                # attempt_read_chars (this attempt's own figure), not a
+                                # cumulative total, for the identical reason.
+                                _jit_record.update(eligible=False, matched_path=_matched,
+                                                    reason=f"insufficient progress this attempt ({_committed:,} < "
+                                                           f"{_JIT_MIN_PROGRESS_CHARS:,} chars) -- treated as a stall, not exhaustion")
+                            else:
+                                _new_ceiling = min(_ceiling + _JIT_READ_INCREMENT, _JIT_READ_ABSOLUTE_CEILING)
+                                if _new_ceiling <= _ceiling:
+                                    _jit_record.update(eligible=False, matched_path=_matched,
+                                                        reason=f"no headroom left under the absolute ceiling ({_JIT_READ_ABSOLUTE_CEILING:,})")
+                                else:
+                                    _jit_record.update(eligible=True, matched_path=_matched,
+                                                        reason="recovery attempt, matched obligation source path, "
+                                                               "genuine progress, headroom available",
+                                                        granted_increment=_new_ceiling - _ceiling, new_ceiling=_new_ceiling)
+                                    _ceiling = _new_ceiling
+                                    activity[_ceiling_key] = _new_ceiling
+                                    _remaining_after_grant = max(_ceiling - _committed - _reserved - _task_offset, 0)
+                                    # The grant raises the CEILING, but the call's own
+                                    # worst-case reservation is still whatever it was
+                                    # computed as before (typically the unadapted
+                                    # 60,000-char default, since this path is only reached
+                                    # when no smaller max_output_chars was already
+                                    # requested and the Phase 1.29c adaptive check above
+                                    # found remaining too small even to attempt adapting).
+                                    # Re-run that SAME adaptive shrink now that there is
+                                    # real room: without this, a grant that raises
+                                    # remaining from 1,000 to 31,000 would still refuse a
+                                    # call reserved at the full 60,000 default, defeating
+                                    # the grant's own purpose.
+                                    if (not (args or {}).get("max_output_chars")
+                                            and _worst_case > _remaining_after_grant >= _MIN_USEFUL_ADAPTED_RESERVATION):
+                                        args["max_output_chars"] = _remaining_after_grant
+                                        _raw = _ACCEPTANCE_RAW_ARGS.get()
+                                        if _raw is not None and _raw is not args:
+                                            _raw["max_output_chars"] = _remaining_after_grant
+                                        _worst_case = _reserve_worst_case(function_name, args)
+                                        _adapted = True
+                                        _jit_record["readapted_max_output_chars"] = _remaining_after_grant
+                                    _projected = _committed + _reserved + _task_offset + _worst_case
+                                    _admit = _projected <= _ceiling
+                        activity["jit_extension_decisions"] = activity.get("jit_extension_decisions", []) + [_jit_record]
+                        print(f"[team] {agent_key or 'coordinator'} JIT extension "
+                              f"{'GRANTED' if _jit_record.get('eligible') else 'denied'} for "
+                              f"{_jit_record.get('requested_path')}: {_jit_record.get('reason')}", flush=True)
                 else:
                     _admit = True
+                if _admit:
                     _reserved_dict[norm_agent_key] = _reserved + _worst_case
             if _admit and _adapted:
                 print(f"[team] {agent_key or 'coordinator'} get_file_content adapted to "
