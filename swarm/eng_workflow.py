@@ -763,7 +763,8 @@ def reconcile_attempts(orig_att, orig_d, rec_att) -> tuple:
 
 
 async def recover_and_reconcile(st: RunState, wi: WorkItem, ctx: dict, controls: dict,
-                                orig_rec: AttemptRecord, orig_d, attempt_no: int):
+                                orig_rec: AttemptRecord, orig_d, attempt_no: int,
+                                extension_info: dict = None):
     """Phase 1.24 Track 5/6: ONE bounded, application-controlled recovery attempt targeting
     specifically the mandatory obligations orig_d.gate['missing'] identifies, followed by
     deterministic evidence reconciliation and an INDEPENDENT final decide() (Track 6: the final
@@ -811,6 +812,16 @@ async def recover_and_reconcile(st: RunState, wi: WorkItem, ctx: dict, controls:
         orig_rec.attempt, orig_d, rec2.attempt)
     recovery_info["raw_recovery_text_sha"] = A.sha(raw_recovery_text)
     recovery_info["raw_recovery_chars"] = len(raw_recovery_text or "")
+    # Phase 1.29d Track 2.3: fold the extension GRANT decision (computed by the caller
+    # BEFORE this recovery attempt ran, from the ORIGINAL attempt's own budget facts) into
+    # THIS recovery attempt's own "budget" dict -- never replacing it, since run_attempt()'s
+    # finally block already wrote the recovery attempt's real post-recovery figures there
+    # (which reflect whatever extended ceiling controls carried into this call). Durable
+    # record of the reason/outstanding-obligations/prior-allocation/new-allocation whether
+    # or not the recovery attempt that followed actually used the extra room.
+    if extension_info is not None and rec2.attempt.terminal is not None:
+        rec2.attempt.terminal["budget"] = dict(rec2.attempt.terminal.get("budget") or {},
+                                               extension=extension_info)
     # Mutate rec2.attempt IN PLACE (never construct a separate object) -- rec2 is the SAME
     # AttemptRecord instance run_attempt() already appended to st.records, and _final_record()
     # looks up the accepted attempt by attempt_id inside st.records; a separate reconciled copy
@@ -1209,7 +1220,30 @@ async def run_engineering_workflow(
                                 st.emit("recovery_triggered", work_item=wi.work_item_id,
                                         attempt=rec.attempt.attempt_id,
                                         missing=[m["id"] for m in d.gate["missing"]])
-                                recovered = await recover_and_reconcile(st, wi, ctx, c, rec, d, n + 1)
+                                # Phase 1.29d Track 2.2: application-controlled, deterministic
+                                # decision on whether this ALREADY-TRIGGERED recovery attempt
+                                # should ALSO get a bounded task-budget extension -- computed
+                                # purely from the ORIGINAL attempt's own ledger/budget facts,
+                                # never from model text, and emitted either way for a durable,
+                                # inspectable record of why.
+                                ext = A.extension_eligible(d, rec)
+                                st.emit("budget_extension_decision", work_item=wi.work_item_id,
+                                        attempt=rec.attempt.attempt_id, **ext)
+                                c_recovery = c
+                                if ext["eligible"]:
+                                    c_recovery = dict(c)
+                                    if ext["new_read_ceiling"]:
+                                        c_recovery["ceiling"] = ext["new_read_ceiling"]
+                                    if ext["new_discovery_ceiling"]:
+                                        c_recovery["discovery_ceiling"] = ext["new_discovery_ceiling"]
+                                    st.emit("budget_extension_granted", work_item=wi.work_item_id,
+                                            attempt=rec.attempt.attempt_id,
+                                            read_extension=ext["read_extension"],
+                                            discovery_extension=ext["discovery_extension"],
+                                            new_read_ceiling=ext["new_read_ceiling"],
+                                            new_discovery_ceiling=ext["new_discovery_ceiling"])
+                                recovered = await recover_and_reconcile(st, wi, ctx, c_recovery, rec, d, n + 1,
+                                                                       extension_info=ext)
                                 if recovered is not None:
                                     rec, d = recovered
                         break

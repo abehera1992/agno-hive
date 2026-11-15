@@ -870,6 +870,99 @@ def recovery_eligible(d: Decision) -> bool:
             and d.coverage_status == "MISSING_MANDATORY")
 
 
+# Phase 1.29d Track 2.2: a bounded incremental extension, granted at most once per work
+# item (the architecture runs exactly one recovery attempt, so there is exactly one
+# extension-decision point) -- these are initial-policy examples per the mission's own
+# text ("not immutable values"), not load-bearing constants: 30,000 at a time, capped so
+# the task's cumulative read/discovery total can never exceed 120,000 (the 90,000 initial
+# allocation plus one bounded increment). Separate from the per-call producer maximum
+# (hive-mcp's own _MAX_RENDERED_CHARS/_MAX_RANGED_READ_CHARS, untouched by this phase) and
+# from the task-scoped initial allocation (_DELEGATION_READ_CEILING's own default, also
+# untouched -- this only ever RAISES the ceiling a specific recovery attempt is given).
+TASK_READ_EXTENSION_INCREMENT = 30_000
+TASK_READ_ABSOLUTE_CEILING = 120_000
+TASK_DISCOVERY_EXTENSION_INCREMENT = 30_000
+TASK_DISCOVERY_ABSOLUTE_CEILING = 120_000
+# A remaining allowance at or below this, when the original attempt finished with mandatory
+# coverage missing, is the deterministic signal that resource exhaustion -- not something
+# else -- was plausibly the blocker. Matches swarm/team.py's own
+# _MIN_USEFUL_ADAPTED_RESERVATION (2,000) with headroom: well below this, no single call
+# could have proceeded even with Phase 1.29d's own adaptive reservation.
+EXTENSION_LOW_REMAINING_THRESHOLD = 5_000
+# The original attempt must have actually spent a meaningful amount of its allowance on
+# reading/discovery -- a 0-char or near-0 spend means retrieval itself stalled or never
+# started, which an extension cannot fix and must not be mistaken for exhaustion.
+EXTENSION_MIN_PROGRESS_CHARS = 1_000
+
+
+def extension_eligible(d: Decision, orig_rec) -> dict:
+    """Phase 1.29d Track 2.2: application-controlled and fully deterministic -- the
+    Coordinator and Researcher are never asked whether to extend, and nothing here reads
+    model text. Every input is a ledger/budget fact already recorded for the ORIGINAL
+    attempt (orig_rec), the same attempt whose Decision (d) already passed
+    recovery_eligible(d) -- this function decides ONLY whether that already-triggered
+    recovery attempt should ALSO receive a bounded task-budget extension, never whether
+    recovery itself happens.
+
+    All of the following must hold for either read or discovery to be extended:
+      - a mandatory coverage obligation is specifically missing (same coverage_status
+        check recovery_eligible already made; recomputed here so this function is
+        correct standalone, e.g. for scratch testing, without relying on caller order);
+      - the ORIGINAL attempt's own recorded remaining allowance for that category was at
+        or below EXTENSION_LOW_REMAINING_THRESHOLD -- i.e. exhaustion, not something else,
+        is the plausible blocker (a MISSING_MANDATORY result reached with budget to spare
+        means more budget would not help, and none is granted);
+      - the ORIGINAL attempt actually spent at least EXTENSION_MIN_PROGRESS_CHARS chars in
+        that category -- meaningful progress, not a stall;
+      - the proposed new ceiling (current ceiling + the bounded increment, capped) is
+        STRICTLY above the current ceiling -- i.e. there is genuine room left under the
+        configured absolute ceiling; at the absolute ceiling already, no extension.
+
+    Returns a dict that always includes "eligible" (true if EITHER category would be
+    extended) plus every fact the decision was made on and the exact new ceiling(s) --
+    recorded via st.emit() whether or not the extension ends up eligible, and folded into
+    the recovery attempt's own terminal["budget"]["extension"] when it does, for a durable,
+    inspectable record of why (Track 2.3: "Every extension must have a durable ledger
+    record... Record the reason, outstanding obligations, prior allocation, additional
+    allocation, new allocation.")."""
+    budget = (orig_rec.attempt.terminal or {}).get("budget") or {}
+    read_remaining = budget.get("task_read_remaining")
+    disc_remaining = budget.get("task_discovery_remaining")
+    attempt_read = budget.get("attempt_read_chars", 0) or 0
+    attempt_discovery = budget.get("attempt_discovery_chars", 0) or 0
+    current_read_ceiling = budget.get("task_read_ceiling")
+    current_disc_ceiling = budget.get("task_discovery_ceiling")
+
+    obligation_missing = d.coverage_status == "MISSING_MANDATORY" and bool(
+        [m["id"] for m in d.gate["missing"]] if d.gate.get("applicable") else [])
+
+    read_exhausted = (read_remaining is not None and read_remaining <= EXTENSION_LOW_REMAINING_THRESHOLD
+                       and attempt_read >= EXTENSION_MIN_PROGRESS_CHARS)
+    disc_exhausted = (disc_remaining is not None and disc_remaining <= EXTENSION_LOW_REMAINING_THRESHOLD
+                       and attempt_discovery >= EXTENSION_MIN_PROGRESS_CHARS)
+
+    new_read_ceiling = (min((current_read_ceiling or 0) + TASK_READ_EXTENSION_INCREMENT, TASK_READ_ABSOLUTE_CEILING)
+                         if (obligation_missing and read_exhausted and current_read_ceiling is not None) else None)
+    new_disc_ceiling = (min((current_disc_ceiling or 0) + TASK_DISCOVERY_EXTENSION_INCREMENT, TASK_DISCOVERY_ABSOLUTE_CEILING)
+                         if (obligation_missing and disc_exhausted and current_disc_ceiling is not None) else None)
+    read_extension = (new_read_ceiling - current_read_ceiling) if (new_read_ceiling is not None
+                       and new_read_ceiling > current_read_ceiling) else 0
+    disc_extension = (new_disc_ceiling - current_disc_ceiling) if (new_disc_ceiling is not None
+                       and new_disc_ceiling > current_disc_ceiling) else 0
+
+    return {
+        "eligible": read_extension > 0 or disc_extension > 0,
+        "obligation_missing": obligation_missing,
+        "missing": [m["id"] for m in d.gate["missing"]] if d.gate.get("applicable") else [],
+        "task_read_remaining": read_remaining, "task_discovery_remaining": disc_remaining,
+        "attempt_read_chars": attempt_read, "attempt_discovery_chars": attempt_discovery,
+        "prior_read_ceiling": current_read_ceiling, "prior_discovery_ceiling": current_disc_ceiling,
+        "read_extension": read_extension, "discovery_extension": disc_extension,
+        "new_read_ceiling": current_read_ceiling + read_extension if read_extension else None,
+        "new_discovery_ceiling": current_disc_ceiling + disc_extension if disc_extension else None,
+    }
+
+
 def requirement_source_paths(policy, req_id: str) -> list:
     """The file paths (or ANY_SOURCE) a missing requirement/enum-requirement needs evidence from,
     resolved from the SAME policy object that produced the obligation in the first place -- never
