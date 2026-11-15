@@ -580,11 +580,24 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
         st.task_discovery_chars[wi.work_item_id] = _task_discovery_after
         st.task_read_chars[wi.work_item_id] = _task_read_after
         if att.terminal is not None:
+            # Phase 1.26: reservation leak check -- see swarm/team.py's own comment at the
+            # activity["attempt_discovery_reserved"] write site. Should be 0/0 whenever the
+            # hook released every reservation it made, on both the success and exception
+            # paths; a scratch harness and the live battery both check this.
+            _disc_reserved = activity.get("attempt_discovery_reserved", 0)
+            _read_reserved = activity.get("attempt_read_reserved", 0)
             att.terminal["budget"] = {
                 "attempt_discovery_chars": _attempt_discovery, "attempt_read_chars": _attempt_read,
                 "task_discovery_chars_before": _task_discovery_before, "task_read_chars_before": _task_read_before,
                 "task_discovery_chars_after": _task_discovery_after, "task_read_chars_after": _task_read_after,
                 "task_discovery_ceiling": T._DELEGATION_DISCOVERY_CEILING, "task_read_ceiling": T._DELEGATION_READ_CEILING,
+                "discovery_reserved_leaked": _disc_reserved, "read_reserved_leaked": _read_reserved,
+                "task_discovery_remaining": max(T._DELEGATION_DISCOVERY_CEILING - _task_discovery_after, 0),
+                "task_read_remaining": max(T._DELEGATION_READ_CEILING - _task_read_after, 0),
+                # Phase 1.29: durable evidence of any budget-contract violation this
+                # attempt's own activity dict recorded (swarm/team.py's own write site,
+                # just above its _reservation_amt check) -- empty list means none.
+                "budget_contract_violations": activity.get("budget_contract_violations", []),
             }
         if led is not None:
             try:     # terminal facts + canonical text + full trace, even for an invalidated attempt (history);

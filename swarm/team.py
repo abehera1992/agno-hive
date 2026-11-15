@@ -20890,6 +20890,112 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # the third, essential read (inventoryApi.ts) outright. Splitting the accounting does
     # not raise either ceiling's number -- see _DELEGATION_DISCOVERY_CEILING's own comment.
     delegation_discovery_chars: dict[str, int] = {}
+    # Phase 1.26: in-flight reservations, same keying as the committed dicts above.
+    # Phase 1.25's own ceiling check compared only COMMITTED (already-returned) totals
+    # against the ceiling, checked BEFORE a call starts -- a soft stop: one in-flight
+    # call already admitted can still push the committed total over the ceiling by up
+    # to its own size once it returns (live T11/T13a: task_read_chars_after reached
+    # 112,461/120,838 against a 90,000 ceiling). Phase 1.26 admits a call only if
+    # committed + already-reserved + this call's own worst-case size would stay AT or
+    # under the ceiling -- see _reserve_worst_case() below for the per-tool sizing and
+    # DOCS.md "Phase 1.26 hard budget admission" for the full design. Reservations are
+    # released (not committed) on refusal/exception and reconciled to the actual
+    # returned size on success, so committed totals still mean exactly what Phase
+    # 1.23-1.25 relied on them meaning.
+    delegation_discovery_reserved: dict[str, int] = {}
+    delegation_read_reserved: dict[str, int] = {}
+    # One asyncio.Lock per logical delegation key, created on first use. This process is
+    # single-worker/single-event-loop (uvicorn.run with no workers= override, confirmed
+    # in the Phase 1.26 investigation) and agno's own arun_function_calls runs same-turn
+    # tool calls concurrently via asyncio.gather -- so two reads from ONE model turn CAN
+    # race on the same norm_agent_key's reserved/committed dicts. The critical section
+    # below (check remaining, then reserve) contains no `await`, so cooperative
+    # scheduling alone would already prevent a race; the lock is kept anyway because
+    # that invariant is easy for a future edit to break silently, and the lock makes it
+    # structurally impossible instead of merely currently-true. A per-process dict is
+    # enough -- there is only one process to share it with.
+    _budget_locks: dict[str, "asyncio.Lock"] = {}
+
+    def _budget_lock(key: str) -> "asyncio.Lock":
+        lk = _budget_locks.get(key)
+        if lk is None:
+            lk = _budget_locks[key] = asyncio.Lock()
+        return lk
+
+    def _reserve_worst_case(fn_name: str, call_args: dict) -> int:
+        """Worst-case chars THIS call could return, grounded in hive-mcp's own real,
+        ENFORCED caps (hive-mcp/tools/context.py) -- never an average/estimated figure.
+        Every categorized tool's output passes through a known, code-level bound:
+          - search_files, search_files_batch, get_files_batch: each wrapped in hive-mcp's
+            own _cap(), hard-bounded to SEARCH_MAX_OUTPUT_CHARS (20,000 by its own
+            config default) regardless of how many sub-results or globs feed it.
+          - count_matches: Phase 1.26 reserved 3,000 chars against a 50-LINE cap that
+            was never a character maximum. Phase 1.29 fixed the producer directly
+            (hive-mcp/tools/context.py): the per-file breakdown is now built
+            incrementally and capped at a real, enforced _MAX_COUNT_MATCHES_CHARS
+            (3,000) -- the TOTAL count itself was always fully evaluated (ripgrep's own
+            --count-matches mode searches every file before returning; only the
+            per-file BREAKDOWN display could ever have been partial), so no accuracy
+            question existed there, only an output-size one.
+          - list_directory_tree: explicitly unbounded by hive-mcp's own design before
+            Phase 1.29 (its docstring stated "no result cap"). Phase 1.29 fixed the
+            producer directly: a real, enforced _MAX_TREE_CHARS (8,000) cap, built
+            incrementally over the deterministic pre-order traversal, with an explicit
+            resume_after parameter for continuation.
+          - get_file_content, ANY call shape: Phase 1.26/1.28 reserved
+            _MAX_FULL_BYTES_LOCAL*1.2 (48,000), on the assumption that a SOURCE-char
+            bound (_MAX_FULL_BYTES = 40,000) implies a similar bound on the RENDERED
+            (cat -n numbered) text. Phase 1.29 proved this false, mathematically and
+            empirically, not from a representative file: for N source chars split into
+            the maximum possible line count (every char a newline -> N empty lines),
+            rendered size is exactly 8*N-1 -- 319,999 for N=40,000, 6.67x the old
+            reservation. The skeleton path (reached once a file EXCEEDS
+            _MAX_FULL_BYTES) has no upper bound on source size at all, so was worse in
+            principle. Phase 1.29 fixed hive-mcp's producer side directly: every
+            get_file_content render path (whole-file, the "fits whole" ranged
+            shortcut, and the skeleton) now stops at _MAX_RENDERED_CHARS (60,000,
+            hive-mcp/tools/context.py) via the same incremental, whole-line-boundary
+            truncation Phase 1.28 already used for genuinely-ranged reads (capped at
+            the smaller _MAX_RANGED_READ_CHARS, 20,000, since 60,000 > 20,000 that cap
+            was and remains covered by the larger figure). The reservation below is
+            updated to match the NEW real maximum, not the old, now-disproven one.
+        """
+        if fn_name in ("search_files", "search_files_batch", "get_files_batch"):
+            return 20_000
+        if fn_name == "count_matches":
+            return _COUNT_MATCHES_RESERVED
+        if fn_name == "list_directory_tree":
+            return _LIST_TREE_RESERVED
+        if fn_name == "get_file_content":
+            # Phase 1.29b: _MAX_RENDERED_CHARS_LOCAL (60,000) alone, no added margin.
+            # Phase 1.29 reserved +2,000 as an EMPIRICAL margin for the header/status
+            # text wrapped around the capped body (measured against near-worst-case
+            # path lengths, never proven). Phase 1.29b closed that gap at the producer:
+            # hive-mcp's three get_file_content render paths (whole-file, the "fits
+            # whole" ranged shortcut, and the genuinely-ranged capped path) now all use
+            # _fit_complete_response, a fixed-point shrink that guarantees the COMPLETE
+            # response -- header, status, continuation text, and body together -- fits
+            # _MAX_RENDERED_CHARS (or _MAX_RANGED_READ_CHARS for the ranged path, which
+            # is smaller and already covered by this same larger figure). The
+            # reservation now matches the producer's own proven maximum exactly, with
+            # nothing left to a measured-but-unproven margin.
+            return _MAX_RENDERED_CHARS_LOCAL
+        return 0  # uncategorized tool (e.g. lightrag_query) -- excluded from both ceilings, unchanged since Phase 1.24
+
+    # Mirrors hive-mcp/tools/context.py's own _MAX_FULL_BYTES (40,000) and (Phase 1.29)
+    # _MAX_RENDERED_CHARS (60,000), read directly from its source rather than duplicated
+    # as a silent guess -- if hive-mcp's own constants change, these local mirrors need
+    # the same update, exactly the risk _reserve_worst_case's own docstring already names.
+    _MAX_FULL_BYTES_LOCAL = 40_000
+    _MAX_RENDERED_CHARS_LOCAL = 60_000
+    # Phase 1.29: mirrors hive-mcp's own newly-enforced _MAX_COUNT_MATCHES_CHARS exactly
+    # -- a real producer-side cap now exists (see that constant's own comment in
+    # hive-mcp/tools/context.py), so this reservation matches it precisely rather than
+    # padding defensively for an unproven figure.
+    _COUNT_MATCHES_RESERVED = 3_000
+    # Phase 1.29: mirrors hive-mcp's own newly-enforced _MAX_TREE_CHARS exactly, for the
+    # same reason.
+    _LIST_TREE_RESERVED = 8_000
     # Phase 1.00 (B1/B2): successful investigation tool calls per member in the CURRENT
     # delegation, reset with delegation_read_chars. A call the model made to a tool that
     # does not exist never reaches this hook, and a tool that returned an error result is
@@ -21259,8 +21365,15 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         # evidence actually needed ever ran (the live T13a incident this closes).
         _ceiling_cat = ("discovery" if function_name in _DISCOVERY_TOOLS_FOR_CEILING
                         else "read" if function_name in _SOURCE_READ_TOOLS_FOR_CEILING else None)
+        # Phase 1.26: reservation made for THIS call, released in the finally-equivalent
+        # paths below (exception, or success-reconciliation) -- None means "this call was
+        # never admitted through the reservation path" (cached hit, or an uncategorized
+        # tool), so nothing needs releasing for it.
+        _reservation_cat = None
+        _reservation_amt = 0
         if _ceiling_cat is not None and cache_key not in cache:
             _chars_dict = delegation_discovery_chars if _ceiling_cat == "discovery" else delegation_read_chars
+            _reserved_dict = delegation_discovery_reserved if _ceiling_cat == "discovery" else delegation_read_reserved
             _ceiling = _DELEGATION_DISCOVERY_CEILING if _ceiling_cat == "discovery" else _DELEGATION_READ_CEILING
             # Phase 1.25: task-scoped budget. `activity["task_discovery_offset"]`/
             # `["task_read_offset"]` is what THIS SAME logical task (one work_item_id,
@@ -21274,12 +21387,31 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             # reportable, exactly as required.
             _task_offset_key = "task_discovery_offset" if _ceiling_cat == "discovery" else "task_read_offset"
             _task_offset = (activity or {}).get(_task_offset_key, 0)
-            _dl_read = _chars_dict.get(norm_agent_key, 0) + _task_offset
-            if _dl_read >= _ceiling:
+            _label = "discovery" if _ceiling_cat == "discovery" else "read"
+            _worst_case = _reserve_worst_case(function_name, args)
+            # Phase 1.26: hard admission. Reserve this call's own worst-case size BEFORE
+            # it runs and check committed + already-reserved + this reservation against
+            # the ceiling -- not just committed-so-far as Phase 1.25 did, which let one
+            # in-flight call push the committed total past the ceiling by up to its own
+            # size once it returned (live T11/T13a overshoot, see the dict's own comment
+            # above). The lock makes the check-then-reserve pair atomic against another
+            # tool call from the SAME model turn racing in via asyncio.gather.
+            async with _budget_lock(f"{norm_agent_key}:{_ceiling_cat}"):
+                _committed = _chars_dict.get(norm_agent_key, 0)
+                _reserved = _reserved_dict.get(norm_agent_key, 0)
+                _projected = _committed + _reserved + _task_offset + _worst_case
+                if _worst_case == 0:
+                    _admit = True  # should not happen for a categorized tool; fail open rather than wedge the run
+                elif _projected > _ceiling:
+                    _admit = False
+                else:
+                    _admit = True
+                    _reserved_dict[norm_agent_key] = _reserved + _worst_case
+            if not _admit:
                 _rkey = (norm_agent_key, _ceiling_cat)
                 read_refusals[_rkey] = read_refusals.get(_rkey, 0) + 1
                 _n = read_refusals[_rkey]
-                _label = "discovery" if _ceiling_cat == "discovery" else "read"
+                _remaining = max(_ceiling - _committed - _reserved - _task_offset, 0)
                 # Escalate rather than repeat. The model demonstrably reads this string
                 # as an ordinary tool result and calls again; forcing text-only is the
                 # only lever here that ends the turn instead of inviting another try.
@@ -21296,16 +21428,25 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                         "report from what you already have, copying enumerable findings "
                         "verbatim, and name what you did not examine."
                     ))
-                print(f"[team] {agent_key or 'coordinator'} has spent {_dl_read:,} {_label} "
-                      f"chars in this delegation (ceiling {_ceiling:,}) — "
-                      f"refusing further {_label} calls until it reports "
-                      f"(refusal {_n}/{_MAX_READ_REFUSALS})", flush=True)
+                print(f"[team] {agent_key or 'coordinator'} would exceed the {_label} ceiling "
+                      f"-- committed {_committed:,} + reserved {_reserved:,} + task offset "
+                      f"{_task_offset:,} + this call's worst case {_worst_case:,} > "
+                      f"ceiling {_ceiling:,} (remaining allowance {_remaining:,}) — "
+                      f"refusing (refusal {_n}/{_MAX_READ_REFUSALS})", flush=True)
+                # BUDGET_EXHAUSTED_OR_TOO_LARGE: the one reason this refusal can mean,
+                # distinct from the unrelated refusal paths elsewhere in this hook that
+                # already carry their own distinct reasons -- a missing source
+                # ("File not found", produced by hive-mcp itself, not this hook) and a
+                # tool execution failure (an exception, handled separately below) can
+                # never reach this message, so a model cannot mistake this for either.
                 return _refuse(agent, function_name, args, f"{_label}_ceiling", (
-                    f"REPORT NOW: you have spent {_dl_read:,} characters on {_label} calls "
-                    f"in this one delegation, which is the {_label} ceiling. No further "
-                    f"{_label} call will run until you report. This refusal means the "
-                    f"BUDGET is spent, not that anything you were looking for does not "
-                    f"exist -- never report an absence based on this refusal alone.\n"
+                    f"REFUSED (budget): this {_label} call's worst-case size "
+                    f"(~{_worst_case:,} chars) would exceed the remaining {_label} "
+                    f"allowance ({_remaining:,} of {_ceiling:,} chars left in this task, "
+                    f"across the initial attempt and any recovery). This refusal means "
+                    f"the BUDGET is spent or this one call is too large for what remains "
+                    f"-- never report an absence based on this refusal alone; it is not "
+                    f"a signal that anything you were looking for does not exist.\n"
                     f"Write up what you have ALREADY read, and copy enumerable findings "
                     f"verbatim — every route decorator, class declaration or column you "
                     f"actually saw, exactly as it appeared. A report that summarises a "
@@ -21315,6 +21456,7 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     f"to again if more is needed, and this ceiling resets when that "
                     f"happens — so an honest partial report costs you nothing."
                 ))
+            _reservation_cat, _reservation_amt = _ceiling_cat, _worst_case
 
         if function_name == "get_files_batch" and cache_key not in cache:
             _nb = batch_counts.get((norm_agent_key, "get_files_batch"), 0)
@@ -21337,8 +21479,28 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         if is_fresh_fetch:
             try:
                 result = await function(**args)
-            except Exception:
+            except BaseException:
+                # Phase 1.27: BaseException, not Exception. asyncio.CancelledError has
+                # inherited only from BaseException (not Exception) since Python 3.8,
+                # specifically so an `except Exception:` block does NOT catch it --
+                # which meant a tool call cancelled mid-flight (e.g. the liveness
+                # watchdog killing a stalled attempt while a read was in-flight) bypassed
+                # this whole block, including the reservation release below, and leaked
+                # the reservation for the rest of that one attempt (reproduced in a
+                # scratch harness: a cancelled call's worst-case reservation was never
+                # released, and a correctly-sized follow-up call was then wrongly
+                # refused with "0 of 90,000 chars left"). `raise` below re-raises the
+                # exact exception caught, unchanged -- this does not swallow or alter
+                # cancellation semantics, it only runs cleanup before the same exception
+                # continues propagating, same as a `finally` block would.
                 _count_investigation_call(agent, function_name, args, "", ok=False)   # D1, see above
+                # Phase 1.26: release this call's reservation -- the call never returned,
+                # so no content was served and nothing should be committed, but the
+                # worst-case hold it placed on the budget must not leak into future calls
+                # ("an abandoned attempt must not permanently leak reserved capacity").
+                if _reservation_cat is not None:
+                    _rd = delegation_discovery_reserved if _reservation_cat == "discovery" else delegation_read_reserved
+                    _rd[norm_agent_key] = max(0, _rd.get(norm_agent_key, 0) - _reservation_amt)
                 raise
             cache[cache_key] = result
             cache_origin_generation[cache_key] = generation
@@ -21374,12 +21536,64 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             # also eat into either character ceiling here). Before this split EVERY
             # fresh fetch through this hook -- including tools never checked against the
             # ceiling -- inflated the one shared delegation_read_chars counter.
+            # Phase 1.28: len(_res_text), not len(str(result)) -- an MCP tool result
+            # reaches this hook as a wrapper object, and str(result) measures that
+            # wrapper's own repr, not the real text (confirmed: a 25,709-char real file
+            # logged as 26,709+ via len(str(result)), per _result_text's own docstring
+            # above). This only touches the two counters that feed the 90,000-char
+            # discovery/read ceiling admission math -- the SEPARATE read_chars/450,000
+            # member-budget counter and diagnostic logging below are intentionally left
+            # on their existing len(str(result)) convention; changing those is outside
+            # this phase's narrow scope and does not affect the hard-ceiling guarantee
+            # Phase 1.26-1.28 is about. The prior len(str(result)) usage here was never
+            # a safety violation (it over-counted, i.e. was MORE conservative than the
+            # real ceiling needed), only an imprecision this makes exact.
             if _ceiling_cat == "discovery":
                 delegation_discovery_chars[norm_agent_key] = (
-                    delegation_discovery_chars.get(norm_agent_key, 0) + len(str(result)))
+                    delegation_discovery_chars.get(norm_agent_key, 0) + len(_res_text))
             elif _ceiling_cat == "read":
                 delegation_read_chars[norm_agent_key] = (
-                    delegation_read_chars.get(norm_agent_key, 0) + len(str(result)))
+                    delegation_read_chars.get(norm_agent_key, 0) + len(_res_text))
+            # Phase 1.29: defensive contract-violation alarm -- NOT a substitute for the
+            # producer-side caps this phase added to every categorized tool (hive-mcp's
+            # own real, enforced maxima). If some path still returns more than its own
+            # worst-case reservation, this must never be silently absorbed: (1) the
+            # actual, real len(_res_text) is ALREADY what was just committed above, not
+            # the smaller reservation estimate -- so every FUTURE admission check on
+            # this task already sees the true, inflated total and refuses sooner,
+            # exactly "preventing subsequent admissions from treating the task as safely
+            # within its ceiling" without any extra mechanism; (2) this block only adds
+            # the missing piece: a loud, explicit diagnostic (never raised as an
+            # exception -- that would alter cancellation/exception propagation
+            # semantics this phase must not touch) and durable evidence surfaced via the
+            # SAME `activity` extension point run_attempt() already reads, so a
+            # violation is visible in the ledger's own budget record, not just a log line.
+            if _reservation_cat is not None and len(_res_text) > _reservation_amt:
+                _violation_msg = (
+                    f"BUDGET CONTRACT VIOLATION: {function_name} returned "
+                    f"{len(_res_text):,} chars, exceeding its own {_reservation_amt:,}-char "
+                    f"reservation ({_reservation_cat} category) -- a producer-side cap "
+                    f"this phase added did not hold. The real, larger amount has already "
+                    f"been committed (never silently truncated), so this task's "
+                    f"remaining budget is already correctly reduced by the full real "
+                    f"amount; this message exists to surface a producer-side bound that "
+                    f"needs re-verification, not to hide the overshoot."
+                )
+                print(f"[team] {_violation_msg}", flush=True)
+                if activity is not None:
+                    activity["budget_contract_violations"] = activity.get("budget_contract_violations", []) + [{
+                        "tool": function_name, "category": _reservation_cat,
+                        "reserved": _reservation_amt, "actual": len(_res_text),
+                    }]
+            # Phase 1.26: release this call's reservation now that the actual size is
+            # known and committed above -- "accounting must reflect actual content
+            # consumed/returned, not merely requested size" (the committed charge, just
+            # above, already does; this only retires the worst-case HOLD the admission
+            # check placed before the call ran, so the next call's admission check sees
+            # committed-to-date rather than committed-to-date-plus-a-now-stale estimate).
+            if _reservation_cat is not None:
+                _rd = delegation_discovery_reserved if _reservation_cat == "discovery" else delegation_read_reserved
+                _rd[norm_agent_key] = max(0, _rd.get(norm_agent_key, 0) - _reservation_amt)
             # Phase 1.25: expose this attempt's OWN (0-based, per-delegation) running totals to
             # the caller via the existing `activity` extension point -- overwritten on every
             # charge, so by the time this attempt ends it holds the final per-attempt figure.
@@ -21388,6 +21602,12 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             if activity is not None:
                 activity["attempt_discovery_chars"] = delegation_discovery_chars.get(norm_agent_key, 0)
                 activity["attempt_read_chars"] = delegation_read_chars.get(norm_agent_key, 0)
+                # Phase 1.26: should settle back to 0 by the time the attempt ends --
+                # a nonzero value here after the last tool call means a reservation leaked
+                # (released neither on success-reconciliation nor on the exception path),
+                # which both the scratch harness and the final live battery check for.
+                activity["attempt_discovery_reserved"] = delegation_discovery_reserved.get(norm_agent_key, 0)
+                activity["attempt_read_reserved"] = delegation_read_reserved.get(norm_agent_key, 0)
             # Log the running total on every fresh read, not only when the budget trips
             # (2026-08-23). The budget shipped without this and promptly went unmeasured:
             # battery T12 stalled with Researcher at 40/50 tool calls and the guard

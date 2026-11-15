@@ -67,15 +67,34 @@ _RG_EXCLUDES = rg_args()          # already in ["--glob", "!pat", ...] form
 _MAX_OUTPUT_CHARS = config.SEARCH_MAX_OUTPUT_CHARS
 
 
-def _cap(text: str) -> str:
+def _cap(text: str, narrow_hint: str = "Narrow `pattern` or pass a `glob_filter` such as '**/*.tsx'.") -> str:
     """Clamp a tool result to _MAX_OUTPUT_CHARS. Applied on EVERY return path, including
     the pure-Python fallback: max_results bounds the number of LINES, not their length,
-    and one matching line in a minified bundle or a JSON blob can be megabytes."""
+    and one matching line in a minified bundle or a JSON blob can be megabytes.
+
+    Phase 1.29b: a raw text[:_MAX_OUTPUT_CHARS] slice (the pre-1.29b behavior) can cut a
+    match line, a file path, or a batch section header mid-way -- a truncated "api/ser"
+    with no visible continuation is not exact source evidence, it is a corrupted
+    fragment that happens to look like one. Every caller of this function joins its
+    results with "\\n" or "\\n\\n" (match lines; batch sections, which are themselves
+    "\\n\\n"-separated and so still bounded correctly by a "\\n" search), so finding the
+    last complete line via _cap_rendered_text (the same mechanism the skeleton path
+    already uses) preserves exact, uncut evidence for every caller, not just
+    get_file_content's own tools.
+
+    `narrow_hint` lets a caller substitute tool-appropriate advice (get_files_batch
+    takes `paths`, not `pattern`/`glob_filter` -- the default wording is wrong for it).
+    """
     if len(text) <= _MAX_OUTPUT_CHARS:
         return text
-    return (text[:_MAX_OUTPUT_CHARS]
-            + f"\n... TRUNCATED at {_MAX_OUTPUT_CHARS} chars. Narrow `pattern` or pass a "
-              f"`glob_filter` such as '**/*.tsx'.")
+    capped, _ = _cap_rendered_text(text, _MAX_OUTPUT_CHARS)
+    return (capped
+            + f"\n... STATUS: TRUNCATED at {_MAX_OUTPUT_CHARS} chars (shown above is complete, "
+              f"uncut lines only -- nothing above was cut mid-line or mid-record). {narrow_hint} "
+              f"Do NOT conclude that something is absent or that this is a complete "
+              f"enumeration based on this truncated result alone -- it may still exist "
+              f"past this cutoff; narrow the search or inspect further before reporting "
+              f"an absence or a complete count.")
 
 _CONTEXT_FILES = [
     "DOCS.md", "README.md", "CONTRIBUTING.md",
@@ -378,6 +397,167 @@ def _regex_skeleton(src: str):
     return _render_skeleton(keep) if keep else None
 
 
+# Phase 1.28: a ranged get_file_content(path, offset, limit) had NO output-size
+# enforcement at all -- `limit` bounds LINE COUNT only, so limit=0 (meaning "to end of
+# file") on a large file returns everything from `offset` to EOF regardless of size, and
+# even a bounded `limit` of ordinary lines can still produce an arbitrarily large result
+# if a single line is very long (a minified bundle, a long JSON blob, one pathological
+# line). The application side (swarm/team.py) had to guess a worst-case reservation from
+# an estimated bytes-per-line figure, which is not a real upper bound on anything this
+# function can actually return. Reusing _MAX_OUTPUT_CHARS (the SAME real, enforced bound
+# search_files/search_files_batch/get_files_batch already use via _cap()) rather than
+# inventing a new constant -- Phase 1.28's own "narrowest safe solution" requirement, and
+# it makes every budget-accounted tool's hard cap a single, auditable number.
+_MAX_RANGED_READ_CHARS = _MAX_OUTPUT_CHARS
+
+
+def _bounded_ranged_body(lines: list[str], start_lineno: int, max_chars: int):
+    """Build cat -n numbered output for `lines` (already the requested [start:end]
+    slice), stopping at the last WHOLE line that keeps the total at or under max_chars.
+    Never cuts a line in the middle -- the returned last_lineno is always a real,
+    complete line's number, so offset/limit semantics for a continuation call stay
+    exact. The one unavoidable exception: if a SINGLE line's own numbered text already
+    exceeds max_chars (a pathological very-long line), that one line's own content is
+    truncated with an explicit inline marker, since otherwise a single line could never
+    be served at all and no forward progress on this path would be possible.
+
+    Returns (body_text, last_included_lineno, truncated: bool, line_itself_truncated: bool).
+    """
+    out_parts: list[str] = []
+    total = 0
+    last_lineno = start_lineno - 1
+    truncated = False
+    line_itself_truncated = False
+    for i, line in enumerate(lines, start=start_lineno):
+        numbered = f"{i:>6}\t{line}"
+        piece_len = len(numbered) + (1 if out_parts else 0)  # +1 for the joining "\n"
+        if total + piece_len > max_chars:
+            if not out_parts:
+                # The very first line alone exceeds the cap -- truncate ITS content so
+                # at least one real, correctly-numbered line is always returned. The
+                # marker's own length depends on the truncation COUNT, which depends on
+                # how much is clipped -- a fixed-point computation rather than a single
+                # guessed margin, so the final result is provably within max_chars
+                # regardless of how large `line` or its digit count is.
+                prefix_len = len(f"{i:>6}\t")
+                budget_for_line = max(max_chars - prefix_len - 80, 100)
+                clipped = line[:budget_for_line]
+                marker = f"...[LINE TRUNCATED: {len(line) - len(clipped):,} more char(s) on this line not shown]"
+                # If the marker itself (whose own length depends on a count that only
+                # shrinks as more is clipped) still overflows, shrink the clip once more
+                # -- two iterations always converge since each shrink only removes chars.
+                while prefix_len + len(clipped) + len(marker) > max_chars and len(clipped) > 0:
+                    clipped = clipped[:-200]
+                    marker = f"...[LINE TRUNCATED: {len(line) - len(clipped):,} more char(s) on this line not shown]"
+                out_parts.append(f"{i:>6}\t{clipped}{marker}")
+                last_lineno = i
+                line_itself_truncated = True
+            truncated = True
+            break
+        out_parts.append(numbered)
+        total += piece_len
+        last_lineno = i
+    return "\n".join(out_parts), last_lineno, truncated, line_itself_truncated
+
+
+# Phase 1.29: a WHOLE-FILE render (via _numbered_lines, either path below) is NOT
+# bounded by _MAX_FULL_BYTES the way its name suggests. _MAX_FULL_BYTES bounds the
+# SOURCE character count, but the per-line rendering overhead (a 6-char field + a tab
+# per line) is paid once per LINE, not once per source character -- a pathological
+# source distribution (many short or empty lines) can multiply the rendered size far
+# beyond the source size. Proven mathematically and empirically, not from a
+# representative file: for N source chars split into the maximum possible number of
+# lines (every character a newline, producing N empty lines), the rendered size is
+# exactly 8*N - 1 chars. At N = _MAX_FULL_BYTES (40,000), that is 319,999 chars -- 6.67x
+# the pre-1.29 reservation (48,000), which was sized from typical (~45-60 chars/line)
+# real-project line lengths, never proven as a maximum. The skeleton path (below) is
+# worse in principle: it has NO upper bound on source size at all (it is only reached
+# once a file already exceeds _MAX_FULL_BYTES), so the same per-line overhead risk is
+# unbounded above, not merely 6.67x.
+#
+# _MAX_RENDERED_CHARS is a SEPARATE, larger cap from the ranged-read cap
+# (_MAX_RANGED_READ_CHARS, 20,000) -- reusing that smaller figure here would truncate
+# ordinary whole-file reads of real files already in this project close to the
+# _MAX_FULL_BYTES threshold (confirmed: vouchers_api.py is 37,852 bytes, models.py is
+# 32,437 -- both well above 20,000 and both cited elsewhere in this codebase as files
+# that must return whole). 60,000 comfortably covers every real file in this project up
+# to the 40,000-char threshold even at a generous 1.5x rendering overhead (observed
+# real overhead is roughly 1.1-1.2x), while still being a real, enforced, mathematically
+# bounded maximum rather than an unproven estimate -- it is enforced exactly like the
+# Phase 1.28 ranged-read cap, by stopping at the last whole line/item at or under the
+# limit, never by raising the 90,000-char task ceiling itself.
+_MAX_RENDERED_CHARS = 60_000
+
+# Phase 1.29: count_matches' own per-file BREAKDOWN (not its TOTAL, which ripgrep
+# always computes completely -- see count_matches' own comment) had a 50-LINE cap but
+# no character maximum; a long real path or high-digit count could still push 50 lines
+# well past a small reservation. 3,000 comfortably covers dozens of typical-length
+# path:count lines (a real path in this project rarely exceeds ~80-100 chars) while
+# being a genuine, enforced maximum, not an estimate.
+_MAX_COUNT_MATCHES_CHARS = 3_000
+
+# Phase 1.29: list_directory_tree's own docstring used to claim "no result cap" --
+# explicitly unbounded by design, bounded only by this project's own empirically
+# measured saturation point (4,609 chars at depth 10). That measurement is real for
+# THIS project's directory count, but is not an architectural limit for any other
+# project or depth. 8,000 is the prior application-side reservation's own figure,
+# reused here as the actual enforced producer-side cap rather than an estimate.
+_MAX_TREE_CHARS = 8_000
+
+
+def _fit_complete_response(lines: list[str], start_lineno: int, max_chars: int, make_wrapper):
+    """Phase 1.29b: guarantee the COMPLETE response (header + status + continuation
+    metadata + body) fits max_chars -- not merely the body in isolation. Phase 1.29's
+    own get_file_content fix bounded the body via _bounded_ranged_body but reserved an
+    EMPIRICAL, unproven +2,000-char margin on the application side for the header/
+    status text added around it (measured, not guaranteed, to stay under 2,000 for
+    near-worst-case path lengths). This closes that gap the same way list_directory_tree
+    and count_matches already close theirs (Phase 1.29): a fixed-point shrink. Start
+    with the full budget for the body, build the complete wrapped response, and if it
+    is still over max_chars (because the header/status text itself, which can embed a
+    long relative_path, consumed some of the budget), reduce the body's own budget by
+    exactly the overage and rebuild -- this converges in at most 2 iterations, since the
+    second attempt's body budget already accounts for the first attempt's real overhead.
+
+    `make_wrapper(body, last_lineno, truncated, line_itself_truncated) -> str` must
+    return the complete response text for that body.
+    """
+    body_budget = max_chars
+    for _ in range(4):  # convergence guard; 2 iterations suffice in every real case
+        body, last_lineno, truncated, line_itself_truncated = _bounded_ranged_body(
+            lines, start_lineno, body_budget)
+        full = make_wrapper(body, last_lineno, truncated, line_itself_truncated)
+        overage = len(full) - max_chars
+        if overage <= 0:
+            return full
+        body_budget = max(body_budget - overage, 0)
+    # Should not be reached in practice (converges in <=2 iterations); if it ever is,
+    # the last attempt is still the smallest body_budget tried, so return it rather
+    # than loop forever or raise -- never silently exceed max_chars without reporting.
+    return full
+
+
+def _cap_rendered_text(text: str, max_chars: int) -> tuple[str, bool]:
+    """Post-hoc truncation of an ALREADY-RENDERED cat -n style block (every line of the
+    form '{number-or-blank:>6}\\t{content}', joined by '\\n') to the last COMPLETE line
+    at or under max_chars. Used where the renderer (e.g. _py_skeleton/_regex_skeleton,
+    which already call _render_skeleton internally and return a finished string) is not
+    easily restructured to build incrementally the way _bounded_ranged_body does for a
+    fresh line list. Finds the last '\\n' at or before max_chars so a line is never cut
+    mid-content -- the one exception, same as _bounded_ranged_body's own single-line
+    case, is a pathological FIRST line alone already exceeding max_chars, which is left
+    whole here rather than clipped (the skeleton's first item is a real citable
+    signature line, not raw arbitrary source text, so splitting it carries a higher risk
+    of producing a misleading partial signature than returning it whole slightly over
+    budget once). Returns (possibly-truncated text, was_truncated)."""
+    if len(text) <= max_chars:
+        return text, False
+    cut = text.rfind("\n", 0, max_chars)
+    if cut <= 0:
+        return text, False  # a single first line already exceeds max_chars -- return it whole, not empty
+    return text[:cut], True
+
+
 def _numbered_lines(lines: list[str], start: int) -> str:
     """Prefix each line with its 1-based file line number (cat -n style).
 
@@ -578,14 +758,63 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
     # the content -- the model paginates because it believes more pages exist, so it
     # has to be told plainly that they do not.
     if (offset or limit) and len(data) <= _MAX_FULL_BYTES:
-        total = len(data.splitlines())
-        return (
-            f"# {relative_path} — offset/limit ignored: the whole file is {len(data):,} "
-            f"bytes ({total} lines) and fits in one read, so all of it is below.\n"
-            f"# There are NO further pages. Do not call this again with another offset "
-            f"or limit for this file.\n"
-            + _numbered_lines(data.splitlines(), 1)
-        )
+        all_lines = data.splitlines()
+        total = len(all_lines)
+        # Phase 1.29a: render from the CALLER's own offset, not always from line 1.
+        # This branch's name ("offset/limit ignored") and its own pre-1.29 behavior
+        # ignored offset/limit because the file's SOURCE fit one read -- but Phase
+        # 1.29's own truncation fix (added because RENDERED size can still exceed the
+        # cap) told a caller to "continue with offset=X" while this line always passed
+        # a hardcoded 1 as the start line, so a continuation call landed right back at
+        # line 1 and could never progress. Confirmed via a mechanism-level scratch test
+        # (Phase 1.29a) on real EkamApp files: a 5,000-char cap on business_admin_api.py
+        # (20,372 bytes) retrieved only 116 of 543 real lines before detecting no
+        # forward progress and stopping -- every "continuation" call was byte-identical
+        # to the first. Honoring `offset` here fixes it while being a complete no-op for
+        # every pre-1.29a caller: offset=0 (the only value any caller used before this
+        # fix existed, since continuation never worked) slices all_lines[0:] == all_lines,
+        # identical to before.
+        _render_start = max(offset, 0)
+
+        def _wrap1(body, last_lineno, size_truncated, line_itself_truncated):
+            if size_truncated:
+                next_offset = last_lineno
+                return (
+                    f"# {relative_path} — offset/limit ignored: the whole file is {len(data):,} "
+                    f"bytes ({total} lines) and fits in one read's SOURCE size, but its "
+                    f"RENDERED text exceeded the {_MAX_RENDERED_CHARS:,}-char output cap.\n"
+                    f"# STATUS: TRUNCATED -- lines {_render_start + 1}..{last_lineno} of {total} shown "
+                    f"({'the last line was also too long and was clipped' if line_itself_truncated else 'all shown lines are complete, uncut'}).\n"
+                    f"# Continue with offset={next_offset}, limit=200 to get the rest. Do NOT "
+                    f"conclude that anything is absent from this file based on this truncated "
+                    f"portion alone -- the remaining lines may contain it; read them before "
+                    f"reporting an absence.\n"
+                    + body
+                )
+            if _render_start > 0:
+                # Phase 1.29a: this IS a continuation call (resuming after a prior
+                # truncation) that happens to complete the file on this round -- say so
+                # accurately rather than the single-call wording below, which would
+                # misstate this as "fits in one read."
+                return (
+                    f"# {relative_path} — lines {_render_start + 1}..{total} of {total} "
+                    f"(STATUS: COMPLETE -- this continuation reaches the end of the file).\n"
+                    f"# There are NO further pages.\n"
+                    + body
+                )
+            return (
+                f"# {relative_path} — offset/limit ignored: the whole file is {len(data):,} "
+                f"bytes ({total} lines) and fits in one read, so all of it is below.\n"
+                f"# There are NO further pages. Do not call this again with another offset "
+                f"or limit for this file.\n"
+                + body
+            )
+
+        # Phase 1.29b: _fit_complete_response guarantees the COMPLETE text (this
+        # wrapper's header/status + the body) fits _MAX_RENDERED_CHARS -- replacing
+        # Phase 1.29's reliance on an empirical, unproven application-side margin for
+        # this header/status overhead.
+        return _fit_complete_response(all_lines[_render_start:], _render_start + 1, _MAX_RENDERED_CHARS, _wrap1)
 
     if offset or limit:
         lines = data.splitlines()
@@ -618,26 +847,110 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
                 f"# You have already seen everything this file contains — move on, or\n"
                 f"# re-read an EARLIER range with offset < {len(lines)}."
             )
-        body = _numbered_lines(lines[start:end], start + 1)
-        more = "" if end >= len(lines) else (
-            f"\n# ── {len(lines) - end} more line(s) below; continue with "
-            f"offset={end}, limit={limit or 200} ──"
-        )
-        at_end = "\n# ── END OF FILE ──" if end >= len(lines) else ""
-        return (f"# {relative_path} — lines {start}..{min(end, len(lines))} "
-                f"of {len(lines)}\n{body}{more}{at_end}")
+        # Phase 1.28: hard output-size enforcement. Walk the requested slice and stop at
+        # the last WHOLE line that keeps the result at or under _MAX_RANGED_READ_CHARS --
+        # `limit` alone (a line count) was never a real bound on output size, since lines
+        # vary in length and limit=0 means "to end of file" regardless of how far that is.
+        def _wrap2(body, last_lineno, size_truncated, line_itself_truncated):
+            if size_truncated:
+                # STATUS is a machine-readable, literal token (not prose) -- the Researcher
+                # must not be able to mistake this for a complete requested range. The
+                # continuation line reuses the EXISTING offset/limit interface, so resuming
+                # needs no new tool or parameter.
+                next_offset = last_lineno  # 0-based: last_lineno is 1-based last included line
+                remaining = len(lines) - next_offset
+                note = (
+                    f"\n# STATUS: TRUNCATED -- this result hit the "
+                    f"{_MAX_RANGED_READ_CHARS:,}-char output cap before reaching the "
+                    f"requested end (line {min(end, len(lines))}).\n"
+                    f"# Lines {start + 1}..{last_lineno} of {len(lines)} are shown above "
+                    f"({'the last line itself was also too long and was clipped -- see its '
+                       'own inline marker' if line_itself_truncated else 'all shown lines are complete, uncut'}).\n"
+                    f"# {remaining} more line(s) remain in the requested range. Continue with "
+                    f"offset={next_offset}, limit={min(limit, end - next_offset) if limit else 200} "
+                    f"to get the rest -- do not re-request the lines already shown above. Do NOT "
+                    f"conclude that anything is absent based on this truncated portion alone -- "
+                    f"the remaining lines may contain it; read them before reporting an absence."
+                )
+                return (f"# {relative_path} — lines {start + 1}..{last_lineno} of {len(lines)} "
+                        f"(TRUNCATED, requested up to {min(end, len(lines))})\n{body}{note}")
+            more = "" if end >= len(lines) else (
+                f"\n# ── {len(lines) - end} more line(s) below; continue with "
+                f"offset={end}, limit={limit or 200} ──"
+            )
+            at_end = "\n# ── END OF FILE ──" if end >= len(lines) else ""
+            # STATUS: COMPLETE is the counterpart machine-readable token to TRUNCATED above --
+            # explicit either way, never left to be inferred from the absence of a marker.
+            # `start` here is unchanged from the pre-1.28 header (0-based) -- preserving the
+            # exact existing numbering convention for the non-truncated path; only the new
+            # TRUNCATED branch above (necessarily 1-based, to match `last_lineno`) differs.
+            return (f"# {relative_path} — lines {start}..{min(end, len(lines))} "
+                    f"of {len(lines)} (STATUS: COMPLETE for this requested range)\n{body}{more}{at_end}")
+
+        # Phase 1.29b: same fixed-point completeness guarantee as the other two
+        # get_file_content branches -- see _fit_complete_response's own docstring.
+        return _fit_complete_response(lines[start:end], start + 1, _MAX_RANGED_READ_CHARS, _wrap2)
 
     if len(data) <= _MAX_FULL_BYTES:
-        return _numbered_lines(data.splitlines(), 1)
+        all_lines = data.splitlines()
+        total = len(all_lines)
+
+        def _wrap3(body, last_lineno, size_truncated, line_itself_truncated):
+            # Phase 1.29: bounded, not raw _numbered_lines -- see _MAX_RENDERED_CHARS's
+            # own comment above _bounded_ranged_body's definition for the proof that a
+            # SOURCE bound (_MAX_FULL_BYTES) does not imply a bound on this RENDERED
+            # text. The common, non-truncated case returns the body alone, unchanged
+            # from its pre-1.29 wording (no header at all) -- only the truncated case
+            # adds wrapper text, and only that case needs the fixed-point guarantee
+            # below to actually matter.
+            if not size_truncated:
+                return body
+            return (
+                f"# {relative_path} is {len(data):,} source bytes (fits under the "
+                f"{_MAX_FULL_BYTES:,}-byte whole-file threshold), but its RENDERED text "
+                f"exceeded the {_MAX_RENDERED_CHARS:,}-char output cap.\n"
+                f"# STATUS: TRUNCATED -- lines 1..{last_lineno} of {total} shown "
+                f"({'the last line was also too long and was clipped' if line_itself_truncated else 'all shown lines are complete, uncut'}).\n"
+                f"# Continue with offset={last_lineno}, limit=200 to get the rest. Do NOT "
+                f"conclude that anything is absent from this file based on this truncated "
+                f"portion alone -- the remaining lines may contain it; read them before "
+                f"reporting an absence.\n"
+                + body
+            )
+
+        # Phase 1.29b: same fixed-point completeness guarantee as the other two
+        # get_file_content branches.
+        return _fit_complete_response(all_lines, 1, _MAX_RENDERED_CHARS, _wrap3)
 
     # Oversized file — reduce it so it can't blow the context window.
     ext = target.suffix.lower()
     if ext in _CODE_EXT:
         skel = _py_skeleton(data) if ext == ".py" else _regex_skeleton(data)
         if skel:
+            # Phase 1.29: the skeleton path has NO upper bound on SOURCE size at all
+            # (reached only once a file already exceeds _MAX_FULL_BYTES, with no ceiling
+            # above that) -- so the same per-line rendering overhead this phase proved
+            # for whole-file reads is unbounded here, not merely 6.67x. _cap_rendered_text
+            # truncates the already-rendered skeleton string at its last complete line.
+            skel_capped, skel_truncated = _cap_rendered_text(skel, _MAX_RENDERED_CHARS)
+            status_line = (
+                f"# STATUS: TRUNCATED -- this skeleton hit the {_MAX_RENDERED_CHARS:,}-char "
+                f"output cap. Signatures past this point are not shown; re-read a later "
+                f"part of the file directly with get_file_content('{relative_path}', "
+                f"offset=<line>, limit=200) once you know which line to target from "
+                f"search_files, or request more of the skeleton is not supported -- the "
+                f"skeleton itself has no continuation cursor, only the underlying file does. "
+                f"Do NOT conclude that a function, class, or symbol does not exist in this "
+                f"file merely because it is absent from this truncated skeleton -- it may "
+                f"be defined past the point shown; search_files or a direct ranged read is "
+                f"required before reporting an absence.\n"
+                if skel_truncated else
+                "# STATUS: COMPLETE -- the full skeleton is shown below.\n"
+            )
             return (
                 f"# {relative_path} is {len(data):,} bytes — too large to return whole.\n"
                 f"# STRUCTURAL SKELETON below (signatures + docstrings; bodies elided as ...).\n"
+                + status_line +
                 # A concrete limit, not "<n>" (2026-08-25). With no number suggested, a
                 # Researcher picked limit=5 and walked this file in FIFTEEN round-trips
                 # (offsets 114, 119, 124 ... 184) to retrieve about as much text as one
@@ -653,7 +966,7 @@ def get_file_content(relative_path: str, offset: int = 0, limit: int = 0) -> str
                 # file lines, so neither the grep nor the guesswork is needed.
                 f"# The numbers below are REAL file line numbers: cite them directly and\n"
                 f"# use them as offsets. Do NOT grep for a symbol that is already listed here.\n\n"
-                + skel
+                + skel_capped
             )
     head, tail = data[:8000], data[-4000:]
     return (
@@ -687,7 +1000,9 @@ async def get_files_batch(paths: list[str]) -> str:
             sections.append(f"=== {p} ===\nERROR: {outcome}")
         else:
             sections.append(f"=== {p} ===\n{outcome}")
-    return _cap("\n\n".join(sections))
+    return _cap("\n\n".join(sections),
+                narrow_hint="Request fewer paths per get_files_batch call, or read the "
+                            "remaining files individually with get_file_content().")
 
 
 async def search_files_batch(pattern: str, glob_filters: list[str], max_results: int = 80) -> str:
@@ -1063,27 +1378,96 @@ def count_matches(pattern: str, glob_filter: str = "**/*",
             # relayed as fact. A 0 from a glob that matched no files is not a count.
             return (f"TOTAL: 0 match(es) for pattern {pattern!r} in '{glob_filter}'"
                     + _zero_glob_note(glob_filter))
-        body = "\n".join(f"  {p}: {c}" for p, c in sorted(per_file, key=lambda x: -x[1])[:50])
-        return head + "\n" + body
+        # Phase 1.29: the TOTAL above is always complete -- ripgrep's own
+        # --count-matches mode searches every file before returning, so `total` sums
+        # the REAL, fully-evaluated count regardless of how much of the per-file
+        # breakdown below ends up displayed. Only the BREAKDOWN (previously capped at
+        # 50 lines, with no character maximum -- a long real path or a count with many
+        # digits could still push 50 lines well past any small reservation) needed a
+        # genuine output-size bound. Built incrementally so a record (one "path: count"
+        # line) is never cut mid-way, same whole-line-boundary discipline as the
+        # get_file_content fixes above.
+        #
+        # _MAX_COUNT_MATCHES_CHARS bounds the COMPLETE returned text (head + breakdown
+        # + status), not the breakdown alone -- head and status are built FIRST so
+        # their own real lengths can be subtracted from the breakdown's budget,
+        # guaranteeing the final assembled string never exceeds the cap regardless of
+        # how long `pattern`/`glob_filter`/the file count make `head`.
+        ranked = sorted(per_file, key=lambda x: -x[1])
+
+        def _status_for(shown_total: int) -> str:
+            if shown_total < len(ranked):
+                return (
+                    f"\nSTATUS: TRUNCATED -- the breakdown above shows the top "
+                    f"{shown_total} of {len(ranked)} file(s) with matches, by descending "
+                    f"count (deterministic, ties broken by rg's own stable output order). "
+                    f"The TOTAL above ({total}) IS the complete, fully-evaluated count "
+                    f"across every file -- it is NOT reduced by this breakdown limit.\n"
+                    f"count_matches has no offset/cursor parameter for continuation. The "
+                    f"narrowest way to see the remaining files' counts with the existing "
+                    f"interface is to re-run with a NARROWER glob_filter that excludes the "
+                    f"{shown_total} path(s) already shown above (e.g. restrict to a "
+                    f"specific subdirectory), which produces a smaller, non-overlapping "
+                    f"per-file breakdown without re-deriving or duplicating what is already "
+                    f"known from this call's own TOTAL and shown file list. Do NOT conclude "
+                    f"that a specific file not shown above has zero matches -- it may still "
+                    f"be among the unshown files counted in the TOTAL; only files actually "
+                    f"listed above have a confirmed per-file count from this call."
+                )
+            return "\nSTATUS: COMPLETE -- every file with at least one match is shown above."
+
+        # Reserve for the LONGER (TRUNCATED) status variant up front -- its own length
+        # barely varies with the actual numbers involved (a few digits at most), so
+        # computing it once against len(ranked) (an upper bound on shown_total) is a
+        # safe, real margin, not a guess.
+        _status_margin = len(_status_for(0))
+        body_budget = max(_MAX_COUNT_MATCHES_CHARS - len(head) - 1 - _status_margin, 0)
+        shown_lines: list[str] = []
+        shown_total = 0
+        running = 0
+        for p, c in ranked:
+            line = f"  {p}: {c}"
+            piece_len = len(line) + (1 if shown_lines else 0)
+            if running + piece_len > body_budget or len(shown_lines) >= 50:
+                break
+            shown_lines.append(line)
+            running += piece_len
+            shown_total += 1
+        body = "\n".join(shown_lines)
+        status = _status_for(shown_total)
+        final = head + "\n" + body + status
+        # Defensive: the margin above is computed from the WORST-CASE (TRUNCATED)
+        # status text; if shown_total ends up >= len(ranked) (nothing was cut), the
+        # actual COMPLETE status is shorter, so `final` is already safely under the cap
+        # -- this assertion exists to catch a future edit breaking that relationship,
+        # not because it is expected to fire.
+        assert len(final) <= _MAX_COUNT_MATCHES_CHARS + 1, (
+            f"count_matches internal budget error: {len(final)} > {_MAX_COUNT_MATCHES_CHARS}")
+        return final
     except subprocess.TimeoutExpired:
         return "count_matches failed: timed out after 30s"
     except Exception as e:
         return f"count_matches failed: {e}"
 
 
-def list_directory_tree(max_depth: int = 8) -> str:
+def list_directory_tree(max_depth: int = 8, resume_after: str = "") -> str:
     """
-    Return the full directory tree of the project up to max_depth levels deep.
-    Shows directories only (no individual files) — no result cap.
-    Use this for any overview or structure question before drilling into specific directories.
-    Prefer this over find_files('**/*') for structure questions — no cap, always complete.
+    Return the directory tree of the project up to max_depth levels deep.
+    Shows directories only (no individual files). The rendered text is bounded at
+    _MAX_TREE_CHARS (8,000) -- see that constant's own comment for why this tool's
+    former "no result cap" design was never actually safe.
 
     Args:
         max_depth: How many levels deep to traverse (default 8)
+        resume_after: (Phase 1.29) relative path of the last directory shown in a
+            PRIOR, TRUNCATED call to this function (e.g. 'src/app/business') -- resumes
+            the SAME deterministic traversal order immediately after that entry. Pass
+            "" (default) for the first call.
 
     Examples:
         list_directory_tree()    → full project structure, 8 levels deep
         list_directory_tree(2)   → top 2 levels only
+        list_directory_tree(8, resume_after='src/app/business')  → continue after that entry
 
     Default raised 3 -> 8 on 2026-09-02. At 3 this tool was STRUCTURALLY BLIND to the
     frontend routes: Client/EcommClient-Web/ekamweb/src/app is already 5 segments deep,
@@ -1107,11 +1491,24 @@ def list_directory_tree(max_depth: int = 8) -> str:
         depth  8 ->  4,038 chars, 213 lines, 3.8s    YES
         depth 10 ->  4,609 chars, 236 lines, 5.5s    YES (saturates)
 
-    ~3 KB and ~3s to stop inventing paths, and the tree saturates by 10 so there is no
-    cliff past this. Note this lists DIRECTORIES only at any depth -- it will show the
-    real route directory, never page.tsx; citing a file still needs find_files/search_files.
+    ~3 KB and ~3s to stop inventing paths, and the tree saturates by 10 for THIS project
+    -- but Phase 1.29 found that was an empirical observation, not an architectural
+    limit: a project with far more directories, or one traversed at a far deeper
+    max_depth, has no reason to stay under any particular size, and this function's own
+    docstring used to claim "no result cap" outright. Note this lists DIRECTORIES only
+    at any depth -- it will show the real route directory, never page.tsx; citing a
+    file still needs find_files/search_files.
+
+    Consistency model (Phase 1.29, stated explicitly rather than assumed): traversal
+    order is deterministic (sorted children, pre-order depth-first) GIVEN AN UNCHANGED
+    filesystem between calls. This is a best-effort continuation, not a true snapshot --
+    if a directory is added, removed, or renamed between a truncated call and its
+    `resume_after` follow-up, the follow-up's "resume point" is found by matching the
+    RELATIVE PATH STRING against the current (possibly different) live traversal, which
+    can skip or repeat entries in that specific edge case. This is reported here rather
+    than silently assumed away, since no actual snapshot mechanism exists.
     """
-    lines = []
+    all_entries: list[tuple[int, str, str]] = []  # (depth, indent, relpath)
 
     def _recurse(path: Path, depth: int) -> None:
         if depth > max_depth:
@@ -1124,13 +1521,76 @@ def list_directory_tree(max_depth: int = 8) -> str:
                 if c.is_dir() and c.name not in _IGNORE_DIRS and not c.name.startswith(".")]
         for d in dirs:
             indent = "  " * (depth - 1)
-            lines.append(f"{indent}{d.name}/")
+            relpath = d.relative_to(PROJECT_ROOT).as_posix()
+            all_entries.append((depth, indent, relpath))
             _recurse(d, depth + 1)
 
     _recurse(PROJECT_ROOT, 1)
-    if not lines:
+    if not all_entries:
         return "No directories found."
-    return f"Project directory tree (dirs only, {max_depth} levels deep):\n" + "\n".join(lines)
+
+    start_idx = 0
+    if resume_after:
+        for idx, (_, _, relpath) in enumerate(all_entries):
+            if relpath == resume_after:
+                start_idx = idx + 1
+                break
+        else:
+            return (
+                f"# list_directory_tree: resume_after={resume_after!r} was not found in "
+                f"the current traversal (max_depth={max_depth}) -- the filesystem may "
+                f"have changed since the prior call, or the path belongs to a different "
+                f"max_depth. Call list_directory_tree(max_depth={max_depth}) with no "
+                f"resume_after to restart from the beginning rather than guessing a "
+                f"different resume point."
+            )
+
+    # Phase 1.29: _MAX_TREE_CHARS bounds the COMPLETE returned text (header + entries +
+    # status), not the entry list alone -- the status line's own length varies with
+    # last_relpath (embedded in its continuation instruction), which itself varies with
+    # how many entries fit, so this is sized with a fixed-point shrink rather than a
+    # single static margin: build generously first, then drop trailing entries (which
+    # only shrinks the result and shortens any candidate last_relpath) until the
+    # complete assembled text actually fits, never cutting an entry mid-line.
+    header = f"Project directory tree (dirs only, {max_depth} levels deep):\n"
+    candidates = all_entries[start_idx:]
+    out_lines: list[str] = []
+    running = 0
+    for depth, indent, relpath in candidates:
+        name = relpath.rsplit("/", 1)[-1]
+        line = f"{indent}{name}/"
+        piece_len = len(line) + (1 if out_lines else 0)
+        if running + piece_len > _MAX_TREE_CHARS:
+            break
+        out_lines.append(line)
+        running += piece_len
+
+    def _assemble(n_shown: int) -> tuple[str, str]:
+        shown = out_lines[:n_shown]
+        body = "\n".join(shown)
+        n_total_shown = start_idx + n_shown
+        if n_total_shown < len(all_entries):
+            last_rel = candidates[n_shown - 1][2] if n_shown else resume_after
+            status = (
+                f"\n# STATUS: TRUNCATED -- {n_shown} directory entries shown above, "
+                f"{len(all_entries) - n_total_shown} more remain at this max_depth. "
+                f"Continue with list_directory_tree(max_depth={max_depth}, "
+                f"resume_after={last_rel!r}) to get the rest. See this function's own "
+                f"docstring for the exact consistency model this continuation relies on. "
+                f"Do NOT treat this as a complete directory inventory, and do NOT conclude "
+                f"a directory does not exist merely because it is absent above -- continue "
+                f"retrieval before reporting an absence or an exhaustive count."
+            )
+        else:
+            status = "\n# STATUS: COMPLETE -- every directory at this max_depth is shown above."
+        return body, status
+
+    n_shown = len(out_lines)
+    body, status = _assemble(n_shown)
+    while len(header) + len(body) + len(status) > _MAX_TREE_CHARS and n_shown > 0:
+        n_shown -= 1
+        body, status = _assemble(n_shown)
+    return header + body + status
 
 
 # Ceilings for the tree search in _glob_hint_bases. A service directory sits at
