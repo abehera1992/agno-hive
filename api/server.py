@@ -1367,7 +1367,8 @@ def _idem_fields(request: RunRequest) -> dict:
             "agents": [a.model_dump() for a in request.agents] if request.agents else None,
             "orchestration": _resolve_orchestration(request.orchestration), "work_items": request.work_items,
             "read_only": request.read_only, "solo": request.solo, "execution_profile": request.execution_profile,
-            "synthesis_run": request.synthesis_run, "workflow_controls": request.workflow_controls}
+            "synthesis_run": request.synthesis_run, "workflow_controls": request.workflow_controls,
+            "evidence_policy": request.evidence_policy}
 
 
 @app.post("/run", response_model=RunResponse)
@@ -1542,6 +1543,7 @@ async def _run_impl(request: RunRequest, http_request: Request):
         "work_items": request.work_items,
         "idempotency_key": request.idempotency_key,
         "knowledge_key": "kn-" + uuid.uuid4().hex[:16],      # Phase 1.20: one retrieval per top-level request
+        "evidence_policy": request.evidence_policy,
     }
     result, tokens, clarification = await _run_worker_subprocess(http_request, worker_payload)
 

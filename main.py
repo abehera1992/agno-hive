@@ -187,6 +187,7 @@ async def _run_worker() -> dict:
             idempotency_key=payload.get("idempotency_key"),
             liveness_nonce=payload.get("liveness_nonce"),
             knowledge_key=payload.get("knowledge_key"),
+            evidence_policy=payload.get("evidence_policy"),
         )
         # Phase 0.80: emitted immediately before this coroutine returns -- the
         # top-level coroutine of this subprocess's own asyncio.run() call

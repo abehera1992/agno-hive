@@ -101,13 +101,24 @@ def _known_policy_for(task: str):
     return None
 
 
-def derive_policy(paths: list, task: str = ""):
+def derive_policy(paths: list, task: str = "", supplied_policy_spec: dict | None = None):
     """Deterministic evidence policy: one requirement per named file (a SUCCESS source_read of that file by the
     attempt). The known T11 doc-upload chain additionally gets its evidence-backed relationship links. A task
     matching a known runbook prompt (Phase 1.23, _known_policy_for) also gets that prompt's own content-coverage
     obligations (EvidencePolicy.enum_requirements), merged with whatever per-named-file requirements the task's
-    own wording independently produces -- never replacing them."""
-    known = _known_policy_for(task)
+    own wording independently produces -- never replacing them.
+
+    `supplied_policy_spec` (Phase 1.36): the caller's own JSON-safe policy data (RunRequest.
+    evidence_policy -> run_task_async -> run_engineering_workflow -> here), deserialized via
+    A.build_policy_from_spec(). THIS IS THE GENERIC PATH -- when present, `_known_policy_for`'s
+    hardcoded task-phrase matching is never even called; the caller's own data is used directly,
+    exactly the separation the mission requires ("generic workflow code must consume supplied
+    policy rather than infer project identity... from hardcoded task-phrase matching"). Absent
+    (the common case for every existing caller, unchanged), falls back to `_known_policy_for`'s
+    pre-existing, explicitly LEGACY, project-specific phrase-matching mechanism -- kept working
+    for backward compatibility, but isolated here as the fallback branch, never the primary
+    path, and never consulted at all once a caller supplies its own policy."""
+    known = A.build_policy_from_spec(supplied_policy_spec) if supplied_policy_spec else _known_policy_for(task)
     if not paths:
         return known if known is not None else A.EvidencePolicy(name="generic-source-evidence", requirements=[
             A.Requirement("G1_source_read", "at least one source file was actually read in this attempt (any file)", [A.ANY_SOURCE])])
@@ -135,16 +146,18 @@ def derive_policy(paths: list, task: str = ""):
 MAX_WORK_ITEMS = 4
 
 
-def plan_work_items(items: list, task_id: str) -> WorkPlan:
+def plan_work_items(items: list, task_id: str, supplied_policy_spec: dict | None = None) -> WorkPlan:
     """Caller-provided explicit work items (each a string naming its own repository files). Deterministic and
     validated: 1..MAX_WORK_ITEMS items, each must name at least one file. Every item gets its own id, evidence
-    policy and attempts; nothing is decomposed or routed by a model. One bad item rejects the whole plan."""
+    policy and attempts; nothing is decomposed or routed by a model. One bad item rejects the whole plan.
+    `supplied_policy_spec` (Phase 1.36): forwarded unchanged to every work item's own plan_request() call --
+    see derive_policy()'s own docstring."""
     texts = [str(i).strip() for i in (items or []) if str(i).strip()]
     if not texts or len(texts) > MAX_WORK_ITEMS:
         return WorkPlan(task_id, [], f"work_items must contain 1..{MAX_WORK_ITEMS} non-empty items (got {len(texts)})")
     out = []
     for k, t in enumerate(texts, 1):
-        p = plan_request(t, task_id)
+        p = plan_request(t, task_id, supplied_policy_spec=supplied_policy_spec)
         if not p.items:
             return WorkPlan(task_id, [], f"work item {k} rejected: {p.rejected_reason}")
         wi = p.items[0]
@@ -153,11 +166,12 @@ def plan_work_items(items: list, task_id: str) -> WorkPlan:
     return WorkPlan(task_id, out)
 
 
-def plan_request(task: str, task_id: str) -> WorkPlan:
+def plan_request(task: str, task_id: str, supplied_policy_spec: dict | None = None) -> WorkPlan:
     """Application-owned plan. Files the request NAMES become required source evidence (one requirement per named file).
     A request that names none is planned as ONE work item with a generic requirement: at least one source file actually read
     by the attempt (any file). Files suggested by the Knowledge Dossier are LEADS handed to the Researcher; they are never
-    acceptance requirements, and a file the Researcher finds on its own is equally valid evidence."""
+    acceptance requirements, and a file the Researcher finds on its own is equally valid evidence.
+    `supplied_policy_spec` (Phase 1.36): forwarded to derive_policy() -- see its own docstring."""
     task = (task or "").strip()
     if not task:
         return WorkPlan(task_id, [], "empty request")
@@ -175,7 +189,7 @@ def plan_request(task: str, task_id: str) -> WorkPlan:
         target=("Files named in the request: " + " ; ".join(paths)) if paths else
                "The request as stated. It names no file; use your own search and read tools to find and read the relevant source.",
         objective=task, evidence_required=evidence, completion_criteria=criteria,
-        paths=paths, policy=derive_policy(paths, task))
+        paths=paths, policy=derive_policy(paths, task, supplied_policy_spec=supplied_policy_spec))
     return WorkPlan(task_id, [wi])
 
 
@@ -587,6 +601,13 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
         att.text = T._strip_leaked_tool_tags(_terminal or "")
         att.trace_text = T._strip_leaked_tool_tags(trace.text or "")
         att.source = "workflow-real"
+        # Phase 1.36: the Researcher's own final session_state, same object agno's RunOutput
+        # already carries -- captured here so decide()/gate_evaluate() can read a
+        # "semantic_mapping" key the Researcher may have written via the EXISTING
+        # update_session_state tool (no new tool, no hive-mcp change needed). dict(...) copies
+        # it so no later mutation of the live run's own state object can retroactively change
+        # what this attempt is judged against.
+        att.session_state = dict(getattr(ro, "session_state", None) or {})
         rec.tokens = {"in": trace.tin, "out": trace.tout}
         if att.state == "RUNNING":
             att.state = "FINISHED"
@@ -921,6 +942,39 @@ def _final_record(st: RunState, wi: WorkItem):
     return (mine[-1] if mine else None), False
 
 
+def _format_cross_reference_section(xref_detail: list) -> list:
+    """Phase 1.36: deterministic, application-generated report of every CrossReferenceRequirement
+    this work item's policy declared -- rendered directly from the structured dict
+    cross_reference_result() already returns, NEVER from the model's own prose. This is the
+    mechanism that satisfies 'the final answer must faithfully communicate the structured
+    findings' without depending solely on the model remembering to state a gap or on a regex
+    check of what it wrote: the application states it itself, appended to every final answer for
+    any work item whose policy has at least one cross_reference_requirement, whether that
+    requirement was satisfied, blocked, or never performed."""
+    if not xref_detail:
+        return []
+    out = ["", "### Cross-reference comparison (application-computed, not model-written)"]
+    for res in xref_detail:
+        out.append(f"- **{res['id']}** ({res['description']}): overall **{res['status']}**")
+        if res["status"] == "UNPERFORMED":
+            out.append(f"  - {res.get('reason', 'left-side evidence was never read')}")
+            continue
+        for it in res.get("items", []):
+            s = it["status"]
+            if s == "MATCHED":
+                out.append(f"  - `{it['item_id']}` → MATCHED to `{it.get('matched_to')}` (via {it.get('via')})")
+            elif s == "UNMATCHED":
+                out.append(f"  - `{it['item_id']}` → UNMATCHED"
+                           f"{' (disclosed in the report text above)' if it.get('disclosed') else ' (NOT disclosed in the report text above)'}")
+            elif s == "AMBIGUOUS":
+                out.append(f"  - `{it['item_id']}` → AMBIGUOUS: {it.get('reason', '')}")
+            elif s == "UNCERTAIN":
+                out.append(f"  - `{it['item_id']}` → UNCERTAIN: {it.get('reason', '')}")
+            elif s == "INSUFFICIENT_EVIDENCE":
+                out.append(f"  - `{it['item_id']}` → INSUFFICIENT_EVIDENCE: {it.get('reason', '')}")
+    return out
+
+
 def _unresolved_items(d) -> list:
     items = []
     gate = getattr(d, "gate", None) or {}
@@ -986,6 +1040,8 @@ def build_final(st: RunState) -> str:
             else:
                 lines.append("Reason: not started because the overall task deadline was reached."
                              if getattr(st, "deadline_hit", False) else "Reason: no attempt produced a decision.")
+        if d is not None:
+            lines.extend(_format_cross_reference_section((d.gate or {}).get("cross_reference_detail") or []))
         hist = [r for r in st.records if r.attempt.work_item_id == wi.work_item_id]
         if len(hist) > 1 or (hist and not accepted):
             lines.append("")
@@ -1085,10 +1141,17 @@ def reconstruct_final(led, task_id: str) -> Optional[str]:
 async def run_engineering_workflow(
     task: str, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
     project_id: str, session_id, controls_raw=None, registry=None, work_items=None, idempotency_key=None,
-    liveness_path=None, liveness_nonce=None, knowledge=None,
+    liveness_path=None, liveness_nonce=None, knowledge=None, evidence_policy=None,
 ):
     """Entry point called from swarm.team.run_task_async when orchestration == "workflow".
-    Returns (content, tokens, clarification) exactly like the Team path."""
+    Returns (content, tokens, clarification) exactly like the Team path.
+
+    `evidence_policy` (Phase 1.36): the caller's own JSON-safe policy spec (RunRequest.
+    evidence_policy -- a genuine, always-available PRODUCTION field, unlike `controls_raw`/
+    `workflow_controls` above which are a TEST-ONLY channel gated behind
+    HIVE_WORKFLOW_TEST_CONTROLS=1 and therefore unusable as a real policy-injection path for a
+    new project). Forwarded to plan_work_items()/plan_request() -> derive_policy() -- see its
+    own docstring for the full mechanism."""
     from agno.tools.mcp import MCPTools
     from agno.workflow import Workflow, Step
     import swarm.team as T
@@ -1213,7 +1276,8 @@ async def run_engineering_workflow(
         async def s_plan(step_input):
             st.steps_run.append("plan")
             st.wf_state = "planning"
-            st.plan = plan_work_items(work_items, task_id) if work_items else plan_request(task, task_id)
+            st.plan = (plan_work_items(work_items, task_id, supplied_policy_spec=evidence_policy) if work_items
+                      else plan_request(task, task_id, supplied_policy_spec=evidence_policy))
             if st.plan.items and st.ledger is not None:
                 try:     # the plan is durable before ANY attempt can exist
                     await st.ledger._a(st.ledger.create_task, task_id, wf_run_id, task, [

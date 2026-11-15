@@ -88,6 +88,14 @@ class RunRequest(BaseModel):
     work_items: list[str] | None = None
     # Phase 1.17: optional. Submitting the same key again never re-runs the task (see swarm/eng_workflow.py).
     idempotency_key: str | None = None
+    # Phase 1.36: the caller's own JSON-safe evidence policy -- the project-agnostic replacement
+    # for requiring an AgnoHive source commit to register a new project's acceptance
+    # requirements. A GENUINE PRODUCTION field, unlike `workflow_controls` above (which is
+    # test-only, gated behind HIVE_WORKFLOW_TEST_CONTROLS=1, and therefore not a real channel
+    # for this). See swarm/acceptance.py's build_policy_from_spec() for the exact schema.
+    # Omitted (every existing caller, unchanged): orchestration="workflow" falls back to the
+    # pre-existing, explicitly legacy task-phrase-matching policy lookup.
+    evidence_policy: dict | None = None
 
 class SessionMeta(BaseModel):
     session_id: str

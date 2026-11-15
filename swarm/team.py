@@ -35302,6 +35302,7 @@ async def run_task_async(
     idempotency_key: str | None = None,
     liveness_nonce: str | None = None,
     knowledge_key: str | None = None,
+    evidence_policy: dict | None = None,
 ) -> tuple[str, dict, dict | None]:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer.
 
@@ -35359,7 +35360,7 @@ async def run_task_async(
                 task, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
                 project_id, session_id, controls_raw=workflow_controls, work_items=work_items,
                 idempotency_key=idempotency_key, liveness_path=liveness_path,
-                liveness_nonce=liveness_nonce, knowledge=_knowledge)
+                liveness_nonce=liveness_nonce, knowledge=_knowledge, evidence_policy=evidence_policy)
         print(f"[team] orchestration=workflow requested but team_name={team_name!r} is not 'engineering' "
               f"(or no roster) -- using the Team path", flush=True)
     # Rebound BEFORE the roster is composed -- see run_task_stream for the reason.

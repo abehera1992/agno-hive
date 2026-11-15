@@ -507,10 +507,25 @@ class CrossReferenceRequirement:
     `match(left_item_id, right_item_id) -> bool`: task-supplied correspondence rule. Default
     `None` uses exact case-insensitive item_id equality. A task needing semantic correspondence
     (e.g. "create_X" on one side, "useCreateXMutation" on the other) supplies its own function
-    -- still deterministic application logic, never a model call. When the right side's own
-    evidence was never read at all, a left item is reported UNCERTAIN, never MISSING or
-    SATISFIED: Track B's distinction between "absent from inspected evidence" and "proven not to
-    exist" is preserved explicitly, not collapsed into a guess in either direction."""
+    -- still deterministic application logic, never a model call -- OR relies on a Researcher-
+    supplied semantic mapping at RUNTIME (Phase 1.36, see cross_reference_result()'s own
+    docstring): the two are complementary, not alternatives -- `match` is for a correspondence
+    the TASK's own policy author already knows in advance; a runtime mapping is for one the
+    Researcher discovers while investigating, which this class cannot know ahead of time.
+
+    Per-item status (Phase 1.36, widened from Phase 1.35's SATISFIED/MISSING/UNCERTAIN to the
+    five categories task-provided comparisons need to distinguish): MATCHED (a confirmed
+    right-side counterpart exists, by `match()` or a grounded runtime mapping), UNMATCHED (right
+    side read, no counterpart found -- must be disclosed), AMBIGUOUS (more than one plausible
+    right-side counterpart, or a runtime mapping conflicting with the deterministic finding --
+    NEVER silently resolved in either direction), UNCERTAIN (the right side's own evidence was
+    never read; matching cannot be determined -- Track B: "absent from inspected evidence" is
+    preserved distinct from "proven not to exist", never collapsed into a guess), and
+    INSUFFICIENT_EVIDENCE (a runtime mapping was supplied but its claimed target was never
+    actually confirmed present -- the Researcher's own claim, unverified). The requirement's
+    OVERALL status additionally distinguishes UNPERFORMED (the left side's own evidence was
+    never read at all -- the comparison never had an input to run against, so it must never be
+    allowed to default to a vacuous SATISFIED merely because there was nothing to iterate)."""
     id: str
     description: str
     left_items: list
@@ -576,15 +591,28 @@ def _presence(pattern, report: str, scoped_src: str, scope_read: bool):
     return scope_read and bool(re.search(pattern, scoped_src, re.I))
 
 
-def cross_reference_result(req: "CrossReferenceRequirement", srcs: dict, text: str) -> dict:
-    """See CrossReferenceRequirement's own docstring. Three deterministic stages: (1) presence
-    on each side via _presence(), reusing enum_requirement_result()'s own check; (2) matching --
-    pure application logic, req.match() or exact item_id equality, never a model call; (3)
-    disclosure -- for each left item confirmed present with no matching right item confirmed
-    present, was the gap actually stated, reusing the item's OWN presence pattern (not a
-    separately-maintained disclosure pattern) so synonyms already declared for presence-checking
-    are honored for disclosure-checking too."""
+def cross_reference_result(req: "CrossReferenceRequirement", srcs: dict, text: str,
+                            semantic_mappings: dict | None = None) -> dict:
+    """See CrossReferenceRequirement's own docstring. Deterministic stages: (1) presence on each
+    side via _presence(), reusing enum_requirement_result()'s own check; (2) matching -- pure
+    application logic, req.match() or exact item_id equality, PLUS any runtime semantic mapping
+    the Researcher supplied (Phase 1.36); (3) disclosure -- for each UNMATCHED left item, was the
+    gap actually stated, reusing the item's OWN presence pattern so synonyms already declared for
+    presence-checking are honored for disclosure-checking too.
+
+    `semantic_mappings` (Phase 1.36): {left_item_id: {"maps_to": right_item_id, "evidence": str}},
+    sourced from the Researcher's OWN `update_session_state` call during the attempt (see
+    docs/reports/phase-1.36-report.md for the exact convention and why this reuses an existing,
+    already-granted tool rather than adding a new one) -- never a model call made BY this
+    function; by the time this runs, the mapping is already-recorded data, evaluated the same
+    deterministic way as everything else here. A left item with a semantic mapping is MATCHED
+    only if the claimed right_item_id is itself confirmed present (grounded, not merely claimed);
+    otherwise INSUFFICIENT_EVIDENCE -- a researcher's own unverified correspondence claim is
+    never trusted at face value. A mapping whose claimed target DIFFERS from what the
+    deterministic match() independently found is AMBIGUOUS (two different answers exist; never
+    silently pick one)."""
     report = text or ""
+    semantic_mappings = semantic_mappings or {}
 
     def scoped(paths):
         if list(paths) == [ANY_SOURCE]:
@@ -598,35 +626,131 @@ def cross_reference_result(req: "CrossReferenceRequirement", srcs: dict, text: s
 
     left_present = {iid: _presence(pat, report, l_src, l_read) for iid, pat in req.left_items}
     right_present = {iid: _presence(pat, report, r_src, r_read) for iid, pat in req.right_items}
-    right_pattern_of = dict(req.right_items)
+
+    if not l_read:
+        # the comparison's own LEFT input was never read at all -- there is nothing to iterate,
+        # which must never be allowed to default to a vacuous SATISFIED. Phase 1.35's own gap:
+        # an empty items_out (because the loop below never even starts) fell through to
+        # "else: overall = SATISFIED". UNPERFORMED is neither "SATISFIED" nor "UNCERTAIN", so
+        # gate_evaluate()'s existing fold logic already treats it as blocking for a mandatory
+        # requirement with no changes to that function needed.
+        return {"id": req.id, "description": req.description, "mandatory": req.mandatory,
+                "status": "UNPERFORMED", "items": [],
+                "reason": "left-side evidence was never read; this comparison never had an input to run"}
 
     items_out = []
     for l_id, l_pattern in req.left_items:
         if not left_present.get(l_id):
             continue   # not confirmed present on the left side (or NOT_EVALUATED) -- nothing to compare yet
+        det_matches = [r_id for r_id, _ in req.right_items
+                       if r_read and right_present.get(r_id) and match_fn(l_id, r_id)] if r_read else []
+        mapping = semantic_mappings.get(l_id)
+        if mapping:
+            claimed = mapping.get("maps_to")
+            claimed_confirmed = r_read and bool(right_present.get(claimed))
+            if det_matches and claimed not in det_matches:
+                items_out.append({"item_id": l_id, "status": "AMBIGUOUS",
+                                  "deterministic_matches": det_matches, "semantic_mapping": mapping,
+                                  "reason": "the Researcher-supplied mapping conflicts with the "
+                                            "deterministic match -- never silently resolved"})
+                continue
+            if not claimed_confirmed:
+                items_out.append({"item_id": l_id, "status": "INSUFFICIENT_EVIDENCE",
+                                  "semantic_mapping": mapping,
+                                  "reason": "the mapping's claimed target was never confirmed "
+                                            "present on the right side -- an unverified claim"})
+                continue
+            items_out.append({"item_id": l_id, "status": "MATCHED", "via": "semantic_mapping",
+                              "matched_to": claimed, "evidence": mapping.get("evidence")})
+            continue
         if not r_read:
-            # the right side's own evidence was never read at all -- matching cannot be
-            # determined either way. UNCERTAIN, never MISSING or SATISFIED (Track B).
             items_out.append({"item_id": l_id, "status": "UNCERTAIN",
                               "reason": "right-side evidence was never read; matching cannot be determined"})
             continue
-        matched = any(right_present.get(r_id) and match_fn(l_id, r_id) for r_id, _ in req.right_items)
-        if matched:
-            continue   # covered -- no disclosure obligation for this item
+        if len(det_matches) > 1:
+            items_out.append({"item_id": l_id, "status": "AMBIGUOUS", "deterministic_matches": det_matches,
+                              "reason": "more than one right-side item matched deterministically -- "
+                                        "never silently picking one"})
+            continue
+        if det_matches:
+            items_out.append({"item_id": l_id, "status": "MATCHED", "via": "deterministic", "matched_to": det_matches[0]})
+            continue
         disclosed = bool(re.search(_proximity_disclosure_pat(l_pattern), report, re.I))
-        items_out.append({"item_id": l_id,
-                          "status": "SATISFIED" if disclosed else "MISSING",
-                          "disclosed": disclosed, "right_side_read": True})
-    blocking = [i for i in items_out if i["status"] in ("MISSING", "INSUFFICIENT_EVIDENCE")]
+        items_out.append({"item_id": l_id, "status": "UNMATCHED", "disclosed": disclosed})
+
+    blocking_statuses = ("UNMATCHED", "AMBIGUOUS", "INSUFFICIENT_EVIDENCE")
+    blocking = [i for i in items_out if i["status"] in blocking_statuses
+                and not (i["status"] == "UNMATCHED" and i.get("disclosed"))]
     uncertain = [i for i in items_out if i["status"] == "UNCERTAIN"]
     if blocking:
-        overall = blocking[0]["status"]
-    elif uncertain and not any(i["status"] == "SATISFIED" for i in items_out):
+        # priority order so the overall status names the most structurally significant problem
+        # first when several kinds co-occur -- an unresolved ambiguity is a sharper failure than
+        # an undisclosed gap, which is sharper than an unverified mapping claim.
+        for pri in ("AMBIGUOUS", "UNMATCHED", "INSUFFICIENT_EVIDENCE"):
+            if any(i["status"] == pri for i in blocking):
+                overall = pri
+                break
+    elif uncertain and not any(i["status"] in ("MATCHED",) for i in items_out):
         overall = "UNCERTAIN"
     else:
         overall = "SATISFIED"
     return {"id": req.id, "description": req.description, "mandatory": req.mandatory, "status": overall,
             "items": items_out}
+
+
+def build_policy_from_spec(spec: dict) -> "EvidencePolicy":
+    """Phase 1.36: the project-agnostic deserializer that lets a CALLER supply its own
+    EvidencePolicy as plain, JSON-safe data over the wire (RunRequest.evidence_policy, see
+    docs/reports/phase-1.36-report.md) -- instead of a new project requiring an AgnoHive source
+    commit (a new module-level Python constant in THIS file) to register its own acceptance
+    requirements. Contains no project-specific content itself; every id/pattern/path below comes
+    from `spec`.
+
+    Schema (all keys optional, default empty):
+      {"name": str,
+       "requirements": [{"id", "description", "any_of_paths": [str,...], "mandatory": bool}],
+       "enum_requirements": [{"id", "description",
+                              "items": [[item_id, pattern_or_null], ...], "source_paths": [...],
+                              "mandatory": bool}],
+       "cross_reference_requirements": [{"id", "description",
+                                         "left_items": [[item_id, pattern_or_null], ...],
+                                         "left_source_paths": [...],
+                                         "right_items": [[item_id, pattern_or_null], ...],
+                                         "right_source_paths": [...], "mandatory": bool}]}
+
+    Deliberately does NOT support `links` (T11's own relationship-chain semantics -- a narrower,
+    task-specific feature, not part of this generic surface) or a custom `match` callable for
+    CrossReferenceRequirement (a Python function cannot cross a JSON wire safely) -- a supplied
+    cross-reference requirement always uses the default exact case-insensitive item_id match.
+    Semantic correspondence between differently-named items is handled at RUNTIME instead, via
+    the Researcher's own `update_session_state` mapping (see cross_reference_result()'s own
+    docstring) -- a deliberately different, complementary mechanism from this static spec, not a
+    gap in it: this spec is for what a policy author already knows when they write the task;
+    the runtime mapping is for what the Researcher discovers while investigating, which the
+    policy author cannot know in advance. A malformed entry (missing a required key) raises
+    ValueError immediately -- never silently dropped or guessed, since a policy that silently
+    checks less than the caller asked for is worse than one that fails loudly at construction."""
+    def _req(e):
+        return Requirement(e["id"], e.get("description", ""), list(e["any_of_paths"]), bool(e.get("mandatory", True)))
+
+    def _enum(e):
+        return EnumRequirement(e["id"], e.get("description", ""),
+                               [tuple(i) if i[1] is not None else (i[0], None) for i in e["items"]],
+                               list(e["source_paths"]), bool(e.get("mandatory", True)))
+
+    def _xref(e):
+        return CrossReferenceRequirement(
+            e["id"], e.get("description", ""),
+            [tuple(i) for i in e["left_items"]], list(e["left_source_paths"]),
+            [tuple(i) for i in e["right_items"]], list(e["right_source_paths"]),
+            match=None, mandatory=bool(e.get("mandatory", True)))
+
+    spec = spec or {}
+    return EvidencePolicy(
+        name=spec.get("name") or "supplied-policy",
+        requirements=[_req(e) for e in spec.get("requirements", [])],
+        enum_requirements=[_enum(e) for e in spec.get("enum_requirements", [])],
+        cross_reference_requirements=[_xref(e) for e in spec.get("cross_reference_requirements", [])])
 
 
 T13_ENDPOINTS_REQ = EnumRequirement(
@@ -688,8 +812,9 @@ def _req_source(req, srcs):
     return None
 
 
-def gate_evaluate(policy, outcomes, text) -> dict:
-    """Only SUCCESS source_read outcomes of THIS attempt satisfy R1-R4; R5 needs source-text evidence of each hop."""
+def gate_evaluate(policy, outcomes, text, semantic_mappings: dict | None = None) -> dict:
+    """Only SUCCESS source_read outcomes of THIS attempt satisfy R1-R4; R5 needs source-text evidence of each hop.
+    `semantic_mappings` (Phase 1.36): forwarded to cross_reference_result() unchanged -- see its own docstring."""
     if policy is None:
         return {"applicable": False, "satisfied": [], "missing": [], "reads": {}, "enum_detail": [], "not_evaluated": []}
     srcs = _read_sources(outcomes)
@@ -750,7 +875,7 @@ def gate_evaluate(policy, outcomes, text) -> dict:
     # against the attempt as a failure, per Track B's absence-vs-proof distinction.
     xref_detail = []
     for xr in policy.cross_reference_requirements:
-        res = cross_reference_result(xr, srcs, text)
+        res = cross_reference_result(xr, srcs, text, semantic_mappings=semantic_mappings)
         xref_detail.append(res)
         if res["status"] == "SATISFIED":
             sat.append({"id": res["id"], "description": res["description"], "items": res["items"]})
@@ -790,6 +915,13 @@ class Attempt:
     source: str = ""
     state: str = "RUNNING"            # RUNNING | FINISHED | SUPERSEDED | CANCELLED
     preloaded: dict = field(default_factory=dict)
+    # Phase 1.36: the Researcher's own final session_state (agno's RunOutput.session_state),
+    # captured once per attempt in swarm/eng_workflow.py's run_attempt() right alongside
+    # att.text/att.outcomes above. Read by decide() for the "semantic_mapping" key a Researcher
+    # may have written via the EXISTING update_session_state tool -- no new MCP tool, no
+    # hive-mcp change, no redeploy needed for this mechanism. See cross_reference_result()'s
+    # own docstring for the exact {left_id: {"maps_to": ..., "evidence": ...}} convention.
+    session_state: dict = field(default_factory=dict)
 
 
 class Registry:
@@ -992,7 +1124,12 @@ def decide(a: Attempt, policy, registry: Registry = None, outcomes=None, registe
                                 fail_closed=True)
     except Exception as e:  # noqa: BLE001 -- Phase 1.15: an assessor error is NOT an Agent failure and NEVER accepts
         asm = {"status": "ERROR", "reason": repr(e)[:300], "claims": [], "supported": [], "unsupported": []}
-    gate = gate_evaluate(policy, outcomes, a.text)
+    # Phase 1.36: a Researcher-supplied semantic mapping lives in the attempt's OWN final
+    # session_state (captured in swarm/eng_workflow.py's run_attempt()), under the
+    # "semantic_mapping" key -- see cross_reference_result()'s own docstring for the exact
+    # convention. Absent entirely for any attempt that never wrote one (the common case).
+    _semantic_mappings = (a.session_state or {}).get("semantic_mapping") or {}
+    gate = gate_evaluate(policy, outcomes, a.text, semantic_mappings=_semantic_mappings)
     d = Decision(ident, a.workflow_status, ex, ex_reason, cnt, gate, assessor_status=asm["status"],
                  assessor_reason=asm["reason"],
                  assessor_claims={"claims": len(asm["claims"]), "supported": len(asm["supported"]),
