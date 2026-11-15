@@ -21434,7 +21434,27 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 if (function_name == "get_file_content" and not (args or {}).get("max_output_chars")):
                     _remaining_now = max(_ceiling - _committed - _reserved - _task_offset, 0)
                     if _worst_case > _remaining_now >= _MIN_USEFUL_ADAPTED_RESERVATION:
-                        args = dict(args or {})
+                        # Phase 1.29d: MUTATE the existing dict in place -- do NOT
+                        # rebind `args` to a new dict object. Confirmed by reading
+                        # Agno 2.5.17's own tools/function.py directly (the Phase
+                        # 1.29c root cause): `execute_entrypoint_async`, the innermost
+                        # step of the tool_hooks chain, ignores its own `args`
+                        # parameter entirely and instead reads `self.arguments` LIVE
+                        # (`arguments.update(self.arguments)`) at call time. This
+                        # hook is the OUTERMOST in `self.function.tool_hooks` (built
+                        # via `reduce(create_hook_wrapper, reversed(hooks), ...)`), so
+                        # the `args` it receives on the hook chain's very first call
+                        # (`execution_chain(name, entrypoint, self.arguments or {})`)
+                        # IS `self.arguments` itself -- the same object, not a copy,
+                        # since a non-empty dict is truthy and `X or {}` returns `X`.
+                        # Rebinding this local name to a NEW dict (the Phase 1.29c
+                        # code) only ever updated OUR OWN reference, never
+                        # `self.arguments`, so the entrypoint call never saw it --
+                        # confirmed live: a call adapted to max_output_chars=21,267
+                        # reached the producer with only {'relative_path': ...} and
+                        # returned its full, unbounded 24,035-char default. Mutating
+                        # the SAME dict object in place is visible to every other
+                        # holder of that reference, including `self.arguments`.
                         args["max_output_chars"] = _remaining_now
                         _worst_case = _reserve_worst_case(function_name, args)
                         _adapted = True
