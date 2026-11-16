@@ -448,20 +448,22 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
 
     `role` (Phase 1.52): which team member actually acts this attempt -- `T._member_key(member.name)`,
     e.g. "researcher"/"coder"/"executor"/"reviewer". Defaults to "researcher", the only role every
-    existing caller passes (explicitly, since this phase's own s_execute()/recover_and_reconcile() set
-    `role = "researcher"` rather than relying on the default) -- so this parameter changes NOTHING for
-    any call that predates it. It is used ONLY to prefer that member during selection (see the
-    `select_capable_member` call below); it does not change read_only (still hardcoded True for every
-    role here -- see this module's own header docstring), the task-prompt text
-    (`T._build_canonical_researcher_task` is, despite its name, pure deterministic construction from
-    target/objective/evidence_required/completion_criteria/knowledge_brief -- verified by reading it
-    directly in swarm/team.py: "Every delegation funnels through this ONE function regardless of which
-    member or task generated it" -- so it already produces correct text for any role, unchanged here),
-    or the knowledge brief (`ctx["knowledge_brief"]`, built ONCE per task by the caller at a fixed
-    `audience="researcher"` -- see run_engineering_workflow's own comment at that call site for why this
-    is a KNOWN, NOT-fixed-in-this-phase gap for any role other than "researcher"). Tool grants,
-    tool_call_limit and skill_catalog filtering are already fully role-independent and need no change
-    here: `_build_team()` resolves them per member (every member, not just the one this function later
+    existing caller passes (explicitly, via run_engineering_workflow()'s own `role` parameter,
+    which s_execute()/recover_and_reconcile() forward rather than hardcoding their own literal --
+    see run_engineering_workflow()'s own `role` docstring, Phase 1.53) -- so this parameter changes
+    NOTHING for any call that predates it. It is used to prefer that member during selection (see
+    the `select_capable_member` call below), AND (Phase 1.53) is the same value `ctx["knowledge_brief"]`
+    was rendered for and task-shape skills were injected into, one level up in
+    run_engineering_workflow() -- so a non-default role here is consistent with the context that
+    role was actually given, not mismatched against a context still assuming Researcher. It does
+    not change read_only (still hardcoded True for every role here -- see this module's own header
+    docstring) or the task-prompt text (`T._build_canonical_researcher_task` is, despite its name,
+    pure deterministic construction from target/objective/evidence_required/completion_criteria/
+    knowledge_brief -- verified by reading it directly in swarm/team.py: "Every delegation funnels
+    through this ONE function regardless of which member or task generated it" -- so it already
+    produces correct text for any role, unchanged here). Tool grants, tool_call_limit and
+    skill_catalog filtering are already fully role-independent and need no change here:
+    `_build_team()` resolves them per member (every member, not just the one this function later
     extracts) from `team_role_tools`/`RolePolicy`/`AgentSpec.skills`, all keyed by role already.
     `task_override` (Phase 1.24): if given, replaces wi.objective ONLY for the text actually sent to the
     Researcher this attempt (a bounded recovery pass targeting specific missing obligations) -- wi.target/
@@ -1432,7 +1434,7 @@ def reconstruct_final(led, task_id: str) -> Optional[str]:
 async def run_engineering_workflow(
     task: str, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
     project_id: str, session_id, controls_raw=None, registry=None, work_items=None, idempotency_key=None,
-    liveness_path=None, liveness_nonce=None, knowledge=None, evidence_policy=None,
+    liveness_path=None, liveness_nonce=None, knowledge=None, evidence_policy=None, role: str = "researcher",
 ):
     """Entry point called from swarm.team.run_task_async when orchestration == "workflow".
     Returns (content, tokens, clarification) exactly like the Team path.
@@ -1442,7 +1444,18 @@ async def run_engineering_workflow(
     `workflow_controls` above which are a TEST-ONLY channel gated behind
     HIVE_WORKFLOW_TEST_CONTROLS=1 and therefore unusable as a real policy-injection path for a
     new project). Forwarded to plan_work_items()/plan_request() -> derive_policy() -- see its
-    own docstring for the full mechanism."""
+    own docstring for the full mechanism.
+
+    `role` (Phase 1.53): the SAME role run_attempt() will be asked to act under for every work
+    item in this task (default "researcher" -- the only value any existing caller passes, so this
+    parameter changes nothing for any call that predates it). Used for the two task-level,
+    once-per-task context-preparation steps that happen BEFORE any attempt and therefore cannot
+    read run_attempt()'s own per-attempt `role` (s_execute() below reads this SAME parameter via
+    closure instead of hardcoding its own literal, Phase 1.52's duplicate): which spec receives
+    task-shape skill injection, and which audience the shared knowledge brief is rendered for. A
+    multi-stage caller that needs different roles for different work items within one task is
+    still not supported here -- that is dynamic planning's job, out of this phase's scope; this
+    parameter is for the single, task-wide role every existing and near-term caller actually has."""
     from agno.tools.mcp import MCPTools
     from agno.workflow import Workflow, Step
     import swarm.team as T
@@ -1507,13 +1520,17 @@ async def run_engineering_workflow(
         return ("## Investigation result: NOT ESTABLISHED\nNo agent roster was supplied for the workflow path.\n",
                 {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, None)
     # Task-shape skills: same injection the Team path applies to the Researcher's own instructions.
-    # Phase 1.52 KNOWN, NOT-fixed-in-this-phase gap: hardcoded to "researcher" regardless of which
-    # role(s) will actually run this task. run_attempt()'s own `role` parameter (this phase) only
-    # generalizes member SELECTION inside run_attempt() itself; this injection happens here, once,
-    # before any attempt, before the caller has decided which role(s) it will invoke -- fixing it
-    # correctly needs the caller to know the target role set ahead of time, which is dynamic
-    # planning's job (explicitly out of scope: "Do not implement... dynamic planning... in this
-    # phase"). Left unchanged and documented, not silently papered over.
+    # Phase 1.52 identified this as hardcoded to "researcher" regardless of which role will
+    # actually run the task. Phase 1.53: targets `role` (the task-wide acting role, see this
+    # function's own `role` parameter docstring) instead of the literal "researcher" -- for
+    # role="researcher" (every existing caller) this is byte-identical, since that is the exact
+    # string the hardcoded check already compared against. The 3 task-shape skills themselves
+    # (_TASK_SHAPE_SKILLS in swarm/team.py: codebase-enumeration-discipline, comparison-discipline,
+    # chain-tracing-discipline) are investigative-reasoning instructions, not Researcher-specific
+    # tool usage -- equally applicable to whichever role is actually the one investigating this
+    # shape of task, which is exactly what targeting the single acting `role` (never multiple
+    # roles at once) expresses: the skill still reaches only the one spec that will actually run,
+    # never sprayed across the whole roster "just in case".
     shapes = T._matching_task_shapes(task)
     if shapes:
         hive_for_skills = T._pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)
@@ -1522,7 +1539,7 @@ async def run_engineering_workflow(
             if not text:
                 continue
             for sp in specs:
-                if T._member_key(getattr(sp, "name", "")) == "researcher":
+                if T._member_key(getattr(sp, "name", "")) == role:
                     sp.instructions = list(getattr(sp, "instructions", None) or []) + [
                         f"── Skill: {name} (auto-loaded — this task matches its shape) ──", text]
     specs, ctools = T._strip_mutating(specs, coordinator_tools)     # investigation-only: ALWAYS read-only
@@ -1554,15 +1571,14 @@ async def run_engineering_workflow(
         await team_config.ensure_cache_loaded()
         hive_url = T._pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)
         catalog = await T._fetch_skill_catalog(hive_url)
-        # Phase 1.52 KNOWN, NOT-fixed-in-this-phase gap: `audience` is hardcoded "researcher" for
-        # the whole task's shared ctx, built once, before any attempt's role is chosen. Verified
-        # directly in swarm/knowledge.py's render_brief(): any audience other than exactly
-        # "researcher" falls into its generic `else` branch, whose body text literally says "the
-        # Researcher receives these with context" -- correct for a Coordinator-style summary,
-        # semantically wrong if handed to a non-Researcher acting agent. run_attempt()'s `role`
-        # parameter (this phase) does not change this -- fixing it means building ctx per-role or
-        # deferring brief rendering into run_attempt() itself, both bigger than this phase's scope.
-        ctx = {"knowledge_brief": K.render_brief(st.knowledge, "researcher"), "specs": specs, "coordinator": coordinator_model or T.config.leader_model, "ctools": ctools,
+        # Phase 1.52 identified `audience` as hardcoded "researcher" for the whole task's shared
+        # ctx. Phase 1.53: renders at `audience=role` instead -- swarm/knowledge.py's
+        # render_brief() now gives every role in its own _DETAILED_AUDIENCES set (researcher/
+        # coder/reviewer/executor) the SAME full-detail body Researcher always got (that body's
+        # own wording was already role-neutral; only which audiences reach it changed), so no
+        # shared evidence or Researcher-found entity/relationship/file content is lost for any of
+        # them. For role="researcher" (every existing caller) this is byte-identical to before.
+        ctx = {"knowledge_brief": K.render_brief(st.knowledge, role), "specs": specs, "coordinator": coordinator_model or T.config.leader_model, "ctools": ctools,
                "mcp_list": mcp_list, "catalog": catalog, "project_id": project_id, "hive_url": hive_url,
                "profile": T.execution_context.resolve_profile(None)}
 
@@ -1610,12 +1626,13 @@ async def run_engineering_workflow(
 
         async def s_execute(step_input):
             st.steps_run.append("execute")
-            # Phase 1.52: explicit, not relied-on-as-default -- every work item today is executed
-            # by the Researcher; this fixed value is what run_attempt()'s own `role` parameter
-            # generalizes, visibly, rather than leaving it implicit in _DEFAULT_MEMBER_PREFERENCE's
-            # ordering. A future multi-stage sequencer resolves this per work item/stage instead of
-            # once per task -- not implemented here (dynamic planning is out of this phase's scope).
-            role = "researcher"
+            # Phase 1.52 added this as its own local `role = "researcher"` literal, duplicating
+            # (and able to drift from) the skill-injection/knowledge-brief call sites above, which
+            # had no role concept yet. Phase 1.53: reads the outer `role` parameter via closure
+            # instead -- the SAME single value now drives skill injection, the knowledge brief,
+            # and every attempt in this task's execute loop, with one definition, not three. Every
+            # work item in a task still shares this one role; a future multi-stage sequencer that
+            # resolves role per work item/stage is dynamic planning's job, out of this phase's scope.
             for wi in (st.plan.items if st.plan else []):
                 c = item_controls(controls, wi.work_item_id)
                 n = 1

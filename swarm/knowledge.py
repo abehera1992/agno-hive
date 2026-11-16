@@ -36,8 +36,16 @@ SOURCE_EXT = (".py", ".ts", ".tsx", ".js", ".jsx")
 DOC_EXT = (".md", ".rst", ".txt")
 EXCLUDE_FRAGMENTS = ("/migrations/", "/node_modules/", "/tests/", "/__tests__/", "/__pycache__/", ".test.", ".spec.", "/alembic/", "__init__.py")
 
-BRIEF_CHARS = int(os.getenv("HIVE_KNOWLEDGE_BRIEF_CHARS", "3500"))          # budget of the brief given to each Researcher execution
-COORD_CHARS = int(os.getenv("HIVE_KNOWLEDGE_COORD_CHARS", "1200"))          # budget of the Coordinator's block
+BRIEF_CHARS = int(os.getenv("HIVE_KNOWLEDGE_BRIEF_CHARS", "3500"))          # budget of the detailed brief (see _DETAILED_AUDIENCES below)
+COORD_CHARS = int(os.getenv("HIVE_KNOWLEDGE_COORD_CHARS", "1200"))          # budget of the Coordinator's compact block
+
+# Phase 1.53: audiences that get the full-detail body (candidate files, relationships, entities,
+# docs) rather than the compact one-line summary -- every role run_attempt()'s own `role`
+# parameter (swarm/eng_workflow.py, Phase 1.52) can select, i.e. every acting role, not just
+# Researcher. Any OTHER audience value (today only "coordinator" -- see render_brief()'s own
+# `else` branch and delegation_note()/the brief_chars_* stats below) keeps the pre-existing
+# compact behavior unchanged.
+_DETAILED_AUDIENCES = frozenset({"researcher", "coder", "reviewer", "executor"})
 BUDGET_S = float(os.getenv("HIVE_KNOWLEDGE_BUDGET_S", "45"))                 # whole preparation, retrieval + verification
 MAX_SOURCE_FILES = int(os.getenv("HIVE_KNOWLEDGE_MAX_FILES", "10"))
 MAX_DOC_FILES, MAX_ENTITIES, MAX_RELS = 3, 8, 8
@@ -273,17 +281,25 @@ def _fit(lines: list, budget: int) -> list:
 
 def render_brief(d: Optional[KnowledgeDossier], audience: str = "researcher", budget: Optional[int] = None) -> str:
     """Compact, labelled application context. Items are dropped whole, lowest rank first; the header and the fallback/guidance
-    text (which the application must always deliver) are never dropped."""
+    text (which the application must always deliver) are never dropped.
+
+    `audience` (Phase 1.53): any value in _DETAILED_AUDIENCES (researcher/coder/reviewer/executor
+    -- every role run_attempt() can select) gets the SAME full-detail body below, unchanged
+    wording from before this phase (it was already role-neutral prose -- "Candidate source files",
+    "Relationships the index knows about", "Related entities" -- none of it named "Researcher").
+    Any other value (today only "coordinator") keeps the pre-existing compact branch, also
+    unchanged. Widening which audiences reach the detailed branch is the only behavior change;
+    no wording changed for either branch."""
     if d is None:
         return ""
-    budget = budget or (BRIEF_CHARS if audience == "researcher" else COORD_CHARS)
+    budget = budget or (BRIEF_CHARS if audience in _DETAILED_AUDIENCES else COORD_CHARS)
     head = [f"KNOWLEDGE PREPARATION (run by the application before you started -- you did not and cannot call it): status={d.status}"
             + (f" -- {d.reason}" if d.reason else "")]
     tail = [FALLBACK_TEXT if (d.fallback_required or d.status != SUCCESS) else GUIDANCE_TEXT]
     body: list = []
     src = [f for f in d.files if f["kind"] == "source" and f.get("verified") is not False]
     docs = [f for f in d.files if f["kind"] == "doc"]
-    if audience == "researcher":
+    if audience in _DETAILED_AUDIENCES:
         if src:
             body.append("Candidate source files (ranked):")
             body += [f"  - {f['path']}" + (f" (lines {f['lines']})" if f.get("lines") else "") + (f" -- {f['role']}" if f.get("role") else "") for f in src[:MAX_SOURCE_FILES]]
