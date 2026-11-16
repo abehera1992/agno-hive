@@ -751,6 +751,53 @@ def cross_reference_result(req: "CrossReferenceRequirement", srcs: dict, text: s
             "items": items_out}
 
 
+class PolicySpecError(ValueError):
+    """Phase 1.38: a supplied evidence_policy that is missing a required key, has the wrong
+    shape, or names an unsupported section raises THIS, never a bare KeyError/TypeError/
+    IndexError -- a clear, named failure the caller (plan_request()/plan_work_items()) is
+    expected to catch and turn into an explicit, visible request rejection, never a silent
+    fallback to the legacy phrase-matching policy. A malformed supplied policy and no supplied
+    policy at all must never be indistinguishable."""
+
+
+EVIDENCE_POLICY_SPEC_VERSION = "1"  # Phase 1.38: the schema build_policy_from_spec() parses.
+# Bumped only on a real, incompatible schema change -- never silently, and never for a change
+# that stays backward-compatible (e.g. adding a new optional key).
+
+
+def canonicalize_policy_spec(raw_spec: dict, source: str = "task_supplied") -> dict:
+    """Phase 1.38: the PERSISTED envelope around a caller's raw evidence_policy spec --
+    version + provenance, so a record written today and read back after a restart (or months
+    later) is unambiguous about which schema produced it and where it came from. `source` is
+    always one of a small, fixed set naming WHO selected the policy -- "task_supplied" (a real
+    RunRequest.evidence_policy) or "legacy_phrase_match" (swarm/eng_workflow.py's
+    _known_policy_for(), kept only for backward compatibility) -- never a project name, so this
+    envelope itself carries no project-specific content. Raises PolicySpecError immediately
+    (via build_policy_from_spec, called here purely to validate) if raw_spec does not parse --
+    canonicalizing a spec that cannot actually be built would persist a record nothing could
+    ever reconstruct from."""
+    if source not in ("task_supplied", "legacy_phrase_match"):
+        raise PolicySpecError(f"unknown policy provenance source: {source!r}")
+    build_policy_from_spec(raw_spec)   # validate eagerly; raises PolicySpecError on failure
+    return {"version": EVIDENCE_POLICY_SPEC_VERSION, "source": source, "raw": raw_spec}
+
+
+def policy_from_canonical(envelope: dict | None):
+    """Phase 1.38: the read-back counterpart to canonicalize_policy_spec() -- used by
+    reconstruct_final() so a restart rebuilds the SAME policy a live run was using, not the
+    legacy phrase-matched one. Returns None for an absent/legacy-source envelope (the caller
+    then falls back to _known_policy_for(), exactly as it always has for every record written
+    before this phase). Raises PolicySpecError on a version this process does not know how to
+    read -- never silently reinterprets an unrecognized schema as if it were the current one."""
+    if not envelope or envelope.get("source") != "task_supplied":
+        return None
+    if envelope.get("version") != EVIDENCE_POLICY_SPEC_VERSION:
+        raise PolicySpecError(f"persisted evidence_policy envelope has unsupported version "
+                              f"{envelope.get('version')!r} (this process reads "
+                              f"{EVIDENCE_POLICY_SPEC_VERSION!r})")
+    return envelope.get("raw")
+
+
 def build_policy_from_spec(spec: dict) -> "EvidencePolicy":
     """Phase 1.36: the project-agnostic deserializer that lets a CALLER supply its own
     EvidencePolicy as plain, JSON-safe data over the wire (RunRequest.evidence_policy, see
@@ -780,9 +827,19 @@ def build_policy_from_spec(spec: dict) -> "EvidencePolicy":
     docstring) -- a deliberately different, complementary mechanism from this static spec, not a
     gap in it: this spec is for what a policy author already knows when they write the task;
     the runtime mapping is for what the Researcher discovers while investigating, which the
-    policy author cannot know in advance. A malformed entry (missing a required key) raises
-    ValueError immediately -- never silently dropped or guessed, since a policy that silently
-    checks less than the caller asked for is worse than one that fails loudly at construction."""
+    policy author cannot know in advance. A malformed entry (missing a required key, or any
+    section/field of the wrong type) raises PolicySpecError immediately, named and with the
+    section+index that failed -- never silently dropped, never guessed, and never allowed to
+    fall through to the legacy phrase-matching policy (that decision belongs to the caller, not
+    this function, but this function's own job is to make the failure unambiguous): a policy
+    that silently checks less than the caller asked for is worse than one that fails loudly at
+    construction."""
+    def _wrap(section, idx, fn, e):
+        try:
+            return fn(e)
+        except (KeyError, TypeError, IndexError) as exc:
+            raise PolicySpecError(f"evidence_policy.{section}[{idx}]: {exc!r} -- entry was {e!r}") from exc
+
     def _req(e):
         return Requirement(e["id"], e.get("description", ""), list(e["any_of_paths"]), bool(e.get("mandatory", True)))
 
@@ -798,12 +855,18 @@ def build_policy_from_spec(spec: dict) -> "EvidencePolicy":
             [tuple(i) for i in e["right_items"]], list(e["right_source_paths"]),
             match=None, mandatory=bool(e.get("mandatory", True)))
 
+    if spec is not None and not isinstance(spec, dict):
+        raise PolicySpecError(f"evidence_policy must be an object/dict, got {type(spec).__name__}")
     spec = spec or {}
+    unsupported = set(spec.keys()) - {"name", "requirements", "enum_requirements", "cross_reference_requirements"}
+    if unsupported:
+        raise PolicySpecError(f"evidence_policy has unsupported top-level key(s): {sorted(unsupported)}")
     return EvidencePolicy(
         name=spec.get("name") or "supplied-policy",
-        requirements=[_req(e) for e in spec.get("requirements", [])],
-        enum_requirements=[_enum(e) for e in spec.get("enum_requirements", [])],
-        cross_reference_requirements=[_xref(e) for e in spec.get("cross_reference_requirements", [])])
+        requirements=[_wrap("requirements", i, _req, e) for i, e in enumerate(spec.get("requirements", []))],
+        enum_requirements=[_wrap("enum_requirements", i, _enum, e) for i, e in enumerate(spec.get("enum_requirements", []))],
+        cross_reference_requirements=[_wrap("cross_reference_requirements", i, _xref, e)
+                                      for i, e in enumerate(spec.get("cross_reference_requirements", []))])
 
 
 T13_ENDPOINTS_REQ = EnumRequirement(

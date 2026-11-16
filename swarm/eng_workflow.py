@@ -175,6 +175,17 @@ def plan_request(task: str, task_id: str, supplied_policy_spec: dict | None = No
     task = (task or "").strip()
     if not task:
         return WorkPlan(task_id, [], "empty request")
+    # Phase 1.38: a malformed/unsupported supplied evidence_policy must reject the request
+    # explicitly -- never silently fall back to the legacy phrase-matching policy, which would
+    # make a request that FAILED to apply the caller's own policy indistinguishable from one
+    # that never supplied a policy at all. derive_policy() raises A.PolicySpecError (never a
+    # bare KeyError/TypeError) for exactly this case; caught here, at the one place that turns
+    # it into a visible WorkPlan rejection, not deeper inside derive_policy() itself.
+    if supplied_policy_spec is not None:
+        try:
+            A.build_policy_from_spec(supplied_policy_spec)
+        except A.PolicySpecError as e:
+            return WorkPlan(task_id, [], f"invalid evidence_policy: {e}")
     paths = extract_paths(task)
     evidence = ("For each named file: the file path you read, the function/handler name, and the route path "
                 "or URL, taken from file content you actually read.") if paths else (
@@ -1145,8 +1156,15 @@ def reconstruct_final(led, task_id: str) -> Optional[str]:
     for it in raw["items"]:
         w = it["work_item"]
         spec = _json.loads(w["spec_json"])
+        # Phase 1.38: rebuild the SAME policy a live run used, not the legacy phrase-matched
+        # one, when a task-supplied evidence_policy was persisted (A.policy_from_canonical
+        # returns None for any record written before this phase, or for a legacy-sourced one --
+        # derive_policy() then falls back to _known_policy_for(spec["objective"]) exactly as it
+        # always has, so every pre-existing record reconstructs unchanged).
+        _supplied = A.policy_from_canonical(spec.get("evidence_policy"))
         wi = WorkItem(w["work_item_id"], w["title"], spec["target"], spec["objective"], spec["evidence_required"],
-                      spec["completion_criteria"], spec["paths"], derive_policy(spec["paths"], spec["objective"]))
+                      spec["completion_criteria"], spec["paths"],
+                      derive_policy(spec["paths"], spec["objective"], supplied_policy_spec=_supplied))
         items.append(wi)
         for a in it["attempts"]:
             at = a["attempt"]
@@ -1310,11 +1328,22 @@ async def run_engineering_workflow(
                       else plan_request(task, task_id, supplied_policy_spec=evidence_policy))
             if st.plan.items and st.ledger is not None:
                 try:     # the plan is durable before ANY attempt can exist
+                    # Phase 1.38: a task-supplied evidence_policy is persisted as its own
+                    # canonical, versioned, provenance-tagged envelope (A.canonicalize_policy_spec)
+                    # -- not just the policy's own .name string the pre-existing "policy" key
+                    # already carries (kept unchanged below, for every existing reader and for
+                    # the legacy phrase-matched case, which still reconstructs correctly from
+                    # spec["objective"] alone, exactly as before). Validation already succeeded
+                    # in plan_request()/plan_work_items() by the time this line runs -- a
+                    # malformed spec never reaches here, since an invalid one already produced
+                    # an empty st.plan.items and skipped this whole block.
+                    _policy_envelope = (A.canonicalize_policy_spec(evidence_policy, source="task_supplied")
+                                       if evidence_policy else None)
                     await st.ledger._a(st.ledger.create_task, task_id, wf_run_id, task, [
                         {"work_item_id": w.work_item_id, "title": w.title,
                          "spec": {"paths": w.paths, "target": w.target, "objective": w.objective,
                                   "evidence_required": w.evidence_required, "completion_criteria": w.completion_criteria,
-                                  "policy": w.policy.name}} for w in st.plan.items])
+                                  "policy": w.policy.name, "evidence_policy": _policy_envelope}} for w in st.plan.items])
                     st.ledger_task_created = True
                 except Exception as e:  # noqa: BLE001 -- fail closed: nothing is dispatched without a durable plan
                     st.plan = WorkPlan(task_id, [], f"durable ledger unavailable ({repr(e)[:120]}); request not dispatched")
