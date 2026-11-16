@@ -450,7 +450,27 @@ class Ledger:
             c.close()
 
     def load_for_reconstruction(self, task_id) -> Optional[dict]:
-        """Raw durable records (decisions, attempt text, spec) from which the final answer can be rebuilt."""
+        """Raw durable records (decisions, attempt text, spec) from which the final answer can be
+        rebuilt.
+
+        Phase 1.41b: an attempt with no `decision` row (killed before `decide()`/`record_terminal()`
+        ever ran -- confirmed live for the actual T11/T13b battery incidents: `record_tool_call()`
+        durably persists EVERY tool call's own full result content, content-addressed in
+        `evidence_blob`, as it happens, well before any terminal-level write) is NOT left with
+        nothing recoverable. For exactly that case (`decision is None` only -- an attempt that DID
+        reach a decision, however unfavourable, already has its own complete, unchanged rendering
+        and this never runs for it), this also fetches the attempt's own `tool_call` rows and
+        resolves each genuinely useful one's real content via `evidence_blob`, attached as
+        `recovered_evidence`. "Genuinely useful" mirrors the SAME generic definition
+        `acceptance.has_new_source_evidence()`/`describe_evidence_without_text()` already use
+        elsewhere in this codebase for the identical concept (a SUCCESS outcome from a tool that is
+        not one of the four STATE_TOOLS) -- reused here as a literal set rather than importing
+        `swarm.acceptance` from this low-level module, to avoid adding a new module-level
+        dependency for four well-known, rarely-changing names.
+
+        Never touches `decision`/`text`/accepted-pointer handling for ANY attempt -- an accepted
+        attempt, or one with any decision at all, is returned exactly as before this phase."""
+        _state_tools = {"update_session_state", "load_skill", "forward_member_answer", "request_clarification"}
         c = self._conn()
         try:
             t = c.execute("SELECT * FROM task WHERE task_id=?", (task_id,)).fetchone()
@@ -462,7 +482,23 @@ class Ledger:
                 for a in c.execute("SELECT * FROM attempt WHERE task_id=? AND work_item_id=? ORDER BY generation", (task_id, w["work_item_id"])).fetchall():
                     d = c.execute("SELECT * FROM decision WHERE attempt_id=?", (a["attempt_id"],)).fetchone()
                     txt = c.execute("SELECT content FROM evidence_blob WHERE sha=?", (a["text_sha"],)).fetchone() if a["text_sha"] else None
-                    atts.append({"attempt": dict(a), "decision": dict(d) if d else None, "text": txt["content"] if txt else ""})
+                    rec = {"attempt": dict(a), "decision": dict(d) if d else None, "text": txt["content"] if txt else ""}
+                    if d is None:
+                        recovered = []
+                        for tc in c.execute(
+                                "SELECT seq, tool, outcome, evidence_kind, paths_read_json, result_sha, result_len "
+                                "FROM tool_call WHERE attempt_id=? ORDER BY seq", (a["attempt_id"],)).fetchall():
+                            if tc["outcome"] != "SUCCESS" or tc["tool"] in _state_tools or not tc["result_sha"]:
+                                continue
+                            try:
+                                paths = json.loads(tc["paths_read_json"] or "[]")
+                            except Exception:  # noqa: BLE001
+                                paths = []
+                            recovered.append({"seq": tc["seq"], "tool": tc["tool"], "evidence_kind": tc["evidence_kind"],
+                                             "paths": paths, "result_sha": tc["result_sha"], "result_len": tc["result_len"]})
+                        if recovered:
+                            rec["recovered_evidence"] = recovered
+                    atts.append(rec)
                 items.append({"work_item": dict(w), "attempts": atts})
             return {"task": dict(t), "items": items}
         finally:

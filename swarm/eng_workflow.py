@@ -1203,6 +1203,23 @@ def build_final(st: RunState) -> str:
             else:
                 lines.append("Reason: not started because the overall task deadline was reached."
                              if getattr(st, "deadline_hit", False) else "Reason: no attempt produced a decision.")
+            # Phase 1.41b: only ever reached when d is None (this whole branch's own condition) --
+            # an attempt that DID reach a decision, however unfavourable, already has its own
+            # distinct rendering above and is never touched here. See
+            # Ledger.load_for_reconstruction()'s own docstring for exactly what is and is not
+            # durable for a decision-less (killed-in-flight) attempt. Never marks this work item
+            # accepted or complete -- `status`/`accepted` above are completely unaffected by this
+            # block; it only adds a clearly-labeled, read-only disclosure of what real evidence
+            # already existed in the ledger before termination.
+            _recovered = getattr(rec.attempt, "recovered_evidence", None) if rec is not None else None
+            if _recovered:
+                lines.append("")
+                lines.append("**Evidence recovered from an abandoned, unaccepted attempt** "
+                            "(never reviewed, never accepted -- shown only because the ledger "
+                            "already held it durably before this attempt ended without a decision):")
+                for ev in _recovered:
+                    _where = ", ".join(ev.get("paths") or []) or "(no path -- search/other evidence)"
+                    lines.append(f"- `{ev['tool']}` → {_where} ({ev.get('result_len', 0)} chars)")
         if d is not None:
             lines.extend(_format_cross_reference_section((d.gate or {}).get("cross_reference_detail") or []))
         # Phase 1.42 Track C: a fact about what happened during execution, independent of
@@ -1211,7 +1228,14 @@ def build_final(st: RunState) -> str:
         # by any available member (never fires for a work item that left required_capabilities
         # unset, i.e. every work item today). Never upgrades or downgrades the acceptance
         # verdict above; only makes an already-real limitation visible instead of silent.
-        _gap = (rec.attempt.terminal or {}).get("capability_gap") if rec is not None else None
+        # Phase 1.41b: reconstruct_final() rebuilds each attempt as a bare SimpleNamespace with
+        # no .terminal attribute at all (a restart-safe record has no live terminal dict to
+        # carry) -- getattr(..., None) rather than a direct attribute access, so this line does
+        # not crash the exact post-SIGKILL recovery path this phase's own work extends. A real,
+        # live attempt (not reconstructed) always has a real dict here, including the Phase 1.42
+        # Track C default of an empty list, so this is a pure safety widening, not a behavior
+        # change for any attempt this already worked for.
+        _gap = (getattr(rec.attempt, "terminal", None) or {}).get("capability_gap") if rec is not None else None
         if _gap:
             lines.append("")
             lines.append(f"**Capability gap disclosed**: this work item required {', '.join(_gap)}, "
@@ -1304,7 +1328,8 @@ def reconstruct_final(led, task_id: str) -> Optional[str]:
         for a in it["attempts"]:
             at = a["attempt"]
             att = NS(attempt_id=at["attempt_id"], work_item_id=at["work_item_id"], generation=at["generation"],
-                     agent_run_id=at["agent_run_id"], text=a["text"])
+                     agent_run_id=at["agent_run_id"], text=a["text"],
+                     recovered_evidence=a.get("recovered_evidence") or [])
             d = a["decision"]
             dec = None
             if d is not None:
