@@ -234,6 +234,16 @@ class AttemptRecord:
     # `role`/`stage` column, so this field does not survive a process restart; it is correct for
     # the current single-attempt-in-flight snapshot and for st.records' own in-process history).
     role: str = "researcher"
+    # Phase 1.54a: the structured WorkProposal (swarm.proposal.WorkProposal) and its
+    # deterministic ValidationResult, populated ONLY when run_attempt() was called with
+    # propose=True (default False everywhere today -- see run_attempt()'s own Phase 1.54a
+    # comment). None/None means "not requested" or "the proposal step itself failed" --
+    # proposal_validation distinguishes the two (None = not requested; a ValidationResult
+    # with valid=False and an explicit error = requested but failed/rejected). Retained here,
+    # in-memory/Workflow-path-only, exactly like `role` above, for a LATER orchestration phase
+    # to read -- nothing in this codebase acts on it yet; it is never dispatched.
+    proposal: object = None
+    proposal_validation: object = None
 
 
 @dataclass
@@ -442,7 +452,7 @@ def select_capable_member(team, required_capabilities, member_key_fn, preference
 
 
 async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, attempt_no: int, task_override: str = None,
-                      extra_activity: dict = None, role: str = "researcher"):
+                      extra_activity: dict = None, role: str = "researcher", propose: bool = False):
     """Create a NEW attempt (new id + generation via the registry), run the real agent for `role` under it,
     observe the Agent's own terminal facts, and return the AttemptRecord. Never raises.
 
@@ -474,7 +484,17 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
     missing_source_paths/missing_obligation_ids (deterministically derived from the ORIGINAL attempt's
     own Decision via the existing requirement_source_paths(), the same call build_recovery_task() already
     makes) so the just-in-time extension check in swarm/team.py's budget hook has something real to match
-    a blocked read's path against, never model text."""
+    a blocked read's path against, never model text.
+
+    `propose` (Phase 1.54a): defaults to False -- EVERY existing caller and every pre-1.54a behavior is
+    completely unaffected. When True, AFTER this attempt's own investigation/evidence/acceptance fields
+    are already finalized (strictly outside the try/finally above -- a failure in this step can change
+    nothing already written), calls swarm.proposal.propose_from_text() with the real, already-built
+    `team`'s own per-role tool surface and this team_name's real DB-granted skill list
+    (team_config.get_extra_skills) as the capability/skill registries -- never a hardcoded or invented
+    one, and never treating an unreachable registry as authorization (see propose_from_text()'s own
+    docstring). Writes rec.proposal/rec.proposal_validation; never raises into the caller, never
+    dispatches Coder/Reviewer/Executor, never changes att.text/att.terminal/rec.decision above."""
     import functools
     import inspect
     import swarm.team as T
@@ -839,6 +859,32 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
                 rec.ledger_error = rec.ledger_error or f"LEDGER_ERROR: {repr(e)[:160]}"
             if outcome_rec.persist_error:
                 rec.ledger_error = rec.ledger_error or f"LEDGER_ERROR: evidence not durable: {outcome_rec.persist_error}"
+    # Phase 1.54a: additive, opt-in structured proposal generation. Strictly outside the
+    # try/finally above -- nothing here can retroactively change att.text/att.terminal/
+    # rec.decision, and this entire block is itself try/except-wrapped so a failure here
+    # can never surface as this attempt's own failure. Skipped entirely (rec.proposal and
+    # rec.proposal_validation stay None, their declared defaults) unless the caller passed
+    # propose=True AND the investigation actually produced real text -- no text means
+    # nothing to propose from, not a reason to invent one.
+    if propose and att.text:
+        from swarm import proposal as P
+        try:
+            from swarm import team_config as _team_config
+            known_caps = frozenset(
+                getattr(t, "name", None) for t in (getattr(agent, "tools", None) or [])) - {None}
+            authorized_skills = {r: frozenset(_team_config.get_extra_skills("engineering", r))
+                                 for r in P.KNOWN_ROLES}
+            proposal_obj, validation = await P.propose_from_text(
+                att.text, wi.objective, agent.model,
+                known_capabilities=known_caps, authorized_skills_by_role=authorized_skills)
+            rec.proposal = proposal_obj
+            rec.proposal_validation = validation
+            st.emit("proposal_generated", work_item=wi.work_item_id, attempt=att.attempt_id,
+                    role=role, valid=validation.valid, errors=len(validation.errors),
+                    items=len(proposal_obj.work_items) if proposal_obj else 0)
+        except Exception as e:  # noqa: BLE001 -- additive capability, must never affect the attempt itself
+            rec.proposal_validation = P.ValidationResult(valid=False, errors=[f"proposal step failed: {repr(e)[:200]}"])
+            st.emit("proposal_failed", work_item=wi.work_item_id, attempt=att.attempt_id, error=repr(e)[:160])
     return rec
 
 
@@ -1054,7 +1100,8 @@ def reconcile_attempts(orig_att, orig_d, rec_att) -> tuple:
 
 async def recover_and_reconcile(st: RunState, wi: WorkItem, ctx: dict, controls: dict,
                                 orig_rec: AttemptRecord, orig_d, attempt_no: int,
-                                extension_info: dict = None, role: str = "researcher"):
+                                extension_info: dict = None, role: str = "researcher",
+                                propose: bool = False):
     """Phase 1.24 Track 5/6: ONE bounded, application-controlled recovery attempt targeting
     specifically the mandatory obligations orig_d.gate['missing'] identifies, followed by
     deterministic evidence reconciliation and an INDEPENDENT final decide() (Track 6: the final
@@ -1076,7 +1123,10 @@ async def recover_and_reconcile(st: RunState, wi: WorkItem, ctx: dict, controls:
     `role` (Phase 1.52): forwarded unchanged to the recovery run_attempt() call below -- a
     recovery pass must run the SAME role as the attempt it is recovering, never silently default
     back to "researcher" if the caller already generalized to a different role. Defaults to
-    "researcher" (every existing caller, since s_execute() passes its own `role` explicitly)."""
+    "researcher" (every existing caller, since s_execute() passes its own `role` explicitly).
+
+    `propose` (Phase 1.54a): forwarded unchanged to the recovery run_attempt() call below.
+    Defaults to False, same as run_attempt()'s own default."""
     task_override = build_recovery_task(wi, orig_rec.attempt, orig_d)
     # Phase 1.30: the same deterministic derivation build_recovery_task() just used to
     # build the recovery prompt's own "Read: <paths>" lines -- reused here, not
@@ -1086,7 +1136,8 @@ async def recover_and_reconcile(st: RunState, wi: WorkItem, ctx: dict, controls:
     _missing_paths = sorted({p for mid in _missing_ids for p in A.requirement_source_paths(wi.policy, mid)})
     rec2 = await run_attempt(st, wi, ctx, controls, attempt_no, task_override=task_override,
                              extra_activity={"missing_source_paths": _missing_paths,
-                                             "missing_obligation_ids": _missing_ids}, role=role)
+                                             "missing_obligation_ids": _missing_ids}, role=role,
+                             propose=propose)
     # rec2.attempt.state is "FINISHED" even on a ledger-start failure or setup error (see
     # run_attempt()'s own early-exit paths) -- rec2.error/rec2.ledger_error are what actually
     # distinguish a genuine run from one that never got to call the Researcher at all.
@@ -1435,6 +1486,7 @@ async def run_engineering_workflow(
     task: str, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
     project_id: str, session_id, controls_raw=None, registry=None, work_items=None, idempotency_key=None,
     liveness_path=None, liveness_nonce=None, knowledge=None, evidence_policy=None, role: str = "researcher",
+    propose: bool = False,
 ):
     """Entry point called from swarm.team.run_task_async when orchestration == "workflow".
     Returns (content, tokens, clarification) exactly like the Team path.
@@ -1455,7 +1507,12 @@ async def run_engineering_workflow(
     task-shape skill injection, and which audience the shared knowledge brief is rendered for. A
     multi-stage caller that needs different roles for different work items within one task is
     still not supported here -- that is dynamic planning's job, out of this phase's scope; this
-    parameter is for the single, task-wide role every existing and near-term caller actually has."""
+    parameter is for the single, task-wide role every existing and near-term caller actually has.
+
+    `propose` (Phase 1.54a): forwarded, via the same closure pattern as `role`, to every
+    run_attempt()/recover_and_reconcile() call s_execute() below makes. Defaults to False --
+    every existing caller is completely unaffected; see run_attempt()'s own `propose` docstring
+    for what it actually does."""
     from agno.tools.mcp import MCPTools
     from agno.workflow import Workflow, Step
     import swarm.team as T
@@ -1647,12 +1704,12 @@ async def run_engineering_workflow(
                     if sup:
                         # Control: a newer generation starts while attempt 1 is still running. The registry marks
                         # attempt 1 SUPERSEDED the moment attempt 2 starts; attempt 1 keeps running and finishes late.
-                        t1 = asyncio.ensure_future(run_attempt(st, wi, ctx, c, 1, role=role))
+                        t1 = asyncio.ensure_future(run_attempt(st, wi, ctx, c, 1, role=role, propose=propose))
                         done, _ = await asyncio.wait({t1}, timeout=float(sup))
                         if not done:
                             c2 = {k: v for k, v in c.items() if k not in ("supersede_after_s", "delay_tool_s", "cancel_after_s")}
                             st.emit("supersede_started", work_item=wi.work_item_id)
-                            rec2 = await run_attempt(st, wi, ctx, c2, 2, role=role)
+                            rec2 = await run_attempt(st, wi, ctx, c2, 2, role=role, propose=propose)
                             reconstruct_missing_terminal_from_evidence(rec2.attempt)
                             d2 = await assess_and_register(st, wi, rec2, c)
                             rec1 = await t1                       # the old attempt finishes LATE
@@ -1663,7 +1720,7 @@ async def run_engineering_workflow(
                             break
                         rec = t1.result()
                     else:
-                        rec = await run_attempt(st, wi, ctx, c, n, role=role)
+                        rec = await run_attempt(st, wi, ctx, c, n, role=role, propose=propose)
                     # Phase 1.39: the original-attempt (and plain-retry) equivalent of Phase
                     # 1.37's recovery-specific evidence rescue -- see
                     # reconstruct_missing_terminal_from_evidence()'s own docstring for the
@@ -1728,7 +1785,8 @@ async def run_engineering_workflow(
                                             new_read_ceiling=ext["new_read_ceiling"],
                                             new_discovery_ceiling=ext["new_discovery_ceiling"])
                                 recovered = await recover_and_reconcile(st, wi, ctx, c_recovery, rec, d, n + 1,
-                                                                       extension_info=ext, role=role)
+                                                                       extension_info=ext, role=role,
+                                                                       propose=propose)
                                 if recovered is not None:
                                     rec, d = recovered
                         break

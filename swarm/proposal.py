@@ -1,12 +1,15 @@
-"""Structured Researcher Work Proposal + application-side validation (Phase 1.54).
+"""Structured Researcher Work Proposal + application-side validation (Phase 1.54; wired into
+run_attempt() as an opt-in, additive step by Phase 1.54a -- see propose_from_text() below).
 
 Researcher PROPOSES a structured work plan; the APPLICATION validates it deterministically
 before anything else may act on it. Neither Researcher nor any Coordinator controls what
 happens next -- this module defines the proposal's shape and a pure, side-effect-free
-validator. It does NOT dispatch agents, does NOT alter execution flow, and is NOT wired into
-run_attempt()/run_engineering_workflow() in this phase: nothing here changes how the existing
-Researcher-only read-only Workflow path behaves today. A future phase that wires this into
-actual multi-stage dispatch is explicitly out of this phase's scope.
+validator, plus (Phase 1.54a) the one function that actually produces a proposal from a
+real agent call. Nothing here ever DISPATCHES Coder/Reviewer/Executor or alters execution
+flow: run_attempt() (swarm/eng_workflow.py) calls `propose_from_text()` only when its own
+new `propose` parameter is explicitly True (default False everywhere), strictly AFTER its
+existing investigation/evidence/acceptance fields are already finalized, and a failure here
+can never change any of them -- see run_attempt()'s own Phase 1.54a comment at that call site.
 
 Schema (`WorkProposal`/`ProposedWorkItem`) is a pydantic BaseModel specifically so a future
 caller CAN set it as `Agent.output_schema` (verified present on the installed Agno package:
@@ -237,3 +240,69 @@ def validate_proposal(
         unauthorized_skills=unauthorized_skills,
         unverified_capabilities=unverified_capabilities,
     )
+
+
+async def propose_from_text(
+    investigation_text: str,
+    task: str,
+    model,
+    *,
+    known_capabilities: Optional[frozenset] = None,
+    authorized_skills_by_role: Optional[dict] = None,
+) -> tuple[Optional[WorkProposal], ValidationResult]:
+    """Phase 1.54a: the SEPARATE structured-planning call run_attempt() invokes, only when
+    explicitly opted into, after its own investigation call has already produced
+    `investigation_text` -- never the same `.arun()` call that produced it, so the existing
+    free-form investigative answer is never replaced or truncated (Scope: "Use a separate
+    structured planning call if necessary to preserve the existing output contract").
+
+    `model` is the CALLER's own already-resolved model object (e.g. the acting agent's own
+    `agent.model` from the completed investigation) -- never a hardcoded model/provider name,
+    so this makes no assumption about what is actually deployed. The planning agent built here
+    is given NO tools: it synthesizes a structured breakdown from text already gathered, it
+    does not investigate further and cannot call anything, Coder/Reviewer/Executor included.
+
+    Never raises: any failure (bad/missing structured content, a model/network error) returns
+    `(None, ValidationResult(valid=False, errors=[...]))` -- a malformed or absent proposal is
+    reported as explicitly invalid, never silently treated as "nothing to validate" and never
+    promoted to something executable. `known_capabilities`/`authorized_skills_by_role` are
+    forwarded unchanged to validate_proposal() -- see that function's own docstring for why
+    missing registry data is disclosed, never treated as authorization."""
+    from agno.agent import Agent
+
+    try:
+        planner = Agent(model=model, tools=[], output_schema=researcher_output_schema(),
+                        markdown=False)
+        prompt = (
+            "Based ONLY on the investigation findings below (already gathered -- do not "
+            "investigate further, you have no tools), propose a structured WorkProposal: "
+            "the overall objective, and zero or more work items. Each work item needs a "
+            "role, objective, dependencies (depends_on, by work_item_id), "
+            "required_capabilities, proposed_skills, acceptance_criteria and "
+            "expected_evidence. If the findings do not call for any further work, return "
+            "an empty work_items list rather than inventing one.\n\n"
+            f"Original task: {task}\n\n"
+            f"Investigation findings:\n{investigation_text}"
+        )
+        run_output = await planner.arun(prompt)
+    except Exception as e:  # noqa: BLE001 -- additive capability, must never raise into the caller
+        return None, ValidationResult(valid=False, errors=[f"proposal generation call failed: {repr(e)[:200]}"])
+
+    content = getattr(run_output, "content", None)
+    try:
+        if isinstance(content, WorkProposal):
+            proposal = content
+        elif isinstance(content, dict):
+            proposal = WorkProposal.model_validate(content)
+        elif isinstance(content, str) and content.strip():
+            proposal = WorkProposal.model_validate_json(content)
+        else:
+            return None, ValidationResult(
+                valid=False,
+                errors=[f"planning call produced no usable structured output (content type: {type(content).__name__})"])
+    except Exception as e:  # noqa: BLE001 -- a malformed response is an explicit validation failure, never a crash
+        return None, ValidationResult(valid=False, errors=[f"could not parse structured output as WorkProposal: {repr(e)[:200]}"])
+
+    return proposal, validate_proposal(
+        proposal, known_capabilities=known_capabilities,
+        authorized_skills_by_role=authorized_skills_by_role)
