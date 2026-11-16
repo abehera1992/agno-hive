@@ -193,6 +193,37 @@ historical failure and means `/post` and `/cancel` were wrongly counted as uncov
 `useCancelVoucherMutation`; and `createStockTransfer` / `createStockAdjustment` /
 `createGRNFromPO` / `createCreditNote` genuinely absent from `inventoryApi.ts`.
 
+### T14 — Ekam feature discovery and structured proposal (Phase 1.56a)
+
+A new kind of entry for this file: not a fact-lookup or comparison with a fixed ground
+truth, but an OPEN-ENDED discovery-and-propose task against the Ekam application
+repository (a separate project this swarm connects to via its own project MCP server),
+using the Phase 1.54/1.54a/1.55 structured `WorkProposal` mechanism
+(`propose_from_text()` → `validate_proposal()` → `record_proposal()`) rather than a
+free-form answer. The feature is deliberately NOT named in the prompt — see Phase 1.56a's
+own report for why, and for how this run's result was independently checked for
+"genuinely missing, not already implemented" before being scored.
+
+> Research this repository (the Ekam application) and identify ONE credible, currently-missing feature that would provide real business or user value, backed by evidence you actually find in this codebase. For the feature you identify: state the user/business problem it solves and the expected benefit; cite the specific files, code, schema, or absence of either that supports why it is genuinely missing (not already implemented elsewhere in this codebase); describe what it would require on the frontend, backend, database, and any relevant third-party/ONDC integration points. Then produce a structured, dependency-ordered execution proposal: one or more work items, each with a unique work_item_id, objective, proposed role (researcher, coder, executor, or reviewer), dependencies on other work_item_ids where applicable, required_capabilities, proposed_skills, acceptance_criteria, and expected_evidence. Do not propose implementing anything yourself, and do not dispatch any work — this is discovery and proposal only.
+
+**Pass (groundedness, scored independently of the integration mechanics):** the
+identified feature is verified NOT already implemented elsewhere in the codebase before
+scoring (an evidence-backed claim of absence is not the same as it being true); every
+claim of presence/absence cites a real file/path/grep result actually obtained this run,
+not inferred; the structured proposal parses into a valid `WorkProposal` with at least
+one work item, every required field meaningfully populated (not a placeholder), a known
+role, no dangling dependency, and no dependency cycle.
+
+**Pass (Phase 1.56a integration, scored separately — see "Scoring" above on never
+merging independent axes):** the real `propose_from_text()` → Agno `output_schema`
+mechanism returned parseable structured output from the verified live Researcher
+inference route (not a scripted response, direct provider call, substitute model, or
+mocked Agent); `validate_proposal()` ran for real against it; the result was persisted
+via the real `record_proposal()` to a disposable, non-production ledger whose exact path
+was proven isolated before the run; and the persisted proposal/work-items retrieved
+correctly via `get_proposal()`, including after a simulated restart (a fresh `Ledger()`
+instance against the same file).
+
 ## Result log
 
 Append one dated section per run. Record accuracy and containment separately, and note the
