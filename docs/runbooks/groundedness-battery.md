@@ -200,6 +200,38 @@ deployed commit so a future reader can tell what was being measured.
 
 ---
 
+### 2026-11-16 (later) — full T1–T13b run (14 prompts), post-Phase-1.49
+
+Deployed: agno-hive `74d0756` for the battery itself (Phase 1.49 — claim attribution and
+table-ownership scope precision for T3/T4/T13b), with a follow-up fix (`84362cb`) landing
+immediately after this run, before the phase was called complete — see
+`docs/runbooks/architecture-acceptance-runs/Phase-1.49-report.md` Section 5 for the full
+account. Same methodology as the entry below (`engineering`, `read_only=True`, fresh session
+each, sequential, exact unmodified prompts). Every claimed citation independently re-verified
+against real files/DB.
+
+**12 pass / 2 partial / 0 fail, scored per this run's own explicit rubric (count
+`ACCEPTED_PARTIAL` as partial, never round up, never infer causation from correlation).**
+T11 ⚠ (self-disclosed, no kill — same honest-partial shape as before, not a regression).
+T13a ⚠ (table-ownership distinction correct, zero fabrication, but the final "all backend
+endpoints have corresponding frontend hooks" sentence is factually wrong given only 5 of 9
+were ever named — the long-standing "reasoning over correct evidence" gap, not new, out of
+Phase 1.49's scope). **T3 and T4 did not naturally reproduce their own original defect
+phrasing this run** (model-wording variance) — both came back clean and independently
+verified accurate, but this means the new T3/T4 guards were not observed catching a live
+recurrence; their correctness rests on the scratch harness's direct reproduction of the exact
+original defect text (20/20), not a live catch. **T13b's own table-ownership note was found
+missing on its accepted (recovery) generation during this very run** — root-caused to the
+guard's new call site using a recovery-pass-specific task string that echoed the prior
+attempt's own text ("...especially those related to vouchers"), spuriously matching a
+"broader relationship requested" exclusion never intended by the real question. Fixed
+(`84362cb`: the call site now always uses the stable, generation-invariant original
+objective) and re-confirmed via a standalone T13b re-run after redeploy — the note now
+correctly appears on the accepted generation with the right owned/referenced
+classification.
+
+---
+
 ### 2026-11-16 — full T1–T13b run (14 prompts), post-Phase-1.46/1.47/1.48
 
 Deployed: agno-hive `e3d2db2` (Phase 1.48 — recovery-aware read-budget extension; also carries
