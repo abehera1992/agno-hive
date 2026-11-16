@@ -193,30 +193,56 @@ historical failure and means `/post` and `/cancel` were wrongly counted as uncov
 `useCancelVoucherMutation`; and `createStockTransfer` / `createStockAdjustment` /
 `createGRNFromPO` / `createCreditNote` genuinely absent from `inventoryApi.ts`.
 
-### T14 — Ekam feature discovery and structured proposal (Phase 1.56a)
+### T14 — Vouchers invoice-entry gap and structured proposal (Phase 1.56a, revised)
 
-A new kind of entry for this file: not a fact-lookup or comparison with a fixed ground
-truth, but an OPEN-ENDED discovery-and-propose task against the Ekam application
-repository (a separate project this swarm connects to via its own project MCP server),
-using the Phase 1.54/1.54a/1.55 structured `WorkProposal` mechanism
-(`propose_from_text()` → `validate_proposal()` → `record_proposal()`) rather than a
-free-form answer. The feature is deliberately NOT named in the prompt — see Phase 1.56a's
-own report for why, and for how this run's result was independently checked for
-"genuinely missing, not already implemented" before being scored.
+**Revised after a first run (2026-11-16, see Phase 1.56a's report).** The original
+wording asked the Researcher to find ANY credible missing feature anywhere in the app,
+open-ended, with no fixed ground truth. That run identified "Automated GST Compliance
+Task Management" — but independent verification found the core claim overstated: a
+`gst_auto_apply` cascade already exists (`admin_gst_api.py` lines 534-570, 984-1014) and
+already automates remediation for opted-in tenants, which the model read this exact file
+but never discovered. An open-ended prompt with no checkable ground truth cannot
+distinguish a genuinely novel finding from an overstated one. This revision keeps the
+same mechanism under test (the Phase 1.54/1.54a/1.55 structured `WorkProposal` pipeline
+— `propose_from_text()` → `validate_proposal()` → `record_proposal()`) but anchors it to
+one specific, pre-verified, narrow gap in the inventory module's Vouchers feature, so a
+future run can be scored against a real, checkable answer instead of an open field.
 
-> Research this repository (the Ekam application) and identify ONE credible, currently-missing feature that would provide real business or user value, backed by evidence you actually find in this codebase. For the feature you identify: state the user/business problem it solves and the expected benefit; cite the specific files, code, schema, or absence of either that supports why it is genuinely missing (not already implemented elsewhere in this codebase); describe what it would require on the frontend, backend, database, and any relevant third-party/ONDC integration points. Then produce a structured, dependency-ordered execution proposal: one or more work items, each with a unique work_item_id, objective, proposed role (researcher, coder, executor, or reviewer), dependencies on other work_item_ids where applicable, required_capabilities, proposed_skills, acceptance_criteria, and expected_evidence. Do not propose implementing anything yourself, and do not dispatch any work — this is discovery and proposal only.
+**Ground truth (verified 2026-11-16, re-verify before each run):**
+- `docs/inventory.md:21` lists "Voucher create form (full invoice entry UI)." under
+  "### Pending".
+- `Client/EcommClient-Web/ekamweb/src/app/(portal)/business/inventory/vouchers/page.tsx`
+  (170 lines) — the ONLY voucher-create UI is a side panel collecting exactly 4 fields:
+  `voucher_type`, `voucher_date`, `party_name`, `reference_number`. `handleSave` (line 40)
+  sends no `line_items` key at all.
+- `API/inventory-service/router/vouchers_api.py` (906 lines) — `VoucherCreate` (line 195)
+  already declares `line_items: List[LineItem] = []`; `LineItem` (line 183) already has
+  `item_id`, `variant_id`, `godown_id`, `quantity`, `unit_price`, `gst_rate`,
+  `description`, `override_reason`, `attested`; `_check_voucher_gst_compliance` (line 114)
+  already runs against line items when present.
+- Net fact: the backend fully supports multi-line invoice vouchers today; the frontend
+  never collects a line item, so every voucher created through the UI has an empty
+  `line_items` array. The gap is real and is frontend-primary, not a backend capability
+  gap.
 
-> **T14 prompt wording is canonical as of this entry.** Same drift-detection convention as
-> T13a/T13b: copy verbatim, never paraphrase or retype from memory. SHA-256 (UTF-8, no
-> trailing newline): `9f742a3a4b551e1cbdf72807c901093c605925b9f7fbcded5b2f0cac9601dbc3`.
+> Investigate the inventory module's Vouchers feature in this repository. Confirm, with direct evidence from the actual frontend and backend source, whether the "Voucher create form (full invoice entry UI)" gap noted as pending in docs/inventory.md is still real today — state exactly what the current create UI collects, and exactly what the backend's voucher-creation schema already supports that the UI does not yet expose. Then produce a structured, dependency-ordered execution proposal for closing this specific gap: one or more work items, each with a unique work_item_id, objective, proposed role (researcher, coder, executor, or reviewer), dependencies on other work_item_ids where applicable, required_capabilities, proposed_skills, acceptance_criteria, and expected_evidence. Scope the proposal to what is actually missing — do not propose rebuilding backend capability that already exists. Do not propose implementing anything yourself, and do not dispatch any work — this is discovery and proposal only.
 
-**Pass (groundedness, scored independently of the integration mechanics):** the
-identified feature is verified NOT already implemented elsewhere in the codebase before
-scoring (an evidence-backed claim of absence is not the same as it being true); every
-claim of presence/absence cites a real file/path/grep result actually obtained this run,
-not inferred; the structured proposal parses into a valid `WorkProposal` with at least
-one work item, every required field meaningfully populated (not a placeholder), a known
-role, no dangling dependency, and no dependency cycle.
+> **T14 prompt wording is canonical as of this revision.** Same drift-detection
+> convention as T13a/T13b: copy verbatim, never paraphrase or retype from memory. The
+> prior (2026-11-16, open-ended) wording's hash,
+> `9f742a3a4b551e1cbdf72807c901093c605925b9f7fbcded5b2f0cac9601dbc3`, is superseded and
+> kept here only so a stray old copy is recognizable as stale, never reused. Current
+> SHA-256 (UTF-8, no trailing newline): `b9924da587ef57e64b6f34564e50d95449e3540e9f92c438f5dd464664ad6743`.
+
+**Pass (groundedness, scored independently of the integration mechanics):** the answer
+correctly states the frontend panel's actual 4 fields (not invented ones) and the
+backend's actual `LineItem` field names (not invented ones) — copy/paste-level accuracy
+against the ground truth above, not paraphrase; correctly identifies the gap as
+frontend-primary (the backend already supports line items); the structured proposal does
+NOT include a work item re-adding `line_items`/GST-compliance support to the backend
+(that would mean the gap was misdiagnosed as backend-missing); parses into a valid
+`WorkProposal` with at least one work item, every required field meaningfully populated,
+a known role, no dangling dependency, no dependency cycle.
 
 **Pass (Phase 1.56a integration, scored separately — see "Scoring" above on never
 merging independent axes):** the real `propose_from_text()` → Agno `output_schema`
