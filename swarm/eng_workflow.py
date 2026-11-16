@@ -226,6 +226,14 @@ class AttemptRecord:
     error: Optional[str] = None
     ledger_error: Optional[str] = None       # a durable write for THIS attempt failed (or its budget was refused)
     tokens: dict = field(default_factory=lambda: {"in": 0, "out": 0})
+    # Phase 1.52: which team member (T._member_key name) actually acted this attempt --
+    # "researcher" for every attempt today (the only role any caller passes), carried here so a
+    # future multi-role sequencer can tell attempts for different roles on the same work item
+    # apart. In-memory/Workflow-path-only -- NOT yet persisted to the Ledger's SQLite schema (see
+    # run_engineering_workflow's Phase 1.52 report: the ledger's attempt/decision tables have no
+    # `role`/`stage` column, so this field does not survive a process restart; it is correct for
+    # the current single-attempt-in-flight snapshot and for st.records' own in-process history).
+    role: str = "researcher"
 
 
 @dataclass
@@ -434,9 +442,27 @@ def select_capable_member(team, required_capabilities, member_key_fn, preference
 
 
 async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, attempt_no: int, task_override: str = None,
-                      extra_activity: dict = None):
-    """Create a NEW attempt (new id + generation via the registry), run the real Researcher under it, observe the
-    Agent's own terminal facts, and return the AttemptRecord. Never raises.
+                      extra_activity: dict = None, role: str = "researcher"):
+    """Create a NEW attempt (new id + generation via the registry), run the real agent for `role` under it,
+    observe the Agent's own terminal facts, and return the AttemptRecord. Never raises.
+
+    `role` (Phase 1.52): which team member actually acts this attempt -- `T._member_key(member.name)`,
+    e.g. "researcher"/"coder"/"executor"/"reviewer". Defaults to "researcher", the only role every
+    existing caller passes (explicitly, since this phase's own s_execute()/recover_and_reconcile() set
+    `role = "researcher"` rather than relying on the default) -- so this parameter changes NOTHING for
+    any call that predates it. It is used ONLY to prefer that member during selection (see the
+    `select_capable_member` call below); it does not change read_only (still hardcoded True for every
+    role here -- see this module's own header docstring), the task-prompt text
+    (`T._build_canonical_researcher_task` is, despite its name, pure deterministic construction from
+    target/objective/evidence_required/completion_criteria/knowledge_brief -- verified by reading it
+    directly in swarm/team.py: "Every delegation funnels through this ONE function regardless of which
+    member or task generated it" -- so it already produces correct text for any role, unchanged here),
+    or the knowledge brief (`ctx["knowledge_brief"]`, built ONCE per task by the caller at a fixed
+    `audience="researcher"` -- see run_engineering_workflow's own comment at that call site for why this
+    is a KNOWN, NOT-fixed-in-this-phase gap for any role other than "researcher"). Tool grants,
+    tool_call_limit and skill_catalog filtering are already fully role-independent and need no change
+    here: `_build_team()` resolves them per member (every member, not just the one this function later
+    extracts) from `team_role_tools`/`RolePolicy`/`AgentSpec.skills`, all keyed by role already.
     `task_override` (Phase 1.24): if given, replaces wi.objective ONLY for the text actually sent to the
     Researcher this attempt (a bounded recovery pass targeting specific missing obligations) -- wi.target/
     wi.policy/wi.evidence_required/wi.completion_criteria are unchanged, so the SAME coverage policy still
@@ -464,7 +490,7 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
             lerr = f"LEDGER_ERROR: {repr(e)[:200]}"
     att = st.registry.start(st.task_id, wi.work_item_id, workflow_run_id=st.workflow_run_id,
                             attempt_id=(lstart or {}).get("attempt_id"), generation=(lstart or {}).get("generation"))
-    rec = AttemptRecord(attempt=att)
+    rec = AttemptRecord(attempt=att, role=role)
     rec.ledger_error = lerr
     st.records.append(rec)
     if lerr:
@@ -493,7 +519,8 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
 
     st.tracker = L.ProgressTracker()                       # progress is judged per attempt
     st.identity = {"task_id": st.task_id, "workflow_run_id": st.workflow_run_id, "work_item_id": wi.work_item_id,
-                   "attempt_id": att.attempt_id, "generation": att.generation, "attempt_no": attempt_no, "agent_run_id": None}
+                   "attempt_id": att.attempt_id, "generation": att.generation, "attempt_no": attempt_no,
+                   "agent_run_id": None, "role": role}
     st.wf_state = "executing"
 
     async def on_finished(o):
@@ -533,7 +560,7 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
             T._DELEGATION_READ_CEILING = controls["ceiling"]
         if controls.get("discovery_ceiling") is not None:
             T._DELEGATION_DISCOVERY_CEILING = controls["discovery_ceiling"]
-        # A fresh team (hence a fresh Researcher, hooks and evidence state) per attempt: a retry inherits nothing.
+        # A fresh team (hence a fresh acting agent, hooks and evidence state) per attempt: a retry inherits nothing.
         team = T._build_team(
             ctx["specs"], ctx["coordinator"], ctx["ctools"], "coordinate", ctx["mcp_list"], [],
             read_only=True, skill_catalog=ctx["catalog"], task=wi.objective, team_name="engineering",
@@ -545,14 +572,24 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
         # Phase 1.42 Track C: identical to the unconditional `next(m for m in team.members if
         # T._member_key(m.name) == "researcher")` this replaces, for every work item that leaves
         # required_capabilities unset (every one today) -- see select_capable_member()'s own
-        # docstring. `researcher` keeps its name for the rest of this function's own, much larger
-        # body (tool_hooks, model overrides, the arun() call, ...), which all operate on whichever
-        # member was actually selected.
-        researcher, _capability_gap = select_capable_member(team, wi.required_capabilities, T._member_key)
+        # docstring.
+        # Phase 1.52: `preference_order` is now built from `role` (default "researcher") instead
+        # of always using the module-level _DEFAULT_MEMBER_PREFERENCE tuple as-is -- putting the
+        # requested role first, then falling back to the existing default order unchanged. For
+        # role="researcher" (every existing caller) this produces the EXACT SAME tuple
+        # _DEFAULT_MEMBER_PREFERENCE already was ("researcher" is already first in it), so
+        # selection is byte-for-byte unchanged; for any other role it prefers that member first
+        # while keeping select_capable_member()'s own fallback/missing-capability behavior
+        # (never leaves a work item with no acting member) completely untouched. `agent` (renamed
+        # from `researcher`, since it may now be any role's member) is used for the rest of this
+        # function's own, much larger body (tool_hooks, model overrides, the arun() call, ...).
+        _role_preference_order = (role,) + tuple(k for k in _DEFAULT_MEMBER_PREFERENCE if k != role)
+        agent, _capability_gap = select_capable_member(team, wi.required_capabilities, T._member_key,
+                                                        preference_order=_role_preference_order)
         o_hook, i_hook = outcome_rec.hooks()
-        researcher.tool_hooks = [o_hook] + list(researcher.tool_hooks or []) + [i_hook]
+        agent.tool_hooks = [o_hook] + list(agent.tool_hooks or []) + [i_hook]
         if controls.get("fail_first_read") or controls.get("delay_tool_s"):
-            for fn in (researcher.tools or []):
+            for fn in (agent.tools or []):
                 orig = getattr(fn, "entrypoint", None)
                 if orig is None or getattr(fn, "name", "") == "update_session_state":
                     continue
@@ -586,19 +623,19 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
         K.emit("KNOWLEDGE_CONTEXT_SUPPLIED", run=getattr(st.knowledge, "run_key", None), attempt=att.attempt_id, task_chars=len(canon),
                brief_chars=len(_kb), brief_in_task=bool(_kb.strip() and _kb.strip() in canon))
         if controls.get("break_model") or attempt_no in (controls.get("break_model_attempts") or ()):
-            researcher.model.base_url = "http://127.0.0.1:9/v1"
+            agent.model.base_url = "http://127.0.0.1:9/v1"
             for attr in ("client", "async_client"):
-                setattr(researcher.model, attr, None)
-        if controls.get("model_base_url"):                 # test control: point the Researcher at a scripted endpoint
-            researcher.model.base_url = controls["model_base_url"]
+                setattr(agent.model, attr, None)
+        if controls.get("model_base_url"):                 # test control: point the acting agent at a scripted endpoint
+            agent.model.base_url = controls["model_base_url"]
             for attr in ("client", "async_client"):
-                setattr(researcher.model, attr, None)
+                setattr(agent.model, attr, None)
 
         async def consume():
             tok = A.ATTEMPT_ID.set(att.attempt_id)
             try:
-                async for ev in researcher.arun(canon, stream=True, stream_events=True, yield_run_output=True,
-                                                session_state={"read_log": [], "delegations_made": []}):
+                async for ev in agent.arun(canon, stream=True, stream_events=True, yield_run_output=True,
+                                           session_state={"read_log": [], "delegations_made": []}):
                     if type(ev).__name__ == "RunOutput":
                         trace.run_output = ev
                     else:
@@ -1015,7 +1052,7 @@ def reconcile_attempts(orig_att, orig_d, rec_att) -> tuple:
 
 async def recover_and_reconcile(st: RunState, wi: WorkItem, ctx: dict, controls: dict,
                                 orig_rec: AttemptRecord, orig_d, attempt_no: int,
-                                extension_info: dict = None):
+                                extension_info: dict = None, role: str = "researcher"):
     """Phase 1.24 Track 5/6: ONE bounded, application-controlled recovery attempt targeting
     specifically the mandatory obligations orig_d.gate['missing'] identifies, followed by
     deterministic evidence reconciliation and an INDEPENDENT final decide() (Track 6: the final
@@ -1032,7 +1069,12 @@ async def recover_and_reconcile(st: RunState, wi: WorkItem, ctx: dict, controls:
     recovery pass itself produced raw, unaffected by the later mutation.
     Returns (AttemptRecord, Decision) to use as this work item's result; never raises -- a failure
     anywhere in recovery leaves the ORIGINAL (orig_rec, orig_d) as the work item's result, since
-    the caller only replaces its own (rec, d) locals on a non-None return."""
+    the caller only replaces its own (rec, d) locals on a non-None return.
+
+    `role` (Phase 1.52): forwarded unchanged to the recovery run_attempt() call below -- a
+    recovery pass must run the SAME role as the attempt it is recovering, never silently default
+    back to "researcher" if the caller already generalized to a different role. Defaults to
+    "researcher" (every existing caller, since s_execute() passes its own `role` explicitly)."""
     task_override = build_recovery_task(wi, orig_rec.attempt, orig_d)
     # Phase 1.30: the same deterministic derivation build_recovery_task() just used to
     # build the recovery prompt's own "Read: <paths>" lines -- reused here, not
@@ -1042,7 +1084,7 @@ async def recover_and_reconcile(st: RunState, wi: WorkItem, ctx: dict, controls:
     _missing_paths = sorted({p for mid in _missing_ids for p in A.requirement_source_paths(wi.policy, mid)})
     rec2 = await run_attempt(st, wi, ctx, controls, attempt_no, task_override=task_override,
                              extra_activity={"missing_source_paths": _missing_paths,
-                                             "missing_obligation_ids": _missing_ids})
+                                             "missing_obligation_ids": _missing_ids}, role=role)
     # rec2.attempt.state is "FINISHED" even on a ledger-start failure or setup error (see
     # run_attempt()'s own early-exit paths) -- rec2.error/rec2.ledger_error are what actually
     # distinguish a genuine run from one that never got to call the Researcher at all.
@@ -1465,6 +1507,13 @@ async def run_engineering_workflow(
         return ("## Investigation result: NOT ESTABLISHED\nNo agent roster was supplied for the workflow path.\n",
                 {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, None)
     # Task-shape skills: same injection the Team path applies to the Researcher's own instructions.
+    # Phase 1.52 KNOWN, NOT-fixed-in-this-phase gap: hardcoded to "researcher" regardless of which
+    # role(s) will actually run this task. run_attempt()'s own `role` parameter (this phase) only
+    # generalizes member SELECTION inside run_attempt() itself; this injection happens here, once,
+    # before any attempt, before the caller has decided which role(s) it will invoke -- fixing it
+    # correctly needs the caller to know the target role set ahead of time, which is dynamic
+    # planning's job (explicitly out of scope: "Do not implement... dynamic planning... in this
+    # phase"). Left unchanged and documented, not silently papered over.
     shapes = T._matching_task_shapes(task)
     if shapes:
         hive_for_skills = T._pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)
@@ -1505,6 +1554,14 @@ async def run_engineering_workflow(
         await team_config.ensure_cache_loaded()
         hive_url = T._pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)
         catalog = await T._fetch_skill_catalog(hive_url)
+        # Phase 1.52 KNOWN, NOT-fixed-in-this-phase gap: `audience` is hardcoded "researcher" for
+        # the whole task's shared ctx, built once, before any attempt's role is chosen. Verified
+        # directly in swarm/knowledge.py's render_brief(): any audience other than exactly
+        # "researcher" falls into its generic `else` branch, whose body text literally says "the
+        # Researcher receives these with context" -- correct for a Coordinator-style summary,
+        # semantically wrong if handed to a non-Researcher acting agent. run_attempt()'s `role`
+        # parameter (this phase) does not change this -- fixing it means building ctx per-role or
+        # deferring brief rendering into run_attempt() itself, both bigger than this phase's scope.
         ctx = {"knowledge_brief": K.render_brief(st.knowledge, "researcher"), "specs": specs, "coordinator": coordinator_model or T.config.leader_model, "ctools": ctools,
                "mcp_list": mcp_list, "catalog": catalog, "project_id": project_id, "hive_url": hive_url,
                "profile": T.execution_context.resolve_profile(None)}
@@ -1553,6 +1610,12 @@ async def run_engineering_workflow(
 
         async def s_execute(step_input):
             st.steps_run.append("execute")
+            # Phase 1.52: explicit, not relied-on-as-default -- every work item today is executed
+            # by the Researcher; this fixed value is what run_attempt()'s own `role` parameter
+            # generalizes, visibly, rather than leaving it implicit in _DEFAULT_MEMBER_PREFERENCE's
+            # ordering. A future multi-stage sequencer resolves this per work item/stage instead of
+            # once per task -- not implemented here (dynamic planning is out of this phase's scope).
+            role = "researcher"
             for wi in (st.plan.items if st.plan else []):
                 c = item_controls(controls, wi.work_item_id)
                 n = 1
@@ -1567,12 +1630,12 @@ async def run_engineering_workflow(
                     if sup:
                         # Control: a newer generation starts while attempt 1 is still running. The registry marks
                         # attempt 1 SUPERSEDED the moment attempt 2 starts; attempt 1 keeps running and finishes late.
-                        t1 = asyncio.ensure_future(run_attempt(st, wi, ctx, c, 1))
+                        t1 = asyncio.ensure_future(run_attempt(st, wi, ctx, c, 1, role=role))
                         done, _ = await asyncio.wait({t1}, timeout=float(sup))
                         if not done:
                             c2 = {k: v for k, v in c.items() if k not in ("supersede_after_s", "delay_tool_s", "cancel_after_s")}
                             st.emit("supersede_started", work_item=wi.work_item_id)
-                            rec2 = await run_attempt(st, wi, ctx, c2, 2)
+                            rec2 = await run_attempt(st, wi, ctx, c2, 2, role=role)
                             reconstruct_missing_terminal_from_evidence(rec2.attempt)
                             d2 = await assess_and_register(st, wi, rec2, c)
                             rec1 = await t1                       # the old attempt finishes LATE
@@ -1583,7 +1646,7 @@ async def run_engineering_workflow(
                             break
                         rec = t1.result()
                     else:
-                        rec = await run_attempt(st, wi, ctx, c, n)
+                        rec = await run_attempt(st, wi, ctx, c, n, role=role)
                     # Phase 1.39: the original-attempt (and plain-retry) equivalent of Phase
                     # 1.37's recovery-specific evidence rescue -- see
                     # reconstruct_missing_terminal_from_evidence()'s own docstring for the
@@ -1648,7 +1711,7 @@ async def run_engineering_workflow(
                                             new_read_ceiling=ext["new_read_ceiling"],
                                             new_discovery_ceiling=ext["new_discovery_ceiling"])
                                 recovered = await recover_and_reconcile(st, wi, ctx, c_recovery, rec, d, n + 1,
-                                                                       extension_info=ext)
+                                                                       extension_info=ext, role=role)
                                 if recovered is not None:
                                     rec, d = recovered
                         break
