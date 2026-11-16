@@ -203,6 +203,58 @@ def classify_return(c: ToolOutcome, out, out_text: str, prior_success_shas: set)
         c.outcome, c.reason = FAILED, "; ".join(f"{f.path}: {f.reason}" for f in c.files)[:200]
         return
     c.outcome = SUCCESS
+    # Phase 1.42 Track B: the real tool executed (reached_tool=True, so this is NOT the
+    # already-handled hook-served-cache case above) but returned content byte-identical to an
+    # earlier genuine SUCCESS this same attempt. A natural extension of the SAME `cached` concept
+    # the hook-served branch above already uses -- "this content was already seen as real evidence
+    # earlier" -- never previously checked on this path. Used by
+    # _maybe_add_repeat_search_hint() below to append a non-blocking note; does not change
+    # c.outcome, does not affect progress accounting (ProgressTracker has its own, separately
+    # correct same-content tracking -- see Phase 1.40) or any acceptance/budget/repetition logic.
+    if c.result_sha and c.result_sha in prior_success_shas:
+        c.cached = True
+
+
+# Phase 1.42 Track B: the exact tools in scope for this hint -- search-class tools whose own
+# result can legitimately be re-queried with a widened max_results and a different (bigger)
+# real answer, which is exactly the shape where a BYTE-IDENTICAL repeat (c.cached) means the
+# widened parameter found nothing new, not that the tool is broken.
+_SEARCH_REPEAT_HINT_TOOLS = {"search_files", "search_files_batch"}
+_SEARCH_REPEAT_HINT_TEXT = (
+    "\n\n[search-strategy note: this call returned the exact same result as an earlier "
+    "search in this attempt. Increasing max_results did not surface anything new here -- "
+    "if you need different results, try a different pattern or a different target file "
+    "rather than a larger max_results.]"
+)
+
+
+def _maybe_add_repeat_search_hint(function_name: str, c, out):
+    """Phase 1.42 Track B: a generic, non-blocking feedback note appended to a search-class
+    tool's OWN RETURNED VALUE (never to c.result_text/c.result_sha, both already finalized by
+    classify_return() before this runs) when c.cached is True -- this call's real, genuinely
+    re-executed result is byte-identical to one already seen as real evidence earlier in this
+    attempt (the live T13b incident this addresses: `search_files` re-issued the same
+    `endpoint.*voucher` pattern against the same file 15 times, each time only raising
+    max_results, with the tool's own result staying byte-identical all 15 times).
+
+    Deliberately does not touch any field read by progress accounting, budget, repetition
+    containment, or acceptance (c.outcome/c.cached/c.result_sha/c.result_text are already set;
+    this only changes what the model is shown). A tool call that is NOT cached -- including
+    legitimate pagination, where a larger max_results genuinely surfaces more real matches and
+    the result therefore differs -- is returned completely unchanged; this function cannot
+    distinguish "more matches really exist" from "no more matches exist" on its own and does
+    not try to -- it only ever fires on a result that is already proven identical."""
+    if function_name not in _SEARCH_REPEAT_HINT_TOOLS or not c.cached or c.outcome != SUCCESS:
+        return out
+    if isinstance(out, str):
+        return out + _SEARCH_REPEAT_HINT_TEXT
+    content = getattr(out, "content", None)
+    if isinstance(content, str):
+        try:
+            return out.model_copy(update={"content": content + _SEARCH_REPEAT_HINT_TEXT})
+        except Exception:  # noqa: BLE001 -- best-effort feedback; never risk the real tool result
+            return out
+    return out
 
 
 _CALL: contextvars.ContextVar = contextvars.ContextVar("hive_tool_call", default=None)
@@ -287,7 +339,7 @@ class OutcomeRecorder:
             if c.outcome == SUCCESS and c.result_sha:
                 me._succ_shas.add(c.result_sha)
             await me._emit(c)
-            return out
+            return _maybe_add_repeat_search_hint(function_name, c, out)
 
         async def acceptance_outcome_inner(function_name, function, args):
             c = _CALL.get()

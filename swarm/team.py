@@ -28067,9 +28067,87 @@ def _assess_member_result(team, key: str, text: str, attempt_id=None) -> dict:
     if _EXPLICIT_INCOMPLETE_INVESTIGATION_RE.search(_latest_text) or _THIN_REPORT_MARKER in _latest_text:
         return done("PARTIAL", "the report itself says part of the objective was not examined",
                     **common)
+    # Phase 1.42 Track A: every individually named claim can be real and still add up to a wrong
+    # total (the live T7 incident -- list_directory returned 6 items, all 6 were named somewhere
+    # in the text, and the text still asserted "5"). The per-item checks above cannot catch this;
+    # this is a separate, aggregate-level check that never downgrades a correct count and never
+    # fires when the signal is ambiguous (see _aggregate_count_mismatch's own docstring).
+    _count_mismatch = _aggregate_count_mismatch(_latest_text, task_text, getattr(team, "_read_state", None))
+    if _count_mismatch:
+        common["diagnostics"] = dict(common.get("diagnostics") or {}, aggregate_count=_count_mismatch)
+        return done("PARTIAL", f"the answer's own stated count does not match the "
+                    f"{_count_mismatch['tool']} result it was read from "
+                    f"(tool returned {_count_mismatch['raw_count']}, answer states "
+                    f"{_count_mismatch['asserted_counts']})", **common)
     src = [k for k, v in sources.items() if v]
     return done("COMPLETE", "supported by: " + (", ".join(src) or "reasoning (no repository claim)"),
                 **common)
+
+
+# Phase 1.42 Track A: a number near a countable noun, OR an explicit "contains/total of/there
+# are N" phrasing. Deliberately narrow -- a bare integer (a line number, a port, an HTTP status)
+# never qualifies, so this cannot fire on "line 129" or "status 404". Generic across any
+# enumerable collection shape (files, endpoints, hooks, tables, ...), never tied to one noun.
+_COUNT_ASSERTION_RE = re.compile(
+    r"\b(?:contains?|total(?:\s+of)?|there\s+(?:are|is|were|was)|found|lists?)\s+(\d{1,4})\b"
+    r"|\b(\d{1,4})\s+(?:distinct\s+|total\s+|different\s+)?"
+    r"(?:files?|items?|endpoints?|hooks?|routes?|entries?|tables?|models?|functions?|classes?|columns?|"
+    r"directories?|folders?|rows?|records?)\b",
+    re.IGNORECASE)
+
+# A signal that the TASK ITSELF (not the model's own answer) licensed narrowing or filtering the
+# count -- e.g. "list the files, excluding tests". Gated on the task's own wording, never the
+# model's, so a model-invented post-hoc exclusion rationale (the live T7 incident: "__init__.py
+# ... is not a .py file") cannot self-reconcile a mismatch it itself introduced.
+_TASK_FILTER_RE = re.compile(
+    r"\b(excluding|except(?:\s+for)?|ignor\w+|skip\w*|only\s+(?:the\s+)?\w+\s+that|not\s+count\w*)\b",
+    re.IGNORECASE)
+
+
+def _aggregate_count_mismatch(text: str, task_text: str, read_state) -> dict | None:
+    """Phase 1.42 Track A: does the answer's own stated count of an enumerable collection
+    disagree with the tool result it was actually read from?
+
+    Deliberately conservative, per the live T7 incident this addresses (list_directory
+    genuinely returned 6 items; the model's own text named all 6 -- 5 in a list plus
+    __init__.py in its own exclusion sentence -- then asserted "5 .py files"). The per-item
+    claim check (claims/supported/unsupported, computed just above in _assessment_for) already
+    verifies every NAMED item is real; nothing before this phase checked the AGGREGATE number
+    against either the tool's own count or the task's own licence to filter it.
+
+    Fires only when:
+      - exactly one enumeration happened this attempt (team._read_state["enumerations"] has
+        exactly one entry) -- multiple enumerations in one attempt cannot be safely associated
+        with one stated count without guessing which collection it refers to, so this is skipped
+        entirely rather than picking one (never invents which collection a count refers to);
+      - the text makes at least one count-shaped assertion (never invents a count to check against);
+      - none of the asserted counts equals the tool's own real count (if the correct number is
+        stated ANYWHERE in the text, this does not fire -- the claim is not wrong, just also
+        confusingly restated);
+      - the TASK's own wording does not itself license a filter/exclusion (if it does, a narrower
+        model-chosen count is not second-guessed -- verifying arbitrary filter criteria is out of
+        scope; only the never-licensed, self-invented exclusion shape this phase targets is flagged).
+
+    Returns a diagnostic dict (truthy) describing the mismatch, or None when nothing is wrong or
+    the signal is too ambiguous to trust."""
+    if not text:
+        return None
+    enumerations = (read_state or {}).get("enumerations") if isinstance(read_state, dict) else None
+    if not enumerations or len(enumerations) != 1:
+        return None
+    enum = next(iter(enumerations.values()))
+    raw_count = enum.get("count")
+    if not raw_count:
+        return None
+    asserted = {int(g1 or g2) for g1, g2 in _COUNT_ASSERTION_RE.findall(text) if (g1 or g2)}
+    if not asserted:
+        return None
+    if raw_count in asserted:
+        return None
+    if task_text and _TASK_FILTER_RE.search(task_text):
+        return None
+    return {"raw_count": raw_count, "asserted_counts": sorted(asserted),
+            "tool": enum.get("tool"), "path": enum.get("path")}
 
 
 def _evidence_fingerprint(team, key: str):

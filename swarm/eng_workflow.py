@@ -54,6 +54,13 @@ class WorkItem:
     completion_criteria: str
     paths: list
     policy: object = None
+    # Phase 1.42 Track C: an OPTIONAL, explicitly-supplied list of tool names this work item's
+    # objective actually requires (e.g. ["get_env_info"]) -- never derived from the task's own
+    # free-text wording (that would be exactly the keyword-hardcoded routing this phase's own
+    # mission explicitly forbids). Defaults to empty for every existing caller/work item, which
+    # is the entire reason this field changes NOTHING for any work item that doesn't set it --
+    # see select_capable_member()'s own docstring for what happens when it is set.
+    required_capabilities: list = field(default_factory=list)
 
 
 @dataclass
@@ -377,6 +384,55 @@ def item_controls(controls: dict, work_item_id: str) -> dict:
     return base
 
 
+_DEFAULT_MEMBER_PREFERENCE = ("researcher", "executor", "coder", "reviewer")
+
+
+def select_capable_member(team, required_capabilities, member_key_fn, preference_order=_DEFAULT_MEMBER_PREFERENCE):
+    """Phase 1.42 Track C: pick the acting member deterministically -- never by asking an LLM to
+    choose, and never by matching a keyword in the task's own free text -- by comparing a work
+    item's own, EXPLICITLY-SUPPLIED `required_capabilities` (tool names) against each member's
+    OWN real, already-granted tool surface (`member.tools`), which is the same least-privilege
+    grant this codebase already enforces for every other purpose. `required_capabilities` is
+    never derived from the objective's wording here or anywhere this phase touches -- the T9
+    forensic finding (Phase 1.41a) was that Researcher is the WORKFLOW ENGINE's own unconditional,
+    hardcoded choice with no routing decision involved at all; this function makes that choice
+    data-driven instead of hardcoded, but only ever activates when a caller/planner has actually
+    set `required_capabilities` on the work item -- a work item that never sets it (every work
+    item in the current battery, since nothing populates this field from task text) is routed
+    IDENTICALLY to today: `required_capabilities` empty/falsy returns the SAME default member
+    (first match in `preference_order`, i.e. Researcher) `select_capable_member` always would
+    have, with an empty `missing` list -- zero behavior change for every existing caller.
+
+    Returns `(member, missing)`:
+      - `missing == []` whenever a member exists that holds every required capability (including
+        the default, nothing-required case) -- route to that member, exactly as `preference_order`
+        ranks it; this is intentionally the FIRST capable member, not a "best fit" search, since
+        the ranking itself already encodes which member should be preferred when more than one
+        technically qualifies.
+      - `missing` is the sorted list of capability names NO available member satisfies, when
+        required_capabilities is non-empty and no member in `preference_order` is a superset --
+        the DEFAULT member is still returned (preserves today's single-member-workflow behavior;
+        this function never leaves a work item with no acting member at all), but the caller MUST
+        treat a non-empty `missing` as a disclosed gap, never as silent, full satisfaction of the
+        objective -- see run_attempt()'s own `att.terminal["capability_gap"]` write site and
+        build_final()'s rendering of it."""
+    members_by_key = {member_key_fn(m.name): m for m in team.members}
+    default = next((members_by_key[k] for k in preference_order if k in members_by_key), None)
+    if not required_capabilities:
+        return default, []
+    required = set(required_capabilities)
+
+    def _tool_names(member):
+        return {getattr(t, "name", None) or getattr(t, "__name__", "") for t in (getattr(member, "tools", None) or [])}
+
+    for key in preference_order:
+        m = members_by_key.get(key)
+        if m is not None and required.issubset(_tool_names(m)):
+            return m, []
+    missing = sorted(required - (_tool_names(default) if default is not None else set()))
+    return default, missing
+
+
 async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, attempt_no: int, task_override: str = None,
                       extra_activity: dict = None):
     """Create a NEW attempt (new id + generation via the registry), run the real Researcher under it, observe the
@@ -486,7 +542,13 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
         team._hive_mcp_url = ctx["hive_url"]
         team._task = wi.objective
         team._project_id = ctx["project_id"]
-        researcher = next(m for m in team.members if T._member_key(m.name) == "researcher")
+        # Phase 1.42 Track C: identical to the unconditional `next(m for m in team.members if
+        # T._member_key(m.name) == "researcher")` this replaces, for every work item that leaves
+        # required_capabilities unset (every one today) -- see select_capable_member()'s own
+        # docstring. `researcher` keeps its name for the rest of this function's own, much larger
+        # body (tool_hooks, model overrides, the arun() call, ...), which all operate on whichever
+        # member was actually selected.
+        researcher, _capability_gap = select_capable_member(team, wi.required_capabilities, T._member_key)
         o_hook, i_hook = outcome_rec.hooks()
         researcher.tool_hooks = [o_hook] + list(researcher.tool_hooks or []) + [i_hook]
         if controls.get("fail_first_read") or controls.get("delay_tool_s"):
@@ -689,6 +751,12 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
                 # site at the admission-refusal branch for the exact fields recorded.
                 "jit_extensions": activity.get("jit_extension_decisions", []),
             }
+            # Phase 1.42 Track C: non-empty only when wi.required_capabilities named a tool no
+            # available member holds (select_capable_member() above) -- empty list (the default,
+            # unconditional case for every work item today) means no capability gap exists, same
+            # as if this field didn't exist. Read by build_final() to render an explicit
+            # disclosure rather than let a capability-starved attempt's answer stand unqualified.
+            att.terminal["capability_gap"] = list(_capability_gap)
         if led is not None:
             try:     # terminal facts + canonical text + full trace, even for an invalidated attempt (history);
                       # never changes a decision
@@ -1137,6 +1205,19 @@ def build_final(st: RunState) -> str:
                              if getattr(st, "deadline_hit", False) else "Reason: no attempt produced a decision.")
         if d is not None:
             lines.extend(_format_cross_reference_section((d.gate or {}).get("cross_reference_detail") or []))
+        # Phase 1.42 Track C: a fact about what happened during execution, independent of
+        # whether the resulting text was ultimately accepted -- rendered whenever
+        # select_capable_member() found the work item's own required_capabilities unsatisfiable
+        # by any available member (never fires for a work item that left required_capabilities
+        # unset, i.e. every work item today). Never upgrades or downgrades the acceptance
+        # verdict above; only makes an already-real limitation visible instead of silent.
+        _gap = (rec.attempt.terminal or {}).get("capability_gap") if rec is not None else None
+        if _gap:
+            lines.append("")
+            lines.append(f"**Capability gap disclosed**: this work item required {', '.join(_gap)}, "
+                        f"which no available member in this run could provide. The answer above, "
+                        f"if any, was produced without that capability and may not fully address "
+                        f"the objective.")
         hist = [r for r in st.records if r.attempt.work_item_id == wi.work_item_id]
         if len(hist) > 1 or (hist and not accepted):
             lines.append("")
