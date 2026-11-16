@@ -762,6 +762,25 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
             # as if this field didn't exist. Read by build_final() to render an explicit
             # disclosure rather than let a capability-starved attempt's answer stand unqualified.
             att.terminal["capability_gap"] = list(_capability_gap)
+            # Phase 1.49: the same "the X module['s] ... database tables" ownership-vs-reference
+            # scope check swarm/team.py's own content-note pipeline has used for the Team engine
+            # since Phase 0.28 -- never previously wired into this (Workflow) engine's own path,
+            # which is why the T13b battery shape (files named as reading hints, not as scope)
+            # showed real-but-unowned tables (stock_ledger, stock_levels) listed with no
+            # ownership distinction. _module_table_ownership_scope() itself is unchanged in
+            # what it detects; this call site is new. Silent ("") for every task shape that
+            # does not match its own narrow "audit/overview/... the X module ... tables" regex
+            # (every work item in this battery except T13a/T13b), so this costs nothing for the
+            # rest of the suite. att.text, not att.trace_text -- the same final, user-facing
+            # text the rest of this attempt's own reporting is built from.
+            try:
+                att.terminal["table_scope_note"] = await T._module_table_ownership_scope(
+                    task_override if task_override is not None else wi.objective, att.text,
+                    ctx.get("hive_url"), None)
+            except Exception as exc:  # noqa: BLE001 -- a guard failure must never block finalization
+                print(f"[team] table-scope check (workflow path): {exc!r} -- silent, "
+                      f"no note added", flush=True)
+                att.terminal["table_scope_note"] = ""
         if led is not None:
             try:     # terminal facts + canonical text + full trace, even for an invalidated attempt (history);
                       # never changes a decision
@@ -1247,6 +1266,13 @@ def build_final(st: RunState) -> str:
                         f"which no available member in this run could provide. The answer above, "
                         f"if any, was produced without that capability and may not fully address "
                         f"the objective.")
+        # Phase 1.49: application-computed, never model-written -- see the write site in
+        # run_attempt() for why this is empty for every work item shape except the narrow
+        # "audit/overview/... the X module ... tables" one _module_table_ownership_scope()
+        # itself matches.
+        _table_scope = (getattr(rec.attempt, "terminal", None) or {}).get("table_scope_note") if rec is not None else None
+        if _table_scope:
+            lines.append(_table_scope)
         hist = [r for r in st.records if r.attempt.work_item_id == wi.work_item_id]
         if len(hist) > 1 or (hist and not accepted):
             lines.append("")

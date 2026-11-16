@@ -14913,9 +14913,19 @@ async def _module_table_ownership_scope(task: str, content: str,
     m = _MODULE_TABLE_ASK_RE.search(task or "")
     if not m or not (content or "").strip():
         return ""
-    if re.search(r"\.(?:py|ts|tsx)\b", task or ""):
-        print("[team] table-scope check: task already names a specific file — "
-              "the existing named-file pattern applies, silent", flush=True)
+    # Phase 1.49: scoped to the matched "...module ... tables" question's OWN span, not the
+    # whole task string. The prior whole-task scan incorrectly bailed whenever ANY later
+    # sentence named a file for ANY purpose -- including a trailing reading hint like "Read
+    # vouchers_api.py for the endpoints, models.py for the tables, ..." (the T13b battery
+    # shape), which names files to tell the Researcher WHERE to look, not to redefine "the
+    # vouchers module['s] ... database tables" as scoped to one file. _MODULE_TABLE_ASK_RE's
+    # own `[^.]{0,...}` segments cannot cross a sentence boundary, so a filename genuinely
+    # naming the SCOPE of the table question itself (e.g. "list the tables in models.py")
+    # would still appear inside task[:m.end()] and still correctly bail here; only a file
+    # named in a LATER, separate sentence no longer does.
+    if re.search(r"\.(?:py|ts|tsx)\b", (task or "")[:m.end()]):
+        print("[team] table-scope check: task already names a specific file within the "
+              "table-ask itself — the existing named-file pattern applies, silent", flush=True)
         return ""
     module = m.group(1).lower()
     if (_REQUESTS_FK_RELATED_RE.search(task or "")
@@ -27682,12 +27692,22 @@ def _new_delegation_evidence(unavail_base: int = 0) -> dict:
             "corpus_norm": "",
             # Phase 1.16 (Workflow path only, off by default): routes composed WITHIN ONE read file from an
             # APIRouter(prefix=...) line and a decorator path in that same file. See _routes_of_source.
-            "compose_routes": False, "composed_routes": set()}
+            "compose_routes": False, "composed_routes": set(),
+            # Phase 1.49: normalized_path -> {lower-cased function/method names declared IN
+            # that specific file}, populated only for a single-path .py read (see
+            # _record_call_in_evidence). Lets a claim like "the `X` function in `Y`" be
+            # checked against the actual file Y was read from, not just "does X exist
+            # somewhere" -- see _misattributed_function_citation.
+            "path_symbols": {}}
 
 
 _ROUTER_PREFIX_RE = re.compile(r"^\s*(\w+)\s*=\s*APIRouter\([^)]*?prefix\s*=\s*[\"']([^\"']*)[\"']", re.M)
 _ROUTE_DECORATOR_RE = re.compile(r"^\s*@(\w+)\.(?:get|post|put|patch|delete|head|options)\(\s*[\"']([^\"']*)[\"']", re.M)
 _SRC_LINE_NO_RE = re.compile(r"^\s*\d+	", re.M)
+# Phase 1.49: a Python function/method declaration, after _SRC_LINE_NO_RE has stripped
+# get_file_content's own leading "  N\t" numbering. Used to build ev["path_symbols"] --
+# see _record_call_in_evidence and _misattributed_function_citation.
+_DEF_DECL_RE = re.compile(r"^\s*(?:async\s+)?def\s+(\w+)\s*\(", re.M)
 
 
 def _routes_of_source(text: str) -> set:
@@ -27793,6 +27813,18 @@ def _record_call_in_evidence(ev: dict, function_name: str, args, text: str, ok: 
             n = _norm_evidence_path(v)
             if n:
                 ev["read_paths"].add(n)
+        # Phase 1.49: a single-file .py read's own declared function/method names, keyed to
+        # THIS path specifically -- deliberately narrower than ev["tokens"]/ev["corpus"]
+        # (which answer "was X seen ANYWHERE", not "was X declared in THIS file"). Scoped to
+        # exactly one requested path (never get_files_batch's multi-file text, which would
+        # need per-section splitting to attribute correctly) and to .py (the T3 defect's own
+        # shape; .ts/.tsx export forms are a different grammar, left for a future phase).
+        if function_name != "get_files_batch" and len(_requested) == 1 and _requested[0].lower().endswith(".py"):
+            n = _norm_evidence_path(_requested[0])
+            if n:
+                _syms = {dm.group(1).lower() for dm in _DEF_DECL_RE.finditer(_SRC_LINE_NO_RE.sub("", text))}
+                if _syms:
+                    ev["path_symbols"].setdefault(n, set()).update(_syms)
     if len(ev["seen_paths"]) < _EVIDENCE_MAX_PATHS:
         for m in _RESULT_PATH_RE.finditer(text[:300_000]):
             ev["seen_paths"].add(_norm_evidence_path(m.group(0)))
@@ -28079,6 +28111,27 @@ def _assess_member_result(team, key: str, text: str, attempt_id=None) -> dict:
                     f"{_count_mismatch['tool']} result it was read from "
                     f"(tool returned {_count_mismatch['raw_count']}, answer states "
                     f"{_count_mismatch['asserted_counts']})", **common)
+    # Phase 1.49 (T3): a real symbol (seen declared in SOME file this attempt actually read)
+    # attributed in the TEXT to a DIFFERENT file than the one it is actually declared in --
+    # an attribution mistake, distinct from both a fabrication (the symbol doesn't exist
+    # anywhere) and an unsupported path claim (the file itself was never read). See
+    # _misattributed_function_citation's own docstring.
+    _misattrib = _misattributed_function_citation(_latest_text, ev)
+    if _misattrib:
+        common["diagnostics"] = dict(common.get("diagnostics") or {}, misattributed_function=_misattrib)
+        _i, _claimed, _actual = _misattrib[0]
+        return done("PARTIAL", f"the report attributes the `{_i}` function to `{_claimed}`, but this "
+                    f"attempt's own evidence shows it declared in `{_actual}` instead", **common)
+    # Phase 1.49 (T4): the text describes a field as "default=X" when the SQLAlchemy
+    # declaration this attempt actually read uses "server_default=X" -- a real, meaningful
+    # distinction (DB-side vs Python-side default) collapsed into imprecise language. See
+    # _server_default_conflation's own docstring.
+    _conflated = _server_default_conflation(_latest_text, ev)
+    if _conflated:
+        common["diagnostics"] = dict(common.get("diagnostics") or {}, server_default_conflation=_conflated)
+        return done("PARTIAL", f"the report describes {', '.join(f'`{f}`' for f in _conflated)} as using "
+                    f"a plain Python-side `default=`, but this attempt's own evidence shows a DB-side "
+                    f"`server_default=` instead", **common)
     src = [k for k, v in sources.items() if v]
     return done("COMPLETE", "supported by: " + (", ".join(src) or "reasoning (no repository claim)"),
                 **common)
@@ -28148,6 +28201,110 @@ def _aggregate_count_mismatch(text: str, task_text: str, read_state) -> dict | N
         return None
     return {"raw_count": raw_count, "asserted_counts": sorted(asserted),
             "tool": enum.get("tool"), "path": enum.get("path")}
+
+
+# Phase 1.49 (T3): "the `get_seller_status` function in `API/business-service/router/
+# business_api.py`" -- the live T3 defect's exact shape. Deliberately narrow: requires
+# both a backticked identifier AND a backticked .py path joined by "function in", so an
+# ordinary mention of a function name near an unrelated file reference never matches.
+_FUNC_FILE_CITATION_RE = re.compile(
+    r"`([A-Za-z_]\w*)`\s+function\s+in\s+`([^`]+\.py)`", re.I)
+
+
+def _misattributed_function_citation(text: str, ev: dict) -> list[tuple[str, str, str]]:
+    """A claim shaped 'the `X` function in `Y`' where `X` is a real symbol this attempt saw
+    declared in SOME file it actually read, but NOT in the specifically cited file `Y` --
+    a file-attribution mistake, not a fabrication (`X` genuinely exists; the location
+    claimed for it is wrong).
+
+    Silent whenever: `Y` itself was never read by this attempt (ev["path_symbols"] only
+    covers files that were; a cited-but-unread file is a different, already-covered gap --
+    the ordinary path-claim check above this one in the caller); `X` was never seen
+    declared in ANY file this attempt read (a plain fabrication, also already covered);
+    or `X` genuinely IS declared in `Y` (the common, correct case). Returns at most the
+    first 5 misattributions found, each as (identifier, claimed_path, actual_path) --
+    `actual_path` is the first file (sorted) `X` was actually found declared in, when more
+    than one exists."""
+    sym_map = ev.get("path_symbols") or {}
+    if not sym_map or not text:
+        return []
+    read_paths = ev.get("read_paths") or set()
+    out: list[tuple[str, str, str]] = []
+    seen_pairs = set()
+    for m in _FUNC_FILE_CITATION_RE.finditer(text):
+        ident, claimed = m.group(1), m.group(2)
+        pair = (ident.lower(), claimed)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        norm = _norm_evidence_path(claimed)
+        if norm not in read_paths:
+            continue
+        actual = sorted(p for p, syms in sym_map.items() if ident.lower() in syms)
+        if not actual or norm in actual:
+            continue
+        out.append((ident, claimed, actual[0]))
+        if len(out) >= 5:
+            break
+    return out
+
+
+# Phase 1.49 (T4): a backticked-or-bare field name followed, within a short window on the
+# SAME description, by a bare "default=" not immediately preceded by "server_" -- the live
+# T4 defect's exact shape ("created_at: DateTime(timezone=True), nullable=False,
+# default=now()" describing a real `server_default=func.now()` declaration).
+_PLAIN_DEFAULT_CLAIM_RE = re.compile(r"`?([A-Za-z_]\w*)`?\s*:[^\n`]{0,100}?(?<!server_)\bdefault\s*=")
+_COLUMN_DECL_SCAN_CAP = 2000  # defensive upper bound; a real single Column(...) call never runs this long
+
+
+def _column_decl_span(corpus: str, start: int) -> str:
+    """From `start` (just after a field's own `= column(`), the text up to that call's OWN
+    matching closing paren, tracking nesting depth -- so a multi-line, nested declaration
+    (`Column(DateTime(timezone=True), nullable=False, server_default=func.now())`) is
+    captured whole, and never bleeds into the NEXT field's own, separate declaration (a flat
+    fixed-width window did exactly that when two short fields were declared close together)."""
+    depth, i, n = 1, start, min(len(corpus), start + _COLUMN_DECL_SCAN_CAP)
+    while i < n and depth > 0:
+        if corpus[i] == "(":
+            depth += 1
+        elif corpus[i] == ")":
+            depth -= 1
+        i += 1
+    return corpus[start:i]
+
+
+def _server_default_conflation(text: str, ev: dict) -> list[str]:
+    """The attempt's own text describes a field as `default=X` when the SQLAlchemy
+    declaration this SAME attempt actually read uses `server_default=X` instead -- a real,
+    meaningful distinction (DB-side default vs. Python-side default) collapsed into
+    imprecise language.
+
+    Checked against this attempt's own merged read corpus (`ev["corpus"]`, already
+    populated from every file this attempt successfully read), anchored to the claimed
+    field's OWN `<field> = Column(...)` declaration via a bounded window -- never against
+    an unrelated field that merely has the word "default" appearing nearby in the corpus.
+    Silent whenever: the field's own declaration was never read (no `<field> = Column(`
+    found in the corpus at all); the declaration's own window contains a genuine bare
+    `default=` (so the text's own wording is not actually wrong); or the declaration's own
+    window has no `server_default` at all (nothing to conflate)."""
+    corpus = ev.get("corpus") or ""
+    if not corpus or not text:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _PLAIN_DEFAULT_CLAIM_RE.finditer(text):
+        field = m.group(1)
+        key = field.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        dm = re.search(r"\b" + re.escape(key) + r"\s*=\s*column\(", corpus)
+        if not dm:
+            continue
+        window = _column_decl_span(corpus, dm.end())
+        if "server_default" in window and not re.search(r"(?<!server_)\bdefault\s*=", window):
+            out.append(field)
+    return out
 
 
 def _evidence_fingerprint(team, key: str):
