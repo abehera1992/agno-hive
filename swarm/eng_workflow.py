@@ -607,7 +607,12 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
                         if getattr(ev, "event", None) == "ToolCallStarted":
                             st.tracker.on_tool_start()
                         else:
-                            st.tracker.on_event()
+                            # Phase 1.47: same content check _Trace.add() above already makes
+                            # (isinstance RunContentEvent + real string content) -- tells the
+                            # tracker's content-recency signal apart from structural events
+                            # (RunStarted, ModelRequestStarted/Completed, segment boundaries).
+                            st.tracker.on_event(is_content=isinstance(ev, RunContentEvent)
+                                                and isinstance(getattr(ev, "content", None), str))
                         if trace.agent_run_id and att.agent_run_id is None:
                             att.agent_run_id = trace.agent_run_id
                             st.identity["agent_run_id"] = att.agent_run_id

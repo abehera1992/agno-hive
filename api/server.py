@@ -577,12 +577,32 @@ def _liveness_kill_reason(snapshot: dict) -> str | None:
     # Phase 1.18B: Workflow no-progress tier. Keys are written ONLY by swarm/eng_workflow.py's snapshot (a Team
     # snapshot has none of them, so this block is inert for Team). Requires BOTH a streak of consecutive tool calls
     # that added no new evidence AND elapsed time since the last real progress.
+    #
+    # Phase 1.47: ALSO requires recent model-content activity to be absent (content_stagnant_seconds past the
+    # same threshold). Confirmed live 2026-11-16: after _force_text_only() flips tool_choice="none", the
+    # Researcher by construction makes zero further tool calls -- wf_no_progress_seconds climbs on schedule even
+    # though a real, GPU-confirmed completion (sustained 4.4-4.5 tok/s, continuously "Running: 1 reqs" on vLLM's
+    # own side for the whole window) is actively generating the forced final answer. This tier was killing that
+    # completion mid-generation at ~242s, before it could reach its own natural terminal event or token cap. A
+    # worker that is genuinely stuck (the ORIGINAL case this tier targets -- a Researcher repeating refused/
+    # duplicate tool calls) is unaffected: every tool call attempt, successful or refused, already refreshes
+    # last_activity_at (ProgressTracker.on_call's own unconditional write), but NOT last_content_at, which only a
+    # genuine content token moves -- so content_stagnant_seconds stays large (no content ever arrives) for exactly
+    # that stuck shape, and this tier still fires on schedule. It is only suppressed while content is GENUINELY,
+    # recently flowing. No sticky "generation in progress" flag is involved anywhere in this check -- the moment
+    # content stops arriving, for ANY reason (natural completion, failure, disconnect, cancellation), this value
+    # simply starts climbing again on its own; there is nothing to leave stale. An older snapshot (a worker
+    # running pre-1.47 code) has no content_stagnant_seconds key at all -- `is None` below treats that exactly as
+    # "no recent content," i.e. the ORIGINAL, unmodified behavior of this tier for any such worker.
     _wf_streak = snapshot.get("wf_no_progress_streak")
+    _content_stagnant = snapshot.get("content_stagnant_seconds")
     if (_wf_streak is not None and _wf_streak >= config.workflow_no_progress_calls
-            and snapshot.get("wf_no_progress_seconds", 0) >= config.workflow_no_progress_s):
+            and snapshot.get("wf_no_progress_seconds", 0) >= config.workflow_no_progress_s
+            and (_content_stagnant is None or _content_stagnant >= config.workflow_no_progress_s)):
         return (f"no research progress: {_wf_streak} consecutive tool calls added no new evidence over "
                 f"{snapshot.get('wf_no_progress_seconds', 0):.0f}s (last tool {snapshot.get('last_tool')!r}, "
-                f"{snapshot.get('wf_identical_state_repeats', 0)} identical state-tool result repeat(s))")
+                f"{snapshot.get('wf_identical_state_repeats', 0)} identical state-tool result repeat(s), "
+                f"content stagnant {_content_stagnant if _content_stagnant is not None else 'n/a'}s)")
     stagnant = snapshot.get("stagnant_seconds", 0)
     if stagnant > config.liveness_silence_threshold_s:
         base = f"no tool call or new stream content for over {config.liveness_silence_threshold_s:.0f}s"

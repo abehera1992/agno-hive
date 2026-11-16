@@ -38,6 +38,23 @@ class ProgressTracker:
         self.started_at = t
         self.last_activity_at = t
         self.last_progress_at = t
+        # Phase 1.47: recency of the last GENUINE model-content token (a RunContentEvent
+        # carrying real string content -- the same check swarm/eng_workflow.py's own
+        # _Trace.add() already makes to decide what counts as answer text), tracked
+        # SEPARATELY from last_activity_at above. last_activity_at refreshes on every
+        # tool call too (successful, refused, or failed -- see on_call()'s unconditional
+        # write at its own top), so it cannot distinguish "busy calling tools" from
+        # "the model is actively streaming its answer, calling nothing." A forced
+        # text-only completion (tool_choice="none") produces exactly the second shape:
+        # zero tool calls, by construction, for as long as it runs. This field exists so
+        # the parent supervisor's workflow no-progress tier (api/server.py's
+        # _liveness_kill_reason) can tell that shape apart from a worker that has gone
+        # genuinely silent on BOTH fronts -- confirmed live 2026-11-16: a forced-answer
+        # completion ran for 3+ minutes with sustained real vLLM generation throughput
+        # (4.4-4.5 tok/s, continuously "Running: 1 reqs") and zero visible stream content
+        # in the worker's own log, and was killed at ~242s by the workflow tier, which
+        # had no way to see that generation was still genuinely in progress.
+        self.last_content_at = t
         self.seen_paths: set = set()
         self.seen_result_shas: set = set()
         self.state_result_shas: dict = {}
@@ -50,8 +67,18 @@ class ProgressTracker:
         self.last_tool: Optional[str] = None
         self.in_flight = 0
 
-    def on_event(self) -> None:
-        self.last_activity_at = self._now()
+    def on_event(self, is_content: bool = False) -> None:
+        """`is_content` (Phase 1.47): True when the caller has already determined (by
+        inspecting the real event object -- this method stays decoupled from agno's
+        event types, same as before) that this specific event is a RunContentEvent
+        carrying real string content, i.e. an actual generated token/chunk, not a
+        structural event (RunStarted, ModelRequestStarted/Completed, a segment
+        boundary, ...). Defaults to False so every pre-existing call site that does not
+        pass it behaves exactly as before -- this is purely additive."""
+        now = self._now()
+        self.last_activity_at = now
+        if is_content:
+            self.last_content_at = now
 
     def on_tool_start(self) -> None:
         self.in_flight += 1
@@ -111,7 +138,13 @@ class ProgressTracker:
                 "source_files_read": len(self.seen_paths), "progress_events": self.progress_events,
                 "wf_no_progress_streak": self.streak, "wf_no_progress_seconds": round(now - self.last_progress_at, 1),
                 "wf_identical_state_repeats": self.identical_repeats, "last_tool": self.last_tool,
-                "tools_in_flight": self.in_flight}
+                "tools_in_flight": self.in_flight,
+                # Phase 1.47: see last_content_at's own comment above. Purely recency-based
+                # -- there is no "generation in progress" flag to go stale, so a completed,
+                # failed, disconnected or cancelled generation is automatically reflected the
+                # instant content stops arriving: this value simply starts climbing again from
+                # that moment, with no separate terminal event required to clear anything.
+                "content_stagnant_seconds": round(now - self.last_content_at, 1)}
 
 
 def build_snapshot(*, nonce, state, identity: dict, tracker: Optional[ProgressTracker], task_deadline_wall,
