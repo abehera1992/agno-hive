@@ -769,6 +769,54 @@ async def assess_and_register(st: RunState, wi: WorkItem, rec: AttemptRecord, co
     return d
 
 
+def reconstruct_missing_terminal_from_evidence(att, prior_outcomes=None) -> bool:
+    """Phase 1.39: generalizes the terminal-repair step recover_and_reconcile() already
+    performs UNCONDITIONALLY for a reconciled recovery attempt (its own
+    `result_selection_status="RECONCILED", completed_event=True, ...` rewrite, below --
+    which runs regardless of whether the recovery itself produced text, since
+    describe_evidence_without_text() can supply the body) to ANY attempt reaching
+    assess_and_register() with a MISSING_TERMINAL result -- not only a recovery pass.
+
+    Root cause this addresses (see docs/reports/phase-1.39-report.md for the full T11
+    incident trace): the ORIGINAL (first) attempt had no equivalent of that repair step.
+    s_execute() called assess_and_register() directly on run_attempt()'s raw result, so an
+    original attempt that read real, valid source evidence but never produced a terminal
+    text segment was discarded in full by terminal_gate()'s own MISSING_TERMINAL->INCOMPLETE
+    routing -- the whole work item landed on NOT_ACCEPTED/NOT ESTABLISHED despite genuine
+    research having happened, with no equivalent of Phase 1.37's recovery-specific rescue.
+
+    Mutates `att` in place (text + terminal flags, mirroring recover_and_reconcile()'s own
+    field set exactly) and returns True only when it actually changed something -- a
+    deliberate no-op for an attempt that already has real text (nothing to fix) or one with
+    no new evidence either (nothing here is worth promoting out of MISSING_TERMINAL; the
+    existing INCOMPLETE/NOT_ACCEPTED path is correct for that case and is left alone). Uses
+    `result_selection_status="RECONSTRUCTED"`, distinct from recovery's own "RECONCILED",
+    so the two provenances are never conflated in a stored record. NEVER marks the attempt
+    COMPLETE by itself -- gate_evaluate()/decide() still run, unchanged, on the real
+    combined evidence afterward, and will correctly land on PARTIAL/UNRESOLVED/etc. if the
+    evidence does not actually satisfy the policy's own obligations; this function only
+    ensures that evaluation has real text and real evidence to work from instead of nothing.
+
+    IMPORTANT, VERIFIED LIMITATION: this function runs INSIDE the worker process, after
+    run_attempt() has already returned control normally. It cannot help, and does not
+    attempt to help, an attempt the parent supervisor SIGKILLed mid-flight (api/server.py's
+    own proc.kill(), confirmed as the actual mechanism in the live T11 incident this phase
+    traces) -- no in-process code runs after that kill. Surviving an arbitrary mid-attempt
+    process kill would require incremental, per-tool-call durable persistence to the ledger,
+    a materially larger architectural change explicitly out of this phase's own safe scope
+    (see the report's own "stop and explain" section)."""
+    t = att.terminal or {}
+    if t.get("result_selection_status") != "MISSING_TERMINAL":
+        return False
+    if not A.has_new_source_evidence(prior_outcomes or [], att.outcomes):
+        return False
+    att.text = A.describe_evidence_without_text(att.outcomes)
+    att.terminal = dict(t, result_selection_status="RECONSTRUCTED", completed_event=True,
+                        run_output_status="RunStatus.completed", run_error=None,
+                        cancelled_event=False, timed_out=False, stream_closed_early=False)
+    return True
+
+
 # ---------------------------------------------------------------------------- Phase 1.24: recovery and reconciliation
 def build_recovery_task(wi: WorkItem, orig_att, orig_d) -> str:
     """Phase 1.24 Track 3.3/5: the recovery attempt's own task text. Carries the ORIGINAL
@@ -1378,8 +1426,10 @@ async def run_engineering_workflow(
                             c2 = {k: v for k, v in c.items() if k not in ("supersede_after_s", "delay_tool_s", "cancel_after_s")}
                             st.emit("supersede_started", work_item=wi.work_item_id)
                             rec2 = await run_attempt(st, wi, ctx, c2, 2)
+                            reconstruct_missing_terminal_from_evidence(rec2.attempt)
                             d2 = await assess_and_register(st, wi, rec2, c)
                             rec1 = await t1                       # the old attempt finishes LATE
+                            reconstruct_missing_terminal_from_evidence(rec1.attempt)
                             d1 = await assess_and_register(st, wi, rec1, c)
                             st.emit("supersede_result", work_item=wi.work_item_id, new=d2.acceptance, old=d1.acceptance,
                                     old_validity=d1.validity)
@@ -1387,6 +1437,12 @@ async def run_engineering_workflow(
                         rec = t1.result()
                     else:
                         rec = await run_attempt(st, wi, ctx, c, n)
+                    # Phase 1.39: the original-attempt (and plain-retry) equivalent of Phase
+                    # 1.37's recovery-specific evidence rescue -- see
+                    # reconstruct_missing_terminal_from_evidence()'s own docstring for the
+                    # full root-cause trace and its one verified limitation (a hard
+                    # supervisor SIGKILL mid-attempt, which no in-process code can survive).
+                    reconstruct_missing_terminal_from_evidence(rec.attempt)
                     d = await assess_and_register(st, wi, rec, c)
                     retry = (d.execution_status in RETRYABLE_TERMINALS and d.validity == "CURRENT"
                              and n < MAX_ATTEMPTS_PER_ITEM)
