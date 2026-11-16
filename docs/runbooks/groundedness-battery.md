@@ -206,6 +206,10 @@ own report for why, and for how this run's result was independently checked for
 
 > Research this repository (the Ekam application) and identify ONE credible, currently-missing feature that would provide real business or user value, backed by evidence you actually find in this codebase. For the feature you identify: state the user/business problem it solves and the expected benefit; cite the specific files, code, schema, or absence of either that supports why it is genuinely missing (not already implemented elsewhere in this codebase); describe what it would require on the frontend, backend, database, and any relevant third-party/ONDC integration points. Then produce a structured, dependency-ordered execution proposal: one or more work items, each with a unique work_item_id, objective, proposed role (researcher, coder, executor, or reviewer), dependencies on other work_item_ids where applicable, required_capabilities, proposed_skills, acceptance_criteria, and expected_evidence. Do not propose implementing anything yourself, and do not dispatch any work — this is discovery and proposal only.
 
+> **T14 prompt wording is canonical as of this entry.** Same drift-detection convention as
+> T13a/T13b: copy verbatim, never paraphrase or retype from memory. SHA-256 (UTF-8, no
+> trailing newline): `9f742a3a4b551e1cbdf72807c901093c605925b9f7fbcded5b2f0cac9601dbc3`.
+
 **Pass (groundedness, scored independently of the integration mechanics):** the
 identified feature is verified NOT already implemented elsewhere in the codebase before
 scoring (an evidence-backed claim of absence is not the same as it being true); every
