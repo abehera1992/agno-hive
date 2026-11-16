@@ -1441,9 +1441,75 @@ EXTENSION_LOW_REMAINING_THRESHOLD = 5_000
 # reading/discovery -- a 0-char or near-0 spend means retrieval itself stalled or never
 # started, which an extension cannot fix and must not be mistaken for exhaustion.
 EXTENSION_MIN_PROGRESS_CHARS = 1_000
+# Phase 1.48: a single targeted call's (get_symbol, or get_file_content given a small
+# enough max_output_chars) minimum useful size -- mirrors swarm/team.py's own tuned
+# _MIN_USEFUL_ADAPTED_RESERVATION (2,000) exactly. Duplicated rather than imported:
+# acceptance.py is imported BY team.py, not the reverse, so importing back would be
+# circular; both values must be changed together if either is ever retuned.
+_MIN_USEFUL_READ_CHARS = 2_000
 
 
-def extension_eligible(d: Decision, orig_rec) -> dict:
+def _estimate_recovery_read_need(policy, missing: list, orig_outcomes: list) -> dict:
+    """Phase 1.48: a GENERIC, non-hardcoded estimate of how many more read chars the
+    recovery attempt will plausibly need to resolve `missing` -- replaces treating "is
+    remaining allowance above a flat floor" as equivalent to "is remaining allowance
+    enough for however many obligations are still open," the defect a live T11 run
+    exposed: 2 missing obligations, 7,590 chars remaining (enough for roughly ONE more
+    full read, not two) -- no extension was granted because 7,590 exceeded the old flat
+    5,000-char floor, and the recovery attempt then spent 7,529 of that 7,590 on the
+    FIRST obligation alone, leaving 61 chars and refusing every read the second needed.
+
+    For each missing obligation, in order:
+      - its candidate source path(s) come from the SAME requirement_source_paths() every
+        other recovery-targeting call site in this codebase already uses (no second
+        path-resolution rule invented here -- reuses existing accounting, never a
+        competing one). A link-derived obligation (e.g. R5_traceable_relationships, built
+        from policy.links rather than policy.requirements/enum_requirements/
+        cross_reference_requirements) is not resolved by that function and comes back
+        `[]` -- handled below by falling into the conservative "needs a new read" branch,
+        never a silent zero.
+      - if ANY of those paths was already read by the ORIGINAL attempt (per its own real
+        outcomes, never guessed or inferred from model text), the obligation is assumed
+        to need only a smaller FOLLOW-UP read (a different offset/symbol of a file
+        already open this task) -- estimated at _MIN_USEFUL_READ_CHARS, never a second
+        full-file assumption (explicitly required: "do not assume one missing obligation
+        equals one full-file read").
+      - otherwise (no path resolved, or none read yet) it is assumed to need a genuinely
+        NEW file read, estimated at THIS SAME original attempt's own already-observed
+        average chars per successful source_read -- a self-calibrating, task-specific
+        figure (reflects the real file sizes already seen in this exact run, never a
+        universal guessed constant), falling back to _MIN_USEFUL_READ_CHARS only when the
+        original attempt made zero source reads to average from.
+
+    Purely an ESTIMATE consulted by extension_eligible() below to decide whether a
+    bounded extension is offered. It never marks anything satisfied, never touches
+    acceptance/coverage, and does not itself grant or cap anything -- the existing
+    bounded increment/absolute-ceiling mechanics (TASK_READ_EXTENSION_INCREMENT/
+    TASK_READ_ABSOLUTE_CEILING, both unchanged by this phase) still apply after this
+    estimate is consulted."""
+    reads = [o for o in (orig_outcomes or [])
+             if getattr(o, "outcome", None) == SUCCESS and getattr(o, "evidence_kind", None) == "source_read"]
+    already_read = {norm_path(p) for o in reads for p in (getattr(o, "paths_read", None) or [])}
+    avg_read_chars = ((sum(getattr(o, "result_len", 0) or 0 for o in reads) / len(reads))
+                       if reads else float(_MIN_USEFUL_READ_CHARS))
+
+    new_file_count = followup_count = 0
+    for m in (missing or []):
+        paths = requirement_source_paths(policy, m["id"]) if policy is not None else []
+        has_evidence = bool(paths) and any(norm_path(p) in already_read for p in paths)
+        if has_evidence:
+            followup_count += 1
+        else:
+            new_file_count += 1
+    estimated_need = new_file_count * avg_read_chars + followup_count * _MIN_USEFUL_READ_CHARS
+    return {
+        "missing_count": len(missing or []), "new_file_count": new_file_count, "followup_count": followup_count,
+        "avg_source_read_chars": round(avg_read_chars, 1), "estimated_need": round(estimated_need, 1),
+        "source_reads_observed": len(reads),
+    }
+
+
+def extension_eligible(d: Decision, orig_rec, policy=None) -> dict:
     """Phase 1.29d Track 2.2: application-controlled and fully deterministic -- the
     Coordinator and Researcher are never asked whether to extend, and nothing here reads
     model text. Every input is a ledger/budget fact already recorded for the ORIGINAL
@@ -1456,15 +1522,29 @@ def extension_eligible(d: Decision, orig_rec) -> dict:
       - a mandatory coverage obligation is specifically missing (same coverage_status
         check recovery_eligible already made; recomputed here so this function is
         correct standalone, e.g. for scratch testing, without relying on caller order);
-      - the ORIGINAL attempt's own recorded remaining allowance for that category was at
-        or below EXTENSION_LOW_REMAINING_THRESHOLD -- i.e. exhaustion, not something else,
-        is the plausible blocker (a MISSING_MANDATORY result reached with budget to spare
-        means more budget would not help, and none is granted);
+      - the ORIGINAL attempt's own recorded remaining READ allowance was at or below
+        max(EXTENSION_LOW_REMAINING_THRESHOLD, the estimated recovery read workload) --
+        i.e. exhaustion relative to what recovery will plausibly need, not merely a flat
+        floor, is the plausible blocker. DISCOVERY exhaustion is unchanged from before
+        this phase (still the flat EXTENSION_LOW_REMAINING_THRESHOLD alone) -- Phase 1.48
+        is scoped to the READ-side defect the live incident identified (missing
+        obligations need source FILE reads, not more discovery/search calls), and
+        widening discovery's own criterion was never part of what that incident showed;
       - the ORIGINAL attempt actually spent at least EXTENSION_MIN_PROGRESS_CHARS chars in
         that category -- meaningful progress, not a stall;
       - the proposed new ceiling (current ceiling + the bounded increment, capped) is
         STRICTLY above the current ceiling -- i.e. there is genuine room left under the
         configured absolute ceiling; at the absolute ceiling already, no extension.
+
+    Phase 1.48 (Track B): `read_need_threshold` replaces the bare EXTENSION_LOW_REMAINING_
+    THRESHOLD comparison for READ only, via _estimate_recovery_read_need() above -- a
+    workload-aware figure (never smaller than the pre-existing flat floor, via max(),
+    so no single-obligation case that used to qualify can stop qualifying) that scales
+    with how many missing obligations still lack evidence and how large this task's own
+    files have actually been, rather than asking only "is a flat 5,000 chars left."
+    `policy` is optional (default None) purely for backward-compatible standalone calls
+    (e.g. an older scratch harness) -- the workload estimate degrades to treating every
+    missing obligation as needing a new file (not a silent zero) when it is omitted.
 
     Returns a dict that always includes "eligible" (true if EITHER category would be
     extended) plus every fact the decision was made on and the exact new ceiling(s) --
@@ -1481,10 +1561,17 @@ def extension_eligible(d: Decision, orig_rec) -> dict:
     current_read_ceiling = budget.get("task_read_ceiling")
     current_disc_ceiling = budget.get("task_discovery_ceiling")
 
+    _missing = d.gate["missing"] if d.gate.get("applicable") else []
     obligation_missing = d.coverage_status == "MISSING_MANDATORY" and bool(
-        [m["id"] for m in d.gate["missing"]] if d.gate.get("applicable") else [])
+        [m["id"] for m in _missing])
 
-    read_exhausted = (read_remaining is not None and read_remaining <= EXTENSION_LOW_REMAINING_THRESHOLD
+    workload = (_estimate_recovery_read_need(policy, _missing, getattr(orig_rec.attempt, "outcomes", None))
+                if obligation_missing else
+                {"missing_count": 0, "new_file_count": 0, "followup_count": 0,
+                 "avg_source_read_chars": 0.0, "estimated_need": 0.0, "source_reads_observed": 0})
+    read_need_threshold = max(EXTENSION_LOW_REMAINING_THRESHOLD, workload["estimated_need"])
+
+    read_exhausted = (read_remaining is not None and read_remaining <= read_need_threshold
                        and attempt_read >= EXTENSION_MIN_PROGRESS_CHARS)
     disc_exhausted = (disc_remaining is not None and disc_remaining <= EXTENSION_LOW_REMAINING_THRESHOLD
                        and attempt_discovery >= EXTENSION_MIN_PROGRESS_CHARS)
@@ -1501,13 +1588,16 @@ def extension_eligible(d: Decision, orig_rec) -> dict:
     return {
         "eligible": read_extension > 0 or disc_extension > 0,
         "obligation_missing": obligation_missing,
-        "missing": [m["id"] for m in d.gate["missing"]] if d.gate.get("applicable") else [],
+        "missing": [m["id"] for m in _missing],
         "task_read_remaining": read_remaining, "task_discovery_remaining": disc_remaining,
         "attempt_read_chars": attempt_read, "attempt_discovery_chars": attempt_discovery,
         "prior_read_ceiling": current_read_ceiling, "prior_discovery_ceiling": current_disc_ceiling,
         "read_extension": read_extension, "discovery_extension": disc_extension,
         "new_read_ceiling": current_read_ceiling + read_extension if read_extension else None,
         "new_discovery_ceiling": current_disc_ceiling + disc_extension if disc_extension else None,
+        # Phase 1.48: the workload estimate and the threshold it was compared against --
+        # durable, inspectable record of WHY, beyond the bare before/after numbers above.
+        "read_workload": workload, "read_need_threshold": read_need_threshold,
     }
 
 

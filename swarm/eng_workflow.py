@@ -1582,7 +1582,12 @@ async def run_engineering_workflow(
                                 # purely from the ORIGINAL attempt's own ledger/budget facts,
                                 # never from model text, and emitted either way for a durable,
                                 # inspectable record of why.
-                                ext = A.extension_eligible(d, rec)
+                                # Phase 1.48: wi.policy passed through so the workload estimate
+                                # can resolve each missing obligation's own candidate source
+                                # path(s) via the existing requirement_source_paths(), the same
+                                # call build_recovery_task() already makes -- no new path-
+                                # resolution rule invented for this.
+                                ext = A.extension_eligible(d, rec, policy=wi.policy)
                                 st.emit("budget_extension_decision", work_item=wi.work_item_id,
                                         attempt=rec.attempt.attempt_id, **ext)
                                 c_recovery = c
