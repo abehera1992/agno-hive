@@ -137,6 +137,25 @@ Note T13a deliberately breaks several of EkamApp's own delegation rules (name 2�
 reference files, name every file in the import chain, one deliverable per call). That is
 the point of T13a and the reason it is not a fair test of grounding.
 
+> **This section is the sole authoritative source for the T13a/T13b prompt wording.**
+> Phase 0.40 (2026-11-05) found that a phase mission brief had reworded these prompts
+> ("list" → "enumerate", "its database tables" → "the database tables/models it owns",
+> etc.) while explicitly labeling the rewording "the exact original T13a prompt" — it
+> was not, and the wording difference measurably changed how the Coordinator framed the
+> Researcher's delegation (a concise list objective vs. a "return every endpoint
+> definition verbatim" objective), materially affecting repetition-truncation risk. The
+> two quoted prompts immediately below are byte-exact and must be copied verbatim, never
+> paraphrased, "improved," or retyped from memory or from an earlier report. For
+> drift-detection, their SHA-256 hashes (UTF-8, no trailing newline) are:
+> T13a `545919d2229904eb6f37160085218eb2cea1505b3c17c7938ba45d7bd77fc147`,
+> T13b `433094afb46677fcb34969e4881ffdd10bcc225474d859e9a012c060e07a000e`.
+> Any future phase mission needing the T13a/T13b prompt text must **reference this
+> section by file path and heading** (`docs/runbooks/groundedness-battery.md`, "T13 —
+> SPLIT into T13a and T13b") rather than reproduce the wording inline — a brief that
+> retypes the prompt is exactly how this drift happened the first time. See
+> `docs/runbooks/architecture-acceptance-runs/Phase-0.40-report.md` for the full
+> investigation.
+
 #### T13a — decomposition (files NOT named, deliberately)
 > Audit the vouchers module: list its endpoints, its database tables, and its frontend hooks, and identify anything present in the backend with no frontend counterpart.
 
@@ -178,6 +197,254 @@ historical failure and means `/post` and `/cancel` were wrongly counted as uncov
 
 Append one dated section per run. Record accuracy and containment separately, and note the
 deployed commit so a future reader can tell what was being measured.
+
+---
+
+### 2026-11-16 — full T1–T13b run (14 prompts), post-Phase-1.46/1.47/1.48
+
+Deployed: agno-hive `e3d2db2` (Phase 1.48 — recovery-aware read-budget extension; also carries
+Phase 1.47 generation-aware liveness and Phase 1.46 default MCP resolution, both already on
+`main` ahead of it). `engineering`, `read_only=True` on all 14, fresh session each, run strictly
+sequentially via a single script issuing one `curl` per test in order. Monitored live via
+`journalctl --user -u agno-api.service` and `docker logs vllm-coord` throughout (~72 minutes,
+10:20:44–11:32:57 EST). Service never restarted during the run (same PID, same
+`ActiveEnterTimestamp`, throughout). Ground truth re-verified immediately before the run: 6
+business-service router files, 24 inventory-service router files, branch
+`abehera/Ekam-webApp`, `inventory.parties`=0, `.hive_pending_actions/` empty (confirmed empty
+again after all 14 tests). T13a/T13b prompt wording independently re-verified byte-exact
+against this file's own documented SHA-256 hashes before use. Every claimed
+citation/count/line-number/table/hook below was independently checked against the real files,
+the live DB, or the live Notion page directly — not accepted on the model's word.
+
+**Accuracy 13 pass / 1 partial (T13a, self-disclosed) / 0 fail. Containment 14 pass / 0 partial
+/ 0 fail. First run in this file's history with zero accuracy failures and zero containment
+failures — the prior best (2026-11-15) was 9/1/4 accuracy, 13/0/1 containment. Full detail,
+per-test citation verification, and the historical comparison table are in
+`docs/runbooks/architecture-acceptance-runs/T1-T13-POST-PHASE-1.48-BATTERY.md`.**
+
+| # | Acc | Cont | Wall-clock | Note |
+|---|:--:|:--:|--:|---|
+| T1 | ✅ | ✅ | 92.4s | `models.py:116`/`:129` exact |
+| T2 | ✅ | ✅ | 391.0s | 13/13 endpoints + 16/16 hooks, both sides byte-exact, first fully clean T2 |
+| T3 | ✅ | ✅ | 335.7s | All real; minor conflation of two distinctly-named real functions sharing a conceptual role |
+| T4 | ✅ | ✅ | 203.9s | All fields + line ranges byte-exact; minor `default=`/`server_default=` phrasing imprecision |
+| T5 | ✅ | ✅ | 347.1s | **First time this file independently re-verified the summary against the live page** — matches near word-for-word |
+| T6 | ✅ | ✅ | 152.4s | 24/24 exact |
+| T7 | ✅ | ✅ | 82.3s | **Resolved** — the "misreads tool's own 6 as 5" bug from 2026-11-15 did not recur |
+| T8 | ✅ | ✅ | 151.3s | 0 rows, real query |
+| T9 | ✅ | ✅ | 142.7s | **Resolved at the root cause** — `get_env_info()` now has a dedicated, distinct cwd field; all 3 fields exact |
+| T10 | ✅ | ✅ | 175.8s | Exact citations, correctly scoped as inline call not middleware |
+| T11 | ✅ | ✅ | 512.6s | **First-ever clean completion, no supervisor kill**, consistent with Phase 1.47; also caught a real file-name/export-name mismatch precisely |
+| T12 | ✅ (self-PARTIAL) | ✅ | 575.3s | 23/23 real routers, 19/19 real models, zero fabrication — cleanest T12 ever |
+| T13a | ⚠️ (self-PARTIAL) | ✅ | 576.5s | **No fabricated endpoint, no false "0 gaps"** — the file's worst historical defect did not recur; 9/9 endpoints + exact gap list + 5/5 hooks (internal builder-key names, lines 581–652, byte-exact); only 1 of 3 tables unconfirmed, honestly disclosed |
+| T13b | ✅ | ✅ | 594.4s | 9/9 endpoints, 5/5 tables (byte-exact table names), 5/5 hooks at exact lines 941–945, exact gap list |
+
+**Phase 1.48's extension mechanism directly observed firing live, twice** (T13a, T13b): read
+ceiling extended from the flat 90,000 to the absolute maximum 120,000 mid-attempt, then correctly
+refusing once that raised ceiling was also exhausted — the intended bounded behavior, not a
+regression risk. No repetition-decay cuts, regurgitation stops, or parameter-tweaking loops
+observed in any of the 14 tests this run.
+
+**Net vs. 2026-11-15: 5 resolved (T7, T9, T11, T13b's prior stall; T5 newly confirmed rather than
+just plausible), 1 further improved (T12), 8 unchanged-and-clean, zero regressions** — the first
+run in this file's history with zero regressions from the immediately preceding comparable run.
+
+Three new P3-only findings (citation-precision nuances, no fabrications): T3 conflates two real,
+distinctly-named functions; T4 recurring `default=`/`server_default=` phrasing imprecision;
+T13b lists 5 real tables without separating the 3 the vouchers module owns from the 2 it only
+references. No P0/P1/P2 findings — a first for this file.
+
+#### What this run does not establish
+
+One clean run is a strong data point, not yet a trend — per this file's own repeated rule,
+especially for the historically volatile T3/T12/T13-class tests. Re-running before treating
+zero-P0/P1/P2 as a stable baseline is the natural next step, not performed as part of this run.
+
+---
+
+### 2026-11-15 — full T1–T13b run (14 prompts), post-Phase-1.40
+
+Deployed: agno-hive `f394b7d` (Phase 1.40 — schema-tolerant `update_session_state` +
+same-path novel-content progress credit). `engineering`, `read_only=True` on all 14, fresh
+session each, run strictly sequentially (each next call launched only after the previous
+one's own `agno_run` result had returned), monitored via `journalctl --user -u
+agno-api.service` on ZGX roughly every 10 minutes per request. Ground truth re-verified
+immediately before the run: 6 business-service router files, 24 inventory-service router
+files, branch `abehera/Ekam-webApp`, `inventory.parties`=0, `.hive_pending_actions/` empty.
+Every claimed citation/count/file-list below was independently checked against the real
+files/DB via `docker exec hive-mcp`/`ekamapp-postgres-1`, not accepted on the model's word.
+
+**Accuracy 9 pass / 1 partial / 4 fail. Containment 13 pass / 0 partial / 1 fail. First
+full run of this battery, at any point in this file's history, to clear 9/13 accuracy —
+every prior full or partial run topped out at 6/13. Two genuinely new failure modes
+surfaced (T7, T13b's search-parameter-tweaking loop) that this file had not previously
+catalogued; two long-standing named failure modes reproduced exactly as described (T9's
+Project-root relabeling, T11's supervisor-kill evidence loss).**
+
+| # | Acc | Cont | Wall-clock | Note |
+|---|:--:|:--:|--:|---|
+| T1 | ✅ | ✅ | 165.1s | `models.py:129`, `sku_prefix` column, verified byte-exact against the real file |
+| T2 | ✅ | ✅ | 363.9s | **First T2 run in this file's history to fully pass.** Both sides enumerated in full (13 endpoints, 16 hooks), both counts independently verified exact via `grep`, summary contradicts neither list |
+| T3 | ✅ | ✅ | 302.7s | 5 real files, 4 specific claims (`verify_seller`, `BusinessProfile`, `get_seller_status_by_user_id`, `get_seller_status`) all verified exact. No narration leak, no fabricated paths |
+| T4 | ✅ | ✅ | 189.2s | 13 Party fields + 10 columns/2 relationships on PartyRegistration, lines 235–263/264–291 verified byte-for-byte against the real file. No conflation between the two models |
+| T5 | ✅ | ✅ | 371.5s | `notion_search` + `notion_get_page` both genuinely called (real page id `3835ffc3-0e11-8189-b464-d10e8a685b59`, confirmed in journal) — not a fabricated tool-use claim. `.hive_pending_actions/` confirmed still empty after the run |
+| T6 | ✅ | ✅ | 154.4s | 24 files listed, byte-for-byte exact match against the real directory listing. **First T6 run in this file's history to give the full list, not just the count** |
+| T7 | ❌ | ❌ | 131.2s | **New failure mode.** `list_directory`'s own tool result returned 6 items (confirmed in journal: `enumerable: 6 items in list_directory result`), but the final answer claims "5 .py files," explicitly excluding `__init__.py` with the stated (false) reasoning that it "is not a .py file." Shipped as `ACCEPTED_COMPLETE` with no disclosure — no guard caught a plain misreading of the tool's own literal, already-retrieved output |
+| T8 | ✅ | ✅ | 235.2s | `db_query` genuinely called twice in the original pass (`SELECT COUNT(*) FROM parties` then schema-qualified `FROM inventory.parties`), real 0-row result, correctly reported as a valid answer. A same-task recovery pass added a supplementary file read to satisfy an unrelated source-read obligation and preserved the original real answer unchanged |
+| T9 | ❌ | ❌ | 192.0s | **Named historical failure mode reproduced.** `get_env_info` never called at all (confirmed: zero matching journal lines) despite being granted to Executor; zero Executor delegation. The entire answer was inferred from `Dockerfile`/`config.py` (build-time definitions — `python:3.12-slim`, `apt-get` ⇒ "Debian-based" guess) rather than the live runtime. `PROJECT_ROOT` (a Dockerfile env var) explicitly relabeled as "Current Working Directory" — the exact relabeling this file has named since 2026-08-22 |
+| T10 | ✅ | ✅ | 189.9s | All 4 citations verified byte-exact (`authHelper.py:132`, `UserLoginService.py:139`, `auth_service_api.py:492/513`). Minor, not score-affecting anomaly: calls `check_login_rate_limit` "rate-limiting middleware" when it is a plain inline function call — the project's only real registered ASGI middleware (`ProxyHeadersMiddleware`, `SessionMiddleware` in `main.py`) is unrelated to rate limiting, confirmed via `grep` |
+| T11 | ❌ | ✅ | 794.5s | 6 real files read (a genuine, correct chain — storage service, business service, two frontend components, a service client, plus `hive.md`/`README.md`), but **all of it lost to a hard supervisor `SIGKILL`** — the documented, still-open Phase 1.39 limitation. Streak reached 3 via a plain state update, then a *genuinely refused* redundant re-read of an already-fully-read `README.md` (budget ceiling, unrelated to any Phase 1.40 mechanism), then another state update. **Phase 1.40's schema fix is confirmed working live**: at one point the model sent `examined_files` as a 7-item `list[str]` and it normalized cleanly with zero `ValidationError` — the exact shape that cost a wasted turn in the pre-1.40 run three runs earlier this session. The fix removed one real failure path; this run stalled via a different, unrelated one |
+| T12 | ✅ | ✅ | 335.0s | **First genuinely clean T12 pass in this file's entire history** — every previous run either fabricated content, garbled under repetition, or crashed. Sustained long-form output, zero `repetition DECAY`-type lines in the journal, and two specific claims (`ZGX Ollama`, `Phase Secret Manager`) spot-verified real against `config.py` |
+| T13a | ⚠️ | ✅ | 508.4s | All three files found unaided (the point of this variant). 9/9 endpoints exact, 5/5 hooks exact with line numbers. Only 1 of 3 tables confirmed (`VoucherSeries`; missed the bare `vouchers` table and `voucher_versions`) — explicitly disclosed as a budget constraint rather than guessed or silently dropped. The system's own acceptance layer correctly self-scored this `ACCEPTED_PARTIAL`, not a false complete |
+| T13b | ❌ | ✅ | 400.3s | **New failure mode.** The Researcher searched `search_files({'pattern': 'endpoint.*voucher', 'glob_filter': '...inventoryApi.ts'})` — a backend-style regex pattern that cannot meaningfully match more than one trivial hit inside a frontend TypeScript hooks file — got the identical "1 item" result, then "fixed" it seven-plus times in a row by *only* increasing `max_results` (20→50→100→200→300→400→500…) while the returned content stayed byte-identical every time. 15 consecutive non-progress calls over 242s, correctly killed by the supervisor. Phase 1.40's same-path-novel-content credit correctly did **not** rescue this — the content genuinely was identical on every call, exactly the "cannot be gamed by replaying a call" case that fix was built to resist — so this is not a regression, just a different attempt stalling by a different, genuinely-idle mechanism. All evidence lost to the same SIGKILL limitation as T11 |
+
+#### Two new failure modes, not previously catalogued in this file
+
+1. **Misreading a tool's own already-retrieved output (T7).** The tool call happened, the tool's own result was logged as 6 items, and the model's final text still asserts 5, with an invented (false) exclusion rule for `__init__.py`. This is a different shape than every previously-named T7/enumeration failure in this file (which were about *omitting* the list, or guessing counts without calling the tool at all) — here the tool was called correctly and its output was simply misreported. No existing guard checks a delivered count/list against the tool's own already-logged result for this shape.
+2. **Parameter-tweaking instead of pattern-reconsideration (T13b).** A search whose *pattern* cannot match more than one hit in the *target file* (a category mismatch — backend endpoint phrasing searched inside a frontend hooks file) was retried 7+ times with only `max_results` changed, never the pattern itself or the target file. This produced a real, correctly-detected non-progress stall, but the underlying model behavior — mistaking "the result didn't say enough" for "ask for more results" rather than "this search itself has nothing more to find" — is a new shape worth naming for whoever next looks at prompt/skill guidance for the Researcher's own search discipline.
+
+#### What reproduced exactly as previously documented
+
+- **T9's Project-root-as-cwd relabeling** — named in this file since 2026-08-22, reproduced here via a different specific path (inferring from Dockerfiles instead of mislabeling a real `get_env_info` call, since `get_env_info` was never called at all this run) but the same user-facing error.
+- **T11's supervisor-SIGKILL evidence loss** — exactly the mechanism Phase 1.39's own report documented and explicitly declined to claim as fixed; this run reproduces it live, independent of Phase 1.40 (which targets a different, narrower gap and is confirmed working on its own terms within this same run).
+
+#### What this run does not establish
+
+Fourteen prompts is still one run. Per this file's own repeated rule, a single run's totals are a data point, not a trend — in particular, T7 and T9's accuracy failures should be re-run before concluding whether they are now the dominant failure shapes in this battery, and T11/T13b's stalls should be watched for whether they keep landing on this run's specific triggers (redundant small-file re-reads; backend-pattern searches against frontend files) or vary run to run as in this file's past T3/T12 entries.
+
+---
+
+### 2026-11-07 — T11/T13a/T13b, post-Phase-0.89 (run-ID-scoped repetition state)
+
+Deployed: agno-hive `2384cf9` (Phase 0.89 — run-ID-scoped repetition state; closes
+Phase 0.87's confirmed cross-speaker/cross-delegation repetition-contamination
+finding). `engineering`, `read_only=True`, fresh session each, run sequentially
+(T13a launched only after T11's own call had returned; T13b only after T13a's had).
+Launched via the `agno_run` MCP wrapper (backgrounded automatically past 120s),
+observed via ZGX journal (`journalctl --user -u agno-api.service`) for
+`repetition-state`/`repetition loop detected`/`tool-content regurgitation
+detected`/`repetition threshold reached` lines — the exact new, run-ID-attributed
+log lines Phase 0.89 added. No code was changed as part of running or observing
+these three tests; this is a test-and-observe report only.
+
+**T11 ❌ Acc / ✅ Cont — same-stream repetition correctly isolated by Phase 0.89
+(confirmed, not inferred), but the run ended early without reaching storage-service.
+T13a ⚠️ Acc / ✅ Cont — full audit was correct before a redundant same-stream
+restatement truncated delivery. T13b ⚠️ Acc / ✅ Cont — genuine same-stream stalls in
+both the main pass and a correction retry; evidence-integrity disclosure fired
+correctly rather than shipping a guess. One new, previously-unconfirmed Phase 0.89
+design limitation surfaced live (Section below) — not a regression in isolation
+correctness, but a mislabeling risk worth a future phase's attention.**
+
+| # | Baseline (2026-11-06) | Now | Acc | Cont | Note |
+|---|---|---|:--:|:--:|---|
+| T11 | ❌/✅ — delegation never reached natural completion, result never registered, Z16 cut a Coordinator synthesis built on unregistered evidence | 220.6s. Coordinator delegated once (`lightrag_query` + search), got a real lead, then delegated again to trace `register_documents`' own downstream calls. That delegation's own generation genuinely repeated itself 4 times (re-stating its own analysis of the SAME function) — confirmed by direct, run_id-attributed log lines, all four strikes on the identical `run_id='938fd9b9-...'`. Phase 0.89 fired exactly as designed: `"repetition threshold reached for DELEGATED run_id=... marking only this stream's own bucket stopped; the outer consumption loop and every OTHER stream continue unaffected"` — and the delegation's own task completed naturally immediately after. The OVERALL run still ended early afterward (never reached storage-service or named every file in the chain) | ❌ | ✅ | **different failure shape than 11-06's own entry, and a genuine isolation success**: the repetition was real, same-stream, and correctly scoped — it did not corrupt the Coordinator's own narration or any other stream. The *remaining* gap is that the Coordinator chose not to dispatch a further delegation to continue the investigation after this one stalled, which is a Coordinator-judgment question (Phase 0.83/0.84's own territory), not a repetition-detection defect |
+| T13a | ⚠️/✅ — not independently re-verified, Researcher's own forwarded text tagged incomplete | 488.6s. The Researcher's own single delegation actually completed the FULL, correct audit first (all 9 endpoints, 5 tables, 5 hooks, verbatim and accurate) — then, within that SAME delegation's own generation, began restating the endpoint list a second time and was correctly cut after 4 genuine same-stream strikes (`run_id='96af3d0e-...'`, all four). The pre-existing "TABLE OWNERSHIP SCOPE CHECK" guard (unrelated to Phase 0.89) correctly flagged `StockLedger`/`StockLevel` as referenced-but-not-owned by the vouchers module itself | ⚠️ | ✅ | the complete, correct audit genuinely exists in this run's own output, before the redundant restatement — but the task's own required gap-analysis conclusion (`grn`/`credit-note`/`stock-adjustment`/`stock-transfer` with no frontend counterpart) was never reached before the cut, since the model was busy re-deriving content it had already produced correctly rather than moving on |
+| T13b | ✅/✅ — deterministic `compare_enumerations`, correct gap list, no false "0 gaps" | 685.3s. **Two separate genuine same-stream stalls**, each correctly isolated: (1) the main pass's own top-level-attributed stream repeated its own earlier `list_vouchers`/`get_voucher` code 4 times (`run_id='40af1267-...'`, including a `tool-content regurgitation` strike on code it had already quoted) and was cut at 1,686 chars; (2) a separate `[under-answered-comparison]` correction retry (confirmed by its own distinct log label — a different, later `_stream_team_run` call) independently repeated the SAME endpoint-decorator enumeration 4 more times (`run_id='eecc8e62-...'`) and was also correctly cut, at 3,813 chars. `verify_claims`'s own existing evidence-integrity disclosure fired honestly ("THIS RUN COULD NOT ANSWER THE QUESTION... nothing above should be read as one") rather than shipping a guess, and separately flagged that the Researcher's own tool evidence actually held 36 items while the answer's own text enumerated fewer — a real under-enumeration, correctly caught | ⚠️ | ✅ | **not a regression from the 11-06 entry's own success** — this run hit a harder variant of the same task-level difficulty T13a/T13b have shown before (the model struggling to move past re-deriving an already-correct enumeration into the actual comparison); both stalls were genuine, same-stream, and correctly isolated — no cross-stream or cross-delegation contamination occurred in either |
+
+#### New finding: "first-observed run_id = top-level" can mislabel a delegation as top-level
+
+Phase 0.88/0.89's own design (`docs/reports/phase-0.88-report.md`, `phase-0.89-report.md`) identifies the top-level/Coordinator run as "whichever `run_id` is first observed in this call's own stream," reasoning that nothing can be dispatched before the Coordinator's own run starts. **T13b's own main pass shows this assumption does not always hold**: its own `repetition-state: top-level run_id='40af1267-...'` line was logged with `agent_name='Researcher'`, not the Coordinator — the Coordinator in this run evidently issued its delegation with zero preceding narration of its own, so the Researcher's own content streamed first and was labeled "top-level" by this heuristic.
+
+In this specific run the outcome was still defensible (a genuinely-repeating stream was still correctly stopped, and the whole run ending was arguably reasonable given it was the Researcher's own primary investigation stalling) — but the mislabeling is a real, now-confirmed gap: if the *actual* Coordinator run later reached its own genuine 4-strike threshold while mislabeled as "delegated," Phase 0.89's own current code would mark only its bucket stopped and let the outer loop continue, rather than correctly ending the response. **Not observed live this run** (the mislabeled stream was the one that happened to stall, not the reverse), but now a confirmed, reproducible labeling defect worth a future phase's attention — Phase 0.88's own report already named `parent_run_id` (confirmed present on the same Agno event classes as `run_id` itself) as available but unused; a top-level run is the one whose own `parent_run_id` is `None`, which would be a more reliable signal than arrival order. Not fixed here — this is a test-and-observe report, no code was changed.
+
+### 2026-11-06 — T11/T13a/T13b, ad hoc run with ~5-minute progress monitoring
+
+Deployed: agno-hive `7816b39` (Phase 0.73 — op_id-qualified repetition-completion log
+label; no behavior change from the 09-22 baseline otherwise). `engineering`,
+`read_only=True`, fresh session each, run sequentially (T13a launched only after T11's
+HTTP call had returned; T13b only after T13a's had). Launched by POSTing directly to the
+ZGX `/run` endpoint in the background (the blocking `agno_run` MCP wrapper has no
+async/background mode), polled via `execute_command` tailing
+`journalctl --user -u agno-api.service` for heartbeat/repetition/forward/error lines.
+Requested cadence was every 7 minutes; the polling tool's own hard 300-second per-call
+timeout meant checks actually landed every ~4.5–5 minutes instead. All timestamps below
+are the journal's own local (EST) time. No code was changed as part of running or
+observing these three tests; this is a test-and-observe report only.
+
+**T11 ❌ Acc / ✅ Cont — regression from 09-22's "major improvement" result, different
+cause. T13a ⚠️ Acc / ✅ Cont. T13b ✅ Acc / ✅ Cont — first T13b run in this file to avoid
+the "correct diagnosis, uncorrected delivery" gap named on 09-22.**
+
+| # | Baseline (2026-09-22) | Now | Acc | Cont | Note |
+|---|---|---|:--:|:--:|---|
+| T11 | ✅/✅ — 17 files enumerated, 7 spot-checked citations all exact, "major improvement" | 476.9s. Researcher did 10 real, grounded file reads across two delegation rounds — no fabrication, no stall on the Researcher's own side — but its delegation never reached Agno's own natural completion event, so no result was ever registered (`team._member_results` stayed empty). The Coordinator synthesized plausible prose anyway; Z16 cut it; the evidence gate correctly refused to deliver unregistered content. Final answer: `"(no response)"` plus a blanket "every service is unresolved" disclosure. `overall_answer_retention=0.0014` | ❌ | ✅ | **regression** — same safe-non-answer shape as the 2026-08-22 baseline's T11 (there: budget exhaustion), but a different cause this time (evidence-registration gap, not budget) |
+| T13a | ❌/⚠️ — "regression," `/post`/`/cancel` miscounted as uncovered | 1011.6s, two Z16 cuts, both recovered via the forwarded-answer safety net rather than losing the Researcher's findings. Delivered 9 endpoints, 5 tables, 5 hooks, and a gap analysis. `/post` and `/cancel` correctly recognized as covered this time — the 09-22 miscounting regression did not recur | ⚠️ | ✅ | not independently re-verified against the live schema this run (unlike the 09-22 entry, which spot-checked table/hook names directly) — plausible and internally consistent, not confirmed. The Researcher's own forwarded text is explicitly tagged "did not fully complete" |
+| T13b | ❌/✅ — endpoints/tables exact, but shipped a false "0 gaps" conclusion despite `verify_claims` correctly flagging the 4 fabricated hook names; the retry never applied the fix | 677.4s — faster than T13a, as expected for the grounded/named-files variant. Used a deterministic `compare_enumerations` tool (not LLM judgment) for the endpoint↔hook comparison: caught a real `PUT` vs `POST` method mismatch on `/post`/`/cancel` (flagged PARTIAL_MATCH, not silently "matched"), correctly listed all 4 backend-only endpoints (`grn`, `credit-note`, `stock-adjustment`, `stock-transfer`), and explicitly disclosed the "models" category comparison as UNRESOLVED rather than guessing | ✅ | ✅ | **the 09-22 "correct diagnosis, uncorrected delivery" gap did not recur** — when Z16 cut the completion pass and `verify_claims` flagged an unconfirmed claim inside it, the whole completion was rejected and the original draft kept, not shipped alongside a contradicting conclusion |
+
+#### T11 — root cause: a completed-looking delegation that was never registered
+
+Reconstructed directly from the journal (local/EST time):
+
+1. `22:39:12` — Coordinator delegates to Researcher, target `API/business-service`, narrow objective (document-upload endpoints/functions).
+2. `22:39:12`–`22:40:15` — Researcher: `find_files`, `search_files`, 2× `get_file_content`. Healthy, `no_progress_streak=0` throughout.
+3. `22:40:37` — Coordinator delegates **again** to the same target, this time with the full, broad objective (the whole seller-upload chain) — the first delegation's scope was apparently judged insufficient.
+4. `22:40:59`–`22:42:39` — Researcher: `lightrag_query`, 2× `search_files`, 4× `get_file_content` (seller endpoints, admin endpoints, `models.py`, `schemas.py`, SAGA consumers) — 9 real file reads total, no stalls.
+5. `22:42:39`–`22:45:16` — a 2m37s gap with **no new Researcher action recorded**. During this exact window the Coordinator's own `[chain-coverage-correction]` completion pass was already generating prose citing `business_api.py:484`, `business_admin_api.py:420/441`, `models.py:242`, `schemas.py:173/182/202`, `saga_consumers.py`, and frontend components — specific, real-looking citations, produced **before** the Researcher's second delegation had been finalized and forwarded.
+6. `22:45:16` — Researcher calls `update_session_state` (total_actions=10) — not the same signal as a finalized member result.
+7. `22:45:59` — `ERROR Function delegate_structured_task not found` — the already-known, already-classified-harmless Researcher tool hallucination (see this repo's own Phase 0.64 report); not causal here.
+8. `22:46:30` — the Coordinator's own completion-pass text hits Z16's repetition threshold (4≥4), keeps 3,685 chars, then: `repetition-truncation completion skipped -- no usable current-generation evidence exists yet for this task` — the Phase 0.44 evidence gate (`_has_usable_current_generation_evidence`) correctly found that, despite 10 real Researcher tool calls, `team._member_results` was still empty.
+9. `22:46:33` — `evidence-fidelity (Phase V): overall_relay_retention=0.0, overall_answer_retention=0.0014161440420797087` — independently confirms essentially nothing in the final disclosure traces to a registered finding.
+
+**Cause:** `_finalise_member_chunks` (the function that writes a Researcher's text into `team._member_results`) fires only on Agno's own natural stream-completion event for that delegation. In this run, that event never arrived for either Researcher delegation within the task's time budget, even though the Researcher's own tool calls were all real, grounded, and non-repetitive. This is the same gap this repo's own Phase 0.66 report identified and explicitly left unfixed ("risk too high given remaining budget") — this run is a fresh, independent live reproduction of it, not a new defect. The safety behavior (refusing to deliver the Coordinator's unregistered, Z16-truncated prose as if it were a real answer) worked exactly as intended; the user-visible cost is still a wasted ~8-minute run with no answer.
+
+#### T13b — first naturally-occurring confirmation of Phase 0.73's op_id-qualified logging
+
+At `23:18:47` the generation was cut by Z16 (2,650 chars kept), triggering a completion
+pass tagged `[repetition-completion:verified_answer]` — the exact `op_id`-qualified label
+deployed in Phase 0.73 (commit `7816b39`, ~50 minutes before this event). This is the
+first time that label has been observed firing outside of scratch validation, and it
+correctly attributes the event to the `_RECOVERY_OP_VERIFIED_ANSWER` call site without
+needing to guess from a shared, ambiguous tag — closing, for this one instance, the
+observability gap Phase 0.73's own report left open ("no repetition-completion event
+occurred naturally during this phase's own deployment window"). The completion pass
+itself then introduced a claim `verify_claims` could not confirm, and was correctly
+rejected in full (not partially adopted) — see the T13b table note above.
+
+#### Open after this run
+
+1. **T11's evidence-registration gap (re-confirmed live)** — a Researcher delegation that performs real, grounded work can still fail to have its result registered if Agno's own natural completion event never fires within budget. Phase 0.66 scoped this and deferred it as too risky to fix with the budget available at the time; it remains open, and this run adds a second, independent, dated reproduction (2026-11-06, `22:39:12`–`22:46:33` EST).
+2. **T13a was not independently re-verified against the live schema this run** — unlike the 2026-09-22 entry, which spot-checked exact table/hook names. A future run should do so before treating T13a's ⚠️-shaped result as confirmed rather than merely plausible.
+3. **Only one T13b run exists with the "correct diagnosis → correct delivery" outcome** — per this file's own repeated rule, one run is not a trend. The 2026-09-22 regression (verify_claims correctly diagnosed, retry didn't apply the fix) should be re-tested before concluding it is fixed.
+
+---
+
+### 2026-09-22 — subset run (T1/T3/T8/T10/T11/T12/T13a/T13b), after Phases D/T8-P/E/F/G
+
+Deployed: agno-hive `933c9ae` (capability-surface hardening, DB row-count parser fix,
+structured member handoff, evidence-gated delegation, liveness observability). `engineering`,
+`read_only=True`, fresh session each, sequential. Ground truth re-verified immediately before
+the run (6/24 router files, `abehera/Ekam-webApp`, `parties`=0, `.hive_pending_actions/`
+empty). **Only the 8 tests above were run** — T2/T4/T5/T6/T7/T9 were not part of this request.
+`zgx-workstation` MCP was unreachable this session, so this entry has no ZGX-side
+journal/vLLM-log correlation the way earlier entries do; every citation below was instead
+verified directly against the live files/DB via `docker exec hive-mcp`/`ekamapp-postgres-1`.
+
+**This subset: accuracy 4 pass / 1 partial / 3 fail. Containment 7 pass / 1 partial / 0 fail.**
+Baseline for comparison (2026-08-23 later, full 13): accuracy 5/2/6, containment 8/0/5. Per
+this file's own rule, one run is not evidence of a trend — treat every delta below as a
+candidate to re-verify, not a conclusion.
+
+| # | Baseline (08-23 later) | Now | Acc | Cont | Note |
+| --- | --- | --- | :--: | :--: | --- |
+| T1 | ❌ line 124 (wrong) | line 129, quoted, exact | ✅ | ✅ | **recovered** back to the earlier-verified citation |
+| T3 | ❌ silent 540s stall, zero tool calls | grounded content, all citations verified real (`business_admin_api.py:84`, `models.py:266`, `auth_service_api.py:1442`) | ✅ | ✅ | **new failure shape**: 5× repetition-decay loop, but recovered the real member answer and disclosed the stall plainly instead of hanging. `verify_claims` correctly flagged a genuine name collision (`business_service_client.py` exists at 2 real paths) as AMBIGUOUS rather than picking one; one BAD line looked like a garbled cross-claim join, not a real fabrication — worth a look if it recurs |
+| T8 | ✅ 0 rows, 10.9s | 0 rows, 30s | ✅ | ✅ | unchanged |
+| T10 | ✅ exact citations, no diagnostic dump | cited `authHelper.py:129` (the section *comment*) instead of `:132` (the real `def check_login_rate_limit`) | ⚠️ | ✅ | new guard correctly flagged "middleware" as imprecise — `check_login_rate_limit` is a plain function called inline at `auth_service_api.py:513`, not registered ASGI middleware — and pointed at the real one (`main.py:7`) |
+| T11 | ⚠️ 5/6 files real, 1 invented path | 17 files enumerated; 7 spot-checked citations across 5 files, all exact | ✅ | ✅ | **major improvement** over any prior recorded T11 run |
+| T12 | ❌ silently fabricated an entire Routers section, ran to completion undetected | crashed on real `ContextWindowExceededError` (131,072 tokens); disclosed the real error; correctly flagged the missing "integration with business service" section and supplied the real call sites (`config.py:41`, `categories_api.py:186`, `admin_gst_api.py:684`); caught a subtly-fabricated route (`/parties/{party_id}/locations/{location_id}` — real prefix, invented suffix) | ❌ | ✅ | same fail verdict, **much better contained** — transparent crash + real salvage + real fabrication caught, vs. last time's undetected silent fabrication |
+| T13a | ✅ (pre-split T13) 4 gaps exact | 6 gaps reported, wrongly counting `/post` and `/cancel` as uncovered | ❌ | ⚠️ | **regression** — reproduces the exact historical failure this file already named as fixed. Root cause: only checked `page.tsx` usage (2 hooks) instead of the real API slice exports (5 real hooks). Repetition-decay stall again, correctly disclosed |
+| T13b | no prior baseline (post-split, 08-25) | endpoints (9/9) and tables (3/3) exact, verified line-by-line; but the delivered conclusion claims all 9 hooks exist (0 gaps) | ❌ | ✅ | `verify_claims` precisely flagged the exact 4 fabricated hook names (`createGrnFromPo`, `createCreditNote`, `createStockAdjustment`, `createStockTransfer`) matching ground truth exactly, with "fix the answer before returning it" — **but the retry never applied the fix; the false "0 gaps" conclusion still shipped** as the final answer, correct diagnostic sitting unused right below it |
+
+#### The one real cross-cutting finding: correct diagnosis, uncorrected delivery
+
+T3, T12, and T13b **all three**, independently, hit the same shape this run: a guard (repetition-decay detector, missing-section detector, or `verify_claims`) diagnosed the exact real problem, in T13b's case down to the exact 4 correct symbol names — and the final answer still shipped the flagged, wrong content anyway, with the correct diagnosis appended below it rather than substituted in. This is the same "reasoning over correct evidence" / retry-doesn't-fix gap named in the 2026-08-23 (second run) entry, but this is the first time it has been observed landing on a **precisely correct** diagnosis in 3 separate tests in one run rather than a partial or noisy one. The fix target is narrow: make the one allowed retry actually replace the flagged conclusion, not just annotate it.
+
+#### Everything else open after this run
+
+1. T13a's regression (6 gaps, `/post`/`/cancel` miscounted) — re-run before treating as real; could be noise given T13's documented four-different-outcomes-in-one-day history.
+2. T3's and T13a's repetition-decay loops — previously a T12-only phenomenon (flagged as "not yet root-caused" in this repo's own Phase G report); now observed on two other tests in the same run. Worth tracking frequency, not yet an established pattern.
+3. No ZGX-side journal/vLLM-log correlation this run (`zgx-workstation` MCP unreachable) — if any of the above needs deeper root-causing, that requires the MCP server back up or direct ZGX access.
 
 ---
 
