@@ -118,7 +118,13 @@ def derive_policy(paths: list, task: str = "", supplied_policy_spec: dict | None
     pre-existing, explicitly LEGACY, project-specific phrase-matching mechanism -- kept working
     for backward compatibility, but isolated here as the fallback branch, never the primary
     path, and never consulted at all once a caller supplies its own policy."""
-    known = A.build_policy_from_spec(supplied_policy_spec) if supplied_policy_spec else _known_policy_for(task)
+    # Phase 1.38a: `is not None`, never bare truthiness -- an explicitly-supplied `{}` is falsy
+    # in Python, so `if supplied_policy_spec:` silently treated it as "nothing supplied" and
+    # fell through to the legacy phrase-matching policy below, even though build_policy_from_spec()
+    # itself (as of this same phase) correctly rejects `{}` as malformed. plan_request() already
+    # guards this call site with its own pre-validation, so this is defense in depth for any
+    # other/future caller of derive_policy(), not the only place the distinction is enforced.
+    known = A.build_policy_from_spec(supplied_policy_spec) if supplied_policy_spec is not None else _known_policy_for(task)
     if not paths:
         return known if known is not None else A.EvidencePolicy(name="generic-source-evidence", requirements=[
             A.Requirement("G1_source_read", "at least one source file was actually read in this attempt (any file)", [A.ANY_SOURCE])])

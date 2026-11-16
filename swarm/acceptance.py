@@ -855,18 +855,36 @@ def build_policy_from_spec(spec: dict) -> "EvidencePolicy":
             [tuple(i) for i in e["right_items"]], list(e["right_source_paths"]),
             match=None, mandatory=bool(e.get("mandatory", True)))
 
+    # Phase 1.38a: `spec is None` ("evidence_policy was never supplied at all") and `spec == {}`
+    # ("evidence_policy was explicitly supplied as an empty object") are NOT the same thing and
+    # must not be collapsed into one by `spec = spec or {}` below treating both as falsy --
+    # that collapse is exactly how a real bug reached production in Phase 1.38: derive_policy()'s
+    # own `if supplied_policy_spec:` truthiness check treated an explicitly-supplied `{}` as
+    # "nothing supplied" and silently fell through to the legacy phrase-matching policy, even
+    # though THIS function would have accepted `{}` successfully (a valid, merely vacuous,
+    # policy) had it ever been reached. `_was_supplied` keeps that distinction alive past the
+    # `spec = spec or {}` normalization immediately below, so an explicitly-empty spec can be
+    # rejected as malformed here rather than silently treated as either "nothing" or "fine."
+    _was_supplied = spec is not None
     if spec is not None and not isinstance(spec, dict):
         raise PolicySpecError(f"evidence_policy must be an object/dict, got {type(spec).__name__}")
     spec = spec or {}
     unsupported = set(spec.keys()) - {"name", "requirements", "enum_requirements", "cross_reference_requirements"}
     if unsupported:
         raise PolicySpecError(f"evidence_policy has unsupported top-level key(s): {sorted(unsupported)}")
-    return EvidencePolicy(
+    result = EvidencePolicy(
         name=spec.get("name") or "supplied-policy",
         requirements=[_wrap("requirements", i, _req, e) for i, e in enumerate(spec.get("requirements", []))],
         enum_requirements=[_wrap("enum_requirements", i, _enum, e) for i, e in enumerate(spec.get("enum_requirements", []))],
         cross_reference_requirements=[_wrap("cross_reference_requirements", i, _xref, e)
                                       for i, e in enumerate(spec.get("cross_reference_requirements", []))])
+    if (_was_supplied and not result.requirements and not result.enum_requirements
+            and not result.cross_reference_requirements):
+        raise PolicySpecError(
+            "evidence_policy was explicitly supplied but defines no requirements of any kind "
+            "(an empty {} is treated as malformed, not as 'no policy' -- omit the evidence_policy "
+            "field entirely, rather than sending an empty object, to use the legacy/default behavior)")
+    return result
 
 
 T13_ENDPOINTS_REQ = EnumRequirement(
