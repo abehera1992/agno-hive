@@ -26,9 +26,11 @@ SCHEMA = "workflow-liveness/1"
 
 class ProgressTracker:
     """Meaningful progress = a previously unread source file was read successfully, or a non-state tool returned a
-    result never seen before in this attempt. Everything else (state-tool calls, repeated/identical results,
-    duplicate-read and other refusal stubs, failed calls) is NOT progress. Narration and content chunks refresh
-    `last_activity_at` (so silence is judged separately) but never count as progress."""
+    result never seen before in this attempt. Phase 1.40: a source-file path already seen still counts as progress
+    if THIS call's actual content (by result_sha) was never seen before -- a different offset/limit window of the
+    same file surfacing genuinely new lines, not a byte-identical re-read. Everything else (state-tool calls,
+    repeated/identical results, duplicate-read and other refusal stubs, failed calls) is NOT progress. Narration and
+    content chunks refresh `last_activity_at` (so silence is judged separately) but never count as progress."""
 
     def __init__(self, now=time.monotonic):
         self._now = now
@@ -74,10 +76,23 @@ class ProgressTracker:
             self.state_result_shas[sha] = self.state_result_shas.get(sha, 0) + 1
         elif o.outcome == A.SUCCESS:
             new_paths = [p for p in (o.paths_read or []) if p not in self.seen_paths]
-            if o.evidence_kind == "source_read" and new_paths:
-                self.seen_paths.update(new_paths)
-                progress = True
-            elif o.result_sha and o.result_sha not in self.seen_result_shas and o.evidence_kind != "source_read":
+            novel_sha = bool(o.result_sha) and o.result_sha not in self.seen_result_shas
+            if o.evidence_kind == "source_read":
+                if new_paths:
+                    self.seen_paths.update(new_paths)
+                    progress = True
+                elif novel_sha:
+                    # Phase 1.40: a path already in seen_paths can still return genuinely
+                    # new evidence on a later call -- e.g. a different offset/limit window
+                    # of the same file surfacing lines never read before in this attempt
+                    # (the live T11 incident: offset=200/limit=50 then offset=64/limit=150
+                    # on the same path -- mostly new content, credited as zero progress
+                    # under the path-only check). classify_return() already gives an EXACT
+                    # re-read (identical offset/limit, byte-identical content) the SAME
+                    # result_sha as the earlier call, so novel_sha is correctly False for a
+                    # true duplicate and this cannot be gamed by re-issuing the same read.
+                    progress = True
+            elif novel_sha:
                 progress = True
             if o.result_sha:
                 self.seen_result_shas.add(o.result_sha)

@@ -230,23 +230,49 @@ def format_skill_catalog(catalog: list[dict], names: list[str] | None) -> str:
 # every intended use (a renamed table, a confirmed decision, a fact to remember) is
 # naturally string-shaped, and it structurally can't become a place to dump nested
 # JSON/file content either.
-def _update_session_state_impl(session_state_updates: dict[str, str], run_context: RunContext = None) -> str:
+# Phase 1.40: a live T11 incident showed the model recording exactly the kind of
+# genuinely-reusable fact this tool exists for -- a short list of the files it had just
+# read -- as session_state_updates={"key_files": [<path>, <path>, <path>]}, which
+# dict[str, str] rejects (ValidationError, list is not a str). The model immediately
+# self-corrected by joining the list into a comma-separated string on its own retry,
+# wasting one full turn (and one non-progress tick the liveness supervisor counts) on a
+# predictable schema mismatch, not a reasoning failure. `_normalize_state_value` accepts
+# the one additional shape a model will reliably reach for -- a flat list of plain
+# strings -- and joins it exactly the way the model's own successful retry did, so the
+# normalized value is indistinguishable from a human having typed it as a string to
+# begin with. It deliberately does NOT widen to dict/nested/mixed-type values: the
+# comment above this function explains why value-shape still matters (never a place to
+# dump nested JSON or file content), and `list[str]` of short path-like strings is the
+# one shape that is still "naturally string-shaped" once flattened, not a loophole into it.
+def _normalize_state_value(v):
+    if isinstance(v, str):
+        return v
+    if isinstance(v, list) and all(isinstance(x, str) for x in v):
+        return ", ".join(v)
+    raise TypeError(f"session_state_updates value must be a string or a list of strings, got {type(v).__name__}")
+
+
+def _update_session_state_impl(session_state_updates: dict[str, "str | list[str]"], run_context: RunContext = None) -> str:
     if run_context is None or run_context.session_state is None:
         return "No shared state available to update."
-    run_context.session_state.update(session_state_updates)
+    normalized = {k: _normalize_state_value(v) for k, v in session_state_updates.items()}
+    run_context.session_state.update(normalized)
     return f"Updated shared state: {run_context.session_state}"
 
 
 @agno_tool
-async def update_session_state(session_state_updates: dict[str, str], run_context: RunContext = None) -> str:
+async def update_session_state(session_state_updates: dict[str, str | list[str]], run_context: RunContext = None) -> str:
     """Record a small, genuinely reusable fact or decision into the shared state every
     agent in this run can see. Never full file content or a long pasted excerpt; that
     belongs in a normal tool result, not shared state.
 
     Example: session_state_updates={"business_documents_table": "renamed from seller_documents in migration d0e1f2a3b4c5"}
+    Example: session_state_updates={"key_files": ["a/b.py", "c/d.ts"]} -- a list of short strings is also accepted and
+    is joined into one string.
 
     Args:
-        session_state_updates (dict[str, str]): key-value pairs to merge into the shared state. Values must be strings.
+        session_state_updates (dict[str, str | list[str]]): key-value pairs to merge into the shared state. Each
+            value must be a string, or a list of strings (which will be joined into one comma-separated string).
     """
     return _update_session_state_impl(session_state_updates, run_context)
 

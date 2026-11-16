@@ -436,18 +436,27 @@ def has_new_source_evidence(prior_outcomes, new_outcomes) -> bool:
     lists inside the SAME process -- but the DEFINITION of "progress" is deliberately identical,
     not a second, divergent one, so a human reading both never has to reconcile two different
     answers to the same question. update_session_state and the other STATE_TOOLS entries are
-    never evidence here either, for the same reason they are never progress there."""
+    never evidence here either, for the same reason they are never progress there.
+
+    Phase 1.40: widened in lockstep with ProgressTracker.on_call()'s own same-change -- a
+    source_read of an already-seen path still counts as new evidence if THIS call's actual
+    content (by result_sha) was never seen before (a different offset/limit window surfacing
+    genuinely new lines), not only on a never-before-seen path."""
     prior_paths = {p for o in (prior_outcomes or []) for p in (o.paths_read or [])
                   if o.outcome == SUCCESS and o.evidence_kind == "source_read"}
-    prior_shas = {o.result_sha for o in (prior_outcomes or [])
-                 if o.outcome == SUCCESS and o.evidence_kind != "source_read" and o.result_sha}
+    prior_source_shas = {o.result_sha for o in (prior_outcomes or [])
+                        if o.outcome == SUCCESS and o.evidence_kind == "source_read" and o.result_sha}
+    prior_other_shas = {o.result_sha for o in (prior_outcomes or [])
+                       if o.outcome == SUCCESS and o.evidence_kind != "source_read" and o.result_sha}
     for o in (new_outcomes or []):
         if o.outcome != SUCCESS or o.tool in STATE_TOOLS:
             continue
         if o.evidence_kind == "source_read":
             if any(p not in prior_paths for p in (o.paths_read or [])):
                 return True
-        elif o.result_sha and o.result_sha not in prior_shas:
+            if o.result_sha and o.result_sha not in prior_source_shas:
+                return True
+        elif o.result_sha and o.result_sha not in prior_other_shas:
             return True
     return False
 
