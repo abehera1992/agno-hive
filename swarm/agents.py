@@ -252,12 +252,45 @@ def _normalize_state_value(v):
     raise TypeError(f"session_state_updates value must be a string or a list of strings, got {type(v).__name__}")
 
 
+# Phase 1.45 Track B1: the live T11 forensic baseline (docs/reports/phase-1.41a-forensic-
+# failures-report.md and the fresh trace in this phase's own report) shows the SAME shape
+# every time research is otherwise complete: the model keeps calling this tool with content
+# that restates what it already recorded, under the same key, sometimes byte-identical,
+# right up to the supervisor's 3-non-progress-call kill. Two narrow, generic changes, scoped
+# exactly to this tool's own return value -- never to outcome classification, progress
+# accounting, or any acceptance/supervisor logic, all of which are unaffected:
+#   1. Unchanged-value detection: a call whose every key already holds that EXACT value is
+#      told so plainly, instead of being told "Updated" as if something changed -- and is
+#      given a direct, generic nudge ("write your final answer directly instead") rather
+#      than silently inviting another identical call.
+#   2. The confirmation for a GENUINE change now names only the keys that changed, not the
+#      full session_state dict -- removing the one plausible mechanism (see this phase's own
+#      report) by which seeing its own growing summary echoed back could be reinforcing the
+#      model's instinct to keep refining it here instead of finalizing. No other caller
+#      parses this string (confirmed: grepped the whole repo for the literal prior text,
+#      "Updated shared state", and this function's own definition is the only hit), so this
+#      is a pure text-format change with nothing else depending on the old wording.
+# Deliberately NOT a fix for the harder shape in the same incident, where the model restates
+# the SAME underlying fact under a NEW key each time (document_upload_flow ->
+# document_upload_services -> document_upload_summary) -- catching that would mean comparing
+# new text against every EXISTING value by some similarity measure, a materially different
+# (and riskier, false-positive-prone) mechanism than the exact-match check the mission scoped
+# this track to. See the Phase 1.45 report's own B2 section for where that larger gap is
+# addressed by design rather than by this function.
 def _update_session_state_impl(session_state_updates: dict[str, "str | list[str]"], run_context: RunContext = None) -> str:
     if run_context is None or run_context.session_state is None:
         return "No shared state available to update."
     normalized = {k: _normalize_state_value(v) for k, v in session_state_updates.items()}
+    unchanged = [k for k, v in normalized.items() if run_context.session_state.get(k) == v]
+    changed = [k for k in normalized if k not in unchanged]
     run_context.session_state.update(normalized)
-    return f"Updated shared state: {run_context.session_state}"
+    if not changed:
+        noun = "this value" if len(unchanged) == 1 else "these values"
+        verb = "is" if len(unchanged) == 1 else "are"
+        return (f"No change: {noun} {verb} already recorded exactly as given ({', '.join(unchanged)}). "
+                f"Restating it again will not add anything -- if your research is otherwise complete, "
+                f"write your final answer directly instead of calling this tool again.")
+    return f"Recorded {len(changed)} key(s): {', '.join(changed)}."
 
 
 @agno_tool
@@ -524,6 +557,20 @@ def make_researcher(*mcps: MCPTools) -> Agent:
             "Use get_file_content() to read and summarise key files.",
             "Output a concise summary: what exists, what patterns are used, what the Coder needs to know.",
             "Do NOT implement anything — research and summarise only.",
+            # Phase 1.45 Track B1: this instruction set previously said nothing about
+            # update_session_state at all, or about what "output a summary" actually means --
+            # the live forensic trace (docs/reports/phase-1.45-report.md) shows the model
+            # repeatedly restating an already-complete summary into shared state instead of
+            # writing it as its own final response. update_session_state stays available (a
+            # real, existing cross_reference_result() mechanism reads a Researcher-written
+            # "semantic_mapping" key from it -- removing the tool entirely would break that),
+            # but is now named for what it is: a small side-channel, not where the deliverable
+            # goes.
+            "Your final response text is the actual deliverable — write your summary there, "
+            "once, when research is sufficient. update_session_state is only for a small, "
+            "genuinely reusable fact other steps might need (a renamed table, a confirmed "
+            "decision) — never a place to draft, restate, or progressively refine your own "
+            "summary; calling it repeatedly does not advance your task.",
         ],
         role="Senior engineer who investigates the codebase and surfaces relevant context.",
         **_COMMON_AGENT_KWARGS,
