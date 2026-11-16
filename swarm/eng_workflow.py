@@ -452,7 +452,8 @@ def select_capable_member(team, required_capabilities, member_key_fn, preference
 
 
 async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, attempt_no: int, task_override: str = None,
-                      extra_activity: dict = None, role: str = "researcher", propose: bool = False):
+                      extra_activity: dict = None, role: str = "researcher", propose: bool = False,
+                      parent_attempt_id: Optional[str] = None):
     """Create a NEW attempt (new id + generation via the registry), run the real agent for `role` under it,
     observe the Agent's own terminal facts, and return the AttemptRecord. Never raises.
 
@@ -494,7 +495,12 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
     (team_config.get_extra_skills) as the capability/skill registries -- never a hardcoded or invented
     one, and never treating an unreachable registry as authorization (see propose_from_text()'s own
     docstring). Writes rec.proposal/rec.proposal_validation; never raises into the caller, never
-    dispatches Coder/Reviewer/Executor, never changes att.text/att.terminal/rec.decision above."""
+    dispatches Coder/Reviewer/Executor, never changes att.text/att.terminal/rec.decision above.
+
+    `parent_attempt_id` (Phase 1.55): forwarded to the Ledger's start_attempt() so a recovery
+    attempt's own `attempt` row durably records which attempt it is recovering. Defaults to
+    None for every original/retry attempt (the only kind that has no parent) -- only
+    recover_and_reconcile() passes a real value, its own orig_rec.attempt.attempt_id."""
     import functools
     import inspect
     import swarm.team as T
@@ -505,7 +511,8 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
     lstart, lerr = None, None
     if led is not None:
         try:     # persisted BEFORE the Agent can run, so no accepted output can exist without a durable attempt
-            lstart = await led._a(led.start_attempt, st.task_id, wi.work_item_id, st.workflow_run_id, MAX_ATTEMPTS_PER_ITEM)
+            lstart = await led._a(led.start_attempt, st.task_id, wi.work_item_id, st.workflow_run_id, MAX_ATTEMPTS_PER_ITEM,
+                                 role=role, parent_attempt_id=parent_attempt_id)
         except RetryBudgetExhausted as e:
             lerr = f"RETRY_EXHAUSTED: {e}"
         except Exception as e:  # noqa: BLE001
@@ -879,6 +886,18 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
                 known_capabilities=known_caps, authorized_skills_by_role=authorized_skills)
             rec.proposal = proposal_obj
             rec.proposal_validation = validation
+            # Phase 1.55: durable persistence, in its OWN try/except -- same pattern as
+            # record_terminal's ledger write above (a ledger failure here is recorded on
+            # rec.ledger_error, never treated as this attempt's own failure, and never
+            # retried or silently re-synthesized). record_proposal() itself is the single
+            # enforcement point for "an invalid proposal never becomes executable work":
+            # it writes zero proposal_work_item rows whenever validation.valid is False.
+            if led is not None:
+                try:
+                    await led._a(led.record_proposal, att.attempt_id, st.task_id, wi.work_item_id,
+                                proposal_obj, validation)
+                except Exception as e:  # noqa: BLE001
+                    rec.ledger_error = rec.ledger_error or f"LEDGER_ERROR: proposal not durable: {repr(e)[:160]}"
             st.emit("proposal_generated", work_item=wi.work_item_id, attempt=att.attempt_id,
                     role=role, valid=validation.valid, errors=len(validation.errors),
                     items=len(proposal_obj.work_items) if proposal_obj else 0)
@@ -1126,7 +1145,12 @@ async def recover_and_reconcile(st: RunState, wi: WorkItem, ctx: dict, controls:
     "researcher" (every existing caller, since s_execute() passes its own `role` explicitly).
 
     `propose` (Phase 1.54a): forwarded unchanged to the recovery run_attempt() call below.
-    Defaults to False, same as run_attempt()'s own default."""
+    Defaults to False, same as run_attempt()'s own default.
+
+    Phase 1.55: the recovery run_attempt() call below always passes
+    parent_attempt_id=orig_rec.attempt.attempt_id -- a recovery attempt's own Ledger row
+    durably records which attempt it is recovering, not just via decision.extra_json's
+    `recovery_info` (unchanged, still written by assess_and_register() as before)."""
     task_override = build_recovery_task(wi, orig_rec.attempt, orig_d)
     # Phase 1.30: the same deterministic derivation build_recovery_task() just used to
     # build the recovery prompt's own "Read: <paths>" lines -- reused here, not
@@ -1137,7 +1161,7 @@ async def recover_and_reconcile(st: RunState, wi: WorkItem, ctx: dict, controls:
     rec2 = await run_attempt(st, wi, ctx, controls, attempt_no, task_override=task_override,
                              extra_activity={"missing_source_paths": _missing_paths,
                                              "missing_obligation_ids": _missing_ids}, role=role,
-                             propose=propose)
+                             propose=propose, parent_attempt_id=orig_rec.attempt.attempt_id)
     # rec2.attempt.state is "FINISHED" even on a ledger-start failure or setup error (see
     # run_attempt()'s own early-exit paths) -- rec2.error/rec2.ledger_error are what actually
     # distinguish a genuine run from one that never got to call the Researcher at all.

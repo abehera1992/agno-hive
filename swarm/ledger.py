@@ -26,8 +26,12 @@ import time
 from pathlib import Path
 from typing import Optional
 
-SCHEMA_VERSION = 2   # Phase 1.22: + attempt.trace_sha (full diagnostic trace, kept separate
-                     # from the canonical attempt.text_sha -- see init_schema()'s migration)
+SCHEMA_VERSION = 3   # Phase 1.22: + attempt.trace_sha (see init_schema()'s migration).
+                     # Phase 1.55: + attempt.role/stage_name/stage_index/parent_attempt_id
+                     # (nullable, forward-compatible lineage columns -- see init_schema()'s
+                     # migration and start_attempt()'s own docstring for what populates them
+                     # today vs. what remains unset pending real multi-stage orchestration)
+                     # and the new proposal/proposal_work_item tables (see record_proposal()).
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / "data" / "workflow_ledger.db"
 
 # attempt states. Terminal ones never change again except RUNNING/FINISHED -> invalidated.
@@ -70,6 +74,15 @@ CREATE TABLE IF NOT EXISTS attempt (
   workflow_run_id TEXT NOT NULL, agent_run_id TEXT, state TEXT NOT NULL,
   owner_instance TEXT NOT NULL, owner_pid INTEGER, started_at REAL NOT NULL, ended_at REAL,
   invalidated_reason TEXT, terminal_json TEXT, text_sha TEXT, trace_sha TEXT,
+  -- Phase 1.55, all nullable/additive: `role` is the T._member_key name run_attempt() actually
+  -- selected (populated by start_attempt() for every attempt from Phase 1.55 onward, NULL for
+  -- every attempt recorded before this phase -- honest, not backfilled). `stage_name`/
+  -- `stage_index` exist for a FUTURE multi-stage sequencer this phase does not implement --
+  -- left NULL by every current caller, see start_attempt()'s own docstring. `parent_attempt_id`
+  -- is populated ONLY for a recovery attempt (recover_and_reconcile()'s own inner run_attempt()
+  -- call) -- the first-class lineage pointer for a relationship this codebase already tracked,
+  -- less directly, inside decision.extra_json's `recovery_info` since Phase 1.25.
+  role TEXT, stage_name TEXT, stage_index INTEGER, parent_attempt_id TEXT REFERENCES attempt(attempt_id),
   FOREIGN KEY (task_id, work_item_id) REFERENCES work_item(task_id, work_item_id),
   UNIQUE (task_id, work_item_id, generation));
 CREATE TABLE IF NOT EXISTS tool_call (
@@ -88,8 +101,43 @@ CREATE TABLE IF NOT EXISTS decision (
 CREATE TABLE IF NOT EXISTS registration (
   attempt_id TEXT PRIMARY KEY REFERENCES attempt(attempt_id), task_id TEXT NOT NULL, work_item_id TEXT NOT NULL,
   generation INTEGER NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, registered_at REAL NOT NULL);
+-- Phase 1.55: the Researcher's structured WorkProposal (swarm.proposal.WorkProposal) and its
+-- deterministic validate_proposal() outcome, for the attempt that produced it. `work_item_id`
+-- here is the APPLICATION'S OWN dispatch work item (the real `work_item` table's own row the
+-- acting attempt was running for) -- never to be confused with `proposal_work_item`'s own
+-- `proposed_work_item_id`, which is the Researcher's PROPOSED sub-item identifier, a nested,
+-- separate concept with no row in `work_item` at all. `version` is a forward-compatible field
+-- (always 1 today -- no proposal-revision mechanism exists yet).
+CREATE TABLE IF NOT EXISTS proposal (
+  proposal_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL UNIQUE REFERENCES attempt(attempt_id),
+  task_id TEXT NOT NULL, work_item_id TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+  objective TEXT NOT NULL, valid INTEGER NOT NULL, errors_json TEXT NOT NULL,
+  unauthorized_skills_json TEXT NOT NULL, unverified_capabilities_json TEXT NOT NULL,
+  created_at REAL NOT NULL);
+-- One row per proposed sub-item of a proposal. Written ONLY when that proposal's own `valid`
+-- is 1 -- record_proposal()'s own enforcement of "an invalid proposal never becomes executable
+-- work": an invalid proposal's `proposal` row still records what was proposed and why it was
+-- rejected (objective/errors_json), but produces ZERO rows here, so there is nothing
+-- work-item-shaped for any future orchestration code to read and dispatch.
+CREATE TABLE IF NOT EXISTS proposal_work_item (
+  proposal_id TEXT NOT NULL REFERENCES proposal(proposal_id), proposed_work_item_id TEXT NOT NULL,
+  objective TEXT NOT NULL, role TEXT NOT NULL, depends_on_json TEXT NOT NULL,
+  required_capabilities_json TEXT NOT NULL, proposed_skills_json TEXT NOT NULL,
+  acceptance_criteria TEXT, expected_evidence TEXT,
+  PRIMARY KEY (proposal_id, proposed_work_item_id));
+"""
+
+# Phase 1.55: split out from _DDL above and run SEPARATELY, AFTER the version-gated ALTER
+# TABLE migration below. ix_attempt_parent references attempt.parent_attempt_id, a column
+# that does not exist yet on a pre-1.55 database until that migration's ALTER runs --
+# CREATE INDEX IF NOT EXISTS still raises "no such column" against a table that is missing
+# the column, so index creation on a possibly-new column can never be unconditional the way
+# _DDL's CREATE TABLE statements are (those only ever create what's entirely absent).
+_DDL_INDEXES = """
 CREATE INDEX IF NOT EXISTS ix_attempt_state ON attempt(state, owner_instance);
 CREATE INDEX IF NOT EXISTS ix_attempt_item ON attempt(task_id, work_item_id);
+CREATE INDEX IF NOT EXISTS ix_attempt_parent ON attempt(parent_attempt_id);
+CREATE INDEX IF NOT EXISTS ix_proposal_task_item ON proposal(task_id, work_item_id);
 """
 
 
@@ -157,30 +205,59 @@ class Ledger:
     # ------------------------------------------------------------------ schema
     def init_schema(self) -> None:
         def go(c):
+            # 1) Tables only (CREATE TABLE IF NOT EXISTS, every time, any version, fresh or
+            # existing) -- a brand-new table (proposal/proposal_work_item, Phase 1.55) needs no
+            # version-gated migration at all. Indexes are deliberately NOT included here and run
+            # LAST (step 3 below): ix_attempt_parent references attempt.parent_attempt_id, a
+            # column that may not exist yet on a pre-1.55 database until step 2's ALTER runs --
+            # unlike CREATE TABLE IF NOT EXISTS, CREATE INDEX IF NOT EXISTS still fails with "no
+            # such column" if the table exists but the column doesn't, so index creation can
+            # never safely precede a column migration the way table creation can.
             for stmt in [s for s in _DDL.split(";") if s.strip()]:
                 c.execute(stmt)
+
+            # 2) Version-gated column migration for the EXISTING attempt table (SQLite's CREATE
+            # TABLE IF NOT EXISTS above cannot retroactively add a column to it).
             row = c.execute("SELECT v FROM ledger_meta WHERE k='schema_version'").fetchone()
             if row is None:
-                # Fresh database: _DDL above already declares trace_sha, nothing to migrate.
+                # Fresh database: _DDL above already declares every current column (trace_sha,
+                # role/stage_name/stage_index/parent_attempt_id), nothing to migrate.
                 c.execute("INSERT INTO ledger_meta(k,v) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
-                return
-            current = int(row["v"])
-            if current == SCHEMA_VERSION:
-                return
-            if current == 1 and SCHEMA_VERSION == 2:
-                # Phase 1.22, additive only: separate the full diagnostic trace from the
-                # canonical attempt result. No existing row is altered or removed;
-                # trace_sha is NULL for every attempt recorded before this migration
-                # (a full trace was never captured for them -- this is honest, not a
-                # backfill). `CREATE TABLE IF NOT EXISTS` above cannot add a column to
-                # an existing table, so this is an explicit, idempotent ALTER.
-                cols = {r["name"] for r in c.execute("PRAGMA table_info(attempt)").fetchall()}
-                if "trace_sha" not in cols:
-                    c.execute("ALTER TABLE attempt ADD COLUMN trace_sha TEXT")
-                c.execute("UPDATE ledger_meta SET v=? WHERE k='schema_version'", (str(SCHEMA_VERSION),))
-                return
-            raise LedgerError(f"ledger schema version {current} != expected {SCHEMA_VERSION} "
-                              f"(no migration path from {current}); refusing to use it")
+            else:
+                current = int(row["v"])
+                if current != SCHEMA_VERSION:
+                    if current not in (1, 2):
+                        raise LedgerError(f"ledger schema version {current} != expected {SCHEMA_VERSION} "
+                                          f"(no migration path from {current}); refusing to use it")
+                    # Sequential, not a single pairwise check: a database still at version 1 must
+                    # step through BOTH migrations below to reach SCHEMA_VERSION, not just the
+                    # latest one.
+                    if current == 1:
+                        # Phase 1.22, additive only: separate the full diagnostic trace from the
+                        # canonical attempt result. No existing row is altered or removed;
+                        # trace_sha is NULL for every attempt recorded before this migration (a
+                        # full trace was never captured for them -- this is honest, not a backfill).
+                        cols = {r["name"] for r in c.execute("PRAGMA table_info(attempt)").fetchall()}
+                        if "trace_sha" not in cols:
+                            c.execute("ALTER TABLE attempt ADD COLUMN trace_sha TEXT")
+                        current = 2
+                    if current == 2:
+                        # Phase 1.55, additive only: role/stage/parent-attempt lineage columns.
+                        # NULL for every attempt recorded before this migration -- not
+                        # backfilled, since none of this information was ever captured for them.
+                        cols = {r["name"] for r in c.execute("PRAGMA table_info(attempt)").fetchall()}
+                        for col, decl in (("role", "TEXT"), ("stage_name", "TEXT"), ("stage_index", "INTEGER"),
+                                          ("parent_attempt_id", "TEXT")):
+                            if col not in cols:
+                                c.execute(f"ALTER TABLE attempt ADD COLUMN {col} {decl}")
+                        current = 3
+                    c.execute("UPDATE ledger_meta SET v=? WHERE k='schema_version'", (str(SCHEMA_VERSION),))
+
+            # 3) Indexes -- every column any index references is now guaranteed to exist,
+            # whether this was a fresh database (step 1's CREATE TABLE already declared it) or an
+            # existing one that step 2 just migrated.
+            for stmt in [s for s in _DDL_INDEXES.split(";") if s.strip()]:
+                c.execute(stmt)
         self._tx(go)
         self._ready = True
 
@@ -201,9 +278,19 @@ class Ledger:
                           (task_id, i["work_item_id"], i.get("title"), _j(i["spec"])))
         self._tx(go)
 
-    def start_attempt(self, task_id, work_item_id, workflow_run_id, max_attempts: int, owner_pid: Optional[int] = None) -> dict:
+    def start_attempt(self, task_id, work_item_id, workflow_run_id, max_attempts: int, owner_pid: Optional[int] = None,
+                      role: Optional[str] = None, stage_name: Optional[str] = None, stage_index: Optional[int] = None,
+                      parent_attempt_id: Optional[str] = None) -> dict:
         """Allocates the next generation and persists the attempt as RUNNING, superseding older live attempts of the SAME
-        work item only, in one transaction. Enforces the retry budget across restarts."""
+        work item only, in one transaction. Enforces the retry budget across restarts.
+
+        `role`/`stage_name`/`stage_index`/`parent_attempt_id` (Phase 1.55, all optional, all default None --
+        every pre-1.55 caller is unaffected): `role` is run_attempt()'s own T._member_key name for whichever
+        member actually acts this attempt -- the SAME value already threaded since Phase 1.52, now also
+        persisted rather than only held in-memory. `stage_name`/`stage_index` exist for a future multi-stage
+        sequencer this phase does not implement; no current caller sets them. `parent_attempt_id` is the
+        ORIGINAL attempt's id when this attempt is a recovery pass (recover_and_reconcile()'s own inner call)
+        -- None for every original/retry attempt, which have no parent."""
         def go(c):
             self._maybe_fail("start")
             w = c.execute("SELECT current_generation, attempts_started FROM work_item WHERE task_id=? AND work_item_id=?",
@@ -217,9 +304,11 @@ class Ledger:
             c.execute("UPDATE attempt SET state=?, invalidated_reason=?, ended_at=COALESCE(ended_at,?) "
                       "WHERE task_id=? AND work_item_id=? AND state IN (?,?)",
                       (SUPERSEDED, f"superseded by generation {gen}", time.time(), task_id, work_item_id, RUNNING, FINISHED))
-            c.execute("INSERT INTO attempt(attempt_id,task_id,work_item_id,generation,workflow_run_id,state,owner_instance,owner_pid,started_at)"
-                      " VALUES(?,?,?,?,?,?,?,?,?)",
-                      (aid, task_id, work_item_id, gen, workflow_run_id, RUNNING, self.instance_id, owner_pid or os.getpid(), time.time()))
+            c.execute("INSERT INTO attempt(attempt_id,task_id,work_item_id,generation,workflow_run_id,state,owner_instance,"
+                      "owner_pid,started_at,role,stage_name,stage_index,parent_attempt_id)"
+                      " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (aid, task_id, work_item_id, gen, workflow_run_id, RUNNING, self.instance_id, owner_pid or os.getpid(), time.time(),
+                       role, stage_name, stage_index, parent_attempt_id))
             c.execute("UPDATE work_item SET current_generation=?, attempts_started=attempts_started+1 WHERE task_id=? AND work_item_id=?",
                       (gen, task_id, work_item_id))
             return {"attempt_id": aid, "generation": gen, "attempts_started": w["attempts_started"] + 1}
@@ -362,6 +451,69 @@ class Ledger:
                     "kind": kind, "acceptance": acceptance, "generation": a["generation"], "reason_text": reason_text, "override": override}
         return self._tx(go)
 
+    # ------------------------------------------------------------------ structured proposals (Phase 1.55)
+    def record_proposal(self, attempt_id: str, task_id: str, work_item_id: str, proposal, validation) -> dict:
+        """Persist the attempt's structured WorkProposal (swarm.proposal.WorkProposal, or None if
+        generation itself failed) and its deterministic ValidationResult. Idempotent per attempt_id,
+        same pattern as commit_decision(): a second call for the same attempt_id is a no-op, never a
+        duplicate row. `work_item_id` here is the application's OWN dispatch work item (this attempt's
+        real work_item row) -- never the proposal's internally-proposed sub-item ids.
+
+        ENFORCES "an invalid proposal never becomes executable work": proposal_work_item rows are
+        written ONLY when validation.valid is True. An invalid (or altogether missing, proposal=None)
+        proposal still gets its own `proposal` row -- objective/errors/disclosures, for audit -- but
+        zero proposal_work_item rows, so nothing work-item-shaped exists for any future orchestration
+        code to read and dispatch from a rejected proposal."""
+        def go(c):
+            self._maybe_fail("proposal")
+            prior = c.execute("SELECT proposal_id FROM proposal WHERE attempt_id=?", (attempt_id,)).fetchone()
+            if prior is not None:
+                return {"recorded": False, "reason": "IDEMPOTENT_DUPLICATE", "proposal_id": prior["proposal_id"]}
+            a = c.execute("SELECT attempt_id FROM attempt WHERE attempt_id=?", (attempt_id,)).fetchone()
+            if a is None:
+                raise LedgerError(f"unknown attempt {attempt_id}")
+            proposal_id = f"prop-{attempt_id}"
+            objective = (getattr(proposal, "objective", None) or "") if proposal is not None else ""
+            c.execute("INSERT INTO proposal(proposal_id,attempt_id,task_id,work_item_id,version,objective,valid,"
+                      "errors_json,unauthorized_skills_json,unverified_capabilities_json,created_at) "
+                      "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                      (proposal_id, attempt_id, task_id, work_item_id, 1, objective, int(bool(validation.valid)),
+                       _j(validation.errors), _j(validation.unauthorized_skills), _j(validation.unverified_capabilities),
+                       time.time()))
+            n = 0
+            if validation.valid and proposal is not None:
+                for wi in proposal.work_items:
+                    c.execute("INSERT INTO proposal_work_item(proposal_id,proposed_work_item_id,objective,role,"
+                              "depends_on_json,required_capabilities_json,proposed_skills_json,acceptance_criteria,"
+                              "expected_evidence) VALUES(?,?,?,?,?,?,?,?,?)",
+                              (proposal_id, wi.work_item_id, wi.objective, wi.role, _j(wi.depends_on),
+                               _j(wi.required_capabilities), _j(wi.proposed_skills), wi.acceptance_criteria,
+                               wi.expected_evidence))
+                    n += 1
+            return {"recorded": True, "proposal_id": proposal_id, "valid": bool(validation.valid), "work_items_persisted": n}
+        return self._tx(go)
+
+    def get_proposal(self, attempt_id: str) -> Optional[dict]:
+        """Read-side counterpart to record_proposal(). None if no proposal was ever recorded for
+        this attempt_id (propose=False, or the attempt never reached the proposal step)."""
+        c = self._conn()
+        try:
+            p = c.execute("SELECT * FROM proposal WHERE attempt_id=?", (attempt_id,)).fetchone()
+            if p is None:
+                return None
+            items = [dict(r) for r in c.execute(
+                "SELECT * FROM proposal_work_item WHERE proposal_id=? ORDER BY proposed_work_item_id",
+                (p["proposal_id"],)).fetchall()]
+            d = dict(p)
+            d["valid"] = bool(d["valid"])
+            d["errors"] = json.loads(d.pop("errors_json"))
+            d["unauthorized_skills"] = json.loads(d.pop("unauthorized_skills_json"))
+            d["unverified_capabilities"] = json.loads(d.pop("unverified_capabilities_json"))
+            d["work_items"] = items
+            return d
+        finally:
+            c.close()
+
     # ------------------------------------------------------------------ finalization (idempotent)
     def finalize_task(self, task_id, final_text: str, audit: dict) -> dict:
         def go(c):
@@ -426,6 +578,10 @@ class Ledger:
                     atts.append({"attempt_id": a["attempt_id"], "generation": a["generation"], "state": a["state"],
                                  "workflow_run_id": a["workflow_run_id"], "agent_run_id": a["agent_run_id"],
                                  "owner_instance": a["owner_instance"], "invalidated_reason": a["invalidated_reason"],
+                                 # Phase 1.55: NULL/None for every attempt recorded before this phase, same
+                                 # honest-not-backfilled convention as trace_sha (Phase 1.22) above.
+                                 "role": a["role"], "stage_name": a["stage_name"], "stage_index": a["stage_index"],
+                                 "parent_attempt_id": a["parent_attempt_id"],
                                  "agent_terminal": json.loads(a["terminal_json"]) if a["terminal_json"] else None,
                                  "tool_calls": {r["outcome"]: r["n"] for r in calls},
                                  "decision": ({k: d[k] for k in ("acceptance", "execution_status", "validity", "assessor_status", "assessor_reason", "not_accepted_cause", "reason")} |
