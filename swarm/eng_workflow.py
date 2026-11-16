@@ -773,10 +773,20 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
             # (every work item in this battery except T13a/T13b), so this costs nothing for the
             # rest of the suite. att.text, not att.trace_text -- the same final, user-facing
             # text the rest of this attempt's own reporting is built from.
+            #
+            # ALWAYS wi.objective, never task_override -- confirmed live (Phase 1.49's own
+            # T13b battery re-run): build_recovery_task() embeds the ORIGINAL attempt's own
+            # text verbatim as "ESTABLISHED FINDINGS" inside the recovery task_override, and
+            # that prior text can innocuously contain generic English like "...especially
+            # those related to vouchers", which spuriously matches
+            # _REQUESTS_WORKFLOW_RELATED_RE's "related to" and makes the guard wrongly treat
+            # a recovery-generation attempt as having explicitly asked for a broader
+            # relationship scope -- even though the user's REAL, original question (wi.objective,
+            # which never changes across generations) did not. wi.objective is immune to this:
+            # it is the stable, original question for every generation of this work item.
             try:
                 att.terminal["table_scope_note"] = await T._module_table_ownership_scope(
-                    task_override if task_override is not None else wi.objective, att.text,
-                    ctx.get("hive_url"), None)
+                    wi.objective, att.text, ctx.get("hive_url"), None)
             except Exception as exc:  # noqa: BLE001 -- a guard failure must never block finalization
                 print(f"[team] table-scope check (workflow path): {exc!r} -- silent, "
                       f"no note added", flush=True)
