@@ -142,6 +142,17 @@ class RunResponse(BaseModel):
     # Phase 1.19: the engine that ACTUALLY ran this request and why it was selected.
     engine: str | None = None
     engine_reason: str | None = None
+    # Phase 1.46: the resolved MCP configuration for this run -- which secondary
+    # integrations were included (default-resolved vs caller-specified) and whether
+    # each one answered a reachability probe BEFORE the worker was dispatched. Present
+    # on every /run response so a run that completed with a degraded toolset (e.g. the
+    # system MCP down, so search_files/get_file_content were never available) is
+    # identifiable from the response itself rather than only from server logs -- the
+    # exact gap a live T11 validation hit 2026-11-16 (omitted mcp_urls silently ran
+    # with only the project MCP's summary tools, discovered only by reading journalctl
+    # after the fact). None of these fields change what the run DID; they only report
+    # what it had available to do it with.
+    mcp_resolution: dict | None = None
 
 
 class PlanResponse(BaseModel):

@@ -42,12 +42,68 @@ from swarm.sessions import (
 setup_telemetry()
 
 
-def _resolve_mcp_urls(request_urls, lightrag_url: str) -> list[str]:
-    """Always include LightRAG MCP so agents get lightrag_query without explicit opt-in."""
-    urls = list(request_urls or [])
+def _resolve_mcp_urls(request_urls, lightrag_url: str, system_mcp_url: str = "") -> list[str] | None:
+    """Resolve the SECONDARY mcp_urls list (the PRIMARY, project-specific `mcp_url` is
+    resolved separately by each caller: `request.mcp_url or config.mcp_url`).
+
+    `request_urls is None` -- the field omitted entirely -- means the caller expressed
+    no preference, so every configured default secondary integration is included:
+    the generic system MCP (hive-mcp; real file I/O -- search_files, get_file_content,
+    list_directory_tree, ...) when `system_mcp_url` is configured, plus LightRAG
+    (unconditional, pre-existing behavior, unchanged).
+
+    `request_urls == []` -- an explicit empty list -- is a DELIBERATE override: the
+    caller named the secondary-MCP field and chose to name nothing in it. That choice
+    is honored as-is; it does NOT receive the system-MCP default (only the pre-existing
+    unconditional LightRAG inclusion, same as before this fix). A non-empty explicit
+    list is likewise used exactly as given (plus LightRAG), unchanged from prior
+    behavior -- this function never second-guesses an explicit list.
+
+    Before Phase 1.46, `list(request_urls or [])` collapsed None and [] into the same
+    case, so there was no way to express "give me the defaults" at all short of the
+    caller hand-naming hive-mcp's URL in every request -- confirmed live 2026-11-16: a
+    T11 run omitting `mcp_urls` silently ran with only the project MCP's summary tools,
+    no real file read tool, and was correctly rejected for citing no source file.
+    """
+    if request_urls is None:
+        urls = [system_mcp_url] if system_mcp_url else []
+    else:
+        urls = list(request_urls)
     if lightrag_url and lightrag_url not in urls:
         urls.append(lightrag_url)
     return urls or None
+
+
+async def _preflight_mcp_report(mcp_url: str | None, resolved_secondary: list[str] | None,
+                                 *, defaulted: bool) -> dict:
+    """Reachability + provenance report for THIS run's resolved MCP configuration,
+    probed BEFORE the worker subprocess is dispatched (Phase 1.46). Reuses
+    swarm.team's own cheap TCP probe (`_mcp_reachable`) -- no new connection logic,
+    no MCP handshake, same ~3s-per-url cost `_build_team` already pays per server.
+
+    This never turns a PARTIAL degradation (e.g. the system MCP down, project MCP
+    up) into a failure -- that preserves the existing graceful-degradation behavior
+    _build_team already has for an unreachable server, and in particular does not
+    make LightRAG's reachability newly load-bearing for every run. It exists only to
+    make that degradation VISIBLE before dispatch (returned to the caller, not just
+    logged) instead of discoverable only by reading server logs after the fact --
+    exactly how Phase 1.46 was triggered in the first place.
+    """
+    from swarm.team import _mcp_reachable
+    secondary = resolved_secondary or []
+    urls = ([mcp_url] if mcp_url else []) + [u for u in secondary if u not in ([mcp_url] if mcp_url else [])]
+    reachable = await asyncio.gather(*[_mcp_reachable(u) for u in urls]) if urls else []
+    by_url = dict(zip(urls, reachable))
+    return {
+        "primary": ({"url": mcp_url, "reachable": by_url.get(mcp_url, False)} if mcp_url else None),
+        "secondary": [
+            {"url": u, "source": "default" if defaulted else "explicit", "reachable": by_url.get(u, False)}
+            for u in secondary
+        ],
+        "secondary_defaulted": defaulted,
+        "any_reachable": any(by_url.values()) if by_url else False,
+    }
+
 
 app = FastAPI(title="AgnoHive", version="1.0.0")
 
@@ -1514,7 +1570,20 @@ async def _run_impl(request: RunRequest, http_request: Request):
     # history — report 0 injected context rather than the (unenforced) message count.
     context_size = 0 if is_chain_handoff else len(prior_messages)
 
-    resolved_mcp_urls = _resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url)
+    resolved_mcp_urls = _resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url, config.system_mcp_url)
+
+    # Phase 1.46: report (and, only when EVERY configured MCP is unreachable, fail
+    # before paying worker-spawn overhead for) this run's resolved MCP configuration.
+    # Mirrors _build_team's own pre-existing "no MCP server available" failure --
+    # just surfaced earlier and returned to the caller instead of discovered only
+    # after a full worker spawn/teardown, or only by reading server logs.
+    mcp_report = await _preflight_mcp_report(mcp_url, resolved_mcp_urls, defaulted=request.mcp_urls is None)
+    if not mcp_report["any_reachable"]:
+        raise HTTPException(status_code=503, detail={
+            "error": "mcp_unavailable",
+            "message": "No configured MCP server answered a reachability probe before dispatch.",
+            "mcp_resolution": mcp_report,
+        })
 
     # Process-boundary cancellation (see DOCS.md "Process-Boundary Cancellation") --
     # runs in an isolated child process, SIGKILLed outright on disconnect. Replaced
@@ -1585,6 +1654,7 @@ async def _run_impl(request: RunRequest, http_request: Request):
         total_tokens=tokens.get("total_tokens", 0),
         needs_clarification=ClarificationRequest(**clarification) if clarification else None,
         engine=engine, engine_reason=engine_reason,
+        mcp_resolution=mcp_report,
     )
 
 
@@ -1776,7 +1846,7 @@ async def plan(request: RunRequest):
         coordinator_model=coordinator_model,
         coordinator_tools=coordinator_tools,
         mcp_url=mcp_url,
-        mcp_urls=_resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url),
+        mcp_urls=_resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url, config.system_mcp_url),
         project_id=request.project_id,
         # Explicit, not the team_name=None default -- /plan always runs the
         # "planning" team, which the 2026-08-15 gate-scope extension explicitly
@@ -1867,7 +1937,7 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
     is_chain_handoff = session_summary.startswith("── Chain handoff")
     context_size = 0 if is_chain_handoff else len(prior_messages)
 
-    resolved_mcp_urls = _resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url)
+    resolved_mcp_urls = _resolve_mcp_urls(request.mcp_urls, config.lightrag_mcp_url, config.system_mcp_url)
 
     if ADMISSION.would_reject():   # Phase 1.18D: answer 429 before the SSE response starts
         ADMISSION.rejected += 1

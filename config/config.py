@@ -24,6 +24,27 @@ class Config:
     # MCP context server — point at any project's MCP server
     mcp_url: str = os.getenv("MCP_URL", "")
 
+    # Phase 1.46: the generic, project-agnostic MCP server (hive-mcp) that provides
+    # real file I/O (search_files, get_file_content, list_directory_tree, find_files,
+    # write_file, apply_diff, ...) -- distinct from mcp_url above, which is the
+    # project-SPECIFIC server (e.g. EkamApp MCP: get_context_section, list_recent_files).
+    # Before this field existed, the HTTP API (api/server.py's /run) had NO canonical
+    # source for this integration at all: AGNO_SYSTEM_MCP_URL was already set correctly
+    # in every deployment's .env, but was read only by one standalone script
+    # (training/fetch_patterns.py) and the `hive` CLI's own separate env-var pinning --
+    # never by the server that actually serves /run. A caller who omitted the
+    # secondary `mcp_urls` request field (the documented, expected way to opt in to
+    # this integration) got a request that ran and returned 200, with every real-file
+    # tool silently absent and only the project MCP's summary tools available --
+    # confirmed live 2026-11-16 (Phase 1.45 T11 validation: `search_files`/
+    # `list_directory_tree` came back "Function ... not found", and the Researcher's
+    # investigation was rejected for reading no real source file).
+    #
+    # Reads HIVE_SYSTEM_MCP_URL first (new, more descriptive name) and falls back to
+    # the pre-existing AGNO_SYSTEM_MCP_URL so a deployment that already set that
+    # variable (every one seen so far) needs no .env change to pick this up.
+    system_mcp_url: str = os.getenv("HIVE_SYSTEM_MCP_URL", os.getenv("AGNO_SYSTEM_MCP_URL", ""))
+
     # Pattern discovery glob — relative to the connected project root
     patterns_glob: str = os.getenv("PATTERNS_GLOB", "patterns/**/*.md")
 
