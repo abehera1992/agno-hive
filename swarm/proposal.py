@@ -40,6 +40,7 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from config.config import config
 from swarm.eng_workflow import _DEFAULT_MEMBER_PREFERENCE
 from swarm.team import _is_mutating
 
@@ -267,11 +268,26 @@ async def propose_from_text(
     reported as explicitly invalid, never silently treated as "nothing to validate" and never
     promoted to something executable. `known_capabilities`/`authorized_skills_by_role` are
     forwarded unchanged to validate_proposal() -- see that function's own docstring for why
-    missing registry data is disclosed, never treated as authorization."""
+    missing registry data is disclosed, never treated as authorization.
+
+    Phase 1.56b: this call needs its OWN, longer HTTP timeout (config.proposal_request_timeout_s,
+    see that field's own docstring for the root cause) -- `model` is reused as a shallow copy
+    with `timeout` overridden, never mutated in place, so the caller's own already-in-use model
+    object (and any client it has already cached) is completely unaffected. `async_client`/
+    `http_client` are explicitly reset to None on the copy so a fresh client is built with the
+    new timeout on first use here, instead of reusing a client the original object may already
+    have cached (and baked the OLD 120s timeout into) from the investigation call that produced
+    `investigation_text`."""
     from agno.agent import Agent
+    import copy as _copy
+
+    planner_model = _copy.copy(model)
+    planner_model.async_client = None
+    planner_model.http_client = None
+    planner_model.timeout = config.proposal_request_timeout_s
 
     try:
-        planner = Agent(model=model, tools=[], output_schema=researcher_output_schema(),
+        planner = Agent(model=planner_model, tools=[], output_schema=researcher_output_schema(),
                         markdown=False)
         prompt = (
             "Based ONLY on the investigation findings below (already gathered -- do not "
