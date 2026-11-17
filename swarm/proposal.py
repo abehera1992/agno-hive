@@ -49,15 +49,33 @@ KNOWN_ROLES = frozenset(_DEFAULT_MEMBER_PREFERENCE)
 _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+_ID_FORMAT_DESC = (
+    "A valid identifier: letters, digits, and underscores only, must start with a letter "
+    "or underscore. No hyphens, spaces, or other punctuation. Example: EK_VOUCHER_FULL_UI "
+    "(not EK-VOUCHER-FULL-UI, not a bare number)."
+)
+
+
 class ProposedWorkItem(BaseModel):
     """One unit of proposed work. Field names deliberately mirror swarm.eng_workflow.WorkItem's
     own vocabulary (work_item_id/objective/required_capabilities) where the same concept
-    already exists there, rather than inventing a second naming convention for it."""
+    already exists there, rather than inventing a second naming convention for it.
 
-    work_item_id: str
+    Phase 1.56d: `work_item_id`'s Field description states the exact identifier format
+    validate_proposal()'s own `_NAME_RE` requires (unchanged, still strict -- this is a
+    schema-level hint for the model that GENERATES a proposal, not a relaxation of the
+    deterministic check that VALIDATES one). Verified that pydantic Field descriptions
+    survive into the JSON schema agno actually sends the model (model_json_schema()) --
+    this is a real generation-time hint, not decorative Python-only documentation."""
+
+    work_item_id: str = Field(description=_ID_FORMAT_DESC)
     objective: str
     role: str
-    depends_on: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description="Other work items' work_item_id values this one depends on. Must use "
+                    "the EXACT SAME identifier string as that other item's own work_item_id "
+                    f"field -- same format rule applies: {_ID_FORMAT_DESC}")
     required_capabilities: list[str] = Field(default_factory=list)
     proposed_skills: list[str] = Field(default_factory=list)
     acceptance_criteria: str = ""
@@ -297,6 +315,9 @@ async def propose_from_text(
             "required_capabilities, proposed_skills, acceptance_criteria and "
             "expected_evidence. If the findings do not call for any further work, return "
             "an empty work_items list rather than inventing one.\n\n"
+            f"Every work_item_id MUST be a valid identifier: {_ID_FORMAT_DESC} Use the exact "
+            "same work_item_id string when another item's depends_on references it -- "
+            "dependencies are matched by exact string equality, not by similarity.\n\n"
             f"Original task: {task}\n\n"
             f"Investigation findings:\n{investigation_text}"
         )
