@@ -2312,6 +2312,17 @@ def main() -> None:
         prog="hive",
         description="AGNOHive CLI — run the agent swarm from your terminal",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "REPL-only commands (type these inside the REPL -- not CLI flags above):\n"
+            "  /skill                    list platform skills + your own third-party skills\n"
+            "  /skill <name> [name...]   select skill(s) to attach to the NEXT task/prompt\n"
+            "  /skill info <name>        show one skill's metadata and description\n"
+            "  /skill import <path>      import a local skill package as a third-party skill\n"
+            "  /skill clear              clear pending skill selections\n"
+            "\n"
+            "  /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff\n"
+            "  /cleanup  /plan  /review  /mcp  /tree  /branch <id>  /exit"
+        ),
     )
     global AGNO_HOST, AGNO_TEAM, AGNO_MCP_URL, AGNO_SYSTEM_MCP_URL
 
