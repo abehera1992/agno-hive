@@ -1832,13 +1832,83 @@ def _skill_info(name: str) -> None:
     print(f"\n{dim(info['content_preview'])}\n")
 
 
+# Phase H.2: the mcp SDK's Streamable HTTP transport hard-caps a single
+# tools/call request body at 4 MiB (mcp.server.transport_security.
+# DEFAULT_MAX_REQUEST_BODY_SIZE) with no override hive-mcp's main.py can pass
+# through FastMCP at the pinned version -- a package whose full JSON-encoded
+# payload exceeds that is rejected with HTTP 413 BEFORE skill_registry_import()
+# ever runs server-side (see docs/runbooks/architecture-acceptance-runs/
+# Phase-H.2-report.md). _SINGLE_CALL_THRESHOLD stays well under the real
+# ceiling so a package just under 4 MiB still safely fits once wrapped in the
+# full JSON-RPC envelope; anything over it goes through the staged
+# begin/batch/finalize path instead, in ~2 MiB batches.
+_SINGLE_CALL_THRESHOLD = 3 * 1024 * 1024
+_BATCH_TARGET_BYTES = 2 * 1024 * 1024
+
+
+def _batch_supporting_files(files: dict, target_bytes: int) -> list[dict]:
+    """Greedily group {rel_path: {"encoding", "data"}} entries into batches
+    whose serialized size stays at or under target_bytes -- a single file
+    larger than target_bytes gets its own solo batch rather than being split
+    (this project's supporting files are never pre-chunked at the byte level;
+    see Phase-H.2-report.md's limitations)."""
+    batches: list[dict] = []
+    current: dict = {}
+    for rel_path, entry in files.items():
+        candidate = {**current, rel_path: entry}
+        if current and len(json.dumps(candidate).encode("utf-8")) > target_bytes:
+            batches.append(current)
+            current = {rel_path: entry}
+        else:
+            current = candidate
+    if current:
+        batches.append(current)
+    return batches
+
+
 def _skill_import(path_str: str) -> None:
     payload, err = _read_skill_package(path_str)
     if err:
         print(red(f"  import rejected: {err}"))
         return
+
+    supporting_files_json = json.dumps(payload["supporting_files"])
+    total_size = len(supporting_files_json.encode("utf-8"))
+
+    if total_size <= _SINGLE_CALL_THRESHOLD:
+        raw = _mcp_call_direct(
+            AGNO_SYSTEM_MCP_URL, "skill_registry_import",
+            {
+                "name": payload["name"],
+                "content": payload["content"],
+                "skill_type": payload["skill_type"],
+                "skill_id": payload["skill_id"],
+                "description": payload["description"],
+                "source": f"cli-import:{path_str}",
+                "supporting_files_json": supporting_files_json,
+            },
+            60,
+        )
+        if raw.startswith("Error:"):
+            print(red(f"  {raw}"))
+            return
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            print(red(f"  unexpected response: {raw[:200]}"))
+            return
+        print(green(f"  imported '{result['name']}' as {result['skill_id']} v{result['version']}"))
+        return
+
+    # Package too large for one request -- staged import.
+    batches = _batch_supporting_files(payload["supporting_files"], _BATCH_TARGET_BYTES)
+    print(dim(
+        f"  package is {total_size:,} bytes — staging upload in {len(batches)} "
+        f"batch(es) of ~{_BATCH_TARGET_BYTES // (1024*1024)} MiB"
+    ))
+
     raw = _mcp_call_direct(
-        AGNO_SYSTEM_MCP_URL, "skill_registry_import",
+        AGNO_SYSTEM_MCP_URL, "skill_registry_import_begin",
         {
             "name": payload["name"],
             "content": payload["content"],
@@ -1846,12 +1916,41 @@ def _skill_import(path_str: str) -> None:
             "skill_id": payload["skill_id"],
             "description": payload["description"],
             "source": f"cli-import:{path_str}",
-            "supporting_files_json": json.dumps(payload["supporting_files"]),
+            "expected_file_count": len(payload["supporting_files"]),
         },
         60,
     )
     if raw.startswith("Error:"):
         print(red(f"  {raw}"))
+        return
+    try:
+        begin_result = json.loads(raw)
+    except json.JSONDecodeError:
+        print(red(f"  unexpected response: {raw[:200]}"))
+        return
+    import_id = begin_result["import_id"]
+
+    for i, batch in enumerate(batches, 1):
+        for attempt in range(3):
+            raw = _mcp_call_direct(
+                AGNO_SYSTEM_MCP_URL, "skill_registry_import_batch",
+                {"import_id": import_id, "files_json": json.dumps(batch)},
+                60,
+            )
+            if not raw.startswith("Error:"):
+                break
+            if attempt == 2:
+                print(red(f"  batch {i}/{len(batches)} failed after 3 attempts: {raw}"))
+                print(dim(f"  aborting import {import_id} — nothing was published"))
+                _mcp_call_direct(AGNO_SYSTEM_MCP_URL, "skill_registry_import_abort", {"import_id": import_id}, 30)
+                return
+            print(dim(f"  batch {i}/{len(batches)} failed, retrying (idempotent): {raw}"))
+        print(dim(f"  batch {i}/{len(batches)} uploaded"))
+
+    raw = _mcp_call_direct(AGNO_SYSTEM_MCP_URL, "skill_registry_import_finalize", {"import_id": import_id}, 60)
+    if raw.startswith("Error:"):
+        print(red(f"  finalize failed: {raw}"))
+        print(dim(f"  import {import_id} is still staged — fix the issue and finalize again, or abort it"))
         return
     try:
         result = json.loads(raw)

@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))  # hive-mcp/ -- not direct
 
 import config
 import skills_registry as reg
+import skill_import_staging as staging
 from skills_identity import IdentityResolutionError, resolve_identity
 
 import structlog
@@ -251,3 +252,156 @@ def skill_registry_import(
         "tenant_id": identity.tenant_id,
         "user_id": identity.user_id,
     })
+
+
+# ── Staged import (Phase H.2) — fixes the /skill import HTTP 413 failure ────
+# skill_registry_import() above sends the ENTIRE package (content + every
+# supporting file, JSON-encoded) in ONE tools/call request. The mcp SDK's
+# Streamable HTTP transport hard-caps that at 4 MiB
+# (mcp.server.transport_security.DEFAULT_MAX_REQUEST_BODY_SIZE) with no
+# override FastMCP exposes at the pinned version — a package whose encoded
+# payload exceeds it is rejected by transport middleware with HTTP 413
+# BEFORE skill_registry_import() (or any application code) ever runs; see
+# docs/runbooks/architecture-acceptance-runs/Phase-H.2-report.md. These four
+# tools are the alternative path for anything that large: begin() + one or
+# more batch() calls + finalize(), each request comfortably under the
+# ceiling. Nothing staged this way is visible to skill_registry_list/info/
+# resolve (and therefore CLI /skill or Workflow skill forwarding) until
+# finalize() atomically publishes it through the SAME, unmodified
+# skills_registry.register_skill() skill_registry_import() already uses —
+# see skill_import_staging.py for the staging logic itself.
+
+def skill_registry_import_begin(
+    name: str,
+    content: str,
+    skill_type: str = "project",
+    skill_id: str = "",
+    description: str = "",
+    source: str = "",
+    expected_file_count: int = 0,
+) -> str:
+    """Start a staged third-party skill import. Returns a JSON object with
+    `import_id` (pass it to every skill_registry_import_batch/_finalize/
+    _abort call that follows), `skill_id`, and `expected_file_count` — or an
+    "Error: ..." string. Use this instead of skill_registry_import() whenever
+    the full package would not comfortably fit in one ~4 MiB request."""
+    db_path, err = _resolve_db_path()
+    if err:
+        return err
+    try:
+        identity = resolve_identity()
+    except IdentityResolutionError as e:
+        return f"Error: {e}"
+
+    if not identity.tenant_id or not identity.user_id:
+        return (
+            "Error: no active third-party identity is configured — set "
+            "HIVE_SKILLS_DEV_TENANT_ID and HIVE_SKILLS_DEV_USER_ID (development "
+            "mode) before importing a third-party skill."
+        )
+
+    resolved_skill_id = skill_id.strip() or reg.generate_skill_id(name)
+    try:
+        handle = staging.begin_import(
+            db_path,
+            skill_id=resolved_skill_id, name=name, skill_type=skill_type or "project",
+            category=reg.THIRD_PARTY, tenant_id=identity.tenant_id, user_id=identity.user_id,
+            content=content, source=source or "cli-import", description=description or None,
+            expected_file_count=expected_file_count,
+        )
+    except reg.OwnershipConflictError:
+        return (
+            f"Error: a skill with id '{resolved_skill_id}' already exists under "
+            "different ownership — choose a different name or an explicit "
+            "skill_id that isn't already taken."
+        )
+    except (reg.InvalidSkillRecordError, ValueError) as e:
+        return f"Error: {e}"
+
+    log.info(
+        "skill_registry_mcp.import_begun",
+        import_id=handle.import_id, skill_id=handle.skill_id,
+        expected_file_count=handle.expected_file_count,
+    )
+    return json.dumps({
+        "import_id": handle.import_id,
+        "skill_id": handle.skill_id,
+        "expected_file_count": handle.expected_file_count,
+    })
+
+
+def skill_registry_import_batch(import_id: str, files_json: str) -> str:
+    """Upload one batch of supporting files for an in-progress staged import.
+    `files_json` must decode to the same {rel_path: {"encoding", "data"}}
+    shape skill_registry_import()'s supporting_files_json already uses — split
+    the full file set across several calls, each comfortably under ~2 MiB
+    serialized (hard-rejected over 3 MiB). Idempotent per file: re-sending a
+    rel_path with content identical to what was already uploaded is a safe
+    no-op, so a batch whose response was lost can simply be retried as-is.
+    Re-sending a rel_path with DIFFERENT content is rejected outright — abort
+    and restart the import to change a file. Returns a JSON object with
+    received/total file counts, or an "Error: ..." string."""
+    try:
+        files = json.loads(files_json) if files_json else {}
+        if not isinstance(files, dict):
+            raise ValueError("files_json must decode to a JSON object")
+    except (json.JSONDecodeError, ValueError) as e:
+        return f"Error: invalid files_json — {e}"
+
+    db_path, err = _resolve_db_path()
+    if err:
+        return err
+
+    try:
+        result = staging.add_batch(db_path, import_id, files)
+    except (staging.ImportNotFoundError, staging.ImportStateError,
+            staging.BatchTooLargeError, staging.FileConflictError, ValueError) as e:
+        return f"Error: {e}"
+
+    return json.dumps(result)
+
+
+def skill_registry_import_finalize(import_id: str) -> str:
+    """Verify every expected file arrived, then publish the staged import
+    atomically through the existing register_skill() path — same return
+    shape as skill_registry_import(). Safe to call again after a successful
+    finalize (returns the same cached result rather than publishing twice).
+    Returns an "Error: ..." string if the import is incomplete (upload the
+    remaining batches and retry), was already aborted, or doesn't exist."""
+    db_path, err = _resolve_db_path()
+    if err:
+        return err
+
+    try:
+        result = staging.finalize_import(db_path, import_id)
+    except (staging.ImportNotFoundError, staging.ImportStateError, staging.IncompleteImportError) as e:
+        return f"Error: {e}"
+    except reg.OwnershipConflictError:
+        return (
+            "Error: this skill_id was registered under different ownership by "
+            "another import in the meantime — choose a different skill_id."
+        )
+
+    log.info(
+        "skill_registry_mcp.import_finalized",
+        import_id=import_id, skill_id=result["skill_id"], version=result["version"],
+    )
+    return json.dumps(result)
+
+
+def skill_registry_import_abort(import_id: str) -> str:
+    """Discard an in-progress staged import and every file uploaded for it —
+    a no-op if it was already aborted. Returns an "Error: ..." string if the
+    import was already finalized (a published skill cannot be un-published
+    this way)."""
+    db_path, err = _resolve_db_path()
+    if err:
+        return err
+
+    try:
+        result = staging.abort_import(db_path, import_id)
+    except staging.ImportStateError as e:
+        return f"Error: {e}"
+
+    log.info("skill_registry_mcp.import_aborted", import_id=import_id)
+    return json.dumps(result)

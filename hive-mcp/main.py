@@ -49,6 +49,8 @@ from tools.symbol_index import structural_index
 from tools.skills import list_skills, load_skill
 from tools.skill_registry_mcp import (
     skill_registry_list, skill_registry_info, skill_registry_import, skill_registry_resolve,
+    skill_registry_import_begin, skill_registry_import_batch,
+    skill_registry_import_finalize, skill_registry_import_abort,
 )
 from tools.shell import run_shell, run_docker, get_env_info, check_port, list_processes
 from tools.git import git_status, git_log, git_diff, git_log_file, git_blame
@@ -218,6 +220,13 @@ _tool(skill_registry_import)
 # which calls it directly over a bespoke MCP session (never through an
 # LLM/agent), the same pattern _fetch_skill_text already uses for load_skill.
 _tool(skill_registry_resolve)
+# Staged import (Phase H.2) -- fixes the /skill import HTTP 413 failure for
+# packages whose encoded payload would exceed the mcp SDK's 4 MiB Streamable
+# HTTP request ceiling. CLI-only, same reasoning as the four tools above.
+_tool(skill_registry_import_begin)
+_tool(skill_registry_import_batch)
+_tool(skill_registry_import_finalize)
+_tool(skill_registry_import_abort)
 
 # ── File writing (WRITE_REVIEW-aware) + read-only shell ──────────────────────
 _tool(write_file)
