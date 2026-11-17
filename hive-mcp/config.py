@@ -96,3 +96,27 @@ MIGRATION_DB_NAME      = os.getenv("MIGRATION_DB_NAME", "")        # e.g. ekamAp
 MIGRATION_DB_HOST      = os.getenv("MIGRATION_DB_HOST", "postgres")  # host as seen from the service container
 MIGRATION_DB_PORT      = os.getenv("MIGRATION_DB_PORT", "5432")
 MIGRATION_SERVICES     = os.getenv("MIGRATION_SERVICES", "")       # "name:container,name:container"
+
+# ── Persistent skills registry (Phase 1.57a) — ownership + identity resolution ──
+# See tools/skills_registry.py (SQLite-backed registry) and tools/skills_identity.py
+# (the one application-level identity provider every registry call goes through).
+# Deliberately NOT wired into tools/skills.py's existing list_skills()/load_skill()
+# yet — this phase ships the persistent schema + ownership/identity primitives only;
+# request forwarding, CLI /skill, and workflow injection are explicit non-goals here.
+#
+# "development" (default): tenant_id/user_id come ONLY from HIVE_SKILLS_DEV_TENANT_ID/
+# HIVE_SKILLS_DEV_USER_ID below, server-side config — never from any caller-supplied
+# value, even in this mode. "authenticated": both IDs must come from the caller's own
+# trusted application request context (resolve_identity()'s trusted_tenant_id/
+# trusted_user_id arguments) — missing either is a hard failure, never a silent
+# fall-through to development mode. No other value is accepted; skills_identity.py
+# raises at resolution time for anything else, rather than defaulting to one of the two.
+HIVE_SKILLS_IDENTITY_MODE  = os.getenv("HIVE_SKILLS_IDENTITY_MODE", "development").strip().lower()
+HIVE_SKILLS_DEV_TENANT_ID  = os.getenv("HIVE_SKILLS_DEV_TENANT_ID", "") or None
+HIVE_SKILLS_DEV_USER_ID    = os.getenv("HIVE_SKILLS_DEV_USER_ID", "") or None
+# Absolute path override for the registry's SQLite file. Unset by default -> a
+# dedicated PROJECT_ROOT/.hive_skills/skills_registry.db, self-registered into
+# .gitignore the same way tools/scratch.py's .hive_scratch/ already is — persists
+# across a container restart (PROJECT_ROOT is the host-mounted volume) with no
+# compose/volume change needed.
+HIVE_SKILLS_DB_PATH        = os.getenv("HIVE_SKILLS_DB_PATH", "")

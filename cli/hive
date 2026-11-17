@@ -27,10 +27,12 @@ Optional TUI upgrade (pip install -r cli/requirements.txt):
     of plain [tool] name(args) lines. Falls back to plain text automatically
     if rich isn't installed -- no flag needed to opt out.
 """
+import base64
 import difflib
 import json
 import os
 import queue
+import re
 try:
     import readline
     _READLINE = True
@@ -929,6 +931,7 @@ def run_task(
     session_id: str | None = None,
     persist: bool = False,
     show_resume: bool = False,
+    requested_skills: list[str] | None = None,
 ) -> str | None:
     """Run a task via streaming SSE; return session_id or None on error."""
     _root   = Path(AGNO_PROJECT_ROOT) if AGNO_PROJECT_ROOT else Path.cwd()
@@ -949,6 +952,15 @@ def run_task(
         payload["mcp_url"] = AGNO_MCP_URL
     if AGNO_SYSTEM_MCP_URL:
         payload["mcp_urls"] = [AGNO_SYSTEM_MCP_URL]
+    # Phase 1.57c: forwarded as-is in the submission payload. NOTE this endpoint
+    # (/stream) has no Workflow implementation (api/server.py's own
+    # _workflow_inapplicable_reasons) -- the server accepts and round-trips this
+    # field on every request, but only /run's orchestration="workflow" +
+    # team="engineering" path actually resolves and acts on it today. Omitted
+    # entirely when empty, same backward-compatible pattern as mcp_url/mcp_urls
+    # above -- "empty selections must retain current behavior".
+    if requested_skills:
+        payload["requested_skills"] = requested_skills
 
     if _COLOUR:
         print(f"{dim('  thinking...')}  {esc_hint}", end="\r", flush=True)
@@ -1092,6 +1104,7 @@ def review_task(
     project_id: str,
     session_id: str | None = None,
     persist: bool = False,
+    requested_skills: list[str] | None = None,
 ) -> str | None:
     """HITL flow — plan -> approve -> execute. Returns session_id or None."""
     has_esc = _start_escape_watcher()
@@ -1142,7 +1155,7 @@ def review_task(
         return None
 
     print(f"\n{bold('Executing...')} {dim('(full engineering team)')}\n")
-    return run_task(task, project_id, session_id=session_id, persist=persist)
+    return run_task(task, project_id, session_id=session_id, persist=persist, requested_skills=requested_skills)
 
 # ── REPL slash commands ───────────────────────────────────────────────────────
 
@@ -1608,6 +1621,301 @@ def _mcp_call_direct(mcp_url: str, tool: str, args: dict, call_timeout: int = 30
     return "\n".join(texts) or "(no output)"
 
 
+# ── /skill — CLI discovery, selection, and third-party import (Phase 1.57b) ──
+#
+# Everything here is a thin client over hive-mcp's skill_registry_list/
+# skill_registry_info/skill_registry_import tools (tools/skill_registry_mcp.py),
+# called the same way _cmd_bootstrap above already calls index_project directly
+# — _mcp_call_direct, bypassing the agent pipeline entirely. No ownership
+# filtering happens here: the server-side tools already return exactly
+# "platform + the active identity's own third-party skills" and reject
+# everything else, so this code only ever displays/forwards what the server
+# already decided was accessible (Phase 1.57b's own instruction: keep
+# ownership enforcement centralized through the existing registry APIs).
+#
+# Selections are PURELY local REPL state in this phase — nothing here is sent
+# to /run, /stream, or the workflow engine yet (that's Phase 1.57c). The only
+# behavior this phase implements for `pending` is: a successful task
+# submission clears it, a failed one leaves it untouched for a retry.
+
+_SKILL_ID_SAFE_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+
+
+def _parse_skill_frontmatter(text: str) -> dict | None:
+    """Minimal, dependency-free '---\\nkey: value\\n...\\n---\\nbody' reader.
+    cli/hive runs with zero required dependencies (see module docstring) —
+    this deliberately does NOT use PyYAML the way hive-mcp's own server-side
+    tools/skills.py parser does. Flat 'key: value' lines are all SKILL.md
+    frontmatter has ever actually used in this project. Returns None for
+    anything malformed or missing a non-empty 'name'."""
+    if not text.startswith("---"):
+        return None
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return None
+    meta: dict[str, str] = {}
+    for line in parts[1].splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        meta[key.strip()] = value.strip().strip('"').strip("'")
+    if not meta.get("name"):
+        return None
+    meta["_body"] = parts[2].lstrip("\n").rstrip()
+    return meta
+
+
+def _read_skill_package(pkg_path_str: str) -> tuple[dict | None, str | None]:
+    """Read + validate a local skill package directory for /skill import.
+    Returns (payload, None) on success or (None, error_message) on failure —
+    never partially: on any rejection, nothing is sent to hive-mcp at all.
+
+    Reads file bytes/text ONLY. Never execs, imports, evaluates, or
+    otherwise interprets any file as code, regardless of its extension —
+    a '.py' or '.sh' file in the package is stored as inert content, exactly
+    like any other asset, both here and by every registry function
+    downstream (skills_registry.register_skill() only ever INSERTs TEXT
+    column values)."""
+    try:
+        pkg_path = Path(pkg_path_str).expanduser().resolve(strict=True)
+    except OSError as e:
+        return None, f"cannot resolve path '{pkg_path_str}': {e}"
+    if not pkg_path.is_dir():
+        return None, f"not a directory: {pkg_path}"
+
+    skill_md = pkg_path / "SKILL.md"
+    if not skill_md.is_file():
+        return None, "missing SKILL.md at the package root"
+
+    try:
+        skill_md_text = skill_md.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        return None, f"cannot read SKILL.md: {e}"
+
+    meta = _parse_skill_frontmatter(skill_md_text)
+    if meta is None:
+        return None, "SKILL.md has invalid or missing frontmatter (needs at least a non-empty 'name:')"
+
+    skill_id = meta.get("skill_id", "")
+    if skill_id and not _SKILL_ID_SAFE_RE.match(skill_id):
+        return None, f"invalid skill_id '{skill_id}' — lowercase letters, digits, and single '-' separators only"
+
+    supporting_files: dict[str, dict] = {}
+    for f in sorted(pkg_path.rglob("*")):
+        if f == skill_md or f.is_dir():
+            continue
+        try:
+            resolved = f.resolve(strict=True)
+        except OSError as e:
+            return None, f"cannot resolve package file '{f.name}': {e}"
+        # Path-traversal / symlink-escape guard: every file's REAL path must
+        # stay physically inside the package root's REAL path. Checked via
+        # the resolved paths (not string prefix) so a symlink anywhere in
+        # the chain is caught, not just a literal '..' in the name.
+        try:
+            resolved.relative_to(pkg_path)
+        except ValueError:
+            return None, (
+                f"rejected: '{f.name}' resolves outside the package root "
+                "(path traversal or symlink escape) — import aborted, nothing registered"
+            )
+        rel = f.relative_to(pkg_path).as_posix()
+        try:
+            data = f.read_bytes()
+        except OSError as e:
+            return None, f"cannot read package file '{rel}': {e}"
+        try:
+            supporting_files[rel] = {"encoding": "utf-8", "data": data.decode("utf-8")}
+        except UnicodeDecodeError:
+            supporting_files[rel] = {"encoding": "base64", "data": base64.b64encode(data).decode("ascii")}
+
+    return {
+        "name": meta["name"],
+        "skill_id": skill_id,
+        "skill_type": meta.get("skill_type", "project"),
+        "description": meta.get("description", ""),
+        "content": meta["_body"],
+        "supporting_files": supporting_files,
+    }, None
+
+
+def _fetch_accessible_skills() -> list[dict] | None:
+    """Platform skills + the active identity's own third-party skills, exactly
+    as hive-mcp's skill_registry_list already scoped them — this function
+    does no filtering of its own. Returns None (having already printed the
+    error) on any failure."""
+    raw = _mcp_call_direct(AGNO_SYSTEM_MCP_URL, "skill_registry_list", {}, 30)
+    if raw.startswith("Error:"):
+        print(red(f"  {raw}"))
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        print(red(f"  unexpected response from hive-mcp: {raw[:200]}"))
+        return None
+
+
+def _fmt_skill_rows(items: list[dict]) -> list[str]:
+    return [
+        f"    {it['skill_id']:<28} v{it['version']:<3} {dim(it.get('source') or '-')}"
+        for it in items
+    ]
+
+
+def _skill_list_and_print(pending: list[dict]) -> None:
+    items = _fetch_accessible_skills()
+    if items is None:
+        return
+    platform_items = [i for i in items if i["scope"] == "platform"]
+    yours_items = [i for i in items if i["scope"] == "yours"]
+
+    print(f"\n  {bold('platform skills')}  {dim('(category=platform, visible to every identity)')}")
+    for l in (_fmt_skill_rows(platform_items) or [dim("    (none)")]):
+        print(l)
+
+    print(f"\n  {bold('your third-party skills')}  {dim('(category=third_party, owned by the active identity only)')}")
+    for l in (_fmt_skill_rows(yours_items) or [dim("    (none)")]):
+        print(l)
+
+    if pending:
+        names = ", ".join(f"{p['name']} ({p['skill_id']})" for p in pending)
+        print(f"\n  {dim('pending for next task: ' + names)}")
+    print()
+
+
+def _resolve_skill_names(tokens: list[str]) -> list[dict] | None:
+    """Resolve each typed token (matched case-insensitively against either
+    skill_id or display name) to a stable skill_id — against the SAME
+    already-ownership-filtered list _skill_list_and_print shows, so a name
+    nobody granted this identity simply never matches."""
+    items = _fetch_accessible_skills()
+    if items is None:
+        return None
+    resolved: list[dict] = []
+    for tok in tokens:
+        matches = [i for i in items if i["skill_id"].lower() == tok.lower() or i["name"].lower() == tok.lower()]
+        if not matches:
+            print(red(f"  no accessible skill matches '{tok}'"))
+            return None
+        if len(matches) > 1:
+            print(red(f"  '{tok}' is ambiguous — matches: {', '.join(m['skill_id'] for m in matches)}"))
+            return None
+        resolved.append(matches[0])
+    return resolved
+
+
+def _skill_info(name: str) -> None:
+    items = _fetch_accessible_skills()
+    if items is None:
+        return
+    matches = [i for i in items if i["skill_id"].lower() == name.lower() or i["name"].lower() == name.lower()]
+    if not matches:
+        print(red(f"  no accessible skill matches '{name}'"))
+        return
+    raw = _mcp_call_direct(AGNO_SYSTEM_MCP_URL, "skill_registry_info", {"skill_id": matches[0]["skill_id"]}, 30)
+    if raw.startswith("Error:"):
+        print(red(f"  {raw}"))
+        return
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError:
+        print(red(f"  unexpected response: {raw[:200]}"))
+        return
+    print(f"\n  {bold(info['name'])}  {dim(info['skill_id'])}")
+    print(f"  category={info['category']}  version={info['version']}  source={info.get('source') or '-'}")
+    if info.get("description"):
+        print(f"  {info['description']}")
+    print(dim(f"  updated_at={info['updated_at']}  content_hash={info['content_hash'][:12]}…"))
+    if info.get("supporting_files"):
+        print(dim(f"  files: {', '.join(info['supporting_files'])}"))
+    print(f"\n{dim(info['content_preview'])}\n")
+
+
+def _skill_import(path_str: str) -> None:
+    payload, err = _read_skill_package(path_str)
+    if err:
+        print(red(f"  import rejected: {err}"))
+        return
+    raw = _mcp_call_direct(
+        AGNO_SYSTEM_MCP_URL, "skill_registry_import",
+        {
+            "name": payload["name"],
+            "content": payload["content"],
+            "skill_type": payload["skill_type"],
+            "skill_id": payload["skill_id"],
+            "description": payload["description"],
+            "source": f"cli-import:{path_str}",
+            "supporting_files_json": json.dumps(payload["supporting_files"]),
+        },
+        60,
+    )
+    if raw.startswith("Error:"):
+        print(red(f"  {raw}"))
+        return
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        print(red(f"  unexpected response: {raw[:200]}"))
+        return
+    print(green(f"  imported '{result['name']}' as {result['skill_id']} v{result['version']}"))
+
+
+def _finalize_pending_skills(pending: list[dict], success: bool) -> None:
+    """Consume pending /skill selections only on a successful submission
+    (same truthiness the REPL loop already uses for returned_id); a failed/
+    interrupted/errored attempt leaves them exactly as they were, so the
+    user can retry without re-selecting. Factored out of the REPL loop body
+    so it has a name and can be called directly from a scratch harness.
+    Not forwarded to the request itself yet — see _cmd_skill's own comment."""
+    if not pending:
+        return
+    if success:
+        print(dim(f"  (cleared {len(pending)} pending skill selection(s) after successful submission)"))
+        pending.clear()
+    else:
+        print(dim(f"  (kept {len(pending)} pending skill selection(s) — submission did not succeed)"))
+
+
+def _cmd_skill(args: str, pending: list[dict]) -> None:
+    if not AGNO_SYSTEM_MCP_URL:
+        print(red("  hive-mcp not reachable — start it first:"))
+        print(dim("  docker compose -f docker-compose.hive.yml up -d"))
+        return
+
+    tokens = args.split()
+    if not tokens:
+        _skill_list_and_print(pending)
+        return
+
+    sub = tokens[0].lower()
+    if sub == "clear":
+        n = len(pending)
+        pending.clear()
+        print(dim(f"  cleared {n} pending skill selection(s)" if n else "  no pending skill selections to clear"))
+        return
+    if sub == "info":
+        if len(tokens) < 2:
+            print(dim("  usage: /skill info <name>"))
+            return
+        _skill_info(tokens[1])
+        return
+    if sub == "import":
+        if len(tokens) < 2:
+            print(dim("  usage: /skill import <path-to-skill-package-directory>"))
+            return
+        _skill_import(" ".join(tokens[1:]))
+        return
+
+    resolved = _resolve_skill_names(tokens)
+    if resolved is None:
+        return  # error already printed; pending left exactly as it was
+    pending.clear()
+    pending.extend(resolved)
+    names = ", ".join(f"{r['name']} ({r['skill_id']})" for r in resolved)
+    print(dim(f"  selected for next task: {names}"))
+
+
 def _cmd_bootstrap(
     project_id: str,
     lightrag_url: str,
@@ -1786,6 +2094,11 @@ def repl(
     initial_session_id: str | None = None,
     persist: bool = False,
 ) -> None:
+    # Phase 1.57b: pending skill selections from /skill <name...>. Purely
+    # local REPL state this phase — see _cmd_skill's own module-level comment
+    # for why nothing here is forwarded to /run or /stream yet.
+    pending_skills: list[dict] = []
+
     history_file = Path.home() / ".agno_history"
     if _READLINE:
         try:
@@ -1840,7 +2153,7 @@ def repl(
     if review:
         print(dim("  review mode: plan shown before every task  ·  prefix with ! to skip"))
 
-    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff  /cleanup  /plan  /review  /mcp  /tree  /branch <id>  /exit  ·  Ctrl+C to interrupt\n"))
+    print(dim("  /new  /sessions  /history  /persist  /delete <id>  /delete-all  /diff  /cleanup  /plan  /review  /mcp  /skill  /tree  /branch <id>  /exit  ·  Ctrl+C to interrupt\n"))
 
     try:
         while True:
@@ -1892,6 +2205,8 @@ def repl(
                     _cmd_cleanup()
                 elif cmd == "/mcp":
                     _cmd_mcp_status()
+                elif cmd == "/skill":
+                    _cmd_skill(args, pending_skills)
                 elif cmd == "/delete-all":
                     _cmd_delete_all_sessions(project_id)
                 elif cmd == "/plan":
@@ -1903,7 +2218,11 @@ def repl(
                     if not args.strip():
                         print(dim("  usage: /review <task to plan then execute>"))
                     else:
-                        returned_id = review_task(args.strip(), project_id, session_id=session_id, persist=persist)
+                        returned_id = review_task(
+                            args.strip(), project_id, session_id=session_id, persist=persist,
+                            requested_skills=[p["skill_id"] for p in pending_skills] or None,
+                        )
+                        _finalize_pending_skills(pending_skills, bool(returned_id))
                         if returned_id:
                             session_id = returned_id
                 elif cmd in ("/confirm", "/reject"):
@@ -1929,7 +2248,7 @@ def repl(
                     if proposed:
                         _confirm_locally(proposed) if cmd == "/confirm" else _reject_locally(proposed)
                 else:
-                    print(dim(f"  unknown command: {cmd}  ·  /new /sessions /history /persist /delete /diff /cleanup /plan /review /mcp /confirm /reject /tree /branch /exit"))
+                    print(dim(f"  unknown command: {cmd}  ·  /new /sessions /history /persist /delete /diff /cleanup /plan /review /mcp /skill /confirm /reject /tree /branch /exit"))
                 if not fall_through_with_new_task:
                     continue
 
@@ -1954,16 +2273,21 @@ def repl(
             skip_review = task.startswith("!") and review
             clean_task  = task[1:].strip() if skip_review else task
 
+            requested_skill_ids = [p["skill_id"] for p in pending_skills] or None
             if skip_review or not review:
                 returned_id = run_task(
                     clean_task, project_id,
                     session_id=session_id, persist=persist,
+                    requested_skills=requested_skill_ids,
                 )
             else:
                 returned_id = review_task(
                     clean_task, project_id,
                     session_id=session_id, persist=persist,
+                    requested_skills=requested_skill_ids,
                 )
+
+            _finalize_pending_skills(pending_skills, bool(returned_id))
 
             if returned_id:
                 session_id = returned_id

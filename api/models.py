@@ -96,6 +96,20 @@ class RunRequest(BaseModel):
     # Omitted (every existing caller, unchanged): orchestration="workflow" falls back to the
     # pre-existing, explicitly legacy task-phrase-matching policy lookup.
     evidence_policy: dict | None = None
+    # Phase 1.57c: stable skill_id strings from the CLI's /skill selection (Phase
+    # 1.57b). Optional, defaults to None/empty for every existing caller -- "empty
+    # selections must retain current behavior". Resolved and authorized
+    # application-side (swarm.team._resolve_requested_skills(), via the existing
+    # hive-mcp registry + identity provider -- never a client-supplied tenant_id/
+    # user_id) and passed as explicit input to run_engineering_workflow() ONLY --
+    # /run's orchestration="workflow" + team="engineering" path. /stream has no
+    # Workflow implementation at all (see api/server.py's own
+    # _workflow_inapplicable_reasons: "the stream entry point has no Workflow
+    # implementation") and the Team engine has nowhere to put a resolved pin yet
+    # (no AgentSpec.skills change in this phase) -- so this field is accepted on
+    # every request for a stable, round-trippable contract, but only acted on by
+    # /run's workflow path today. See Phase 1.57c's report for the full boundary.
+    requested_skills: list[str] | None = None
 
 class SessionMeta(BaseModel):
     session_id: str

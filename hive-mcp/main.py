@@ -47,6 +47,9 @@ from tools.bash import (
 from tools.verify import verify_claims
 from tools.symbol_index import structural_index
 from tools.skills import list_skills, load_skill
+from tools.skill_registry_mcp import (
+    skill_registry_list, skill_registry_info, skill_registry_import, skill_registry_resolve,
+)
 from tools.shell import run_shell, run_docker, get_env_info, check_port, list_processes
 from tools.git import git_status, git_log, git_diff, git_log_file, git_blame
 from tools.index import index_project
@@ -196,6 +199,25 @@ _tool(list_skills)
 _tool(load_skill)
 _tool(list_directory)
 _tool(list_directory_tree)
+
+# ── Persistent skills registry (Phase 1.57b) — CLI-only, not for agent use ───
+# Registered here only so cli/hive's /skill commands can reach them via
+# _mcp_call_direct's own raw MCP session (bypasses agno's MCPTools/
+# team_role_tools allowlist entirely, same path index_project/
+# scan_project_context already use for CLI-direct calls). Deliberately NOT
+# added to _instructions above and NOT granted to any team's
+# team_role_tools allowlist — an agent's own tool surface is unaffected by
+# this registration (see swarm/team_config.py: a role's live tools come from
+# its explicit DB/YAML allowlist, never "every tool hive-mcp happens to
+# expose").
+_tool(skill_registry_list)
+_tool(skill_registry_info)
+_tool(skill_registry_import)
+# skill_registry_resolve (Phase 1.57c) -- also CLI-only by the rule above, but
+# in practice its real caller is swarm/team.py's _resolve_requested_skills(),
+# which calls it directly over a bespoke MCP session (never through an
+# LLM/agent), the same pattern _fetch_skill_text already uses for load_skill.
+_tool(skill_registry_resolve)
 
 # ── File writing (WRITE_REVIEW-aware) + read-only shell ──────────────────────
 _tool(write_file)

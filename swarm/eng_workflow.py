@@ -286,6 +286,11 @@ class RunState:
     # independently-tracked ones racing to describe the same task.
     task_read_ceiling: dict = field(default_factory=dict)
     task_discovery_ceiling: dict = field(default_factory=dict)
+    # Phase 1.57c: already-resolved, version/hash-pinned ResolvedSkillPin records for
+    # this run's requested_skills -- explicit workflow input, never content, never
+    # injected into any agent. Empty for every run that didn't request any (which is
+    # every caller before this phase, and every caller that still doesn't).
+    requested_skills: list = field(default_factory=list)
 
     def remaining(self) -> Optional[float]:
         return None if self.deadline_mono is None else self.deadline_mono - time.monotonic()
@@ -1510,7 +1515,7 @@ async def run_engineering_workflow(
     task: str, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
     project_id: str, session_id, controls_raw=None, registry=None, work_items=None, idempotency_key=None,
     liveness_path=None, liveness_nonce=None, knowledge=None, evidence_policy=None, role: str = "researcher",
-    propose: bool = False,
+    propose: bool = False, resolved_skills=None,
 ):
     """Entry point called from swarm.team.run_task_async when orchestration == "workflow".
     Returns (content, tokens, clarification) exactly like the Team path.
@@ -1536,7 +1541,16 @@ async def run_engineering_workflow(
     `propose` (Phase 1.54a): forwarded, via the same closure pattern as `role`, to every
     run_attempt()/recover_and_reconcile() call s_execute() below makes. Defaults to False --
     every existing caller is completely unaffected; see run_attempt()'s own `propose` docstring
-    for what it actually does."""
+    for what it actually does.
+
+    `resolved_skills` (Phase 1.57c, default None -- every existing caller unaffected):
+    already-resolved, version/hash-pinned ResolvedSkillPin records (swarm.team.
+    _resolve_requested_skills() has ALREADY run and ALREADY raised if any requested
+    skill_id failed to resolve -- by the time this function is entered, every pin
+    here is known-valid and known-owned-by-the-active-identity). Stored on `st`
+    (RunState.requested_skills) as explicit workflow input ONLY -- nothing in this
+    function (or anything it calls) reads it to inject content into any agent's
+    instructions or tools. That remains Phase 1.57d's job."""
     from agno.tools.mcp import MCPTools
     from agno.workflow import Workflow, Step
     import swarm.team as T
@@ -1563,6 +1577,7 @@ async def run_engineering_workflow(
     st.deadline_wall = time.time() + _dl
     st.deadline_mono = None if controls.get("ignore_task_deadline") else time.monotonic() + _dl
     st.identity = {"task_id": task_id, "workflow_run_id": wf_run_id}
+    st.requested_skills = list(resolved_skills or [])
 
     async def _snapshot_loop():
         while True:
@@ -1593,6 +1608,10 @@ async def run_engineering_workflow(
                     {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, None)
     LAST["state"] = st
     st.emit("workflow_start", task=task_id, workflow_run=wf_run_id, controls=sorted(controls) or None)
+    if st.requested_skills:
+        st.emit("requested_skills_resolved",
+                skill_ids=[p.skill_id for p in st.requested_skills],
+                versions={p.skill_id: p.version for p in st.requested_skills})
 
     effective_mcp_url = mcp_url or T.config.mcp_url
     all_mcp_urls = [u for u in (mcp_urls or []) + [effective_mcp_url] if u]

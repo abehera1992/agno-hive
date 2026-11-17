@@ -1371,10 +1371,20 @@ def _resolve_orchestration(requested: str | None) -> str:
 
 def _workflow_inapplicable_reasons(*, entry: str, team_name: str | None, custom_agents: bool, read_only: bool) -> list:
     """Why the Workflow engine cannot serve this execution. The Workflow is the application-owned, INVESTIGATION-ONLY
-    engineering engine: it always strips mutating tools, exists only for the engineering team, runs no streaming and
-    no session-chained chunks."""
+    engineering engine: it always strips mutating tools, exists only for the engineering team, runs no
+    session-chained chunks.
+
+    Phase 1.57c.1: "run" and "stream" are BOTH valid entry points now -- /stream's
+    run_task_stream() gained its own orchestration="workflow" branch (swarm/team.py's
+    shared _run_workflow_engine(), the SAME function /run's run_task_async() calls, so
+    the two can never drift) that adapts the Workflow's single-shot (content, tokens,
+    clarification) return into one "__done__" stream event rather than incremental
+    chunks -- a real, if coarse-grained, form of streaming (see that function's own
+    docstring). Every OTHER eligibility reason below is completely unchanged and still
+    applies identically to both entry points -- this phase widens WHICH entry points are
+    even considered, never loosens what makes a specific request eligible."""
     why = []
-    if entry != "run":
+    if entry not in ("run", "stream"):
         why.append(f"the {entry} entry point has no Workflow implementation")
     if team_name != "engineering":
         why.append(f"the Workflow exists only for the engineering team (this request resolved to {team_name or 'a custom roster'!r})")
@@ -1633,6 +1643,7 @@ async def _run_impl(request: RunRequest, http_request: Request):
         "idempotency_key": request.idempotency_key,
         "knowledge_key": "kn-" + uuid.uuid4().hex[:16],      # Phase 1.20: one retrieval per top-level request
         "evidence_policy": request.evidence_policy,
+        "requested_skills": request.requested_skills,       # Phase 1.57c: forwarded as-is; resolved inside run_task_async
     }
     result, tokens, clarification = await _run_worker_subprocess(http_request, worker_payload)
 
@@ -1989,6 +2000,20 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
                 "team_name": gate_team_name,
                 "execution_profile": request.execution_profile,
                 "knowledge_key": "kn-" + uuid.uuid4().hex[:16],
+                # Phase 1.57c.1: `engine` is ALREADY the resolved choice from
+                # _select_engine just above (explicit request, or the applicable
+                # default) -- forwarded here exactly like /run's own worker_payload
+                # does, so run_task_stream() knows which path to take. The other four
+                # are the same Workflow-only fields /run already threads through;
+                # all four are harmless no-ops for a Team-engine request (unused by
+                # that path, exactly as /run's behavior is unaffected when its own
+                # engine resolves to "team").
+                "orchestration": engine,
+                "work_items": request.work_items,
+                "idempotency_key": request.idempotency_key,
+                "workflow_controls": request.workflow_controls,
+                "evidence_policy": request.evidence_policy,
+                "requested_skills": request.requested_skills,
             })
 
             async for chunk in stream_source:

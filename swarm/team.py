@@ -4574,6 +4574,118 @@ async def _fetch_skill_text(hive_mcp_url: str | None, name: str) -> str:
         return ""
 
 
+@dataclass(frozen=True)
+class ResolvedSkillPin:
+    """A requested skill, pinned to the exact version/content_hash the
+    registry held at resolution time (Phase 1.57c). Deliberately carries NO
+    content/supporting_files — this phase passes pins as explicit workflow
+    input only; fetching and injecting the actual skill body into an agent
+    is Phase 1.57d's job, not this one's."""
+    skill_id: str
+    name: str
+    category: str
+    version: int
+    source: str | None
+    content_hash: str
+
+
+class RequestedSkillResolutionError(Exception):
+    """Raised by _resolve_requested_skills() — never returns a partial or
+    silently-filtered result. `reasons` maps EVERY failed skill_id to why
+    (missing/disabled/invalid/unauthorized, or hive-mcp unreachable) so the
+    caller can report explicitly instead of discarding a rejection quietly,
+    per Phase 1.57c's own instruction. A single bad id fails the whole
+    requested_skills batch — there is no caller yet (by design, this phase)
+    that would know what to do with a run whose own request was only
+    partially honored."""
+    def __init__(self, reasons: dict[str, str]):
+        self.reasons = reasons
+        super().__init__(f"could not resolve requested_skills: {reasons}")
+
+
+async def _resolve_requested_skills(hive_mcp_url: str | None, skill_ids: list[str] | None) -> list["ResolvedSkillPin"]:
+    """Resolve each requested skill_id to a version/hash-pinned record via
+    hive-mcp's skill_registry_resolve tool (Phase 1.57c), called directly —
+    the SAME bespoke short-lived MCP session pattern _fetch_skill_text above
+    already uses, never through an LLM/agent.
+
+    Ownership/ identity: this function passes NO tenant_id/user_id argument
+    to skill_registry_resolve at all — there is no parameter for one. The
+    active identity is resolved entirely inside hive-mcp via
+    skills_identity.resolve_identity() (Phase 1.57a), from server-side
+    config this process has no visibility into and cannot override. This is
+    the actual enforcement of "never accept client-supplied tenant_id or
+    user_id as authoritative": the client-side (this function, and
+    everything that calls it) has no channel through which to supply one in
+    the first place.
+
+    Service-boundary note (Phase 1.57c inspection): the registry's SQLite
+    file lives inside hive-mcp's own container/host filesystem — this
+    process (the agno-hive API server, a different machine in every real
+    deployment seen in this codebase's own docs) has no direct filesystem or
+    Python-import access to it. The ONLY safe way to reach it is the MCP
+    network call this function makes, reusing the SAME hive-mcp connection
+    mechanism every other cross-service call in this file already depends
+    on — not a new or improvised channel.
+
+    Returns [] immediately, with zero network calls, when skill_ids is empty
+    or None — "empty selections must retain current behavior" (Phase 1.57c).
+
+    Raises RequestedSkillResolutionError (see its own docstring) rather than
+    returning a partial list when:
+      - skill_ids is non-empty but no hive-mcp URL was resolved for this
+        request (the registry cannot be safely consulted at all); or
+      - any individual skill_id comes back missing, disabled, invalid, or
+        unauthorized for the active identity.
+    """
+    if not skill_ids:
+        return []
+    if not hive_mcp_url:
+        raise RequestedSkillResolutionError(
+            {sid: "no hive-mcp URL resolved for this request — the registry cannot be consulted" for sid in skill_ids}
+        )
+
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    async def _call(skill_id: str):
+        async with streamablehttp_client(hive_mcp_url) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                return await session.call_tool("skill_registry_resolve", {"skill_id": skill_id})
+
+    resolved: list[ResolvedSkillPin] = []
+    reasons: dict[str, str] = {}
+    for skill_id in skill_ids:
+        try:
+            res = await asyncio.wait_for(_call(skill_id), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+        except Exception as exc:
+            reasons[skill_id] = f"hive-mcp unreachable: {type(exc).__name__}: {exc}"
+            continue
+        err = _mcp_error_text(res)
+        if err:
+            reasons[skill_id] = err
+            continue
+        text = _extract_mcp_text(res) or ""
+        if text.startswith("Error:"):
+            reasons[skill_id] = text
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            reasons[skill_id] = f"unexpected response from hive-mcp: {text[:200]}"
+            continue
+        resolved.append(ResolvedSkillPin(
+            skill_id=data["skill_id"], name=data["name"], category=data["category"],
+            version=data["version"], source=data.get("source"), content_hash=data["content_hash"],
+        ))
+
+    if reasons:
+        print(f"[skills] requested_skills resolution rejected: {reasons}", flush=True)
+        raise RequestedSkillResolutionError(reasons)
+    return resolved
+
+
 # Tools that gather EVIDENCE. An answer asserting facts about the codebase without one
 # of these has no basis beyond the model's priors and the loaded context.
 _READ_TOOLS = {
@@ -29911,6 +30023,44 @@ def _log_unclassified_stream_event(log_label: str, event, unrecognized_event_cou
     )
 
 
+async def _run_workflow_engine(
+    task: str, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
+    project_id: str, session_id, *, workflow_controls, work_items, idempotency_key,
+    liveness_path, liveness_nonce, knowledge, evidence_policy, requested_skills,
+) -> tuple[str, dict, dict | None]:
+    """Resolve requested_skills, then execute the engineering Workflow — the ONE
+    place either entry point (run_task_async's /run path, run_task_stream's /stream
+    path, Phase 1.57c.1) does this, so they cannot drift apart. Callers must have
+    ALREADY confirmed team_name=="engineering" and agent_specs is truthy; this
+    function does not re-check eligibility (api/server.py's
+    _workflow_inapplicable_reasons is still the single source of truth for that,
+    for BOTH entry points — see its own docstring), it only executes.
+
+    Returns (content, tokens, clarification) — run_task_async returns this tuple
+    directly; run_task_stream (which must YIELD, not return, to honor its own
+    generator contract) wraps it into one {"__done__": ...} event instead. Either
+    way this function's own body — resolve, then call run_engineering_workflow() —
+    runs exactly once per call site, never duplicated."""
+    from swarm.eng_workflow import run_engineering_workflow
+    reset_unavailable_tool_state()
+    reset_peak_token_state()
+    effective_mcp_url = mcp_url or config.mcp_url
+    all_mcp_urls_for_skills = [u for u in (mcp_urls or []) + [effective_mcp_url] if u]
+    # Phase 1.57c: resolve BEFORE entering the Workflow at all — a rejection here
+    # must fail the request outright (see _resolve_requested_skills' own
+    # docstring), not surface partway through a run that already started work.
+    resolved_skills = await _resolve_requested_skills(
+        _pick_hive_mcp_url(all_mcp_urls_for_skills, effective_mcp_url), requested_skills)
+    print("[team] orchestration=workflow -- application-controlled engineering Workflow "
+          "(Team/Coordinator path not used for this request)", flush=True)
+    return await run_engineering_workflow(
+        task, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
+        project_id, session_id, controls_raw=workflow_controls, work_items=work_items,
+        idempotency_key=idempotency_key, liveness_path=liveness_path,
+        liveness_nonce=liveness_nonce, knowledge=knowledge, evidence_policy=evidence_policy,
+        resolved_skills=resolved_skills)
+
+
 async def run_task_stream(
     task: str,
     agent_specs: list | None = None,
@@ -29925,8 +30075,34 @@ async def run_task_stream(
     team_name: str | None = None,
     execution_profile: str | None = None,
     knowledge_key: str | None = None,
+    orchestration: str | None = None,
+    workflow_controls: dict | None = None,
+    work_items: list | None = None,
+    idempotency_key: str | None = None,
+    evidence_policy: dict | None = None,
+    requested_skills: list[str] | None = None,
 ):
     """Same setup as run_task_async but yields text chunks as the coordinator generates them.
+
+    `orchestration`/`workflow_controls`/`work_items`/`idempotency_key`/
+    `evidence_policy`/`requested_skills` (Phase 1.57c.1, all default None/empty —
+    every existing caller completely unaffected): when `orchestration=="workflow"`
+    and eligible (team_name=="engineering", a real agent_specs roster, no custom
+    roster, read_only — api/server.py's _workflow_inapplicable_reasons is still
+    the single source of truth for eligibility, now covering BOTH "run" and
+    "stream"), this function routes to the SAME application-controlled
+    engineering Workflow /run already uses, via the shared
+    _run_workflow_engine() (resolves requested_skills, then calls
+    run_engineering_workflow() — identical code either entry point reaches,
+    never duplicated). Because the Workflow returns one single-shot
+    (content, tokens, clarification) rather than incremental deltas, this
+    yields exactly ONE {"__done__": ...} event and returns — no str chunks,
+    no tool-event sentinels. This is a real, coarse-grained form of streaming
+    (one flush instead of many), not simulated incremental delivery; see
+    Phase 1.57c.1's own report for why finer-grained streaming was out of
+    scope. Every OTHER caller (orchestration is None/"team", or "workflow"
+    but ineligible) is completely unaffected — same Team path, same
+    incremental chunks, byte-identical to before this phase.
 
     `execution_profile` (Workstream B, 2026-10-24): one of "standard"
     (default, unbounded -- today's exact prior behavior), "extended", or
@@ -29956,6 +30132,26 @@ async def run_task_stream(
     effective_coordinator = coordinator_model or config.leader_model
     # Phase 1.20: shared Knowledge Preparation, once per top-level execution, before any agent starts.
     _knowledge = await _prepare_knowledge(task, project_id, mcp_urls, effective_mcp_url, knowledge_key, "run_task_stream")
+    # Phase 1.57c.1: mirrors run_task_async's own orchestration branch, placed at the
+    # exact same point (immediately after Knowledge Preparation, before any
+    # Team-specific setup) so eligibility/resolution happen before anything
+    # Team-only runs below. Early-returns (via a bare `return` — valid in a
+    # generator; this function is one because of the `yield`s further down)
+    # on the eligible path; falls through to the unchanged Team path otherwise.
+    if orchestration == "workflow":
+        if team_name == "engineering" and agent_specs:
+            content, tokens, clarification = await _run_workflow_engine(
+                task, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
+                project_id, session_id, workflow_controls=workflow_controls, work_items=work_items,
+                idempotency_key=idempotency_key, liveness_path=None, liveness_nonce=None,
+                knowledge=_knowledge, evidence_policy=evidence_policy, requested_skills=requested_skills)
+            done_event = {"__done__": True, "content": content, "tokens": tokens}
+            if clarification:
+                done_event["clarification"] = clarification
+            yield done_event
+            return
+        print(f"[team] orchestration=workflow requested but team_name={team_name!r} is not 'engineering' "
+              f"(or no roster) -- using the Team path (stream)", flush=True)
     # Rebound BEFORE the roster is composed: the Coordinator's roster preamble prints each
     # member's tools, and a read_only run was advertising tools _strip_mutating removes
     # later. Idempotent with the strip below, which then removes nothing further.
@@ -35538,6 +35734,7 @@ async def run_task_async(
     liveness_nonce: str | None = None,
     knowledge_key: str | None = None,
     evidence_policy: dict | None = None,
+    requested_skills: list[str] | None = None,
 ) -> tuple[str, dict, dict | None]:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer.
 
@@ -35560,6 +35757,18 @@ async def run_task_async(
     subprocess poll loop supplies this (computed from the child's own pid) when
     config.enable_liveness_autokill is set; main.py's CLI one-shot path and every
     existing caller that doesn't pass it get the previous behaviour unchanged.
+
+    `requested_skills` (Phase 1.57c, default None/empty — every existing caller
+    unaffected): stable skill_id strings forwarded from the CLI's /skill
+    selection. Resolved (via _resolve_requested_skills(), see its own
+    docstring for the identity/service-boundary reasoning) and passed as
+    explicit input ONLY on the orchestration="workflow" + team_name=
+    "engineering" path below — this phase does not yet give the Team path
+    anywhere to put a resolved pin, matching "no fixed execution pipeline"
+    and "no AgentSpec.skills change" from this phase's own instructions. A
+    non-empty list that fails to resolve raises RequestedSkillResolutionError
+    (explicit, never silently dropped) before run_engineering_workflow() is
+    even called.
 
     Returns (content, tokens, clarification). clarification is None on a normal
     completed answer; when the coordinator emitted a needs_clarification block
@@ -35586,16 +35795,12 @@ async def run_task_async(
     _knowledge = await _prepare_knowledge(task, project_id, mcp_urls, effective_mcp_url, knowledge_key, "run_task_async")
     if orchestration == "workflow":
         if team_name == "engineering" and agent_specs:
-            from swarm.eng_workflow import run_engineering_workflow
-            reset_unavailable_tool_state()
-            reset_peak_token_state()
-            print("[team] orchestration=workflow -- application-controlled engineering Workflow "
-                  "(Team/Coordinator path not used for this request)", flush=True)
-            return await run_engineering_workflow(
+            return await _run_workflow_engine(
                 task, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
-                project_id, session_id, controls_raw=workflow_controls, work_items=work_items,
+                project_id, session_id, workflow_controls=workflow_controls, work_items=work_items,
                 idempotency_key=idempotency_key, liveness_path=liveness_path,
-                liveness_nonce=liveness_nonce, knowledge=_knowledge, evidence_policy=evidence_policy)
+                liveness_nonce=liveness_nonce, knowledge=_knowledge, evidence_policy=evidence_policy,
+                requested_skills=requested_skills)
         print(f"[team] orchestration=workflow requested but team_name={team_name!r} is not 'engineering' "
               f"(or no roster) -- using the Team path", flush=True)
     # Rebound BEFORE the roster is composed -- see run_task_stream for the reason.
