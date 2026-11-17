@@ -26,12 +26,22 @@ import time
 from pathlib import Path
 from typing import Optional
 
-SCHEMA_VERSION = 3   # Phase 1.22: + attempt.trace_sha (see init_schema()'s migration).
+SCHEMA_VERSION = 4   # Phase 1.22: + attempt.trace_sha (see init_schema()'s migration).
                      # Phase 1.55: + attempt.role/stage_name/stage_index/parent_attempt_id
                      # (nullable, forward-compatible lineage columns -- see init_schema()'s
                      # migration and start_attempt()'s own docstring for what populates them
                      # today vs. what remains unset pending real multi-stage orchestration)
                      # and the new proposal/proposal_work_item tables (see record_proposal()).
+                     # Phase 1.56c: + proposal.raw_proposal_json -- the complete original
+                     # WorkProposal (every work item's objective/role/dependencies/
+                     # capabilities/skills/acceptance_criteria/expected_evidence), persisted for
+                     # BOTH valid and invalid proposals (NULL only when proposal itself is None --
+                     # generation/parsing produced nothing at all to persist). validate_proposal()'s
+                     # verdict (valid/errors/unauthorized_skills/unverified_capabilities) stays in
+                     # its own existing columns, unchanged -- this is additive storage of the
+                     # ORIGINAL proposal, not a second copy of the validation outcome.
+                     # proposal_work_item is UNCHANGED: still written only when valid=1, still the
+                     # only place anything work-item-shaped for a REJECTED proposal does not exist.
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / "data" / "workflow_ledger.db"
 
 # attempt states. Terminal ones never change again except RUNNING/FINISHED -> invalidated.
@@ -113,7 +123,7 @@ CREATE TABLE IF NOT EXISTS proposal (
   task_id TEXT NOT NULL, work_item_id TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
   objective TEXT NOT NULL, valid INTEGER NOT NULL, errors_json TEXT NOT NULL,
   unauthorized_skills_json TEXT NOT NULL, unverified_capabilities_json TEXT NOT NULL,
-  created_at REAL NOT NULL);
+  created_at REAL NOT NULL, raw_proposal_json TEXT);
 -- One row per proposed sub-item of a proposal. Written ONLY when that proposal's own `valid`
 -- is 1 -- record_proposal()'s own enforcement of "an invalid proposal never becomes executable
 -- work": an invalid proposal's `proposal` row still records what was proposed and why it was
@@ -226,7 +236,7 @@ class Ledger:
             else:
                 current = int(row["v"])
                 if current != SCHEMA_VERSION:
-                    if current not in (1, 2):
+                    if current not in (1, 2, 3):
                         raise LedgerError(f"ledger schema version {current} != expected {SCHEMA_VERSION} "
                                           f"(no migration path from {current}); refusing to use it")
                     # Sequential, not a single pairwise check: a database still at version 1 must
@@ -251,6 +261,15 @@ class Ledger:
                             if col not in cols:
                                 c.execute(f"ALTER TABLE attempt ADD COLUMN {col} {decl}")
                         current = 3
+                    if current == 3:
+                        # Phase 1.56c, additive only: the complete original WorkProposal, for
+                        # both valid and invalid proposals. NULL for every proposal row recorded
+                        # before this migration -- not backfilled, since the original structured
+                        # output was never captured for them (only the validation verdict was).
+                        cols = {r["name"] for r in c.execute("PRAGMA table_info(proposal)").fetchall()}
+                        if "raw_proposal_json" not in cols:
+                            c.execute("ALTER TABLE proposal ADD COLUMN raw_proposal_json TEXT")
+                        current = 4
                     c.execute("UPDATE ledger_meta SET v=? WHERE k='schema_version'", (str(SCHEMA_VERSION),))
 
             # 3) Indexes -- every column any index references is now guaranteed to exist,
@@ -463,7 +482,16 @@ class Ledger:
         written ONLY when validation.valid is True. An invalid (or altogether missing, proposal=None)
         proposal still gets its own `proposal` row -- objective/errors/disclosures, for audit -- but
         zero proposal_work_item rows, so nothing work-item-shaped exists for any future orchestration
-        code to read and dispatch from a rejected proposal."""
+        code to read and dispatch from a rejected proposal.
+
+        Phase 1.56c: `raw_proposal_json` persists the COMPLETE original WorkProposal (every work
+        item's objective/role/dependencies/required_capabilities/proposed_skills/
+        acceptance_criteria/expected_evidence) for BOTH valid and invalid proposals -- the whole
+        point is to keep a rejected proposal's full original content auditable, not just that it
+        was rejected and why. NULL only when `proposal` itself is None (generation/parsing produced
+        no structured object at all -- nothing to persist). This is independent of, and never
+        substitutes for, proposal_work_item: a rejected proposal's items still never get a
+        proposal_work_item row, no matter what raw_proposal_json holds."""
         def go(c):
             self._maybe_fail("proposal")
             prior = c.execute("SELECT proposal_id FROM proposal WHERE attempt_id=?", (attempt_id,)).fetchone()
@@ -474,12 +502,13 @@ class Ledger:
                 raise LedgerError(f"unknown attempt {attempt_id}")
             proposal_id = f"prop-{attempt_id}"
             objective = (getattr(proposal, "objective", None) or "") if proposal is not None else ""
+            raw_proposal_json = _j(proposal.model_dump()) if proposal is not None else None
             c.execute("INSERT INTO proposal(proposal_id,attempt_id,task_id,work_item_id,version,objective,valid,"
-                      "errors_json,unauthorized_skills_json,unverified_capabilities_json,created_at) "
-                      "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                      "errors_json,unauthorized_skills_json,unverified_capabilities_json,created_at,"
+                      "raw_proposal_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                       (proposal_id, attempt_id, task_id, work_item_id, 1, objective, int(bool(validation.valid)),
                        _j(validation.errors), _j(validation.unauthorized_skills), _j(validation.unverified_capabilities),
-                       time.time()))
+                       time.time(), raw_proposal_json))
             n = 0
             if validation.valid and proposal is not None:
                 for wi in proposal.work_items:
@@ -495,7 +524,14 @@ class Ledger:
 
     def get_proposal(self, attempt_id: str) -> Optional[dict]:
         """Read-side counterpart to record_proposal(). None if no proposal was ever recorded for
-        this attempt_id (propose=False, or the attempt never reached the proposal step)."""
+        this attempt_id (propose=False, or the attempt never reached the proposal step).
+
+        `raw_proposal` (Phase 1.56c) is the complete original WorkProposal (model_dump()'d dict),
+        parsed back from raw_proposal_json -- present for both valid and invalid proposals, None
+        only when the column itself is NULL (proposal was None at record time, or a pre-1.56c row
+        that predates this field). `work_items` (existing, unchanged) stays the EXECUTABLE view:
+        empty for any invalid proposal regardless of what raw_proposal holds, since
+        proposal_work_item is never written for one."""
         c = self._conn()
         try:
             p = c.execute("SELECT * FROM proposal WHERE attempt_id=?", (attempt_id,)).fetchone()
@@ -509,6 +545,8 @@ class Ledger:
             d["errors"] = json.loads(d.pop("errors_json"))
             d["unauthorized_skills"] = json.loads(d.pop("unauthorized_skills_json"))
             d["unverified_capabilities"] = json.loads(d.pop("unverified_capabilities_json"))
+            raw = d.pop("raw_proposal_json", None)
+            d["raw_proposal"] = json.loads(raw) if raw else None
             d["work_items"] = items
             return d
         finally:
