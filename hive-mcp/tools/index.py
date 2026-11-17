@@ -65,9 +65,25 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+import config
 from config import PROJECT_ROOT
 
-_STATE_DIR  = Path(os.getenv("HIVE_INDEX_STATE_DIR", str(PROJECT_ROOT / ".hive-index-state")))
+# Phase H: HIVE_INDEX_STATE_DIR is now resolved centrally by config.py's
+# _resolve_persistent_path() (explicit override, legacy PROJECT_ROOT/.hive-index-
+# state/ preserved if it already has data, or the new HIVE_DATA_ROOT/indexes/
+# <namespace>/ default) — this module no longer reads the env var or constructs
+# its own PROJECT_ROOT-relative fallback itself.
+#
+# Phase H.1: resolved LAZILY (a function, not a module-level constant like
+# before) because config.HIVE_INDEX_STATE_DIR can be "" (a legacy/new conflict
+# — see config.PersistenceConflictError). Path("") silently resolves to the
+# current directory, which is exactly the "silently operating against
+# potentially stale or incomplete state" Phase H.1 exists to prevent — this
+# must raise at the point of actual use, not resolve to a bogus default.
+def _state_dir() -> Path:
+    return config.require_resolved_path(config.HIVE_INDEX_STATE_DIR, "index_state")
+
+
 _CHUNK_SIZE = 4000   # chars for non-Python files
 
 # Bump whenever _get_chunks()/its dispatch targets change what gets embedded in a
@@ -333,7 +349,7 @@ def _chunk_citation_path(rel: str, index: int) -> str:
 # ── State tracking ────────────────────────────────────────────────────────────
 
 def _load_state(project_id: str) -> dict:
-    f = _STATE_DIR / f"{project_id}.json"
+    f = _state_dir() / f"{project_id}.json"
     if not f.exists():
         return {}  # legitimately empty — first run for this project
     # An EXISTING state file that fails to read/parse must NOT silently reset
@@ -356,10 +372,11 @@ def _load_state(project_id: str) -> dict:
 
 
 def _save_state(project_id: str, state: dict) -> None:
-    _STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state_dir = _state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
     # Atomic write: serialize to a temp file then replace, so a reader never
     # observes a half-written (corrupt) state file mid-save.
-    target = _STATE_DIR / f"{project_id}.json"
+    target = state_dir / f"{project_id}.json"
     tmp = target.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state))
     os.replace(tmp, target)

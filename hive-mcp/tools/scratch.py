@@ -27,9 +27,10 @@ import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+import config
 from config import PROJECT_ROOT
 
-_SCRATCH_DIRNAME = ".hive_scratch"
+_SCRATCH_DIRNAME = ".hive_scratch"  # legacy dirname — only used in the .gitignore guard below
 _GITIGNORE_COMMENT = "# hive-mcp scratch files (oversized tool output, auto-swept) — machine-local"
 _GITIGNORE_ENTRY = f"{_SCRATCH_DIRNAME}/"
 
@@ -47,18 +48,34 @@ _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 def _scratch_dir() -> Path:
-    return PROJECT_ROOT / _SCRATCH_DIRNAME
+    """config.HIVE_SCRATCH_ROOT — resolved centrally by config.py's Phase H
+    block (explicit HIVE_SCRATCH_ROOT override, or the new HIVE_DATA_ROOT/cache/
+    scratch/ default). No legacy-PROJECT_ROOT fallback here by design: scratch is
+    disposable TTL-swept cache (see this module's own docstring), so there is
+    never existing content worth preserving the way the skills registry / index
+    state's legacy-fallback branches preserve theirs — meaning this subsystem
+    can never actually hit config.PersistenceConflictError in practice. Still
+    routed through config.require_resolved_path() for structural consistency
+    with the other two subsystems (Phase H.1), not because this one can fail."""
+    return config.require_resolved_path(config.HIVE_SCRATCH_ROOT, "scratch")
 
 
 def ensure_scratch_dir() -> Path:
     """Create the scratch directory if missing, and self-register a .gitignore entry
-    for it the first time. Matches the existing convention every other hive-owned
-    dot-artifact already follows -- .hive_pending_actions/, .hive-index-state/, each
-    with its own explicit commented line; no broad .hive* wildcard exists to piggyback
-    on (confirmed by reading EkamApp's actual .gitignore, not assumed). Best-effort on
-    the .gitignore write: bookkeeping must never block the actual scratch write."""
+    for it — ONLY when it's still actually under PROJECT_ROOT (same guard
+    tools/skills_registry.py's ensure_skills_dir() uses). Phase H's new default
+    (HIVE_DATA_ROOT/cache/scratch/) lives outside the project tree entirely, so for
+    every fresh install this is now a no-op; it only still fires if HIVE_SCRATCH_ROOT
+    is explicitly overridden back to a PROJECT_ROOT-relative path. Best-effort on
+    the .gitignore write either way: bookkeeping must never block the actual
+    scratch write."""
     d = _scratch_dir()
     d.mkdir(parents=True, exist_ok=True)
+    try:
+        if PROJECT_ROOT not in d.parents:
+            return d
+    except Exception:
+        return d
     gitignore = PROJECT_ROOT / ".gitignore"
     try:
         existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""

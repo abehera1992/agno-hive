@@ -59,8 +59,7 @@ import structlog
 
 log = structlog.get_logger()
 
-_SKILLS_DIRNAME = ".hive_skills"
-_DB_FILENAME = "skills_registry.db"
+_SKILLS_DIRNAME = ".hive_skills"  # legacy dirname — only relevant if HIVE_SKILLS_DB_PATH resolves there (Phase H legacy-preserved case)
 _GITIGNORE_COMMENT = "# hive-mcp persistent skills registry (Phase 1.57a) — machine-local, not source"
 _GITIGNORE_ENTRY = f"{_SKILLS_DIRNAME}/"
 
@@ -168,14 +167,19 @@ def _row_to_record(row: sqlite3.Row) -> SkillRecord:
 
 
 def default_db_path() -> Path:
-    """HIVE_SKILLS_DB_PATH if explicitly set, otherwise a dedicated
-    PROJECT_ROOT/.hive_skills/skills_registry.db — persists across a container
-    restart because PROJECT_ROOT is the host-mounted project volume, with no
-    compose/volume change needed. Mirrors tools/scratch.py's identical
-    "dedicated dot-directory under PROJECT_ROOT" precedent."""
-    if config.HIVE_SKILLS_DB_PATH:
-        return Path(config.HIVE_SKILLS_DB_PATH)
-    return config.PROJECT_ROOT / _SKILLS_DIRNAME / _DB_FILENAME
+    """config.HIVE_SKILLS_DB_PATH — fully resolved by the centralized Phase H
+    path-resolution block in config.py (explicit override, legacy-preserved, or
+    the new HIVE_DATA_ROOT/registry/ default; see that block's own docstring).
+    This function no longer has its own PROJECT_ROOT-relative fallback — Phase H's
+    own requirement is exactly this: one centralized resolver, not one invented
+    per module.
+
+    Raises config.PersistenceConflictError (Phase H.1) if legacy and new-default
+    skills data both exist and were never reconciled — this is the ACTUAL
+    enforcement point for "a conflict blocks this subsystem": every real caller
+    (register_skill, get_platform_skill, list_platform_skills, ...) reaches the
+    registry's db_path through this function first."""
+    return config.require_resolved_path(config.HIVE_SKILLS_DB_PATH, "skills_registry")
 
 
 def ensure_skills_dir(db_path: Path) -> None:

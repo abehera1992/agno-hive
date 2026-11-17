@@ -344,6 +344,44 @@ if __name__ == "__main__":
         project_root=str(config.PROJECT_ROOT),
         write_review=config.WRITE_REVIEW,
     )
+
+    # Phase H.1 — emit every persistence-path decision through this SAME
+    # existing logger (never a new framework; structlog was already in use for
+    # the startup banner two lines above). Each HIVE_PERSISTENCE_NOTES entry is
+    # already a dict of exactly the fields required (subsystem, resolved_path,
+    # decision, legacy_path, legacy_has_data, new_default_path, new_has_data,
+    # message) — none of them are credentials, skill content, or database
+    # content; they are only paths and short decision labels, by construction
+    # (see config.py's own _resolve_persistent_path docstring).
+    for note in config.HIVE_PERSISTENCE_NOTES:
+        log.info("hive_persistence_decision", **note)
+
+    # Phase H.1 — fail startup clearly rather than silently running against
+    # ephemeral container storage. This is a BLANKET gate on HIVE_DATA_ROOT
+    # itself (distinct from the per-subsystem conflict check above, which
+    # blocks only one subsystem at actual-use time) — if the data root isn't
+    # genuinely persistent, EVERYTHING downstream of it is unsound, so this
+    # stops the process before it ever starts serving, not after.
+    _data_root_check = config.validate_data_root()
+    log.info(
+        "hive_data_root_check",
+        data_root=str(config.HIVE_DATA_ROOT),
+        ok=_data_root_check["ok"],
+        reason=_data_root_check["reason"],
+        checks=_data_root_check["checks"],
+        dev_override=config.HIVE_DATA_ROOT_ALLOW_EPHEMERAL,
+    )
+    if not _data_root_check["ok"]:
+        log.error("hive_data_root_check_failed", reason=_data_root_check["reason"])
+        print(
+            f"\nFATAL: HIVE_DATA_ROOT persistence check failed — refusing to start.\n"
+            f"  {_data_root_check['reason']}\n"
+            f"  Set HIVE_DATA_ROOT_ALLOW_EPHEMERAL=true to run without a mounted "
+            f"persistent volume (development only).\n",
+            file=sys.stderr, flush=True,
+        )
+        sys.exit(1)
+
     mcp.run(
         transport="streamable-http",
         host=config.MCP_HOST,

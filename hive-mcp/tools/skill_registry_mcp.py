@@ -33,12 +33,27 @@ sys.path.insert(0, str(Path(__file__).parent))         # tools/ itself -- siblin
 sys.path.insert(0, str(Path(__file__).parent.parent))  # hive-mcp/ -- not directly needed here, kept
                                                         # for consistency with every other tools/*.py
 
+import config
 import skills_registry as reg
 from skills_identity import IdentityResolutionError, resolve_identity
 
 import structlog
 
 log = structlog.get_logger()
+
+
+def _resolve_db_path():
+    """(db_path, None) on success, or (None, error_string) on a legacy/new
+    persistence CONFLICT (Phase H.1) -- centralizes the one failure mode every
+    function below must handle identically, the same way IdentityResolutionError
+    already is. A conflict means skills_registry.default_db_path() refused to
+    pick a side (see config.PersistenceConflictError's own docstring); this
+    surfaces that as the SAME clean "Error: ..." string shape every other
+    failure in this module already uses, instead of an unhandled exception."""
+    try:
+        return reg.default_db_path(), None
+    except config.PersistenceConflictError as e:
+        return None, f"Error: {e}"
 
 
 def _summary(rec: reg.SkillRecord, scope: str) -> dict:
@@ -59,7 +74,9 @@ def skill_registry_list() -> str:
     version, source, scope}. Returns an "Error: ..." string (never raises)
     if identity resolution itself fails (e.g. authenticated mode with no
     trusted identity available -- see module docstring)."""
-    db_path = reg.default_db_path()
+    db_path, err = _resolve_db_path()
+    if err:
+        return err
     try:
         identity = resolve_identity()
     except IdentityResolutionError as e:
@@ -78,7 +95,9 @@ def skill_registry_info(skill_id: str) -> str:
     not-found exactly like a skill_id that doesn't exist at all (see
     skills_registry.SkillNotFoundError's own docstring). Returns a JSON
     object, or an "Error: ..." string."""
-    db_path = reg.default_db_path()
+    db_path, err = _resolve_db_path()
+    if err:
+        return err
     try:
         identity = resolve_identity()
     except IdentityResolutionError as e:
@@ -121,7 +140,9 @@ def skill_registry_resolve(skill_id: str) -> str:
     identity is reported not-found exactly like a nonexistent one; disabled
     records are likewise already excluded by resolve_skill() itself. Returns
     a JSON object, or an "Error: ..." string (never raises)."""
-    db_path = reg.default_db_path()
+    db_path, err = _resolve_db_path()
+    if err:
+        return err
     try:
         identity = resolve_identity()
     except IdentityResolutionError as e:
@@ -170,7 +191,9 @@ def skill_registry_import(
     owns.
 
     Returns a JSON object on success, or an "Error: ..." string."""
-    db_path = reg.default_db_path()
+    db_path, err = _resolve_db_path()
+    if err:
+        return err
     try:
         identity = resolve_identity()
     except IdentityResolutionError as e:
