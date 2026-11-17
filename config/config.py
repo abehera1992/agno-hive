@@ -375,6 +375,26 @@ class Config:
     # silent multi-minute stall only an external process kill can end.
     model_request_timeout_s: float = float(os.getenv("MODEL_REQUEST_TIMEOUT_S", "120"))
 
+    # Dedicated, longer timeout for propose_from_text()'s own one-off structured-output call
+    # (Phase 1.56b) -- NOT a change to model_request_timeout_s above, which stays untouched
+    # for every other caller. Root-caused live during Phase 1.56a's T14 run: the real
+    # exception was openai.APITimeoutError, whose own hardcoded message ("Request timed
+    # out.", found verbatim in the installed openai package's _exceptions.py) exactly matched
+    # what was observed, raised by this same 120s value -- while LiteLLM's own gateway-side
+    # request_timeout (600s, zgx-ai-setup/litellm-config.yaml) never got anywhere near firing,
+    # ruling out the gateway or backend as the proximate cause. The mechanism: unlike the
+    # streaming tool-call turns model_request_timeout_s's own docstring above is about,
+    # propose_from_text()'s Agent.arun() call runs non-streaming (no stream=True anywhere in
+    # that call chain; agno/agent/_run.py's own `if opts.stream:` branch takes the non-stream
+    # path by default). httpx's single-float `timeout` is a read timeout measured as the gap
+    # between chunks -- for a non-streaming request there is only one chunk, delivered after
+    # the entire generation completes server-side, so the "gap" IS the whole generation time.
+    # At Devstral's measured ~4.2-5 tok/s on this hardware, 120s cannot reliably finish a
+    # several-hundred-token structured WorkProposal even though the model is actively and
+    # continuously generating, not hung. Used only by propose_from_text()'s own dedicated
+    # model copy (see that module) -- the model object any other caller holds is unaffected.
+    proposal_request_timeout_s: float = float(os.getenv("PROPOSAL_REQUEST_TIMEOUT_S", "300"))
+
     # Liveness-based auto-kill (Recommendation #2, 2026-08-13 -- see DOCS.md
     # "Liveness-Based Auto-Kill"). The token caps above bound any SINGLE generation,
     # and tool_call_limit/max_iterations eventually bound the whole loop -- but a run
