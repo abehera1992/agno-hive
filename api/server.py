@@ -19,6 +19,7 @@ from api.models import (
     ClarificationRequest, ChunkedRunRequest, ChunkedRunResponse,
     TeamRoleToolEntry, TeamRoleSkillEntry, InstructionOverlayCreate, InstructionOverlayPatch,
     InstructionOverlayOut, TeamGateFlagEntry, RegistryRefreshRequest, TeamConfigReloadResponse,
+    ProposalDecisionRequest, ProposalDecisionResponse,
 )
 from fastapi.responses import StreamingResponse
 from swarm.ollama import ensure_models
@@ -405,6 +406,44 @@ async def ledger_tasks(limit: int = 20):
     if not Path(led.path).exists():
         return {"tasks": []}
     return {"tasks": await led._a(led.list_tasks, max(1, min(limit, 100)))}
+
+
+@app.post("/ledger/proposals/{proposal_id}/decide", response_model=ProposalDecisionResponse)
+async def ledger_decide_proposal(proposal_id: str, request: ProposalDecisionRequest):
+    """Phase 1.58: THE only way a persisted proposal becomes approved (or
+    rejected) for execution. A plain HTTP route -- no MCP tool anywhere wraps
+    it, so no agent (Researcher included) has a channel to call it; only an
+    operator or an application-side approval workflow posts here. Once
+    approved, the SAME proposal_id is posted as RunRequest.proposal_id to
+    /run or /stream (with orchestration=workflow, team=engineering) to
+    actually execute it -- see swarm.eng_workflow.run_engineering_workflow()'s
+    `proposal_id` parameter for the authorization gate this decision feeds."""
+    from swarm.ledger import Ledger, LedgerError
+    led = Ledger()
+    await led.ainit()
+    try:
+        result = await led._a(led.decide_proposal, proposal_id, request.approved, request.decided_by, request.reason)
+    except LedgerError as e:
+        raise HTTPException(status_code=404, detail=f"unknown proposal: {e}")
+    return ProposalDecisionResponse(proposal_id=proposal_id, recorded=result["recorded"],
+                                    approved=result["approved"], reason=result.get("reason"))
+
+
+@app.get("/ledger/proposals/{proposal_id}")
+async def ledger_get_proposal(proposal_id: str):
+    """Read-only: the proposal's own validation verdict plus its current
+    decision (None if not yet reviewed) -- what an operator inspects before
+    posting to .../decide."""
+    from swarm.ledger import Ledger, LedgerError
+    led = Ledger()
+    if not Path(led.path).exists():
+        raise HTTPException(status_code=404, detail="no ledger")
+    try:
+        exec_check = await led._a(led.get_executable_proposal, proposal_id)
+    except LedgerError:
+        raise HTTPException(status_code=404, detail="unknown proposal")
+    decision = await led._a(led.get_proposal_decision, proposal_id)
+    return {"proposal_id": proposal_id, "executable": exec_check, "decision": decision}
 
 
 @app.on_event("startup")
@@ -1622,6 +1661,16 @@ async def _run_impl(request: RunRequest, http_request: Request):
     # kills, zero anyio errors, including one mid-write.
     engine, engine_reason = _select_engine("run", request.orchestration, team_name=gate_team_name,
                                            custom_agents=bool(request.agents), read_only=request.read_only)
+    # Phase 1.58: a proposal-driven run only has somewhere to go on the Workflow
+    # engine (run_engineering_workflow's own authorization gate) -- never the Team
+    # path, which has no concept of a persisted proposal at all. Rejected here,
+    # explicitly, rather than silently falling through to a normal task-text Team
+    # run that ignores proposal_id entirely.
+    if request.proposal_id and engine != "workflow":
+        raise HTTPException(status_code=422, detail={
+            "error": "proposal_requires_workflow_engine", "proposal_id": request.proposal_id,
+            "engine": engine, "engine_reason": engine_reason,
+            "hint": "set orchestration=workflow and ensure team=engineering, read_only=true"})
     worker_payload = {
         "task": request.task,
         "agent_specs": [a.model_dump() for a in agent_specs] if agent_specs else None,
@@ -1644,6 +1693,7 @@ async def _run_impl(request: RunRequest, http_request: Request):
         "knowledge_key": "kn-" + uuid.uuid4().hex[:16],      # Phase 1.20: one retrieval per top-level request
         "evidence_policy": request.evidence_policy,
         "requested_skills": request.requested_skills,       # Phase 1.57c: forwarded as-is; resolved inside run_task_async
+        "proposal_id": request.proposal_id,                 # Phase 1.58: forwarded as-is; authorized+planned inside run_engineering_workflow
     }
     result, tokens, clarification = await _run_worker_subprocess(http_request, worker_payload)
 
@@ -1944,6 +1994,12 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
     # done event); an explicit orchestration=workflow is rejected with 422 rather than silently run as Team.
     engine, engine_reason = _select_engine("stream", request.orchestration, team_name=gate_team_name,
                                            custom_agents=bool(request.agents), read_only=request.read_only)
+    # Phase 1.58: same guard as /run -- see that endpoint's own comment.
+    if request.proposal_id and engine != "workflow":
+        raise HTTPException(status_code=422, detail={
+            "error": "proposal_requires_workflow_engine", "proposal_id": request.proposal_id,
+            "engine": engine, "engine_reason": engine_reason,
+            "hint": "set orchestration=workflow and ensure team=engineering, read_only=true"})
 
     mcp_url = request.mcp_url or config.mcp_url
 
@@ -2014,6 +2070,7 @@ async def stream_endpoint(request: RunRequest, http_request: Request):
                 "workflow_controls": request.workflow_controls,
                 "evidence_policy": request.evidence_policy,
                 "requested_skills": request.requested_skills,
+                "proposal_id": request.proposal_id,          # Phase 1.58: same field /run already threads through
             })
 
             async for chunk in stream_source:

@@ -110,6 +110,38 @@ class RunRequest(BaseModel):
     # every request for a stable, round-trippable contract, but only acted on by
     # /run's workflow path today. See Phase 1.57c's report for the full boundary.
     requested_skills: list[str] | None = None
+    # Phase 1.58: when set, this run's entire plan is built from a persisted,
+    # previously-APPROVED WorkProposal (swarm.proposal.WorkProposal, recorded by
+    # Phase 1.55/1.56's propose=True path and authorized via
+    # POST /ledger/proposals/{proposal_id}/decide) instead of from `work_items`/
+    # task-phrase planning. Only acted on by orchestration="workflow" +
+    # team="engineering" (see api/server.py's own validation: a request that sets
+    # this but does not resolve to the workflow engine is rejected with 422, never
+    # silently run as a normal Team/Workflow task-text request). None (every
+    # existing caller) is completely unaffected -- see
+    # swarm.eng_workflow.run_engineering_workflow()'s own `proposal_id` docstring
+    # for the full authorization-gate/plan-from-proposal mechanism.
+    proposal_id: str | None = None
+
+
+class ProposalDecisionRequest(BaseModel):
+    """Phase 1.58: the ONLY request shape that can authorize (or reject) a
+    persisted proposal for execution. Posted to
+    POST /ledger/proposals/{proposal_id}/decide -- a plain HTTP route with no
+    MCP tool wrapping it anywhere, so no agent (Researcher included) has any
+    channel to call it. That is the actual enforcement of "Researcher cannot
+    authorize its own proposal" -- a structural boundary, not a prompt rule."""
+    approved: bool
+    decided_by: str
+    reason: str = ""
+
+
+class ProposalDecisionResponse(BaseModel):
+    proposal_id: str
+    recorded: bool
+    approved: bool
+    reason: str | None = None
+
 
 class SessionMeta(BaseModel):
     session_id: str

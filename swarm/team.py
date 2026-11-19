@@ -4580,13 +4580,24 @@ class ResolvedSkillPin:
     registry held at resolution time (Phase 1.57c). Deliberately carries NO
     content/supporting_files — this phase passes pins as explicit workflow
     input only; fetching and injecting the actual skill body into an agent
-    is Phase 1.57d's job, not this one's."""
+    is Phase 1.57d's job, not this one's.
+
+    `target_role` (Phase 1.58, default None — every existing caller/pin
+    unaffected): which role this pin was resolved FOR, in a role-aware
+    (per-work-item) resolution — see swarm.eng_workflow's s_execute, which
+    builds a copy of a resolver-returned pin via dataclasses.replace(...,
+    target_role=item_role) rather than this class ever setting it itself.
+    None for every task-wide (non-role-scoped) requested_skills pin, exactly
+    as before this phase. `category` ("platform" | "third_party", already
+    present since 1.57c) already IS this record's assignment-type/ownership
+    distinction — no separate field was added for that."""
     skill_id: str
     name: str
     category: str
     version: int
     source: str | None
     content_hash: str
+    target_role: str | None = None
 
 
 class RequestedSkillResolutionError(Exception):
@@ -30027,6 +30038,7 @@ async def _run_workflow_engine(
     task: str, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
     project_id: str, session_id, *, workflow_controls, work_items, idempotency_key,
     liveness_path, liveness_nonce, knowledge, evidence_policy, requested_skills,
+    proposal_id: str | None = None,
 ) -> tuple[str, dict, dict | None]:
     """Resolve requested_skills, then execute the engineering Workflow — the ONE
     place either entry point (run_task_async's /run path, run_task_stream's /stream
@@ -30040,7 +30052,18 @@ async def _run_workflow_engine(
     directly; run_task_stream (which must YIELD, not return, to honor its own
     generator contract) wraps it into one {"__done__": ...} event instead. Either
     way this function's own body — resolve, then call run_engineering_workflow() —
-    runs exactly once per call site, never duplicated."""
+    runs exactly once per call site, never duplicated.
+
+    `proposal_id` (Phase 1.58, default None — every existing caller unaffected):
+    forwarded unchanged to run_engineering_workflow(), which does ALL of the
+    actual proposal handoff (authorization gate, plan-from-proposal, per-item
+    role/skill resolution) — this function's own job is unchanged by its
+    presence: resolve any task-wide `requested_skills`, then call the Workflow.
+    A proposal-driven run typically passes no `requested_skills` of its own
+    (its skills come from the proposal's own per-item skill_ids instead,
+    resolved inside run_engineering_workflow) — both can technically coexist,
+    since they are stored on RunState under different, non-conflicting names
+    (`requested_skills` vs. `item_skills`)."""
     from swarm.eng_workflow import run_engineering_workflow
     reset_unavailable_tool_state()
     reset_peak_token_state()
@@ -30058,7 +30081,7 @@ async def _run_workflow_engine(
         project_id, session_id, controls_raw=workflow_controls, work_items=work_items,
         idempotency_key=idempotency_key, liveness_path=liveness_path,
         liveness_nonce=liveness_nonce, knowledge=knowledge, evidence_policy=evidence_policy,
-        resolved_skills=resolved_skills)
+        resolved_skills=resolved_skills, proposal_id=proposal_id)
 
 
 async def run_task_stream(
@@ -30081,6 +30104,7 @@ async def run_task_stream(
     idempotency_key: str | None = None,
     evidence_policy: dict | None = None,
     requested_skills: list[str] | None = None,
+    proposal_id: str | None = None,
 ):
     """Same setup as run_task_async but yields text chunks as the coordinator generates them.
 
@@ -30144,7 +30168,8 @@ async def run_task_stream(
                 task, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
                 project_id, session_id, workflow_controls=workflow_controls, work_items=work_items,
                 idempotency_key=idempotency_key, liveness_path=None, liveness_nonce=None,
-                knowledge=_knowledge, evidence_policy=evidence_policy, requested_skills=requested_skills)
+                knowledge=_knowledge, evidence_policy=evidence_policy, requested_skills=requested_skills,
+                proposal_id=proposal_id)
             done_event = {"__done__": True, "content": content, "tokens": tokens}
             if clarification:
                 done_event["clarification"] = clarification
@@ -35735,6 +35760,7 @@ async def run_task_async(
     knowledge_key: str | None = None,
     evidence_policy: dict | None = None,
     requested_skills: list[str] | None = None,
+    proposal_id: str | None = None,
 ) -> tuple[str, dict, dict | None]:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer.
 
@@ -35770,6 +35796,13 @@ async def run_task_async(
     (explicit, never silently dropped) before run_engineering_workflow() is
     even called.
 
+    `proposal_id` (Phase 1.58, default None — every existing caller
+    unaffected): forwarded unchanged to _run_workflow_engine() /
+    run_engineering_workflow() on the SAME orchestration="workflow" +
+    team_name="engineering" path `requested_skills` above already uses —
+    see run_engineering_workflow()'s own docstring for the authorization
+    gate and per-item role/skill handoff this actually performs.
+
     Returns (content, tokens, clarification). clarification is None on a normal
     completed answer; when the coordinator emitted a needs_clarification block
     (see _extract_clarification), it's {"question": str, "options": [...]} and
@@ -35800,7 +35833,7 @@ async def run_task_async(
                 project_id, session_id, workflow_controls=workflow_controls, work_items=work_items,
                 idempotency_key=idempotency_key, liveness_path=liveness_path,
                 liveness_nonce=liveness_nonce, knowledge=_knowledge, evidence_policy=evidence_policy,
-                requested_skills=requested_skills)
+                requested_skills=requested_skills, proposal_id=proposal_id)
         print(f"[team] orchestration=workflow requested but team_name={team_name!r} is not 'engineering' "
               f"(or no roster) -- using the Team path", flush=True)
     # Rebound BEFORE the roster is composed -- see run_task_stream for the reason.

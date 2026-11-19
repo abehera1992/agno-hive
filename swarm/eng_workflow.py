@@ -19,7 +19,9 @@ from the Workflow's own status.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
+import json
 import os
 import re
 import time
@@ -61,6 +63,24 @@ class WorkItem:
     # is the entire reason this field changes NOTHING for any work item that doesn't set it --
     # see select_capable_member()'s own docstring for what happens when it is set.
     required_capabilities: list = field(default_factory=list)
+    # Phase 1.58, all optional/additive -- None/empty for every work item plan_request()/
+    # plan_work_items() ever build, so neither of those pre-existing callers changes behavior.
+    # Populated only by plan_from_proposal() below, from a persisted, approved WorkProposal:
+    #   `role`        -- this ONE item's own acting role (s_execute reads `wi.role or role`,
+    #                     so an unset item still falls back to the task-wide `role` parameter
+    #                     exactly as before -- workload/capability-driven role selection, never
+    #                     a hardcoded Researcher->Coder->Executor->Reviewer sequence).
+    #   `depends_on`  -- other work_item_ids in THIS SAME plan that must already have reached a
+    #                     terminal decision before this one is attempted (see plan_from_proposal's
+    #                     own topological ordering -- s_execute's existing sequential loop needs
+    #                     no new scheduler to honor this, only the items arriving pre-ordered).
+    #   `skill_ids`   -- this item's own AUTHORIZED (unauthorized ones already filtered out by
+    #                     Ledger.get_executable_proposal) skill_id strings, resolved just-in-time
+    #                     in s_execute via the SAME swarm.team._resolve_requested_skills() Phase
+    #                     1.57c already uses -- never a second resolution mechanism.
+    role: Optional[str] = None
+    depends_on: list = field(default_factory=list)
+    skill_ids: list = field(default_factory=list)
 
 
 @dataclass
@@ -217,6 +237,63 @@ def plan_request(task: str, task_id: str, supplied_policy_spec: dict | None = No
     return WorkPlan(task_id, [wi])
 
 
+def plan_from_proposal(exec_payload: dict, task_id: str) -> WorkPlan:
+    """Phase 1.58: builds a WorkPlan from Ledger.get_executable_proposal()'s own
+    `work_items` rows. Those rows were already deterministically validated by
+    swarm.proposal.validate_proposal() at proposal-RECORD time (role is a known role,
+    no dependency cycle, no dangling depends_on, no mutating required_capability --
+    see that function's own docstring) and already filtered for skill authorization by
+    get_executable_proposal() itself -- this function does no semantic re-validation of
+    its own, only structural translation into the Workflow's existing WorkItem/
+    evidence-policy shape, the same division of labor plan_request() already has with
+    its own caller (api/server.py validates the HTTP request; plan_request() only plans).
+
+    Ordering: a topological sort on `depends_on` (DFS post-order -- a dependency is
+    guaranteed acyclic by validate_proposal()'s own _find_cycle() check at record time,
+    so a cycle here would be an upstream bug, never an expected input) so the result
+    list is already dependency-ordered before it ever reaches s_execute()'s existing,
+    UNMODIFIED sequential loop -- "reuse existing... orchestration architecture; no
+    parallel orchestration engine" is satisfied by feeding it pre-ordered work, not by
+    adding a second scheduler alongside it."""
+    rows = exec_payload["work_items"]
+    by_id = {r["proposed_work_item_id"]: r for r in rows}
+    ordered: list = []
+    seen: set = set()
+
+    def visit(wid: str) -> None:
+        if wid in seen or wid not in by_id:
+            return
+        seen.add(wid)
+        for dep in by_id[wid]["depends_on"]:
+            visit(dep)
+        ordered.append(wid)
+
+    for wid in by_id:
+        visit(wid)
+
+    items = []
+    for wid in ordered:
+        r = by_id[wid]
+        objective = r["objective"] or ""
+        paths = extract_paths(objective)
+        items.append(WorkItem(
+            work_item_id=wid, title=objective[:80] or wid,
+            target=("Files named in the objective: " + " ; ".join(paths)) if paths
+                   else "The proposed objective as stated; use your own search and read tools "
+                        "to find and read the relevant source.",
+            objective=objective,
+            evidence_required=r.get("expected_evidence") or
+                "For every claim: the file path and line you read it in, taken from source "
+                "content you actually read with your own tools.",
+            completion_criteria=r.get("acceptance_criteria") or
+                "Done when the objective is satisfied with source evidence, or an explicit "
+                "statement of what could not be evidenced and why.",
+            paths=paths, policy=derive_policy(paths, objective),
+            required_capabilities=list(r["required_capabilities"]), role=r["role"],
+            depends_on=list(r["depends_on"]), skill_ids=list(r["authorized_skill_ids"])))
+    return WorkPlan(task_id, items)
+
+
 # ---------------------------------------------------------------------------- run state
 @dataclass
 class AttemptRecord:
@@ -291,6 +368,14 @@ class RunState:
     # injected into any agent. Empty for every run that didn't request any (which is
     # every caller before this phase, and every caller that still doesn't).
     requested_skills: list = field(default_factory=list)
+    # Phase 1.58: PER-WORK-ITEM resolved skill pins (role-aware execution context),
+    # keyed by work_item_id -- distinct from `requested_skills` above, which is one
+    # flat, TASK-wide list. Populated only for a proposal-driven plan (plan_from_proposal
+    # items with a non-empty skill_ids); empty for every task-phrase/work_items-string
+    # plan, exactly like requested_skills was before this phase. Same restraint as
+    # Phase 1.57c: explicit workflow input/lineage only, never injected into any agent's
+    # instructions or tools (that remains out of scope, per that phase's own docstring).
+    item_skills: dict = field(default_factory=dict)
 
     def remaining(self) -> Optional[float]:
         return None if self.deadline_mono is None else self.deadline_mono - time.monotonic()
@@ -1515,7 +1600,7 @@ async def run_engineering_workflow(
     task: str, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
     project_id: str, session_id, controls_raw=None, registry=None, work_items=None, idempotency_key=None,
     liveness_path=None, liveness_nonce=None, knowledge=None, evidence_policy=None, role: str = "researcher",
-    propose: bool = False, resolved_skills=None,
+    propose: bool = False, resolved_skills=None, proposal_id: Optional[str] = None,
 ):
     """Entry point called from swarm.team.run_task_async when orchestration == "workflow".
     Returns (content, tokens, clarification) exactly like the Team path.
@@ -1550,7 +1635,19 @@ async def run_engineering_workflow(
     here is known-valid and known-owned-by-the-active-identity). Stored on `st`
     (RunState.requested_skills) as explicit workflow input ONLY -- nothing in this
     function (or anything it calls) reads it to inject content into any agent's
-    instructions or tools. That remains Phase 1.57d's job."""
+    instructions or tools. That remains Phase 1.57d's job.
+
+    `proposal_id` (Phase 1.58, default None -- every existing caller unaffected):
+    when set, this run's ENTIRE plan is built from a persisted, previously-APPROVED
+    WorkProposal instead of from `work_items`/task-phrase planning -- see
+    Ledger.get_executable_proposal()/plan_from_proposal(). Checked immediately after
+    the ledger is ready and BEFORE any MCP connection, knowledge preparation, or
+    agent dispatch: an unapproved, invalid, or stale proposal returns a NOT
+    ESTABLISHED result right here, having spent nothing. Mutually exclusive with
+    `work_items` by construction of this phase's only caller (api/server.py) --
+    this function itself does not need to enforce that, since when `proposal_id` is
+    set it takes over planning entirely and `work_items` (if also somehow present)
+    is simply never consulted."""
     from agno.tools.mcp import MCPTools
     from agno.workflow import Workflow, Step
     import swarm.team as T
@@ -1612,6 +1709,26 @@ async def run_engineering_workflow(
         st.emit("requested_skills_resolved",
                 skill_ids=[p.skill_id for p in st.requested_skills],
                 versions={p.skill_id: p.version for p in st.requested_skills})
+
+    # Phase 1.58: the single authorization gate. Checked BEFORE any MCP connection,
+    # knowledge preparation, or agent dispatch -- an unapproved/invalid/stale proposal
+    # is rejected having spent nothing, and is reported as an explicit, non-success
+    # NOT ESTABLISHED result, never a silent success ("Failures must not silently
+    # become successful or completed executions").
+    exec_payload = None
+    if proposal_id:
+        try:
+            exec_payload = await led._a(led.get_executable_proposal, proposal_id)
+        except Exception as e:  # noqa: BLE001 -- fail closed: an unreadable ledger can never authorize execution
+            exec_payload = {"ok": False, "reason": f"ledger unavailable ({repr(e)[:100]})"}
+        if not exec_payload.get("ok"):
+            st.emit("proposal_rejected", proposal_id=proposal_id, reason=exec_payload.get("reason"))
+            st.final = (f"## Investigation result: NOT ESTABLISHED\ntask `{task_id}` · proposal `{proposal_id}`\n\n"
+                        f"This proposal was not executed: {exec_payload.get('reason')}.\n")
+            if hb_task is not None:
+                hb_task.cancel()
+            return st.final, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, None
+        st.emit("proposal_accepted", proposal_id=proposal_id, work_items=len(exec_payload["work_items"]))
 
     effective_mcp_url = mcp_url or T.config.mcp_url
     all_mcp_urls = [u for u in (mcp_urls or []) + [effective_mcp_url] if u]
@@ -1698,7 +1815,11 @@ async def run_engineering_workflow(
         async def s_plan(step_input):
             st.steps_run.append("plan")
             st.wf_state = "planning"
-            st.plan = (plan_work_items(work_items, task_id, supplied_policy_spec=evidence_policy) if work_items
+            # Phase 1.58: a proposal-driven run takes over planning entirely -- the
+            # authorization gate above already confirmed it is approved/valid/not stale,
+            # and plan_from_proposal() does the structural translation, never a model.
+            st.plan = (plan_from_proposal(exec_payload, task_id) if proposal_id
+                      else plan_work_items(work_items, task_id, supplied_policy_spec=evidence_policy) if work_items
                       else plan_request(task, task_id, supplied_policy_spec=evidence_policy))
             if st.plan.items and st.ledger is not None:
                 try:     # the plan is durable before ANY attempt can exist
@@ -1734,6 +1855,24 @@ async def run_engineering_workflow(
             # work item in a task still shares this one role; a future multi-stage sequencer that
             # resolves role per work item/stage is dynamic planning's job, out of this phase's scope.
             for wi in (st.plan.items if st.plan else []):
+                # Phase 1.58: this item's own acting role, falling back to the task-wide
+                # `role` parameter when unset (every pre-1.58 WorkItem, always) -- workload/
+                # capability-driven role selection, never a hardcoded pipeline sequence.
+                item_role = wi.role or role
+                if wi.skill_ids:
+                    hive_for_item_skills = T._pick_hive_mcp_url(all_mcp_urls, effective_mcp_url)
+                    try:
+                        pins = await T._resolve_requested_skills(hive_for_item_skills, wi.skill_ids)
+                    except T.RequestedSkillResolutionError as e:  # noqa: BLE001 -- fail closed per item, never silently granted
+                        st.emit("work_item_skills_rejected", work_item=wi.work_item_id, role=item_role,
+                                reasons=e.reasons)
+                        pins = []
+                    else:
+                        pins = [dataclasses.replace(p, target_role=item_role) for p in pins]
+                        st.item_skills[wi.work_item_id] = pins
+                        st.emit("work_item_skills_resolved", work_item=wi.work_item_id, role=item_role,
+                                skill_ids=[p.skill_id for p in pins],
+                                categories={p.skill_id: p.category for p in pins})
                 c = item_controls(controls, wi.work_item_id)
                 n = 1
                 while n <= MAX_ATTEMPTS_PER_ITEM:
@@ -1747,12 +1886,12 @@ async def run_engineering_workflow(
                     if sup:
                         # Control: a newer generation starts while attempt 1 is still running. The registry marks
                         # attempt 1 SUPERSEDED the moment attempt 2 starts; attempt 1 keeps running and finishes late.
-                        t1 = asyncio.ensure_future(run_attempt(st, wi, ctx, c, 1, role=role, propose=propose))
+                        t1 = asyncio.ensure_future(run_attempt(st, wi, ctx, c, 1, role=item_role, propose=propose))
                         done, _ = await asyncio.wait({t1}, timeout=float(sup))
                         if not done:
                             c2 = {k: v for k, v in c.items() if k not in ("supersede_after_s", "delay_tool_s", "cancel_after_s")}
                             st.emit("supersede_started", work_item=wi.work_item_id)
-                            rec2 = await run_attempt(st, wi, ctx, c2, 2, role=role, propose=propose)
+                            rec2 = await run_attempt(st, wi, ctx, c2, 2, role=item_role, propose=propose)
                             reconstruct_missing_terminal_from_evidence(rec2.attempt)
                             d2 = await assess_and_register(st, wi, rec2, c)
                             rec1 = await t1                       # the old attempt finishes LATE
@@ -1763,7 +1902,7 @@ async def run_engineering_workflow(
                             break
                         rec = t1.result()
                     else:
-                        rec = await run_attempt(st, wi, ctx, c, n, role=role, propose=propose)
+                        rec = await run_attempt(st, wi, ctx, c, n, role=item_role, propose=propose)
                     # Phase 1.39: the original-attempt (and plain-retry) equivalent of Phase
                     # 1.37's recovery-specific evidence rescue -- see
                     # reconstruct_missing_terminal_from_evidence()'s own docstring for the
@@ -1828,7 +1967,7 @@ async def run_engineering_workflow(
                                             new_read_ceiling=ext["new_read_ceiling"],
                                             new_discovery_ceiling=ext["new_discovery_ceiling"])
                                 recovered = await recover_and_reconcile(st, wi, ctx, c_recovery, rec, d, n + 1,
-                                                                       extension_info=ext, role=role,
+                                                                       extension_info=ext, role=item_role,
                                                                        propose=propose)
                                 if recovered is not None:
                                     rec, d = recovered

@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-SCHEMA_VERSION = 4   # Phase 1.22: + attempt.trace_sha (see init_schema()'s migration).
+SCHEMA_VERSION = 5   # Phase 1.22: + attempt.trace_sha (see init_schema()'s migration).
                      # Phase 1.55: + attempt.role/stage_name/stage_index/parent_attempt_id
                      # (nullable, forward-compatible lineage columns -- see init_schema()'s
                      # migration and start_attempt()'s own docstring for what populates them
@@ -42,6 +42,11 @@ SCHEMA_VERSION = 4   # Phase 1.22: + attempt.trace_sha (see init_schema()'s migr
                      # ORIGINAL proposal, not a second copy of the validation outcome.
                      # proposal_work_item is UNCHANGED: still written only when valid=1, still the
                      # only place anything work-item-shaped for a REJECTED proposal does not exist.
+                     # Phase 1.58: + proposal_decision -- the APPLICATION's own authorization
+                     # record for turning a persisted, valid proposal into dispatchable work
+                     # (see decide_proposal()/get_executable_proposal()). A brand-new table,
+                     # same as proposal/proposal_work_item were at 1.55 -- needs no column
+                     # migration on an existing database, only the version-counter bump below.
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / "data" / "workflow_ledger.db"
 
 # attempt states. Terminal ones never change again except RUNNING/FINISHED -> invalidated.
@@ -135,6 +140,16 @@ CREATE TABLE IF NOT EXISTS proposal_work_item (
   required_capabilities_json TEXT NOT NULL, proposed_skills_json TEXT NOT NULL,
   acceptance_criteria TEXT, expected_evidence TEXT,
   PRIMARY KEY (proposal_id, proposed_work_item_id));
+-- Phase 1.58: the APPLICATION's own decision on a proposal -- never written by the
+-- Researcher or any agent (no MCP tool exposes this -- only decide_proposal(), called
+-- from api/server.py's own HTTP-only /ledger/proposals/{id}/decide route, ever writes
+-- a row here). One row per proposal_id, first decision wins (see decide_proposal()).
+-- `approved=1` on a proposal whose own `valid` is 0 can never be written --
+-- decide_proposal() enforces this the same way record_proposal() enforces "an invalid
+-- proposal never becomes executable work" for proposal_work_item.
+CREATE TABLE IF NOT EXISTS proposal_decision (
+  proposal_id TEXT PRIMARY KEY REFERENCES proposal(proposal_id), task_id TEXT NOT NULL,
+  approved INTEGER NOT NULL, decided_by TEXT NOT NULL, reason TEXT, decided_at REAL NOT NULL);
 """
 
 # Phase 1.55: split out from _DDL above and run SEPARATELY, AFTER the version-gated ALTER
@@ -236,7 +251,7 @@ class Ledger:
             else:
                 current = int(row["v"])
                 if current != SCHEMA_VERSION:
-                    if current not in (1, 2, 3):
+                    if current not in (1, 2, 3, 4):
                         raise LedgerError(f"ledger schema version {current} != expected {SCHEMA_VERSION} "
                                           f"(no migration path from {current}); refusing to use it")
                     # Sequential, not a single pairwise check: a database still at version 1 must
@@ -270,6 +285,14 @@ class Ledger:
                         if "raw_proposal_json" not in cols:
                             c.execute("ALTER TABLE proposal ADD COLUMN raw_proposal_json TEXT")
                         current = 4
+                    if current == 4:
+                        # Phase 1.58: proposal_decision is a brand-new table -- step 1's CREATE
+                        # TABLE IF NOT EXISTS already created it unconditionally, for a fresh
+                        # database and an existing one alike. Nothing to ALTER; this step only
+                        # advances the version counter, the same no-op-migration shape 1.55's
+                        # proposal/proposal_work_item tables used at version 2->... (no entry
+                        # was needed there either, for the identical reason).
+                        current = 5
                     c.execute("UPDATE ledger_meta SET v=? WHERE k='schema_version'", (str(SCHEMA_VERSION),))
 
             # 3) Indexes -- every column any index references is now guaranteed to exist,
@@ -549,6 +572,113 @@ class Ledger:
             d["raw_proposal"] = json.loads(raw) if raw else None
             d["work_items"] = items
             return d
+        finally:
+            c.close()
+
+    # ------------------------------------------------------------------ proposal authorization (Phase 1.58)
+    def decide_proposal(self, proposal_id: str, approved: bool, decided_by: str, reason: str = "") -> dict:
+        """THE single place a persisted proposal becomes authorized (or rejected) for
+        execution -- never called from inside a Researcher/agent tool surface, only from
+        api/server.py's own HTTP-only `/ledger/proposals/{id}/decide` route. That boundary
+        (no MCP tool anywhere calls this) is the actual enforcement of "Researcher cannot
+        authorize its own proposal" -- the Researcher process has no channel to reach this
+        method at all, not a policy check inside it that a prompt could talk around.
+
+        Idempotent per proposal_id (first decision wins, same pattern as commit_decision()/
+        record_proposal()): a second call returns the ALREADY-RECORDED decision rather than
+        overwriting it -- a decision, once made, is a durable fact, not a toggle.
+
+        Fails closed on `approved=True` for a proposal whose own `valid` is 0: an invalid
+        proposal can never be approved, mirroring record_proposal()'s "an invalid proposal
+        never becomes executable work" for proposal_work_item. A REJECTION of an invalid
+        proposal is allowed (and the obvious real-world case) -- only approval of one is
+        refused."""
+        def go(c):
+            self._maybe_fail("decide_proposal")
+            p = c.execute("SELECT proposal_id, task_id, valid FROM proposal WHERE proposal_id=?",
+                          (proposal_id,)).fetchone()
+            if p is None:
+                raise LedgerError(f"unknown proposal {proposal_id}")
+            prior = c.execute("SELECT approved, decided_by, reason FROM proposal_decision WHERE proposal_id=?",
+                              (proposal_id,)).fetchone()
+            if prior is not None:
+                return {"recorded": False, "reason": "IDEMPOTENT_DUPLICATE", "approved": bool(prior["approved"]),
+                        "decided_by": prior["decided_by"]}
+            if approved and not p["valid"]:
+                return {"recorded": False, "reason": "CANNOT_APPROVE_INVALID_PROPOSAL", "approved": False}
+            c.execute("INSERT INTO proposal_decision(proposal_id,task_id,approved,decided_by,reason,decided_at) "
+                      "VALUES(?,?,?,?,?,?)",
+                      (proposal_id, p["task_id"], int(bool(approved)), decided_by, (reason or "")[:300], time.time()))
+            return {"recorded": True, "approved": bool(approved), "decided_by": decided_by}
+        return self._tx(go)
+
+    def get_proposal_decision(self, proposal_id: str) -> Optional[dict]:
+        """Read-side counterpart to decide_proposal(). None if no decision was ever
+        recorded for this proposal_id (not yet reviewed, or review was skipped)."""
+        c = self._conn()
+        try:
+            r = c.execute("SELECT * FROM proposal_decision WHERE proposal_id=?", (proposal_id,)).fetchone()
+            return dict(r) if r else None
+        finally:
+            c.close()
+
+    def get_executable_proposal(self, proposal_id: str) -> dict:
+        """THE single authorization gate between a persisted proposal and dispatchable
+        work (Phase 1.58's own "application-controlled execution" requirement). Returns
+        either {"ok": True, "objective": str, "work_items": [...]} or
+        {"ok": False, "reason": "<code>"} -- NEVER a partial list and never raises for a
+        normal rejection path (unapproved/invalid/stale); only a genuinely unknown
+        proposal_id raises LedgerError, consistent with every other *_id lookup here.
+
+        Rejection reasons, checked in this order (the first one that applies wins):
+          PROPOSAL_INVALID              -- validate_proposal() never accepted it
+          STALE_TASK_ALREADY_FINALIZED  -- the task this proposal belongs to already
+                                            finished (by a Team/Workflow run, or by a
+                                            different, later proposal) -- executing it
+                                            now would dispatch work for a task that is
+                                            durably done
+          NOT_APPROVED                  -- decide_proposal() was never called for it
+          REJECTED                      -- decide_proposal() was called with approved=False
+
+        Each returned work item's `authorized_skill_ids` is `proposed_skills_json` MINUS
+        whatever the proposal's own `unauthorized_skills_json` flagged for that exact
+        work_item_id -- validate_proposal() stores the full original proposed_skills list
+        on proposal_work_item regardless of authorization (Phase 1.56c: "persist the
+        complete original WorkProposal... for audit"), so a caller that read
+        proposed_skills_json directly would re-expose a skill validate_proposal() itself
+        already flagged as unauthorized. This filtering happens ONCE, here, at the single
+        read path anything downstream uses to turn a proposal into dispatchable skill
+        input -- never left to be redone (or forgotten) by each caller."""
+        c = self._conn()
+        try:
+            p = c.execute("SELECT * FROM proposal WHERE proposal_id=?", (proposal_id,)).fetchone()
+            if p is None:
+                raise LedgerError(f"unknown proposal {proposal_id}")
+            if not p["valid"]:
+                return {"ok": False, "reason": "PROPOSAL_INVALID"}
+            t = c.execute("SELECT status FROM task WHERE task_id=?", (p["task_id"],)).fetchone()
+            if t is not None and t["status"] == "FINALIZED":
+                return {"ok": False, "reason": "STALE_TASK_ALREADY_FINALIZED"}
+            d = c.execute("SELECT approved FROM proposal_decision WHERE proposal_id=?", (proposal_id,)).fetchone()
+            if d is None:
+                return {"ok": False, "reason": "NOT_APPROVED"}
+            if not d["approved"]:
+                return {"ok": False, "reason": "REJECTED"}
+            unauthorized = json.loads(p["unauthorized_skills_json"] or "{}")
+            rows = c.execute(
+                "SELECT * FROM proposal_work_item WHERE proposal_id=? ORDER BY proposed_work_item_id",
+                (proposal_id,)).fetchall()
+            items = []
+            for r in rows:
+                d2 = dict(r)
+                all_skills = json.loads(d2.pop("proposed_skills_json") or "[]")
+                blocked = set(unauthorized.get(d2["proposed_work_item_id"], []))
+                d2["authorized_skill_ids"] = [s for s in all_skills if s not in blocked]
+                d2["blocked_skill_ids"] = [s for s in all_skills if s in blocked]
+                d2["depends_on"] = json.loads(d2.pop("depends_on_json") or "[]")
+                d2["required_capabilities"] = json.loads(d2.pop("required_capabilities_json") or "[]")
+                items.append(d2)
+            return {"ok": True, "objective": p["objective"], "work_items": items}
         finally:
             c.close()
 
