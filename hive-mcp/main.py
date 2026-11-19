@@ -49,6 +49,7 @@ from tools.symbol_index import structural_index
 from tools.skills import list_skills, load_skill
 from tools.skill_registry_mcp import (
     skill_registry_list, skill_registry_info, skill_registry_import, skill_registry_resolve,
+    skill_registry_get_content,
     skill_registry_import_begin, skill_registry_import_batch,
     skill_registry_import_finalize, skill_registry_import_abort,
 )
@@ -220,6 +221,13 @@ _tool(skill_registry_import)
 # which calls it directly over a bespoke MCP session (never through an
 # LLM/agent), the same pattern _fetch_skill_text already uses for load_skill.
 _tool(skill_registry_resolve)
+# skill_registry_get_content (Phase 1.58.1) -- the content-delivery tool
+# skill_registry_resolve's own docstring deferred as "Phase 1.57d". Same
+# CLI-only rule as every tool in this block; its real caller is
+# swarm/team.py's _fetch_resolved_skill_content(), over the SAME bespoke MCP
+# session pattern _resolve_requested_skills() already uses -- never through
+# an LLM/agent, never granted to any team's team_role_tools allowlist.
+_tool(skill_registry_get_content)
 # Staged import (Phase H.2) -- fixes the /skill import HTTP 413 failure for
 # packages whose encoded payload would exceed the mcp SDK's 4 MiB Streamable
 # HTTP request ceiling. CLI-only, same reasoning as the four tools above.

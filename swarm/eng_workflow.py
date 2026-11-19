@@ -81,6 +81,16 @@ class WorkItem:
     role: Optional[str] = None
     depends_on: list = field(default_factory=list)
     skill_ids: list = field(default_factory=list)
+    # Phase 1.58.1, additive/optional: pre-rendered, provenance-tagged injection text
+    # for THIS work item's own resolved skills (one entry per skill_ids pin whose
+    # content was fetched successfully) — populated by s_execute() once, right after
+    # resolving skill_ids (Phase 1.58's own step), BEFORE this item's own attempts
+    # start. Empty for every pre-1.58.1 work item and for any 1.58 work item with no
+    # skill_ids. Read only by run_attempt(), which injects it into a PER-ATTEMPT COPY
+    # of the acting role's own AgentSpec — never the shared `ctx["specs"]` list — so
+    # one work item's skill content can never reach another's agent call (Scope:
+    # "strict per-work-item isolation... never enter another item's prompt").
+    skill_blocks: list = field(default_factory=list)
 
 
 @dataclass
@@ -679,9 +689,26 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
             T._DELEGATION_READ_CEILING = controls["ceiling"]
         if controls.get("discovery_ceiling") is not None:
             T._DELEGATION_DISCOVERY_CEILING = controls["discovery_ceiling"]
+        # Phase 1.58.1: this work item's own resolved skill content, injected into a
+        # PER-ATTEMPT COPY of the acting role's AgentSpec only -- never `ctx["specs"]`
+        # itself, which is the SAME list object every other work item in this task
+        # also builds its team from. Mutating it in place would leak this item's
+        # skill content into every other item's agent, for the rest of the task --
+        # exactly what "strict per-work-item isolation... never fall back to
+        # task-wide injection" forbids. `_build_team` is already called fresh per
+        # attempt (see the comment below, pre-existing) specifically so a fresh
+        # roster can be built without disturbing shared state; `specs_for_attempt`
+        # reuses that same fresh-per-attempt lifecycle rather than adding a new one.
+        specs_for_attempt = ctx["specs"]
+        if wi.skill_blocks:
+            specs_for_attempt = [
+                sp.model_copy(update={"instructions": list(sp.instructions or []) + wi.skill_blocks})
+                if T._member_key(sp.name) == role else sp
+                for sp in ctx["specs"]
+            ]
         # A fresh team (hence a fresh acting agent, hooks and evidence state) per attempt: a retry inherits nothing.
         team = T._build_team(
-            ctx["specs"], ctx["coordinator"], ctx["ctools"], "coordinate", ctx["mcp_list"], [],
+            specs_for_attempt, ctx["coordinator"], ctx["ctools"], "coordinate", ctx["mcp_list"], [],
             read_only=True, skill_catalog=ctx["catalog"], task=wi.objective, team_name="engineering",
             activity=activity,
             project_id=ctx["project_id"], tool_call_limit_bonus=ctx["profile"].tool_call_limit_bonus)
@@ -973,7 +1000,8 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
                                  for r in P.KNOWN_ROLES}
             proposal_obj, validation = await P.propose_from_text(
                 att.text, wi.objective, agent.model,
-                known_capabilities=known_caps, authorized_skills_by_role=authorized_skills)
+                known_capabilities=known_caps, authorized_skills_by_role=authorized_skills,
+                skill_blocks=wi.skill_blocks)
             rec.proposal = proposal_obj
             rec.proposal_validation = validation
             # Phase 1.55: durable persistence, in its OWN try/except -- same pattern as
@@ -1873,6 +1901,26 @@ async def run_engineering_workflow(
                         st.emit("work_item_skills_resolved", work_item=wi.work_item_id, role=item_role,
                                 skill_ids=[p.skill_id for p in pins],
                                 categories={p.skill_id: p.category for p in pins})
+                        # Phase 1.58.1: deliver CONTENT for each already-authorized pin,
+                        # stored on `wi` itself (never on `st` or `ctx`, which are shared
+                        # across every work item in this task) -- see WorkItem.skill_blocks'
+                        # own docstring for the isolation reasoning. A content-fetch
+                        # failure for one pin is disclosed and skipped; it never fails this
+                        # work item or falls back to task-wide injection (Scope: "Do not
+                        # fall back to task-wide skill injection").
+                        blocks, injected_ids = [], []
+                        for p in pins:
+                            content = await T._fetch_resolved_skill_content(hive_for_item_skills, p)
+                            if content is None:
+                                st.emit("work_item_skill_content_unavailable", work_item=wi.work_item_id,
+                                        role=item_role, skill_id=p.skill_id)
+                                continue
+                            blocks.append(T._render_skill_injection_block(p, content))
+                            injected_ids.append(p.skill_id)
+                        wi.skill_blocks = blocks
+                        if blocks:
+                            st.emit("work_item_skills_injected", work_item=wi.work_item_id, role=item_role,
+                                    skill_ids=injected_ids, blocks=len(blocks))
                 c = item_controls(controls, wi.work_item_id)
                 n = 1
                 while n <= MAX_ATTEMPTS_PER_ITEM:

@@ -4589,8 +4589,19 @@ class ResolvedSkillPin:
     target_role=item_role) rather than this class ever setting it itself.
     None for every task-wide (non-role-scoped) requested_skills pin, exactly
     as before this phase. `category` ("platform" | "third_party", already
-    present since 1.57c) already IS this record's assignment-type/ownership
-    distinction — no separate field was added for that."""
+    present since 1.57c) is the OWNERSHIP distinction (who the skill belongs
+    to) — unrelated to `assignment_type` below.
+
+    `assignment_type` (Phase 1.58.1, default "user_requested" — every
+    existing pin/caller gets the same value every proposal-driven pin
+    already implicitly was): WHO decided this skill should be used, not who
+    owns it. "user_requested" — the Researcher's own proposal named this
+    skill (`proposed_skills`), the only source any current call site ever
+    produces. "application_curated" is reserved for a future pin sourced
+    from AgentSpec.skills (the pre-existing, team-YAML-curated catalog a
+    role's L1 index already advertises) — that path does not go through
+    this class at all today, so no call site actually sets this value;
+    documented here, not fabricated as live behavior."""
     skill_id: str
     name: str
     category: str
@@ -4598,6 +4609,7 @@ class ResolvedSkillPin:
     source: str | None
     content_hash: str
     target_role: str | None = None
+    assignment_type: str = "user_requested"
 
 
 class RequestedSkillResolutionError(Exception):
@@ -4695,6 +4707,108 @@ async def _resolve_requested_skills(hive_mcp_url: str | None, skill_ids: list[st
         print(f"[skills] requested_skills resolution rejected: {reasons}", flush=True)
         raise RequestedSkillResolutionError(reasons)
     return resolved
+
+
+# Phase 1.58.1: rewrites a hand-authored `${CLAUDE_PLUGIN_ROOT}/.claude/skills/<id>/`
+# reference (the form the ui-ux-pro-max package's own core SKILL.md documents every
+# script invocation with -- verified directly against the real package at
+# `AI/skills/ui-ux-pro-max-skill/.claude/skills/ui-ux-pro-max/SKILL.md`) down to the
+# bare relative path. That variable denotes the Claude Code PLUGIN install's own
+# repository root -- meaningless inside agno-hive's own runtime, which never installs
+# this package as a plugin at all: skill_registry_import() (cli/hive's
+# _read_skill_package) stores every non-SKILL.md file's CONTENT under a relative,
+# package-root-relative key (e.g. "scripts/search.py", "data/products.csv" --
+# verified directly against that function) in `supporting_files`, with no on-disk
+# path of its own on this side. Rewriting the reference to match that exact key
+# convention is the "resolve the assumption" fix the mission asks for -- done ONLY on
+# the in-memory copy injected into an agent's context, never on the original package
+# on disk (this function takes and returns a plain string; nothing here opens a file
+# under AI/skills/... or anywhere else).
+_PLUGIN_ROOT_SKILL_PATH_RE = re.compile(
+    r"\$\{CLAUDE_PLUGIN_ROOT\}/\.claude/skills/[A-Za-z0-9_-]+/")
+
+
+def _rewrite_plugin_root_refs(text: str) -> str:
+    """See _PLUGIN_ROOT_SKILL_PATH_RE's own comment for the full reasoning. Idempotent
+    and a pure string transform — safe to call on content that has none of this form
+    (returns it unchanged) and safe to call twice (a second call finds nothing left to
+    rewrite)."""
+    return _PLUGIN_ROOT_SKILL_PATH_RE.sub("", text or "")
+
+
+async def _fetch_resolved_skill_content(hive_mcp_url: str | None, pin: "ResolvedSkillPin") -> str | None:
+    """Phase 1.58.1: fetches the FULL content for an ALREADY-RESOLVED, ALREADY-
+    AUTHORIZED pin (one _resolve_requested_skills already returned) via the new
+    skill_registry_get_content tool — the same bespoke short-lived MCP session
+    pattern _resolve_requested_skills/_fetch_skill_text already use, never a second
+    resolution mechanism and never a new ownership check (skill_registry_get_content
+    reuses resolve_skill(), exactly like skill_registry_resolve does).
+
+    Returns None (never raises) on ANY failure: unreachable hive-mcp, a malformed
+    response, or — checked explicitly — a `content_hash` that no longer matches the
+    pin's own (the skill changed between resolution and this fetch; safer to inject
+    nothing than stale/mismatched content). A content-delivery failure for an
+    ALREADY-authorized pin is reported (logged) and the run proceeds without that
+    skill's content, same restrained failure posture as a missing task-shape skill
+    text (`_fetch_skill_text`, which also returns "" on failure rather than failing
+    the whole attempt) — the pin's AUTHORIZATION (the fail-closed decision) already
+    happened in _resolve_requested_skills; this step only delivers a body for a
+    decision that already stands."""
+    if not hive_mcp_url:
+        print(f"[skills] cannot fetch content for {pin.skill_id!r}: no hive-mcp URL resolved", flush=True)
+        return None
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    async def _call():
+        async with streamablehttp_client(hive_mcp_url) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                return await session.call_tool("skill_registry_get_content", {"skill_id": pin.skill_id})
+
+    try:
+        res = await asyncio.wait_for(_call(), timeout=_BESPOKE_MCP_SESSION_TIMEOUT)
+    except Exception as exc:
+        print(f"[skills] content fetch for {pin.skill_id!r} failed: {type(exc).__name__}: {exc}", flush=True)
+        return None
+    err = _mcp_error_text(res)
+    if err:
+        print(f"[skills] content fetch for {pin.skill_id!r} rejected: {err}", flush=True)
+        return None
+    text = _extract_mcp_text(res) or ""
+    if text.startswith("Error:"):
+        print(f"[skills] content fetch for {pin.skill_id!r} rejected: {text}", flush=True)
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        print(f"[skills] content fetch for {pin.skill_id!r}: unexpected response: {text[:200]}", flush=True)
+        return None
+    if data.get("content_hash") != pin.content_hash:
+        print(f"[skills] content fetch for {pin.skill_id!r}: content_hash changed since resolution "
+              f"({pin.content_hash} -> {data.get('content_hash')}) -- refusing stale content", flush=True)
+        return None
+    return data.get("content") or ""
+
+
+def _render_skill_injection_block(pin: "ResolvedSkillPin", content: str) -> str:
+    """Phase 1.58.1: the one place injected skill text is assembled, so every
+    injection site (the main investigation agent, the proposal-generation call) uses
+    an identical, provenance-tagged shape — never a bare content dump. Applies
+    _rewrite_plugin_root_refs() to the content (not to the header), so a package like
+    ui-ux-pro-max that documents `${CLAUDE_PLUGIN_ROOT}/...` script paths gets a
+    skill-relative path instead of a reference to an environment variable that does
+    not exist in this runtime."""
+    header = (
+        f"── Skill: {pin.name} (skill_id={pin.skill_id}, v{pin.version}, "
+        f"category={pin.category}, assignment_type={pin.assignment_type}, "
+        f"target_role={pin.target_role}, content_hash={pin.content_hash[:12]}) ──\n"
+        "This skill was authorized specifically for this work item by its approved "
+        "proposal. Any script path below is relative to this skill's own package; "
+        "no execution tool is available in this read-only run regardless of what a "
+        "script's documented invocation suggests."
+    )
+    return header + "\n" + _rewrite_plugin_root_refs(content)
 
 
 # Tools that gather EVIDENCE. An answer asserting facts about the codebase without one

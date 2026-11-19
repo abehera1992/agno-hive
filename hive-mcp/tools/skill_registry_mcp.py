@@ -164,6 +164,58 @@ def skill_registry_resolve(skill_id: str) -> str:
     })
 
 
+def skill_registry_get_content(skill_id: str) -> str:
+    """Phase 1.58.1 (previously deferred by skill_registry_resolve's own
+    docstring as "Phase 1.57d"): the FULL content and FULL supporting_files
+    bodies for ONE skill this identity can access -- the piece
+    skill_registry_resolve deliberately omits (pin-only) and
+    skill_registry_info deliberately truncates/omits (a 1000-char preview and
+    supporting_files KEYS only, no bodies). Exists so an already-authorized,
+    already-resolved skill_id (the caller already called skill_registry_resolve
+    and checked content_hash) can have its actual body delivered for
+    injection, without re-doing resolution or ownership logic here.
+
+    Same identity/ownership path as every other tool in this module --
+    resolved via resolve_identity() + resolve_skill(), so a skill_id
+    belonging to another identity is reported not-found exactly like a
+    nonexistent one (see SkillNotFoundError's own docstring); disabled
+    records are likewise already excluded by resolve_skill() itself. No new
+    or weaker check is introduced here.
+
+    `content_hash` is echoed on every successful response so a caller that
+    already has a pin from skill_registry_resolve can confirm this is the
+    SAME version it was authorized for before using the body, without a
+    second round-trip.
+
+    Not registered on any agent's own tool surface (see this module's
+    docstring) -- reached only by application code's own bespoke MCP session,
+    the same boundary skill_registry_resolve already has. Returns a JSON
+    object, or an "Error: ..." string (never raises)."""
+    db_path, err = _resolve_db_path()
+    if err:
+        return err
+    try:
+        identity = resolve_identity()
+    except IdentityResolutionError as e:
+        return f"Error: {e}"
+
+    try:
+        rec = reg.resolve_skill(db_path, identity, skill_id)
+    except reg.SkillNotFoundError:
+        return f"Error: skill '{skill_id}' not found or not accessible to the active identity."
+
+    return json.dumps({
+        "skill_id": rec.skill_id,
+        "name": rec.name,
+        "category": rec.category,
+        "version": rec.version,
+        "source": rec.source,
+        "content_hash": rec.content_hash,
+        "content": rec.content,
+        "supporting_files": rec.supporting_files,
+    })
+
+
 def skill_registry_import(
     name: str,
     content: str,

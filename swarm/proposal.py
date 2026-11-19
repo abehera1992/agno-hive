@@ -268,6 +268,7 @@ async def propose_from_text(
     *,
     known_capabilities: Optional[frozenset] = None,
     authorized_skills_by_role: Optional[dict] = None,
+    skill_blocks: Optional[list] = None,
 ) -> tuple[Optional[WorkProposal], ValidationResult]:
     """Phase 1.54a: the SEPARATE structured-planning call run_attempt() invokes, only when
     explicitly opted into, after its own investigation call has already produced
@@ -288,6 +289,20 @@ async def propose_from_text(
     forwarded unchanged to validate_proposal() -- see that function's own docstring for why
     missing registry data is disclosed, never treated as authorization.
 
+    `skill_blocks` (Phase 1.58.1, default None/empty -- every existing caller
+    unaffected): pre-rendered, provenance-tagged skill content
+    (swarm.team._render_skill_injection_block) for the SAME work item this
+    investigation already ran under, already resolved/authorized by
+    run_attempt()'s own caller (eng_workflow.s_execute) before this attempt
+    started. Prepended to the planning prompt, never to `instructions=`
+    (this planner Agent is built with no `instructions` concept at all --
+    see below -- its only input is this one prompt string). Covers the
+    mission's "Researcher... proposal-generation stages where applicable":
+    the exact same per-item skill text the investigation call itself got
+    (via eng_workflow.run_attempt's own AgentSpec injection) is also visible
+    to the planning call that synthesizes a proposal FROM that
+    investigation's findings.
+
     Phase 1.56b: this call needs its OWN, longer HTTP timeout (config.proposal_request_timeout_s,
     see that field's own docstring for the root cause) -- `model` is reused as a shallow copy
     with `timeout` overridden, never mutated in place, so the caller's own already-in-use model
@@ -307,7 +322,9 @@ async def propose_from_text(
     try:
         planner = Agent(model=planner_model, tools=[], output_schema=researcher_output_schema(),
                         markdown=False)
+        skill_preamble = ("\n\n".join(skill_blocks) + "\n\n") if skill_blocks else ""
         prompt = (
+            skill_preamble +
             "Based ONLY on the investigation findings below (already gathered -- do not "
             "investigate further, you have no tools), propose a structured WorkProposal: "
             "the overall objective, and zero or more work items. Each work item needs a "
