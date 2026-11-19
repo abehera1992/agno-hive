@@ -1093,7 +1093,7 @@ async def assess_and_register(st: RunState, wi: WorkItem, rec: AttemptRecord, co
     return d
 
 
-def reconstruct_missing_terminal_from_evidence(att, prior_outcomes=None) -> bool:
+def reconstruct_missing_terminal_from_evidence(att, prior_outcomes=None, registry=None) -> bool:
     """Phase 1.39: generalizes the terminal-repair step recover_and_reconcile() already
     performs UNCONDITIONALLY for a reconciled recovery attempt (its own
     `result_selection_status="RECONCILED", completed_event=True, ...` rewrite, below --
@@ -1128,8 +1128,36 @@ def reconstruct_missing_terminal_from_evidence(att, prior_outcomes=None) -> bool
     traces) -- no in-process code runs after that kill. Surviving an arbitrary mid-attempt
     process kill would require incremental, per-tool-call durable persistence to the ledger,
     a materially larger architectural change explicitly out of this phase's own safe scope
-    (see the report's own "stop and explain" section)."""
+    (see the report's own "stop and explain" section).
+
+    Phase 1.60.3 (confirmed gap, T14 2026-11-19): this function previously ran UNCONDITIONALLY
+    on any MISSING_TERMINAL attempt, including one already TIMED_OUT or CANCELLED -- spending
+    a full evidence-only reconstruction plus a real assessor pass on an attempt that
+    Ledger.commit_decision()'s own, entirely independent `a["state"] in INVALIDATED` check
+    (swarm/ledger.py) was always going to reject regardless. Acceptance itself was never wrong
+    (that ledger-side gate already catches this on its own); the only real cost was a wasted
+    reconstruction + reassessment and a misleading `status=COMPLETE`-shaped diagnostic for work
+    nobody could ever register. Now skipped via two checks, in order: (1) `att.terminal`'s own
+    `timed_out`/`cancelled_event` flags (set by run_attempt() itself, before this function ever
+    mutates them -- the exact signal for the TIMED_OUT case this phase traced, and for an
+    Agent-reported cancellation); (2) when a `registry` is supplied, `registry.validity(att)
+    != "CURRENT"` -- the same authoritative check decide() itself consults, additionally
+    covering SUPERSEDED/ABANDONED/generation-stale attempts this function cannot detect from
+    `att.terminal` alone. A validity-check failure (e.g. an unregistered attempt_id) is
+    swallowed, never blocking the pre-existing rescue -- consistent with this codebase's own
+    rule that a guard failure must never block finalization. A healthy attempt that merely
+    omitted a terminal segment (the original Phase 1.39/T11 case -- timed_out=False,
+    cancelled_event=False, and CURRENT when a registry is known) is completely unaffected:
+    every existing check below still runs exactly as before."""
     t = att.terminal or {}
+    if t.get("timed_out") or t.get("cancelled_event"):
+        return False
+    if registry is not None:
+        try:
+            if registry.validity(att) != "CURRENT":
+                return False
+        except Exception:  # noqa: BLE001 -- a validity-check failure must never block the existing rescue
+            pass
     if t.get("result_selection_status") != "MISSING_TERMINAL":
         return False
     if not A.has_new_source_evidence(prior_outcomes or [], att.outcomes):
@@ -1971,10 +1999,10 @@ async def run_engineering_workflow(
                             c2 = {k: v for k, v in c.items() if k not in ("supersede_after_s", "delay_tool_s", "cancel_after_s")}
                             st.emit("supersede_started", work_item=wi.work_item_id)
                             rec2 = await run_attempt(st, wi, ctx, c2, 2, role=item_role, propose=propose)
-                            reconstruct_missing_terminal_from_evidence(rec2.attempt)
+                            reconstruct_missing_terminal_from_evidence(rec2.attempt, registry=st.registry)
                             d2 = await assess_and_register(st, wi, rec2, c)
                             rec1 = await t1                       # the old attempt finishes LATE
-                            reconstruct_missing_terminal_from_evidence(rec1.attempt)
+                            reconstruct_missing_terminal_from_evidence(rec1.attempt, registry=st.registry)
                             d1 = await assess_and_register(st, wi, rec1, c)
                             st.emit("supersede_result", work_item=wi.work_item_id, new=d2.acceptance, old=d1.acceptance,
                                     old_validity=d1.validity)
@@ -1987,7 +2015,7 @@ async def run_engineering_workflow(
                     # reconstruct_missing_terminal_from_evidence()'s own docstring for the
                     # full root-cause trace and its one verified limitation (a hard
                     # supervisor SIGKILL mid-attempt, which no in-process code can survive).
-                    reconstruct_missing_terminal_from_evidence(rec.attempt)
+                    reconstruct_missing_terminal_from_evidence(rec.attempt, registry=st.registry)
                     d = await assess_and_register(st, wi, rec, c)
                     retry = (d.execution_status in RETRYABLE_TERMINALS and d.validity == "CURRENT"
                              and n < MAX_ATTEMPTS_PER_ITEM)
