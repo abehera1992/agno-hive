@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-SCHEMA_VERSION = 5   # Phase 1.22: + attempt.trace_sha (see init_schema()'s migration).
+SCHEMA_VERSION = 6   # Phase 1.22: + attempt.trace_sha (see init_schema()'s migration).
                      # Phase 1.55: + attempt.role/stage_name/stage_index/parent_attempt_id
                      # (nullable, forward-compatible lineage columns -- see init_schema()'s
                      # migration and start_attempt()'s own docstring for what populates them
@@ -47,6 +47,14 @@ SCHEMA_VERSION = 5   # Phase 1.22: + attempt.trace_sha (see init_schema()'s migr
                      # (see decide_proposal()/get_executable_proposal()). A brand-new table,
                      # same as proposal/proposal_work_item were at 1.55 -- needs no column
                      # migration on an existing database, only the version-counter bump below.
+                     # Phase 1.59b: + proposal.executed_task_id -- closes the Phase 1.59a G1/G5
+                     # gap (an approved proposal had no "already executed" marker, so the same
+                     # proposal_id could create a second, independent task). NULL until a
+                     # proposal is successfully claimed by claim_proposal_and_create_task();
+                     # NULL for every proposal row recorded before this migration -- not
+                     # backfilled, since no pre-1.59b proposal was ever claimed under this
+                     # mechanism (the gap this phase closes did not previously record a claim
+                     # at all, so there is nothing true to backfill it with).
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / "data" / "workflow_ledger.db"
 
 # attempt states. Terminal ones never change again except RUNNING/FINISHED -> invalidated.
@@ -128,7 +136,7 @@ CREATE TABLE IF NOT EXISTS proposal (
   task_id TEXT NOT NULL, work_item_id TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
   objective TEXT NOT NULL, valid INTEGER NOT NULL, errors_json TEXT NOT NULL,
   unauthorized_skills_json TEXT NOT NULL, unverified_capabilities_json TEXT NOT NULL,
-  created_at REAL NOT NULL, raw_proposal_json TEXT);
+  created_at REAL NOT NULL, raw_proposal_json TEXT, executed_task_id TEXT);
 -- One row per proposed sub-item of a proposal. Written ONLY when that proposal's own `valid`
 -- is 1 -- record_proposal()'s own enforcement of "an invalid proposal never becomes executable
 -- work": an invalid proposal's `proposal` row still records what was proposed and why it was
@@ -178,7 +186,7 @@ class Ledger:
     def __init__(self, path: Optional[str] = None, instance_id: Optional[str] = None):
         self.path = str(path or os.environ.get("HIVE_LEDGER_DB") or DEFAULT_PATH)
         self.instance_id = instance_id or f"inst-{os.environ.get('AGNO_PORT', '9001')}"
-        self.fail_next: Optional[str] = None      # test hook: "start" | "evidence" | "commit" | "finalize"
+        self.fail_next: Optional[str] = None      # test hook: "start" | "evidence" | "commit" | "finalize" | "claim_proposal"
         self._ready = False
 
     # ------------------------------------------------------------------ plumbing
@@ -251,7 +259,7 @@ class Ledger:
             else:
                 current = int(row["v"])
                 if current != SCHEMA_VERSION:
-                    if current not in (1, 2, 3, 4):
+                    if current not in (1, 2, 3, 4, 5):
                         raise LedgerError(f"ledger schema version {current} != expected {SCHEMA_VERSION} "
                                           f"(no migration path from {current}); refusing to use it")
                     # Sequential, not a single pairwise check: a database still at version 1 must
@@ -293,6 +301,15 @@ class Ledger:
                         # proposal/proposal_work_item tables used at version 2->... (no entry
                         # was needed there either, for the identical reason).
                         current = 5
+                    if current == 5:
+                        # Phase 1.59b, additive only: proposal.executed_task_id. NULL for
+                        # every proposal row recorded before this migration -- not backfilled,
+                        # since no proposal was ever claimed under this mechanism before it
+                        # existed (see this column's own DDL comment above).
+                        cols = {r["name"] for r in c.execute("PRAGMA table_info(proposal)").fetchall()}
+                        if "executed_task_id" not in cols:
+                            c.execute("ALTER TABLE proposal ADD COLUMN executed_task_id TEXT")
+                        current = 6
                     c.execute("UPDATE ledger_meta SET v=? WHERE k='schema_version'", (str(SCHEMA_VERSION),))
 
             # 3) Indexes -- every column any index references is now guaranteed to exist,
@@ -308,16 +325,26 @@ class Ledger:
             await self._a(self.init_schema)
 
     # ------------------------------------------------------------------ task / work items
+    def _insert_task_rows(self, c, task_id, workflow_run_id, request_text, plan_items: list) -> None:
+        """The actual task+work_item INSERTs, factored out of create_task() (Phase 1.59b) so
+        claim_proposal_and_create_task() below can run the IDENTICAL insert logic inside its
+        OWN transaction (which also claims the proposal) rather than duplicating it -- a single
+        source of truth for what a newly-created task's rows look like, whichever caller creates
+        it. Takes an already-open cursor `c`; never opens or commits its own transaction."""
+        c.execute("INSERT INTO task(task_id,workflow_run_id,instance_id,request_sha,request_preview,plan_json,status,created_at)"
+                  " VALUES(?,?,?,?,?,?,?,?)",
+                  (task_id, workflow_run_id, self.instance_id, _sha(request_text), (request_text or "")[:160],
+                   _j([{"work_item_id": i["work_item_id"], "title": i.get("title")} for i in plan_items]), "RUNNING", time.time()))
+        for i in plan_items:
+            c.execute("INSERT INTO work_item(task_id,work_item_id,title,spec_json) VALUES(?,?,?,?)",
+                      (task_id, i["work_item_id"], i.get("title"), _j(i["spec"])))
+
     def create_task(self, task_id, workflow_run_id, request_text, plan_items: list):
-        """plan_items: [{work_item_id, title, spec(dict)}]. Persisted BEFORE any attempt can exist."""
+        """plan_items: [{work_item_id, title, spec(dict)}]. Persisted BEFORE any attempt can exist.
+        Unchanged by Phase 1.59b -- every non-proposal-driven caller (plan_work_items()/
+        plan_request()) still goes through exactly this method, exactly this transaction shape."""
         def go(c):
-            c.execute("INSERT INTO task(task_id,workflow_run_id,instance_id,request_sha,request_preview,plan_json,status,created_at)"
-                      " VALUES(?,?,?,?,?,?,?,?)",
-                      (task_id, workflow_run_id, self.instance_id, _sha(request_text), (request_text or "")[:160],
-                       _j([{"work_item_id": i["work_item_id"], "title": i.get("title")} for i in plan_items]), "RUNNING", time.time()))
-            for i in plan_items:
-                c.execute("INSERT INTO work_item(task_id,work_item_id,title,spec_json) VALUES(?,?,?,?)",
-                          (task_id, i["work_item_id"], i.get("title"), _j(i["spec"])))
+            self._insert_task_rows(c, task_id, workflow_run_id, request_text, plan_items)
         self._tx(go)
 
     def start_attempt(self, task_id, work_item_id, workflow_run_id, max_attempts: int, owner_pid: Optional[int] = None,
@@ -622,13 +649,15 @@ class Ledger:
         finally:
             c.close()
 
-    def get_executable_proposal(self, proposal_id: str) -> dict:
-        """THE single authorization gate between a persisted proposal and dispatchable
-        work (Phase 1.58's own "application-controlled execution" requirement). Returns
-        either {"ok": True, "objective": str, "work_items": [...]} or
-        {"ok": False, "reason": "<code>"} -- NEVER a partial list and never raises for a
-        normal rejection path (unapproved/invalid/stale); only a genuinely unknown
-        proposal_id raises LedgerError, consistent with every other *_id lookup here.
+    def _proposal_executability(self, c, proposal_id: str) -> dict:
+        """Phase 1.59b: the shared rejection-ordering check, factored out of
+        get_executable_proposal() so BOTH it (its own standalone read connection, used for the
+        caller's early fail-fast check) and claim_proposal_and_create_task() below (inside its
+        OWN write transaction, where this check is re-run authoritatively immediately before the
+        actual claim) use the IDENTICAL order and reasons -- a single source of truth that can
+        never let the two silently diverge. Returns {"ok": False, "reason": "<code>"} (plus
+        `executed_task_id` for ALREADY_EXECUTED) or {"ok": True, "row": <sqlite3.Row>}; only a
+        genuinely unknown proposal_id raises LedgerError.
 
         Rejection reasons, checked in this order (the first one that applies wins):
           PROPOSAL_INVALID              -- validate_proposal() never accepted it
@@ -639,6 +668,48 @@ class Ledger:
                                             durably done
           NOT_APPROVED                  -- decide_proposal() was never called for it
           REJECTED                      -- decide_proposal() was called with approved=False
+          ALREADY_EXECUTED (Phase 1.59b) -- claim_proposal_and_create_task() already claimed
+                                            this proposal_id for a task (`executed_task_id`,
+                                            below) -- checked LAST, after every authorization
+                                            check above, so a stray/corrupt executed_task_id can
+                                            never bypass PROPOSAL_INVALID/NOT_APPROVED/REJECTED;
+                                            execution state never overrides authorization."""
+        p = c.execute("SELECT * FROM proposal WHERE proposal_id=?", (proposal_id,)).fetchone()
+        if p is None:
+            raise LedgerError(f"unknown proposal {proposal_id}")
+        if not p["valid"]:
+            return {"ok": False, "reason": "PROPOSAL_INVALID"}
+        t = c.execute("SELECT status FROM task WHERE task_id=?", (p["task_id"],)).fetchone()
+        if t is not None and t["status"] == "FINALIZED":
+            return {"ok": False, "reason": "STALE_TASK_ALREADY_FINALIZED"}
+        d = c.execute("SELECT approved FROM proposal_decision WHERE proposal_id=?", (proposal_id,)).fetchone()
+        if d is None:
+            return {"ok": False, "reason": "NOT_APPROVED"}
+        if not d["approved"]:
+            return {"ok": False, "reason": "REJECTED"}
+        if p["executed_task_id"]:
+            return {"ok": False, "reason": "ALREADY_EXECUTED", "executed_task_id": p["executed_task_id"]}
+        return {"ok": True, "row": p}
+
+    def get_executable_proposal(self, proposal_id: str) -> dict:
+        """THE single authorization gate between a persisted proposal and dispatchable
+        work (Phase 1.58's own "application-controlled execution" requirement). Returns
+        either {"ok": True, "objective": str, "work_items": [...]} or
+        {"ok": False, "reason": "<code>"} (plus `executed_task_id` for ALREADY_EXECUTED,
+        Phase 1.59b) -- NEVER a partial list and never raises for a normal rejection path
+        (unapproved/invalid/stale/already-executed); only a genuinely unknown proposal_id
+        raises LedgerError, consistent with every other *_id lookup here.
+
+        This is a READ-ONLY check (see _proposal_executability() for the exact rejection
+        order) -- it tells a caller whether a proposal LOOKS executable right now, which is
+        what run_engineering_workflow()'s own early gate uses to fail fast before any
+        MCP/knowledge work. It is deliberately NOT the claim itself: the actual, atomic
+        claim-and-create-task happens in claim_proposal_and_create_task() below, which
+        re-runs this same check inside its own write transaction immediately before claiming
+        -- closing the race window between this read and that later write (Phase 1.59a's
+        G1/G5). A caller that only calls THIS method and never calls
+        claim_proposal_and_create_task() can never cause a double-dispatch merely by reading
+        twice; reading here has no side effect.
 
         Each returned work item's `authorized_skill_ids` is `proposed_skills_json` MINUS
         whatever the proposal's own `unauthorized_skills_json` flagged for that exact
@@ -651,19 +722,10 @@ class Ledger:
         input -- never left to be redone (or forgotten) by each caller."""
         c = self._conn()
         try:
-            p = c.execute("SELECT * FROM proposal WHERE proposal_id=?", (proposal_id,)).fetchone()
-            if p is None:
-                raise LedgerError(f"unknown proposal {proposal_id}")
-            if not p["valid"]:
-                return {"ok": False, "reason": "PROPOSAL_INVALID"}
-            t = c.execute("SELECT status FROM task WHERE task_id=?", (p["task_id"],)).fetchone()
-            if t is not None and t["status"] == "FINALIZED":
-                return {"ok": False, "reason": "STALE_TASK_ALREADY_FINALIZED"}
-            d = c.execute("SELECT approved FROM proposal_decision WHERE proposal_id=?", (proposal_id,)).fetchone()
-            if d is None:
-                return {"ok": False, "reason": "NOT_APPROVED"}
-            if not d["approved"]:
-                return {"ok": False, "reason": "REJECTED"}
+            chk = self._proposal_executability(c, proposal_id)
+            if not chk["ok"]:
+                return chk
+            p = chk["row"]
             unauthorized = json.loads(p["unauthorized_skills_json"] or "{}")
             rows = c.execute(
                 "SELECT * FROM proposal_work_item WHERE proposal_id=? ORDER BY proposed_work_item_id",
@@ -681,6 +743,59 @@ class Ledger:
             return {"ok": True, "objective": p["objective"], "work_items": items}
         finally:
             c.close()
+
+    def claim_proposal_and_create_task(self, proposal_id: str, task_id: str, workflow_run_id: str,
+                                       request_text: str, plan_items: list) -> dict:
+        """Phase 1.59b: THE atomic fix for Phase 1.59a's G1/G5 -- claims a persisted, approved
+        proposal for exactly one execution AND creates its Workflow task (via
+        _insert_task_rows()) inside the SAME `BEGIN IMMEDIATE` transaction, so a crash or
+        injected failure between the two can never leave a proposal claimed with no task, or a
+        task created with no claim recorded: either both writes land, or (any exception anywhere
+        in `go()`, via `_tx()`'s own pre-existing rollback -- unchanged by this phase) neither
+        does.
+
+        Re-runs `_proposal_executability()` -- the SAME check get_executable_proposal() uses --
+        INSIDE this write transaction, never trusting an earlier caller's read. That earlier read
+        (run_engineering_workflow()'s own early-rejection gate, which exists purely to fail fast
+        before any MCP/knowledge work) and THIS call are separated by real wall-clock time; that
+        gap is exactly the race window Phase 1.59a identified, and this method is what actually
+        closes it, not the earlier read.
+
+        Concurrency: a second, concurrent call for the SAME proposal_id is never allowed to also
+        succeed. SQLite's `BEGIN IMMEDIATE` acquires a RESERVED lock immediately on entry to
+        `_tx()`, so a second writer blocks (up to the connection's busy_timeout) until this
+        transaction commits or rolls back, then runs its OWN `_proposal_executability()` check
+        against the now-committed `executed_task_id` and correctly observes ALREADY_EXECUTED --
+        true cross-process exclusion comes from that lock, not from application code. The
+        `UPDATE ... WHERE executed_task_id IS NULL` + `rowcount` check below is defence-in-depth
+        in the same style as commit_decision()'s own `work_item.accepted_generation` CAS: it
+        means this method is correct even if SQLite's locking semantics were ever weaker than
+        documented, not that it is the only thing preventing a double-claim.
+
+        Returns {"ok": True, "task_id": task_id} on a fresh claim, or the SAME shape
+        _proposal_executability() returns on any rejection (PROPOSAL_INVALID /
+        STALE_TASK_ALREADY_FINALIZED / NOT_APPROVED / REJECTED / ALREADY_EXECUTED, the last with
+        `executed_task_id` set to the ORIGINAL claiming task) -- never raises for a normal
+        rejection path; a genuine ledger failure raises LedgerError, same as every other method
+        here, and the caller must treat that as NOT claimed (fail closed)."""
+        def go(c):
+            self._maybe_fail("claim_proposal")
+            chk = self._proposal_executability(c, proposal_id)
+            if not chk["ok"]:
+                return chk
+            cur = c.execute("UPDATE proposal SET executed_task_id=? WHERE proposal_id=? AND executed_task_id IS NULL",
+                            (task_id, proposal_id))
+            if cur.rowcount != 1:
+                # Should be unreachable under BEGIN IMMEDIATE's own exclusivity (see docstring) --
+                # if it ever happens anyway, re-read authoritatively rather than assume what
+                # occurred, and never proceed to create a task when the claim itself did not
+                # provably succeed.
+                row = c.execute("SELECT executed_task_id FROM proposal WHERE proposal_id=?", (proposal_id,)).fetchone()
+                return {"ok": False, "reason": "ALREADY_EXECUTED",
+                        "executed_task_id": row["executed_task_id"] if row else None}
+            self._insert_task_rows(c, task_id, workflow_run_id, request_text, plan_items)
+            return {"ok": True, "task_id": task_id}
+        return self._tx(go)
 
     # ------------------------------------------------------------------ finalization (idempotent)
     def finalize_task(self, task_id, final_text: str, audit: dict) -> dict:

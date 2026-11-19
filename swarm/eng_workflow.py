@@ -1750,9 +1750,18 @@ async def run_engineering_workflow(
         except Exception as e:  # noqa: BLE001 -- fail closed: an unreadable ledger can never authorize execution
             exec_payload = {"ok": False, "reason": f"ledger unavailable ({repr(e)[:100]})"}
         if not exec_payload.get("ok"):
-            st.emit("proposal_rejected", proposal_id=proposal_id, reason=exec_payload.get("reason"))
+            # Phase 1.59b: get_executable_proposal() now also reports ALREADY_EXECUTED (with
+            # the original claiming task_id) -- this early, read-only check catches every
+            # SEQUENTIAL duplicate /run{proposal_id} right here, before any MCP/knowledge work;
+            # see claim_proposal_and_create_task() for the atomic write that catches a
+            # genuinely CONCURRENT one that reaches past this point.
+            _executed_task_id = exec_payload.get("executed_task_id")
+            st.emit("proposal_rejected", proposal_id=proposal_id, reason=exec_payload.get("reason"),
+                    executed_task_id=_executed_task_id)
+            _extra = (f" The original task is `{_executed_task_id}`; inspect it via "
+                      f"/ledger/tasks/{_executed_task_id}.") if _executed_task_id else ""
             st.final = (f"## Investigation result: NOT ESTABLISHED\ntask `{task_id}` · proposal `{proposal_id}`\n\n"
-                        f"This proposal was not executed: {exec_payload.get('reason')}.\n")
+                        f"This proposal was not executed: {exec_payload.get('reason')}.{_extra}\n")
             if hb_task is not None:
                 hb_task.cancel()
             return st.final, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, None
@@ -1862,12 +1871,34 @@ async def run_engineering_workflow(
                     # an empty st.plan.items and skipped this whole block.
                     _policy_envelope = (A.canonicalize_policy_spec(evidence_policy, source="task_supplied")
                                        if evidence_policy else None)
-                    await st.ledger._a(st.ledger.create_task, task_id, wf_run_id, task, [
+                    _plan_items = [
                         {"work_item_id": w.work_item_id, "title": w.title,
                          "spec": {"paths": w.paths, "target": w.target, "objective": w.objective,
                                   "evidence_required": w.evidence_required, "completion_criteria": w.completion_criteria,
-                                  "policy": w.policy.name, "evidence_policy": _policy_envelope}} for w in st.plan.items])
-                    st.ledger_task_created = True
+                                  "policy": w.policy.name, "evidence_policy": _policy_envelope}} for w in st.plan.items]
+                    if proposal_id:
+                        # Phase 1.59b: claiming the proposal and creating its task is ONE
+                        # atomic ledger transaction (Ledger.claim_proposal_and_create_task) --
+                        # closes Phase 1.59a's G1/G5. The early exec_payload read above only
+                        # fails fast before MCP/knowledge work; it is never itself the claim.
+                        # A second, concurrent run for the SAME proposal_id can reach this
+                        # exact line too -- the ledger transaction's own locking, not this
+                        # Python code, is what guarantees only one of them creates a task.
+                        claim = await st.ledger._a(st.ledger.claim_proposal_and_create_task,
+                                                   proposal_id, task_id, wf_run_id, task, _plan_items)
+                        if not claim.get("ok"):
+                            _reason = claim.get("reason")
+                            _claimed_by = claim.get("executed_task_id")
+                            _extra = (f" The original task is `{_claimed_by}`; inspect it via "
+                                      f"/ledger/tasks/{_claimed_by}.") if _claimed_by else ""
+                            st.emit("proposal_claim_rejected", proposal_id=proposal_id, reason=_reason,
+                                    executed_task_id=_claimed_by)
+                            st.plan = WorkPlan(task_id, [], f"proposal not claimed for execution: {_reason}.{_extra}")
+                        else:
+                            st.ledger_task_created = True
+                    else:
+                        await st.ledger._a(st.ledger.create_task, task_id, wf_run_id, task, _plan_items)
+                        st.ledger_task_created = True
                 except Exception as e:  # noqa: BLE001 -- fail closed: nothing is dispatched without a durable plan
                     st.plan = WorkPlan(task_id, [], f"durable ledger unavailable ({repr(e)[:120]}); request not dispatched")
             st.emit("step", name="plan", items=len(st.plan.items), rejected=st.plan.rejected_reason)
