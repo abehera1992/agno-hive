@@ -27797,25 +27797,34 @@ def _specific_tokens(text: str) -> set[str]:
     return out
 
 
-_PLAIN_SLASH_PAIR_RE = re.compile(r"^[A-Za-z]+/[A-Za-z]+$")
+# Phase 1.60: was _PLAIN_SLASH_PAIR_RE (exactly one slash, two segments: "read/write"-shaped
+# only); generalized to an arbitrary-length list of plain words ("quantities/prices/GST", not
+# just two-word pairs) -- (?:/[A-Za-z]+)+ matches one-or-more repetitions, so this is a strict
+# superset and every previous 2-segment match still matches. Still strictly alpha-only per
+# segment -- an extension, '_', '-', a digit or a dot anywhere still disqualifies the whole
+# token, exactly as the original 2-segment-only regex already required.
+_PLAIN_SLASH_LIST_RE = re.compile(r"^[A-Za-z]+(?:/[A-Za-z]+)+$")
 
 
 def _ambiguous_slash_pairs(text: str) -> set:
-    """Phase 1.06 (WS2). A bare pair of plain words joined by one slash ("Public/private",
-    "read/write", "admin/files") cannot be told apart, from the text alone, as prose or as a
-    path -- the two look identical. Context decides what CAN be decided: a leading '/', an
+    """Phase 1.06 (WS2), widened Phase 1.60. A bare list of plain words joined by slashes
+    ("Public/private", "read/write", "admin/files", or a 3+-segment list like
+    "quantities/prices/GST") cannot be told apart, from the text alone, as prose or as a
+    path -- they look identical. Context decides what CAN be decided: a leading '/', an
     inline-code backtick, a quote or an opening bracket directly before it marks a path or
-    route fragment (a full claim); with none of those it is ambiguous. An ambiguous pair that
-    the delegation's evidence supports counts as supported as usual. One that it does not
-    support is NOT counted toward PARTIAL, but is reported in the diagnostics as
-    ambiguous_slash_pair, so it is neither silently accepted nor treated as an unsupported
-    repository fact. Anything with an extension, a second slash, '_', '-', a digit or a dot is
-    not a plain pair and is never ambiguous."""
+    route fragment (a full claim); with none of those it is ambiguous. An ambiguous list that
+    the delegation's evidence supports counts as supported as usual (see _claim_support's own
+    Phase 1.60 branch for 3+-segment lists). One that it does not support is NOT counted
+    toward PARTIAL, but is reported in the diagnostics as ambiguous_slash_pair, so it is
+    neither silently accepted nor treated as an unsupported repository fact. Anything with an
+    extension, '_', '-', a digit or a dot anywhere is not a plain list and is never ambiguous
+    -- Phase 1.60 widened the segment COUNT this covers (was exactly 2; now 2 or more), not
+    the per-segment character class, so genuine paths/identifiers are unaffected."""
     out = set()
     text = text or ""
     for m in _IDENT_TOKEN_RE.finditer(text):
         tok = m.group(0).strip(".,;:-/")
-        if _PLAIN_SLASH_PAIR_RE.match(tok):
+        if _PLAIN_SLASH_LIST_RE.match(tok):
             before = text[m.start() - 1] if m.start() > 0 else " "
             if before not in "/`'\"([":
                 out.add(tok)
@@ -28112,6 +28121,23 @@ def _path_matches(norm: str, p: str) -> bool:
             or ("/" not in norm and p.rsplit("/", 1)[-1] == norm))
 
 
+def _plain_singular(word: str) -> str:
+    """Phase 1.60: the smallest, most conservative plural->singular step that covers the
+    T14 case ("quantities"->"quantity", "prices"->"price") without touching real identifiers
+    -- only ever called on a segment _PLAIN_SLASH_LIST_RE already proved is a bare alpha word,
+    never on path/dot/underscore-shaped tokens. Not a stemmer: no attempt at irregular plurals
+    beyond the common 's'/'es'/'ies' endings, by design -- a miss here only means a genuinely
+    unsupported segment stays unsupported, never a false accept."""
+    w = word.lower()
+    if len(w) > 4 and w.endswith("ies"):
+        return w[:-3] + "y"
+    if len(w) > 4 and w.endswith("ses"):
+        return w[:-2]
+    if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+        return w[:-1]
+    return w
+
+
 def _claim_support(tok: str, ev: dict, preload: str):
     """'tool' (appears in this delegation's own tool results / read or seen paths),
     'preload' (appears in its preloaded context) or None."""
@@ -28137,6 +28163,23 @@ def _claim_support(tok: str, ev: dict, preload: str):
     if ("/" in tok or "-" in tok) and len(tok.strip("/")) >= 4:
         nneedle = _norm_punct(tok).strip("/")
         if len(nneedle) >= 4 and nneedle in ev.get("corpus_norm", ""):
+            return "tool"
+    # Phase 1.60 (T14, 2026-11-19): a plain-word LIST of 3+ segments ("quantities/prices/GST")
+    # is never a real filesystem path -- _PLAIN_SLASH_LIST_RE's pure-alpha, no extension/._-/
+    # digit restriction means a genuine path/route would already have matched one of the
+    # branches above, never this one. Grounded only when EVERY segment independently appears
+    # in this delegation's own evidence corpus (after a conservative singular normalisation --
+    # see _plain_singular) -- a partially-fabricated list (two real segments, one invented) is
+    # NOT accepted, so this does not broadly exempt every slash-containing string, only a
+    # fully-corroborated plain-word list. Scoped to 3+ segments (tok.count("/") >= 2): 2-segment
+    # pairs ("read/write") are untouched and keep their exact pre-1.60 behavior -- they were
+    # never the reported failure and this phase does not change how they are scored.
+    if tok.count("/") >= 2 and _PLAIN_SLASH_LIST_RE.match(tok):
+        corpus = ev.get("corpus", "")
+        segments = [s for s in tok.split("/") if s]
+        if len(segments) >= 3 and corpus and all(
+                len(_plain_singular(seg)) >= 3 and _plain_singular(seg) in corpus
+                for seg in segments):
             return "tool"
     if preload and re.search(r"(?<![\w.-])" + re.escape(tok) + r"(?![\w])", preload):
         return "preload"

@@ -261,6 +261,144 @@ deployed commit so a future reader can tell what was being measured.
 
 ---
 
+### 2026-11-19 — T14 only, isolated ledger, first run against the proposal-driven Workflow execution path (Phases 1.58/1.58.1/1.59b)
+
+Deployed: agno-hive `9ce8c2af51f` (HEAD; carries Phase 1.58 — application-controlled execution
+of approved proposals, 1.58.1 — proposal-driven role-specific skill injection, 1.59b — atomic
+proposal execution claim & idempotency). `engineering`, `role="researcher"`, `propose=True`,
+single fresh session, invoked via a new, uncommitted, local-only script
+(`phase159e_t14_isolated_rerun.py`, same methodology as the existing `phase159d_t14_rerun.py`
+but DELIBERATELY pointed at an isolated ledger instead of production — see below). T14's own
+canonical prompt hash was re-verified live, both at script start and independently afterward:
+`b9924da587ef...` — unchanged, no drift. The `propose=True` operation remains reachable only
+in-process; `api/models.py`'s `RunRequest` has `proposal_id` (for executing an
+already-approved proposal) but no `propose` field, so proposal *generation* still has no HTTP
+entry point as of this commit — confirmed by reading the model directly, not inferred.
+
+**Isolation (safety requirement for this run):** `phase159d_t14_rerun.py` asserts the
+production ledger path on purpose, so its resulting proposal can later feed the real
+`/run?proposal_id=` endpoint — out of scope for this run, which was required to use an
+isolated ledger instead. `swarm/ledger.py`'s `Ledger.__init__` resolves
+`path or os.environ.get("HIVE_LEDGER_DB") or DEFAULT_PATH` (ledger.py:186-188), read once at
+process construction, so `HIVE_LEDGER_DB=<isolated path>` was set only for this one subprocess
+invocation on ZGX — `agno-api.service`'s own already-running environment was never touched.
+Verified: ledger path used was `/tmp/phase159e_ledger_1795119695_3955595.db` throughout (never
+`DEFAULT_PATH`, asserted at runtime before any work began); production
+`~/agno-hive/data/workflow_ledger.db` was never opened by this process. No
+`/ledger/proposals/{id}/decide` or `/run?proposal_id=` call was made; no work was dispatched;
+no deploy/restart/commit/push occurred.
+
+**Identifiers:** `task_id=task-887aa76083`, `workflow_run_id=wf-1ecc4268`,
+`session_id=phase159e-t14-3521670cf009`, `attempt_id=att-a76083-wi-1-g0`,
+`proposal_id=prop-att-a76083-wi-1-g0`. Elapsed 1,475.9s (24.6 min), no crash, no exception.
+Tokens: 1,046,905 in / 5,115 out / 1,052,020 total.
+
+**Overall: MIXED — NOT PASS.** Four independent dimensions, scored separately per this file's
+own rule never to merge them:
+
+| Dimension | Verdict | Note |
+|---|---|---|
+| Ground-truth file retrieval | ✅ PASS | Read exactly `docs/inventory.md` + the 3 designated files (`vouchers/page.tsx`, `vouchers_api.py`, `inventoryApi.ts`); no wrong-path guessing |
+| Frontend fields (groundedness) | ✅ PASS | voucher type, date, party name, reference number — exact match |
+| Backend `LineItem` fields (groundedness) | ✅ PASS | `item_id`, `variant_id`, `godown_id`, `quantity`, `unit_price`, `gst_rate`, `description`, `override_reason`, `attested` — exact match, no invented fields |
+| Gap diagnosis direction | ✅ PASS | Correctly frontend-primary: "extending the frontend to collect all fields supported by the backend schema" |
+| Evidence-assessor final-answer acceptance | ❌ FAIL (but see root-cause note below — demonstrated false positive, not a real grounding gap) | Final answer withheld entirely: `"## Investigation result: NOT ESTABLISHED ... Reason: assessor: no claim in the report is supported by anything this delegation obtained - not established: claims in the report not supported by this attempt's own evidence: quantities/prices/GST"` |
+| Structured proposal validity | ❌ FAIL | `validate_proposal()`: `valid: false`, 15 errors, authoritative `work_items` empty (raw proposal preserved per Phase 1.56c) |
+
+**Proposal defects (15 errors):** two work items used roles outside the real vocabulary
+(`tester`, `documenter`; known roles are `coder`/`executor`/`researcher`/`reviewer`), and most
+`required_capabilities`/`proposed_skills` strings didn't match the known registry
+(`"frontend development"`, `"UI/UX design"`, `"backend development"`, `"API integration"`,
+`"REST API"`, `"testing"`, `"QA"`, `"manual testing"`, `"automated testing"`, `"technical
+writing"`, `"documentation tools"`). Separately, the `EK_VOUCHER_BACKEND_INTEGRATION` work item
+requires `"backend development"` and proposes `Python, Django, REST API` skills to make the
+backend "correctly process and store all new fields" — despite this exact attempt's own
+evidence already showing the backend fully supports `line_items` today. `Django` is also
+flatly fabricated: this is a FastAPI codebase, not Django. Same "reasoning over correct
+evidence" gap this file has named repeatedly (T2, T13 2026-08-23 entries) — the facts were
+gathered correctly; the generated proposal didn't fully apply them.
+
+#### Root cause: evidence-assessor rejection is a demonstrated claim-extraction false positive, not a real grounding gap
+
+The withheld attempt's actual submitted text (447 chars, `sha=3d2758c5dacb`, reconstructed
+verbatim from the run's own log and independently re-verified by re-hashing/re-measuring it)
+correctly states the exact frontend fields and explicitly says the backend "already supports a
+full invoice entry schema including line items with quantities/prices/GST, godown selection,
+party ID, tax inclusive option, parent voucher reference, and notes" — i.e., the correct
+conclusion, in the model's own words, built from real tool calls in this same attempt that
+directly quoted `quantity: Decimal (required)`, `unit_price: Decimal (required)`,
+`gst_rate: Optional[Decimal]` from the real `LineItem` model in `vouchers_api.py`.
+
+Traced via `swarm/team.py`'s `_assess_member_result` (team.py:28216) and confirmed by a direct,
+read-only replay of the real production functions against this exact text (no new Researcher
+investigation, no new proposal — pure-function calls only, on ZGX, same checkout):
+
+1. `_specific_tokens(text)` (team.py:27788) extracts exactly two tokens from the real 447-char
+   text: `docs/inventory.md` and `quantities/prices/GST`. The first is filtered out as an echo
+   of the task's own wording (`t not in echo`); the second is the sole claim this attempt is
+   judged on (`claims=1` in the live log, confirmed to be this token by direct replay).
+2. `_is_path_shaped("quantities/prices/GST")` (team.py:28106) returns `True` — the heuristic is
+   "contains `/` or ends in a file-extension-shaped suffix" — so the token is routed through
+   file-path-matching logic in `_claim_support` (team.py:28115), never through plain-word
+   matching.
+3. `_ambiguous_slash_pairs(text)` (team.py:27803) — the Phase 1.06/WS2 safety net built
+   specifically for this ambiguity — does **not** catch it: `_PLAIN_SLASH_PAIR_RE` only matches
+   an *exactly one-slash*, two-segment pair (`^[A-Za-z]+/[A-Za-z]+$`). `quantities/prices/GST`
+   has 2 slashes / 3 segments, confirmed by direct replay (`slash count: 2`,
+   `PLAIN_SLASH_PAIR_RE match: False`). The docstring says so explicitly: "anything with ... a
+   second slash ... is never ambiguous" — this is a real, three-way natural-language list
+   ("quantities, prices, GST"), not a two-way pair, and the exemption's own scope excludes it by
+   design.
+4. None of `_claim_support`'s path-matching branches can ever succeed for this token, because
+   it was never a real path: no file is named `quantities/prices/GST`, nor does that literal
+   joined string appear anywhere in the attempt's tool-call corpus.
+5. `_reject_reason` (team.py:28152) independently confirms the underlying facts WERE present in
+   this attempt's own evidence: it computes the final path segment as `"gst"` and finds it
+   really is present in `ev["tokens"]` (derived from the real `vouchers_api.py` read, which
+   genuinely contains "GST" repeatedly — `gst_rate`, `_check_voucher_gst_compliance`, etc.) —
+   hence the live log's own diagnostic, `quantities/prices/GST=basename_seen`, verbatim.
+6. Because `supported` ends up empty (the one non-echoed claim can never match as a path), line
+   28310-28312's `if not supported: return done("UNRESOLVED", ...)` fires regardless of the
+   `_ambiguous_slash_pairs` diagnostic tag — that tag only ever removes a token from the
+   `unsupported` tally (used for the PARTIAL branch), never adds it to `supported`.
+
+**Classification: claim extraction / claim-to-evidence matching failure** (not missing
+evidence, not a citation/reference mismatch, not truncation, and not a genuinely unsupported
+claim — all ruled out by the trace above). The model wrote ordinary slash-shorthand for a
+three-item list of real, individually-verified field concepts; the assessor's path-shape
+heuristic and its own narrower-than-needed ambiguity exemption together make any 3-or-more
+segment slash list structurally unsupportable as a claim, independent of how well the
+underlying facts are actually grounded. This is a genuine, demonstrated false containment
+positive on this run — not asserted without the trace above, per this entry's own requirement
+not to label it one without evidence.
+
+**Replay performed:** read-only, pure-function calls to the real, deployed
+`swarm.team._specific_tokens`, `_ambiguous_slash_pairs`, `_is_path_shaped`, and
+`_PLAIN_SLASH_PAIR_RE` against the attempt's own exact 447-char text, on the same ZGX checkout
+(HEAD `9ce8c2af51f`). No Ledger was opened, no agent was invoked, no new investigation or
+proposal was created by this replay.
+
+**Not fixed in this run** — narrow follow-up candidate: widen `_ambiguous_slash_pairs`/
+`_PLAIN_SLASH_PAIR_RE`'s exemption (or add a sibling check in `_claim_support`) to cover an
+N-segment plain-word slash list (`quantities/prices/GST`, not just `read/write`-shaped
+pairs), falling back to per-segment word matching when every segment is a plain word with no
+path/extension shape of its own.
+
+**Fixed: Phase 1.60 (2026-11-19, same day).** `_PLAIN_SLASH_PAIR_RE` generalized to
+`_PLAIN_SLASH_LIST_RE` (2+ segments, strict superset — every prior 2-segment match still
+matches); `_claim_support` gained a narrowly-scoped branch (3+ segments only,
+`tok.count("/") >= 2`, so 2-segment pairs are untouched) that accepts a plain-word list only
+when EVERY segment independently appears in the delegation's own evidence corpus after a
+conservative singular normalization (`_plain_singular`) — a partially-fabricated list is still
+rejected. Validated via 18 checks (`phase160_driver.py`, local, not committed) against the
+real functions and real local EkamApp files, including a full `_assess_member_result()` replay
+of this exact run's preserved 447-char attempt text: status flips `UNRESOLVED` → `COMPLETE`,
+and a negative control (a genuinely fabricated 3-segment list as the sole claim) still
+correctly returns `UNRESOLVED`. See the Phase 1.60 report for the full diff, commit SHA, and
+ZGX deployment record.
+
+---
+
 ### 2026-11-16 (later) — full T1–T13b run (14 prompts), post-Phase-1.49
 
 Deployed: agno-hive `74d0756` for the battery itself (Phase 1.49 — claim attribution and
