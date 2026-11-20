@@ -76,20 +76,66 @@ class ProposedWorkItem(BaseModel):
         description="Other work items' work_item_id values this one depends on. Must use "
                     "the EXACT SAME identifier string as that other item's own work_item_id "
                     f"field -- same format rule applies: {_ID_FORMAT_DESC}")
-    required_capabilities: list[str] = Field(default_factory=list)
-    proposed_skills: list[str] = Field(default_factory=list)
+    required_capabilities: list[str] = Field(
+        default_factory=list,
+        description="MCP TOOL IDENTIFIERS ONLY (e.g. get_file_content, search_files) -- the "
+                    "exact names of tools this work item's role needs. Never a framework, "
+                    "language, or library name -- those belong in `technologies` below.")
+    proposed_skills: list[str] = Field(
+        default_factory=list,
+        description="Skill IDENTIFIERS ONLY, from the skill registry already granted to this "
+                    "work item's role. Never a human-readable label like 'UI/UX Design' or "
+                    "'Quality Assurance' -- those belong in `technologies` below. Subject to "
+                    "the existing per-role authorization check; unauthorized or malformed "
+                    "entries are still disclosed/rejected exactly as before.")
     acceptance_criteria: str = ""
     expected_evidence: str = ""
+    # Phase 1.61a: informational only, added alongside (never instead of) the two
+    # identifier-shaped fields above. None of these four fields is read by
+    # validate_proposal()'s authorization logic, by Ledger.record_proposal()'s
+    # proposal_work_item INSERT (which hand-picks only the pre-existing columns -- see
+    # that function's own docstring), or by plan_from_proposal()/s_execute() (which only
+    # ever reads Ledger.get_executable_proposal()'s work_items rows, never raw_proposal).
+    # They exist purely so a persisted, auditable proposal communicates WHY the proposed
+    # work items look the way they do -- they can never grant a permission, authorize a
+    # tool/skill, change which role is selected, or affect whether a work item becomes
+    # executable. Defaulting to "" / [] keeps every proposal recorded before this phase
+    # fully parseable: WorkProposal.model_validate(old_json) still succeeds unchanged.
+    technologies: list[str] = Field(
+        default_factory=list,
+        description="Human-readable frameworks, languages, and technologies relevant to THIS "
+                    "work item (e.g. 'React', 'TypeScript', 'Formik', 'FastAPI'). Purely "
+                    "descriptive -- never validated against any registry, never checked for "
+                    "authorization, never affects execution.")
 
 
 class WorkProposal(BaseModel):
     """The Researcher's structured output: an overall objective plus the proposed work items.
     Construction always succeeds for any well-typed JSON (lists/strings in the right shape) --
     semantic correctness (known role, no cycle, no dangling dependency, ...) is exclusively
-    validate_proposal()'s job, run separately, after construction."""
+    validate_proposal()'s job, run separately, after construction.
+
+    Phase 1.61a: `implementation_rationale`/`alternatives_considered`/`risks` are the
+    overall-strategy counterparts to ProposedWorkItem.technologies (see that field's own
+    docstring for the full "informational only, never authorization-checked, never read by
+    plan_from_proposal()" guarantee -- identical here). Default "" / [] so a pre-1.61a
+    persisted proposal (raw_proposal_json with no such keys) still parses via
+    model_validate() unchanged."""
 
     objective: str
     work_items: list[ProposedWorkItem] = Field(default_factory=list)
+    implementation_rationale: str = Field(
+        default="",
+        description="Concise, evidence-grounded explanation of why the proposed approach "
+                    "fits the task -- grounded in the investigation findings, not invented.")
+    alternatives_considered: list[str] = Field(
+        default_factory=list,
+        description="Other viable approaches considered and why the proposed approach was "
+                    "preferred. Concise, evidence-grounded -- not required for every task.")
+    risks: list[str] = Field(
+        default_factory=list,
+        description="Relevant implementation risks or constraints (e.g. compatibility, "
+                    "scope boundaries). Concise, evidence-grounded -- not required for every task.")
 
 
 def researcher_output_schema() -> type[WorkProposal]:
@@ -329,12 +375,29 @@ async def propose_from_text(
             "investigate further, you have no tools), propose a structured WorkProposal: "
             "the overall objective, and zero or more work items. Each work item needs a "
             "role, objective, dependencies (depends_on, by work_item_id), "
-            "required_capabilities, proposed_skills, acceptance_criteria and "
+            "required_capabilities, proposed_skills, technologies, acceptance_criteria and "
             "expected_evidence. If the findings do not call for any further work, return "
             "an empty work_items list rather than inventing one.\n\n"
             f"Every work_item_id MUST be a valid identifier: {_ID_FORMAT_DESC} Use the exact "
             "same work_item_id string when another item's depends_on references it -- "
             "dependencies are matched by exact string equality, not by similarity.\n\n"
+            "IMPORTANT -- these three fields are NOT interchangeable:\n"
+            "- required_capabilities: MCP TOOL IDENTIFIERS ONLY (e.g. get_file_content, "
+            "search_files) -- the literal names of tools a work item's role needs. Never a "
+            "framework, language, or library name.\n"
+            "- proposed_skills: SKILL IDENTIFIERS ONLY, from the skill registry already "
+            "granted to that work item's role. Never a human-readable label.\n"
+            "- technologies: human-readable frameworks, languages, and technologies relevant "
+            "to that work item (e.g. 'React', 'TypeScript', 'Formik', 'FastAPI'). This is "
+            "where ALL human-readable labels belong -- never in required_capabilities or "
+            "proposed_skills.\n\n"
+            "Also provide, at the overall WorkProposal level: implementation_rationale (a "
+            "concise, evidence-grounded explanation of why the proposed approach fits the "
+            "task -- grounded in the investigation findings below, never invented), "
+            "alternatives_considered (other viable approaches and why this one was preferred, "
+            "if any were genuinely considered), and risks (relevant implementation risks or "
+            "constraints, if any apply). Leave these empty rather than inventing content the "
+            "investigation findings do not support.\n\n"
             f"Original task: {task}\n\n"
             f"Investigation findings:\n{investigation_text}"
         )
