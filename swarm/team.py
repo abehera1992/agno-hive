@@ -151,6 +151,45 @@ def _model_verify_claims_unavailable_result() -> str:
     )
 
 
+def _verify_result_confidently_classified(result) -> bool:
+    """Phase 1.62b: whether an agent-voluntary verify_claims result represents a
+    real, completed check this attempt's dedup cache may safely store.
+
+    Deliberately NOT a judgment of whether the claim PASSED -- a confidently
+    reported "NOT FOUND"/"BAD"/"MISMATCH" finding is exactly as cacheable as a
+    clean report, since verify_claims is a deterministic grep-based check: the
+    same claim text against the same evidence state will always find the same
+    thing (see verify.py's own module docstring). What this excludes is a result
+    that means the check did NOT actually run to a real conclusion this time:
+
+    - empty/whitespace-only text (nothing to classify at all);
+    - this file's own _model_verify_claims_unavailable_result() text (a timeout,
+      recognized by its load-bearing "VERIFICATION UNAVAILABLE" prefix);
+    - hive-mcp's own "nothing to check (empty answer)" short-circuit
+      (verify.py:3029-3030 -- an input-validation bail-out, not a verification);
+    - hive-mcp's own "verify_claims STOPPED" meta-notice (verify.py:3077) -- that
+      message is itself hive-mcp's OWN, separate, answer-text-keyed dedup notice;
+      caching it here would mean caching "the other mechanism's own notice" as if
+      it were a real grep result, compounding rather than avoiding redundancy.
+
+    Matches only on these pre-existing, already-load-bearing literal markers
+    (never a new classification heuristic) -- the same methodology
+    _reader_facing_report/_compact_verify_report already use elsewhere in this
+    file for the identical class of problem (telling a real finding apart from
+    a meta-notice about the check itself)."""
+    text = _result_text(result) if result is not None else ""
+    if not text or not text.strip():
+        return False
+    stripped = text.strip()
+    if stripped.startswith("VERIFICATION UNAVAILABLE"):
+        return False
+    if stripped.startswith("verify_claims STOPPED"):
+        return False
+    if stripped.startswith("verify_claims: nothing to check"):
+        return False
+    return True
+
+
 # agno_run/agno_list_teams only make sense triggered from the Claude-Code side (the
 # project MCP); passing them to the coordinator would let it recurse back into this
 # same swarm and deadlock, so they're excluded from the project MCP connection only.
@@ -21380,6 +21419,15 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # _build_team can wire it onto `team._evidence_ledger` -- the generic
     # evidence-recording counterpart to read_state (C.4, 2026-10-03).
     evidence_ledger = _EvidenceLedger()
+    # Phase 1.62b: attempt-scoped verify_claims dedup history, same closure-lifetime
+    # convention as `cache`/`evidence_ledger` above -- a new, empty dict per
+    # _build_team() call, so a recovery/regeneration attempt (a fresh call to
+    # _build_team()) never inherits a prior generation's verification history.
+    # Keyed (agent_key, normalized_claim_text, evidence_fingerprint); see
+    # _read_cache_tool_hook's own verify_claims branch for the key construction and
+    # Phase 1.62a's audit for why this lives here rather than in hive-mcp or in
+    # orchestrator-driven _verify_claims() (both explicitly out of scope).
+    verification_history: dict[tuple, dict] = {}
 
     async def _read_cache_tool_hook(function_name, function, args, agent=None, run_context=None):
         # Phase 1.32: scratch/comparison-only kill switch for the whole Phase 1.31
@@ -21442,11 +21490,68 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             return await function(**args)
 
         if function_name == "verify_claims":
+            # Phase 1.62b: dedup an agent-voluntary call whose claim text and evidence
+            # state exactly match one already verified THIS attempt, by THIS agent.
+            # Never applied to orchestrator-driven _verify_claims() (a different,
+            # untouched call path) and never touches hive-mcp's own server-side
+            # answer-text dedup (verify.py) -- this is purely an additional,
+            # independent client-side check that runs BEFORE the real tool call.
+            _answer = (args or {}).get("answer") if isinstance(args, dict) else None
+            _glob = (args or {}).get("glob_filter") if isinstance(args, dict) else None
+            _verify_agent_key = _member_id(getattr(agent, "name", None) or "") or ""
+            _verify_key = None
+            if isinstance(_answer, str) and _answer.strip():
+                # Whitespace collapse/trim ONLY -- no stemming, reordering, or fuzzy
+                # normalization (Phase 1.62a: a claim differing only by an added
+                # citation, e.g. a line number, must NOT collapse into its predecessor).
+                _normalized_claim = re.sub(r"\s+", " ", _answer.strip())
+                # Conservative evidence-state fingerprint (Phase 1.62a Option A): the
+                # full, ordered set of evidence_ids this closure's OWN evidence_ledger
+                # holds right now. Confirmed by direct tracing (not assumed): a cache
+                # HIT in this same hook never reaches _record_evidence_from_observation
+                # (that call is gated inside the fresh-fetch branch only), so this
+                # fingerprint changes only when genuinely NEW evidence has been
+                # recorded since the prior identical claim was checked -- never on a
+                # repeated/cached read of unchanged content. Does not parse which
+                # specific files a claim is ABOUT (that would require duplicating
+                # hive-mcp's own citation-extraction regex, explicitly out of scope
+                # for this phase) -- documented limitation, not an oversight: two
+                # DIFFERENT claims can never collide regardless (the claim text is
+                # also part of the key), so this fingerprint only needs to answer
+                # "has anything changed since", not "what is this claim about".
+                _evidence_fingerprint = tuple(r.evidence_id for r in evidence_ledger.list())
+                _verify_key = (_verify_agent_key, _normalized_claim, _evidence_fingerprint, _glob)
+                _cached = verification_history.get(_verify_key)
+                if _cached is not None:
+                    print(f"[team] verify_claims DEDUP HIT — identical claim + unchanged "
+                          f"evidence state already verified by "
+                          f"{_verify_agent_key or 'coordinator'} this attempt (original "
+                          f"check recorded at t={_cached['created_at']:.2f}) — returning "
+                          f"the stored report unchanged, no new verification call made",
+                          flush=True)
+                    return _cached["report"]
             try:
-                return await asyncio.wait_for(function(**args), timeout=_MODEL_VERIFY_CLAIMS_TIMEOUT)
+                _verify_result = await asyncio.wait_for(
+                    function(**args), timeout=_MODEL_VERIFY_CLAIMS_TIMEOUT)
             except Exception as exc:
                 print(f"[team] model-voluntary verify_claims call did not complete in time: {exc}")
                 return _model_verify_claims_unavailable_result()
+            if _verify_key is not None and _verify_result_confidently_classified(_verify_result):
+                # Recorded only on a confidently-classified completion -- a "clean"
+                # report and a "NOT FOUND"/"BAD"/"MISMATCH" report are BOTH eligible
+                # (verify_claims is a deterministic grep-based check: the same claim
+                # against the same evidence state will always find the same thing,
+                # so a genuine negative finding is exactly as cacheable as a genuine
+                # positive one). What is excluded is anything that means the check
+                # did not actually run to a real conclusion this time: a timeout, an
+                # exception, the tool's own empty-answer short-circuit, or hive-mcp's
+                # OWN "STOPPED" meta-notice (caching THAT would mean caching "the
+                # other dedup mechanism's own notice" rather than a real grep result).
+                verification_history[_verify_key] = {
+                    "report": _verify_result,
+                    "created_at": time.monotonic(),
+                }
+            return _verify_result
 
         if function_name not in _CACHEABLE_READ_TOOLS:
             # Repeated IDENTICAL FAILING call (2026-08-31, change #2). The read cache
