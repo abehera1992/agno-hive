@@ -748,9 +748,31 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
         # roster can be built without disturbing shared state; `specs_for_attempt`
         # reuses that same fresh-per-attempt lifecycle rather than adding a new one.
         specs_for_attempt = ctx["specs"]
-        if wi.skill_blocks:
+        # Phase 1.63b: wi.required_capabilities (populated ONLY by plan_from_proposal(),
+        # from an already-validated, already-executable proposal's own required_capabilities
+        # -- never from unvalidated model text, never invented here) widens the acting
+        # role's own PER-ATTEMPT tool copy the exact same way wi.skill_blocks already
+        # does, immediately below -- same isolation guarantee (ctx["specs"] itself is
+        # never mutated, so no other work item's agent is affected), same "no-op unless
+        # the field is actually set" guarantee WorkItem's own docstring already promises
+        # for this field (every pre-1.63b caller leaves it empty, so this changes nothing
+        # for them). Union, not replace: the role keeps every tool it already statically
+        # has (team_role_tools/YAML), plus whatever this one work item additionally
+        # needs -- make_agent_from_spec() resolves the combined name list against the
+        # SAME already-connected MCP toolkits it always has (swarm/agents.py:390-395),
+        # so an unknown/unresolvable name is silently excluded there, never granted.
+        # Already guaranteed non-mutating by validate_proposal()'s own mutating check at
+        # proposal-record time (an invalid, mutating-capability proposal is never
+        # executable in the first place -- see Ledger.get_executable_proposal()), and
+        # independently covered again by this same Workflow's own unconditional
+        # _strip_mutating() pass over ctx["specs"] (line ~1874) that already ran before
+        # this per-attempt copy exists -- two independent layers, neither touched here.
+        if wi.skill_blocks or wi.required_capabilities:
             specs_for_attempt = [
-                sp.model_copy(update={"instructions": list(sp.instructions or []) + wi.skill_blocks})
+                sp.model_copy(update={
+                    "instructions": list(sp.instructions or []) + wi.skill_blocks,
+                    "tools": sorted(set(sp.tools or []) | set(wi.required_capabilities)),
+                })
                 if T._member_key(sp.name) == role else sp
                 for sp in ctx["specs"]
             ]
@@ -1042,7 +1064,20 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
         from swarm import proposal as P
         try:
             from swarm import team_config as _team_config
-            known_caps = _exposed_mcp_tool_names(getattr(agent, "tools", None))
+            # Phase 1.63b: SQLite registry-driven catalog, replacing the Phase 1.61c
+            # live-MCP-introspection source at THIS call site specifically (that fix
+            # and _exposed_mcp_tool_names() itself are untouched and still used
+            # elsewhere -- see that function's own docstring). Selection rule, exactly
+            # as specified: a role with one or more DB-assigned tools (team_role_tools)
+            # gets exactly those as its catalog; a role with none assigned (None/empty)
+            # falls back to every globally registered tool; an empty global registry
+            # yields an explicit empty catalog -- propose_from_text()'s own Phase 1.61e
+            # rendering already distinguishes "nothing assigned to you" from "nothing
+            # registered at all" via the None-vs-empty-frozenset distinction, so no new
+            # prompt wording is needed here, only the right set to pass in.
+            _role_assigned_tools = _team_config.get_extra_tools("engineering", role)
+            known_caps = (frozenset(_role_assigned_tools) if _role_assigned_tools
+                         else frozenset(_team_config.get_registered_tools()))
             authorized_skills = {r: frozenset(_team_config.get_extra_skills("engineering", r))
                                  for r in P.KNOWN_ROLES}
             proposal_obj, validation = await P.propose_from_text(

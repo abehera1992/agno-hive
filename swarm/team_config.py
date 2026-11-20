@@ -147,6 +147,17 @@ def get_gate_enabled(team_name: str | None, gate_name: str, default: bool) -> bo
     return _gate_flags_cache.get((team_name, gate_name), default)
 
 
+def get_registered_tools() -> list[str]:
+    """Sync, cache-only. Every tool name currently in the tool registry -- the
+    same set is_tool_registered() checks membership against, exposed here as a
+    full listing rather than a per-name boolean (Phase 1.63b: the global-catalog
+    fallback for a role with no team_role_tools assignment at all). Reuses
+    _tool_registry_cache verbatim -- no new cache, no new table, no new loading
+    path; refreshed by the same refresh_registry()/reload() this module's other
+    registry reads already depend on."""
+    return sorted(_tool_registry_cache)
+
+
 def is_tool_registered(tool_name: str) -> bool:
     """Sync, cache-only. Used by api/server.py's admin endpoint to reject an
     unregistered tool_name at write time (Open Question #2's resolution) —

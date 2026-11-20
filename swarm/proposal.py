@@ -125,6 +125,57 @@ def _render_skills_by_role(authorized_skills_by_role: Optional[dict], known_role
     return "\n".join(lines)
 
 
+# Phase 1.63b: field classification by responsibility -- WHAT each property is for, WHO
+# produces its value, and WHAT it actually does at execution time. Documentation only; no
+# field is added, removed, or renamed, and every existing persisted proposal still parses
+# exactly as before (see each field's own Field(description=...) below for the model-facing
+# generation hint, unchanged by this phase).
+#
+# WORK DEFINITION -- ProposedWorkItem.objective/role/depends_on, WorkProposal.objective,
+#   plus ProposedWorkItem.acceptance_criteria/expected_evidence:
+#   Producer: the planner model (propose_from_text()'s structured-output call).
+#   Execution significance: these are what plan_from_proposal() actually translates into a
+#   real Workflow WorkItem (swarm/eng_workflow.py) when a proposal is approved and
+#   dispatched -- the only fields that directly shape WHAT gets done and in what order
+#   (topological, via depends_on).
+#
+# TECHNOLOGY GUIDANCE -- ProposedWorkItem.technologies:
+#   Producer: the planner model, free-form (never validated against any registry).
+#   Execution significance: PURELY INFORMATIONAL. Never read by validate_proposal(),
+#   never reaches the executable work_items projection, never affects which MCP tools or
+#   skills an agent receives. Exists only so a persisted, auditable proposal communicates
+#   WHY the proposed capabilities/skills look the way they do (Phase 1.61a).
+#
+# ENGINEERING REASONING -- WorkProposal.implementation_rationale/alternatives_considered/
+#   risks:
+#   Producer: the planner model, free-form, evidence-grounded.
+#   Execution significance: PURELY INFORMATIONAL, identical treatment to `technologies`
+#   above -- disclosure for a human/auditor reading the recorded proposal, never consumed
+#   by validation or execution (Phase 1.61a).
+#
+# MCP CAPABILITIES -- ProposedWorkItem.required_capabilities:
+#   Producer: the planner model, constrained to EXACT MCP tool identifiers selected from
+#   the authoritative catalog propose_from_text() renders into its own prompt (Phase 1.61e:
+#   a role's SQLite-registry-assigned tools, or -- when none are assigned -- every globally
+#   registered tool; Phase 1.63b formalizes this selection rule via
+#   swarm.team_config.get_extra_tools()/get_registered_tools()).
+#   Execution significance: FUNCTIONAL, not merely descriptive. validate_proposal() rejects
+#   any entry that is malformed, unknown to the supplied catalog, or would need write
+#   access (never relaxed by this phase). For an APPROVED, EXECUTABLE proposal,
+#   swarm/eng_workflow.py's run_attempt() (Phase 1.63b) widens the acting role's own
+#   per-attempt tool set with exactly these names before the agent is built, so a
+#   model-selected capability is not just persisted/displayed but actually made callable --
+#   see that call site's own comment for the resolution path (swarm/agents.py's
+#   make_agent_from_spec(), unchanged).
+#
+# SKILLS -- ProposedWorkItem.proposed_skills:
+#   Producer: the planner model, constrained to skill identifiers already granted to the
+#   work item's OWN role (per-role catalogs, never a cross-role union -- Phase 1.61e).
+#   Execution significance: FUNCTIONAL but advisory, not an authorization grant on its own
+#   -- validate_proposal() reports an unauthorized (but well-formed, real) skill as a
+#   DISCLOSURE (`unauthorized_skills`), never a hard error; skill content actually reaching
+#   an executing agent still goes through the SAME existing skill-resolution/ownership path
+#   (swarm.team._resolve_requested_skills(), Phase 1.57c) this phase does not touch.
 class ProposedWorkItem(BaseModel):
     """One unit of proposed work. Field names deliberately mirror swarm.eng_workflow.WorkItem's
     own vocabulary (work_item_id/objective/required_capabilities) where the same concept
