@@ -21145,6 +21145,16 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # a file being one page is a fact about the file, not about the arguments or the
     # agent that asked. Drives the key collapse in the hook below.
     whole_file_paths: set[str] = set()
+    # Phase 1.63d: the converse of whole_file_paths -- paths hive-mcp has CONFIRMED
+    # exceed its own _MAX_FULL_BYTES threshold (reached the genuinely-ranged render
+    # path, never the "offset/limit ignored" one), populated the same way
+    # (read off the tool's own response marker, never guessed from size -- see the
+    # population site below). _reserve_worst_case() below only reserves the smaller,
+    # producer-enforced _MAX_RANGED_READ_CHARS bound for a path once it is IN this
+    # set -- a ranged request for a path not yet confirmed large still reserves the
+    # full default, since a small file ignores offset/limit entirely and is served up
+    # to the SAME full-file cap regardless (hive-mcp's own "fits whole" shortcut).
+    ranged_capped_paths: set[str] = set()
     # Identical FAILING calls per (agent, tool, args) -- see the collapse branch below.
     # Reset on success, so a tool that fails twice then works starts clean.
     failure_counts: dict[tuple, int] = {}
@@ -21310,6 +21320,29 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
             _requested = (call_args or {}).get("max_output_chars") or 0
             if _requested > 0:
                 return min(int(_requested), _MAX_RENDERED_CHARS_LOCAL)
+            # Phase 1.63d: a genuinely bounded ranged read (offset/limit) of a path
+            # ALREADY CONFIRMED this run to exceed hive-mcp's own _MAX_FULL_BYTES
+            # threshold reserves the smaller, producer-enforced _MAX_RANGED_READ_CHARS
+            # bound -- see ranged_capped_paths' own comment for why "offset/limit was
+            # requested" ALONE is not enough: a small file ignores them entirely and is
+            # still served up to the full _MAX_RENDERED_CHARS default (hive-mcp's own
+            # "offset/limit ignored" shortcut), so reducing the reservation without that
+            # confirmation would under-reserve against a real possible 60,000-char
+            # result. Strictly validated before the reduction applies -- a malformed
+            # type, a non-positive value, or an unconfirmed path all fall through to the
+            # existing, safe default unchanged.
+            _off = (call_args or {}).get("offset")
+            _lim = (call_args or {}).get("limit")
+            def _valid_nonneg_int(v):
+                return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+            _args_well_formed = (
+                (_off is None or _valid_nonneg_int(_off))
+                and (_lim is None or _valid_nonneg_int(_lim)))
+            _range_requested = bool(_off) or bool(_lim)  # mirrors hive-mcp's own `if offset or limit:` gate
+            _path = (call_args or {}).get("relative_path")
+            if (_args_well_formed and _range_requested
+                    and isinstance(_path, str) and _path in ranged_capped_paths):
+                return _MAX_RANGED_READ_CHARS_LOCAL
             return _MAX_RENDERED_CHARS_LOCAL
         if fn_name == "get_symbol":
             # Phase 1.31: hive-mcp's own _MAX_SYMBOL_CHARS is defined as an alias of
@@ -21329,6 +21362,10 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # the same update, exactly the risk _reserve_worst_case's own docstring already names.
     _MAX_FULL_BYTES_LOCAL = 40_000
     _MAX_RENDERED_CHARS_LOCAL = 60_000
+    # Phase 1.63d: mirrors hive-mcp's own _MAX_RANGED_READ_CHARS (config.SEARCH_MAX_
+    # OUTPUT_CHARS, defaulting to 20,000) -- the smaller cap its genuinely-ranged
+    # get_file_content render path enforces, distinct from the full-file default above.
+    _MAX_RANGED_READ_CHARS_LOCAL = 20_000
     # Phase 1.29: mirrors hive-mcp's own newly-enforced _MAX_COUNT_MATCHES_CHARS exactly
     # -- a real producer-side cap now exists (see that constant's own comment in
     # hive-mcp/tools/context.py), so this reservation matches it precisely rather than
@@ -22196,6 +22233,18 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 cache_origin_generation.setdefault(_collapsed_key, generation)
                 print(f"[team] {_path} was served whole — later ranged reads of it "
                       f"will be served from cache, not re-fetched", flush=True)
+            # Phase 1.63d: the converse record -- a get_file_content call that actually
+            # REQUESTED a range (offset or limit truthy, mirroring hive-mcp's own gate)
+            # and did NOT come back "offset/limit ignored" can only have reached the
+            # genuinely-ranged render path, which means this path is now CONFIRMED to
+            # exceed _MAX_FULL_BYTES. Recorded once; _reserve_worst_case() reads this
+            # set to decide whether a LATER ranged request for the SAME path may safely
+            # reserve the smaller bound instead of the full-file default.
+            if (function_name == "get_file_content" and _path
+                    and _path not in ranged_capped_paths
+                    and ((args or {}).get("offset") or (args or {}).get("limit"))
+                    and "offset/limit ignored" not in _result_text(result)[:400]):
+                ranged_capped_paths.add(_path)
         else:
             result = cache[cache_key]
 
@@ -22642,6 +22691,10 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # uses for its own closure-local counter.
     _read_cache_tool_hook.state = read_state
     _read_cache_tool_hook.evidence_ledger = evidence_ledger
+    # Phase 1.63d: exposed the same way, for the same reason -- a scratch driver can
+    # observe exactly which paths were confirmed large without reaching into the
+    # closure directly. Read-only visibility; nothing external ever assigns to it.
+    _read_cache_tool_hook.ranged_capped_paths = ranged_capped_paths
     # Phase 0.23: exposed the same way -- see member_result_generation's own
     # module-level comment (where member_answers is defined) for why
     # forward_member_answer needs read access to this live counter.
