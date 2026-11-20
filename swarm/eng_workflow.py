@@ -551,6 +551,54 @@ def select_capable_member(team, required_capabilities, member_key_fn, preference
     return default, missing
 
 
+def _exposed_mcp_tool_names(tools) -> frozenset:
+    """Phase 1.61c: the actual, runtime-discovered tool identifiers an agent's own `tools`
+    list exposes -- NOT `getattr(t, "name", None)` for each entry, which is the toolkit
+    WRAPPER's own name (e.g. literally "MCPTools" for every agno MCPTools instance,
+    confirmed live via this file's own `[team] member surface ...` log,
+    swarm/team.py:26813-26816), never the individual tool names (get_file_content,
+    search_files, ...) agno discovers dynamically inside it from the connected MCP
+    server's own `list_tools()` response.
+
+    Root cause (Phase 1.61b, live T14 acceptance run): run_attempt()'s own
+    `known_capabilities` was built from exactly that wrapper-name extraction, so a
+    Researcher proposal correctly naming real tools it had just used (get_file_content,
+    search_files) was still rejected as "not in the known capability registry" --
+    the registry never actually held an individual tool name to begin with.
+
+    Fix: agno's `Toolkit` base class (every MCPTools instance IS one -- agno.tools.mcp.mcp.
+    MCPTools(Toolkit)) keeps its OWN discovered tools in `self.functions`/
+    `self.async_functions` (both `Dict[str, Function]`, populated by MCPTools.initialize()
+    from the real `session.list_tools()` response -- agno.tools.mcp.mcp:594,649). Reading
+    THOSE dicts' keys is the one reliable, already-populated-by-agno-itself source of real
+    tool identifiers; nothing here second-guesses or recomputes what agno discovered.
+
+    A Toolkit-shaped entry (has a `functions` or `async_functions` dict, even if empty)
+    contributes ONLY its own discovered names, NEVER falls back to its own wrapper `.name`
+    -- a toolkit that failed to initialize/list_tools (empty dict) genuinely exposes zero
+    real capabilities right now, and a placeholder name would misrepresent that as a real,
+    usable one. A non-Toolkit entry (a bare function-style tool such as
+    update_session_state, which has no `functions` dict of its own) falls back to its own
+    `.name`, exactly as before -- zero behavior change for that case.
+
+    Deliberately NOT shared with select_capable_member()'s own, separately-scoped
+    `_tool_names()` helper above (same underlying wrapper-name pattern, but that function's
+    own docstring already establishes it is currently dormant -- no caller populates a
+    dispatched WorkItem's required_capabilities from a proposal today) -- fixing it is a
+    second defect, out of this phase's own "one defect only" scope."""
+    names: set = set()
+    for t in tools or []:
+        if hasattr(t, "functions") or hasattr(t, "async_functions"):
+            for d in (getattr(t, "functions", None), getattr(t, "async_functions", None)):
+                if isinstance(d, dict):
+                    names.update(d.keys())
+            continue
+        n = getattr(t, "name", None)
+        if n:
+            names.add(n)
+    return frozenset(names)
+
+
 async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, attempt_no: int, task_override: str = None,
                       extra_activity: dict = None, role: str = "researcher", propose: bool = False,
                       parent_attempt_id: Optional[str] = None):
@@ -994,8 +1042,7 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
         from swarm import proposal as P
         try:
             from swarm import team_config as _team_config
-            known_caps = frozenset(
-                getattr(t, "name", None) for t in (getattr(agent, "tools", None) or [])) - {None}
+            known_caps = _exposed_mcp_tool_names(getattr(agent, "tools", None))
             authorized_skills = {r: frozenset(_team_config.get_extra_skills("engineering", r))
                                  for r in P.KNOWN_ROLES}
             proposal_obj, validation = await P.propose_from_text(
