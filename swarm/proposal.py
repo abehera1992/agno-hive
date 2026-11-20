@@ -55,6 +55,75 @@ _ID_FORMAT_DESC = (
     "(not EK-VOUCHER-FULL-UI, not a bare number)."
 )
 
+# Phase 1.61e: these three constants/helpers render the SAME registries validate_proposal()
+# checks against -- known_capabilities / authorized_skills_by_role / KNOWN_ROLES -- into the
+# generation prompt itself. Phase 1.61d (read-only audit) found that propose_from_text() only
+# ever forwarded these to validate_proposal() (post-hoc check), never into the prompt the
+# planner model actually reads -- so the model had nothing authoritative to select from and
+# fell back to plausible-sounding guesses (technology names, invented roles/skills). This is
+# purely a generation-time disclosure: it changes what the planner is TOLD, never what
+# validate_proposal() CHECKS -- that function, _NAME_RE, and every authorization rule are
+# untouched by this phase.
+_MAX_CATALOG_ITEMS = 300  # safety bound only; real registries today are a few dozen entries
+
+
+def _render_catalog_list(items: list, *, empty_note: str) -> str:
+    """Deterministic, sorted-input, newline-free rendering of a flat identifier catalog,
+    bounded to _MAX_CATALOG_ITEMS so a pathologically large registry cannot cause unbounded
+    prompt growth. Caller passes an already-sorted list; this function only truncates/joins."""
+    if not items:
+        return empty_note
+    shown = items[:_MAX_CATALOG_ITEMS]
+    text = ", ".join(shown)
+    remaining = len(items) - len(shown)
+    if remaining > 0:
+        text += f", ... ({remaining} more not shown)"
+    return text
+
+
+def _render_known_roles(known_roles: frozenset) -> str:
+    """Flat, sorted role-identifier list -- known_roles is always a small, fixed set in
+    practice (the same KNOWN_ROLES validate_proposal() itself defaults to), but this is
+    defensive against an empty/overridden set rather than assuming non-empty."""
+    return _render_catalog_list(sorted(known_roles), empty_note="(no roles configured)")
+
+
+def _render_known_capabilities(known_capabilities: Optional[frozenset]) -> str:
+    """known_capabilities is a single, global (not role-scoped) catalog in
+    validate_proposal() -- rendered ONCE here, never duplicated per role, to keep prompt
+    growth bounded. None means the caller has no live registry to offer at all (distinct
+    from an empty-but-real frozenset(), which means a real registry that's genuinely empty
+    right now) -- both cases must leave required_capabilities empty, but the wording differs
+    so the model is told WHY, not left to guess between 'nothing available' and 'not told'."""
+    if known_capabilities is None:
+        return ("No MCP capability registry was supplied for this attempt -- do not invent "
+                "tool identifiers; required_capabilities MUST be an empty list for every "
+                "work item.")
+    return _render_catalog_list(
+        sorted(known_capabilities),
+        empty_note="No MCP capabilities are currently available -- required_capabilities "
+                   "MUST be an empty list for every work item.")
+
+
+def _render_skills_by_role(authorized_skills_by_role: Optional[dict], known_roles: frozenset) -> str:
+    """One line per role, in deterministic sorted(known_roles) order -- NEVER a global union
+    of every role's skills, so a skill authorized for one role is never presented as if it
+    were available to another (the exact confusion a flat combined list would invite, since
+    validate_proposal()'s own authorization check is strictly per-role). Only known_roles are
+    rendered -- an authorized_skills_by_role key outside known_roles would never pass the
+    role check anyway, so showing it here would only add noise. None (no registry supplied
+    at all) renders one explicit, unambiguous instruction instead of per-role rows, since
+    there is nothing real to group by role in that case."""
+    if authorized_skills_by_role is None:
+        return ("No skill registry was supplied for this attempt -- do not invent skill "
+                "identifiers; proposed_skills MUST be an empty list for every work item.")
+    lines = []
+    for role in sorted(known_roles):
+        role_skills = sorted(authorized_skills_by_role.get(role) or [])
+        rendered = _render_catalog_list(role_skills, empty_note="(none authorized for this role)")
+        lines.append(f"- {role}: {rendered}")
+    return "\n".join(lines)
+
 
 class ProposedWorkItem(BaseModel):
     """One unit of proposed work. Field names deliberately mirror swarm.eng_workflow.WorkItem's
@@ -369,6 +438,14 @@ async def propose_from_text(
         planner = Agent(model=planner_model, tools=[], output_schema=researcher_output_schema(),
                         markdown=False)
         skill_preamble = ("\n\n".join(skill_blocks) + "\n\n") if skill_blocks else ""
+        # Phase 1.61e: render the SAME registries validate_proposal() will check this
+        # proposal against, so the planner is told what is actually valid instead of being
+        # expected to infer it. See the _render_* helpers' own docstrings above for why each
+        # is rendered the way it is (capabilities: one global list; skills: per-role, never
+        # a union; roles: the same KNOWN_ROLES validate_proposal() defaults to).
+        role_catalog_text = _render_known_roles(KNOWN_ROLES)
+        capability_catalog_text = _render_known_capabilities(known_capabilities)
+        skills_catalog_text = _render_skills_by_role(authorized_skills_by_role, KNOWN_ROLES)
         prompt = (
             skill_preamble +
             "Based ONLY on the investigation findings below (already gathered -- do not "
@@ -382,15 +459,25 @@ async def propose_from_text(
             "same work_item_id string when another item's depends_on references it -- "
             "dependencies are matched by exact string equality, not by similarity.\n\n"
             "IMPORTANT -- these three fields are NOT interchangeable:\n"
-            "- required_capabilities: MCP TOOL IDENTIFIERS ONLY (e.g. get_file_content, "
-            "search_files) -- the literal names of tools a work item's role needs. Never a "
-            "framework, language, or library name.\n"
-            "- proposed_skills: SKILL IDENTIFIERS ONLY, from the skill registry already "
-            "granted to that work item's role. Never a human-readable label.\n"
+            "- required_capabilities: MCP TOOL IDENTIFIERS ONLY -- select ONLY from the "
+            "authoritative capability list below. Never a framework, language, or library "
+            "name.\n"
+            "- proposed_skills: SKILL IDENTIFIERS ONLY -- select ONLY from the authoritative "
+            "per-role skill lists below, for the work item's OWN selected role. Never a "
+            "human-readable label, and never a skill listed under a different role.\n"
             "- technologies: human-readable frameworks, languages, and technologies relevant "
             "to that work item (e.g. 'React', 'TypeScript', 'Formik', 'FastAPI'). This is "
             "where ALL human-readable labels belong -- never in required_capabilities or "
             "proposed_skills.\n\n"
+            "AUTHORITATIVE CATALOGS -- the ONLY values allowed in the fields named above. Do "
+            "not invent, guess, paraphrase, or substitute a plausible-sounding alternative. If "
+            "nothing in a catalog fits a work item, use an empty list for that field rather "
+            "than inventing an entry:\n\n"
+            f"Valid roles (role field): {role_catalog_text}\n\n"
+            f"Valid MCP tool identifiers (required_capabilities field): {capability_catalog_text}\n\n"
+            "Valid skill identifiers (proposed_skills field), listed separately per role -- a "
+            "skill listed under one role is NOT authorized for any other role:\n"
+            f"{skills_catalog_text}\n\n"
             "Also provide, at the overall WorkProposal level: implementation_rationale (a "
             "concise, evidence-grounded explanation of why the proposed approach fits the "
             "task -- grounded in the investigation findings below, never invented), "
