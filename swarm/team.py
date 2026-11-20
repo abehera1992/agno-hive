@@ -21486,6 +21486,25 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         "and unchanged evidence. Do not call verify_claims again for this claim. Proceed "
         "to write your final answer using the verification result already provided above."
     )
+    # Phase 1.63k: a SECOND, higher threshold on the SAME _VERIFY_ESCALATION_HIT_THRESHOLD
+    # counter (verification_hit_counts) -- no new counter. Strictly greater than
+    # _VERIFY_ESCALATION_HIT_THRESHOLD (2) so the model always receives the Phase 1.63g
+    # escalation instruction at least once (hit #2) before a refusal is ever possible
+    # (hit #3+). Phase 1.63j's audit confirmed the real verifier never runs again once a
+    # key is cached, with or without this threshold -- this constant only changes what a
+    # repeat beyond it RETURNS (a structured ToolRefusal instead of a disguised success
+    # carrying the cached report), never whether the real tool is invoked again. The
+    # cached report itself (_cached["report"]) is never read, mutated, or concatenated in
+    # this branch -- the refusal text below is returned standalone.
+    _VERIFY_EXACT_REPEAT_REFUSAL_HIT_THRESHOLD = 3
+    _VERIFY_EXACT_REPEAT_REFUSAL_TEXT = (
+        "This exact verification request (same claim, same evidence state, same filter, "
+        "same agent) has already been completed during this attempt. The application is "
+        "refusing another verify_claims call for this exact request. Use the verification "
+        "result already returned earlier in this conversation and proceed with the task. "
+        "If you have a genuinely changed claim or newly available evidence, submit it as "
+        "a distinct verification request instead."
+    )
     # Phase 1.63i: a SEPARATE attempt-local, agent-scoped history from verification_history/
     # verification_hit_counts above -- those key on the CLAIM+evidence (Phase 1.62b/1.63g);
     # this one keys on the verifier's own exact OUTPUT content, independent of what claim
@@ -21626,10 +21645,25 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                           f"(original check recorded at t={_cached['created_at']:.2f}) — "
                           f"returning the stored report unchanged, no new verification "
                           f"call made", flush=True)
+                    # Phase 1.63k: past the refusal threshold, return a structured
+                    # ToolRefusal (via the same _refuse() helper every other refusal in
+                    # this hook already uses) INSTEAD of the cached report -- checked
+                    # first so it takes precedence once reached, and every hit at or past
+                    # this threshold refuses, not just the first one. The STORED report
+                    # (_cached["report"]) is read nowhere in this branch -- never mutated,
+                    # never concatenated, never exposed.
+                    if _hit_count >= _VERIFY_EXACT_REPEAT_REFUSAL_HIT_THRESHOLD:
+                        print(f"[team] verify_claims EXACT-REPEAT REFUSED (hit #{_hit_count} "
+                              f"on this key, threshold {_VERIFY_EXACT_REPEAT_REFUSAL_HIT_THRESHOLD}) "
+                              f"— returning ToolRefusal, cached report not touched", flush=True)
+                        return _refuse(agent, function_name, args,
+                                        "verify_claims_exact_repeat_refused",
+                                        _VERIFY_EXACT_REPEAT_REFUSAL_TEXT)
                     # The STORED report (_cached["report"]) is never mutated -- only the
                     # value RETURNED to the model on this one call gets the escalation
                     # appended, starting at the configured threshold and on every repeat
-                    # after it (never just once).
+                    # after it (never just once, and never past the refusal threshold
+                    # above, which takes precedence).
                     if _hit_count >= _VERIFY_ESCALATION_HIT_THRESHOLD:
                         return _cached["report"] + _VERIFY_ESCALATION_TEXT
                     return _cached["report"]
