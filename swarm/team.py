@@ -21486,6 +21486,35 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
         "and unchanged evidence. Do not call verify_claims again for this claim. Proceed "
         "to write your final answer using the verification result already provided above."
     )
+    # Phase 1.63i: a SEPARATE attempt-local, agent-scoped history from verification_history/
+    # verification_hit_counts above -- those key on the CLAIM+evidence (Phase 1.62b/1.63g);
+    # this one keys on the verifier's own exact OUTPUT content, independent of what claim
+    # text produced it. Phase 1.63h's audit found the model rewording/reformatting a claim
+    # (adding line numbers, adding/removing analysis prose, changing backtick styling)
+    # across several DIFFERENT exact-key verifications that nonetheless returned
+    # byte-identical result content -- each one a genuine cache MISS by Phase 1.62b's own
+    # correct standard (the input differed), yet none of them told the model it was
+    # re-deriving an already-known outcome. This mechanism detects exactly that, on the
+    # verifier's OUTPUT only -- never comparing or normalizing claim TEXT, never fuzzy or
+    # semantic matching, never skipping or short-circuiting the real call that produces the
+    # result (detection happens strictly AFTER a fresh call returns).
+    verification_result_history: dict[tuple, dict] = {}
+    verification_result_repeat_counts: dict[tuple, int] = {}
+    # "two repeat matches after the initial observation" -- the 1st occurrence of a given
+    # result just records it (no escalation); the 2nd occurrence is repeat-match #1
+    # (unchanged, no escalation yet); the 3rd occurrence is repeat-match #2, which meets
+    # this threshold and escalates -- and every occurrence after that continues to.
+    _VERIFY_RESULT_ESCALATION_THRESHOLD = 2
+    _VERIFY_RESULT_ESCALATION_TEXT = (
+        "\n\n── NOTE FROM THE RUN, not from the tool ──\n"
+        "This exact verification RESULT has already been obtained earlier in this attempt, "
+        "under a different verification request. Reproducing an existing result through "
+        "wording or formatting changes does not establish that the claims are semantically "
+        "identical, and it has not produced new information. Stop re-deriving this same "
+        "outcome by rewording or reformatting your claim. Proceed using the available "
+        "evidence and the verification results already obtained, unless you have genuinely "
+        "new evidence or a materially different verification objective."
+    )
 
     async def _read_cache_tool_hook(function_name, function, args, agent=None, run_context=None):
         # Phase 1.32: scratch/comparison-only kill switch for the whole Phase 1.31
@@ -21625,6 +21654,35 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                     "report": _verify_result,
                     "created_at": time.monotonic(),
                 }
+                # Phase 1.63i: result-content check, strictly AFTER the real call has
+                # already returned and already been recorded above -- never a basis for
+                # skipping or short-circuiting this (or any) real verification call.
+                # Fully synchronous, no `await`, same reasoning as Phase 1.63g's own
+                # hit-counting: asyncio's cooperative scheduling means this whole block
+                # runs to completion without interleaving, so concurrent fresh calls that
+                # happen to land on the same (agent, result-hash) pair still increment
+                # correctly and in some real serial order.
+                # Defensive: only applies when the result is a plain str (confirmed the
+                # real shape by Phase 1.63g's own already-live-validated `report + text`
+                # concatenation on this exact value) -- never guesses at hashing/
+                # concatenating an unexpected shape; silently skips this mechanism rather
+                # than risk an error on a real verification result that already succeeded.
+                if isinstance(_verify_result, str):
+                    _result_key = (_verify_agent_key, hashlib.sha256(_verify_result.encode("utf-8")).hexdigest())
+                    _prior_result_seen = verification_result_history.get(_result_key)
+                    if _prior_result_seen is not None:
+                        _result_repeat_count = verification_result_repeat_counts.get(_result_key, 0) + 1
+                        verification_result_repeat_counts[_result_key] = _result_repeat_count
+                        print(f"[team] verify_claims REPEATED RESULT (match #{_result_repeat_count} "
+                              f"on this result) — a FRESH call by {_verify_agent_key or 'coordinator'} "
+                              f"under a different verification key reproduced a result already "
+                              f"observed this attempt (first seen at "
+                              f"t={_prior_result_seen['created_at']:.2f}) — real verification still "
+                              f"ran; this is a disclosure, not a skip", flush=True)
+                        if _result_repeat_count >= _VERIFY_RESULT_ESCALATION_THRESHOLD:
+                            return _verify_result + _VERIFY_RESULT_ESCALATION_TEXT
+                    else:
+                        verification_result_history[_result_key] = {"created_at": time.monotonic()}
             return _verify_result
 
         if function_name not in _CACHEABLE_READ_TOOLS:
