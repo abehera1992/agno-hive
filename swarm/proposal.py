@@ -354,18 +354,21 @@ def validate_proposal(
     for wi in proposal.work_items:
         if not _NAME_RE.match(wi.work_item_id or ""):
             errors.append(f"work_item_id {wi.work_item_id!r} is not a valid identifier")
-            continue
-        if wi.work_item_id in seen_ids:
-            duplicate_ids.add(wi.work_item_id)
-        seen_ids.add(wi.work_item_id)
-    for dup in sorted(duplicate_ids):
-        errors.append(f"duplicate work_item_id: {dup!r}")
-
-    valid_ids = seen_ids - duplicate_ids  # a duplicated id is never a safe dependency target
-    edges: dict[str, list[str]] = {}
-    for wi in proposal.work_items:
-        if wi.work_item_id not in valid_ids:
-            continue  # already reported above (malformed or duplicate); do not compound errors
+        else:
+            if wi.work_item_id in seen_ids:
+                duplicate_ids.add(wi.work_item_id)
+            seen_ids.add(wi.work_item_id)
+        # Phase 1.63e: field-level completeness (objective/acceptance_criteria/
+        # expected_evidence/role) is checked HERE, unconditionally, for EVERY work item --
+        # including one whose own work_item_id is malformed or a duplicate. Previously these
+        # checks lived only in the second loop below, gated on `wi.work_item_id in valid_ids`,
+        # so a work item with a bad id got exactly one error (about the id) and NOTHING about
+        # whatever else was wrong with it -- confirmed live (Phase 1.63d T14 run): a
+        # work_item_id='' item's own blank role/acceptance_criteria/expected_evidence were
+        # never reported at all, only the id problem. This never changes the outcome for an
+        # already-valid proposal (which by definition has no malformed/duplicate ids, so this
+        # code path for THOSE items is unreachable for it) -- it only makes an already-invalid
+        # proposal's error list more complete, never less strict.
         if not (wi.objective or "").strip():
             errors.append(f"work item {wi.work_item_id!r}: objective is empty")
         if not (wi.acceptance_criteria or "").strip():
@@ -375,6 +378,19 @@ def validate_proposal(
         if wi.role not in known_roles:
             errors.append(f"work item {wi.work_item_id!r}: unsupported role {wi.role!r} "
                           f"(known roles: {sorted(known_roles)})")
+    for dup in sorted(duplicate_ids):
+        errors.append(f"duplicate work_item_id: {dup!r}")
+
+    # Phase 1.63e: id-dependent graph/registry checks below are UNCHANGED -- depends_on
+    # resolution, cycle detection, and capability/skill authorization genuinely need a
+    # valid, unique id to be meaningful (an edge or a dict key built from a malformed/
+    # duplicate id would itself be meaningless), so they remain gated on valid_ids exactly
+    # as before. Only the field-completeness checks above were widened.
+    valid_ids = seen_ids - duplicate_ids  # a duplicated id is never a safe dependency target
+    edges: dict[str, list[str]] = {}
+    for wi in proposal.work_items:
+        if wi.work_item_id not in valid_ids:
+            continue  # id itself (and this item's field completeness) already reported above
 
         resolved_deps: list[str] = []
         for dep in wi.depends_on:
