@@ -21465,6 +21465,27 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
     # Phase 1.62a's audit for why this lives here rather than in hive-mcp or in
     # orchestrator-driven _verify_claims() (both explicitly out of scope).
     verification_history: dict[tuple, dict] = {}
+    # Phase 1.63g: per-key repeat count for the SAME verification_history key -- never a
+    # global or cross-key counter. Same closure-lifetime convention as verification_history
+    # itself (fresh per attempt), and keyed IDENTICALLY, so a changed claim, evidence
+    # fingerprint, agent, or glob_filter is a different key with its own count starting at
+    # 0 -- it never inherits a prior key's repeat count. See the verify_claims branch below
+    # for why no explicit lock is needed despite concurrent callers being possible.
+    verification_hit_counts: dict[tuple, int] = {}
+    # Phase 1.63g: a cache HIT this many times on the SAME key (2nd hit = 3rd submission
+    # overall: 1 real check + 1 silent repeat + this one) gets an appended, model-directed
+    # instruction telling it to stop and finalize. Chosen deliberately small: Phase 1.63f's
+    # live evidence showed a real run submit the identical claim 6 times in a row with zero
+    # intervening progress, so one silent repeat (giving the model one honest chance to have
+    # simply mis-clicked/retried) is enough slack before escalating -- it is not meant to be
+    # generous. Threshold is on HIT count, not total submissions.
+    _VERIFY_ESCALATION_HIT_THRESHOLD = 2
+    _VERIFY_ESCALATION_TEXT = (
+        "\n\n── NOTE FROM THE RUN, not from the tool ──\n"
+        "You have already verified this exact claim repeatedly with an identical result "
+        "and unchanged evidence. Do not call verify_claims again for this claim. Proceed "
+        "to write your final answer using the verification result already provided above."
+    )
 
     async def _read_cache_tool_hook(function_name, function, args, agent=None, run_context=None):
         # Phase 1.32: scratch/comparison-only kill switch for the whole Phase 1.31
@@ -21560,12 +21581,28 @@ def _make_read_cache_tool_hook(activity: dict | None = None):
                 _verify_key = (_verify_agent_key, _normalized_claim, _evidence_fingerprint, _glob)
                 _cached = verification_history.get(_verify_key)
                 if _cached is not None:
-                    print(f"[team] verify_claims DEDUP HIT — identical claim + unchanged "
-                          f"evidence state already verified by "
-                          f"{_verify_agent_key or 'coordinator'} this attempt (original "
-                          f"check recorded at t={_cached['created_at']:.2f}) — returning "
-                          f"the stored report unchanged, no new verification call made",
-                          flush=True)
+                    # Phase 1.63g: increment-then-read, with NO `await` anywhere in this
+                    # branch -- asyncio's cooperative scheduling guarantees this whole
+                    # block runs to completion without another coroutine interleaving, so
+                    # two concurrent hits on the SAME key still increment correctly and in
+                    # some real serial order, never losing or duplicating a count. No lock
+                    # is needed here (unlike the miss-path's own, separately-documented,
+                    # already-accepted race in Phase 1.62b's "both may execute" case, which
+                    # this phase does not touch).
+                    _hit_count = verification_hit_counts.get(_verify_key, 0) + 1
+                    verification_hit_counts[_verify_key] = _hit_count
+                    print(f"[team] verify_claims DEDUP HIT (repeat #{_hit_count} on this "
+                          f"key) — identical claim + unchanged evidence state already "
+                          f"verified by {_verify_agent_key or 'coordinator'} this attempt "
+                          f"(original check recorded at t={_cached['created_at']:.2f}) — "
+                          f"returning the stored report unchanged, no new verification "
+                          f"call made", flush=True)
+                    # The STORED report (_cached["report"]) is never mutated -- only the
+                    # value RETURNED to the model on this one call gets the escalation
+                    # appended, starting at the configured threshold and on every repeat
+                    # after it (never just once).
+                    if _hit_count >= _VERIFY_ESCALATION_HIT_THRESHOLD:
+                        return _cached["report"] + _VERIFY_ESCALATION_TEXT
                     return _cached["report"]
             try:
                 _verify_result = await asyncio.wait_for(
