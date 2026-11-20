@@ -94,15 +94,51 @@ def _render_known_capabilities(known_capabilities: Optional[frozenset]) -> str:
     growth bounded. None means the caller has no live registry to offer at all (distinct
     from an empty-but-real frozenset(), which means a real registry that's genuinely empty
     right now) -- both cases must leave required_capabilities empty, but the wording differs
-    so the model is told WHY, not left to guess between 'nothing available' and 'not told'."""
+    so the model is told WHY, not left to guess between 'nothing available' and 'not told'.
+
+    Phase 1.64b: back-compat path only -- the real production call site now always supplies
+    `known_capabilities_by_role` (see _render_capabilities_by_role below), so this function is
+    exercised only by a caller that still passes the old flat `known_capabilities` alone (e.g.
+    existing scratch drivers). The rendered list excludes any _is_mutating() tool name -- DISPLAY
+    ONLY: `known_capabilities` itself is returned unfiltered to the caller and is what
+    validate_proposal() still checks against, so its own, separate _is_mutating rejection and
+    error text are completely unaffected by this filter. A mutating tool was never going to be
+    authorized here (this Workflow path is read_only=True always), so showing it as a selectable
+    option only invited a guess that was guaranteed to be rejected."""
     if known_capabilities is None:
         return ("No MCP capability registry was supplied for this attempt -- do not invent "
                 "tool identifiers; required_capabilities MUST be an empty list for every "
                 "work item.")
+    displayable = sorted(c for c in known_capabilities if not _is_mutating(c))
     return _render_catalog_list(
-        sorted(known_capabilities),
+        displayable,
         empty_note="No MCP capabilities are currently available -- required_capabilities "
                    "MUST be an empty list for every work item.")
+
+
+def _render_capabilities_by_role(known_capabilities_by_role: Optional[dict], known_roles: frozenset) -> str:
+    """Phase 1.64b: the capability-catalog counterpart to _render_skills_by_role -- one line per
+    role, in deterministic sorted(known_roles) order, NEVER a global union, so a tool assigned to
+    one role's catalog is never presented as if it were available to another. Mirrors
+    _render_known_capabilities' None-vs-empty-frozenset distinction per role: a role whose entry
+    is missing/falsy is rendered as having nothing available (the safe default -- the real
+    production caller always populates every known role's entry; a defensive caller that omits
+    one is treated the same as "nothing assigned, nothing to fall back to" rather than guessed
+    at). Filters out any _is_mutating() tool name from the DISPLAYED list only, for the same
+    reason _render_known_capabilities does -- the dict passed in here is never mutated and is
+    exactly what validate_proposal() will check the proposal's own selections against,
+    unfiltered."""
+    if known_capabilities_by_role is None:
+        return ("No MCP capability registry was supplied for this attempt -- do not invent "
+                "tool identifiers; required_capabilities MUST be an empty list for every "
+                "work item.")
+    lines = []
+    for role in sorted(known_roles):
+        role_caps = known_capabilities_by_role.get(role) or frozenset()
+        displayable = sorted(c for c in role_caps if not _is_mutating(c))
+        rendered = _render_catalog_list(displayable, empty_note="(no MCP capabilities currently available for this role)")
+        lines.append(f"- {role}: {rendered}")
+    return "\n".join(lines)
 
 
 def _render_skills_by_role(authorized_skills_by_role: Optional[dict], known_roles: frozenset) -> str:
@@ -325,6 +361,7 @@ def validate_proposal(
     *,
     known_roles: frozenset = KNOWN_ROLES,
     known_capabilities: Optional[frozenset] = None,
+    known_capabilities_by_role: Optional[dict] = None,
     authorized_skills_by_role: Optional[dict] = None,
 ) -> ValidationResult:
     """Deterministic, side-effect-free. Never raises for a malformed proposal -- every
@@ -339,7 +376,19 @@ def validate_proposal(
     no registry at all. `authorized_skills_by_role` (default None) is the caller's own mapping
     of role -> the skill names actually granted to it (e.g. from AgentSpec.skills); when
     absent, EVERY proposed skill is treated as unauthorized by default -- the safe direction,
-    since skills are recommendations only and nothing here may authorize or load one."""
+    since skills are recommendations only and nothing here may authorize or load one.
+
+    `known_capabilities_by_role` (Phase 1.64b, default None): the role-scoped counterpart to
+    `known_capabilities`, same role -> frozenset(tool_name) shape as `authorized_skills_by_role`.
+    When supplied, a work item's `required_capabilities` are checked against ITS OWN role's entry
+    (`.get(wi.role, frozenset())`) -- NEVER against another role's entry and NEVER a union across
+    roles, the exact "proposals can contain work items assigned to different roles" requirement
+    this phase exists to satisfy. When NOT supplied (None, the default -- every existing caller,
+    including every pre-1.64b scratch driver that only ever passed the flat `known_capabilities`),
+    behavior is BYTE-IDENTICAL to before this phase: every work item is checked against the one
+    flat `known_capabilities` set regardless of its role. `known_capabilities_by_role` taking
+    precedence over `known_capabilities` is the ONLY new branch; nothing about the MUTATING-tool
+    check, the malformed-name check, or the unverified-capabilities disclosure changes shape."""
     errors: list[str] = []
     unauthorized_skills: dict[str, list[str]] = {}
     unverified_capabilities: dict[str, list[str]] = {}
@@ -404,6 +453,15 @@ def validate_proposal(
         edges[wi.work_item_id] = resolved_deps
 
         item_unverified: list[str] = []
+        # Phase 1.64b: resolve THIS item's own effective capability catalog -- its OWN role's
+        # entry when a role-scoped registry was supplied, otherwise the old flat `known_capabilities`
+        # exactly as before. A role absent from `known_capabilities_by_role` resolves to an empty
+        # frozenset (the same safe-default convention `authorized_skills_by_role`'s own per-role
+        # lookup already uses below), never silently falling back to the flat value or to another
+        # role's entry.
+        _effective_known_caps = (
+            known_capabilities_by_role.get(wi.role, frozenset())
+            if known_capabilities_by_role is not None else known_capabilities)
         for cap in wi.required_capabilities:
             if not _NAME_RE.match(cap or ""):
                 errors.append(f"work item {wi.work_item_id!r}: malformed capability name {cap!r}")
@@ -413,10 +471,10 @@ def validate_proposal(
                     f"work item {wi.work_item_id!r}: required_capability {cap!r} needs write "
                     f"access, which this read-only workflow can never authorize")
                 continue
-            if known_capabilities is not None and cap not in known_capabilities:
+            if _effective_known_caps is not None and cap not in _effective_known_caps:
                 errors.append(f"work item {wi.work_item_id!r}: unsupported capability "
-                              f"{cap!r} (not in the known capability registry)")
-            elif known_capabilities is None:
+                              f"{cap!r} (not in the known capability registry for role {wi.role!r})")
+            elif _effective_known_caps is None:
                 item_unverified.append(cap)
         if item_unverified:
             unverified_capabilities[wi.work_item_id] = item_unverified
@@ -449,6 +507,7 @@ async def propose_from_text(
     model,
     *,
     known_capabilities: Optional[frozenset] = None,
+    known_capabilities_by_role: Optional[dict] = None,
     authorized_skills_by_role: Optional[dict] = None,
     skill_blocks: Optional[list] = None,
 ) -> tuple[Optional[WorkProposal], ValidationResult]:
@@ -492,7 +551,18 @@ async def propose_from_text(
     `http_client` are explicitly reset to None on the copy so a fresh client is built with the
     new timeout on first use here, instead of reusing a client the original object may already
     have cached (and baked the OLD 120s timeout into) from the investigation call that produced
-    `investigation_text`."""
+    `investigation_text`.
+
+    `known_capabilities_by_role` (Phase 1.64b, default None): role -> frozenset(tool_name), the
+    SAME shape as `authorized_skills_by_role`. When supplied, this is what actually gets rendered
+    into the prompt (via _render_capabilities_by_role) AND forwarded to validate_proposal() --
+    `known_capabilities` is still accepted and still forwarded unchanged for a caller that has
+    nothing role-scoped to offer (every pre-1.64b scratch driver), in which case behavior is
+    byte-identical to before this phase. Fixes the Phase 1.64a-confirmed defect where the
+    acting-role-only catalog this caller used to build meant every OTHER role's work items in the
+    same proposal were validated/shown against the wrong (acting role's) catalog -- this parameter
+    lets the caller hand over a real per-role catalog covering every role a proposal's work items
+    might name, not just the one currently executing."""
     from agno.agent import Agent
     import copy as _copy
 
@@ -511,7 +581,16 @@ async def propose_from_text(
         # is rendered the way it is (capabilities: one global list; skills: per-role, never
         # a union; roles: the same KNOWN_ROLES validate_proposal() defaults to).
         role_catalog_text = _render_known_roles(KNOWN_ROLES)
-        capability_catalog_text = _render_known_capabilities(known_capabilities)
+        if known_capabilities_by_role is not None:
+            capability_catalog_text = _render_capabilities_by_role(known_capabilities_by_role, KNOWN_ROLES)
+            capability_catalog_intro = (
+                "Valid MCP tool identifiers (required_capabilities field), listed separately "
+                "per role -- a tool listed under one role's catalog is NOT necessarily available "
+                "to another role, and each list already reflects that role's own assignment (or "
+                "the global fallback, if that role has no specific assignment):")
+        else:
+            capability_catalog_text = _render_known_capabilities(known_capabilities)
+            capability_catalog_intro = "Valid MCP tool identifiers (required_capabilities field):"
         skills_catalog_text = _render_skills_by_role(authorized_skills_by_role, KNOWN_ROLES)
         prompt = (
             skill_preamble +
@@ -541,7 +620,7 @@ async def propose_from_text(
             "nothing in a catalog fits a work item, use an empty list for that field rather "
             "than inventing an entry:\n\n"
             f"Valid roles (role field): {role_catalog_text}\n\n"
-            f"Valid MCP tool identifiers (required_capabilities field): {capability_catalog_text}\n\n"
+            f"{capability_catalog_intro}\n{capability_catalog_text}\n\n"
             "Valid skill identifiers (proposed_skills field), listed separately per role -- a "
             "skill listed under one role is NOT authorized for any other role:\n"
             f"{skills_catalog_text}\n\n"
@@ -587,4 +666,5 @@ async def propose_from_text(
 
     return proposal, validate_proposal(
         proposal, known_capabilities=known_capabilities,
+        known_capabilities_by_role=known_capabilities_by_role,
         authorized_skills_by_role=authorized_skills_by_role)

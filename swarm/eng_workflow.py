@@ -1075,14 +1075,49 @@ async def run_attempt(st: RunState, wi: WorkItem, ctx: dict, controls: dict, att
             # rendering already distinguishes "nothing assigned to you" from "nothing
             # registered at all" via the None-vs-empty-frozenset distinction, so no new
             # prompt wording is needed here, only the right set to pass in.
-            _role_assigned_tools = _team_config.get_extra_tools("engineering", role)
-            known_caps = (frozenset(_role_assigned_tools) if _role_assigned_tools
-                         else frozenset(_team_config.get_registered_tools()))
-            authorized_skills = {r: frozenset(_team_config.get_extra_skills("engineering", r))
+            #
+            # Phase 1.64b: Phase 1.64a's audit confirmed `role` and every entry of
+            # P.KNOWN_ROLES here are the lowercase proposal/workflow vocabulary
+            # ("researcher", "coder", ...), while team_role_tools/team_role_skills are
+            # keyed by the REAL, capitalized YAML agent name ("Researcher", "Coder",
+            # ...) -- passing the lowercase string straight into get_extra_tools()/
+            # get_extra_skills() (the pre-1.64b code below this comment) always misses,
+            # always returning empty regardless of real assignment. Fixed by resolving
+            # each lowercase role to the real roster name via T._member_key() -- the
+            # SAME normalized-comparison primitive the execution-time handoff below
+            # (`T._member_key(sp.name) == role`) already uses safely -- built fresh from
+            # `ctx["specs"]`, the real agent roster for this attempt, never a hardcoded
+            # or invented mapping. A role with no roster match falls back to the raw
+            # string unchanged (the existing fail-safe shape: an unresolved lookup still
+            # returns empty from team_config, exactly as it did before this phase,
+            # never broadening authorization).
+            _name_by_member_key = {T._member_key(sp.name): sp.name for sp in ctx["specs"]}
+
+            def _real_role_name(r: str) -> str:
+                return _name_by_member_key.get(T._member_key(r), r)
+
+            # Built ONCE per known role, never unioned across roles: each role's own
+            # entry is either its own team_role_tools assignment, or (only when that
+            # role has none at all) the shared global registered-tool fallback -- the
+            # exact "proposals can contain work items assigned to different roles, do
+            # not build one catalog from only the executing role" requirement. A role
+            # resolves to this SAME global fallback frozenset object when unassigned,
+            # which is intentional and harmless: it is read-only data, never mutated,
+            # and sharing the object does not make the roles' catalogs the same catalog
+            # for authorization purposes -- each is still checked against its OWN
+            # role key in validate_proposal(), never a cross-role union.
+            _registered_tools = frozenset(_team_config.get_registered_tools())
+            known_caps_by_role = {}
+            for _r in P.KNOWN_ROLES:
+                _assigned = _team_config.get_extra_tools("engineering", _real_role_name(_r))
+                known_caps_by_role[_r] = frozenset(_assigned) if _assigned else _registered_tools
+            known_caps = known_caps_by_role.get(role, _registered_tools)
+            authorized_skills = {r: frozenset(_team_config.get_extra_skills("engineering", _real_role_name(r)))
                                  for r in P.KNOWN_ROLES}
             proposal_obj, validation = await P.propose_from_text(
                 att.text, wi.objective, agent.model,
-                known_capabilities=known_caps, authorized_skills_by_role=authorized_skills,
+                known_capabilities=known_caps, known_capabilities_by_role=known_caps_by_role,
+                authorized_skills_by_role=authorized_skills,
                 skill_blocks=wi.skill_blocks)
             rec.proposal = proposal_obj
             rec.proposal_validation = validation
