@@ -2278,4 +2278,31 @@ async def run_engineering_workflow(
     print("[workflow] decisions " + "; ".join(
         f"{r.attempt.attempt_id}:{r.decision.execution_status if r.decision else 'n/a'}->"
         f"{r.decision.acceptance if r.decision else 'n/a'}" for r in st.records), flush=True)
-    return st.final, {"input_tokens": tin, "output_tokens": tout, "total_tokens": tin + tout}, None
+    # Phase 1.65d: surface any proposals generated this run (propose=True --
+    # default False, so this list is empty and the "proposals" key below is
+    # simply never added for every pre-1.65d caller -- byte-identical return
+    # shape). Collected from st.records rather than threaded separately,
+    # since run_attempt() (Phase 1.54a) already writes rec.proposal/
+    # rec.proposal_validation there for exactly this purpose. Deliberately
+    # NOT a 4th tuple element -- main.py's _run_worker() (and both scratch
+    # drivers phase164h/j_t14_rerun.py) unpack this function's return as a
+    # strict 3-tuple; changing that arity would break every one of them. The
+    # tokens dict is the one piece of this return that already crosses the
+    # worker-subprocess JSON boundary and is already consumed by KEY (never
+    # positionally) at every call site -- see api/server.py's /run handler,
+    # which already does tokens.get("input_tokens", 0) etc. -- so an
+    # additive "proposals" key here is the backward-compatible channel.
+    tokens_out = {"input_tokens": tin, "output_tokens": tout, "total_tokens": tin + tout}
+    proposals = [
+        {
+            "work_item_id": r.attempt.work_item_id,
+            "proposal_id": f"prop-{r.attempt.attempt_id}",
+            "attempt_id": r.attempt.attempt_id,
+            "generation": r.attempt.generation,
+            "valid": bool(r.proposal_validation.valid) if r.proposal_validation else False,
+        }
+        for r in st.records if r.proposal is not None
+    ]
+    if proposals:
+        tokens_out["proposals"] = proposals
+    return st.final, tokens_out, None

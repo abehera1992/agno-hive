@@ -433,7 +433,19 @@ async def ledger_decide_proposal(proposal_id: str, request: ProposalDecisionRequ
 async def ledger_get_proposal(proposal_id: str):
     """Read-only: the proposal's own validation verdict plus its current
     decision (None if not yet reviewed) -- what an operator inspects before
-    posting to .../decide."""
+    posting to .../decide.
+
+    `executable` and `decision` are UNCHANGED (same calls, same shapes) -- `executable`
+    stays get_executable_proposal()'s own dispatch-authorization view and never carries
+    disclosures, by design (see that method's docstring).
+
+    `disclosures` (Phase 1.64m, new, additive): all 4 ValidationResult categories --
+    `errors`, `unauthorized_skills`, `unverified_capabilities`, `runtime_verification_advisories`
+    -- as persisted by record_proposal() at proposal-generation time, via
+    get_proposal_by_id() (proposal_id-keyed; delegates to get_proposal() for the actual
+    decode). None only if proposal_id is unknown -- same case `executable`'s own 404 already
+    covers, so this should not normally differ, but is fetched independently rather than
+    assumed."""
     from swarm.ledger import Ledger, LedgerError
     led = Ledger()
     if not Path(led.path).exists():
@@ -443,7 +455,12 @@ async def ledger_get_proposal(proposal_id: str):
     except LedgerError:
         raise HTTPException(status_code=404, detail="unknown proposal")
     decision = await led._a(led.get_proposal_decision, proposal_id)
-    return {"proposal_id": proposal_id, "executable": exec_check, "decision": decision}
+    full = await led._a(led.get_proposal_by_id, proposal_id)
+    disclosures = ({k: full[k] for k in ("errors", "unauthorized_skills", "unverified_capabilities",
+                                          "runtime_verification_advisories")}
+                   if full is not None else None)
+    return {"proposal_id": proposal_id, "executable": exec_check, "decision": decision,
+            "disclosures": disclosures}
 
 
 @app.on_event("startup")
@@ -1671,6 +1688,15 @@ async def _run_impl(request: RunRequest, http_request: Request):
             "error": "proposal_requires_workflow_engine", "proposal_id": request.proposal_id,
             "engine": engine, "engine_reason": engine_reason,
             "hint": "set orchestration=workflow and ensure team=engineering, read_only=true"})
+    # Phase 1.65d: same guard, same reasoning, as proposal_id above -- propose=True
+    # has no effect anywhere outside run_engineering_workflow(), so silently
+    # accepting it on a Team-engine request would be a confusing no-op rather than
+    # a clear rejection.
+    if request.propose and engine != "workflow":
+        raise HTTPException(status_code=422, detail={
+            "error": "propose_requires_workflow_engine",
+            "engine": engine, "engine_reason": engine_reason,
+            "hint": "set orchestration=workflow and ensure team=engineering, read_only=true"})
     worker_payload = {
         "task": request.task,
         "agent_specs": [a.model_dump() for a in agent_specs] if agent_specs else None,
@@ -1694,8 +1720,14 @@ async def _run_impl(request: RunRequest, http_request: Request):
         "evidence_policy": request.evidence_policy,
         "requested_skills": request.requested_skills,       # Phase 1.57c: forwarded as-is; resolved inside run_task_async
         "proposal_id": request.proposal_id,                 # Phase 1.58: forwarded as-is; authorized+planned inside run_engineering_workflow
+        "propose": request.propose,                         # Phase 1.65d: forwarded as-is; acted on inside run_attempt() (Phase 1.54a)
     }
     result, tokens, clarification = await _run_worker_subprocess(http_request, worker_payload)
+    # Phase 1.65d: additive key on the SAME tokens dict every pre-1.65d caller
+    # already consumes by key (tokens.get("input_tokens", 0) etc. below) -- never
+    # present unless this run actually generated something (see
+    # run_engineering_workflow()'s final return in swarm/eng_workflow.py).
+    proposals = tokens.get("proposals")
 
     # Append this turn to session
     await append_message(session_id, "user", request.task)
@@ -1736,6 +1768,7 @@ async def _run_impl(request: RunRequest, http_request: Request):
         needs_clarification=ClarificationRequest(**clarification) if clarification else None,
         engine=engine, engine_reason=engine_reason,
         mcp_resolution=mcp_report,
+        proposals=proposals,
     )
 
 

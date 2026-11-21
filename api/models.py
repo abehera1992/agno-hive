@@ -122,6 +122,19 @@ class RunRequest(BaseModel):
     # swarm.eng_workflow.run_engineering_workflow()'s own `proposal_id` docstring
     # for the full authorization-gate/plan-from-proposal mechanism.
     proposal_id: str | None = None
+    # Phase 1.65d: the OPT-IN, opposite-direction counterpart to proposal_id above --
+    # that field CONSUMES an already-approved WorkProposal; this one GENERATES a new
+    # one. Only acted on by orchestration="workflow" + team="engineering" (same
+    # eligibility gate as proposal_id, enforced the same way: a request that sets
+    # this but doesn't resolve to the workflow engine is rejected with 422, never
+    # silently ignored). False (every existing caller, every default) is byte-
+    # identical to pre-1.65d behavior -- generation only ever happens when this is
+    # explicitly set True. See swarm.eng_workflow.run_attempt()'s own `propose`
+    # docstring (Phase 1.54a) for what generation actually does and the hard
+    # guarantees around it (no tools, cannot approve/execute/dispatch, reuses the
+    # existing capability/skill authorization registries). Any proposal(s) this run
+    # produces are reported back via RunResponse.proposals below.
+    propose: bool = False
 
 
 class ProposalDecisionRequest(BaseModel):
@@ -199,6 +212,17 @@ class RunResponse(BaseModel):
     # after the fact). None of these fields change what the run DID; they only report
     # what it had available to do it with.
     mcp_resolution: dict | None = None
+    # Phase 1.65d: present only when this run actually generated one or more
+    # proposals (RunRequest.propose=True on an eligible orchestration="workflow" +
+    # team="engineering" run that reached run_attempt() with usable investigation
+    # text). None for every run that didn't request generation -- the overwhelming
+    # majority of callers, completely unaffected. Each item:
+    #   {"work_item_id": str, "proposal_id": str, "attempt_id": str,
+    #    "generation": int, "valid": bool}
+    # `proposal_id` is what hive --proposal <id> (Phase 1.65b) takes directly to
+    # review and decide it -- this field is the production bridge Phase 1.65c's
+    # audit found missing between generation and that existing CLI command.
+    proposals: list[dict] | None = None
 
 
 class PlanResponse(BaseModel):

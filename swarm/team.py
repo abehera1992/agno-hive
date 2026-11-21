@@ -30500,7 +30500,7 @@ async def _run_workflow_engine(
     task: str, agent_specs, coordinator_model, coordinator_tools, mcp_url, mcp_urls,
     project_id: str, session_id, *, workflow_controls, work_items, idempotency_key,
     liveness_path, liveness_nonce, knowledge, evidence_policy, requested_skills,
-    proposal_id: str | None = None,
+    proposal_id: str | None = None, propose: bool = False,
 ) -> tuple[str, dict, dict | None]:
     """Resolve requested_skills, then execute the engineering Workflow — the ONE
     place either entry point (run_task_async's /run path, run_task_stream's /stream
@@ -30525,7 +30525,12 @@ async def _run_workflow_engine(
     (its skills come from the proposal's own per-item skill_ids instead,
     resolved inside run_engineering_workflow) — both can technically coexist,
     since they are stored on RunState under different, non-conflicting names
-    (`requested_skills` vs. `item_skills`)."""
+    (`requested_skills` vs. `item_skills`).
+
+    `propose` (Phase 1.65d, default False — every existing caller unaffected):
+    forwarded unchanged to run_engineering_workflow(), which already accepts
+    and acts on it (Phase 1.54a) — this function's own body is otherwise
+    unchanged by its presence."""
     from swarm.eng_workflow import run_engineering_workflow
     reset_unavailable_tool_state()
     reset_peak_token_state()
@@ -30543,7 +30548,7 @@ async def _run_workflow_engine(
         project_id, session_id, controls_raw=workflow_controls, work_items=work_items,
         idempotency_key=idempotency_key, liveness_path=liveness_path,
         liveness_nonce=liveness_nonce, knowledge=knowledge, evidence_policy=evidence_policy,
-        resolved_skills=resolved_skills, proposal_id=proposal_id)
+        resolved_skills=resolved_skills, proposal_id=proposal_id, propose=propose)
 
 
 async def run_task_stream(
@@ -30567,6 +30572,7 @@ async def run_task_stream(
     evidence_policy: dict | None = None,
     requested_skills: list[str] | None = None,
     proposal_id: str | None = None,
+    propose: bool = False,
 ):
     """Same setup as run_task_async but yields text chunks as the coordinator generates them.
 
@@ -30631,7 +30637,7 @@ async def run_task_stream(
                 project_id, session_id, workflow_controls=workflow_controls, work_items=work_items,
                 idempotency_key=idempotency_key, liveness_path=None, liveness_nonce=None,
                 knowledge=_knowledge, evidence_policy=evidence_policy, requested_skills=requested_skills,
-                proposal_id=proposal_id)
+                proposal_id=proposal_id, propose=propose)
             done_event = {"__done__": True, "content": content, "tokens": tokens}
             if clarification:
                 done_event["clarification"] = clarification
@@ -36223,6 +36229,7 @@ async def run_task_async(
     evidence_policy: dict | None = None,
     requested_skills: list[str] | None = None,
     proposal_id: str | None = None,
+    propose: bool = False,
 ) -> tuple[str, dict, dict | None]:
     """Run a task with the given team spec, or fall back to default Coder+Reviewer.
 
@@ -36265,6 +36272,21 @@ async def run_task_async(
     see run_engineering_workflow()'s own docstring for the authorization
     gate and per-item role/skill handoff this actually performs.
 
+    `propose` (Phase 1.65d, default False — every existing caller
+    unaffected): forwarded unchanged to _run_workflow_engine() /
+    run_engineering_workflow(), which has accepted and acted on it since
+    Phase 1.54a (swarm/eng_workflow.py's run_attempt()) — this parameter
+    never previously existed on this function or _run_workflow_engine(),
+    which is the entire reason propose=True had no production entry point
+    before this phase (api/server.py's /run never had a request field to
+    set it with in the first place). Any proposal(s) generated this way are
+    returned via the tokens dict's own "proposals" key (see
+    run_engineering_workflow()'s final return) -- NOT a 4th tuple element,
+    so this function's return arity is unchanged and every existing
+    `content, tokens, clarification = await run_task_async(...)` unpacking
+    site (main.py's _run_worker, both phase164h/j_t14_rerun.py scratch
+    drivers) stays exactly as it was.
+
     Returns (content, tokens, clarification). clarification is None on a normal
     completed answer; when the coordinator emitted a needs_clarification block
     (see _extract_clarification), it's {"question": str, "options": [...]} and
@@ -36295,7 +36317,7 @@ async def run_task_async(
                 project_id, session_id, workflow_controls=workflow_controls, work_items=work_items,
                 idempotency_key=idempotency_key, liveness_path=liveness_path,
                 liveness_nonce=liveness_nonce, knowledge=_knowledge, evidence_policy=evidence_policy,
-                requested_skills=requested_skills, proposal_id=proposal_id)
+                requested_skills=requested_skills, proposal_id=proposal_id, propose=propose)
         print(f"[team] orchestration=workflow requested but team_name={team_name!r} is not 'engineering' "
               f"(or no roster) -- using the Team path", flush=True)
     # Rebound BEFORE the roster is composed -- see run_task_stream for the reason.

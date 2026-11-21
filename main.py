@@ -190,6 +190,7 @@ async def _run_worker() -> dict:
             evidence_policy=payload.get("evidence_policy"),
             requested_skills=payload.get("requested_skills"),
             proposal_id=payload.get("proposal_id"),
+            propose=payload.get("propose", False),
         )
         # Phase 0.80: emitted immediately before this coroutine returns -- the
         # top-level coroutine of this subprocess's own asyncio.run() call
@@ -306,6 +307,7 @@ async def _run_stream_worker(real_stdout) -> None:
             evidence_policy=payload.get("evidence_policy"),
             requested_skills=payload.get("requested_skills"),
             proposal_id=payload.get("proposal_id"),
+            propose=payload.get("propose", False),
         ):
             print(json.dumps({"ok": True, "v": _json_safe_stream_chunk(chunk)}),
                   file=real_stdout, flush=True)
