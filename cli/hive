@@ -29,6 +29,7 @@ Optional TUI upgrade (pip install -r cli/requirements.txt):
 """
 import base64
 import difflib
+import getpass
 import json
 import os
 import queue
@@ -79,6 +80,12 @@ AGNO_SYSTEM_MCP_PORT = os.getenv("AGNO_SYSTEM_MCP_PORT", "9003")
 # Root directory scanned for .hive_proposed files — set to your project root if hive
 # is invoked from a different working directory (e.g. export AGNO_PROJECT_ROOT=/path/to/ekam)
 AGNO_PROJECT_ROOT    = os.getenv("AGNO_PROJECT_ROOT",    "")
+# Phase 1.65b: label recorded as ProposalDecisionRequest.decided_by -- NOT an
+# authenticated identity (this CLI/API has no auth layer anywhere, confirmed
+# in the Phase 1.65a audit). Same convention as every other AGNO_* setting
+# here: env var override, falls back to the local OS username at call time
+# (see _default_reviewer_identity()) when unset.
+AGNO_REVIEWER        = os.getenv("AGNO_REVIEWER",        "")
 HIVE_VERBOSE_TOOLS   = os.getenv("HIVE_VERBOSE_TOOLS", "") in ("1", "true", "True")
 _VERBOSE_TOOLS       = HIVE_VERBOSE_TOOLS   # overridable by --verbose-tools in main()
 
@@ -269,7 +276,15 @@ def _arrow_select(options: list[str], hints: list[str] | None = None) -> int:
             idx = int(raw) - 1
             return idx if 0 <= idx < n else 0
         except Exception:
-            return 0
+            # Phase 1.65b: was `return 0` -- on a closed/absent stdin (EOFError)
+            # this silently picked the FIRST option, which is "confirm"/"create"
+            # for both existing callers (_prompt_confirm_reject/_prompt_confirm_action).
+            # Checked every current caller (cli/hive, grep for `_arrow_select(`):
+            # all four treat a negative return as "cancel, do nothing" (an
+            # `idx < 0` check, or an `else` branch after `== 0`/`== 1`), so
+            # returning -1 here instead is a pure safety fix with no behavior
+            # change on any normal (non-exceptional) path.
+            return -1
 
     selected = 0
 
@@ -342,9 +357,9 @@ def _arrow_select(options: list[str], hints: list[str] | None = None) -> int:
                     termios.tcsetattr(fd, termios.TCSADRAIN, old)
                 except Exception:
                     pass
-                return 0
+                return -1  # Phase 1.65b: was 0 -- see the non-TTY fallback's note above
         except Exception:
-            return 0
+            return -1  # Phase 1.65b: was 0 -- msvcrt AND tty/termios both unavailable
 
 
 def _show_inline_diff(original: Path, proposed: Path) -> None:
@@ -512,6 +527,126 @@ def _prompt_confirm_action(action_file: Path) -> None:
     else:
         print(dim("  skipped — /confirm-action or /reject-action when ready"))
     print()
+
+
+def _default_reviewer_identity() -> str:
+    """Best-effort LOCAL identity for ProposalDecisionRequest.decided_by (Phase
+    1.65b). This is NOT an authenticated or independently verified identity --
+    Phase 1.65a's audit confirmed there is no auth layer anywhere in this CLI
+    or the API it talks to (zero Authorization/API-key headers in call_api/
+    call_get/call_delete/call_patch). It is only a label for the audit trail,
+    equivalent to what the OS reports for the current user.
+    AGNO_REVIEWER env var takes precedence (checked by the caller); this is
+    only the fallback. getpass.getuser() is used over os.getlogin() because
+    the latter can raise with no controlling TTY (common when stdin/stdout are
+    redirected), which getpass.getuser() handles via USERNAME/USER env vars."""
+    try:
+        return getpass.getuser()
+    except Exception:
+        return "unknown"
+
+
+def _prompt_decision(issue: dict, options: list[dict]) -> dict | None:
+    """Reusable human-decision prompt (Phase 1.65b) -- the generalized primitive
+    Phase 1.65a's audit recommended, built on the existing _arrow_select()
+    selector instead of a new widget. Unlike _prompt_confirm_reject()/
+    _prompt_confirm_action(), this primitive makes NO HTTP calls and mutates NO
+    proposal/file/action state -- it only collects a human decision for the
+    caller to act on (or not).
+
+    `issue`: {"title": str,
+              "context": list[tuple[str, str]]  (optional, label/value pairs),
+              "detail": str                      (optional, may be multi-line)}
+    `options`: list of {"id": str, "label": str,
+                         "hint": str             (optional, shown dim next to the label),
+                         "free_text": bool        (optional -- marks the "custom
+                                                    instructions" choice: comment
+                                                    becomes REQUIRED, not optional),
+                         "cancel": bool           (optional -- marks a "skip/decide
+                                                    later" choice that returns None
+                                                    immediately, same semantics as
+                                                    the existing skip entries in
+                                                    _prompt_confirm_reject()/
+                                                    _prompt_confirm_action(), with no
+                                                    comment prompt or confirmation step)}
+
+    Returns {"option_id": str, "comment": str | None} ONLY after the user has
+    EXPLICITLY confirmed a non-cancel option. Returns None on: a "cancel"-flagged
+    option, Esc/Ctrl-C/EOF during selection, EOF/Ctrl-C during comment entry,
+    declining the final confirmation, or stdin not being interactive at all.
+    Never silently picks an option -- every path except an explicit confirmed
+    choice is None.
+    """
+    # Section 2 of the Phase 1.65b brief: "If stdin is not interactive, abort
+    # the prompt without recording a decision." Checked explicitly and FIRST,
+    # rather than relying solely on _arrow_select()'s own now-corrected EOF
+    # fallback -- that function's TTY-rendering branch keys off
+    # sys.stdout.isatty(), not stdin, so stdout-is-a-tty-but-stdin-is-not
+    # (e.g. output to a terminal with input redirected from a closed/empty
+    # source) would otherwise reach the raw msvcrt/termios key-reading loop
+    # at all, instead of aborting cleanly here.
+    if not sys.stdin.isatty():
+        print(dim("  (non-interactive stdin — decision prompt skipped, no decision recorded)"))
+        return None
+
+    print()
+    sep = dim("  " + "─" * 54)
+    print(sep)
+    print(f"  {bold(issue.get('title', 'Decision required'))}")
+    for label, value in issue.get("context", []):
+        print(f"  {dim(str(label) + ':')} {value}")
+    detail = issue.get("detail")
+    if detail:
+        print()
+        for line in str(detail).splitlines() or [""]:
+            print(f"  {line}")
+    print(sep)
+
+    labels = [o["label"] for o in options]
+    hints  = [o.get("hint", "") for o in options]
+    idx = _arrow_select(labels, hints)
+    if idx < 0:
+        print(dim("  cancelled — no decision recorded"))
+        print()
+        return None
+
+    chosen = options[idx]
+    if chosen.get("cancel"):
+        print(dim(f"  {chosen['label']} — no decision recorded"))
+        print()
+        return None
+
+    comment: str | None = None
+    print()
+    try:
+        if chosen.get("free_text"):
+            while not comment:
+                comment = input(f"  {bold('Instructions:')} ").strip()
+                if not comment:
+                    print(dim("  (required — enter custom instructions, or Ctrl-C to cancel)"))
+        else:
+            comment = input(f"  {dim('Optional comment (Enter to skip):')} ").strip() or None
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n{yellow('  cancelled — no decision recorded')}")
+        print()
+        return None
+
+    print()
+    comment_suffix = f"  {dim('— ' + comment)}" if comment else ""
+    print(f"  {bold('Confirm:')} {chosen['label']}{comment_suffix}")
+    try:
+        answer = input(f"  {dim('[y/N]')} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n{yellow('  cancelled — no decision recorded')}")
+        print()
+        return None
+
+    if answer not in ("y", "yes"):
+        print(dim("  cancelled — no decision recorded"))
+        print()
+        return None
+
+    return {"option_id": chosen["id"], "comment": comment}
 
 
 # ── ESC interrupt + mid-flight steering ─────────────────────────────────────────
@@ -2095,6 +2230,186 @@ def _cmd_mcp_status() -> None:
     print()
 
 
+def _render_disclosure_category(label: str, value) -> None:
+    """One disclosure category from GET /ledger/proposals/{id}'s `disclosures`
+    (Phase 1.64m) -- `errors` is list[str]; the other three are
+    dict[work_item_id -> list[str | dict]] (see swarm/proposal.py's
+    ValidationResult). Purely a display helper -- never mutates `value`."""
+    print(f"\n  {bold(label)}")
+    if not value:
+        print(dim("    (none)"))
+        return
+    if isinstance(value, list):
+        for item in value:
+            print(f"    - {item}")
+        return
+    for work_item_id, items in value.items():
+        print(f"    {cyan(work_item_id)}:")
+        for item in items:
+            if isinstance(item, dict):
+                field  = item.get("field", "?")
+                reason = item.get("reason", item.get("text", item))
+                print(f"      - {field}: {reason}")
+            else:
+                print(f"      - {item}")
+
+
+def _cmd_propose(task: str, project_id: str) -> None:
+    """--propose TASK (Phase 1.65d): a one-shot POST /run with orchestration="workflow",
+    team="engineering", read_only=True, propose=True -- the only combination that reaches
+    run_engineering_workflow()'s propose=True path (api/server.py rejects propose=True
+    outright, 422, on any other engine). Deliberately NOT the normal streaming run_task()
+    path (/stream): /stream has no Workflow engine at all (api/server.py's own
+    _workflow_inapplicable_reasons), so a propose=True request sent there would always be
+    rejected -- this needs its own one-shot /run call, same reasoning as --migrate/
+    --proposal already skipping the streaming path for their own single-shot routes.
+
+    Prints the investigation result text, then every proposal RunResponse.proposals
+    reports (work_item_id, proposal_id, valid) -- each proposal_id is exactly what
+    `hive --proposal <id>` (Phase 1.65b) takes next to review and decide it. Makes
+    no decide call itself; generation and review/decision stay fully separate."""
+    payload = {
+        "task": task, "project_id": project_id, "team": "engineering",
+        "orchestration": "workflow", "read_only": True, "propose": True,
+    }
+    if AGNO_MCP_URL:
+        payload["mcp_url"] = AGNO_MCP_URL
+    if AGNO_SYSTEM_MCP_URL:
+        payload["mcp_urls"] = [AGNO_SYSTEM_MCP_URL]
+    print(dim(f"  POST /run  task={task[:60]!r}{'...' if len(task) > 60 else ''}  "
+              f"team=engineering orchestration=workflow propose=True"))
+    print(dim("  (one-shot, not streamed -- this can take several minutes for a real investigation)"))
+    try:
+        resp = call_api("/run", payload, timeout=1800)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        try:
+            detail = json.loads(body).get("detail", body)
+        except Exception:
+            detail = body
+        print(red(f"  error {e.code}: {detail}"))
+        return
+    except Exception as e:
+        print(red(f"  error: {e}"))
+        return
+
+    print()
+    print(resp.get("result", "") or dim("  (no result text)"))
+    print()
+    proposals = resp.get("proposals") or []
+    if not proposals:
+        print(dim("  no proposal was generated/persisted this run."))
+        return
+    print(f"  {bold(f'{len(proposals)} proposal(s) generated:')}")
+    for p in proposals:
+        verdict = green("valid") if p.get("valid") else yellow("invalid")
+        print(f"    {cyan(p.get('proposal_id', '?'))}  work_item={p.get('work_item_id', '?')}  "
+              f"attempt={p.get('attempt_id', '?')} gen={p.get('generation', '?')}  {verdict}")
+    print(dim(f"\n  review and decide: hive --proposal {proposals[0].get('proposal_id', '<id>')}"))
+    print()
+
+
+def _cmd_proposal(proposal_id: str) -> None:
+    """--proposal <id> (Phase 1.65b): fetch GET /ledger/proposals/{id}, render
+    its executable status, existing decision (if any), and all 4 Phase 1.64m
+    disclosure categories, then -- only on an explicit approve/reject choice
+    plus confirmation via _prompt_decision() -- POST the decision to
+    POST /ledger/proposals/{id}/decide using the EXISTING ProposalDecisionRequest
+    contract. Viewing (this function's first half) never calls /decide; a
+    "skip/cancel" choice or any cancellation from _prompt_decision() means this
+    function returns without ever reaching the /decide call below."""
+    try:
+        data = call_get(f"/ledger/proposals/{proposal_id}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        try:
+            detail = json.loads(body).get("detail", body)
+        except Exception:
+            detail = body
+        print(red(f"  error {e.code}: {detail}"))
+        return
+    except Exception as e:
+        print(red(f"  error: {e}"))
+        return
+
+    executable  = data.get("executable") or {}
+    decision    = data.get("decision")
+    disclosures = data.get("disclosures") or {}
+
+    print()
+    print(f"  {bold('Proposal')}  {cyan(proposal_id)}")
+    if executable.get("ok"):
+        print(f"  {green('executable: ok')}")
+    else:
+        reason = executable.get("reason", "?")
+        executed = executable.get("executed_task_id")
+        suffix = dim(f"  (executed as {executed})") if executed else ""
+        print(f"  {yellow('executable: ' + str(reason))}{suffix}")
+
+    if decision is None:
+        print(f"  {dim('decision: none yet')}")
+    else:
+        verdict = "approved" if decision.get("approved") else "rejected"
+        print(f"  decision: {verdict}  {dim('by ' + str(decision.get('decided_by')))}")
+        if decision.get("reason"):
+            print(f"  {dim('reason: ' + str(decision['reason']))}")
+
+    _render_disclosure_category("errors", disclosures.get("errors"))
+    _render_disclosure_category("unauthorized_skills", disclosures.get("unauthorized_skills"))
+    _render_disclosure_category("unverified_capabilities", disclosures.get("unverified_capabilities"))
+    _render_disclosure_category("runtime_verification_advisories", disclosures.get("runtime_verification_advisories"))
+    print()
+
+    if decision is not None:
+        print(dim("  this proposal already has a recorded decision — approving/rejecting "
+                   "below is idempotent: the server returns the EXISTING decision rather "
+                   "than overwriting it (see decide_proposal()'s first-decision-wins rule)."))
+        print()
+
+    issue = {
+        "title": f"Review proposal {proposal_id}",
+        "context": [("Executable", "ok" if executable.get("ok") else str(executable.get("reason", "?")))],
+        "detail": ("Approving or rejecting is a SEPARATE action from the disclosures above — "
+                    "this command does not resolve, remediate, or rewrite any individual "
+                    "finding. It only records an approve/reject decision for this proposal_id."),
+    }
+    options = [
+        {"id": "approve", "label": "Approve proposal"},
+        {"id": "reject",  "label": "Reject proposal"},
+        {"id": "skip",    "label": "Skip / cancel", "cancel": True},
+    ]
+    result = _prompt_decision(issue, options)
+    if result is None:
+        print(dim("  no decision call made."))
+        return
+
+    reviewer = AGNO_REVIEWER or _default_reviewer_identity()
+    print(dim(f"  recording as: {reviewer}  (local identity only — not authenticated)"))
+    payload = {
+        "approved":   result["option_id"] == "approve",
+        "decided_by": reviewer,
+        "reason":     result.get("comment") or "",
+    }
+    try:
+        resp = call_api(f"/ledger/proposals/{proposal_id}/decide", payload)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        print(red(f"  decide failed {e.code}: {body}"))
+        return
+    except Exception as e:
+        print(red(f"  decide error: {e}"))
+        return
+
+    if resp.get("recorded"):
+        print(green(f"  recorded: {'approved' if resp.get('approved') else 'rejected'} by {reviewer}"))
+    elif resp.get("reason") == "IDEMPOTENT_DUPLICATE":
+        verdict = "approved" if resp.get("approved") else "rejected"
+        print(yellow(f"  already decided — existing decision unchanged ({verdict})"))
+    else:
+        print(yellow(f"  not recorded: {resp.get('reason', '?')}"))
+    print()
+
+
 def _cmd_migrate() -> None:
     """Bring agno-hive's OWN app-storage database up to the migration head this
     checkout expects -- chat_sessions/session_messages/failure_log/
@@ -2446,6 +2761,12 @@ def main() -> None:
                         help=f"hive-mcp port for Tailscale auto-detection (default: {AGNO_MCP_PORT})")
     parser.add_argument("--mcp-status",        action="store_true",
                         help="show hive-mcp connection status and exit")
+    parser.add_argument("--proposal",          metavar="PROPOSAL_ID",
+                        help="review a persisted proposal's disclosures and approve/reject it, then exit")
+    parser.add_argument("--propose",          action="store_true",
+                        help="generate a structured work proposal for TASK via the engineering "
+                             "Workflow (one-shot, orchestration=workflow+propose=True) instead of "
+                             "a normal investigation, then exit; review the result with --proposal")
     parser.add_argument("--bootstrap",         action="store_true",
                         help="index this project into LightRAG for semantic search and exit")
     parser.add_argument("--lightrag-url",      metavar="URL",
@@ -2482,6 +2803,13 @@ def main() -> None:
         AGNO_HOST = args.host
     if args.team:
         AGNO_TEAM = args.team
+
+    if args.proposal:
+        # No project/MCP resolution needed -- this command only talks to
+        # AGNO_HOST's /ledger/proposals/{id} and /decide routes (same reasoning
+        # as --migrate above: skip the Tailscale auto-detection entirely).
+        _cmd_proposal(args.proposal)
+        return
 
     # Resolve primary (project) MCP URL: flag > env var > Tailscale auto-detect
     if args.mcp_url:
@@ -2551,7 +2879,9 @@ def main() -> None:
 
     if args.task:
         task = " ".join(args.task)
-        if args.review:
+        if args.propose:
+            _cmd_propose(task, project_id)
+        elif args.review:
             review_task(task, project_id, session_id=args.session, persist=args.persist)
         else:
             returned_id = run_task(
